@@ -74,9 +74,13 @@ naturally.
   surface area of specialized ops. If something can be expressed via existing primitives and `jit`,
   that's preferred over adding a new backend kernel.
 - **Explicit disposal over GC** — operations don't consume inputs, but GPU/WASM buffers must be
-  freed explicitly via `.dispose()` when no longer needed. Inside `jit()`, the compiler manages
-  intermediate lifetimes automatically. See [Memory management](#memory-management--ownership) for
-  details.
+  freed explicitly via `.dispose()` when no longer needed. See
+  [Memory management](#memory-management--ownership) for details.
+- **Ownership-correct in both modes** — code must dispose correctly in eager mode **and** under
+  `jit()` tracing. `jit()` is a pure performance optimization (kernel fusion, buffer recycling); it
+  must not change ownership semantics. If code leaks or double-disposes in eager mode, that is a
+  real bug to fix — not something to paper over by wrapping in `jit()`. See
+  [Ownership correctness principle](#ownership-correctness-principle).
 - **Compounding returns** — every improvement to the compiler makes _all_ operations faster, every
   new primitive gets autodiff for free, every `jit`-wrapped function gets kernel fusion
   automatically. Prioritize work that compounds.
@@ -241,9 +245,9 @@ arr.dispose(); // explicit disposal when done
 ```
 
 Inside `jit()` bodies, the compiler manages intermediate lifetimes automatically (freeing at exact
-last-use). In eager mode, intermediates live until collected by GC or explicit `.dispose()`. **Wrap
-compute-heavy code in `jit()`** for both performance (kernel fusion) and automatic memory management
-— see [Eager-Mode Memory Management](#eager-mode-memory-management) for details.
+last-use). In eager mode, intermediates live until collected by GC or explicit `.dispose()`. Use
+`jit()` for **performance** (kernel fusion, buffer recycling) — but code must be ownership-correct
+in eager mode too. See [Ownership correctness principle](#ownership-correctness-principle).
 
 **Why `.dispose()` is required:**
 
@@ -308,7 +312,7 @@ jax-js supports the `using` keyword
 | ------------------------------------ | ---------------------------------------------- |
 | Short-lived arrays in a function     | `using` — cleaner, exception-safe              |
 | JIT functions used across many calls | `.dispose()` when truly done                   |
-| Loop bodies                          | `jit()` manages intermediates automatically    |
+| Loop bodies creating intermediates   | `using` or explicit `.dispose()` per iteration |
 | Test cleanup                         | `using` or `onTestFinished(() => x.dispose())` |
 
 **When NOT to use `using`:**
@@ -989,7 +993,7 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 - Backends: `src/backend/webgpu/`, `src/backend/wasm/`
 - Demos: `website/src/routes/repl/`, `website/src/routes/mobileclip/`
 - Deno WebGPU tests: `test/deno/webgpu.test.ts` — headless hardware GPU testing
-- Scan tests: `test/lax-scan.test.ts` — comprehensive scan suite (~1700 lines)
+- Scan tests: `test/lax-scan.test.ts` — comprehensive scan suite (~1880 lines)
 
 ---
 
@@ -2203,7 +2207,7 @@ contributors should be aware of:
 
 | File                            | Purpose                                        |
 | ------------------------------- | ---------------------------------------------- |
-| `test/lax-scan.test.ts`         | Main scan test suite (~1700 lines)             |
+| `test/lax-scan.test.ts`         | Main scan test suite (~1880 lines)             |
 | `test/scan-backends.test.ts`    | Backend coverage & `copyBufferToBuffer` checks |
 | `test/scan-bench.test.ts`       | Scan benchmark tests                           |
 | `test/deno/webgpu.test.ts`      | Headless WebGPU tests via Deno                 |
@@ -2746,6 +2750,32 @@ called at two points in `lax-scan.ts` — immediately after scan execution and o
 For `jit()`, the `JitProgram` owns captured constants and `jit.dispose()` frees them. The eager
 `Primitive.Scan` impl calls `closedJaxpr.dispose()` directly.
 
+### User-disposed constants in grad bodies (fixed)
+
+**Problem:** When user code inside a `grad` body disposes an array that was captured as a
+`ClosedJaxpr` constant, the backward pass crashes with `UseAfterFreeError`:
+
+```ts
+// Crashed before the fix:
+const f = (xs) => {
+  const initVal = np.array([0.0]);
+  const [finalCarry, ys] = lax.scan(step, initVal, xs);
+  initVal.dispose(); // ← user disposes; rc drops to 1
+  ys.dispose();
+  return finalCarry.sum();
+};
+grad(f)(xs); // UseAfterFreeError in getOrComputePrimal
+```
+
+**Root cause:** `getOrMakeConstTracer` does `val.ref` (rc → 2), but user's `.dispose()` drops rc to
+
+1. After `partialEvalGraphToJaxpr` (net zero), `disposePeIntermediates` takes the last ref (rc → 0),
+   killing the ClosedJaxpr's ownership before the backward pass reads it.
+
+**Fix:** In both `linearizeFlat` and `vjpFlat`, before calling `disposePeIntermediates`, protect
+jaxpr consts whose `c.refCount <= 1`. Normal consts (rc ≥ 2) are unaffected; only user-disposed
+consts (rc = 1) are protected from over-disposal.
+
 ## Debugging Ownership Issues
 
 If a `UseAfterFreeError` or `ReferenceError` appears:
@@ -2783,83 +2813,119 @@ These are the compositions most sensitive to ownership bugs:
 | `jit(grad(scan))`   | Scan body tracing + grad + JIT — tests const ownership     |
 | `vmap(grad(scan))`  | All layers combined                                        |
 
-## Eager-Mode Memory Management
+## Ownership Correctness Principle
 
-The non-consuming model means **eager-mode intermediates are not auto-freed**. `x.mul(y).add(z)`
-creates an intermediate `x.mul(y)` that lives until explicit `.dispose()` or GC (which doesn't track
-GPU/WASM memory).
+> **Write code that is ownership-correct in both eager and JIT mode.**
 
-### Why `jit()` is the primary answer
+This is the central memory management principle in jax-js. `jit()` is a **pure performance
+optimization** (kernel fusion, buffer recycling, dispatch batching). It must never change program
+semantics — including memory ownership. If code leaks or double-disposes in eager mode, that is a
+real bug, not something to paper over by wrapping in `jit()`.
 
-`jit()` provides optimal memory management for all execution modes:
+**Why this matters:** During development you frequently switch between eager and JIT modes —
+debugging, profiling, adding logging, testing individual operations. If your code only works under
+`jit()` tracing (where the compiler manages lifetimes), you can't freely switch. By keeping code
+ownership-correct at all times, `jit()` becomes something you add or remove purely for performance.
 
-| Property                  | `jit()` body                          | Eager (no jit)                |
-| ------------------------- | ------------------------------------- | ----------------------------- |
-| Intermediate lifetime     | Freed at exact last-use               | Lives until `.dispose()` / GC |
-| Peak memory               | O(max concurrent live)                | O(all intermediates)          |
-| Buffer reuse within scope | Full `recycleBuffers()` pass          | None until pool recycles      |
-| Kernel fusion             | Yes (huge perf win)                   | None                          |
-| Pool integration          | Compile-time recycling, zero overhead | Individual dispose→pool       |
-| Caching across calls      | Trace once, run many                  | N/A                           |
+**What "ownership-correct" means in the non-consuming model:**
 
-A chain of 10 ops on a 500MB tensor: `jit()` peaks at ~1.5GB (input + 1 recycled intermediate);
-eager peaks at ~5.5GB (input + 10 live intermediates simultaneously).
+1. Every array you create must eventually be `.dispose()`'d (or auto-disposed via `using`).
+2. Operations do NOT consume inputs — you're responsible for disposing them when done.
+3. Intermediates in expression chains (e.g., `x.mul(y).add(z)`) create arrays that are only disposed
+   by GC in eager mode. Keep chains short or use `using` / explicit disposal for large tensors.
+4. Transform outputs (`grad`, `vjp`, `jit`) — the caller owns the results.
+5. `vjpFn.dispose()` / `jitFn.dispose()` — free captured forward-pass intermediates / constants.
 
-The guidance for users is: **wrap your compute in `jit()`**. This is already true for performance
-(kernel fusion, dispatch overhead). Automatic memory management is just another reason.
+**JIT's role is performance, not correctness:**
 
-### Alternatives evaluated
+| Aspect                    | Eager mode                         | JIT mode                              |
+| ------------------------- | ---------------------------------- | ------------------------------------- |
+| Intermediate lifetimes    | Live until `.dispose()` / GC       | Freed at exact last-use automatically |
+| Peak memory (chains)      | O(all intermediates)               | O(max concurrent live)                |
+| Buffer reuse              | Pool only (on dealloc→realloc)     | Compile-time recycling + pool         |
+| Kernel fusion             | None (one dispatch per op)         | Fused into single kernels             |
+| **Ownership correctness** | **Must be correct** (ground truth) | **Must also be correct**              |
 
-#### `tidy()` (TF.js-style scope cleanup)
+The eager column shows worse _performance_ characteristics — that's expected and fine. The critical
+row is the last one: ownership correctness must hold in _both_ modes. JIT should only make things
+faster, never fix ownership bugs.
+
+### Static analysis: ESLint plugin (upstream jax-js)
+
+The community [`@hamk-uas/eslint-plugin-jax-js`](https://github.com/hamk-uas/eslint-plugin-jax-js)
+ESLint plugin catches array ownership violations statically for the upstream (move-semantics)
+jax-js. It embodies the same ownership-correctness principle — it warns inside `jit()` callbacks on
+purpose, because ownership-correct code should work in both modes.
+
+The upstream plugin's three rules (`no-use-after-consume`, `no-unnecessary-ref`, `require-consume`)
+target move semantics and are not directly applicable to this non-consuming fork. However, the
+**design philosophy is identical**: code that is correct in eager mode will be correct under
+`jit()`.
+
+A future jax-js-specific linter for the non-consuming model could enforce:
+
+- Every created array is eventually disposed (the `require-consume` analog)
+- No use after `.dispose()` (the `no-use-after-consume` analog)
+- No unnecessary `.ref` calls (`.ref` is never needed in user code under non-consuming semantics)
+
+This would catch leaks and use-after-free bugs at edit time, before they surface as
+`UseAfterFreeError` at runtime or silent memory leaks.
+
+### Memory management ergonomics
+
+For **short-lived computations**, `using` declarations provide the cleanest pattern:
 
 ```ts
-const result = tidy(() => a.mul(2).add(3).sqrt());
-// All intermediates auto-disposed at scope exit; only result survives.
+{
+  using x = np.array([1, 2, 3]);
+  using y = np.array([4, 5, 6]);
+  const z = x.add(y);
+  console.log(await z.data()); // [5, 7, 9]
+  z.dispose();
+  // x, y auto-disposed at block end
+}
 ```
 
-**Verdict:** Skip. `jit()` is strictly better for memory and performance. `tidy()` provides no
-buffer reuse within the scope — peak memory is the same as unmanaged eager. Only sync (breaks at
-`await` boundaries). Adds API surface without adding capability beyond `jit()`. If dynamic control
-flow with large tensors becomes common (e.g., RL environments), revisit.
-
-#### `pipe()` (functional chain with per-step cleanup)
+For **expression chains with large tensors**, break them up to control peak memory:
 
 ```ts
-const b = np.pipe(
-  a,
-  (x) => x.mul(2),
-  (x) => x.add(3),
-  (x) => x.sqrt(),
-);
-// Each intermediate disposed before next step — only 1 extra buffer live at a time.
+// Eager-safe: explicit intermediate disposal
+const a = x.mul(weights);
+const b = a.add(bias);
+a.dispose(); // free intermediate before next op
+const result = nn.relu(b);
+b.dispose();
+// result is the only live intermediate
 ```
 
-**Verdict:** Nice ergonomic sugar (~15 lines to implement) but only works for linear
-single-input→single-output chains. Multi-input patterns don't fit. Doesn't justify a public API for
-a narrow pattern.
-
-#### `.donate()` (opt-in buffer transfer)
+For **performance-critical hot paths**, wrap in `jit()` — you get kernel fusion and automatic
+intermediate recycling, on top of the already-correct ownership:
 
 ```ts
-const b = a.donate().mul(2); // a is dead, buffer reused in-place for b
+// Same ownership semantics, but faster
+const forward = jit((x) => nn.relu(x.mul(weights).add(bias)));
+const result = forward(input);
+// forward.dispose() when the function is no longer needed
 ```
 
-**Verdict:** Defer. Brings back `UseAfterFreeError` risk. Requires backend changes. Inside `jit()`
-bodies it's useless (compiler already knows lifetimes). Only valuable if profiling shows the pool
-isn't fast enough for large buffers in eager hot paths.
+### Alternatives evaluated (and rejected)
 
-#### In-place ops `mul_()` and `out=` parameter (PyTorch/NumPy style)
-
-**Hard no.** Both require mutability, which breaks tracing (JIT can't trace side effects) and
-autodiff (in-place mutation invalidates the computation graph). Fundamentally incompatible with
-JAX's immutable-array design.
+| Approach          | Memory benefit     | Footgun risk | Recommendation                           |
+| ----------------- | ------------------ | ------------ | ---------------------------------------- |
+| `using` / manual  | Explicit, correct  | None         | **Primary pattern**                      |
+| `jit()`           | Auto intermediates | None         | **Performance optimization**             |
+| `tidy()` (TF.js)  | Scope cleanup      | None         | Skip — no buffer reuse, sync-only        |
+| `pipe()`          | Chain cleanup      | None         | Skip — too narrow                        |
+| `.donate()`       | Zero-alloc reuse   | High (UAF)   | Defer — pool handles it                  |
+| In-place / `out=` | Zero-alloc reuse   | Breaks model | **Never** — incompatible with tracing/AD |
 
 ### `checkLeaks` diagnostic (implemented)
 
-A zero-overhead leak detection tool. When active, it snapshots backend slot counts across ALL
-devices and tracks Array creations with lazy Error objects for stack traces. The `leaked` count uses
-backend `slotCount()` deltas, so it exactly matches existing leak detection behavior. Used in the
-global test setup (`test/setup.ts`) to wrap every test with automatic leak checking.
+A zero-overhead leak detection tool that enforces ownership correctness at test time. When active,
+it snapshots backend slot counts across ALL devices and tracks Array creations with lazy Error
+objects for stack traces. The `leaked` count uses backend `slotCount()` deltas, so it exactly
+matches existing leak detection behavior. Used in the global test setup (`test/setup.ts`) to wrap
+every test with automatic leak checking — **every single test in the suite must be leak-free**.
 
 ```ts
 import { checkLeaks } from "@jax-js/jax";
@@ -2929,26 +2995,31 @@ backend Slot.
   `getOrMakeConstTracer`'s `.ref`. After `_disposeAllJitCaches`, rc drops to 1. Extract constants to
   named variables and dispose them manually.
 
-**Why this is better than `tidy()`:** Zero overhead in production. Educates users toward `jit()`
-rather than providing a weaker alternative. Keeps the API surface JAX-compatible.
+**Why this matters:** Ownership correctness is enforced at test time via `checkLeaks` (every test
+must be leak-free) and at development time via IDE diagnostics. Zero overhead in production. Keeps
+the API surface JAX-compatible. A future ESLint plugin for the non-consuming model would catch leaks
+and use-after-free statically at edit time, complementing the runtime `checkLeaks` diagnostic.
 
 ### Decision summary
 
-| Approach          | Eager memory | Buffer reuse | Footgun risk | Recommendation           |
-| ----------------- | ------------ | ------------ | ------------ | ------------------------ |
-| `jit()`           | Optimal      | Full         | None         | **Primary answer**       |
-| `tidy()`          | Cleanup only | None         | None         | Skip — `jit()` is better |
-| `pipe()`          | 1 extra buf  | Pool only    | None         | Skip — too narrow        |
-| `.donate()`       | Zero-alloc   | True reuse   | High         | Defer — pool handles it  |
-| `checkLeaks`      | Diagnostic   | N/A          | None         | **Implemented**          |
-| In-place / `out=` | Zero-alloc   | True reuse   | Breaks model | **Never** — incompatible |
+| Approach          | Eager memory | Buffer reuse | Footgun risk | Recommendation                         |
+| ----------------- | ------------ | ------------ | ------------ | -------------------------------------- |
+| `using` / manual  | Correct      | Pool only    | None         | **Primary pattern**                    |
+| `jit()`           | Optimal      | Full         | None         | **Performance optimization**           |
+| `checkLeaks`      | Diagnostic   | N/A          | None         | **Implemented — enforces correctness** |
+| `tidy()`          | Cleanup only | None         | None         | Skip — no buffer reuse, sync-only      |
+| `pipe()`          | 1 extra buf  | Pool only    | None         | Skip — too narrow                      |
+| `.donate()`       | Zero-alloc   | True reuse   | High         | Defer — pool handles it                |
+| In-place / `out=` | Zero-alloc   | True reuse   | Breaks model | **Never** — incompatible               |
 
 ## Future Work
 
-| Priority | Feature                             | Notes                                                                                                                                                                                         |
-| -------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ~~High~~ | ~~`checkLeaks` diagnostic~~         | ✅ Implemented in `src/frontend/check-leaks.ts`                                                                                                                                               |
-| ~~High~~ | ~~unreachable Const PETracer leak~~ | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                         |
-| Medium   | Anonymous constant leak fix         | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                     |
-| Medium   | `scatter_add` primitive             | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices. |
-| ~~Low~~  | ~~`using` declaration examples~~    | ✅ Documented in copilot-instructions + README                                                                                                                                                |
+| Priority | Feature                               | Notes                                                                                                                                                                                         |
+| -------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~High~~ | ~~`checkLeaks` diagnostic~~           | ✅ Implemented in `src/frontend/check-leaks.ts`                                                                                                                                               |
+| ~~High~~ | ~~unreachable Const PETracer leak~~   | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                         |
+| ~~High~~ | ~~user-disposed const over-disposal~~ | ✅ Fixed via `refCount <= 1` protection in `linearizeFlat`/`vjpFlat`                                                                                                                          |
+| Medium   | Anonymous constant leak fix           | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                     |
+| Medium   | ESLint plugin for non-consuming model | Analog of `@hamk-uas/eslint-plugin-jax-js` — enforce `require-dispose`, `no-use-after-dispose`, `no-unnecessary-ref` statically                                                               |
+| Medium   | `scatter_add` primitive               | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices. |
+| ~~Low~~  | ~~`using` declaration examples~~      | ✅ Documented in copilot-instructions + README                                                                                                                                                |
