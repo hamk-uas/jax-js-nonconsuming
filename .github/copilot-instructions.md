@@ -329,6 +329,16 @@ extensively inside functions that run under tracing (`lax.ts`, `random.ts`, `num
 `lax-linalg.ts`). This supports the ownership-correctness principle: code should look identical
 regardless of whether it runs in eager or JIT mode.
 
+**Technical detail — `[Symbol.dispose]` on tracers:**
+
+Currently, `Tracer` base class defines `[Symbol.dispose]() {}` (no-op). `JaxprTracer` inherits this
+no-op, so `using` on a JaxprTracer doesn't actually decrement `#rc`. Only `JVPTracer` and `Array`
+override it. This means `using` is safe (can't break anything) but doesn't enforce ownership during
+JIT tracing — it's cosmetic. A future enforcement path would be to override `[Symbol.dispose]` on
+`JaxprTracer` to call `this.dispose()` and add `#rc <= 0` checks in `getVar()` /
+`processPrimitive()`, matching what `PartialEvalTracer` and `Array` already do. The library code
+already uses `using` everywhere, so this change should be safe.
+
 ### Memory lifecycle
 
 A **Slot** is jax-js's internal handle to a backend memory allocation (WASM pointer or GPU buffer).
