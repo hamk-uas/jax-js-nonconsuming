@@ -317,9 +317,17 @@ jax-js supports the `using` keyword
 
 **When NOT to use `using`:**
 
-- Inside `jit()` bodies — the compiler manages lifetimes automatically
 - For arrays you want to return from a function — `using` would dispose before return
 - For arrays stored in data structures for later use
+
+**`using` inside `jit()` bodies — recommended:**
+
+`using` works correctly inside `jit()` bodies and **should be used** for uniformity with eager mode.
+On tracers, `dispose()` is a harmless refcount decrement. On concrete arrays during PE tracing,
+`[Symbol.dispose]()` is guarded by `_peArrayCreationTracker`. The library itself uses `using`
+extensively inside functions that run under tracing (`lax.ts`, `random.ts`, `numpy-fft.ts`,
+`lax-linalg.ts`). This supports the ownership-correctness principle: code should look identical
+regardless of whether it runs in eager or JIT mode.
 
 ### Memory lifecycle
 
@@ -2902,8 +2910,12 @@ For **performance-critical hot paths**, wrap in `jit()` — you get kernel fusio
 intermediate recycling, on top of the already-correct ownership:
 
 ```ts
-// Same ownership semantics, but faster
-const forward = jit((x) => nn.relu(x.mul(weights).add(bias)));
+// Same ownership semantics, but faster — using works inside jit too
+const forward = jit((x) => {
+  using a = x.mul(weights);
+  using b = a.add(bias);
+  return nn.relu(b);
+});
 const result = forward(input);
 // forward.dispose() when the function is no longer needed
 ```
@@ -2916,8 +2928,12 @@ const result = forward(input);
 | `jit()`           | Auto intermediates | None         | **Performance optimization**             |
 | `tidy()` (TF.js)  | Scope cleanup      | None         | Skip — no buffer reuse, sync-only        |
 | `pipe()`          | Chain cleanup      | None         | Skip — too narrow                        |
-| `.donate()`       | Zero-alloc reuse   | High (UAF)   | Defer — pool handles it                  |
+| `.donate()` ¹     | Zero-alloc reuse   | High (UAF)   | Defer — pool handles it                  |
 | In-place / `out=` | Zero-alloc reuse   | Breaks model | **Never** — incompatible with tracing/AD |
+
+¹ `.donate()` is a **hypothetical future API** (inspired by JAX's `jax.device_put(x, donate=True)`)
+that does not exist in the codebase. The JIT compiler's internal `recycle` pass and the WebGPU
+buffer pool already provide buffer reuse without a user-facing donation API.
 
 ### `checkLeaks` diagnostic (implemented)
 
@@ -3009,8 +3025,10 @@ and use-after-free statically at edit time, complementing the runtime `checkLeak
 | `checkLeaks`      | Diagnostic   | N/A          | None         | **Implemented — enforces correctness** |
 | `tidy()`          | Cleanup only | None         | None         | Skip — no buffer reuse, sync-only      |
 | `pipe()`          | 1 extra buf  | Pool only    | None         | Skip — too narrow                      |
-| `.donate()`       | Zero-alloc   | True reuse   | High         | Defer — pool handles it                |
+| `.donate()` ¹     | Zero-alloc   | True reuse   | High         | Defer — pool handles it                |
 | In-place / `out=` | Zero-alloc   | True reuse   | Breaks model | **Never** — incompatible               |
+
+¹ `.donate()` does not exist — see [Alternatives evaluated](#alternatives-evaluated-and-rejected).
 
 ## Future Work
 
