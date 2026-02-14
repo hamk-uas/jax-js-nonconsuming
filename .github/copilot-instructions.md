@@ -2891,6 +2891,23 @@ This would catch leaks and use-after-free bugs at edit time, before they surface
 
 ### Memory management ergonomics
 
+### Layer 1 policy (preferred)
+
+Use a **`using`-by-default** style for all non-global array bindings:
+
+1. If a binding is local and short-lived, write `using name = ...`.
+2. If an array is returned, do not mark it `using` in the producer scope.
+3. If an array is stored for later (state object/cache/module-level const), use explicit
+   `.dispose()` at the true end-of-life.
+
+This keeps eager and `jit` code structurally identical and makes linting simple.
+
+**Lintable exceptions to `using`-by-default:**
+
+- Returned values
+- Persisted values (object fields, arrays/maps, module-scope constants)
+- Intentional expression chains where no binding exists (discouraged in strict mode)
+
 For **short-lived computations**, `using` declarations provide the cleanest pattern:
 
 ```ts
@@ -2914,6 +2931,11 @@ a.dispose(); // free intermediate before next op
 const result = nn.relu(b);
 b.dispose();
 // result is the only live intermediate
+
+// Preferred strict-mode style (same in eager + jit):
+using a2 = x.mul(weights);
+using b2 = a2.add(bias);
+const result2 = nn.relu(b2);
 ```
 
 For **performance-critical hot paths**, wrap in `jit()` — you get kernel fusion and automatic
@@ -3042,12 +3064,12 @@ and use-after-free statically at edit time, complementing the runtime `checkLeak
 
 ## Future Work
 
-| Priority | Feature                               | Notes                                                                                                                                                                                         |
-| -------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ~~High~~ | ~~`checkLeaks` diagnostic~~           | ✅ Implemented in `src/frontend/check-leaks.ts`                                                                                                                                               |
-| ~~High~~ | ~~unreachable Const PETracer leak~~   | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                         |
-| ~~High~~ | ~~user-disposed const over-disposal~~ | ✅ Fixed via `refCount <= 1` protection in `linearizeFlat`/`vjpFlat`                                                                                                                          |
-| Medium   | Anonymous constant leak fix           | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                     |
-| Medium   | ESLint plugin for non-consuming model | Analog of `@hamk-uas/eslint-plugin-jax-js` — enforce `require-dispose`, `no-use-after-dispose`, `no-unnecessary-ref` statically                                                               |
-| Medium   | `scatter_add` primitive               | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices. |
-| ~~Low~~  | ~~`using` declaration examples~~      | ✅ Documented in copilot-instructions + README                                                                                                                                                |
+| Priority | Feature                               | Notes                                                                                                                                                                                             |
+| -------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~High~~ | ~~`checkLeaks` diagnostic~~           | ✅ Implemented in `src/frontend/check-leaks.ts`                                                                                                                                                   |
+| ~~High~~ | ~~unreachable Const PETracer leak~~   | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                             |
+| ~~High~~ | ~~user-disposed const over-disposal~~ | ✅ Fixed via `refCount <= 1` protection in `linearizeFlat`/`vjpFlat`                                                                                                                              |
+| Medium   | Anonymous constant leak fix           | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                         |
+| Medium   | ESLint plugin for non-consuming model | Analog of `@hamk-uas/eslint-plugin-jax-js` — enforce `using`-by-default (with return/persist exceptions), `no-use-after-dispose`, `no-unnecessary-ref`, and optional `no-array-chain` strict mode |
+| Medium   | `scatter_add` primitive               | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.     |
+| ~~Low~~  | ~~`using` declaration examples~~      | ✅ Documented in copilot-instructions + README                                                                                                                                                    |
