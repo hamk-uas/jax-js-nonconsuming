@@ -2889,6 +2889,50 @@ A future jax-js-specific linter for the non-consuming model could enforce:
 This would catch leaks and use-after-free bugs at edit time, before they surface as
 `UseAfterFreeError` at runtime or silent memory leaks.
 
+**Layer 1 ESLint rule contract (implementation spec):**
+
+1. **`jax-js/require-using`** (default: error)
+   - Enforce `using`-by-default for local array-valued bindings.
+   - Trigger on `VariableDeclarator` with kind `const|let` where initializer is array-producing.
+   - Array-producing includes:
+     - `np.array(...)`, `array(...)`, `zeros(...)`, `ones(...)`, `full(...)`, etc.
+     - Member-call chains on array-like receivers (e.g., `x.mul(...)`, `x.add(...)`,
+       `x.reshape(...)`)
+     - Known transform calls returning arrays (`grad(...)`, `vmap(...)`, `jit(...)` call results
+       excluded when binding function)
+   - Pass when one of:
+     - declaration kind is `using`
+     - value is directly returned (`const x = ...; return x;` in same block)
+     - value is persisted (assigned to object field / array slot / map value / module-scope binding)
+     - declaration has explicit opt-out comment: `// jax-js-lint: allow-non-using`
+   - No autofix for general case (control-flow-sensitive); optional suggestion fix:
+     - `const x = expr;` → `using x = expr;` when no reassignment and no crossing `await`/`yield`.
+
+2. **`jax-js/no-use-after-dispose`** (default: error)
+   - Track local identifiers; after `.dispose()` or end of `using` scope, further reads/writes are
+     errors.
+   - Trigger examples:
+     - `x.dispose(); x.add(1);`
+     - using-declared variable escaping its block via closure/reference.
+   - Must be flow-sensitive within function scope; inter-procedural analysis not required.
+
+3. **`jax-js/no-unnecessary-ref`** (default: error)
+   - Flag `.ref` usage in user/library code unless explicitly justified.
+   - Allow only behind opt-out comment `// jax-js-lint: allow-ref` for rare internals.
+
+4. **`jax-js/no-array-chain`** (default: off, strict mode)
+   - Optional performance/ownership strictness rule.
+   - Trigger on chained array calls depth ≥ 2 in a single expression:
+     - e.g., `x.mul(w).add(b).relu()`
+   - Rationale: unnamed temporaries in eager mode cannot be `using`-managed.
+   - Provide suggestion (not autofix): split into `using` bindings.
+
+**Rule scope and non-goals:**
+
+- Scope: function-local reasoning (fast, predictable, low false positives).
+- Non-goal: proving disposal across module boundaries or through alias-heavy dataflow.
+- Bias toward false-negative over false-positive for persisted/global lifetimes.
+
 ### Memory management ergonomics
 
 ### Layer 1 policy (preferred)
