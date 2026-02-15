@@ -426,9 +426,9 @@ patterns and will flag `.ref` usage as unnecessary.
 
 ### AI-assisted development
 
-This fork is developed primarily using AI coding agents (GitHub Copilot, Claude) with human
-supervision for design decisions, code review, and test validation. All changes go through the full
-CI pipeline (`pnpm test`, `pnpm check`, `pnpm run test:deno`) and the pre-commit hook runs the
+This fork is developed primarily using AI coding agents (GitHub Copilot, Claude, GPT, Gemini) with
+human supervision for design decisions, code review, and test validation. All changes go through the
+full CI pipeline (`pnpm test`, `pnpm check`, `pnpm run test:deno`) and the pre-commit hook runs the
 complete test suite before every commit.
 
 ## Future work / help wanted
@@ -444,4 +444,4 @@ Contributions are welcomed! Some fruitful areas to look into:
 - Helping the JIT compiler to fuse operations in more cases, like `tanh` branches.
 - Making a fast transformer inference engine, comparing against onnxruntime-web.
 
-You may join our [Discord server](https://discord.gg/BW6YsCd4Tf) and chat with the community.
+You may join the jax-js [Discord server](https://discord.gg/BW6YsCd4Tf) and chat with the community.
