@@ -3125,6 +3125,49 @@ must be leak-free) and at development time via IDE diagnostics. Zero overhead in
 the API surface JAX-compatible. A future ESLint plugin for the non-consuming model would catch leaks
 and use-after-free statically at edit time, complementing the runtime `checkLeaks` diagnostic.
 
+### Fluent chain transform (v1 contract)
+
+To add syntax headroom for anonymous intermediates without move semantics, we may introduce an
+**opt-in compile-time transform** (not runtime monkey-patching) for fluent method chains.
+
+**Core guarantees:**
+
+1. Preserve source-level chained syntax for users.
+2. Keep named bindings non-consuming unless explicitly disposed.
+3. Dispose unnamed intermediates deterministically in eager mode.
+4. Never dispose earlier than the transformed expression's last use.
+5. Keep JS evaluation order and exception behavior unchanged.
+
+**Allowed ergonomic forms (v1):**
+
+- Assignment RHS chains:
+  - `const y = a.op1(...).op2(...).op3(...);`
+- Return chains:
+  - `return a.op1(...).op2(...);`
+- Expression-statement chains where result is intentionally discarded.
+
+**Lowering strategy (conceptual):**
+
+- Rewrite chain to explicit temporaries in-order.
+- Insert disposal of each temporary after its final transformed consumer.
+- Wrap transformed region in `try/finally` when needed so exceptions do not leak intermediates.
+
+**Bailout conditions (do NOT transform in v1):**
+
+- `await` / `yield` in the chain expression.
+- Optional chaining or computed dynamic call targets with unclear side effects.
+- Patterns where a chain subexpression escapes/aliases before completion.
+- Cases where ordering cannot be preserved without duplicating side effects.
+
+When a bailout triggers, keep original code and optionally emit a non-blocking diagnostic: "chain
+not transformed; consider `using` temporaries".
+
+**Non-goals (v1):**
+
+- No runtime global chain tracking.
+- No refcount simulation in the transform.
+- No rewriting across statement boundaries.
+
 ### Decision summary
 
 | Approach          | Eager memory | Buffer reuse | Footgun risk | Recommendation                         |
