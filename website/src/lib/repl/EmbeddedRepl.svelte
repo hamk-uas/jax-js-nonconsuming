@@ -1,7 +1,7 @@
 <script lang="ts">
   import { resolve } from "$app/paths";
 
-  import type { Device } from "@hamk-uas/jax-js-nonconsuming";
+  import type { Device } from "@jax-js-nonconsuming/jax";
   import {
     CheckIcon,
     ExternalLinkIcon,

@@ -3,7 +3,7 @@
 // Parse ONNX models and convert them to jax-js functions.
 
 import { fromBinary } from "@bufbuild/protobuf";
-import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { numpy as np } from "@jax-js-nonconsuming/jax";
 import {
   AttributeProto_AttributeType,
   ModelProto,
@@ -32,8 +32,8 @@ import {
  *
  * @example
  * ```ts
- * import { ONNXModel } from "@hamk-uas/onnx";
- * import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+ * import { ONNXModel } from "@jax-js-nonconsuming/onnx";
+ * import { numpy as np } from "@jax-js-nonconsuming/jax";
  *
  * const modelBytes = await fetch("./model.onnx").then((r) => r.bytes());
  * const model = new ONNXModel(modelBytes);

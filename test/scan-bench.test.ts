@@ -9,7 +9,7 @@ import {
   jit,
   lax,
   numpy as np,
-} from "@hamk-uas/jax-js-nonconsuming";
+} from "@jax-js-nonconsuming/jax";
 import { describe, expect, it } from "vitest";
 
 async function timeMs(fn: () => void, warmup = 3, runs = 10): Promise<number> {

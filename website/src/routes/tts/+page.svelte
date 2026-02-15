@@ -4,8 +4,8 @@
     init,
     numpy as np,
     tree,
-  } from "@hamk-uas/jax-js-nonconsuming";
-  import { cachedFetch, safetensors, tokenizers } from "@hamk-uas/loaders";
+  } from "@jax-js-nonconsuming/jax";
+  import { cachedFetch, safetensors, tokenizers } from "@jax-js-nonconsuming/loaders";
   import { AudioLinesIcon, DownloadIcon, GithubIcon } from "@lucide/svelte";
 
   import DownloadManager from "$lib/common/DownloadManager.svelte";

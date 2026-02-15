@@ -25,7 +25,7 @@
 numerical applications on the web.
 
 ```bash
-npm i @hamk-uas/jax-js-nonconsuming
+npm i @jax-js-nonconsuming/jax
 ```
 
 Under the hood, it translates array operations into a compiler representation, then synthesizes
@@ -38,7 +38,7 @@ GPU ML framework, since it runs anywhere a browser can run.
 ## Quickstart
 
 ```js
-import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { numpy as np } from "@jax-js-nonconsuming/jax";
 
 // Array operations, compatible with JAX/NumPy.
 const x = np.array([1, 2, 3]);
@@ -105,7 +105,7 @@ just in JavaScript.
 Create an array with `np.array()`:
 
 ```ts
-import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { numpy as np } from "@jax-js-nonconsuming/jax";
 
 const ar = np.array([1, 2, 3]);
 ```
@@ -139,7 +139,7 @@ await ar.data(); // Fastest, non-blocking
 Arrays can have mathematical operations applied to them. For example:
 
 ```ts
-import { numpy as np, scipySpecial as special } from "@hamk-uas/jax-js-nonconsuming";
+import { numpy as np, scipySpecial as special } from "@jax-js-nonconsuming/jax";
 
 using x = np.arange(100).astype(np.float32); // array of integers [0..99]
 
@@ -184,7 +184,7 @@ result.dispose(); // caller disposes the output when done
 f.dispose(); // free captured constants when the function is no longer needed
 ```
 
-The `@hamk-uas/eslint-plugin-jax-js-nonconsuming` catches the most common memory leaks (missing
+The `@jax-js-nonconsuming/eslint-plugin-jax-js` catches the most common memory leaks (missing
 `using`, use-after-dispose, unnecessary `.ref`) at edit time — see the
 [plugin README](packages/eslint-plugin) for setup.
 
@@ -194,7 +194,7 @@ JAX's signature composable transformations are also supported in jax-js. Here is
 using `grad` and `vmap` to compute the derivative of a function:
 
 ```ts
-import { numpy as np, grad, vmap } from "@hamk-uas/jax-js-nonconsuming";
+import { numpy as np, grad, vmap } from "@jax-js-nonconsuming/jax";
 
 using x = np.linspace(-10, 10, 1000);
 
@@ -226,7 +226,7 @@ All functional transformations can take typed `JsTree` of inputs and outputs. Th
 nested JavaScript objects and arrays. For instance:
 
 ```ts
-import { grad, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { grad, numpy as np } from "@jax-js-nonconsuming/jax";
 
 type Params = {
   foo: np.Array;
@@ -269,7 +269,7 @@ There are currently 4 devices in jax-js:
 device is `wasm`, but you can change this at startup time:
 
 ```ts
-import { defaultDevice, init } from "@hamk-uas/jax-js-nonconsuming";
+import { defaultDevice, init } from "@jax-js-nonconsuming/jax";
 
 const devices = await init(); // Starts all available backends.
 
@@ -283,7 +283,7 @@ if (devices.includes("webgpu")) {
 You can also place individual arrays on specific devices:
 
 ```ts
-import { devicePut, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { devicePut, numpy as np } from "@jax-js-nonconsuming/jax";
 
 const ar = np.array([1, 2, 3]); // Starts with device="wasm"
 await devicePut(ar, "webgpu"); // Now device="webgpu"
@@ -294,12 +294,12 @@ await devicePut(ar, "webgpu"); // Now device="webgpu"
 There are other libraries in the `@hamk-uas` namespace that can work with jax-js, or be used in a
 self-contained way in other projects.
 
-- [**`@hamk-uas/loaders`**](packages/loaders) can load tensors from various formats like
+- [**`@jax-js-nonconsuming/loaders`**](packages/loaders) can load tensors from various formats like
   Safetensors, includes a fast and compliant implementation of BPE, and caches HTTP requests for
   large assets like model weights in OPFS.
-- [**`@hamk-uas/onnx`**](packages/onnx) is a model loader from the [ONNX](https://onnx.ai/) format
+- [**`@jax-js-nonconsuming/onnx`**](packages/onnx) is a model loader from the [ONNX](https://onnx.ai/) format
   into native jax-js functions.
-- [**`@hamk-uas/optax`**](packages/optax) provides implementations of optimizers like Adam and SGD.
+- [**`@jax-js-nonconsuming/optax`**](packages/optax) provides implementations of optimizers like Adam and SGD.
 
 ### Performance
 
@@ -340,7 +340,7 @@ files to ensure code quality.
 You can also run linting and formatting manually:
 
 ```bash
-pnpm lint          # Run ESLint (includes @hamk-uas/eslint-plugin-jax-js-nonconsuming ownership rules)
+pnpm lint          # Run ESLint (includes @jax-js-nonconsuming/eslint-plugin-jax-js ownership rules)
 pnpm format        # Format all files with Prettier
 pnpm format:check  # Check formatting without writing
 pnpm check         # Run TypeScript type checking
@@ -375,7 +375,7 @@ and demos work the same way.
 | **`.ref` needed to reuse arrays?** | Yes — `x.ref` before passing to a second op | Never                                                         |
 | **`UseAfterFreeError` risk**       | Common if `.ref` is forgotten               | Eliminated by design                                          |
 | **`using` declarations**           | Not used                                    | First-class — auto-dispose at block end                       |
-| **ESLint plugin**                  | `@hamk-uas/eslint-plugin-jax-js` (move)     | `@hamk-uas/eslint-plugin-jax-js-nonconsuming` (non-consuming) |
+| **ESLint plugin**                  | `@hamk-uas/eslint-plugin-jax-js` (move)     | `@jax-js-nonconsuming/eslint-plugin-jax-js` (non-consuming) |
 | **`lax.scan`**                     | Not implemented                             | Full support (JIT, autodiff, vmap, native compilation)        |
 | **Buffer recycling**               | Not implemented                             | JIT-level `recycle` step + WebGPU buffer pool                 |
 | **`tree.makeDisposable`**          | Not available                               | Wraps any object for `using`-based cleanup                    |
@@ -390,7 +390,7 @@ and demos work the same way.
   ESLint plugin, or if you need to stay on the upstream release cadence.
 
 The two versions are **not mix-and-match** — code written for one ownership model will not work
-correctly with the other. The `@hamk-uas/eslint-plugin-jax-js-nonconsuming` included here enforces
+correctly with the other. The `@jax-js-nonconsuming/eslint-plugin-jax-js` included here enforces
 the non-consuming patterns and will flag `.ref` usage as unnecessary.
 
 ### Migrating from upstream
@@ -399,7 +399,7 @@ the non-consuming patterns and will flag `.ref` usage as unnecessary.
 2. **Replace manual refcount juggling with `using`** — `using x = np.array(...)` auto-disposes at
    block end.
 3. **Call `.dispose()` explicitly for long-lived arrays** — or wrap in `tree.makeDisposable()`.
-4. **Install `@hamk-uas/eslint-plugin-jax-js-nonconsuming`** — it catches leaks, use-after-dispose,
+4. **Install `@jax-js-nonconsuming/eslint-plugin-jax-js`** — it catches leaks, use-after-dispose,
    and unnecessary `.ref` at edit time. See the [plugin README](packages/eslint-plugin) for setup.
 
 ### AI-assisted development

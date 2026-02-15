@@ -1,4 +1,4 @@
-import { cachedFetch } from "@hamk-uas/loaders";
+import { cachedFetch } from "@jax-js-nonconsuming/loaders";
 
 /** A book in text format, split up into excerpts for individual embedding. */
 export interface Book {

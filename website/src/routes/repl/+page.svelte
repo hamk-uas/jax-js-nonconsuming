@@ -4,7 +4,7 @@
   import { resolve } from "$app/paths";
   import { page } from "$app/state";
 
-  import type { Device } from "@hamk-uas/jax-js-nonconsuming";
+  import type { Device } from "@jax-js-nonconsuming/jax";
   import {
     ArrowRightIcon,
     LoaderIcon,
@@ -165,7 +165,7 @@
         </p>
 
         <pre class="mb-4 text-sm bg-gray-100 px-2 py-1 rounded"><code
-            >npm i @hamk-uas/jax-js-nonconsuming</code
+            >npm i @jax-js-nonconsuming/jax</code
           ></pre>
 
         <h2 class="text-lg mt-8 mb-2">Examples</h2>

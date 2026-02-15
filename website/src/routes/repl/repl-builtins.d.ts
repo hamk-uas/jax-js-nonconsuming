@@ -1,4 +1,4 @@
-import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { numpy as np } from "@jax-js-nonconsuming/jax";
 
 declare global {
   function displayImage(param: np.Array): Promise<void>;

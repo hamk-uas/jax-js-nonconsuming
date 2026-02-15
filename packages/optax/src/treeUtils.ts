@@ -3,7 +3,7 @@ import {
   JsTree,
   numpy as np,
   tree,
-} from "@hamk-uas/jax-js-nonconsuming";
+} from "@jax-js-nonconsuming/jax";
 
 export function treeZerosLike(
   tr: JsTree<np.Array>,

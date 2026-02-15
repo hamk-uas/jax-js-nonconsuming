@@ -1,6 +1,6 @@
 // Tests for tree.dispose, tree.makeDisposable, and Array.consumeData.
 
-import { getBackend, numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
+import { getBackend, numpy as np, tree } from "@jax-js-nonconsuming/jax";
 import { expect, suite, test } from "vitest";
 
 suite("tree.dispose", () => {

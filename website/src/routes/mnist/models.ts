@@ -4,7 +4,7 @@ import {
   nn,
   numpy as np,
   random,
-} from "@hamk-uas/jax-js-nonconsuming";
+} from "@jax-js-nonconsuming/jax";
 
 import { fetchMnist } from "$lib/dataset/mnist";
 

@@ -9,7 +9,7 @@ export function createJaxJsMatmulStrategy(
   return {
     name: fp16 ? "jax-js-fp16" : "jax-js",
     async run(): Promise<number> {
-      const jax = await import("@hamk-uas/jax-js-nonconsuming");
+      const jax = await import("@jax-js-nonconsuming/jax");
       await jax.init();
       jax.defaultDevice("webgpu");
       const np = jax.numpy;

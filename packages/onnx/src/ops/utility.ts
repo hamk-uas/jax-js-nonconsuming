@@ -4,7 +4,7 @@
 // TODO: OneHot (prompt_encoder_mask_decoder)
 // TODO: ScatterND (prompt_encoder_mask_decoder)
 
-import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { numpy as np } from "@jax-js-nonconsuming/jax";
 import { TensorProto } from "onnx-buf";
 
 import {

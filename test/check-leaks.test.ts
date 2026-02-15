@@ -9,7 +9,7 @@ import {
   init,
   jit,
   numpy as np,
-} from "@hamk-uas/jax-js-nonconsuming";
+} from "@jax-js-nonconsuming/jax";
 import { describe, expect, it } from "vitest";
 
 await init();

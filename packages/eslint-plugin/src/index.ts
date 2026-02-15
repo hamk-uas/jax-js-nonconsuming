@@ -10,7 +10,7 @@ import requireUsing from "./rules/require-using";
 
 const plugin: ESLint.Plugin = {
   meta: {
-    name: "@hamk-uas/eslint-plugin-jax-js-nonconsuming",
+    name: "@jax-js-nonconsuming/eslint-plugin-jax-js",
     version: "0.1.0",
   },
   rules: {
@@ -71,7 +71,7 @@ const strict: Linter.Config = {
 };
 
 // Attach configs to plugin object for flat-config consumers:
-//   import jaxJs from "@hamk-uas/eslint-plugin-jax-js-nonconsuming";
+//   import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
 //   export default [ jaxJs.configs.recommended, ... ];
 (plugin as any).configs = { recommended, strict };
 

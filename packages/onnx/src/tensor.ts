@@ -1,6 +1,6 @@
 // Tensor conversion utilities for ONNX to jax-js.
 
-import { DType, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { DType, numpy as np } from "@jax-js-nonconsuming/jax";
 import type { TensorProto } from "onnx-buf";
 import { TensorProto_DataType } from "onnx-buf";
 

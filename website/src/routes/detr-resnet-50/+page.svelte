@@ -7,8 +7,8 @@
     lax,
     nn,
     numpy as np,
-  } from "@hamk-uas/jax-js-nonconsuming";
-  import { ONNXModel } from "@hamk-uas/onnx";
+  } from "@jax-js-nonconsuming/jax";
+  import { ONNXModel } from "@jax-js-nonconsuming/onnx";
 
   import { runBenchmark } from "$lib/benchmark";
   import DownloadManager from "$lib/common/DownloadManager.svelte";

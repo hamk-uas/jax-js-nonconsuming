@@ -12,7 +12,7 @@ import {
   jit,
   lax,
   numpy as np,
-} from "@hamk-uas/jax-js-nonconsuming";
+} from "@jax-js-nonconsuming/jax";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 describe("buffer recycling", () => {

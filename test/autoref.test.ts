@@ -11,7 +11,7 @@ import {
   lax,
   numpy as np,
   valueAndGrad,
-} from "@hamk-uas/jax-js-nonconsuming";
+} from "@jax-js-nonconsuming/jax";
 import { describe, expect, it } from "vitest";
 
 describe("non-consuming ownership model", () => {

@@ -3,7 +3,7 @@
 // TODO: ConvTranspose (prompt_encoder_mask_decoder)
 // TODO: Pad (vision_encoder)
 
-import { lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
 
 import {
   type Operand,

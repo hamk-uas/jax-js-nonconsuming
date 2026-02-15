@@ -1,4 +1,4 @@
-import { jit, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { jit, numpy as np } from "@jax-js-nonconsuming/jax";
 
 // This example draws a Mandelbrot fractal using array operations and jit() for each step.
 const width = 750;

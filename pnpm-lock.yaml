@@ -92,7 +92,7 @@ importers:
       '@bufbuild/protobuf':
         specifier: ^2.10.2
         version: 2.10.2
-      '@hamk-uas/jax-js-nonconsuming':
+      '@jax-js-nonconsuming/jax':
         specifier: workspace:^
         version: link:../..
       onnx-buf:
@@ -101,7 +101,7 @@ importers:
 
   packages/optax:
     dependencies:
-      '@hamk-uas/jax-js-nonconsuming':
+      '@jax-js-nonconsuming/jax':
         specifier: workspace:^
         version: link:../..
 
@@ -113,16 +113,16 @@ importers:
       '@fontsource-variable/tiktok-sans':
         specifier: ^5.2.3
         version: 5.2.3
-      '@hamk-uas/jax-js-nonconsuming':
+      '@jax-js-nonconsuming/jax':
         specifier: workspace:^
         version: link:..
-      '@hamk-uas/loaders':
+      '@jax-js-nonconsuming/loaders':
         specifier: workspace:^
         version: link:../packages/loaders
-      '@hamk-uas/onnx':
+      '@jax-js-nonconsuming/onnx':
         specifier: workspace:^
         version: link:../packages/onnx
-      '@hamk-uas/optax':
+      '@jax-js-nonconsuming/optax':
         specifier: workspace:^
         version: link:../packages/optax
       '@lucide/svelte':

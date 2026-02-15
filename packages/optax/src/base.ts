@@ -1,4 +1,4 @@
-import { JsTree, numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
+import { JsTree, numpy as np, tree } from "@jax-js-nonconsuming/jax";
 
 /** The internal state of the optimizer, varies in shape. */
 export type OptState = JsTree<np.Array>;

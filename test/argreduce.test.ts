@@ -3,7 +3,7 @@ import {
   devices,
   init,
   numpy as np,
-} from "@hamk-uas/jax-js-nonconsuming";
+} from "@jax-js-nonconsuming/jax";
 import { beforeEach, expect, suite, test } from "vitest";
 
 const devicesAvailable = await init();

@@ -5,8 +5,8 @@ import {
   numpy as np,
   random,
   tree,
-} from "@hamk-uas/jax-js-nonconsuming";
-import { applyUpdates, sgd } from "@hamk-uas/optax";
+} from "@jax-js-nonconsuming/jax";
+import { applyUpdates, sgd } from "@jax-js-nonconsuming/optax";
 
 // Logistic regression on a sample dataset.
 //   > Classifier: y = sigmoid(X @ w)

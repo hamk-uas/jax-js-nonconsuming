@@ -1,5 +1,5 @@
 import "vitest";
-import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { numpy as np } from "@jax-js-nonconsuming/jax";
 
 interface CustomMatchers<R = unknown> {
   toBeAllclose: (

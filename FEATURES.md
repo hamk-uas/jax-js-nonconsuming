@@ -713,11 +713,11 @@ These modules are unimplemented:
 ## [`optax`](https://optax.readthedocs.io/en/latest/index.html)
 
 We have ported a subset of the [Optax](https://github.com/google-deepmind/optax) gradient processing
-and optimization library at `@hamk-uas/optax`. You can install this alongside
-`@hamk-uas/jax-js-nonconsuming`.
+and optimization library at `@jax-js-nonconsuming/optax`. You can install this alongside
+`@jax-js-nonconsuming/jax`.
 
 ```bash
-npm i @hamk-uas/optax
+npm i @jax-js-nonconsuming/optax
 ```
 
 [API docs](https://jax-js.com/docs/modules/_jax-js_optax.html). Currently, the following optimizers

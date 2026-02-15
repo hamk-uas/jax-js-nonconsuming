@@ -1,4 +1,4 @@
-import { numpy as np, random, tree } from "@hamk-uas/jax-js-nonconsuming";
+import { numpy as np, random, tree } from "@jax-js-nonconsuming/jax";
 
 import type { AudioPlayer } from "./audio";
 import {

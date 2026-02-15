@@ -1,4 +1,4 @@
-import { defaultDevice, jit, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { defaultDevice, jit, numpy as np } from "@jax-js-nonconsuming/jax";
 import { beforeEach, expect, suite, test } from "vitest";
 
 beforeEach(() => {

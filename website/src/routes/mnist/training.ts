@@ -4,8 +4,8 @@ import {
   random,
   tree,
   valueAndGrad,
-} from "@hamk-uas/jax-js-nonconsuming";
-import { adam, applyUpdates } from "@hamk-uas/optax";
+} from "@jax-js-nonconsuming/jax";
+import { adam, applyUpdates } from "@jax-js-nonconsuming/optax";
 import { range, shuffle } from "es-toolkit";
 
 import { loadData, lossFn, type ModelType, type Params } from "./models";

@@ -1,6 +1,6 @@
 // Movement operations, changing shape and indexing.
 
-import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { numpy as np } from "@jax-js-nonconsuming/jax";
 
 import {
   type Operand,

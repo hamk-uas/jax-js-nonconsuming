@@ -1,7 +1,7 @@
 <!-- @component Updates a `DownlodToast` with fetch progress. -->
 
 <script lang="ts">
-  import { cachedFetch } from "@hamk-uas/loaders";
+  import { cachedFetch } from "@jax-js-nonconsuming/loaders";
 
   import DownloadToast, {
     type Props as DownloadToastProps,

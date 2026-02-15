@@ -1,5 +1,5 @@
-import { numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
-import { clipByGlobalNorm } from "@hamk-uas/optax";
+import { numpy as np, tree } from "@jax-js-nonconsuming/jax";
+import { clipByGlobalNorm } from "@jax-js-nonconsuming/optax";
 import { expect, test } from "vitest";
 
 test("clipByGlobalNorm: no clipping when norm is below threshold", () => {
