@@ -366,7 +366,7 @@ pnpm -C website dev
 
 This fork replaces the upstream **move-semantics** ownership model with a **non-consuming** model.
 The API is otherwise identical — all NumPy/JAX functions, `jit`, `grad`, `vmap`, `scan`, backends,
-and demos work the same way.
+and demos work the same way. Mandelbrot has been updated with `scan` though.
 
 | Aspect                             | Upstream (ekzhang/jax-js)                   | This fork (non-consuming)                                     |
 | ---------------------------------- | ------------------------------------------- | ------------------------------------------------------------- |
