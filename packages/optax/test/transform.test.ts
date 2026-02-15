@@ -1,10 +1,10 @@
-import { numpy as np, tree } from "@jax-js/jax";
+import { numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
 import {
   addDecayedWeights,
   scaleByLearningRate,
   scaleBySchedule,
   trace,
-} from "@jax-js/optax";
+} from "@hamk-uas/optax";
 import { expect, test } from "vitest";
 
 test("scaleByLearningRate function", () => {

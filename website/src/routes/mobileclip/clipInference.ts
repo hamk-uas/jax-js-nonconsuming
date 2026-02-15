@@ -1,5 +1,5 @@
-import { nn, numpy as np } from "@jax-js/jax";
-import { safetensors, WeightMapper } from "@jax-js/loaders";
+import { nn, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { safetensors, WeightMapper } from "@hamk-uas/loaders";
 
 // MobileCLIP2 model weights interfaces and forward pass.
 

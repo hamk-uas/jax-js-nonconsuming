@@ -5,7 +5,7 @@ import {
   numpy as np,
   random,
   vmap,
-} from "@jax-js/jax";
+} from "@hamk-uas/jax-js-nonconsuming";
 import { beforeEach, expect, suite, test } from "vitest";
 
 const devicesAvailable = await init();

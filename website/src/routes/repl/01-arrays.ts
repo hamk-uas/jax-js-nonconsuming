@@ -1,4 +1,4 @@
-import { grad, numpy as np } from "@jax-js/jax";
+import { grad, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 const f = (x: np.Array) => np.sqrt(x.mul(x).sum());
 const df = grad(f);

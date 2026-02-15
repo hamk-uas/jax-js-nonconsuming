@@ -1,4 +1,9 @@
-import { defaultDevice, devicePut, devices, numpy as np } from "@jax-js/jax";
+import {
+  defaultDevice,
+  devicePut,
+  devices,
+  numpy as np,
+} from "@hamk-uas/jax-js-nonconsuming";
 import { expect, test } from "vitest";
 
 defaultDevice("cpu");

@@ -1,4 +1,4 @@
-import { numpy as np } from "@jax-js/jax";
+import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 import { expect, test } from "vitest";
 
 import { treeMax, treeNorm, treeSum } from "../src/treeUtils";

@@ -6,7 +6,7 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "paths": {
-      "@jax-js/jax": ["."]
+      "@hamk-uas/jax-js-nonconsuming": ["."]
     },
     "types": ["@webgpu/types"],
     "noEmit": true,

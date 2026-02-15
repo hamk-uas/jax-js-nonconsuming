@@ -1,4 +1,4 @@
-# @jax-js/eslint-plugin
+# @hamk-uas/eslint-plugin-jax-js-nonconsuming
 
 ESLint rules for **jax-js array ownership** — enforces deterministic disposal, prevents GPU/WASM
 memory leaks, and catches use-after-dispose bugs at edit time.
@@ -14,7 +14,7 @@ explicitly `.dispose()`'d (or auto-disposed via `using`), and `.ref` is never ne
 
 ```bash
 # From the jax-js monorepo (workspace dependency):
-pnpm add -D @jax-js/eslint-plugin
+pnpm add -D @hamk-uas/eslint-plugin-jax-js-nonconsuming
 ```
 
 **Requirements:**
@@ -29,7 +29,7 @@ pnpm add -D @jax-js/eslint-plugin
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js/eslint-plugin";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js-nonconsuming";
 
 export default [
   jaxJs.configs.recommended,
@@ -53,7 +53,7 @@ This enables:
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js/eslint-plugin";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js-nonconsuming";
 
 export default [
   jaxJs.configs.strict,
@@ -68,7 +68,7 @@ enforcement.
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js/eslint-plugin";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js-nonconsuming";
 
 export default [
   {
@@ -90,7 +90,7 @@ export default [
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js/eslint-plugin";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js-nonconsuming";
 
 export default [
   // Enable for source, disable for tests
@@ -419,7 +419,7 @@ const CACHE_B = np.ones([128]);
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js/eslint-plugin";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js-nonconsuming";
 
 export default [
   jaxJs.configs.recommended,
@@ -498,7 +498,7 @@ Optional settings for a better experience (add to `.vscode/settings.json`):
 1. Go to **Settings → Languages & Frameworks → JavaScript → Code Quality Tools → ESLint**.
 2. Select **Automatic ESLint configuration** (or point to your config manually).
 3. Check **Run eslint --fix on save** if you want autofixes applied automatically.
-4. Warnings from `@jax-js/eslint-plugin` will appear inline in the editor.
+4. Warnings from `@hamk-uas/eslint-plugin-jax-js-nonconsuming` will appear inline in the editor.
 
 ### Neovim
 
@@ -565,18 +565,18 @@ The community [`@hamk-uas/eslint-plugin-jax-js`](https://github.com/hamk-uas/esl
 plugin targets the **upstream move-semantics** jax-js. This plugin targets the **non-consuming
 fork** where operations leave inputs alive.
 
-| Aspect                | `@hamk-uas/eslint-plugin-jax-js`               | `@jax-js/eslint-plugin`                      |
-| --------------------- | ---------------------------------------------- | -------------------------------------------- |
-| Ownership model       | Move semantics (consuming)                     | Non-consuming                                |
-| `.ref` guidance       | Sometimes necessary                            | Never needed in user code                    |
-| Dispose terminology   | "consume" (input consumed by op)               | "dispose" (explicit cleanup)                 |
-| `using` support       | Not mentioned                                  | First-class (`require-using`)                |
-| Chain detection       | No                                             | `no-array-chain` rule                        |
-| Flat config (`>=v9`)  | Yes (`configs.recommended`)                    | Yes (`configs.recommended`)                  |
-| Suggested fixes       | `require-consume`, `no-use-after-consume`      | `require-using`                              |
-| Autofix               | `no-unnecessary-ref`                           | `no-unnecessary-ref`                         |
-| Dispose line in error | `no-use-after-consume` includes consuming line | `no-use-after-dispose` includes dispose line |
-| Suppression directive | `// @jax-borrow`                               | `// jax-js-lint: allow-*`                    |
+| Aspect                | `@hamk-uas/eslint-plugin-jax-js`               | `@hamk-uas/eslint-plugin-jax-js-nonconsuming` |
+| --------------------- | ---------------------------------------------- | --------------------------------------------- |
+| Ownership model       | Move semantics (consuming)                     | Non-consuming                                 |
+| `.ref` guidance       | Sometimes necessary                            | Never needed in user code                     |
+| Dispose terminology   | "consume" (input consumed by op)               | "dispose" (explicit cleanup)                  |
+| `using` support       | Not mentioned                                  | First-class (`require-using`)                 |
+| Chain detection       | No                                             | `no-array-chain` rule                         |
+| Flat config (`>=v9`)  | Yes (`configs.recommended`)                    | Yes (`configs.recommended`)                   |
+| Suggested fixes       | `require-consume`, `no-use-after-consume`      | `require-using`                               |
+| Autofix               | `no-unnecessary-ref`                           | `no-unnecessary-ref`                          |
+| Dispose line in error | `no-use-after-consume` includes consuming line | `no-use-after-dispose` includes dispose line  |
+| Suppression directive | `// @jax-borrow`                               | `// jax-js-lint: allow-*`                     |
 
 If you're using the upstream jax-js (move semantics), use the HAMK plugin. If you're using this fork
 (non-consuming model with `using`), use this plugin.

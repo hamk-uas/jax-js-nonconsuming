@@ -1,5 +1,5 @@
-import { grad, numpy as np, tree } from "@jax-js/jax";
-import { applyUpdates, sgd, squaredError } from "@jax-js/optax";
+import { grad, numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
+import { applyUpdates, sgd, squaredError } from "@hamk-uas/optax";
 import { expect, test } from "vitest";
 
 test("stochastic gradient descent", () => {

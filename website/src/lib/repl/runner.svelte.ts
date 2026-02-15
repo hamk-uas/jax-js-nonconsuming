@@ -1,4 +1,4 @@
-import type { Device, numpy as np } from "@jax-js/jax";
+import type { Device, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 import type { Plugin } from "@rollup/browser";
 
 import { arrayToDataUrl } from "./displayImage";
@@ -135,9 +135,9 @@ async function _runProgram(
   runner: ReplRunner,
 ): Promise<RunResult> {
   const [jax, optax, loaders] = await Promise.all([
-    import("@jax-js/jax"),
-    import("@jax-js/optax"),
-    import("@jax-js/loaders"),
+    import("@hamk-uas/jax-js-nonconsuming"),
+    import("@hamk-uas/optax"),
+    import("@hamk-uas/loaders"),
   ]);
   const ts = await import("typescript");
   const { rollup } = await import("@rollup/browser");
@@ -205,7 +205,11 @@ async function _runProgram(
     const bundle = await rollup({
       input: "index.ts",
       plugins: [typescriptPlugin, virtualPlugin],
-      external: ["@jax-js/jax", "@jax-js/optax", "@jax-js/loaders"],
+      external: [
+        "@hamk-uas/jax-js-nonconsuming",
+        "@hamk-uas/optax",
+        "@hamk-uas/loaders",
+      ],
     });
 
     // We use the "system" format because it allows you to use async/await.
@@ -237,9 +241,9 @@ async function _runProgram(
     await new AsyncFunction("_MODULES", "_BUILTINS", bundledCode)(
       // _MODULES
       {
-        "@jax-js/jax": jax,
-        "@jax-js/optax": optax,
-        "@jax-js/loaders": loaders,
+        "@hamk-uas/jax-js-nonconsuming": jax,
+        "@hamk-uas/optax": optax,
+        "@hamk-uas/loaders": loaders,
       },
       // _BUILTINS
       {

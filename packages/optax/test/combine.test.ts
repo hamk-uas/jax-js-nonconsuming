@@ -1,5 +1,5 @@
-import { numpy as np, tree } from "@jax-js/jax";
-import { chain, scale } from "@jax-js/optax";
+import { numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
+import { chain, scale } from "@hamk-uas/optax";
 import { expect, test } from "vitest";
 
 test("chain function combines transformations", () => {

@@ -5,7 +5,7 @@
     init,
     numpy as np,
     tree,
-  } from "@jax-js/jax";
+  } from "@hamk-uas/jax-js-nonconsuming";
   import pThrottle from "p-throttle";
   import { onMount } from "svelte";
 

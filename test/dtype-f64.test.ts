@@ -8,7 +8,7 @@ import {
   jvp,
   nn,
   numpy as np,
-} from "@jax-js/jax";
+} from "@hamk-uas/jax-js-nonconsuming";
 import { beforeEach, expect, suite, test } from "vitest";
 
 // f64 is currently only supported on WebAssembly.

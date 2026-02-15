@@ -1,4 +1,9 @@
-import { DType, JsTree, numpy as np, tree } from "@jax-js/jax";
+import {
+  DType,
+  JsTree,
+  numpy as np,
+  tree,
+} from "@hamk-uas/jax-js-nonconsuming";
 
 export function treeZerosLike(
   tr: JsTree<np.Array>,

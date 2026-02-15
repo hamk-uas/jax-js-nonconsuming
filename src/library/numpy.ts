@@ -1071,7 +1071,7 @@ export function tensordot(
  *
  * @example
  * ```ts
- * import { numpy as np } from "@jax-js/jax";
+ * import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
  *
  * const a = np.ones([2, 3]);
  * const b = np.ones([3]);
@@ -1085,7 +1085,7 @@ export function einsum(subscripts: string, ...operands: ArrayLike[]): Array;
  *
  * @example
  * ```ts
- * import { numpy as np } from "@jax-js/jax";
+ * import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
  *
  * const a = np.ones([2, 3]);
  * const b = np.ones([3]);

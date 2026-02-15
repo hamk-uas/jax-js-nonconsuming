@@ -10,7 +10,7 @@ import {
   valueAndGrad,
   vjp,
   vmap,
-} from "@jax-js/jax";
+} from "@hamk-uas/jax-js-nonconsuming";
 import { expect, suite, test } from "vitest";
 
 suite("jax.makeJaxpr()", () => {

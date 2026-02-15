@@ -168,7 +168,7 @@ export interface ScanOptions {
  *
  * @example Cumulative sum
  * ```ts
- * import { lax, numpy as np } from '@jax-js/jax';
+ * import { lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
  *
  * const step = (carry, x) => {
  *   const sum = np.add(carry, x);
@@ -270,7 +270,7 @@ export interface ScanOptions {
  *
  * @example jit(scan) - Compile the entire scan loop
  * ```ts
- * import { jit, lax, numpy as np } from '@jax-js/jax';
+ * import { jit, lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
  *
  * // Wrap scan in jit to compile the entire loop into optimized native code.
  * // This is the most common and efficient pattern for production use.
@@ -291,7 +291,7 @@ export interface ScanOptions {
  *
  * @example scan(jit(body)) - JIT-compile only the step function
  * ```ts
- * import { jit, lax, numpy as np } from '@jax-js/jax';
+ * import { jit, lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
  *
  * // JIT-compile just the step function. Each iteration calls compiled code,
  * // but the loop itself runs in JavaScript. Useful when step is expensive
@@ -311,7 +311,7 @@ export interface ScanOptions {
  *
  * @example With grad for differentiation
  * ```ts
- * import { grad, lax, numpy as np } from '@jax-js/jax';
+ * import { grad, lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
  *
  * const loss = (init, xs) => {
  *   const [final, ys] = lax.scan(step, init, xs);

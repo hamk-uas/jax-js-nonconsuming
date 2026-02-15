@@ -1,5 +1,5 @@
 {
-  "name": "@jax-js/onnx",
+  "name": "@hamk-uas/onnx",
   "version": "0.0.0",
   "description": "Load ONNX models and run inference natively with jax-js.",
   "keywords": [
@@ -15,7 +15,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ekzhang/jax-js.git"
+    "url": "git+https://github.com/hamk-uas/jax-js-nonconsuming.git"
   },
   "type": "module",
   "files": [
@@ -41,7 +41,7 @@
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.10.2",
-    "@jax-js/jax": "workspace:^",
+    "@hamk-uas/jax-js-nonconsuming": "workspace:^",
     "onnx-buf": "^1.20.0-1"
   }
 }

@@ -1,4 +1,4 @@
-import { checkLeaks, numpy as np } from "@jax-js/jax";
+import { checkLeaks, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 import { afterEach, beforeEach, expect } from "vitest";
 
 beforeEach(() => {
@@ -6,7 +6,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-    const result = checkLeaks.stop();
+  const result = checkLeaks.stop();
   expect(result.leaked, result.summary).toBe(0);
 });
 

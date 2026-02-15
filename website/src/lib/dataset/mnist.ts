@@ -1,4 +1,4 @@
-import { cachedFetch } from "@jax-js/loaders";
+import { cachedFetch } from "@hamk-uas/loaders";
 
 // CORS-enabled version of https://github.com/cvdfoundation/mnist
 const mnistLinks = {

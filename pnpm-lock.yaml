@@ -72,6 +72,12 @@ importers:
         specifier: ^4.0.9
         version: 4.0.9(@types/debug@4.1.12)(@types/node@24.1.0)(@vitest/browser-playwright@4.0.9)(jiti@2.4.2)(lightningcss@1.30.1)(msw@2.10.4(@types/node@24.1.0)(typescript@5.9.3))(tsx@4.20.3)(yaml@2.8.1)
 
+  packages/eslint-plugin:
+    dependencies:
+      eslint:
+        specifier: '>=9.0.0'
+        version: 9.31.0(jiti@2.4.2)
+
   packages/loaders:
     dependencies:
       '@bufbuild/protobuf':
@@ -86,7 +92,7 @@ importers:
       '@bufbuild/protobuf':
         specifier: ^2.10.2
         version: 2.10.2
-      '@jax-js/jax':
+      '@hamk-uas/jax-js-nonconsuming':
         specifier: workspace:^
         version: link:../..
       onnx-buf:
@@ -95,7 +101,7 @@ importers:
 
   packages/optax:
     dependencies:
-      '@jax-js/jax':
+      '@hamk-uas/jax-js-nonconsuming':
         specifier: workspace:^
         version: link:../..
 
@@ -107,16 +113,16 @@ importers:
       '@fontsource-variable/tiktok-sans':
         specifier: ^5.2.3
         version: 5.2.3
-      '@jax-js/jax':
+      '@hamk-uas/jax-js-nonconsuming':
         specifier: workspace:^
         version: link:..
-      '@jax-js/loaders':
+      '@hamk-uas/loaders':
         specifier: workspace:^
         version: link:../packages/loaders
-      '@jax-js/onnx':
+      '@hamk-uas/onnx':
         specifier: workspace:^
         version: link:../packages/onnx
-      '@jax-js/optax':
+      '@hamk-uas/optax':
         specifier: workspace:^
         version: link:../packages/optax
       '@lucide/svelte':

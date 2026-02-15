@@ -11,7 +11,13 @@
  *
  * Each test uses checkLeaks.start()/stop() to verify zero leaked arrays.
  */
-import { checkLeaks, defaultDevice, init, lax, numpy as np } from "@jax-js/jax";
+import {
+  checkLeaks,
+  defaultDevice,
+  init,
+  lax,
+  numpy as np,
+} from "@hamk-uas/jax-js-nonconsuming";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 let previousDevice: string | undefined;
@@ -100,9 +106,10 @@ describe("scan fallback leak detection (CPU)", () => {
     carry.dispose();
     ys.dispose();
     const report = checkLeaks.stop();
-    expect(report.leaked, `${report.summary}\n${report.details.join("\n")}`).toBe(
-      0,
-    );
+    expect(
+      report.leaked,
+      `${report.summary}\n${report.details.join("\n")}`,
+    ).toBe(0);
 
     xs.dispose();
     initC.dispose();

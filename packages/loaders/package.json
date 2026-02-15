@@ -1,5 +1,5 @@
 {
-  "name": "@jax-js/loaders",
+  "name": "@hamk-uas/loaders",
   "version": "0.1.1",
   "description": "Persistent, OPFS-based cache for downloding large files like model weights in browser",
   "keywords": [
@@ -15,7 +15,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ekzhang/jax-js.git"
+    "url": "git+https://github.com/hamk-uas/jax-js-nonconsuming.git"
   },
   "type": "module",
   "files": [

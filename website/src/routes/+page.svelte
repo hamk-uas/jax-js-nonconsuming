@@ -9,11 +9,11 @@
   import EmbeddedRepl from "$lib/repl/EmbeddedRepl.svelte";
 
   const installText = {
-    npm: `npm install @jax-js/jax`,
+    npm: `npm install @hamk-uas/jax-js-nonconsuming`,
     web:
       `<` +
       String.raw`script type="module">
-  import * as jax from "https://esm.sh/@jax-js/jax";
+  import * as jax from "https://esm.sh/@hamk-uas/jax-js-nonconsuming";
 </script` +
       `>`,
   };
@@ -188,7 +188,7 @@
     </p>
 
     <EmbeddedRepl
-      initialText={String.raw`import { grad, numpy as np, vmap } from "@jax-js/jax";
+      initialText={String.raw`import { grad, numpy as np, vmap } from "@hamk-uas/jax-js-nonconsuming";
 
 const f = (x: np.Array) => np.sqrt(x.mul(x).sum());
 const x = np.array([1, 2, 3, 4]);

@@ -1,5 +1,5 @@
-import { jit, numpy as np, tree, vmap } from "@jax-js/jax";
-import type { tokenizers } from "@jax-js/loaders";
+import { jit, numpy as np, tree, vmap } from "@hamk-uas/jax-js-nonconsuming";
+import type { tokenizers } from "@hamk-uas/loaders";
 
 import { type MobileCLIP, runMobileCLIPTextEncoder } from "./clipInference";
 

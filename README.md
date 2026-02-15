@@ -11,17 +11,22 @@
 
 > **Fork notice:** This is a fork of [ekzhang/jax-js](https://github.com/ekzhang/jax-js) with a
 > **non-consuming ownership model**. Operations leave inputs alive (no `.ref` needed), and `using`
-> declarations provide deterministic GPU/WASM memory cleanup. If you are looking for the upstream
-> version (move semantics, `.ref` required), see the
-> [original repository](https://github.com/ekzhang/jax-js). See
-> [Differences from upstream](#differences-from-upstream) for a full comparison.
+> declarations provide deterministic GPU/WASM memory cleanup.
+>
+> **Why this fork?** The original jax-js uses move semantics, where operations consume their inputs.
+> This fork was created for teams familiar with MATLAB or Python (NumPy) where move semantics are
+> unexpected. We needed a version of jax-js that fits our team's workflow, and we are sharing it
+> because we believe others might find this ownership model useful too.
+>
+> If you prefer move semantics, see the [original repository](https://github.com/ekzhang/jax-js).
+> See [Differences from upstream](#differences-from-upstream) for a full comparison.
 
 **jax-js** is a machine learning framework for the browser. It aims to bring
 [JAX](https://jax.dev)-style, high-performance CPU and GPU kernels to JavaScript, so you can run
 numerical applications on the web.
 
 ```bash
-npm i @jax-js/jax
+npm i @hamk-uas/jax-js-nonconsuming
 ```
 
 Under the hood, it translates array operations into a compiler representation, then synthesizes
@@ -34,7 +39,7 @@ GPU ML framework, since it runs anywhere a browser can run.
 ## Quickstart
 
 ```js
-import { numpy as np } from "@jax-js/jax";
+import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 // Array operations, compatible with JAX/NumPy.
 const x = np.array([1, 2, 3]);
@@ -48,7 +53,7 @@ way to get started on a blank HTML page.
 
 ```html
 <script type="module">
-  import { numpy as np } from "https://esm.sh/@jax-js/jax";
+  import { numpy as np } from "https://esm.sh/@hamk-uas/jax-js-nonconsuming";
 </script>
 ```
 
@@ -128,7 +133,7 @@ just in JavaScript.
 Create an array with `np.array()`:
 
 ```ts
-import { numpy as np } from "@jax-js/jax";
+import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 const ar = np.array([1, 2, 3]);
 ```
@@ -162,7 +167,7 @@ await ar.data(); // Fastest, non-blocking
 Arrays can have mathematical operations applied to them. For example:
 
 ```ts
-import { numpy as np, scipySpecial as special } from "@jax-js/jax";
+import { numpy as np, scipySpecial as special } from "@hamk-uas/jax-js-nonconsuming";
 
 using x = np.arange(100).astype(np.float32); // array of integers [0..99]
 
@@ -207,8 +212,8 @@ result.dispose(); // caller disposes the output when done
 f.dispose(); // free captured constants when the function is no longer needed
 ```
 
-The `@jax-js/eslint-plugin` catches the most common memory leaks (missing `using`,
-use-after-dispose, unnecessary `.ref`) at edit time — see the
+The `@hamk-uas/eslint-plugin-jax-js-nonconsuming` catches the most common memory leaks (missing
+`using`, use-after-dispose, unnecessary `.ref`) at edit time — see the
 [plugin README](packages/eslint-plugin) for setup.
 
 ### grad(), vmap() and jit()
@@ -217,7 +222,7 @@ JAX's signature composable transformations are also supported in jax-js. Here is
 using `grad` and `vmap` to compute the derivative of a function:
 
 ```ts
-import { numpy as np, grad, vmap } from "@jax-js/jax";
+import { numpy as np, grad, vmap } from "@hamk-uas/jax-js-nonconsuming";
 
 using x = np.linspace(-10, 10, 1000);
 
@@ -249,7 +254,7 @@ All functional transformations can take typed `JsTree` of inputs and outputs. Th
 nested JavaScript objects and arrays. For instance:
 
 ```ts
-import { grad, numpy as np } from "@jax-js/jax";
+import { grad, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 type Params = {
   foo: np.Array;
@@ -291,7 +296,7 @@ There are currently 4 devices in jax-js:
 device is `wasm`, but you can change this at startup time:
 
 ```ts
-import { defaultDevice, init } from "@jax-js/jax";
+import { defaultDevice, init } from "@hamk-uas/jax-js-nonconsuming";
 
 const devices = await init(); // Starts all available backends.
 
@@ -305,7 +310,7 @@ if (devices.includes("webgpu")) {
 You can also place individual arrays on specific devices:
 
 ```ts
-import { devicePut, numpy as np } from "@jax-js/jax";
+import { devicePut, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 const ar = np.array([1, 2, 3]); // Starts with device="wasm"
 await devicePut(ar, "webgpu"); // Now device="webgpu"
@@ -313,15 +318,15 @@ await devicePut(ar, "webgpu"); // Now device="webgpu"
 
 ### Helper libraries
 
-There are other libraries in the `@jax-js` namespace that can work with jax-js, or be used in a
+There are other libraries in the `@hamk-uas` namespace that can work with jax-js, or be used in a
 self-contained way in other projects.
 
-- [**`@jax-js/loaders`**](packages/loaders) can load tensors from various formats like Safetensors,
-  includes a fast and compliant implementation of BPE, and caches HTTP requests for large assets
-  like model weights in OPFS.
-- [**`@jax-js/onnx`**](packages/onnx) is a model loader from the [ONNX](https://onnx.ai/) format
+- [**`@hamk-uas/loaders`**](packages/loaders) can load tensors from various formats like
+  Safetensors, includes a fast and compliant implementation of BPE, and caches HTTP requests for
+  large assets like model weights in OPFS.
+- [**`@hamk-uas/onnx`**](packages/onnx) is a model loader from the [ONNX](https://onnx.ai/) format
   into native jax-js functions.
-- [**`@jax-js/optax`**](packages/optax) provides implementations of optimizers like Adam and SGD.
+- [**`@hamk-uas/optax`**](packages/optax) provides implementations of optimizers like Adam and SGD.
 
 ### Performance
 
@@ -362,7 +367,7 @@ files to ensure code quality.
 You can also run linting and formatting manually:
 
 ```bash
-pnpm lint          # Run ESLint (includes @jax-js/eslint-plugin ownership rules)
+pnpm lint          # Run ESLint (includes @hamk-uas/eslint-plugin-jax-js-nonconsuming ownership rules)
 pnpm format        # Format all files with Prettier
 pnpm format:check  # Check formatting without writing
 pnpm check         # Run TypeScript type checking
@@ -390,19 +395,19 @@ This fork replaces the upstream **move-semantics** ownership model with a **non-
 The API is otherwise identical — all NumPy/JAX functions, `jit`, `grad`, `vmap`, `scan`, backends,
 and demos work the same way.
 
-| Aspect                             | Upstream (ekzhang/jax-js)                   | This fork (non-consuming)                              |
-| ---------------------------------- | ------------------------------------------- | ------------------------------------------------------ |
-| **Ownership model**                | Move semantics                              | Non-consuming                                          |
-| **Operations consume inputs?**     | Yes — every op decrements refcount          | No — inputs stay alive                                 |
-| **`.ref` needed to reuse arrays?** | Yes — `x.ref` before passing to a second op | Never                                                  |
-| **`UseAfterFreeError` risk**       | Common if `.ref` is forgotten               | Eliminated by design                                   |
-| **`using` declarations**           | Not used                                    | First-class — auto-dispose at block end                |
-| **ESLint plugin**                  | `@hamk-uas/eslint-plugin-jax-js` (move)     | `@jax-js/eslint-plugin` (non-consuming)                |
-| **`lax.scan`**                     | Not implemented                             | Full support (JIT, autodiff, vmap, native compilation) |
-| **Buffer recycling**               | Not implemented                             | JIT-level `recycle` step + WebGPU buffer pool          |
-| **`tree.makeDisposable`**          | Not available                               | Wraps any object for `using`-based cleanup             |
-| **`Array.consumeData()`**          | Not available                               | Reads data and disposes in one call                    |
-| **`checkLeaks` diagnostic**        | Not available                               | Runtime leak detection with stack traces               |
+| Aspect                             | Upstream (ekzhang/jax-js)                   | This fork (non-consuming)                                     |
+| ---------------------------------- | ------------------------------------------- | ------------------------------------------------------------- |
+| **Ownership model**                | Move semantics                              | Non-consuming                                                 |
+| **Operations consume inputs?**     | Yes — every op decrements refcount          | No — inputs stay alive                                        |
+| **`.ref` needed to reuse arrays?** | Yes — `x.ref` before passing to a second op | Never                                                         |
+| **`UseAfterFreeError` risk**       | Common if `.ref` is forgotten               | Eliminated by design                                          |
+| **`using` declarations**           | Not used                                    | First-class — auto-dispose at block end                       |
+| **ESLint plugin**                  | `@hamk-uas/eslint-plugin-jax-js` (move)     | `@hamk-uas/eslint-plugin-jax-js-nonconsuming` (non-consuming) |
+| **`lax.scan`**                     | Not implemented                             | Full support (JIT, autodiff, vmap, native compilation)        |
+| **Buffer recycling**               | Not implemented                             | JIT-level `recycle` step + WebGPU buffer pool                 |
+| **`tree.makeDisposable`**          | Not available                               | Wraps any object for `using`-based cleanup                    |
+| **`Array.consumeData()`**          | Not available                               | Reads data and disposes in one call                           |
+| **`checkLeaks` diagnostic**        | Not available                               | Runtime leak detection with stack traces                      |
 
 ### Which version should I use?
 
@@ -412,8 +417,8 @@ and demos work the same way.
   ESLint plugin, or if you need to stay on the upstream release cadence.
 
 The two versions are **not mix-and-match** — code written for one ownership model will not work
-correctly with the other. The `@jax-js/eslint-plugin` included here enforces the non-consuming
-patterns and will flag `.ref` usage as unnecessary.
+correctly with the other. The `@hamk-uas/eslint-plugin-jax-js-nonconsuming` included here enforces
+the non-consuming patterns and will flag `.ref` usage as unnecessary.
 
 ### Migrating from upstream
 
@@ -421,8 +426,8 @@ patterns and will flag `.ref` usage as unnecessary.
 2. **Replace manual refcount juggling with `using`** — `using x = np.array(...)` auto-disposes at
    block end.
 3. **Call `.dispose()` explicitly for long-lived arrays** — or wrap in `tree.makeDisposable()`.
-4. **Install `@jax-js/eslint-plugin`** — it catches leaks, use-after-dispose, and unnecessary `.ref`
-   at edit time. See the [plugin README](packages/eslint-plugin) for setup.
+4. **Install `@hamk-uas/eslint-plugin-jax-js-nonconsuming`** — it catches leaks, use-after-dispose,
+   and unnecessary `.ref` at edit time. See the [plugin README](packages/eslint-plugin) for setup.
 
 ### AI-assisted development
 

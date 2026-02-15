@@ -1,6 +1,6 @@
-import jaxTypesSrc from "@jax-js/jax/dist/index.d.ts?raw";
-import loadersTypesSrc from "@jax-js/loaders/dist/index.d.ts?raw";
-import optaxTypesSrc from "@jax-js/optax/dist/index.d.ts?raw";
+import jaxTypesSrc from "@hamk-uas/jax-js-nonconsuming/dist/index.d.ts?raw";
+import loadersTypesSrc from "@hamk-uas/loaders/dist/index.d.ts?raw";
+import optaxTypesSrc from "@hamk-uas/optax/dist/index.d.ts?raw";
 import * as monaco from "monaco-editor";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 // import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
@@ -44,15 +44,15 @@ monaco.typescript.typescriptDefaults.setCompilerOptions({
 
 monaco.typescript.typescriptDefaults.addExtraLib(
   jaxTypesSrc,
-  "file:///node_modules/@jax-js/jax/index.d.ts",
+  "file:///node_modules/@hamk-uas/jax-js-nonconsuming/index.d.ts",
 );
 monaco.typescript.typescriptDefaults.addExtraLib(
   optaxTypesSrc,
-  "file:///node_modules/@jax-js/optax/index.d.ts",
+  "file:///node_modules/@hamk-uas/optax/index.d.ts",
 );
 monaco.typescript.typescriptDefaults.addExtraLib(
   loadersTypesSrc,
-  "file:///node_modules/@jax-js/loaders/index.d.ts",
+  "file:///node_modules/@hamk-uas/loaders/index.d.ts",
 );
 
 // Global declarations for _BUILTINS available in the REPL.

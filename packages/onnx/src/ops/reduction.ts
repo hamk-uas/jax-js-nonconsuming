@@ -1,6 +1,6 @@
 // Reductions and matrix multiplication.
 
-import { nn, numpy as np } from "@jax-js/jax";
+import { nn, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 import { type Operand, operandToJax, operandToJs } from "../tensor";
 

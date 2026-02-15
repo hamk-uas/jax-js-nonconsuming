@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { defaultDevice, init } from "@jax-js/jax";
+  import { defaultDevice, init } from "@hamk-uas/jax-js-nonconsuming";
   import { onMount } from "svelte";
 
   import {

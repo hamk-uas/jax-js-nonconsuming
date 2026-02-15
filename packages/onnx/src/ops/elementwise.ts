@@ -1,6 +1,11 @@
 // Element-wise operations, mostly simple to wrap directly.
 
-import { DType, nn, numpy as np, scipySpecial as special } from "@jax-js/jax";
+import {
+  DType,
+  nn,
+  numpy as np,
+  scipySpecial as special,
+} from "@hamk-uas/jax-js-nonconsuming";
 
 import {
   onnxDtypeToJax,

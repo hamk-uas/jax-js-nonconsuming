@@ -9,7 +9,7 @@
  * ## Quick start
  *
  * ```ts
- * import * as jax from "@jax-js/jax";
+ * import * as jax from "@hamk-uas/jax-js-nonconsuming";
  *
  * jax.checkLeaks.start();
  *
@@ -27,9 +27,9 @@
  * 5 slot(s) leaked (2 tracked array(s)):
  *
  *   test/numpy.test.ts:389:27 — 1× Array:float32[] rc=1  (via onesLike → fullLike)
- *   src/frontend/jvp.ts:107:39 — 1× Array:float32[] rc=1  (@jax-js/jax)
+ *   src/frontend/jvp.ts:107:39 — 1× Array:float32[] rc=1  (@hamk-uas/jax-js-nonconsuming)
  *
- * 1 from user code, 1 in @jax-js/jax.
+ * 1 from user code, 1 in @hamk-uas/jax-js-nonconsuming.
  *
  * 3 slot(s) not in tracked list (created before start() or by internal buffers).
  * rc=1 → never disposed. Call .dispose() when done.
@@ -126,7 +126,7 @@ const _libSrcPrefix = (() => {
 
 /**
  * Detect which package a raw frame URL belongs to.
- * Returns the package name (e.g. "@jax-js/jax", "some-lib") or null for user code.
+ * Returns the package name (e.g. "@hamk-uas/jax-js-nonconsuming", "some-lib") or null for user code.
  */
 function detectPackage(rawUrl: string): string | null {
   // node_modules/<scope>/<pkg> or node_modules/<pkg>
@@ -134,7 +134,7 @@ function detectPackage(rawUrl: string): string | null {
   if (nm) return nm[1];
   // jax-js library src
   if (_libSrcPrefix !== null && rawUrl.startsWith(_libSrcPrefix))
-    return "@jax-js/jax";
+    return "@hamk-uas/jax-js-nonconsuming";
   return null;
 }
 

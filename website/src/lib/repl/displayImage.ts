@@ -1,4 +1,4 @@
-import { numpy as np } from "@jax-js/jax";
+import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 /**
  * Convert a jax-js array (2D grayscale, 3D RGB/RGBA) to a data URL.
