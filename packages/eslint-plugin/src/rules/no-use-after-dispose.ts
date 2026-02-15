@@ -54,6 +54,9 @@ const rule: Rule.RuleModule = {
         if (node.callee?.type !== "MemberExpression") return;
         const prop = getMemberName(node.callee.property);
         if (prop !== "dispose") return;
+        // tree.dispose(arg) disposes arg, not the receiver `tree`.
+        // Only mark the receiver as disposed for zero-argument .dispose() calls.
+        if (node.arguments.length > 0) return;
         const obj = node.callee.object;
         if (obj?.type !== "Identifier") return;
         const variable = resolveVariable(context, obj);

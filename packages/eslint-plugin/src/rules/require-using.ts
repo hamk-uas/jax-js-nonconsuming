@@ -54,6 +54,59 @@ const ARRAY_FACTORIES = new Set([
   "matrixTranspose",
   "hamming",
   "hann",
+  // numpy long-form function names (aliases in numpy.ts)
+  "subtract",
+  "multiply",
+  "divide",
+  "trueDivide",
+  "floorDivide",
+  "negative",
+  "reciprocal",
+  "remainder",
+  "fmod",
+  "power",
+  "positive",
+  "heaviside",
+  "hypot",
+  "atan2",
+  "moveaxis",
+  "pad",
+  // numpy functions returning arrays
+  "allclose",
+  "argmax",
+  "argmin",
+  "corrcoef",
+  "cov",
+  "deg2rad",
+  "divmod",
+  "exp2",
+  "expm1",
+  "frexp",
+  "isinf",
+  "isnan",
+  "isneginf",
+  "isposinf",
+  "ldexp",
+  "log10",
+  "log1p",
+  "log2",
+  "nanToNum",
+  "ptp",
+  "rad2deg",
+  "std",
+  "trace",
+  "trunc",
+  "var_",
+  // numpy trig aliases
+  "arccosh",
+  "arcsinh",
+  "arctanh",
+  "cbrt",
+  "cosh",
+  "degrees",
+  "radians",
+  "sinc",
+  "sinh",
 ]);
 
 const ARRAY_METHODS = new Set([
@@ -134,11 +187,51 @@ function isReturnedAfterDeclaration(declStmt: any, idName: string): boolean {
   if (idx < 0) return false;
 
   for (let i = idx + 1; i < statements.length; i++) {
+    // Direct return/yield of this identifier
     if (hasReturnOrYieldOfIdentifier(statements[i], idName)) {
+      return true;
+    }
+    // Single-hop indirect return: `const out = { a }; return out;`
+    // Check if idName is assigned into a variable that is later returned.
+    if (isAssignedToReturnedVariable(statements, i, idName)) {
       return true;
     }
   }
 
+  return false;
+}
+
+/**
+ * Single-hop indirect return detection.
+ *
+ * Checks if `statements[stmtIdx]` is a variable declaration whose initializer
+ * contains `idName`, AND that variable is later returned/yielded.
+ *
+ * Covers the common pattern:
+ *   const a = np.add(x, y);
+ *   const output = { a, b };  // ← stmtIdx points here
+ *   return output;            // ← a escapes via output
+ */
+function isAssignedToReturnedVariable(
+  statements: any[],
+  stmtIdx: number,
+  idName: string,
+): boolean {
+  const stmt = statements[stmtIdx];
+  if (stmt.type !== "VariableDeclaration") return false;
+
+  for (const decl of stmt.declarations as any[]) {
+    if (!decl.init || decl.id?.type !== "Identifier") continue;
+    // Check if the initializer of this variable references our target id
+    if (!usesIdentifier(decl.init, idName)) continue;
+    // Now check if THIS variable is returned/yielded later
+    const varName = decl.id.name;
+    for (let j = stmtIdx + 1; j < statements.length; j++) {
+      if (hasReturnOrYieldOfIdentifier(statements[j], varName)) {
+        return true;
+      }
+    }
+  }
   return false;
 }
 

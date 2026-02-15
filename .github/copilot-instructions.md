@@ -3081,6 +3081,10 @@ For users migrating from the `.ref` / move-semantics model:
    `tree.makeDisposable()`
 4. **`.data()` no longer auto-disposes** — add `.dispose()` after reading, or use `.consumeData()`
 5. **Never use `using` on values that are returned** — `using` disposes at scope end
+6. **Destructure `tree` module** to avoid `no-use-after-dispose` false positive:
+   ```ts
+   const { dispose: disposeTree, makeDisposable } = tree;
+   ```
 
 ### `checkLeaks` diagnostic (implemented)
 
