@@ -644,7 +644,6 @@ function importWasmHelperFuncs(
 
 function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   const tune = tuneNullopt(kernel);
-  const re = kernel.reduction;
 
   if (DEBUG >= 3) {
     console.info(`kernel.exp: ${kernel.exp}\ntune.exp: ${tune.exp}`);
@@ -1036,14 +1035,11 @@ function emitKernelBody(opts: {
   /** Emit code to push the output base address for element [gidx] onto stack. */
   emitOutputAddr: () => void;
   /** Translate an expression (leaves result on WASM stack). */
-  emitExp: (
-    exp: AluExp,
-    extra: { ridx?: number; acc?: number },
-  ) => void;
+  emitExp: (exp: AluExp, extra: { ridx?: number; acc?: number }) => void;
   /** Custom store logic. If omitted, a simple typed store is emitted. */
   emitStore?: () => void;
 }): void {
-  const { cg, funcs, kernel, gidx, emitOutputAddr, emitExp, emitStore } = opts;
+  const { cg, kernel, gidx, emitOutputAddr, emitExp, emitStore } = opts;
   const tune = tuneNullopt(kernel);
   const re = kernel.reduction;
   const storeAlign = Math.log2(byteWidth(kernel.dtype));
@@ -1514,9 +1510,7 @@ function codegenNativeScanGeneral(
             emitStore: needsDualStore
               ? () => {
                   const storeAlign = Math.log2(bw);
-                  const tmpVal = cg.local.declare(
-                    dty(cg, null, kernel.dtype),
-                  );
+                  const tmpVal = cg.local.declare(dty(cg, null, kernel.dtype));
                   cg.local.tee(tmpVal);
                   dty(cg, null, kernel.dtype).store(storeAlign);
                   // Store to ysStacked

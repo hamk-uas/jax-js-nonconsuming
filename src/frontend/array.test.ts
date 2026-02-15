@@ -4,6 +4,8 @@ import { defaultDevice, devices, init } from "../backend";
 import { arange, array, eye, ones, zeros } from "./array";
 import { DType } from "../alu";
 
+/* eslint-disable jax-js/require-using -- unit tests for Array construction, not long-lived code */
+
 const devicesAvailable = await init();
 
 suite.each(devices)("device:%s", (device) => {

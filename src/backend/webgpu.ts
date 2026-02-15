@@ -1018,7 +1018,7 @@ export class WebGPUBackend implements Backend {
     // If current pool exceeds new budget, evict excess (LIFO per size).
     while (this.#poolCurrentBytes > this.#poolBudgetBytes) {
       let evicted = false;
-      for (const [size, list] of this.#bufferPool) {
+      for (const [_size, list] of this.#bufferPool) {
         if (list.length > 0) {
           const buf = list.pop()!;
           this.#poolCurrentBytes -= buf.size;

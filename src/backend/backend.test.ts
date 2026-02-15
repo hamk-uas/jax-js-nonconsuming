@@ -186,6 +186,7 @@ suite.each(devices)("device:%s", (device) => {
       const st1 = st.reshape([n, 1, n]).expand([n, n, n]);
       const st2 = st.permute([1, 0]).reshape([1, n, n]).expand([n, n, n]);
       const indices = [...unravelAlu([n, n], AluVar.gidx), AluVar.ridx];
+      // eslint-disable-next-line jax-js/require-using -- AluExp, not np.Array
       const exp = AluExp.mul(
         AluExp.globalView(DType.Float32, 0, st1, indices),
         AluExp.globalView(DType.Float32, 0, st2, indices),
