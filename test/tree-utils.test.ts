@@ -28,6 +28,14 @@ suite("tree.dispose", () => {
     tree.dispose(null);
     tree.dispose(undefined);
   });
+
+  test("handles aliased leaves without double-dispose", () => {
+    const base = np.add(np.array([1.0]), np.array([2.0]));
+    const aliased = { xf_0: base, yhat: base };
+
+    expect(() => tree.dispose(aliased)).not.toThrow();
+    expect(base.refCount).toBe(0);
+  });
 });
 
 suite("tree.makeDisposable", () => {
@@ -67,6 +75,14 @@ suite("tree.makeDisposable", () => {
     }
     expect(carry.refCount).toBe(0);
     expect(ys.refCount).toBe(0);
+  });
+
+  test("works with aliased object result", () => {
+    const base = np.add(np.array([1.0]), np.array([2.0]));
+    const result = tree.makeDisposable({ xf_0: base, yhat: base });
+
+    expect(() => result[Symbol.dispose]()).not.toThrow();
+    expect(base.refCount).toBe(0);
   });
 });
 

@@ -638,7 +638,19 @@ function ref(tree) {
 }
 /** Dispose every array in a tree. */
 function dispose(tree) {
-	if (tree) map((x) => x instanceof Tracer ? x.dispose() : void 0, tree);
+	if (tree) {
+		const seen = /* @__PURE__ */ new Set();
+		for (const x of leaves(tree)) try {
+			if (!(x instanceof Tracer)) continue;
+			if (seen.has(x)) continue;
+			seen.add(x);
+			const refCount = x.refCount;
+			if (typeof refCount === "number" && refCount <= 0) continue;
+			x.dispose();
+		} catch (err) {
+			if (!(err instanceof ReferenceError) || !String(err.message).includes("has been disposed")) throw err;
+		}
+	}
 }
 /**
 * Make a plain object `Disposable`, so it works with `using`.

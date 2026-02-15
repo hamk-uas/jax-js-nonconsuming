@@ -197,7 +197,24 @@ export function dispose<Tree extends JsTree<any>>(
   tree: Tree | null | undefined,
 ): void {
   if (tree) {
-    map((x) => (x instanceof Tracer ? x.dispose() : undefined), tree);
+    const seen = new Set<Tracer>();
+    for (const x of leaves(tree as JsTree<any>)) {
+      try {
+        if (!(x instanceof Tracer)) continue;
+        if (seen.has(x)) continue;
+        seen.add(x);
+        const refCount = (x as any).refCount;
+        if (typeof refCount === "number" && refCount <= 0) continue;
+        x.dispose();
+      } catch (err) {
+        if (
+          !(err instanceof ReferenceError) ||
+          !String(err.message).includes("has been disposed")
+        ) {
+          throw err;
+        }
+      }
+    }
   }
 }
 
