@@ -405,21 +405,5 @@ the non-consuming patterns and will flag `.ref` usage as unnecessary.
 ### AI-assisted development
 
 This fork is developed primarily using AI coding agents (GitHub Copilot, Claude, GPT, Gemini) with
-human supervision for design decisions, code review, and test validation. All changes go through the
-full CI pipeline (`pnpm test`, `pnpm check`, `pnpm run test:deno`) and the pre-commit hook runs the
-complete test suite before every commit.
-
-## Future work / help wanted
-
-Contributions are welcomed! Some fruitful areas to look into:
-
-- Adding support for more JAX functions and operations, see [compatibility table](./FEATURES.md).
-- Improving performance of the WebGPU and Wasm runtimes, generating better kernels, and using SIMD
-  and multithreading. (Even single-threaded Wasm could be ~20x faster.)
-- Adding support for `jax.profiling`, in particular the start and end trace functions. We should be
-  able to generate `traceEvents` from backends (especially on GPU, with precise timestamp queries)
-  to help with model performance debugging.
-- Helping the JIT compiler to fuse operations in more cases, like `tanh` branches.
-- Making a fast transformer inference engine, comparing against onnxruntime-web.
-
-You may join the jax-js [Discord server](https://discord.gg/BW6YsCd4Tf) and chat with the community.
+gentle human supervision. All changes go through the full CI pipeline (`pnpm test`, `pnpm check`,
+`pnpm run test:deno`) and the pre-commit hook runs the complete test suite before every commit.
