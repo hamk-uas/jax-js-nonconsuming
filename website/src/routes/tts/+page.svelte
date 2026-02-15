@@ -5,6 +5,7 @@
     numpy as np,
     tree,
   } from "@jax-js-nonconsuming/jax";
+  import { resolve } from "$app/paths";
   import {
     cachedFetch,
     safetensors,
@@ -180,7 +181,7 @@
   </h1>
   <p class="text-lg text-gray-500">
     Text-to-speech AI voice model, running in your browser with <a
-      href="/"
+      href={resolve("/")}
       class="text-primary hover:underline">jax-js</a
     >.
   </p>
