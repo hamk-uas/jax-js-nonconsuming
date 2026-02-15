@@ -424,6 +424,13 @@ patterns and will flag `.ref` usage as unnecessary.
 4. **Install `@jax-js/eslint-plugin`** — it catches leaks, use-after-dispose, and unnecessary `.ref`
    at edit time. See the [plugin README](packages/eslint-plugin) for setup.
 
+### AI-assisted development
+
+This fork is developed primarily using AI coding agents (GitHub Copilot, Claude) with human
+supervision for design decisions, code review, and test validation. All changes go through the full
+CI pipeline (`pnpm test`, `pnpm check`, `pnpm run test:deno`) and the pre-commit hook runs the
+complete test suite before every commit.
+
 ## Future work / help wanted
 
 Contributions are welcomed! Some fruitful areas to look into:
