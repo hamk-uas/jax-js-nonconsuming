@@ -11,7 +11,13 @@ This package contains jax-js ownership lint rules for the non-consuming model.
 
 ## Workspace wiring
 
-The plugin is wired in root `eslint.config.ts` as plugin name `jax-js`. Rules are currently set to
-`off` by default for gradual rollout.
+The plugin is wired in root `eslint.config.ts` as plugin name `jax-js`.
+
+Current rollout in this repo:
+
+- `jax-js/require-using`: `warn` on `src/**`, `test/**`, `packages/**`
+- `jax-js/no-unnecessary-ref`: `warn` on `src/**`, `test/**`, `packages/**`
+- `jax-js/no-use-after-dispose`: `off`
+- `jax-js/no-array-chain`: `off`
 
 Enable them explicitly in local config/CI as needed.

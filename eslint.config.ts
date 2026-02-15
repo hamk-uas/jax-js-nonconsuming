@@ -79,4 +79,17 @@ export default defineConfig([
       "jax-js/require-using": "off",
     },
   },
+  {
+    files: [
+      "src/**/*.{js,mjs,cjs,ts}",
+      "test/**/*.{js,mjs,cjs,ts}",
+      "packages/**/*.{js,mjs,cjs,ts}",
+    ],
+    rules: {
+      "jax-js/no-array-chain": "off",
+      "jax-js/no-unnecessary-ref": "warn",
+      "jax-js/no-use-after-dispose": "off",
+      "jax-js/require-using": "warn",
+    },
+  },
 ]);

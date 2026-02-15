@@ -2892,7 +2892,14 @@ This would catch leaks and use-after-free bugs at edit time, before they surface
 **Current in-repo status (initial implementation):**
 
 An in-repo plugin now exists at `packages/eslint-plugin` and is wired into root `eslint.config.ts`
-under plugin name `jax-js` (rules default to `off` for gradual rollout).
+under plugin name `jax-js`.
+
+Current rollout in this repo:
+
+- `jax-js/require-using`: `warn` on `src/**`, `test/**`, `packages/**`
+- `jax-js/no-unnecessary-ref`: `warn` on `src/**`, `test/**`, `packages/**`
+- `jax-js/no-use-after-dispose`: `off`
+- `jax-js/no-array-chain`: `off`
 
 Implemented rules:
 
