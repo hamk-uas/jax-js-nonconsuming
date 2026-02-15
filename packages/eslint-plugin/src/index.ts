@@ -4,6 +4,7 @@ import noArrayChain from "./rules/no-array-chain";
 import noDisposeThenReassignParam from "./rules/no-dispose-then-reassign-param";
 import noUnnecessaryRef from "./rules/no-unnecessary-ref";
 import noUseAfterDispose from "./rules/no-use-after-dispose";
+import requireScanResultDispose from "./rules/require-scan-result-dispose";
 import requireUsing from "./rules/require-using";
 
 const plugin: ESLint.Plugin = {
@@ -17,6 +18,7 @@ const plugin: ESLint.Plugin = {
     "no-dispose-then-reassign-param": noDisposeThenReassignParam,
     "no-unnecessary-ref": noUnnecessaryRef,
     "no-array-chain": noArrayChain,
+    "require-scan-result-dispose": requireScanResultDispose,
   },
 };
 
@@ -40,6 +42,7 @@ const recommended: Linter.Config = {
     "jax-js/no-dispose-then-reassign-param": "warn",
     "jax-js/no-unnecessary-ref": "warn",
     "jax-js/no-array-chain": "off",
+    "jax-js/require-scan-result-dispose": "warn",
   },
 };
 
@@ -59,6 +62,7 @@ const strict: Linter.Config = {
     "jax-js/no-dispose-then-reassign-param": "error",
     "jax-js/no-unnecessary-ref": "error",
     "jax-js/no-array-chain": "error",
+    "jax-js/require-scan-result-dispose": "error",
   },
 };
 

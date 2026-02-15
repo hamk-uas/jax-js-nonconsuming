@@ -46,6 +46,7 @@ This enables:
 | `jax-js/no-dispose-then-reassign-param` | `warn`  | Callback alias hazard: `dispose(state); state = param` |
 | `jax-js/no-unnecessary-ref`             | `warn`  | `.ref` calls (unnecessary in non-consuming)            |
 | `jax-js/no-array-chain`                 | `off`   | Deep fluent chains (strict-mode only)                  |
+| `jax-js/require-scan-result-dispose`    | `warn`  | Undisposed destructured `lax.scan(...)` results        |
 
 ### Strict config
 
@@ -77,6 +78,7 @@ export default [
       "jax-js/no-dispose-then-reassign-param": "warn",
       "jax-js/no-unnecessary-ref": "warn",
       "jax-js/no-array-chain": ["error", { minDepth: 3 }],
+      "jax-js/require-scan-result-dispose": "warn",
     },
   },
 ];
@@ -255,6 +257,38 @@ import { ... } from "...";
 Flags deep fluent method chains that create unnamed eager-mode temporaries. These intermediates
 can't be `using`-managed and may accumulate in GPU memory until GC runs.
 
+### `jax-js/require-scan-result-dispose`
+
+**Type:** problem (`warn` in recommended, `error` in strict) · no autofix
+
+Requires destructured `lax.scan(...)` outputs to be either disposed in the same scope (for example
+via `tree.dispose(carry)` / `tree.dispose(ys)`) or returned to caller-owned scope.
+
+```ts
+// ❌ Warn: scan outputs are dropped without dispose/return
+function leaky(step, initCarry, xs) {
+  const [carry, ys] = lax.scan(step, initCarry, xs);
+  return np.add(ys.pred, ys.pred);
+}
+
+// ✅ OK: both scan outputs are explicitly disposed
+function safe(step, initCarry, xs) {
+  const [carry, ys] = lax.scan(step, initCarry, xs);
+  tree.dispose(carry);
+  try {
+    return np.add(ys.pred, ys.pred);
+  } finally {
+    tree.dispose(ys);
+  }
+}
+
+// ✅ OK: caller owns returned values
+function forward(step, initCarry, xs) {
+  const [carry, ys] = lax.scan(step, initCarry, xs);
+  return { carry, ys };
+}
+```
+
 Only the outermost chain is reported — inner subchains don't produce duplicate diagnostics.
 
 ```ts
@@ -296,11 +330,11 @@ cases, prefer disabling the specific rule as locally as possible, and include a 
 Some rules support purpose-built suppression comments placed on the line immediately before the
 flagged code:
 
-| Rule                 | Suppression comment                | Scope           |
-| -------------------- | ---------------------------------- | --------------- |
-| `require-using`      | `// jax-js-lint: allow-non-using`  | Next line       |
-| `no-unnecessary-ref` | `// jax-js-lint: allow-ref`        | Next line       |
-| `no-unnecessary-ref` | `// jax-js-lint: allow-ref` (top)  | Entire file     |
+| Rule                 | Suppression comment               | Scope       |
+| -------------------- | --------------------------------- | ----------- |
+| `require-using`      | `// jax-js-lint: allow-non-using` | Next line   |
+| `no-unnecessary-ref` | `// jax-js-lint: allow-ref`       | Next line   |
+| `no-unnecessary-ref` | `// jax-js-lint: allow-ref` (top) | Entire file |
 
 ### Standard ESLint directives
 
@@ -395,8 +429,8 @@ Optional settings for a better experience (add to `.vscode/settings.json`):
 
   // Auto-fix fixable rules on save (e.g., removes unnecessary .ref)
   "editor.codeActionsOnSave": {
-    "source.fixAll.eslint": "explicit"
-  }
+    "source.fixAll.eslint": "explicit",
+  },
 }
 ```
 
@@ -420,8 +454,7 @@ require('lspconfig').eslint.setup({
 ```
 
 Or with [none-ls](https://github.com/nvimtools/none-ls.nvim) /
-[efm-langserver](https://github.com/mattn/efm-langserver), configure ESLint as a diagnostics
-source.
+[efm-langserver](https://github.com/mattn/efm-langserver), configure ESLint as a diagnostics source.
 
 ### Sublime Text
 
@@ -458,8 +491,8 @@ Or add it as a script in your `package.json`:
 **`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING` when loading the plugin:**
 
 If your ESLint config is `eslint.config.js` (not `.ts`), Node's built-in type stripping does not
-apply to files inside `node_modules`. **Fix:** rename your config to `eslint.config.ts`. ESLint
-then uses `jiti` to load the config and the plugin, bypassing the restriction.
+apply to files inside `node_modules`. **Fix:** rename your config to `eslint.config.ts`. ESLint then
+uses `jiti` to load the config and the plugin, bypassing the restriction.
 
 **Rules fire on non-jax-js code:**
 

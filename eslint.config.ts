@@ -85,6 +85,7 @@ export default defineConfig([
       "jax-js/no-unnecessary-ref": "off",
       "jax-js/no-use-after-dispose": "off",
       "jax-js/require-using": "off",
+      "jax-js/require-scan-result-dispose": "off",
     },
   },
   {
@@ -95,6 +96,7 @@ export default defineConfig([
       "jax-js/no-unnecessary-ref": "warn",
       "jax-js/no-use-after-dispose": "warn",
       "jax-js/require-using": "warn",
+      "jax-js/require-scan-result-dispose": "warn",
     },
   },
   {
@@ -105,6 +107,7 @@ export default defineConfig([
       "jax-js/no-unnecessary-ref": "off",
       "jax-js/no-use-after-dispose": "off",
       "jax-js/require-using": "off",
+      "jax-js/require-scan-result-dispose": "off",
     },
   },
 ]);
