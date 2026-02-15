@@ -15,7 +15,7 @@
   <!-- Needs to be an absolute URL, so this is hardcoded. -->
   <meta
     property="og:image"
-    content="https://jax-js.com/images/social-image.png"
+    content="https://hamk-uas.github.io/jax-js-nonconsuming/images/social-image.png"
   />
   <meta property="twitter:card" content="summary_large_image" />
 </svelte:head>

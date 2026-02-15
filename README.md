@@ -3,8 +3,8 @@
 <p align="center"><em>Non-consuming ownership fork</em></p>
 
 <p align="center"><strong>
-  <a href="https://jax-js.com">Website</a> |
-  <a href="https://jax-js.com/docs/">API Reference</a> |
+  <a href="https://hamk-uas.github.io/jax-js-nonconsuming/">Website</a> |
+  <a href="https://hamk-uas.github.io/jax-js-nonconsuming/docs/">API Reference</a> |
   <a href="./FEATURES.md">Compatibility Table</a> |
   <a href="https://discord.gg/BW6YsCd4Tf">Discord</a>
 </strong></p>
@@ -31,9 +31,9 @@ npm i @jax-js-nonconsuming/jax
 Under the hood, it translates array operations into a compiler representation, then synthesizes
 kernels in WebAssembly and WebGPU.
 
-The original jax-js was written from scratch with zero zero external dependencies. jax-js and this fork maintain close API
-compatibility with NumPy/JAX. Since everything runs client-side, jax-js is likely the most portable
-GPU ML framework, since it runs anywhere a browser can run.
+The original jax-js was written from scratch with zero zero external dependencies. jax-js and this
+fork maintain close API compatibility with NumPy/JAX. Since everything runs client-side, jax-js is
+likely the most portable GPU ML framework, since it runs anywhere a browser can run.
 
 ## Quickstart
 
@@ -49,51 +49,51 @@ const y = x.mul(4); // [4, 8, 12]
 
 Here's a quick, high-level comparison with other popular web ML runtimes:
 
-| Feature                         | jax-js-nonconsuming     | jax-js v0.1.9 | TensorFlow.js   | onnxruntime-web    |
-| ------------------------------- | ----------------------- | ---------- | --------------- | ------------------ |
-| **Overview**                    |                         |            |                 |                    |
-| API style                       | JAX/NumPy               | JAX/NumPy  | TensorFlow-like | Static ONNX graphs |
-| Latest release                  | 2026                    | 2026       | ⚠️ 2024         | 2026               |
-| Speed                           | Fastest                 | Fastest    | Fast            | Fastest            |
-| Bundle size (gzip)              | 107 KB                  | 80 KB      | 269 KB          | 90 KB + 24 MB Wasm |
-| **Autodiff & JIT**              |                         |            |                 |                    |
-| Gradients                       | ✅                       | ✅         | ✅              | ❌                 |
-| Jacobian and Hessian            | ✅                       | ✅         | ❌              | ❌                 |
-| `jvp()` forward differentiation | ✅                       | ✅         | ❌              | ❌                 |
-| `jit()` kernel fusion           | ✅                       | ✅         | ❌              | ❌                 |
-| `vmap()` auto-vectorization     | ✅                       | ✅         | ❌              | ❌                 |
-| `scan()` scan over leading axis | ✅                       | ❌         | ❌              | ❌                 |
-| Graph capture                   | ✅                       | ✅         | ❌              | ✅                 |
-| **Backends & Data**             |                         |            |                 |                    |
-| WebGPU backend                  | ✅                       | ✅         | 🟡 Preview      | ✅                 |
-| WebGL backend                   | ✅                       | ✅         | ✅              | ✅                 |
-| Wasm (CPU) backend              | ✅                       | ✅         | ✅              | ✅                 |
-| Eager array API                 | ✅                       | ✅         | ✅              | ❌                 |
-| Run ONNX models                 | 🟡 Partial               | 🟡 Partial | ❌              | ✅                 |
-| Read safetensors                | ✅                       | ✅         | ❌              | ❌                 |
-| Float64                         | ✅                       | ✅         | ❌              | ❌                 |
-| Float32                         | ✅                       | ✅         | ✅              | ✅                 |
-| Float16                         | ✅                       | ✅         | ❌              | ✅                 |
-| BFloat16                        | ❌                       | ❌         | ❌              | ❌                 |
-| Packed Uint8                    | ❌                       | ❌         | ❌              | 🟡 Partial         |
-| Mixed precision                 | ✅                       | ✅         | ❌              | ✅                 |
-| Mixed devices                   | ✅                       | ✅         | ❌              | ❌                 |
-| **Ops & Numerics**              |                          |            |                 |                    |
-| Arithmetic functions            | ✅                       | ✅         | ✅              | ✅                 |
-| Matrix multiplication           | ✅                       | ✅         | ✅              | ✅                 |
-| General einsum                  | ✅                       | ✅         | 🟡 Partial      | 🟡 Partial         |
-| Sorting                         | ✅                       | ✅         | ❌              | ❌                 |
-| Activation functions            | ✅                       | ✅         | ✅              | ✅                 |
-| NaN/Inf numerics                | ✅                       | ✅         | ✅              | ✅                 |
-| Basic convolutions              | ✅                       | ✅         | ✅              | ✅                 |
-| n-d convolutions                | ✅                       | ✅         | ❌              | ✅                 |
-| Strided/dilated convolution     | ✅                       | ✅         | ✅              | ✅                 |
-| Cholesky, Lstsq                 | ✅                       | ✅         | ❌              | ❌                 |
-| LU, Solve, Determinant          | ✅                       | ✅         | ❌              | ❌                 |
-| SVD                             | ❌                       | ❌         | ❌              | ❌                 |
-| FFT                             | ✅                       | ✅         | ✅              | ✅                 |
-| Basic RNG (Uniform, Normal)     | ✅                       | ✅         | ✅              | ✅                 |
-| Advanced RNG                    | ✅                       | ✅         | ❌              | ❌                 |
+| Feature                         | jax-js-nonconsuming | jax-js v0.1.9 | TensorFlow.js   | onnxruntime-web    |
+| ------------------------------- | ------------------- | ------------- | --------------- | ------------------ |
+| **Overview**                    |                     |               |                 |                    |
+| API style                       | JAX/NumPy           | JAX/NumPy     | TensorFlow-like | Static ONNX graphs |
+| Latest release                  | 2026                | 2026          | ⚠️ 2024         | 2026               |
+| Speed                           | Fastest             | Fastest       | Fast            | Fastest            |
+| Bundle size (gzip)              | 107 KB              | 80 KB         | 269 KB          | 90 KB + 24 MB Wasm |
+| **Autodiff & JIT**              |                     |               |                 |                    |
+| Gradients                       | ✅                  | ✅            | ✅              | ❌                 |
+| Jacobian and Hessian            | ✅                  | ✅            | ❌              | ❌                 |
+| `jvp()` forward differentiation | ✅                  | ✅            | ❌              | ❌                 |
+| `jit()` kernel fusion           | ✅                  | ✅            | ❌              | ❌                 |
+| `vmap()` auto-vectorization     | ✅                  | ✅            | ❌              | ❌                 |
+| `scan()` scan over leading axis | ✅                  | ❌            | ❌              | ❌                 |
+| Graph capture                   | ✅                  | ✅            | ❌              | ✅                 |
+| **Backends & Data**             |                     |               |                 |                    |
+| WebGPU backend                  | ✅                  | ✅            | 🟡 Preview      | ✅                 |
+| WebGL backend                   | ✅                  | ✅            | ✅              | ✅                 |
+| Wasm (CPU) backend              | ✅                  | ✅            | ✅              | ✅                 |
+| Eager array API                 | ✅                  | ✅            | ✅              | ❌                 |
+| Run ONNX models                 | 🟡 Partial          | 🟡 Partial    | ❌              | ✅                 |
+| Read safetensors                | ✅                  | ✅            | ❌              | ❌                 |
+| Float64                         | ✅                  | ✅            | ❌              | ❌                 |
+| Float32                         | ✅                  | ✅            | ✅              | ✅                 |
+| Float16                         | ✅                  | ✅            | ❌              | ✅                 |
+| BFloat16                        | ❌                  | ❌            | ❌              | ❌                 |
+| Packed Uint8                    | ❌                  | ❌            | ❌              | 🟡 Partial         |
+| Mixed precision                 | ✅                  | ✅            | ❌              | ✅                 |
+| Mixed devices                   | ✅                  | ✅            | ❌              | ❌                 |
+| **Ops & Numerics**              |                     |               |                 |                    |
+| Arithmetic functions            | ✅                  | ✅            | ✅              | ✅                 |
+| Matrix multiplication           | ✅                  | ✅            | ✅              | ✅                 |
+| General einsum                  | ✅                  | ✅            | 🟡 Partial      | 🟡 Partial         |
+| Sorting                         | ✅                  | ✅            | ❌              | ❌                 |
+| Activation functions            | ✅                  | ✅            | ✅              | ✅                 |
+| NaN/Inf numerics                | ✅                  | ✅            | ✅              | ✅                 |
+| Basic convolutions              | ✅                  | ✅            | ✅              | ✅                 |
+| n-d convolutions                | ✅                  | ✅            | ❌              | ✅                 |
+| Strided/dilated convolution     | ✅                  | ✅            | ✅              | ✅                 |
+| Cholesky, Lstsq                 | ✅                  | ✅            | ❌              | ❌                 |
+| LU, Solve, Determinant          | ✅                  | ✅            | ❌              | ❌                 |
+| SVD                             | ❌                  | ❌            | ❌              | ❌                 |
+| FFT                             | ✅                  | ✅            | ✅              | ✅                 |
+| Basic RNG (Uniform, Normal)     | ✅                  | ✅            | ✅              | ✅                 |
+| Advanced RNG                    | ✅                  | ✅            | ❌              | ❌                 |
 
 ## Tutorial
 
@@ -265,8 +265,8 @@ There are currently 4 devices in jax-js:
   slower than WebGPU. It's offered on a best-effort basis and not as well-supported. The `webgl`
   device has not been tested during development of jax-js-nonconsuming.
 
-**We recommend `webgpu` for best performance running neural networks and `wasm` for narrow sequential computations.** The default
-device is `wasm`, but you can change this at startup time:
+**We recommend `webgpu` for best performance running neural networks and `wasm` for narrow
+sequential computations.** The default device is `wasm`, but you can change this at startup time:
 
 ```ts
 import { defaultDevice, init } from "@jax-js-nonconsuming/jax";
@@ -297,16 +297,17 @@ self-contained way in other projects.
 - [**`@jax-js-nonconsuming/loaders`**](packages/loaders) can load tensors from various formats like
   Safetensors, includes a fast and compliant implementation of BPE, and caches HTTP requests for
   large assets like model weights in OPFS.
-- [**`@jax-js-nonconsuming/onnx`**](packages/onnx) is a model loader from the [ONNX](https://onnx.ai/) format
-  into native jax-js functions.
-- [**`@jax-js-nonconsuming/optax`**](packages/optax) provides implementations of optimizers like Adam and SGD.
+- [**`@jax-js-nonconsuming/onnx`**](packages/onnx) is a model loader from the
+  [ONNX](https://onnx.ai/) format into native jax-js functions.
+- [**`@jax-js-nonconsuming/optax`**](packages/optax) provides implementations of optimizers like
+  Adam and SGD.
 
 ### Performance
 
 The WebGPU runtime includes an ML compiler with tile-aware optimizations, tuned for individual
 browsers. Also, this library uniquely has the `jit()` feature that fuses operations together and
 records an execution graph. jax-js achieves **over 7000 GFLOP/s** for matrix multiplication on an
-Apple M4 Max chip ([try it](https://jax-js.com/bench/matmul)).
+Apple M4 Max chip ([try it](https://hamk-uas.github.io/jax-js-nonconsuming/bench/matmul)).
 
 For that example, it's significantly faster than both
 [TensorFlow.js](https://github.com/tensorflow/tfjs) and
@@ -319,7 +320,7 @@ well as unique optimizations such as FlashAttention variants.
 ### API Reference
 
 That's all for this short tutorial. Please see the generated
-[API reference](https://jax-js.com/docs) (TODO: update) for detailed documentation.
+[API reference](https://hamk-uas.github.io/jax-js-nonconsuming/docs/) for detailed documentation.
 
 ## Development
 
@@ -368,19 +369,19 @@ This fork replaces the upstream **move-semantics** ownership model with a **non-
 The API is otherwise identical — all NumPy/JAX functions, `jit`, `grad`, `vmap`, `scan`, backends,
 and demos work the same way. Mandelbrot has been updated with `scan` though.
 
-| Aspect                             | Upstream (ekzhang/jax-js)                   | This fork (non-consuming)                                     |
-| ---------------------------------- | ------------------------------------------- | ------------------------------------------------------------- |
-| **Ownership model**                | Move semantics                              | Non-consuming                                                 |
-| **Operations consume inputs?**     | Yes — every op decrements refcount          | No — inputs stay alive                                        |
-| **`.ref` needed to reuse arrays?** | Yes — `x.ref` before passing to a second op | Never                                                         |
-| **`UseAfterFreeError` risk**       | Common if `.ref` is forgotten               | Eliminated by design                                          |
-| **`using` declarations**           | Not used                                    | First-class — auto-dispose at block end                       |
+| Aspect                             | Upstream (ekzhang/jax-js)                   | This fork (non-consuming)                                   |
+| ---------------------------------- | ------------------------------------------- | ----------------------------------------------------------- |
+| **Ownership model**                | Move semantics                              | Non-consuming                                               |
+| **Operations consume inputs?**     | Yes — every op decrements refcount          | No — inputs stay alive                                      |
+| **`.ref` needed to reuse arrays?** | Yes — `x.ref` before passing to a second op | Never                                                       |
+| **`UseAfterFreeError` risk**       | Common if `.ref` is forgotten               | Eliminated by design                                        |
+| **`using` declarations**           | Not used                                    | First-class — auto-dispose at block end                     |
 | **ESLint plugin**                  | `@hamk-uas/eslint-plugin-jax-js` (move)     | `@jax-js-nonconsuming/eslint-plugin-jax-js` (non-consuming) |
-| **`lax.scan`**                     | Not implemented                             | Full support (JIT, autodiff, vmap, native compilation)        |
-| **Buffer recycling**               | Not implemented                             | JIT-level `recycle` step + WebGPU buffer pool                 |
-| **`tree.makeDisposable`**          | Not available                               | Wraps any object for `using`-based cleanup                    |
-| **`Array.consumeData()`**          | Not available                               | Reads data and disposes in one call                           |
-| **`checkLeaks` diagnostic**        | Not available                               | Runtime leak detection with stack traces                      |
+| **`lax.scan`**                     | Not implemented                             | Full support (JIT, autodiff, vmap, native compilation)      |
+| **Buffer recycling**               | Not implemented                             | JIT-level `recycle` step + WebGPU buffer pool               |
+| **`tree.makeDisposable`**          | Not available                               | Wraps any object for `using`-based cleanup                  |
+| **`Array.consumeData()`**          | Not available                               | Reads data and disposes in one call                         |
+| **`checkLeaks` diagnostic**        | Not available                               | Runtime leak detection with stack traces                    |
 
 ### Which version should I use?
 
@@ -390,8 +391,8 @@ and demos work the same way. Mandelbrot has been updated with `scan` though.
   ESLint plugin, or if you need to stay on the upstream release cadence.
 
 The two versions are **not mix-and-match** — code written for one ownership model will not work
-correctly with the other. The `@jax-js-nonconsuming/eslint-plugin-jax-js` included here enforces
-the non-consuming patterns and will flag `.ref` usage as unnecessary.
+correctly with the other. The `@jax-js-nonconsuming/eslint-plugin-jax-js` included here enforces the
+non-consuming patterns and will flag `.ref` usage as unnecessary.
 
 ### Migrating from upstream
 

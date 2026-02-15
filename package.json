@@ -15,7 +15,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ekzhang/jax-js.git"
+    "url": "git+https://github.com/hamk-uas/jax-js-nonconsuming.git"
   },
   "type": "module",
   "files": [

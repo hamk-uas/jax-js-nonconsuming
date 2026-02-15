@@ -5,7 +5,11 @@
     numpy as np,
     tree,
   } from "@jax-js-nonconsuming/jax";
-  import { cachedFetch, safetensors, tokenizers } from "@jax-js-nonconsuming/loaders";
+  import {
+    cachedFetch,
+    safetensors,
+    tokenizers,
+  } from "@jax-js-nonconsuming/loaders";
   import { AudioLinesIcon, DownloadIcon, GithubIcon } from "@lucide/svelte";
 
   import DownloadManager from "$lib/common/DownloadManager.svelte";
@@ -169,7 +173,7 @@
     Kyutai Pocket TTS
     <a
       target="_blank"
-      href="https://github.com/ekzhang/jax-js/tree/main/website/src/routes/tts"
+      href="https://github.com/hamk-uas/jax-js-nonconsuming/tree/main/website/src/routes/tts"
     >
       <GithubIcon class="inline-block ml-2 -mt-1" />
     </a>

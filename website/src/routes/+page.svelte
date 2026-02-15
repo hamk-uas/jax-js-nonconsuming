@@ -23,7 +23,7 @@
   const links = [
     {
       title: "GitHub Repository",
-      href: "https://github.com/ekzhang/jax-js",
+      href: "https://github.com/hamk-uas/jax-js-nonconsuming",
       description: "Get started with jax-js and check out the tutorial.",
     },
     {
@@ -33,7 +33,7 @@
     },
     {
       title: "API Reference",
-      href: "https://jax-js.com/docs/",
+      href: "https://hamk-uas.github.io/jax-js-nonconsuming/docs/",
       description: "View the full API documentation.",
     },
     {
@@ -72,11 +72,13 @@
     <a href={resolve("/repl")} class="hidden sm:block hover:text-primary"
       >REPL</a
     >
-    <a rel="external" href="https://jax-js.com/docs/" class="hover:text-primary"
-      >Docs</a
+    <a
+      rel="external"
+      href="https://hamk-uas.github.io/jax-js-nonconsuming/docs/"
+      class="hover:text-primary">Docs</a
     >
     <a
-      href="https://github.com/ekzhang/jax-js"
+      href="https://github.com/hamk-uas/jax-js-nonconsuming"
       target="_blank"
       class="bg-primary/15 hover:bg-primary/25 px-4 py-1 rounded-full"
     >
@@ -152,7 +154,7 @@
           <li>Runs completely client-side (Chrome, Firefox, iOS, Android).</li>
           <li>
             Has close <a
-              href="https://github.com/ekzhang/jax-js/blob/main/FEATURES.md"
+              href="https://github.com/hamk-uas/jax-js-nonconsuming/blob/main/FEATURES.md"
               target="_blank"
               class="underline hover:text-primary">API compatibility</a
             > with NumPy/JAX.

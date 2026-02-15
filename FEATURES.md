@@ -24,7 +24,8 @@ In the tables below, we use a color legend to refer to functions in JAX:
 
 ## [`jax`](https://docs.jax.dev/en/latest/jax.html)
 
-[API docs](https://jax-js.com/docs/modules/_jax-js_jax.html) for these functions.
+[API docs](https://hamk-uas.github.io/jax-js-nonconsuming/docs/modules/_jax-js_jax.html) for these
+functions.
 
 | API                  | Support | Notes                                            |
 | -------------------- | ------- | ------------------------------------------------ |
@@ -110,7 +111,7 @@ mostly meant for compatibility in browsers that don't support WebGPU, but you sh
 possible._
 
 Most operations behave the same way as they do in JAX.
-[API docs](https://jax-js.com/docs/modules/_jax-js_jax.numpy.html).
+[API docs](https://hamk-uas.github.io/jax-js-nonconsuming/docs/modules/_jax-js_jax.numpy.html).
 
 | API                   | Support | Notes                                        |
 | --------------------- | ------- | -------------------------------------------- |
@@ -720,8 +721,8 @@ and optimization library at `@jax-js-nonconsuming/optax`. You can install this a
 npm i @jax-js-nonconsuming/optax
 ```
 
-[API docs](https://jax-js.com/docs/modules/_jax-js_optax.html). Currently, the following optimizers
-are supported:
+[API docs](https://hamk-uas.github.io/jax-js-nonconsuming/docs/modules/_jax-js_optax.html).
+Currently, the following optimizers are supported:
 
 - SGD
 - Adam

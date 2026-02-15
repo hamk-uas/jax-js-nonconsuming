@@ -31,7 +31,7 @@ function sourceLinkOptions(dir: string): string {
     // Disable automatic Git detection and pass in specific link.
     "--disableGit",
     "--gitRevision main",
-    `--sourceLinkTemplate "https://github.com/ekzhang/jax-js/blob/{gitRevision}/${dir}{path}#L{line}"`,
+    `--sourceLinkTemplate "https://github.com/hamk-uas/jax-js-nonconsuming/blob/{gitRevision}/${dir}{path}#L{line}"`,
   ].join(" ");
 }
 
@@ -57,7 +57,7 @@ pnpm typedoc \
   --name jax-js \
   --entryPointStrategy merge \
   --favicon website/static/favicon.ico \
-  --titleLink "https://jax-js.com" \
+  --titleLink "https://hamk-uas.github.io/jax-js-nonconsuming/" \
   --searchInDocuments \
   --searchInComments \
   --router structure \
