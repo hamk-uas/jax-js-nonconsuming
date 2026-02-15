@@ -2,6 +2,7 @@ import type { ESLint, Linter } from "eslint";
 
 import noArrayChain from "./rules/no-array-chain";
 import noDisposeThenReassignParam from "./rules/no-dispose-then-reassign-param";
+import noMakeDisposableAlias from "./rules/no-make-disposable-alias";
 import noUnnecessaryRef from "./rules/no-unnecessary-ref";
 import noUseAfterDispose from "./rules/no-use-after-dispose";
 import requireScanResultDispose from "./rules/require-scan-result-dispose";
@@ -16,6 +17,7 @@ const plugin: ESLint.Plugin = {
     "require-using": requireUsing,
     "no-use-after-dispose": noUseAfterDispose,
     "no-dispose-then-reassign-param": noDisposeThenReassignParam,
+    "no-make-disposable-alias": noMakeDisposableAlias,
     "no-unnecessary-ref": noUnnecessaryRef,
     "no-array-chain": noArrayChain,
     "require-scan-result-dispose": requireScanResultDispose,
@@ -40,6 +42,7 @@ const recommended: Linter.Config = {
     "jax-js/require-using": "warn",
     "jax-js/no-use-after-dispose": "error",
     "jax-js/no-dispose-then-reassign-param": "warn",
+    "jax-js/no-make-disposable-alias": "warn",
     "jax-js/no-unnecessary-ref": "warn",
     "jax-js/no-array-chain": "off",
     "jax-js/require-scan-result-dispose": "warn",
@@ -60,6 +63,7 @@ const strict: Linter.Config = {
     "jax-js/require-using": "error",
     "jax-js/no-use-after-dispose": "error",
     "jax-js/no-dispose-then-reassign-param": "error",
+    "jax-js/no-make-disposable-alias": "error",
     "jax-js/no-unnecessary-ref": "error",
     "jax-js/no-array-chain": "error",
     "jax-js/require-scan-result-dispose": "error",

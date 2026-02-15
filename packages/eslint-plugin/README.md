@@ -44,6 +44,7 @@ This enables:
 | `jax-js/require-using`                  | `warn`  | Local array bindings missing `using`                   |
 | `jax-js/no-use-after-dispose`           | `error` | Reading/writing a variable after `.dispose()`          |
 | `jax-js/no-dispose-then-reassign-param` | `warn`  | Callback alias hazard: `dispose(state); state = param` |
+| `jax-js/no-make-disposable-alias`       | `warn`  | Duplicate references in `tree.makeDisposable(...)`     |
 | `jax-js/no-unnecessary-ref`             | `warn`  | `.ref` calls (unnecessary in non-consuming)            |
 | `jax-js/no-array-chain`                 | `off`   | Deep fluent chains (strict-mode only)                  |
 | `jax-js/require-scan-result-dispose`    | `warn`  | Undisposed destructured `lax.scan(...)` results        |
@@ -76,6 +77,7 @@ export default [
       "jax-js/require-using": "error",
       "jax-js/no-use-after-dispose": "error",
       "jax-js/no-dispose-then-reassign-param": "warn",
+      "jax-js/no-make-disposable-alias": "warn",
       "jax-js/no-unnecessary-ref": "warn",
       "jax-js/no-array-chain": ["error", { minDepth: 3 }],
       "jax-js/require-scan-result-dispose": "warn",
@@ -218,6 +220,24 @@ function onParamsUpdate(params) {
 **Current scope:** Adjacent statement pattern in function bodies:
 `dispose(stateVar); stateVar = paramName;`.
 
+### `jax-js/no-make-disposable-alias`
+
+**Type:** suggestion (`warn` in recommended, `error` in strict) · no autofix
+
+Warns when a single identifier is reused multiple times inside a literal passed to
+`tree.makeDisposable(...)`, e.g. `{ xf_0: base, yhat: base }` or `[a, a]`.
+
+Even though runtime disposal is alias-safe, this pattern is easy to create accidentally and can hide
+ownership intent.
+
+```ts
+// ❌ Warn: same array handed off under two keys
+const owned = tree.makeDisposable({ xf_0: base, yhat: base });
+
+// ✅ OK: distinct arrays
+const owned2 = tree.makeDisposable({ xf_0, yhat });
+```
+
 ### `jax-js/no-unnecessary-ref`
 
 **Fixable:** ✅ autofix (removes `.ref` automatically with `--fix` or on save)
@@ -341,6 +361,11 @@ try {
 const [carry2, ys2] = lax.scan(step, initCarry, xs);
 using owned = tree.makeDisposable({ carry: carry2, ys: ys2 });
 return await owned.carry.consumeData();
+
+// Pattern 4: avoid accidental aliasing in handoff literals
+const xf_0 = np.add(x, y);
+const yhat = np.add(x, y);
+using out = tree.makeDisposable({ xf_0, yhat });
 ```
 
 ### Svelte note (`.svelte`, `.svelte.ts`)

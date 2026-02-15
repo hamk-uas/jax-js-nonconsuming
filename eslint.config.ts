@@ -82,6 +82,7 @@ export default defineConfig([
       ],
       "jax-js/no-array-chain": "off",
       "jax-js/no-dispose-then-reassign-param": "off",
+      "jax-js/no-make-disposable-alias": "off",
       "jax-js/no-unnecessary-ref": "off",
       "jax-js/no-use-after-dispose": "off",
       "jax-js/require-using": "off",
@@ -93,6 +94,7 @@ export default defineConfig([
     rules: {
       "jax-js/no-array-chain": "off",
       "jax-js/no-dispose-then-reassign-param": "warn",
+      "jax-js/no-make-disposable-alias": "warn",
       "jax-js/no-unnecessary-ref": "warn",
       "jax-js/no-use-after-dispose": "warn",
       "jax-js/require-using": "warn",
@@ -104,6 +106,7 @@ export default defineConfig([
     rules: {
       "jax-js/no-array-chain": "off",
       "jax-js/no-dispose-then-reassign-param": "off",
+      "jax-js/no-make-disposable-alias": "off",
       "jax-js/no-unnecessary-ref": "off",
       "jax-js/no-use-after-dispose": "off",
       "jax-js/require-using": "off",
