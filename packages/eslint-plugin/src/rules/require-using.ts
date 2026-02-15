@@ -25,7 +25,6 @@ const ARRAY_METHODS = new Set([
   "sum",
   "mean",
   "astype",
-  "slice",
   "neg",
   "exp",
   "log",
@@ -50,6 +49,10 @@ function isArrayProducingCall(node: any): boolean {
   if (callee.type === "MemberExpression") {
     const property = getMemberName(callee.property);
     if (!property) return false;
+
+    if (callee.object.type === "Identifier" && callee.object.name === "Math") {
+      return false;
+    }
 
     if (
       callee.object.type === "Identifier" &&
@@ -76,10 +79,74 @@ function isReturnedAfterDeclaration(declStmt: any, idName: string): boolean {
     const stmt = statements[i];
     if (
       stmt.type === "ReturnStatement" &&
-      stmt.argument?.type === "Identifier" &&
-      stmt.argument.name === idName
+      usesIdentifier(stmt.argument, idName)
     ) {
       return true;
+    }
+    if (hasYieldedIdentifier(stmt, idName)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasYieldedIdentifier(
+  node: any,
+  idName: string,
+  seen: WeakSet<object> = new WeakSet(),
+): boolean {
+  if (!node || typeof node !== "object") return false;
+  if (seen.has(node)) return false;
+  seen.add(node);
+
+  if (node.type === "YieldExpression") {
+    return usesIdentifier(node.argument, idName);
+  }
+
+  for (const key of Object.keys(node)) {
+    if (key === "parent") continue;
+    const value = (node as any)[key];
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (hasYieldedIdentifier(item, idName, seen)) return true;
+      }
+    } else if (value && typeof value === "object") {
+      if (hasYieldedIdentifier(value, idName, seen)) return true;
+    }
+  }
+
+  return false;
+}
+
+function hasDisposeCallForIdentifier(
+  node: any,
+  idName: string,
+  seen: WeakSet<object> = new WeakSet(),
+): boolean {
+  if (!node || typeof node !== "object") return false;
+  if (seen.has(node)) return false;
+  seen.add(node);
+
+  if (
+    node.type === "CallExpression" &&
+    node.callee?.type === "MemberExpression"
+  ) {
+    if (getMemberName(node.callee.property) === "dispose") {
+      const obj = node.callee.object;
+      if (obj?.type === "Identifier" && obj.name === idName) return true;
+    }
+  }
+
+  for (const key of Object.keys(node)) {
+    if (key === "parent") continue;
+    const value = (node as any)[key];
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (hasDisposeCallForIdentifier(item, idName, seen)) return true;
+      }
+    } else if (value && typeof value === "object") {
+      if (hasDisposeCallForIdentifier(value, idName, seen)) return true;
     }
   }
 
@@ -97,14 +164,7 @@ function hasExplicitDisposeAfterDeclaration(
   if (idx < 0) return false;
 
   for (let i = idx + 1; i < statements.length; i++) {
-    const stmt = statements[i];
-    if (stmt.type !== "ExpressionStatement") continue;
-    const expr = stmt.expression;
-    if (expr?.type !== "CallExpression") continue;
-    if (expr.callee?.type !== "MemberExpression") continue;
-    if (getMemberName(expr.callee.property) !== "dispose") continue;
-    const obj = expr.callee.object;
-    if (obj?.type === "Identifier" && obj.name === idName) return true;
+    if (hasDisposeCallForIdentifier(statements[i], idName)) return true;
   }
 
   return false;

@@ -121,13 +121,14 @@ export const uniform = jit(
     // Use `using` to dispose these anonymous typed consts after tracing captures them.
     using divisor = array(1 << 9, { dtype: DType.Uint32, device: key.device });
     using bias = array(0x3f800000, { dtype: DType.Uint32, device: key.device });
-    const mantissa = bits(key, shape).div(divisor);
-    const float12 = mantissa.add(bias); // Add 1.0 in IEEE 754, now it's a float in [1, 2).
+    using mantissa = bits(key, shape).div(divisor);
+    using float12 = mantissa.add(bias); // Add 1.0 in IEEE 754, now it's a float in [1, 2).
     const rand = bitcast(float12, DType.Float32).sub(1) as Array; // [0, 1) range
     if (minval === 0 && maxval === 1) {
       return rand;
     } else {
-      return rand.mul(maxval - minval).add(minval);
+      using scaled = rand.mul(maxval - minval);
+      return scaled.add(minval);
     }
   },
   { staticArgnums: [1, 2] },
@@ -235,7 +236,9 @@ export const cauchy = jit(
   function cauchy(key: Array, shape: number[] = []): Array {
     const u = uniform(key, shape);
     // Inverse CDF of Cauchy: tan(π * (u - 0.5))
-    return tan(u.sub(0.5).mul(Math.PI));
+    using centered = u.sub(0.5);
+    using scaled = centered.mul(Math.PI);
+    return tan(scaled);
   },
   { staticArgnums: [1] },
 );
@@ -279,7 +282,7 @@ export const laplace = jit(
   function laplace(key: Array, shape: number[] = []): Array {
     const u = uniform(key, shape);
     // u - 0.5 is in [-0.5, 0.5)
-    const centered = u.sub(0.5);
+    using centered = u.sub(0.5);
     const s = sign(centered);
     // |u - 0.5| ranges from 0 to 0.5, so 2*|u-0.5| ranges from 0 to 1
     // We use log1p(-(2*|centered|)) = log(1 - 2*|centered|) to avoid log(0)

@@ -11,9 +11,9 @@ import {
   flattenFun,
   flip,
   fullRaise,
-  insideAbstractTrace,
-  hasAbstractTraceBelow,
   gather,
+  hasAbstractTraceBelow,
+  insideAbstractTrace,
   ndim,
   newMain,
   pad,
@@ -98,7 +98,7 @@ class BatchTracer extends Tracer {
   }
 
   get ref() {
-    this.val.ref;
+    this.val;
     return this;
   }
   dispose() {
@@ -403,14 +403,14 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
       const newAxis = [0, ...axis.map((ax) => ax + 1)];
       const arangeArr = arange(axisSize);
       const extraBatchIndex = arangeArr.reshape([-1, ...rep(nd - 1, 1)]);
-      arangeArr[Symbol.dispose]();
+      arangeArr.dispose();
       indices.splice(0, 0, extraBatchIndex);
       const result = gather(x, indices, newAxis, outDim);
-      if (x !== origX) x[Symbol.dispose]();
-      extraBatchIndex[Symbol.dispose]();
+      if (x !== origX) x.dispose();
+      extraBatchIndex.dispose();
       for (let i = 1; i < indices.length; i++) {
         // skip extraBatchIndex at 0
-        if (indices[i] !== origIndices[i - 1]) indices[i][Symbol.dispose]();
+        if (indices[i] !== origIndices[i - 1]) indices[i].dispose();
       }
       return [[result], [outDim]];
     }

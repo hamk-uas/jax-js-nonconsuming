@@ -931,16 +931,27 @@ export abstract class Tracer {
     }
     const originalDtype = this.dtype;
     const castDtype = promoteTypes(originalDtype, DType.Float32);
-    const d: Tracer[] = [];
     const casted = this.astype(castDtype);
-    if (casted !== (this as Tracer)) d.push(casted);
-    const result = reduce(casted, AluOp.Add, axis, opts);
-    d.push(result);
-    const scaled = result.mul(1 / n);
-    d.push(scaled);
-    const final_ = scaled.astype(originalDtype);
-    for (const v of d) if (v !== final_) v[Symbol.dispose]();
-    return final_ as this;
+    let summed: Tracer | null = null;
+    let scaled: Tracer | null = null;
+    let final_: Tracer | null = null;
+    try {
+      summed = reduce(casted, AluOp.Add, axis, opts);
+      scaled = summed.mul(1 / n);
+      final_ = scaled.astype(originalDtype);
+      return final_ as this;
+    } finally {
+      if (scaled && scaled !== final_) scaled.dispose();
+      if (summed && summed !== scaled && summed !== final_) summed.dispose();
+      if (
+        casted !== (this as Tracer) &&
+        casted !== summed &&
+        casted !== scaled &&
+        casted !== final_
+      ) {
+        casted.dispose();
+      }
+    }
   }
 
   /** Minimum of the elements of the array along a given axis. */
@@ -959,7 +970,7 @@ export abstract class Tracer {
     try {
       return boolArr.min(axis, opts);
     } finally {
-      if (boolArr !== (this as Tracer)) boolArr[Symbol.dispose]();
+      if (boolArr !== (this as Tracer)) boolArr.dispose();
     }
   }
 
@@ -969,7 +980,7 @@ export abstract class Tracer {
     try {
       return boolArr.max(axis, opts);
     } finally {
-      if (boolArr !== (this as Tracer)) boolArr[Symbol.dispose]();
+      if (boolArr !== (this as Tracer)) boolArr.dispose();
     }
   }
 
@@ -1098,10 +1109,10 @@ export abstract class Tracer {
       if (i < n - 1) {
         const lr = split(residual, 0, [1, residual.shape[0] - 1]);
         // Dispose previous residual (but not `this`)
-        if (residual !== (this as Tracer)) residual[Symbol.dispose]?.();
+        if (residual !== (this as Tracer)) residual.dispose();
         const first = lr[0];
         const reshaped = first.reshape(subarrayShape);
-        if (first !== reshaped) first[Symbol.dispose]?.();
+        if (first !== reshaped) first.dispose();
         yield reshaped as this;
         residual = lr[1];
       } else {
@@ -1110,7 +1121,7 @@ export abstract class Tracer {
         // generator is abandoned (e.g., by array destructuring).
         const reshaped = residual.reshape(subarrayShape);
         if (residual !== reshaped && residual !== (this as Tracer))
-          residual[Symbol.dispose]?.();
+          residual.dispose();
         yield reshaped as this;
       }
     }
@@ -1131,8 +1142,8 @@ export abstract class Tracer {
     const transposed = this.transpose(perm);
     const sorted = sort(transposed);
     const result = sorted.transpose(invertPermutation(perm));
-    if (transposed !== (this as Tracer)) transposed[Symbol.dispose]();
-    if (sorted !== result) sorted[Symbol.dispose]();
+    if (transposed !== (this as Tracer)) transposed.dispose();
+    if (sorted !== result) sorted.dispose();
     return result as this;
   }
 
@@ -1156,9 +1167,9 @@ export abstract class Tracer {
     const transposed = this.transpose(perm);
     const [y, yi] = argsort(transposed);
     y.dispose();
-    if (transposed !== (this as Tracer)) transposed[Symbol.dispose]();
+    if (transposed !== (this as Tracer)) transposed.dispose();
     const result = yi.transpose(invertPermutation(perm));
-    if (yi !== result) yi[Symbol.dispose]();
+    if (yi !== result) yi.dispose();
     return result as this;
   }
 

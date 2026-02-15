@@ -42,11 +42,12 @@ const rule: Rule.RuleModule = {
     },
     schema: [],
     messages: {
-      useAfterDispose: "`{{name}}` is used after `.dispose()`.",
+      useAfterDispose:
+        "`{{name}}` is used after `.dispose()` on line {{disposeLine}}.",
     },
   },
   create(context) {
-    const disposedAt = new Map<any, number>();
+    const disposedAt = new Map<any, { end: number; line: number }>();
 
     return {
       CallExpression(node: any) {
@@ -57,14 +58,17 @@ const rule: Rule.RuleModule = {
         if (obj?.type !== "Identifier") return;
         const variable = resolveVariable(context, obj);
         if (!variable) return;
-        disposedAt.set(variable, node.range[1]);
+        disposedAt.set(variable, {
+          end: node.range[1],
+          line: node.loc?.start?.line ?? 0,
+        });
       },
       Identifier(node: any) {
         const variable = resolveVariable(context, node);
         if (!variable) return;
-        const end = disposedAt.get(variable);
-        if (end === undefined) return;
-        if (node.range[0] <= end) return;
+        const info = disposedAt.get(variable);
+        if (info === undefined) return;
+        if (node.range[0] <= info.end) return;
         if (!isIdentifierReference(node, node.parent)) return;
 
         const parent = node.parent;
@@ -79,7 +83,10 @@ const rule: Rule.RuleModule = {
         context.report({
           node,
           messageId: "useAfterDispose",
-          data: { name: node.name },
+          data: {
+            name: node.name,
+            disposeLine: String(info.line),
+          },
         });
       },
     };

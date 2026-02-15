@@ -53,7 +53,7 @@ const fftUpdate = jit(
     // k is anonymous: created inside jit body, nobody holds a reference.
     // Mark so getOrMakeConstTracer skips .ref, preventing a slot leak.
     anonymousConstArrays.add(k);
-    const theta = k.mul(-Math.PI / half);
+    using theta = k.mul(-Math.PI / half);
     const wr = cos(theta);
     const wi = sin(theta);
 
@@ -63,8 +63,12 @@ const fftUpdate = jit(
     const vi = imag.slice([], [half, 2 * half]);
 
     // t = w * v
-    const tr = vr.mul(wr).sub(vi.mul(wi));
-    const ti = vr.mul(wi).add(vi.mul(wr));
+    using vrWr = vr.mul(wr);
+    using viWi = vi.mul(wi);
+    const tr = vrWr.sub(viWi);
+    using vrWi = vr.mul(wi);
+    using viWr = vi.mul(wr);
+    const ti = vrWi.add(viWr);
 
     // store [u + t, u - t]
     return {

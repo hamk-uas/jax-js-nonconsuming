@@ -2880,19 +2880,11 @@ target move semantics and are not directly applicable to this non-consuming fork
 **design philosophy is identical**: code that is correct in eager mode will be correct under
 `jit()`.
 
-A future jax-js-specific linter for the non-consuming model could enforce:
+**In-repo plugin (publish-ready, v0.1.0):**
 
-- Every created array is eventually disposed (the `require-consume` analog)
-- No use after `.dispose()` (the `no-use-after-consume` analog)
-- No unnecessary `.ref` calls (`.ref` is never needed in user code under non-consuming semantics)
-
-This would catch leaks and use-after-free bugs at edit time, before they surface as
-`UseAfterFreeError` at runtime or silent memory leaks.
-
-**Current in-repo status (initial implementation):**
-
-An in-repo plugin now exists at `packages/eslint-plugin` and is wired into root `eslint.config.ts`
-under plugin name `jax-js`.
+The in-repo plugin at `packages/eslint-plugin` (`@jax-js/eslint-plugin`) is wired into root
+`eslint.config.ts` under plugin name `jax-js`. It exports `configs.recommended` and `configs.strict`
+for flat-config consumers.
 
 Current rollout in this repo:
 
@@ -2902,12 +2894,26 @@ Current rollout in this repo:
 - `jax-js/no-array-chain`: `off`
 - all `jax-js/*` rules: `off` on `test/**`
 
+**Shared configs:**
+
+- `configs.recommended` — `require-using: warn`, `no-use-after-dispose: error`,
+  `no-unnecessary-ref: warn`, `no-array-chain: off`
+- `configs.strict` — all rules at `error` level, including `no-array-chain`
+
+**User setup (external consumers):**
+
+```ts
+// eslint.config.ts
+import jaxJs from "@jax-js/eslint-plugin";
+export default [jaxJs.configs.recommended];
+```
+
 Implemented rules:
 
-- `jax-js/require-using`
-- `jax-js/no-use-after-dispose`
-- `jax-js/no-unnecessary-ref`
-- `jax-js/no-array-chain`
+- `jax-js/require-using` — suggestion fix (converts `const`/`let` to `using`)
+- `jax-js/no-use-after-dispose` — includes `.dispose()` line number in message
+- `jax-js/no-unnecessary-ref` — **autofix** (removes `.ref` with `--fix`)
+- `jax-js/no-array-chain` — reports outermost chain only (no duplicate subchain reports)
 
 Current semantics in the in-repo implementation:
 
@@ -2917,53 +2923,15 @@ Current semantics in the in-repo implementation:
   - explicitly disposed later via `<name>.dispose()`, or
   - persisted to longer-lived structures (e.g., property/index assignment, `set`/`push`/`add`).
 - `jax-js/no-use-after-dispose` tracks identifiers by lexical variable identity (scope-aware),
-  avoiding false positives from shadowed names.
+  avoiding false positives from shadowed names. Error messages include the line number of the
+  `.dispose()` call for easy cross-referencing.
+- `jax-js/no-unnecessary-ref` has autofix: `--fix` removes `.ref` (the dot and property) from the
+  chain. Safe because `.ref` is never needed in the non-consuming model.
+- `jax-js/no-array-chain` deduplicates: only the outermost qualifying chain is reported, avoiding
+  noisy depth-N + depth-(N-1) + ... reports for a single expression.
 
-This provides a baseline Layer 1 enforcement path that can evolve with jax-js in the same repo.
-
-**Layer 1 ESLint rule contract (implementation spec):**
-
-1. **`jax-js/require-using`** (default: error)
-   - Enforce `using`-by-default for local array-valued bindings.
-   - Trigger on `VariableDeclarator` with kind `const|let` where initializer is array-producing.
-   - Array-producing includes:
-     - `np.array(...)`, `array(...)`, `zeros(...)`, `ones(...)`, `full(...)`, etc.
-     - Member-call chains on array-like receivers (e.g., `x.mul(...)`, `x.add(...)`,
-       `x.reshape(...)`)
-     - Known transform calls returning arrays (`grad(...)`, `vmap(...)`, `jit(...)` call results
-       excluded when binding function)
-   - Pass when one of:
-     - declaration kind is `using`
-     - value is directly returned (`const x = ...; return x;` in same block)
-     - value is persisted (assigned to object field / array slot / map value / module-scope binding)
-     - declaration has explicit opt-out comment: `// jax-js-lint: allow-non-using`
-   - No autofix for general case (control-flow-sensitive); optional suggestion fix:
-     - `const x = expr;` → `using x = expr;` when no reassignment and no crossing `await`/`yield`.
-
-2. **`jax-js/no-use-after-dispose`** (default: error)
-   - Track local identifiers; after `.dispose()` or end of `using` scope, further reads/writes are
-     errors.
-   - Trigger examples:
-     - `x.dispose(); x.add(1);`
-     - using-declared variable escaping its block via closure/reference.
-   - Must be flow-sensitive within function scope; inter-procedural analysis not required.
-
-3. **`jax-js/no-unnecessary-ref`** (default: error)
-   - Flag `.ref` usage in user/library code unless explicitly justified.
-   - Allow only behind opt-out comment `// jax-js-lint: allow-ref` for rare internals.
-
-4. **`jax-js/no-array-chain`** (default: off, strict mode)
-   - Optional performance/ownership strictness rule.
-   - Trigger on chained array calls depth ≥ 2 in a single expression:
-     - e.g., `x.mul(w).add(b).relu()`
-   - Rationale: unnamed temporaries in eager mode cannot be `using`-managed.
-   - Provide suggestion (not autofix): split into `using` bindings.
-
-**Rule scope and non-goals:**
-
-- Scope: function-local reasoning (fast, predictable, low false positives).
-- Non-goal: proving disposal across module boundaries or through alias-heavy dataflow.
-- Bias toward false-negative over false-positive for persisted/global lifetimes.
+See `packages/eslint-plugin/README.md` for full user-facing documentation, rule details, IDE
+integration, and comparison with the community HAMK plugin.
 
 ### Memory management ergonomics
 
@@ -3122,78 +3090,17 @@ backend Slot.
 
 **Why this matters:** Ownership correctness is enforced at test time via `checkLeaks` (every test
 must be leak-free) and at development time via IDE diagnostics. Zero overhead in production. Keeps
-the API surface JAX-compatible. A future ESLint plugin for the non-consuming model would catch leaks
-and use-after-free statically at edit time, complementing the runtime `checkLeaks` diagnostic.
-
-### Fluent chain transform (v1 contract)
-
-To add syntax headroom for anonymous intermediates without move semantics, we may introduce an
-**opt-in compile-time transform** (not runtime monkey-patching) for fluent method chains.
-
-**Core guarantees:**
-
-1. Preserve source-level chained syntax for users.
-2. Keep named bindings non-consuming unless explicitly disposed.
-3. Dispose unnamed intermediates deterministically in eager mode.
-4. Never dispose earlier than the transformed expression's last use.
-5. Keep JS evaluation order and exception behavior unchanged.
-
-**Allowed ergonomic forms (v1):**
-
-- Assignment RHS chains:
-  - `const y = a.op1(...).op2(...).op3(...);`
-- Return chains:
-  - `return a.op1(...).op2(...);`
-- Expression-statement chains where result is intentionally discarded.
-- Callback-local return chains (e.g., `array.map(x => x.op1(...).op2(...))`) — transformed only
-  inside the callback's own function body.
-
-**Lowering strategy (conceptual):**
-
-- Rewrite chain to explicit temporaries in-order.
-- Insert disposal of each temporary after its final transformed consumer.
-- Wrap transformed region in `try/finally` when needed so exceptions do not leak intermediates.
-
-**Bailout conditions (do NOT transform in v1):**
-
-- `await` / `yield` in the chain expression.
-- Optional chaining or computed dynamic call targets with unclear side effects.
-- Patterns where a chain subexpression escapes/aliases before completion.
-- Cases where ordering cannot be preserved without duplicating side effects.
-- Cross-callback / higher-order-function boundaries (never rewrite a chain so that temp/dispose
-  logic spans multiple function bodies).
-
-When a bailout triggers, keep original code and optionally emit a non-blocking diagnostic: "chain
-not transformed; consider `using` temporaries".
-
-**Non-goals (v1):**
-
-- No runtime global chain tracking.
-- No refcount simulation in the transform.
-- No rewriting across statement boundaries.
-
-### Decision summary
-
-| Approach          | Eager memory | Buffer reuse | Footgun risk | Recommendation                         |
-| ----------------- | ------------ | ------------ | ------------ | -------------------------------------- |
-| `using` / manual  | Correct      | Pool only    | None         | **Primary pattern**                    |
-| `jit()`           | Optimal      | Full         | None         | **Performance optimization**           |
-| `checkLeaks`      | Diagnostic   | N/A          | None         | **Implemented — enforces correctness** |
-| `tidy()`          | Cleanup only | None         | None         | Skip — no buffer reuse, sync-only      |
-| `pipe()`          | 1 extra buf  | Pool only    | None         | Skip — too narrow                      |
-| `.donate()` ¹     | Zero-alloc   | True reuse   | High         | Defer — pool handles it                |
-| In-place / `out=` | Zero-alloc   | True reuse   | Breaks model | **Never** — incompatible               |
-
-¹ `.donate()` does not exist — see [Alternatives evaluated](#alternatives-evaluated-and-rejected).
+the API surface JAX-compatible. The `@jax-js/eslint-plugin` catches leaks and use-after-free
+statically at edit time, complementing the runtime `checkLeaks` diagnostic.
 
 ## Future Work
 
-| Priority | Feature                               | Notes                                                                                                                                                                                             |
-| -------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ~~High~~ | ~~`checkLeaks` diagnostic~~           | ✅ Implemented in `src/frontend/check-leaks.ts`                                                                                                                                                   |
-| ~~High~~ | ~~unreachable Const PETracer leak~~   | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                             |
-| ~~High~~ | ~~user-disposed const over-disposal~~ | ✅ Fixed via `refCount <= 1` protection in `linearizeFlat`/`vjpFlat`                                                                                                                              |
-| Medium   | Anonymous constant leak fix           | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                         |
-| Medium   | ESLint plugin for non-consuming model | Analog of `@hamk-uas/eslint-plugin-jax-js` — enforce `using`-by-default (with return/persist exceptions), `no-use-after-dispose`, `no-unnecessary-ref`, and optional `no-array-chain` strict mode |
-| Medium   | `scatter_add` primitive               | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.     |
-| ~~Low~~  | ~~`using` declaration examples~~      | ✅ Documented in copilot-instructions + README                                                                                                                                                    |
+| Priority   | Feature                                   | Notes                                                                                                                                                                                         |
+| ---------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~High~~   | ~~`checkLeaks` diagnostic~~               | ✅ Implemented in `src/frontend/check-leaks.ts`                                                                                                                                               |
+| ~~High~~   | ~~unreachable Const PETracer leak~~       | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                         |
+| ~~High~~   | ~~user-disposed const over-disposal~~     | ✅ Fixed via `refCount <= 1` protection in `linearizeFlat`/`vjpFlat`                                                                                                                          |
+| Medium     | Anonymous constant leak fix               | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                     |
+| ~~Medium~~ | ~~ESLint plugin for non-consuming model~~ | ✅ Implemented as `@jax-js/eslint-plugin` v0.1.0 — `require-using`, `no-use-after-dispose`, `no-unnecessary-ref`, `no-array-chain`                                                            |
+| Medium     | `scatter_add` primitive                   | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices. |
+| ~~Low~~    | ~~`using` declaration examples~~          | ✅ Documented in copilot-instructions + README                                                                                                                                                |

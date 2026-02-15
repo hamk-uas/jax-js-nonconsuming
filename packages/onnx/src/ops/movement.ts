@@ -300,7 +300,7 @@ export function Slice([
       // Need to pad with zeros
       const padShape = [...result.shape];
       padShape[axis] = padded - len;
-      const padding = np.zeros(padShape, { dtype: result.dtype });
+      using padding = np.zeros(padShape, { dtype: result.dtype });
       result = np.concatenate([result, padding], axis);
     }
     // Reshape to split axis into [outLen, step]

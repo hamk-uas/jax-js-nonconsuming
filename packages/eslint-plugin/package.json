@@ -1,10 +1,30 @@
 {
   "name": "@jax-js/eslint-plugin",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
+  "description": "ESLint rules for jax-js array ownership — enforces deterministic disposal and prevents memory leaks",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
+  },
+  "keywords": [
+    "eslint",
+    "eslintplugin",
+    "jax-js",
+    "memory",
+    "ownership",
+    "dispose",
+    "gpu",
+    "webgpu",
+    "wasm"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/olli4/jax-js.git",
+    "directory": "packages/eslint-plugin"
+  },
+  "peerDependencies": {
+    "eslint": ">=9.0.0"
   }
 }

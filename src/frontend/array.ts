@@ -1105,8 +1105,8 @@ export class Array extends Tracer {
         const genShape = shape.slice(keyShape.length);
         // Arrays of size >2^32 won't fit into browser memory anyway, so it's
         // okay to take lazy iota this way for counters.
-        const c0 = zeros(genShape, { dtype: DType.Uint32, device: k0.device });
-        const c1 = arange(0, prod(genShape), 1, {
+        using c0 = zeros(genShape, { dtype: DType.Uint32, device: k0.device });
+        using c1 = arange(0, prod(genShape), 1, {
           dtype: DType.Uint32,
           device: k0.device,
         }).reshape(genShape);

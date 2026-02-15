@@ -1,5 +1,38 @@
 import type { Rule } from "eslint";
 
+import { getMemberName } from "../types";
+
+const CHAINABLE_ARRAY_METHODS = new Set([
+  "add",
+  "sub",
+  "mul",
+  "div",
+  "pow",
+  "mod",
+  "neg",
+  "reshape",
+  "transpose",
+  "sum",
+  "mean",
+  "astype",
+  "exp",
+  "log",
+  "sin",
+  "cos",
+  "tanh",
+  "sqrt",
+  "maximum",
+  "minimum",
+  "dot",
+  "matmul",
+  "less",
+  "lessEqual",
+  "greater",
+  "greaterEqual",
+  "equal",
+  "notEqual",
+]);
+
 const rule: Rule.RuleModule = {
   meta: {
     type: "suggestion",
@@ -31,6 +64,8 @@ const rule: Rule.RuleModule = {
         current?.type === "CallExpression" &&
         current.callee?.type === "MemberExpression"
       ) {
+        const method = getMemberName(current.callee.property);
+        if (!method || !CHAINABLE_ARRAY_METHODS.has(method)) break;
         depth++;
         current = current.callee.object;
       }
@@ -42,6 +77,18 @@ const rule: Rule.RuleModule = {
         if (node.callee?.type !== "MemberExpression") return;
         const depth = depthOfCallChain(node);
         if (depth < minDepth) return;
+
+        // Only report the outermost chain — skip if a parent call is also
+        // a qualifying chain (avoids duplicate depth-3 + depth-2 reports).
+        const parentCall = node.parent;
+        if (
+          parentCall?.type === "MemberExpression" &&
+          parentCall.parent?.type === "CallExpression"
+        ) {
+          const parentDepth = depthOfCallChain(parentCall.parent);
+          if (parentDepth >= minDepth) return;
+        }
+
         context.report({
           node,
           messageId: "noArrayChain",

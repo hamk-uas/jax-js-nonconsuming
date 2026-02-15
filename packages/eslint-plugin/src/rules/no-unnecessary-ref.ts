@@ -9,6 +9,7 @@ const rule: Rule.RuleModule = {
       description:
         "Disallow .ref in non-consuming jax-js code unless explicitly opted out",
     },
+    fixable: "code",
     schema: [],
     messages: {
       unnecessaryRef:
@@ -21,7 +22,21 @@ const rule: Rule.RuleModule = {
         const name = getMemberName(node.property);
         if (name !== "ref") return;
         if (hasAllowComment(context, node, "jax-js-lint: allow-ref")) return;
-        context.report({ node: node.property, messageId: "unnecessaryRef" });
+        context.report({
+          node: node.property,
+          messageId: "unnecessaryRef",
+          fix(fixer) {
+            // Remove `.ref` from the chain: `x.ref` → `x`, `x.ref.add(1)` → `x.add(1)`
+            // Range: from the dot before `ref` to the end of `ref`
+            const sourceCode = context.sourceCode ?? context.getSourceCode();
+            const dotToken = sourceCode.getTokenBefore(node.property);
+            if (!dotToken || dotToken.value !== ".") return null;
+            return fixer.removeRange([
+              dotToken.range[0],
+              node.property.range[1],
+            ]);
+          },
+        });
       },
     };
   },

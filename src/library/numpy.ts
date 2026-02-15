@@ -1647,7 +1647,9 @@ export const fmod = jit(function fmod(x: Array, y: Array): Array {
 export const remainder = jit(function remainder(x: Array, y: Array): Array {
   // The `Mod` primitive matches the sign of x, following JS rounding rules.
   // This function must match the sign of y instead.
-  return core.mod(core.mod(x, y).add(y), y) as Array;
+  using inner = core.mod(x, y) as Array;
+  using shifted = inner.add(y);
+  return core.mod(shifted, y) as Array;
 });
 
 /**
@@ -1696,13 +1698,15 @@ export function ldexp(x1: ArrayLike, x2: ArrayLike): Array {
  */
 export function frexp(x: ArrayLike): [Array, Array] {
   x = fudgeArray(x);
-  const absx = absolute(x);
-  const exponent = where(
-    equal(x, 0),
-    0,
-    floor(log2(absx)).add(1).astype(DType.Int32),
-  );
-  const mantissa = x.div(exp2(exponent.astype(x.dtype)));
+  using absx = absolute(x);
+  using log2abs = log2(absx);
+  using floorLog = floor(log2abs);
+  using shiftedExp = floorLog.add(1);
+  using exponentI32 = shiftedExp.astype(DType.Int32);
+  const exponent = where(equal(x, 0), 0, exponentI32);
+  using exponentAsX = exponent.astype(x.dtype);
+  using scale = exp2(exponentAsX);
+  const mantissa = x.div(scale);
   return [mantissa, exponent];
 }
 
@@ -1765,16 +1769,15 @@ export const power = jit(function power(x1: Array, x2: Array) {
   // Should be NaN if x1 < 0 and x2 is non-integer.
   const shouldBeNaN = multiply(x2.notEqual(x2i), x1.less(0));
   // If x2 is odd integer, result sign matches x1, else it's positive.
-  const resultSign = where(
-    core.mod(x2i, 2).notEqual(0) as Array,
-    where(x1.less(0), -1, 1),
-    1,
-  );
-  return where(
-    shouldBeNaN,
-    nan,
-    exp(log(absolute(x1)).mul(x2)).mul(resultSign),
-  );
+  using parityRaw = core.mod(x2i, 2) as Array;
+  using parityOdd = parityRaw.notEqual(0);
+  const resultSign = where(parityOdd, where(x1.less(0), -1, 1), 1);
+  using absX1 = absolute(x1);
+  using logAbsX1 = log(absX1);
+  using scaled = logAbsX1.mul(x2);
+  using magnitude = exp(scaled);
+  using signedMagnitude = magnitude.mul(resultSign);
+  return where(shouldBeNaN, nan, signedMagnitude);
 });
 
 export { power as pow };
@@ -1783,7 +1786,11 @@ export { power as pow };
 export const cbrt = jit(function cbrt(x: Array) {
   // This isn't just power(x, 1/3) since we need to handle negative numbers.
   const sgn = where(less(x, 0), -1, 1);
-  return sgn.mul(exp(log(x.mul(sgn)).mul(1 / 3)));
+  using signedX = x.mul(sgn);
+  using logSignedX = log(signedX);
+  using scaled = logSignedX.mul(1 / 3);
+  using magnitude = exp(scaled);
+  return sgn.mul(magnitude);
 });
 
 /**
@@ -1795,7 +1802,8 @@ export const cbrt = jit(function cbrt(x: Array) {
 export const sinh = jit(function sinh(x: Array) {
   const ex = exp(x);
   const emx = reciprocal(ex);
-  return ex.sub(emx).mul(0.5);
+  using diff = ex.sub(emx);
+  return diff.mul(0.5);
 });
 
 /**
@@ -1807,7 +1815,8 @@ export const sinh = jit(function sinh(x: Array) {
 export const cosh = jit(function cosh(x: Array) {
   const ex = exp(x);
   const emx = reciprocal(ex);
-  return ex.add(emx).mul(0.5);
+  using sum = ex.add(emx);
+  return sum.mul(0.5);
 });
 
 /**
@@ -1820,8 +1829,13 @@ export const tanh = jit(function tanh(x: Array) {
   // Avoid overflow for large x by taking advantage of alternate representations:
   // tanh(x) = -tanh(-x) = (1 - e^{-2x}) / (1 + e^{-2x})
   const negsgn = where(less(x, 0), 1, -1);
-  const en2x = exp(x.mul(negsgn).mul(2));
-  return en2x.sub(1).div(en2x.add(1)).mul(negsgn);
+  using signed = x.mul(negsgn);
+  using scaled = signed.mul(2);
+  const en2x = exp(scaled);
+  using numer = en2x.sub(1);
+  using denom = en2x.add(1);
+  using ratio = numer.div(denom);
+  return ratio.mul(negsgn);
 });
 
 /**
@@ -1831,7 +1845,11 @@ export const tanh = jit(function tanh(x: Array) {
  * `arcsinh(x) = ln(x + sqrt(x^2 + 1))`
  */
 export const arcsinh = jit(function arcsinh(x: Array) {
-  return log(x.add(sqrt(square(x).add(1))));
+  using sq = square(x);
+  using shifted = sq.add(1);
+  using root = sqrt(shifted);
+  using arg = x.add(root);
+  return log(arg);
 });
 
 /**
@@ -1841,7 +1859,11 @@ export const arcsinh = jit(function arcsinh(x: Array) {
  * `arccosh(x) = ln(x + sqrt(x^2 - 1))`
  */
 export const arccosh = jit(function arccosh(x: Array) {
-  return log(x.add(sqrt(square(x).sub(1))));
+  using sq = square(x);
+  using shifted = sq.sub(1);
+  using root = sqrt(shifted);
+  using arg = x.add(root);
+  return log(arg);
 });
 
 /**
@@ -2028,5 +2050,8 @@ export function nanToNum(
  */
 export const isfinite = jit(function isfinite(x: Array): Array {
   if (!isFloatDtype(x.dtype)) return fullLike(x, true);
-  return isnan(x).add(isinf(x)).notEqual(true);
+  using nanMask = isnan(x);
+  using infMask = isinf(x);
+  using union = nanMask.add(infMask);
+  return union.notEqual(true);
 });

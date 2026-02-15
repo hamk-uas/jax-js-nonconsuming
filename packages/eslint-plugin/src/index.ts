@@ -1,4 +1,4 @@
-import type { ESLint } from "eslint";
+import type { ESLint, Linter } from "eslint";
 
 import noArrayChain from "./rules/no-array-chain";
 import noUnnecessaryRef from "./rules/no-unnecessary-ref";
@@ -8,7 +8,7 @@ import requireUsing from "./rules/require-using";
 const plugin: ESLint.Plugin = {
   meta: {
     name: "@jax-js/eslint-plugin",
-    version: "0.0.0",
+    version: "0.1.0",
   },
   rules: {
     "require-using": requireUsing,
@@ -18,4 +18,50 @@ const plugin: ESLint.Plugin = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Shared configs
+// ---------------------------------------------------------------------------
+
+/**
+ * Recommended config — catches ownership bugs without being overly strict.
+ *
+ * - `require-using`: warn
+ * - `no-use-after-dispose`: error
+ * - `no-unnecessary-ref`: warn
+ * - `no-array-chain`: off
+ */
+const recommended: Linter.Config = {
+  plugins: { "jax-js": plugin },
+  rules: {
+    "jax-js/require-using": "warn",
+    "jax-js/no-use-after-dispose": "error",
+    "jax-js/no-unnecessary-ref": "warn",
+    "jax-js/no-array-chain": "off",
+  },
+};
+
+/**
+ * Strict config — everything in recommended, plus chain-splitting enforcement.
+ *
+ * - `require-using`: error
+ * - `no-use-after-dispose`: error
+ * - `no-unnecessary-ref`: error
+ * - `no-array-chain`: error
+ */
+const strict: Linter.Config = {
+  plugins: { "jax-js": plugin },
+  rules: {
+    "jax-js/require-using": "error",
+    "jax-js/no-use-after-dispose": "error",
+    "jax-js/no-unnecessary-ref": "error",
+    "jax-js/no-array-chain": "error",
+  },
+};
+
+// Attach configs to plugin object for flat-config consumers:
+//   import jaxJs from "@jax-js/eslint-plugin";
+//   export default [ jaxJs.configs.recommended, ... ];
+(plugin as any).configs = { recommended, strict };
+
 export default plugin;
+export { recommended, strict };

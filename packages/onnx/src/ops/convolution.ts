@@ -80,13 +80,13 @@ function padWithNegInf(x: np.Array, pads: [number, number][]): np.Array {
     if (padBefore > 0) {
       const beforeShape = [...x.shape];
       beforeShape[axis] = padBefore;
-      const before = np.full(beforeShape, -Infinity, { dtype: x.dtype });
+      using before = np.full(beforeShape, -Infinity, { dtype: x.dtype });
       x = np.concatenate([before, x], axis);
     }
     if (padAfter > 0) {
       const afterShape = [...x.shape];
       afterShape[axis] = padAfter;
-      const after = np.full(afterShape, -Infinity, { dtype: x.dtype });
+      using after = np.full(afterShape, -Infinity, { dtype: x.dtype });
       x = np.concatenate([x, after], axis);
     }
   }

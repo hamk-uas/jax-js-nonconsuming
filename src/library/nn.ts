@@ -105,7 +105,9 @@ export const sparsePlus = jit((x: Array): Array => {
  * - When `x >= 1`: `1`
  */
 export const sparseSigmoid = jit((x: Array): Array => {
-  return clip(x.add(1).mul(0.5), 0, 1);
+  using shifted = x.add(1);
+  using scaled = shifted.mul(0.5);
+  return clip(scaled, 0, 1);
 });
 
 /**
@@ -245,13 +247,21 @@ export const gelu = jit(
   function gelu(x: Array, opts?: { approximate?: boolean }): Array {
     if (opts?.approximate ?? true) {
       const SQRT_2_OVER_PI = Math.sqrt(2 / Math.PI);
-      return x
-        .mul(0.5)
-        .mul(
-          tanh(x.mul(x.mul(x).mul(0.044715).add(1)).mul(SQRT_2_OVER_PI)).add(1),
-        );
+      using x2 = x.mul(x);
+      using quadTerm = x2.mul(0.044715);
+      using poly = quadTerm.add(1);
+      using polyScaled = x.mul(poly);
+      using tanhArg = polyScaled.mul(SQRT_2_OVER_PI);
+      using tanhVal = tanh(tanhArg);
+      using gate = tanhVal.add(1);
+      using halfX = x.mul(0.5);
+      return halfX.mul(gate);
     } else {
-      return x.mul(0.5).mul(erfc(negative(x.mul(Math.SQRT1_2))));
+      using scaled = x.mul(Math.SQRT1_2);
+      using negScaled = negative(scaled);
+      using erfComp = erfc(negScaled);
+      using halfX = x.mul(0.5);
+      return halfX.mul(erfComp);
     }
   },
   { staticArgnums: [1] },
@@ -377,9 +387,8 @@ export function logsumexp(
   using expShifted = exp(shifted);
   using sumExp = expShifted.sum(axis, { keepdims: true });
   using logSum = log(sumExp);
-  const result = xMax.add(logSum);
-  if (opts?.keepdims) return result;
-  using resultToSqueeze = result;
+  if (opts?.keepdims) return xMax.add(logSum);
+  using resultToSqueeze = xMax.add(logSum);
   return squeeze(resultToSqueeze, axis);
 }
 

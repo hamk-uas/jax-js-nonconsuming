@@ -209,7 +209,8 @@ const checkLeaks = {
 		_active = false;
 		_disposeAllJitCaches();
 		let leaked = 0;
-		for (const [d, baseline] of _startSlots) try {
+		for (const d of devices) try {
+			const baseline = _startSlots.get(d) ?? 0;
 			leaked += getBackend(d).slotCount() - baseline;
 		} catch {}
 		_startSlots.clear();
@@ -872,6 +873,20 @@ function concatenate$1(xs, axis) {
 	const avals = xs.map((x) => ShapedArray.fromAval(getAval(x)));
 	axis = checkAxis(axis, avals[0].ndim);
 	for (const x of avals) if (x.ndim !== avals[0].ndim || !x.shape.every((s, i) => i === axis || s === avals[0].shape[i])) throw new Error(`Concatenate: inputs ${avals[0]} and ${x} must match shapes except on axis ${axis}`);
+	const MAX_CONCAT_CHUNK = 7;
+	if (xs.length > MAX_CONCAT_CHUNK) {
+		const chunks = [];
+		for (let i = 0; i < xs.length; i += MAX_CONCAT_CHUNK) {
+			const group = xs.slice(i, Math.min(i + MAX_CONCAT_CHUNK, xs.length));
+			chunks.push(group.length === 1 ? group[0] : bind1(Primitive.Concatenate, group, { axis }));
+		}
+		const result = concatenate$1(chunks, axis);
+		if (!insideAbstractTrace()) {
+			const xsSet = new Set(xs);
+			for (const c of chunks) if (c !== result && !xsSet.has(c) && typeof c.dispose === "function") c.dispose();
+		}
+		return result;
+	}
 	return bind1(Primitive.Concatenate, xs, { axis });
 }
 function split$2(x, axis, sizes) {
@@ -1172,16 +1187,20 @@ var Tracer = class Tracer {
 		if (n === 0) throw new Error("mean: cannot compute mean over zero-length axis");
 		const originalDtype = this.dtype;
 		const castDtype = promoteTypes(originalDtype, DType.Float32);
-		const d = [];
 		const casted = this.astype(castDtype);
-		if (casted !== this) d.push(casted);
-		const result = reduce(casted, AluOp.Add, axis, opts);
-		d.push(result);
-		const scaled = result.mul(1 / n);
-		d.push(scaled);
-		const final_ = scaled.astype(originalDtype);
-		for (const v of d) if (v !== final_) v[Symbol.dispose]();
-		return final_;
+		let summed = null;
+		let scaled = null;
+		let final_ = null;
+		try {
+			summed = reduce(casted, AluOp.Add, axis, opts);
+			scaled = summed.mul(1 / n);
+			final_ = scaled.astype(originalDtype);
+			return final_;
+		} finally {
+			if (scaled && scaled !== final_) scaled.dispose();
+			if (summed && summed !== scaled && summed !== final_) summed.dispose();
+			if (casted !== this && casted !== summed && casted !== scaled && casted !== final_) casted.dispose();
+		}
 	}
 	/** Minimum of the elements of the array along a given axis. */
 	min(axis = null, opts) {
@@ -1197,7 +1216,7 @@ var Tracer = class Tracer {
 		try {
 			return boolArr.min(axis, opts);
 		} finally {
-			if (boolArr !== this) boolArr[Symbol.dispose]();
+			if (boolArr !== this) boolArr.dispose();
 		}
 	}
 	/** Test whether any array element along a given axis evaluates to true. */
@@ -1206,7 +1225,7 @@ var Tracer = class Tracer {
 		try {
 			return boolArr.max(axis, opts);
 		} finally {
-			if (boolArr !== this) boolArr[Symbol.dispose]();
+			if (boolArr !== this) boolArr.dispose();
 		}
 	}
 	/** Permute the dimensions of an array. Defaults to reversing the axis order. */
@@ -1318,15 +1337,15 @@ var Tracer = class Tracer {
 		const subarrayShape = this.shape.slice(1);
 		for (let i = 0; i < n; i++) if (i < n - 1) {
 			const lr = split$2(residual, 0, [1, residual.shape[0] - 1]);
-			if (residual !== this) residual[Symbol.dispose]?.();
+			if (residual !== this) residual.dispose();
 			const first = lr[0];
 			const reshaped = first.reshape(subarrayShape);
-			if (first !== reshaped) first[Symbol.dispose]?.();
+			if (first !== reshaped) first.dispose();
 			yield reshaped;
 			residual = lr[1];
 		} else {
 			const reshaped = residual.reshape(subarrayShape);
-			if (residual !== reshaped && residual !== this) residual[Symbol.dispose]?.();
+			if (residual !== reshaped && residual !== this) residual.dispose();
 			yield reshaped;
 		}
 	}
@@ -1345,8 +1364,8 @@ var Tracer = class Tracer {
 		const transposed = this.transpose(perm);
 		const sorted = sort$1(transposed);
 		const result = sorted.transpose(invertPermutation(perm));
-		if (transposed !== this) transposed[Symbol.dispose]();
-		if (sorted !== result) sorted[Symbol.dispose]();
+		if (transposed !== this) transposed.dispose();
+		if (sorted !== result) sorted.dispose();
 		return result;
 	}
 	/**
@@ -1369,9 +1388,9 @@ var Tracer = class Tracer {
 		const transposed = this.transpose(perm);
 		const [y, yi] = argsort$1(transposed);
 		y.dispose();
-		if (transposed !== this) transposed[Symbol.dispose]();
+		if (transposed !== this) transposed.dispose();
 		const result = yi.transpose(invertPermutation(perm));
-		if (yi !== result) yi[Symbol.dispose]();
+		if (yi !== result) yi.dispose();
 		return result;
 	}
 	/**
@@ -2425,9 +2444,15 @@ function sliceXsAtIteration(backend, xsSlots, xsStrides, xsAvals, iterIdx) {
 	for (let j = 0; j < xsSlots.length; j++) {
 		const srcOffset = iterIdx * xsStrides[j];
 		const sliceSize = xsAvals[j].size * byteWidth(xsAvals[j].dtype);
-		const data = backend.readSync(xsSlots[j], srcOffset, sliceSize);
-		const slot = backend.malloc(sliceSize, data);
-		slices.push(slot);
+		if (backend.copyBufferToBuffer) {
+			const slot = backend.malloc(sliceSize);
+			backend.copyBufferToBuffer(xsSlots[j], srcOffset, slot, 0, sliceSize);
+			slices.push(slot);
+		} else {
+			const data = backend.readSync(xsSlots[j], srcOffset, sliceSize);
+			const slot = backend.malloc(sliceSize, data);
+			slices.push(slot);
+		}
 	}
 	return slices;
 }
@@ -2772,6 +2797,28 @@ function tryPrepareWebGPUNativeScan(backend, bodyProgram, bodyJaxpr, executeStep
 		step
 	});
 	orderedSteps.sort((a, b) => a.carryIdx - b.carryIdx);
+	for (let i = 0; i < orderedSteps.length; i++) {
+		const writtenCarryGid = numConsts + orderedSteps[i].carryIdx;
+		for (let j = i + 1; j < orderedSteps.length; j++) {
+			const laterStep = orderedSteps[j].step;
+			const laterSource = laterStep.source;
+			const laterReindexMap = laterStep.inputs;
+			const laterExp = laterSource.exp.reindexGids(laterReindexMap);
+			const readsWrittenCarry = laterExp.some((e$1) => (e$1.op === AluOp.GlobalIndex || e$1.op === AluOp.GlobalView) && e$1.arg[0] === writtenCarryGid);
+			if (readsWrittenCarry) {
+				if (DEBUG >= 1) console.log(`[webgpu-scan] skipped, step ${j} reads carry[${orderedSteps[i].carryIdx}] written by step ${i}`);
+				return null;
+			}
+			if (laterSource.reduction) {
+				const laterReductionExp = laterSource.reduction.epilogue.reindexGids(laterReindexMap);
+				const readsInReduction = laterReductionExp.some((e$1) => (e$1.op === AluOp.GlobalIndex || e$1.op === AluOp.GlobalView) && e$1.arg[0] === writtenCarryGid);
+				if (readsInReduction) {
+					if (DEBUG >= 1) console.log(`[webgpu-scan] skipped, step ${j} reduction reads carry[${orderedSteps[i].carryIdx}] written by step ${i}`);
+					return null;
+				}
+			}
+		}
+	}
 	const multiSteps = orderedSteps.map(({ carryIdx, step }) => {
 		const source = step.source;
 		const reindexMap = step.inputs;
@@ -4468,28 +4515,35 @@ var Array$1 = class Array$1 extends Tracer {
 				return outputs;
 			},
 			[Primitive.RandomBits]([k0, k1], { shape: shape$1, mode }) {
-				const keyShape = k0.shape;
-				const genShape = shape$1.slice(keyShape.length);
-				const c0 = zeros(genShape, {
-					dtype: DType.Uint32,
-					device: k0.device
-				});
-				const c1 = arange(0, prod(genShape), 1, {
-					dtype: DType.Uint32,
-					device: k0.device
-				}).reshape(genShape);
-				const k0View = k0.#reshape(k0.#st.reshape(keyShape.concat(rep(genShape.length, 1))));
-				const k1View = k1.#reshape(k1.#st.reshape(keyShape.concat(rep(genShape.length, 1))));
-				const custom = ([k0$1, k1$1, c0$1, c1$1]) => AluExp.threefry2x32(k0$1, k1$1, c0$1, c1$1, mode);
-				const result = Array$1.#naryCustom("random_bits", custom, [
-					k0View,
-					k1View,
-					c0,
-					c1
-				]);
-				k0View.dispose();
-				k1View.dispose();
-				return [result];
+				try {
+					var _usingCtx3 = _usingCtx();
+					const keyShape = k0.shape;
+					const genShape = shape$1.slice(keyShape.length);
+					const c0 = _usingCtx3.u(zeros(genShape, {
+						dtype: DType.Uint32,
+						device: k0.device
+					}));
+					const c1 = _usingCtx3.u(arange(0, prod(genShape), 1, {
+						dtype: DType.Uint32,
+						device: k0.device
+					}).reshape(genShape));
+					const k0View = k0.#reshape(k0.#st.reshape(keyShape.concat(rep(genShape.length, 1))));
+					const k1View = k1.#reshape(k1.#st.reshape(keyShape.concat(rep(genShape.length, 1))));
+					const custom = ([k0$1, k1$1, c0$1, c1$1]) => AluExp.threefry2x32(k0$1, k1$1, c0$1, c1$1, mode);
+					const result = Array$1.#naryCustom("random_bits", custom, [
+						k0View,
+						k1View,
+						c0,
+						c1
+					]);
+					k0View.dispose();
+					k1View.dispose();
+					return [result];
+				} catch (_) {
+					_usingCtx3.e = _;
+				} finally {
+					_usingCtx3.d();
+				}
 			},
 			[Primitive.Gather]([x, ...indices], { axis, outDim }) {
 				return [x.#gather(indices, axis, outDim)];
@@ -5016,61 +5070,61 @@ function arange(start, stop, step = 1, { dtype, device } = {}) {
 */
 function tri(n, m, k = 0, { dtype, device } = {}) {
 	try {
-		var _usingCtx3 = _usingCtx();
+		var _usingCtx4 = _usingCtx();
 		m ??= n;
 		dtype ??= DType.Float32;
 		if (!Number.isInteger(n) || n < 0) throw new Error(`tri: n must be a non-negative integer, got ${n}`);
 		if (!Number.isInteger(m) || m < 0) throw new Error(`tri: m must be a non-negative integer, got ${m}`);
 		if (!Number.isInteger(k)) throw new Error(`tri: k must be an integer, got ${k}`);
-		const rows = _usingCtx3.u(arange(k, n + k, 1, {
+		const rows = _usingCtx4.u(arange(k, n + k, 1, {
 			dtype: DType.Int32,
 			device
 		}));
-		const cols = _usingCtx3.u(arange(0, m, 1, {
+		const cols = _usingCtx4.u(arange(0, m, 1, {
 			dtype: DType.Int32,
 			device
 		}));
-		const rowsReshaped = _usingCtx3.u(rows.reshape([n, 1]));
+		const rowsReshaped = _usingCtx4.u(rows.reshape([n, 1]));
 		const ge = rowsReshaped.greaterEqual(cols);
 		if (ge.dtype === dtype) return ge;
-		_usingCtx3.u(ge);
+		_usingCtx4.u(ge);
 		return ge.astype(dtype);
-	} catch (_) {
-		_usingCtx3.e = _;
-	} finally {
-		_usingCtx3.d();
-	}
-}
-/** Return the lower triangle of an array. Must be of dimension >= 2. */
-function tril(a, k = 0) {
-	try {
-		var _usingCtx4 = _usingCtx();
-		if (ndim$1(a) < 2) throw new Error(`tril: input array must be at least 2D, got ${ndim$1(a)}D`);
-		a = fudgeArray(a);
-		const [n, m] = a.shape.slice(-2);
-		const mask = _usingCtx4.u(tri(n, m, k, { dtype: DType.Bool }));
-		const zeros$1 = _usingCtx4.u(zerosLike$1(a));
-		return where$1(mask, a, zeros$1);
 	} catch (_) {
 		_usingCtx4.e = _;
 	} finally {
 		_usingCtx4.d();
 	}
 }
-/** Return the upper triangle of an array. Must be of dimension >= 2. */
-function triu(a, k = 0) {
+/** Return the lower triangle of an array. Must be of dimension >= 2. */
+function tril(a, k = 0) {
 	try {
 		var _usingCtx5 = _usingCtx();
 		if (ndim$1(a) < 2) throw new Error(`tril: input array must be at least 2D, got ${ndim$1(a)}D`);
 		a = fudgeArray(a);
 		const [n, m] = a.shape.slice(-2);
-		const mask = _usingCtx5.u(tri(n, m, k - 1, { dtype: DType.Bool }));
+		const mask = _usingCtx5.u(tri(n, m, k, { dtype: DType.Bool }));
 		const zeros$1 = _usingCtx5.u(zerosLike$1(a));
-		return where$1(mask, zeros$1, a);
+		return where$1(mask, a, zeros$1);
 	} catch (_) {
 		_usingCtx5.e = _;
 	} finally {
 		_usingCtx5.d();
+	}
+}
+/** Return the upper triangle of an array. Must be of dimension >= 2. */
+function triu(a, k = 0) {
+	try {
+		var _usingCtx6 = _usingCtx();
+		if (ndim$1(a) < 2) throw new Error(`tril: input array must be at least 2D, got ${ndim$1(a)}D`);
+		a = fudgeArray(a);
+		const [n, m] = a.shape.slice(-2);
+		const mask = _usingCtx6.u(tri(n, m, k - 1, { dtype: DType.Bool }));
+		const zeros$1 = _usingCtx6.u(zerosLike$1(a));
+		return where$1(mask, zeros$1, a);
+	} catch (_) {
+		_usingCtx6.e = _;
+	} finally {
+		_usingCtx6.d();
 	}
 }
 /**
@@ -5386,12 +5440,12 @@ const vmapRules = {
 			const newAxis = [0, ...axis.map((ax) => ax + 1)];
 			const arangeArr = arange(axisSize);
 			const extraBatchIndex = arangeArr.reshape([-1, ...rep(nd - 1, 1)]);
-			arangeArr[Symbol.dispose]();
+			arangeArr.dispose();
 			indices.splice(0, 0, extraBatchIndex);
 			const result = gather(x, indices, newAxis, outDim);
-			if (x !== origX) x[Symbol.dispose]();
-			extraBatchIndex[Symbol.dispose]();
-			for (let i = 1; i < indices.length; i++) if (indices[i] !== origIndices[i - 1]) indices[i][Symbol.dispose]();
+			if (x !== origX) x.dispose();
+			extraBatchIndex.dispose();
+			for (let i = 1; i < indices.length; i++) if (indices[i] !== origIndices[i - 1]) indices[i].dispose();
 			return [[result], [outDim]];
 		}
 	},
@@ -6012,7 +6066,7 @@ const jvpRules = {
 	[Primitive.Sort]([x], [dx]) {
 		const [y, idx] = argsort$1(x);
 		const gatherResult = gather(dx, [idx], [-1], -1);
-		idx.dispose();
+		if (!_peArrayCreationTracker) idx.dispose();
 		return [[y], [gatherResult]];
 	},
 	[Primitive.Argsort]([x], [dx]) {
@@ -6473,6 +6527,7 @@ function linearizeFlatUtil(f, primalsIn) {
 function linearizeFlat(f, primalsIn, auxStore) {
 	const { primalsOut, jaxpr, peIntermediates, literalIntermediates } = linearizeFlatUtil(f, primalsIn);
 	const protectedVals = new Set(primalsOut);
+	for (const c of jaxpr.consts) if (c.refCount <= 1) protectedVals.add(c);
 	if (auxStore?.value != null) for (const arr of collectConcreteArrays(auxStore.value)) protectedVals.add(arr);
 	disposePeIntermediates(peIntermediates, literalIntermediates, protectedVals);
 	const fLin = (...tangents) => evalJaxpr(jaxpr.jaxpr, [...jaxpr.consts.map((c) => c.ref), ...tangents]);
@@ -7172,7 +7227,15 @@ const transposeRules = {
 	[Primitive.Gather]([ct], [x, ...indices], { axis, outDim }) {
 		if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Gather);
 		if (indices.some((i) => i instanceof UndefPrimal)) throw new NonlinearError(Primitive.Gather);
-		throw new Error("Gather transpose rule is not yet implemented, requires complex Scatter sum operation");
+		if (indices.length === 1 && axis.length === 1 && ct.shape[axis[0]] === x.aval.shape[axis[0]]) {
+			const idx = indices[0];
+			const [sortedVals, invIdx] = argsort$1(idx);
+			const result = gather(ct, [invIdx], axis, outDim);
+			sortedVals.dispose();
+			invIdx.dispose();
+			return [result, null];
+		}
+		throw new Error("Gather transpose rule is only implemented for permutation gathers. General case (duplicate indices) requires a scatter_add primitive.");
 	},
 	[Primitive.Transpose]([ct], [x], { perm }) {
 		if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Transpose);
@@ -7504,6 +7567,7 @@ function transposeJaxpr(jaxpr, undefPrimals) {
 function vjpFlat(f, primalsIn, auxStore) {
 	const { primalsOut, jaxpr, peIntermediates, literalIntermediates } = linearizeFlatUtil(f, primalsIn);
 	const protectedVals = new Set(primalsOut);
+	for (const c of jaxpr.consts) if (c.refCount <= 1) protectedVals.add(c);
 	if (auxStore?.value != null) for (const arr of collectConcreteArrays(auxStore.value)) protectedVals.add(arr);
 	disposePeIntermediates(peIntermediates, literalIntermediates, protectedVals);
 	if (!insideAbstractTrace()) {
@@ -7863,24 +7927,35 @@ function checkPowerOfTwo(name, n) {
 	if ((n & n - 1) !== 0) throw new Error(`jax.numpy.fft.${name}: size must be a power of two, got ${n}`);
 }
 const fftUpdate = jit$1(function fftUpdate$1(i, { real, imag }) {
-	const half = 2 ** i;
-	real = real.reshape([-1, 2 * half]);
-	imag = imag.reshape([-1, 2 * half]);
-	const k = arange(0, half, 1, { dtype: real.dtype });
-	anonymousConstArrays.add(k);
-	const theta = k.mul(-Math.PI / half);
-	const wr = cos(theta);
-	const wi = sin(theta);
-	const ur = real.slice([], [0, half]);
-	const ui = imag.slice([], [0, half]);
-	const vr = real.slice([], [half, 2 * half]);
-	const vi = imag.slice([], [half, 2 * half]);
-	const tr = vr.mul(wr).sub(vi.mul(wi));
-	const ti = vr.mul(wi).add(vi.mul(wr));
-	return {
-		real: concatenate([ur.add(tr), ur.sub(tr)], -1),
-		imag: concatenate([ui.add(ti), ui.sub(ti)], -1)
-	};
+	try {
+		var _usingCtx$1 = _usingCtx();
+		const half = 2 ** i;
+		real = real.reshape([-1, 2 * half]);
+		imag = imag.reshape([-1, 2 * half]);
+		const k = arange(0, half, 1, { dtype: real.dtype });
+		anonymousConstArrays.add(k);
+		const theta = _usingCtx$1.u(k.mul(-Math.PI / half));
+		const wr = cos(theta);
+		const wi = sin(theta);
+		const ur = real.slice([], [0, half]);
+		const ui = imag.slice([], [0, half]);
+		const vr = real.slice([], [half, 2 * half]);
+		const vi = imag.slice([], [half, 2 * half]);
+		const vrWr = _usingCtx$1.u(vr.mul(wr));
+		const viWi = _usingCtx$1.u(vi.mul(wi));
+		const tr = vrWr.sub(viWi);
+		const vrWi = _usingCtx$1.u(vr.mul(wi));
+		const viWr = _usingCtx$1.u(vi.mul(wr));
+		const ti = vrWi.add(viWr);
+		return {
+			real: concatenate([ur.add(tr), ur.sub(tr)], -1),
+			imag: concatenate([ui.add(ti), ui.sub(ti)], -1)
+		};
+	} catch (_) {
+		_usingCtx$1.e = _;
+	} finally {
+		_usingCtx$1.d();
+	}
 }, { staticArgnums: [0] });
 /**
 * Compute a one-dimensional discrete Fourier transform.
@@ -7951,28 +8026,28 @@ function fft(a, axis = -1) {
 */
 function ifft(a, axis = -1) {
 	try {
-		var _usingCtx$1 = _usingCtx();
+		var _usingCtx3 = _usingCtx();
 		checkPairInput("ifft", a);
 		const { real, imag } = a;
 		axis = checkAxis(axis, real.ndim);
 		const n = real.shape[axis];
 		checkPowerOfTwo("ifft", n);
-		const negImag = _usingCtx$1.u(imag.mul(-1));
+		const negImag = _usingCtx3.u(imag.mul(-1));
 		const result = fft({
 			real,
 			imag: negImag
 		}, axis);
-		const fftReal = _usingCtx$1.u(result.real);
-		const fftImag = _usingCtx$1.u(result.imag);
-		const negFftImag = _usingCtx$1.u(fftImag.mul(-1));
+		const fftReal = _usingCtx3.u(result.real);
+		const fftImag = _usingCtx3.u(result.imag);
+		const negFftImag = _usingCtx3.u(fftImag.mul(-1));
 		return {
 			real: fftReal.div(n),
 			imag: negFftImag.div(n)
 		};
 	} catch (_) {
-		_usingCtx$1.e = _;
+		_usingCtx3.e = _;
 	} finally {
-		_usingCtx$1.d();
+		_usingCtx3.d();
 	}
 }
 
@@ -9812,7 +9887,16 @@ const fmod = jit$1(function fmod$1(x, y) {
 * Calculate element-wise remainder of the division (matches sign of y).
 */
 const remainder = jit$1(function remainder$1(x, y) {
-	return mod(mod(x, y).add(y), y);
+	try {
+		var _usingCtx27 = _usingCtx();
+		const inner$1 = _usingCtx27.u(mod(x, y));
+		const shifted = _usingCtx27.u(inner$1.add(y));
+		return mod(shifted, y);
+	} catch (_) {
+		_usingCtx27.e = _;
+	} finally {
+		_usingCtx27.d();
+	}
 });
 /**
 * Return element-wise quotient and remainder simultaneously.
@@ -9842,13 +9926,13 @@ function trunc(x) {
 */
 function ldexp(x1, x2) {
 	try {
-		var _usingCtx27 = _usingCtx();
-		const e$1 = _usingCtx27.u(exp2(x2));
+		var _usingCtx28 = _usingCtx();
+		const e$1 = _usingCtx28.u(exp2(x2));
 		return multiply(x1, e$1);
 	} catch (_) {
-		_usingCtx27.e = _;
+		_usingCtx28.e = _;
 	} finally {
-		_usingCtx27.d();
+		_usingCtx28.d();
 	}
 }
 /**
@@ -9859,70 +9943,83 @@ function ldexp(x1, x2) {
 * `x = mantissa * 2**exponent`.
 */
 function frexp(x) {
-	x = fudgeArray(x);
-	const absx = absolute(x);
-	const exponent = where(equal(x, 0), 0, floor(log2(absx)).add(1).astype(DType.Int32));
-	const mantissa = x.div(exp2(exponent.astype(x.dtype)));
-	return [mantissa, exponent];
-}
-/** Calculate `2**p` for all p in the input array. */
-function exp2(p) {
-	try {
-		var _usingCtx28 = _usingCtx();
-		const prod$2 = _usingCtx28.u(multiply(p, Math.LN2));
-		return exp(prod$2);
-	} catch (_) {
-		_usingCtx28.e = _;
-	} finally {
-		_usingCtx28.d();
-	}
-}
-/** Return the base-2 logarithm of x, element-wise. */
-function log2(x) {
 	try {
 		var _usingCtx29 = _usingCtx();
-		const logX = _usingCtx29.u(log(x));
-		return logX.mul(Math.LOG2E);
+		x = fudgeArray(x);
+		const absx = _usingCtx29.u(absolute(x));
+		const log2abs = _usingCtx29.u(log2(absx));
+		const floorLog = _usingCtx29.u(floor(log2abs));
+		const shiftedExp = _usingCtx29.u(floorLog.add(1));
+		const exponentI32 = _usingCtx29.u(shiftedExp.astype(DType.Int32));
+		const exponent = where(equal(x, 0), 0, exponentI32);
+		const exponentAsX = _usingCtx29.u(exponent.astype(x.dtype));
+		const scale = _usingCtx29.u(exp2(exponentAsX));
+		const mantissa = x.div(scale);
+		return [mantissa, exponent];
 	} catch (_) {
 		_usingCtx29.e = _;
 	} finally {
 		_usingCtx29.d();
 	}
 }
-/** Return the base-10 logarithm of x, element-wise. */
-function log10(x) {
+/** Calculate `2**p` for all p in the input array. */
+function exp2(p) {
 	try {
 		var _usingCtx30 = _usingCtx();
-		const logX = _usingCtx30.u(log(x));
-		return logX.mul(Math.LOG10E);
+		const prod$2 = _usingCtx30.u(multiply(p, Math.LN2));
+		return exp(prod$2);
 	} catch (_) {
 		_usingCtx30.e = _;
 	} finally {
 		_usingCtx30.d();
 	}
 }
-/** Calculate `exp(x) - 1` element-wise. */
-function expm1(x) {
+/** Return the base-2 logarithm of x, element-wise. */
+function log2(x) {
 	try {
 		var _usingCtx31 = _usingCtx();
-		const expX = _usingCtx31.u(exp(x));
-		return expX.sub(1);
+		const logX = _usingCtx31.u(log(x));
+		return logX.mul(Math.LOG2E);
 	} catch (_) {
 		_usingCtx31.e = _;
 	} finally {
 		_usingCtx31.d();
 	}
 }
-/** Calculate the natural logarithm of `1 + x` element-wise. */
-function log1p(x) {
+/** Return the base-10 logarithm of x, element-wise. */
+function log10(x) {
 	try {
 		var _usingCtx32 = _usingCtx();
-		const sum$1 = _usingCtx32.u(add(1, x));
-		return log(sum$1);
+		const logX = _usingCtx32.u(log(x));
+		return logX.mul(Math.LOG10E);
 	} catch (_) {
 		_usingCtx32.e = _;
 	} finally {
 		_usingCtx32.d();
+	}
+}
+/** Calculate `exp(x) - 1` element-wise. */
+function expm1(x) {
+	try {
+		var _usingCtx33 = _usingCtx();
+		const expX = _usingCtx33.u(exp(x));
+		return expX.sub(1);
+	} catch (_) {
+		_usingCtx33.e = _;
+	} finally {
+		_usingCtx33.d();
+	}
+}
+/** Calculate the natural logarithm of `1 + x` element-wise. */
+function log1p(x) {
+	try {
+		var _usingCtx34 = _usingCtx();
+		const sum$1 = _usingCtx34.u(add(1, x));
+		return log(sum$1);
+	} catch (_) {
+		_usingCtx34.e = _;
+	} finally {
+		_usingCtx34.d();
 	}
 }
 /** Convert angles from degrees to radians. */
@@ -9942,15 +10039,40 @@ const degrees = rad2deg;
 * Computes first array raised to power of second array, element-wise.
 */
 const power = jit$1(function power$1(x1, x2) {
-	const x2i = trunc(x2);
-	const shouldBeNaN = multiply(x2.notEqual(x2i), x1.less(0));
-	const resultSign = where(mod(x2i, 2).notEqual(0), where(x1.less(0), -1, 1), 1);
-	return where(shouldBeNaN, nan, exp(log(absolute(x1)).mul(x2)).mul(resultSign));
+	try {
+		var _usingCtx35 = _usingCtx();
+		const x2i = trunc(x2);
+		const shouldBeNaN = multiply(x2.notEqual(x2i), x1.less(0));
+		const parityRaw = _usingCtx35.u(mod(x2i, 2));
+		const parityOdd = _usingCtx35.u(parityRaw.notEqual(0));
+		const resultSign = where(parityOdd, where(x1.less(0), -1, 1), 1);
+		const absX1 = _usingCtx35.u(absolute(x1));
+		const logAbsX1 = _usingCtx35.u(log(absX1));
+		const scaled = _usingCtx35.u(logAbsX1.mul(x2));
+		const magnitude = _usingCtx35.u(exp(scaled));
+		const signedMagnitude = _usingCtx35.u(magnitude.mul(resultSign));
+		return where(shouldBeNaN, nan, signedMagnitude);
+	} catch (_) {
+		_usingCtx35.e = _;
+	} finally {
+		_usingCtx35.d();
+	}
 });
 /** @function Calculate the element-wise cube root of the input array. */
 const cbrt = jit$1(function cbrt$1(x) {
-	const sgn = where(less(x, 0), -1, 1);
-	return sgn.mul(exp(log(x.mul(sgn)).mul(1 / 3)));
+	try {
+		var _usingCtx36 = _usingCtx();
+		const sgn = where(less(x, 0), -1, 1);
+		const signedX = _usingCtx36.u(x.mul(sgn));
+		const logSignedX = _usingCtx36.u(log(signedX));
+		const scaled = _usingCtx36.u(logSignedX.mul(1 / 3));
+		const magnitude = _usingCtx36.u(exp(scaled));
+		return sgn.mul(magnitude);
+	} catch (_) {
+		_usingCtx36.e = _;
+	} finally {
+		_usingCtx36.d();
+	}
 });
 /**
 * @function
@@ -9959,9 +10081,17 @@ const cbrt = jit$1(function cbrt$1(x) {
 * `sinh(x) = (exp(x) - exp(-x)) / 2`
 */
 const sinh = jit$1(function sinh$1(x) {
-	const ex = exp(x);
-	const emx = reciprocal(ex);
-	return ex.sub(emx).mul(.5);
+	try {
+		var _usingCtx37 = _usingCtx();
+		const ex = exp(x);
+		const emx = reciprocal(ex);
+		const diff = _usingCtx37.u(ex.sub(emx));
+		return diff.mul(.5);
+	} catch (_) {
+		_usingCtx37.e = _;
+	} finally {
+		_usingCtx37.d();
+	}
 });
 /**
 * @function
@@ -9970,9 +10100,17 @@ const sinh = jit$1(function sinh$1(x) {
 * `cosh(x) = (exp(x) + exp(-x)) / 2`
 */
 const cosh = jit$1(function cosh$1(x) {
-	const ex = exp(x);
-	const emx = reciprocal(ex);
-	return ex.add(emx).mul(.5);
+	try {
+		var _usingCtx38 = _usingCtx();
+		const ex = exp(x);
+		const emx = reciprocal(ex);
+		const sum$1 = _usingCtx38.u(ex.add(emx));
+		return sum$1.mul(.5);
+	} catch (_) {
+		_usingCtx38.e = _;
+	} finally {
+		_usingCtx38.d();
+	}
 });
 /**
 * @function
@@ -9981,9 +10119,21 @@ const cosh = jit$1(function cosh$1(x) {
 * `tanh(x) = sinh(x)/cosh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))`
 */
 const tanh = jit$1(function tanh$1(x) {
-	const negsgn = where(less(x, 0), 1, -1);
-	const en2x = exp(x.mul(negsgn).mul(2));
-	return en2x.sub(1).div(en2x.add(1)).mul(negsgn);
+	try {
+		var _usingCtx39 = _usingCtx();
+		const negsgn = where(less(x, 0), 1, -1);
+		const signed = _usingCtx39.u(x.mul(negsgn));
+		const scaled = _usingCtx39.u(signed.mul(2));
+		const en2x = exp(scaled);
+		const numer = _usingCtx39.u(en2x.sub(1));
+		const denom = _usingCtx39.u(en2x.add(1));
+		const ratio = _usingCtx39.u(numer.div(denom));
+		return ratio.mul(negsgn);
+	} catch (_) {
+		_usingCtx39.e = _;
+	} finally {
+		_usingCtx39.d();
+	}
 });
 /**
 * @function
@@ -9992,7 +10142,18 @@ const tanh = jit$1(function tanh$1(x) {
 * `arcsinh(x) = ln(x + sqrt(x^2 + 1))`
 */
 const arcsinh = jit$1(function arcsinh$1(x) {
-	return log(x.add(sqrt(square(x).add(1))));
+	try {
+		var _usingCtx40 = _usingCtx();
+		const sq = _usingCtx40.u(square(x));
+		const shifted = _usingCtx40.u(sq.add(1));
+		const root = _usingCtx40.u(sqrt(shifted));
+		const arg = _usingCtx40.u(x.add(root));
+		return log(arg);
+	} catch (_) {
+		_usingCtx40.e = _;
+	} finally {
+		_usingCtx40.d();
+	}
 });
 /**
 * @function
@@ -10001,7 +10162,18 @@ const arcsinh = jit$1(function arcsinh$1(x) {
 * `arccosh(x) = ln(x + sqrt(x^2 - 1))`
 */
 const arccosh = jit$1(function arccosh$1(x) {
-	return log(x.add(sqrt(square(x).sub(1))));
+	try {
+		var _usingCtx41 = _usingCtx();
+		const sq = _usingCtx41.u(square(x));
+		const shifted = _usingCtx41.u(sq.sub(1));
+		const root = _usingCtx41.u(sqrt(shifted));
+		const arg = _usingCtx41.u(x.add(root));
+		return log(arg);
+	} catch (_) {
+		_usingCtx41.e = _;
+	} finally {
+		_usingCtx41.d();
+	}
 });
 /**
 * @function
@@ -10055,19 +10227,19 @@ function var_(x, axis = null, opts) {
 */
 function std(x, axis = null, opts) {
 	try {
-		var _usingCtx33 = _usingCtx();
-		const v = _usingCtx33.u(var_(x, axis, opts));
+		var _usingCtx42 = _usingCtx();
+		const v = _usingCtx42.u(var_(x, axis, opts));
 		return sqrt(v);
 	} catch (_) {
-		_usingCtx33.e = _;
+		_usingCtx42.e = _;
 	} finally {
-		_usingCtx33.d();
+		_usingCtx42.d();
 	}
 }
 /** Estimate the sample covariance of a set of variables. */
 function cov(x, y = null, { rowvar = true } = {}) {
 	try {
-		var _usingCtx34 = _usingCtx();
+		var _usingCtx43 = _usingCtx();
 		const disposables = [];
 		let a = fudgeArray(x);
 		if (a.ndim === 1) {
@@ -10088,47 +10260,47 @@ function cov(x, y = null, { rowvar = true } = {}) {
 			disposables.push(a);
 		}
 		const [_M, N] = a.shape;
-		const mean$1 = _usingCtx34.u(a.mean(1, { keepdims: true }));
+		const mean$1 = _usingCtx43.u(a.mean(1, { keepdims: true }));
 		const centered = a.sub(mean$1);
 		disposables.push(centered);
-		const xt = _usingCtx34.u(centered.transpose());
-		const dotResult = _usingCtx34.u(dot$1(centered, xt));
+		const xt = _usingCtx43.u(centered.transpose());
+		const dotResult = _usingCtx43.u(dot$1(centered, xt));
 		const result = dotResult.div(N - 1);
 		for (const d of disposables) d.dispose();
 		return result;
 	} catch (_) {
-		_usingCtx34.e = _;
+		_usingCtx43.e = _;
 	} finally {
-		_usingCtx34.d();
+		_usingCtx43.d();
 	}
 }
 /** Compute the Pearson correlation coefficients (in range `[-1, 1]`). */
 function corrcoef(x, y) {
 	try {
-		var _usingCtx35 = _usingCtx();
-		const c = _usingCtx35.u(cov(x, y));
-		const variances = _usingCtx35.u(diag(c));
-		const norm = _usingCtx35.u(sqrt(outer(variances, variances)));
+		var _usingCtx44 = _usingCtx();
+		const c = _usingCtx44.u(cov(x, y));
+		const variances = _usingCtx44.u(diag(c));
+		const norm = _usingCtx44.u(sqrt(outer(variances, variances)));
 		return c.div(norm);
 	} catch (_) {
-		_usingCtx35.e = _;
+		_usingCtx44.e = _;
 	} finally {
-		_usingCtx35.d();
+		_usingCtx44.d();
 	}
 }
 /** Test element-wise for positive or negative infinity, return bool array. */
 function isinf(x) {
 	try {
-		var _usingCtx36 = _usingCtx();
+		var _usingCtx45 = _usingCtx();
 		x = fudgeArray(x);
 		if (!isFloatDtype(x.dtype)) return fullLike$1(x, false);
-		const posInf = _usingCtx36.u(x.equal(Infinity));
-		const negInf = _usingCtx36.u(x.equal(-Infinity));
+		const posInf = _usingCtx45.u(x.equal(Infinity));
+		const negInf = _usingCtx45.u(x.equal(-Infinity));
 		return posInf.add(negInf);
 	} catch (_) {
-		_usingCtx36.e = _;
+		_usingCtx45.e = _;
 	} finally {
-		_usingCtx36.d();
+		_usingCtx45.d();
 	}
 }
 /** Test element-wise for NaN (Not a Number). */
@@ -10154,20 +10326,20 @@ function isposinf(x) {
 */
 function nanToNum(x, { nan: nan$1 = 0, posinf = null, neginf = null } = {}) {
 	try {
-		var _usingCtx37 = _usingCtx();
+		var _usingCtx46 = _usingCtx();
 		x = fudgeArray(x);
-		const nanMask = _usingCtx37.u(isnan(x));
-		const afterNan = _usingCtx37.u(where(nanMask, nan$1, x));
+		const nanMask = _usingCtx46.u(isnan(x));
+		const afterNan = _usingCtx46.u(where(nanMask, nan$1, x));
 		posinf ??= isFloatDtype(afterNan.dtype) ? finfo(afterNan.dtype).max : iinfo(afterNan.dtype).max;
 		neginf ??= isFloatDtype(afterNan.dtype) ? finfo(afterNan.dtype).min : iinfo(afterNan.dtype).min;
-		const posInfMask = _usingCtx37.u(isposinf(afterNan));
-		const afterPosInf = _usingCtx37.u(where(posInfMask, posinf, afterNan));
-		const negInfMask = _usingCtx37.u(isneginf(afterPosInf));
+		const posInfMask = _usingCtx46.u(isposinf(afterNan));
+		const afterPosInf = _usingCtx46.u(where(posInfMask, posinf, afterNan));
+		const negInfMask = _usingCtx46.u(isneginf(afterPosInf));
 		return where(negInfMask, neginf, afterPosInf);
 	} catch (_) {
-		_usingCtx37.e = _;
+		_usingCtx46.e = _;
 	} finally {
-		_usingCtx37.d();
+		_usingCtx46.d();
 	}
 }
 /**
@@ -10175,8 +10347,18 @@ function nanToNum(x, { nan: nan$1 = 0, posinf = null, neginf = null } = {}) {
 * Test element-wise for finite values (not infinity or NaN).
 */
 const isfinite = jit$1(function isfinite$1(x) {
-	if (!isFloatDtype(x.dtype)) return fullLike$1(x, true);
-	return isnan(x).add(isinf(x)).notEqual(true);
+	try {
+		var _usingCtx47 = _usingCtx();
+		if (!isFloatDtype(x.dtype)) return fullLike$1(x, true);
+		const nanMask = _usingCtx47.u(isnan(x));
+		const infMask = _usingCtx47.u(isinf(x));
+		const union = _usingCtx47.u(nanMask.add(infMask));
+		return union.notEqual(true);
+	} catch (_) {
+		_usingCtx47.e = _;
+	} finally {
+		_usingCtx47.d();
+	}
 });
 
 //#endregion
@@ -11038,7 +11220,16 @@ const sparsePlus = jit$1((x) => {
 * - When `x >= 1`: `1`
 */
 const sparseSigmoid = jit$1((x) => {
-	return clip(x.add(1).mul(.5), 0, 1);
+	try {
+		var _usingCtx4 = _usingCtx();
+		const shifted = _usingCtx4.u(x.add(1));
+		const scaled = _usingCtx4.u(shifted.mul(.5));
+		return clip(scaled, 0, 1);
+	} catch (_) {
+		_usingCtx4.e = _;
+	} finally {
+		_usingCtx4.d();
+	}
 });
 /**
 * Soft-sign activation function, computed element-wise:
@@ -11046,15 +11237,15 @@ const sparseSigmoid = jit$1((x) => {
 */
 function softSign(x) {
 	try {
-		var _usingCtx4 = _usingCtx();
+		var _usingCtx5 = _usingCtx();
 		x = fudgeArray(x);
-		const absX = _usingCtx4.u(absolute(x));
-		const denom = _usingCtx4.u(absX.add(1));
+		const absX = _usingCtx5.u(absolute(x));
+		const denom = _usingCtx5.u(absX.add(1));
 		return x.div(denom);
 	} catch (_) {
-		_usingCtx4.e = _;
+		_usingCtx5.e = _;
 	} finally {
-		_usingCtx4.d();
+		_usingCtx5.d();
 	}
 }
 /**
@@ -11076,14 +11267,14 @@ const silu = jit$1(function silu$1(x) {
 */
 function logSigmoid(x) {
 	try {
-		var _usingCtx5 = _usingCtx();
-		const neg$1 = _usingCtx5.u(negative(x));
-		const sp = _usingCtx5.u(softplus(neg$1));
+		var _usingCtx6 = _usingCtx();
+		const neg$1 = _usingCtx6.u(negative(x));
+		const sp = _usingCtx6.u(softplus(neg$1));
 		return negative(sp);
 	} catch (_) {
-		_usingCtx5.e = _;
+		_usingCtx6.e = _;
 	} finally {
-		_usingCtx5.d();
+		_usingCtx6.d();
 	}
 }
 /**
@@ -11094,41 +11285,41 @@ const identity = fudgeArray;
 /** Leaky rectified linear (ReLU) activation function */
 function leakyRelu(x, negativeSlope = .01) {
 	try {
-		var _usingCtx6 = _usingCtx();
-		x = fudgeArray(x);
-		const cond = _usingCtx6.u(less(x, 0));
-		const scaled = _usingCtx6.u(x.mul(negativeSlope));
-		return where(cond, scaled, x);
-	} catch (_) {
-		_usingCtx6.e = _;
-	} finally {
-		_usingCtx6.d();
-	}
-}
-/** Hard sigmoid activation function: `relu6(x+3)/6`. */
-function hardSigmoid(x) {
-	try {
 		var _usingCtx7 = _usingCtx();
-		const sum$1 = _usingCtx7.u(add(x, 3));
-		const r = _usingCtx7.u(relu6(sum$1));
-		return r.mul(1 / 6);
+		x = fudgeArray(x);
+		const cond = _usingCtx7.u(less(x, 0));
+		const scaled = _usingCtx7.u(x.mul(negativeSlope));
+		return where(cond, scaled, x);
 	} catch (_) {
 		_usingCtx7.e = _;
 	} finally {
 		_usingCtx7.d();
 	}
 }
-/** Hard SiLU (swish) activation function: `x * hardSigmoid(x)`. */
-function hardSilu(x) {
+/** Hard sigmoid activation function: `relu6(x+3)/6`. */
+function hardSigmoid(x) {
 	try {
 		var _usingCtx8 = _usingCtx();
-		x = fudgeArray(x);
-		const hs = _usingCtx8.u(hardSigmoid(x));
-		return x.mul(hs);
+		const sum$1 = _usingCtx8.u(add(x, 3));
+		const r = _usingCtx8.u(relu6(sum$1));
+		return r.mul(1 / 6);
 	} catch (_) {
 		_usingCtx8.e = _;
 	} finally {
 		_usingCtx8.d();
+	}
+}
+/** Hard SiLU (swish) activation function: `x * hardSigmoid(x)`. */
+function hardSilu(x) {
+	try {
+		var _usingCtx9 = _usingCtx();
+		x = fudgeArray(x);
+		const hs = _usingCtx9.u(hardSigmoid(x));
+		return x.mul(hs);
+	} catch (_) {
+		_usingCtx9.e = _;
+	} finally {
+		_usingCtx9.d();
 	}
 }
 /** Hard tanh activation function: `clip(x, -1, 1)`. */
@@ -11143,17 +11334,17 @@ function hardTanh(x) {
 */
 function elu(x, alpha = 1) {
 	try {
-		var _usingCtx9 = _usingCtx();
+		var _usingCtx10 = _usingCtx();
 		x = fudgeArray(x);
-		const cond = _usingCtx9.u(less(x, 0));
-		const e$1 = _usingCtx9.u(exp(x));
-		const em1 = _usingCtx9.u(e$1.sub(1));
-		const scaled = _usingCtx9.u(em1.mul(alpha));
+		const cond = _usingCtx10.u(less(x, 0));
+		const e$1 = _usingCtx10.u(exp(x));
+		const em1 = _usingCtx10.u(e$1.sub(1));
+		const scaled = _usingCtx10.u(em1.mul(alpha));
 		return where(cond, scaled, x);
 	} catch (_) {
-		_usingCtx9.e = _;
+		_usingCtx10.e = _;
 	} finally {
-		_usingCtx9.d();
+		_usingCtx10.d();
 	}
 }
 /**
@@ -11164,18 +11355,18 @@ function elu(x, alpha = 1) {
 */
 function celu(x, alpha = 1) {
 	try {
-		var _usingCtx10 = _usingCtx();
+		var _usingCtx11 = _usingCtx();
 		x = fudgeArray(x);
-		const cond = _usingCtx10.u(less(x, 0));
-		const ratio = _usingCtx10.u(x.div(alpha));
-		const e$1 = _usingCtx10.u(exp(ratio));
-		const em1 = _usingCtx10.u(e$1.sub(1));
-		const scaled = _usingCtx10.u(em1.mul(alpha));
+		const cond = _usingCtx11.u(less(x, 0));
+		const ratio = _usingCtx11.u(x.div(alpha));
+		const e$1 = _usingCtx11.u(exp(ratio));
+		const em1 = _usingCtx11.u(e$1.sub(1));
+		const scaled = _usingCtx11.u(em1.mul(alpha));
 		return where(cond, scaled, x);
 	} catch (_) {
-		_usingCtx10.e = _;
+		_usingCtx11.e = _;
 	} finally {
-		_usingCtx10.d();
+		_usingCtx11.d();
 	}
 }
 /**
@@ -11205,10 +11396,35 @@ const selu = jit$1(function selu$1(x) {
 * Reference: https://ml-explore.github.io/mlx/build/html/python/nn/_autosummary_functions/mlx.nn.gelu_approx.html
 */
 const gelu = jit$1(function gelu$1(x, opts) {
-	if (opts?.approximate ?? true) {
+	if (opts?.approximate ?? true) try {
+		var _usingCtx12 = _usingCtx();
 		const SQRT_2_OVER_PI = Math.sqrt(2 / Math.PI);
-		return x.mul(.5).mul(tanh(x.mul(x.mul(x).mul(.044715).add(1)).mul(SQRT_2_OVER_PI)).add(1));
-	} else return x.mul(.5).mul(erfc$1(negative(x.mul(Math.SQRT1_2))));
+		const x2 = _usingCtx12.u(x.mul(x));
+		const quadTerm = _usingCtx12.u(x2.mul(.044715));
+		const poly = _usingCtx12.u(quadTerm.add(1));
+		const polyScaled = _usingCtx12.u(x.mul(poly));
+		const tanhArg = _usingCtx12.u(polyScaled.mul(SQRT_2_OVER_PI));
+		const tanhVal = _usingCtx12.u(tanh(tanhArg));
+		const gate = _usingCtx12.u(tanhVal.add(1));
+		const halfX = _usingCtx12.u(x.mul(.5));
+		return halfX.mul(gate);
+	} catch (_) {
+		_usingCtx12.e = _;
+	} finally {
+		_usingCtx12.d();
+	}
+	else try {
+		var _usingCtx13 = _usingCtx();
+		const scaled = _usingCtx13.u(x.mul(Math.SQRT1_2));
+		const negScaled = _usingCtx13.u(negative(scaled));
+		const erfComp = _usingCtx13.u(erfc$1(negScaled));
+		const halfX = _usingCtx13.u(x.mul(.5));
+		return halfX.mul(erfComp);
+	} catch (_) {
+		_usingCtx13.e = _;
+	} finally {
+		_usingCtx13.d();
+	}
 }, { staticArgnums: [1] });
 /**
 * Gated linear unit (GLU) activation function.
@@ -11218,20 +11434,20 @@ const gelu = jit$1(function gelu$1(x, opts) {
 */
 function glu(x, axis = -1) {
 	try {
-		var _usingCtx11 = _usingCtx();
+		var _usingCtx14 = _usingCtx();
 		x = fudgeArray(x);
 		axis = checkAxis(axis, x.ndim);
 		const size$1 = x.shape[axis];
 		if (size$1 % 2 !== 0) throw new Error(`glu: axis ${axis} of shape (${x.shape}) does not have even length`);
 		const slice = x.shape.map((a$1) => [0, a$1]);
-		const a = _usingCtx11.u(shrink(x, slice.toSpliced(axis, 1, [0, size$1 / 2])));
-		const b = _usingCtx11.u(shrink(x, slice.toSpliced(axis, 1, [size$1 / 2, size$1])));
-		const sig = _usingCtx11.u(sigmoid(b));
+		const a = _usingCtx14.u(shrink(x, slice.toSpliced(axis, 1, [0, size$1 / 2])));
+		const b = _usingCtx14.u(shrink(x, slice.toSpliced(axis, 1, [size$1 / 2, size$1])));
+		const sig = _usingCtx14.u(sigmoid(b));
 		return a.mul(sig);
 	} catch (_) {
-		_usingCtx11.e = _;
+		_usingCtx14.e = _;
 	} finally {
-		_usingCtx11.d();
+		_usingCtx14.d();
 	}
 }
 /**
@@ -11242,17 +11458,17 @@ function glu(x, axis = -1) {
 */
 function squareplus(x, b = 4) {
 	try {
-		var _usingCtx12 = _usingCtx();
+		var _usingCtx15 = _usingCtx();
 		x = fudgeArray(x);
-		const sq = _usingCtx12.u(square(x));
-		const sumSq = _usingCtx12.u(sq.add(b));
-		const sr = _usingCtx12.u(sqrt(sumSq));
-		const sum$1 = _usingCtx12.u(x.add(sr));
+		const sq = _usingCtx15.u(square(x));
+		const sumSq = _usingCtx15.u(sq.add(b));
+		const sr = _usingCtx15.u(sqrt(sumSq));
+		const sum$1 = _usingCtx15.u(x.add(sr));
 		return sum$1.mul(.5);
 	} catch (_) {
-		_usingCtx12.e = _;
+		_usingCtx15.e = _;
 	} finally {
-		_usingCtx12.d();
+		_usingCtx15.d();
 	}
 }
 /**
@@ -11263,15 +11479,15 @@ function squareplus(x, b = 4) {
 */
 function mish(x) {
 	try {
-		var _usingCtx13 = _usingCtx();
+		var _usingCtx16 = _usingCtx();
 		x = fudgeArray(x);
-		const sp = _usingCtx13.u(softplus(x));
-		const t = _usingCtx13.u(tanh(sp));
+		const sp = _usingCtx16.u(softplus(x));
+		const t = _usingCtx16.u(tanh(sp));
 		return x.mul(t);
 	} catch (_) {
-		_usingCtx13.e = _;
+		_usingCtx16.e = _;
 	} finally {
-		_usingCtx13.d();
+		_usingCtx16.d();
 	}
 }
 /**
@@ -11284,20 +11500,20 @@ function mish(x) {
 */
 function softmax(x, axis = -1) {
 	try {
-		var _usingCtx14 = _usingCtx();
+		var _usingCtx17 = _usingCtx();
 		x = fudgeArray(x);
 		axis = normalizeAxis(axis, x.ndim);
 		if (axis.length === 0) return onesLike(x);
-		const xMax = _usingCtx14.u(max(x, axis, { keepdims: true }));
+		const xMax = _usingCtx17.u(max(x, axis, { keepdims: true }));
 		const sg = stopGradient(xMax);
-		const shifted = _usingCtx14.u(x.sub(sg));
-		const unnormalized = _usingCtx14.u(exp(shifted));
-		const denom = _usingCtx14.u(unnormalized.sum(axis, { keepdims: true }));
+		const shifted = _usingCtx17.u(x.sub(sg));
+		const unnormalized = _usingCtx17.u(exp(shifted));
+		const denom = _usingCtx17.u(unnormalized.sum(axis, { keepdims: true }));
 		return unnormalized.div(denom);
 	} catch (_) {
-		_usingCtx14.e = _;
+		_usingCtx17.e = _;
 	} finally {
-		_usingCtx14.d();
+		_usingCtx17.d();
 	}
 }
 /**
@@ -11310,21 +11526,21 @@ function softmax(x, axis = -1) {
 */
 function logSoftmax(x, axis = -1) {
 	try {
-		var _usingCtx15 = _usingCtx();
+		var _usingCtx18 = _usingCtx();
 		x = fudgeArray(x);
 		axis = normalizeAxis(axis, x.ndim);
 		if (axis.length === 0) return zerosLike(x);
-		const xMax = _usingCtx15.u(max(x, axis, { keepdims: true }));
+		const xMax = _usingCtx18.u(max(x, axis, { keepdims: true }));
 		const sg = stopGradient(xMax);
-		const shifted = _usingCtx15.u(x.sub(sg));
-		const expShifted = _usingCtx15.u(exp(shifted));
-		const sumExp = _usingCtx15.u(expShifted.sum(axis, { keepdims: true }));
-		const shiftedLogsumexp = _usingCtx15.u(log(sumExp));
+		const shifted = _usingCtx18.u(x.sub(sg));
+		const expShifted = _usingCtx18.u(exp(shifted));
+		const sumExp = _usingCtx18.u(expShifted.sum(axis, { keepdims: true }));
+		const shiftedLogsumexp = _usingCtx18.u(log(sumExp));
 		return shifted.sub(shiftedLogsumexp);
 	} catch (_) {
-		_usingCtx15.e = _;
+		_usingCtx18.e = _;
 	} finally {
-		_usingCtx15.d();
+		_usingCtx18.d();
 	}
 }
 /**
@@ -11337,40 +11553,39 @@ function logSoftmax(x, axis = -1) {
 */
 function logsumexp(x, axis = null, opts) {
 	try {
-		var _usingCtx16 = _usingCtx();
+		var _usingCtx19 = _usingCtx();
 		x = fudgeArray(x);
 		axis = normalizeAxis(axis, x.ndim);
 		if (axis.length === 0) return x;
-		const rawMax = _usingCtx16.u(max(x, axis, { keepdims: true }));
+		const rawMax = _usingCtx19.u(max(x, axis, { keepdims: true }));
 		const xMax = stopGradient(rawMax);
-		const shifted = _usingCtx16.u(x.sub(xMax));
-		const expShifted = _usingCtx16.u(exp(shifted));
-		const sumExp = _usingCtx16.u(expShifted.sum(axis, { keepdims: true }));
-		const logSum = _usingCtx16.u(log(sumExp));
-		const result = xMax.add(logSum);
-		if (opts?.keepdims) return result;
-		const resultToSqueeze = _usingCtx16.u(result);
+		const shifted = _usingCtx19.u(x.sub(xMax));
+		const expShifted = _usingCtx19.u(exp(shifted));
+		const sumExp = _usingCtx19.u(expShifted.sum(axis, { keepdims: true }));
+		const logSum = _usingCtx19.u(log(sumExp));
+		if (opts?.keepdims) return xMax.add(logSum);
+		const resultToSqueeze = _usingCtx19.u(xMax.add(logSum));
 		return squeeze(resultToSqueeze, axis);
 	} catch (_) {
-		_usingCtx16.e = _;
+		_usingCtx19.e = _;
 	} finally {
-		_usingCtx16.d();
+		_usingCtx19.d();
 	}
 }
 /** Log-mean-exp reduction, like `jax.nn.logsumexp()` but subtracts `log(n)`. */
 function logmeanexp(x, axis = null, opts) {
 	try {
-		var _usingCtx17 = _usingCtx();
+		var _usingCtx20 = _usingCtx();
 		x = fudgeArray(x);
 		axis = normalizeAxis(axis, x.ndim);
 		if (axis.length === 0) return x;
 		const n = axis.reduce((acc, a) => acc * x.shape[a], 1);
-		const lse = _usingCtx17.u(logsumexp(x, axis, opts));
+		const lse = _usingCtx20.u(logsumexp(x, axis, opts));
 		return lse.sub(Math.log(n));
 	} catch (_) {
-		_usingCtx17.e = _;
+		_usingCtx20.e = _;
 	} finally {
-		_usingCtx17.d();
+		_usingCtx20.d();
 	}
 }
 /**
@@ -11699,11 +11914,19 @@ const uniform = jit$1(function uniform$1(key$1, shape$1 = [], { minval = 0, maxv
 			dtype: DType.Uint32,
 			device: key$1.device
 		}));
-		const mantissa = bits(key$1, shape$1).div(divisor);
-		const float12 = mantissa.add(bias);
+		const mantissa = _usingCtx4.u(bits(key$1, shape$1).div(divisor));
+		const float12 = _usingCtx4.u(mantissa.add(bias));
 		const rand = bitcast(float12, DType.Float32).sub(1);
 		if (minval === 0 && maxval === 1) return rand;
-		else return rand.mul(maxval - minval).add(minval);
+		else try {
+			var _usingCtx5 = _usingCtx();
+			const scaled = _usingCtx5.u(rand.mul(maxval - minval));
+			return scaled.add(minval);
+		} catch (_) {
+			_usingCtx5.e = _;
+		} finally {
+			_usingCtx5.d();
+		}
 	} catch (_) {
 		_usingCtx4.e = _;
 	} finally {
@@ -11718,14 +11941,14 @@ const uniform = jit$1(function uniform$1(key$1, shape$1 = [], { minval = 0, maxv
 */
 function bernoulli(key$1, p = .5, shape$1 = []) {
 	try {
-		var _usingCtx5 = _usingCtx();
+		var _usingCtx6 = _usingCtx();
 		p = fudgeArray(p);
-		const u = _usingCtx5.u(uniform(key$1, shape$1));
+		const u = _usingCtx6.u(uniform(key$1, shape$1));
 		return u.less(p);
 	} catch (_) {
-		_usingCtx5.e = _;
+		_usingCtx6.e = _;
 	} finally {
-		_usingCtx5.d();
+		_usingCtx6.d();
 	}
 }
 /**
@@ -11776,8 +11999,17 @@ const categorical = jit$1(function categorical$1(key$1, logits, { axis = -1, sha
 * Uses inverse transform sampling: `x = tan(π * (u - 0.5))` where u ~ Uniform(0, 1).
 */
 const cauchy = jit$1(function cauchy$1(key$1, shape$1 = []) {
-	const u = uniform(key$1, shape$1);
-	return tan(u.sub(.5).mul(Math.PI));
+	try {
+		var _usingCtx7 = _usingCtx();
+		const u = uniform(key$1, shape$1);
+		const centered = _usingCtx7.u(u.sub(.5));
+		const scaled = _usingCtx7.u(centered.mul(Math.PI));
+		return tan(scaled);
+	} catch (_) {
+		_usingCtx7.e = _;
+	} finally {
+		_usingCtx7.d();
+	}
 }, { staticArgnums: [1] });
 /**
 * @function
@@ -11805,11 +12037,18 @@ const gumbel = jit$1(function gumbel$1(key$1, shape$1 = []) {
 * Inverting: `x = -sign(u - 0.5) * log(1 - 2 * |u - 0.5|)`.
 */
 const laplace = jit$1(function laplace$1(key$1, shape$1 = []) {
-	const u = uniform(key$1, shape$1);
-	const centered = u.sub(.5);
-	const s = sign(centered);
-	const absVal = absolute(centered);
-	return s.mul(log1p(absVal.mul(-2)).mul(-1));
+	try {
+		var _usingCtx8 = _usingCtx();
+		const u = uniform(key$1, shape$1);
+		const centered = _usingCtx8.u(u.sub(.5));
+		const s = sign(centered);
+		const absVal = absolute(centered);
+		return s.mul(log1p(absVal.mul(-2)).mul(-1));
+	} catch (_) {
+		_usingCtx8.e = _;
+	} finally {
+		_usingCtx8.d();
+	}
 }, { staticArgnums: [1] });
 /**
 * @function

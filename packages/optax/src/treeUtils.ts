@@ -21,9 +21,9 @@ function ipow(a: np.Array, order: number) {
   if (order === 1) return a;
   let result = a.mul(a);
   for (let i = 2; i < order; i++) {
-    const next = result.mul(a);
-    result.dispose();
-    result = next;
+    const prev = result;
+    result = result.mul(a);
+    prev.dispose();
   }
   return result;
 }
@@ -66,10 +66,10 @@ export function treeSum(tr: JsTree<np.Array>): np.Array {
   let total = np.array(0.0);
   for (const leaf of leaves) {
     const s = np.sum(leaf);
-    const next = total.add(s);
+    const prevTotal = total;
+    total = total.add(s);
     s.dispose();
-    total.dispose();
-    total = next;
+    prevTotal.dispose();
   }
   return total;
 }
@@ -80,10 +80,10 @@ export function treeMax(tr: JsTree<np.Array>): np.Array {
   let maxVal = np.array(-Infinity);
   for (const leaf of leaves) {
     const m = np.max(leaf);
-    const next = np.maximum(maxVal, m);
+    const prevMax = maxVal;
+    maxVal = np.maximum(maxVal, m);
     m.dispose();
-    maxVal.dispose();
-    maxVal = next;
+    prevMax.dispose();
   }
   return maxVal;
 }
