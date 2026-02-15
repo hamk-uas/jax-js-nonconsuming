@@ -2971,6 +2971,7 @@ This keeps eager and `jit` code structurally identical and makes linting simple.
 
 - Returned values
 - Persisted values (object fields, arrays/maps, module-scope constants)
+- Explicit local `.dispose()` management (manual lifetime cuts)
 - Intentional expression chains where no binding exists (discouraged in strict mode)
 
 For **short-lived computations**, `using` declarations provide the cleanest pattern:

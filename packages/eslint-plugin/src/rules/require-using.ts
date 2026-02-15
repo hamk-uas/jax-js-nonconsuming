@@ -65,18 +65,49 @@ function isArrayProducingCall(node: any): boolean {
   return false;
 }
 
-function isImmediatelyReturned(decl: any, idName: string): boolean {
-  const block = decl.parent?.parent;
+function isReturnedAfterDeclaration(declStmt: any, idName: string): boolean {
+  const block = declStmt.parent;
   if (!block || block.type !== "BlockStatement") return false;
   const statements = block.body as any[];
-  const idx = statements.indexOf(decl);
-  if (idx < 0 || idx + 1 >= statements.length) return false;
-  const next = statements[idx + 1];
-  return (
-    next.type === "ReturnStatement" &&
-    next.argument?.type === "Identifier" &&
-    next.argument.name === idName
-  );
+  const idx = statements.indexOf(declStmt);
+  if (idx < 0) return false;
+
+  for (let i = idx + 1; i < statements.length; i++) {
+    const stmt = statements[i];
+    if (
+      stmt.type === "ReturnStatement" &&
+      stmt.argument?.type === "Identifier" &&
+      stmt.argument.name === idName
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasExplicitDisposeAfterDeclaration(
+  declStmt: any,
+  idName: string,
+): boolean {
+  const block = declStmt.parent;
+  if (!block || block.type !== "BlockStatement") return false;
+  const statements = block.body as any[];
+  const idx = statements.indexOf(declStmt);
+  if (idx < 0) return false;
+
+  for (let i = idx + 1; i < statements.length; i++) {
+    const stmt = statements[i];
+    if (stmt.type !== "ExpressionStatement") continue;
+    const expr = stmt.expression;
+    if (expr?.type !== "CallExpression") continue;
+    if (expr.callee?.type !== "MemberExpression") continue;
+    if (getMemberName(expr.callee.property) !== "dispose") continue;
+    const obj = expr.callee.object;
+    if (obj?.type === "Identifier" && obj.name === idName) return true;
+  }
+
+  return false;
 }
 
 const rule: Rule.RuleModule = {
@@ -107,7 +138,8 @@ const rule: Rule.RuleModule = {
         for (const decl of node.declarations as any[]) {
           if (!decl.init || decl.id?.type !== "Identifier") continue;
           if (!isArrayProducingCall(decl.init)) continue;
-          if (isImmediatelyReturned(node, decl.id.name)) continue;
+          if (isReturnedAfterDeclaration(node, decl.id.name)) continue;
+          if (hasExplicitDisposeAfterDeclaration(node, decl.id.name)) continue;
 
           context.report({
             node: decl.id,
