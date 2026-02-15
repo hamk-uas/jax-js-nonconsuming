@@ -43,7 +43,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint",
-    "prepare": "husky || true",
+    "prepare": "tsdown && (husky || true)",
     "test": "vitest",
     "test:eslint-plugin": "tsx --test packages/eslint-plugin/test/*.node.ts",
     "test:all": "scripts/test-all.sh",
