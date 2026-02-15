@@ -15,11 +15,10 @@
 >
 > **Why this fork?** The original jax-js uses move semantics, where operations consume their inputs.
 > This fork was created for teams familiar with MATLAB or Python (NumPy) where move semantics are
-> unexpected. We needed a version of jax-js that fits our team's workflow, and we are sharing it
-> because we believe others might find this ownership model useful too.
+> unexpected. We also fast-tracked a `lax.scan` implementation in this fork.
 >
-> If you prefer move semantics, see the [original repository](https://github.com/ekzhang/jax-js).
-> See [Differences from upstream](#differences-from-upstream) for a full comparison.
+> See [Differences from upstream](#differences-from-upstream) for a full comparison between the
+> original and this fork.
 
 **jax-js** is a machine learning framework for the browser. It aims to bring
 [JAX](https://jax.dev)-style, high-performance CPU and GPU kernels to JavaScript, so you can run
@@ -32,7 +31,7 @@ npm i @hamk-uas/jax-js-nonconsuming
 Under the hood, it translates array operations into a compiler representation, then synthesizes
 kernels in WebAssembly and WebGPU.
 
-The library is written from scratch, with zero external dependencies. It maintains close API
+The original jax-js was written from scratch with zero zero external dependencies. jax-js and this fork maintain close API
 compatibility with NumPy/JAX. Since everything runs client-side, jax-js is likely the most portable
 GPU ML framework, since it runs anywhere a browser can run.
 
@@ -46,82 +45,55 @@ const x = np.array([1, 2, 3]);
 const y = x.mul(4); // [4, 8, 12]
 ```
 
-### Web usage (CDN)
-
-In vanilla JavaScript (without a bundler), just import from a module script tag. This is the easiest
-way to get started on a blank HTML page.
-
-```html
-<script type="module">
-  import { numpy as np } from "https://esm.sh/@hamk-uas/jax-js-nonconsuming";
-</script>
-```
-
-## Examples
-
-Cool things that the community has made with jax-js:
-
-- [**tanh.xyz**: Interactive ML visualizations](https://tanh.xyz/)
-
-And some more demos on the official website.
-
-- [Training neural networks on MNIST](https://jax-js.com/mnist)
-- [Voice cloning: Kyutai Pocket TTS](https://jax-js.com/tts)
-- [CLIP embeddings for books in-browser](https://jax-js.com/mobileclip)
-- [Object detection: DETR ResNet-50 (ONNX)](https://jax-js.com/detr-resnet-50)
-- [In-browser REPL](https://jax-js.com/repl)
-- [Matmul benchmark](https://jax-js.com/bench/matmul)
-- [Conv2d benchmark](https://jax-js.com/bench/conv2d)
-- [Mandelbrot set](https://jax-js.com/mandelbrot)
-
 ## Feature comparison
 
 Here's a quick, high-level comparison with other popular web ML runtimes:
 
-| Feature                         | jax-js     | TensorFlow.js   | onnxruntime-web    |
-| ------------------------------- | ---------- | --------------- | ------------------ |
-| **Overview**                    |            |                 |                    |
-| API style                       | JAX/NumPy  | TensorFlow-like | Static ONNX graphs |
-| Latest release                  | 2026       | ⚠️ 2024         | 2026               |
-| Speed                           | Fastest    | Fast            | Fastest            |
-| Bundle size (gzip)              | 80 KB      | 269 KB          | 90 KB + 24 MB Wasm |
-| **Autodiff & JIT**              |            |                 |                    |
-| Gradients                       | ✅         | ✅              | ❌                 |
-| Jacobian and Hessian            | ✅         | ❌              | ❌                 |
-| `jvp()` forward differentiation | ✅         | ❌              | ❌                 |
-| `jit()` kernel fusion           | ✅         | ❌              | ❌                 |
-| `vmap()` auto-vectorization     | ✅         | ❌              | ❌                 |
-| Graph capture                   | ✅         | ❌              | ✅                 |
-| **Backends & Data**             |            |                 |                    |
-| WebGPU backend                  | ✅         | 🟡 Preview      | ✅                 |
-| WebGL backend                   | ✅         | ✅              | ✅                 |
-| Wasm (CPU) backend              | ✅         | ✅              | ✅                 |
-| Eager array API                 | ✅         | ✅              | ❌                 |
-| Run ONNX models                 | 🟡 Partial | ❌              | ✅                 |
-| Read safetensors                | ✅         | ❌              | ❌                 |
-| Float64                         | ✅         | ❌              | ❌                 |
-| Float32                         | ✅         | ✅              | ✅                 |
-| Float16                         | ✅         | ❌              | ✅                 |
-| BFloat16                        | ❌         | ❌              | ❌                 |
-| Packed Uint8                    | ❌         | ❌              | 🟡 Partial         |
-| Mixed precision                 | ✅         | ❌              | ✅                 |
-| Mixed devices                   | ✅         | ❌              | ❌                 |
-| **Ops & Numerics**              |            |                 |                    |
-| Arithmetic functions            | ✅         | ✅              | ✅                 |
-| Matrix multiplication           | ✅         | ✅              | ✅                 |
-| General einsum                  | ✅         | 🟡 Partial      | 🟡 Partial         |
-| Sorting                         | ✅         | ❌              | ❌                 |
-| Activation functions            | ✅         | ✅              | ✅                 |
-| NaN/Inf numerics                | ✅         | ✅              | ✅                 |
-| Basic convolutions              | ✅         | ✅              | ✅                 |
-| n-d convolutions                | ✅         | ❌              | ✅                 |
-| Strided/dilated convolution     | ✅         | ✅              | ✅                 |
-| Cholesky, Lstsq                 | ✅         | ❌              | ❌                 |
-| LU, Solve, Determinant          | ✅         | ❌              | ❌                 |
-| SVD                             | ❌         | ❌              | ❌                 |
-| FFT                             | ✅         | ✅              | ✅                 |
-| Basic RNG (Uniform, Normal)     | ✅         | ✅              | ✅                 |
-| Advanced RNG                    | ✅         | ❌              | ❌                 |
+| Feature                         | jax-js-nonconsuming     | jax-js v0.1.9 | TensorFlow.js   | onnxruntime-web    |
+| ------------------------------- | ----------------------- | ---------- | --------------- | ------------------ |
+| **Overview**                    |                         |            |                 |                    |
+| API style                       | JAX/NumPy               | JAX/NumPy  | TensorFlow-like | Static ONNX graphs |
+| Latest release                  | 2026                    | 2026       | ⚠️ 2024         | 2026               |
+| Speed                           | Fastest                 | Fastest    | Fast            | Fastest            |
+| Bundle size (gzip)              | 107 KB                  | 80 KB      | 269 KB          | 90 KB + 24 MB Wasm |
+| **Autodiff & JIT**              |                         |            |                 |                    |
+| Gradients                       | ✅                       | ✅         | ✅              | ❌                 |
+| Jacobian and Hessian            | ✅                       | ✅         | ❌              | ❌                 |
+| `jvp()` forward differentiation | ✅                       | ✅         | ❌              | ❌                 |
+| `jit()` kernel fusion           | ✅                       | ✅         | ❌              | ❌                 |
+| `vmap()` auto-vectorization     | ✅                       | ✅         | ❌              | ❌                 |
+| `scan()` scan over leading axis | ✅                       | ❌         | ❌              | ❌                 |
+| Graph capture                   | ✅                       | ✅         | ❌              | ✅                 |
+| **Backends & Data**             |                         |            |                 |                    |
+| WebGPU backend                  | ✅                       | ✅         | 🟡 Preview      | ✅                 |
+| WebGL backend                   | ✅                       | ✅         | ✅              | ✅                 |
+| Wasm (CPU) backend              | ✅                       | ✅         | ✅              | ✅                 |
+| Eager array API                 | ✅                       | ✅         | ✅              | ❌                 |
+| Run ONNX models                 | 🟡 Partial               | 🟡 Partial | ❌              | ✅                 |
+| Read safetensors                | ✅                       | ✅         | ❌              | ❌                 |
+| Float64                         | ✅                       | ✅         | ❌              | ❌                 |
+| Float32                         | ✅                       | ✅         | ✅              | ✅                 |
+| Float16                         | ✅                       | ✅         | ❌              | ✅                 |
+| BFloat16                        | ❌                       | ❌         | ❌              | ❌                 |
+| Packed Uint8                    | ❌                       | ❌         | ❌              | 🟡 Partial         |
+| Mixed precision                 | ✅                       | ✅         | ❌              | ✅                 |
+| Mixed devices                   | ✅                       | ✅         | ❌              | ❌                 |
+| **Ops & Numerics**              |                          |            |                 |                    |
+| Arithmetic functions            | ✅                       | ✅         | ✅              | ✅                 |
+| Matrix multiplication           | ✅                       | ✅         | ✅              | ✅                 |
+| General einsum                  | ✅                       | ✅         | 🟡 Partial      | 🟡 Partial         |
+| Sorting                         | ✅                       | ✅         | ❌              | ❌                 |
+| Activation functions            | ✅                       | ✅         | ✅              | ✅                 |
+| NaN/Inf numerics                | ✅                       | ✅         | ✅              | ✅                 |
+| Basic convolutions              | ✅                       | ✅         | ✅              | ✅                 |
+| n-d convolutions                | ✅                       | ✅         | ❌              | ✅                 |
+| Strided/dilated convolution     | ✅                       | ✅         | ✅              | ✅                 |
+| Cholesky, Lstsq                 | ✅                       | ✅         | ❌              | ❌                 |
+| LU, Solve, Determinant          | ✅                       | ✅         | ❌              | ❌                 |
+| SVD                             | ❌                       | ❌         | ❌              | ❌                 |
+| FFT                             | ✅                       | ✅         | ✅              | ✅                 |
+| Basic RNG (Uniform, Normal)     | ✅                       | ✅         | ✅              | ✅                 |
+| Advanced RNG                    | ✅                       | ✅         | ❌              | ❌                 |
 
 ## Tutorial
 
@@ -290,9 +262,10 @@ There are currently 4 devices in jax-js:
   [supported browsers](https://caniuse.com/webgpu) (Chrome, Firefox, Safari, iOS).
 - `webgl`: [WebGL2](https://developer.mozilla.org/en-US/docs/Web/API/WebGL2RenderingContext), via
   fragment shaders. This is an older graphics API that runs on almost all browsers, but it is much
-  slower than WebGPU. It's offered on a best-effort basis and not as well-supported.
+  slower than WebGPU. It's offered on a best-effort basis and not as well-supported. The `webgl`
+  device has not been tested during development of jax-js-nonconsuming.
 
-**We recommend `webgpu` for best performance, especially when running neural networks.** The default
+**We recommend `webgpu` for best performance running neural networks and `wasm` for narrow sequential computations.** The default
 device is `wasm`, but you can change this at startup time:
 
 ```ts
@@ -346,7 +319,7 @@ well as unique optimizations such as FlashAttention variants.
 ### API Reference
 
 That's all for this short tutorial. Please see the generated
-[API reference](https://jax-js.com/docs) for detailed documentation.
+[API reference](https://jax-js.com/docs) (TODO: update) for detailed documentation.
 
 ## Development
 
