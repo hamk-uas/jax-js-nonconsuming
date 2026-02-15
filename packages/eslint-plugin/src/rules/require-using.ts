@@ -110,6 +110,67 @@ function hasExplicitDisposeAfterDeclaration(
   return false;
 }
 
+function usesIdentifier(node: any, idName: string): boolean {
+  if (!node || typeof node !== "object") return false;
+  if (node.type === "Identifier" && node.name === idName) return true;
+
+  for (const key of Object.keys(node)) {
+    const value = (node as any)[key];
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (usesIdentifier(item, idName)) return true;
+      }
+    } else if (value && typeof value === "object") {
+      if (usesIdentifier(value, idName)) return true;
+    }
+  }
+
+  return false;
+}
+
+function hasPersistedUseAfterDeclaration(
+  declStmt: any,
+  idName: string,
+): boolean {
+  const block = declStmt.parent;
+  if (!block || block.type !== "BlockStatement") return false;
+  const statements = block.body as any[];
+  const idx = statements.indexOf(declStmt);
+  if (idx < 0) return false;
+
+  for (let i = idx + 1; i < statements.length; i++) {
+    const stmt = statements[i];
+
+    if (stmt.type === "ExpressionStatement") {
+      const expr = stmt.expression;
+
+      if (
+        expr?.type === "AssignmentExpression" &&
+        usesIdentifier(expr.right, idName) &&
+        expr.left?.type !== "Identifier"
+      ) {
+        return true;
+      }
+
+      if (
+        expr?.type === "CallExpression" &&
+        expr.callee?.type === "MemberExpression"
+      ) {
+        const name = getMemberName(expr.callee.property);
+        if (
+          name &&
+          ["set", "push", "unshift", "add"].includes(name) &&
+          expr.arguments.some((arg: any) => usesIdentifier(arg, idName))
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
 const rule: Rule.RuleModule = {
   meta: {
     type: "problem",
@@ -140,6 +201,7 @@ const rule: Rule.RuleModule = {
           if (!isArrayProducingCall(decl.init)) continue;
           if (isReturnedAfterDeclaration(node, decl.id.name)) continue;
           if (hasExplicitDisposeAfterDeclaration(node, decl.id.name)) continue;
+          if (hasPersistedUseAfterDeclaration(node, decl.id.name)) continue;
 
           context.report({
             node: decl.id,

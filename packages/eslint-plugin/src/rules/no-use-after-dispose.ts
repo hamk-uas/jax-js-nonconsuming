@@ -2,6 +2,17 @@ import type { Rule } from "eslint";
 
 import { getMemberName } from "../types";
 
+function resolveVariable(context: Rule.RuleContext, node: any): any {
+  if (!node || node.type !== "Identifier") return null;
+  let scope: any = context.sourceCode.getScope(node);
+  while (scope) {
+    const found = scope.set?.get?.(node.name);
+    if (found) return found;
+    scope = scope.upper;
+  }
+  return null;
+}
+
 function isIdentifierReference(node: any, parent: any): boolean {
   if (!parent) return false;
   if (parent.type === "VariableDeclarator" && parent.id === node) return false;
@@ -35,7 +46,7 @@ const rule: Rule.RuleModule = {
     },
   },
   create(context) {
-    const disposedAt = new Map<string, number>();
+    const disposedAt = new Map<any, number>();
 
     return {
       CallExpression(node: any) {
@@ -44,10 +55,14 @@ const rule: Rule.RuleModule = {
         if (prop !== "dispose") return;
         const obj = node.callee.object;
         if (obj?.type !== "Identifier") return;
-        disposedAt.set(obj.name, node.range[1]);
+        const variable = resolveVariable(context, obj);
+        if (!variable) return;
+        disposedAt.set(variable, node.range[1]);
       },
       Identifier(node: any) {
-        const end = disposedAt.get(node.name);
+        const variable = resolveVariable(context, node);
+        if (!variable) return;
+        const end = disposedAt.get(variable);
         if (end === undefined) return;
         if (node.range[0] <= end) return;
         if (!isIdentifierReference(node, node.parent)) return;

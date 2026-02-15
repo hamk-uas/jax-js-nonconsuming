@@ -2908,6 +2908,16 @@ Implemented rules:
 - `jax-js/no-unnecessary-ref`
 - `jax-js/no-array-chain`
 
+Current semantics in the in-repo implementation:
+
+- `jax-js/require-using` treats local bindings as compliant when they are:
+  - declared with `using`,
+  - returned later in the same block,
+  - explicitly disposed later via `<name>.dispose()`, or
+  - persisted to longer-lived structures (e.g., property/index assignment, `set`/`push`/`add`).
+- `jax-js/no-use-after-dispose` tracks identifiers by lexical variable identity (scope-aware),
+  avoiding false positives from shadowed names.
+
 This provides a baseline Layer 1 enforcement path that can evolve with jax-js in the same repo.
 
 **Layer 1 ESLint rule contract (implementation spec):**
