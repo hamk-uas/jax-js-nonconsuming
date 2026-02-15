@@ -561,7 +561,7 @@ declare class Executable<T = any> {
   data: T);
 }
 declare namespace tree_d_exports {
-  export { JsTree, JsTreeDef, MapJsTree, NodeType, dispose, flatten, leaves, map, ref, structure, unflatten };
+  export { JsTree, JsTreeDef, MapJsTree, NodeType, dispose, flatten, leaves, makeDisposable, map, ref, structure, unflatten };
 }
 declare enum NodeType {
   Array = "Array",
@@ -608,6 +608,20 @@ declare function map<T, U, Tree extends JsTree<T>>(fn: (...args: T[]) => U, tree
 declare function ref<Tree extends JsTree<any>>(tree: Tree): Tree;
 /** Dispose every array in a tree. */
 declare function dispose<Tree extends JsTree<any>>(tree: Tree | null | undefined): void;
+/**
+ * Make a plain object `Disposable`, so it works with `using`.
+ *
+ * Calling `[Symbol.dispose]()` on the result disposes every `Array` leaf
+ * found in the object's own enumerable values (shallow, one level deep).
+ *
+ * Useful for scan/jit result pytrees:
+ * ```ts
+ * using result = tree.makeDisposable(await lax.scan(f, init, xs));
+ * // result[0] is the carry, result[1] is stacked ys
+ * // both are disposed at block end
+ * ```
+ */
+declare function makeDisposable<T extends object>(obj: T): T & Disposable;
 //#endregion
 //#region src/frontend/convolution.d.ts
 /** Definition of a general dilated convolution. Should be valid on creation. */
@@ -1262,6 +1276,22 @@ declare class Array extends Tracer {
   js(): any;
   /** Convert this array into a JavaScript object, asynchronously. */
   jsAsync(): Promise<any>;
+  /**
+   * Read the underlying data and dispose this array in one step.
+   *
+   * This is a convenience for the very common "extract and dispose" pattern
+   * at the boundary between jax-js and plain JavaScript:
+   * ```ts
+   * const floats = await arr.consumeData();
+   * // arr is now disposed — no separate .dispose() needed
+   * ```
+   */
+  consumeData(): Promise<DataArray>;
+  /**
+   * Synchronous variant of `consumeData()`. Reads the data and disposes this
+   * array. Prefer the async `consumeData()` for better performance.
+   */
+  consumeDataSync(): DataArray;
   /**
    * Copy an element of an array to a numeric scalar and return it.
    *

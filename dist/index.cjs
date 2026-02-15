@@ -525,6 +525,7 @@ __export(tree_exports, {
 	dispose: () => dispose,
 	flatten: () => flatten,
 	leaves: () => leaves,
+	makeDisposable: () => makeDisposable,
 	map: () => map,
 	ref: () => ref,
 	structure: () => structure,
@@ -638,6 +639,24 @@ function ref(tree) {
 /** Dispose every array in a tree. */
 function dispose(tree) {
 	if (tree) map((x) => x instanceof Tracer ? x.dispose() : void 0, tree);
+}
+/**
+* Make a plain object `Disposable`, so it works with `using`.
+*
+* Calling `[Symbol.dispose]()` on the result disposes every `Array` leaf
+* found in the object's own enumerable values (shallow, one level deep).
+*
+* Useful for scan/jit result pytrees:
+* ```ts
+* using result = tree.makeDisposable(await lax.scan(f, init, xs));
+* // result[0] is the carry, result[1] is stacked ys
+* // both are disposed at block end
+* ```
+*/
+function makeDisposable(obj) {
+	return Object.assign(obj, { [Symbol.dispose]() {
+		dispose(obj);
+	} });
 }
 
 //#endregion
@@ -4400,6 +4419,30 @@ var Array$1 = class Array$1 extends Tracer {
 	/** Convert this array into a JavaScript object, asynchronously. */
 	async jsAsync() {
 		return dataToJs(this.dtype, await this.data(), this.shape);
+	}
+	/**
+	* Read the underlying data and dispose this array in one step.
+	*
+	* This is a convenience for the very common "extract and dispose" pattern
+	* at the boundary between jax-js and plain JavaScript:
+	* ```ts
+	* const floats = await arr.consumeData();
+	* // arr is now disposed — no separate .dispose() needed
+	* ```
+	*/
+	async consumeData() {
+		const result = await this.data();
+		this.dispose();
+		return result;
+	}
+	/**
+	* Synchronous variant of `consumeData()`. Reads the data and disposes this
+	* array. Prefer the async `consumeData()` for better performance.
+	*/
+	consumeDataSync() {
+		const result = this.dataSync();
+		this.dispose();
+		return result;
 	}
 	/**
 	* Copy an element of an array to a numeric scalar and return it.

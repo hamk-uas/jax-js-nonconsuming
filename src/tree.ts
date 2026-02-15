@@ -200,3 +200,24 @@ export function dispose<Tree extends JsTree<any>>(
     map((x) => (x instanceof Tracer ? x.dispose() : undefined), tree);
   }
 }
+
+/**
+ * Make a plain object `Disposable`, so it works with `using`.
+ *
+ * Calling `[Symbol.dispose]()` on the result disposes every `Array` leaf
+ * found in the object's own enumerable values (shallow, one level deep).
+ *
+ * Useful for scan/jit result pytrees:
+ * ```ts
+ * using result = tree.makeDisposable(await lax.scan(f, init, xs));
+ * // result[0] is the carry, result[1] is stacked ys
+ * // both are disposed at block end
+ * ```
+ */
+export function makeDisposable<T extends object>(obj: T): T & Disposable {
+  return Object.assign(obj, {
+    [Symbol.dispose]() {
+      dispose(obj as any);
+    },
+  });
+}

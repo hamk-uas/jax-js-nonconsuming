@@ -12,6 +12,48 @@ const ARRAY_FACTORIES = new Set([
   "empty",
   "arange",
   "linspace",
+  "eye",
+  "identity",
+  "concatenate",
+  "stack",
+  "hstack",
+  "vstack",
+  "dstack",
+  "columnStack",
+  "diag",
+  "diagonal",
+  "flip",
+  "flipud",
+  "fliplr",
+  "tile",
+  "repeat",
+  "sort",
+  "argsort",
+  "clip",
+  "absolute",
+  "abs",
+  "sign",
+  "square",
+  "einsum",
+  "tensordot",
+  "inner",
+  "outer",
+  "vdot",
+  "vecdot",
+  "convolve",
+  "correlate",
+  "cumsum",
+  "where",
+  "take",
+  "meshgrid",
+  "broadcastTo",
+  "expandDims",
+  "squeeze",
+  "ravel",
+  "swapaxes",
+  "matrixTranspose",
+  "hamming",
+  "hann",
 ]);
 
 const ARRAY_METHODS = new Set([
@@ -20,22 +62,38 @@ const ARRAY_METHODS = new Set([
   "mul",
   "div",
   "pow",
+  "mod",
   "reshape",
   "transpose",
+  "flatten",
   "sum",
+  "prod",
   "mean",
+  "min",
+  "max",
   "astype",
   "neg",
+  "abs",
   "exp",
   "log",
   "sin",
   "cos",
+  "tan",
+  "asin",
+  "acos",
+  "atan",
   "tanh",
   "sqrt",
+  "square",
   "maximum",
   "minimum",
   "dot",
   "matmul",
+  "clip",
+  "squeeze",
+  "expandDims",
+  "at",
+  "slice",
 ]);
 
 function isArrayProducingCall(node: any): boolean {
@@ -76,14 +134,7 @@ function isReturnedAfterDeclaration(declStmt: any, idName: string): boolean {
   if (idx < 0) return false;
 
   for (let i = idx + 1; i < statements.length; i++) {
-    const stmt = statements[i];
-    if (
-      stmt.type === "ReturnStatement" &&
-      usesIdentifier(stmt.argument, idName)
-    ) {
-      return true;
-    }
-    if (hasYieldedIdentifier(stmt, idName)) {
+    if (hasReturnOrYieldOfIdentifier(statements[i], idName)) {
       return true;
     }
   }
@@ -91,7 +142,12 @@ function isReturnedAfterDeclaration(declStmt: any, idName: string): boolean {
   return false;
 }
 
-function hasYieldedIdentifier(
+/**
+ * Deeply search a node subtree for any return/yield statement that
+ * references the given identifier. This catches identifiers returned
+ * inside if/else branches, try/finally, etc.
+ */
+function hasReturnOrYieldOfIdentifier(
   node: any,
   idName: string,
   seen: WeakSet<object> = new WeakSet(),
@@ -100,19 +156,41 @@ function hasYieldedIdentifier(
   if (seen.has(node)) return false;
   seen.add(node);
 
-  if (node.type === "YieldExpression") {
-    return usesIdentifier(node.argument, idName);
+  // Don't recurse into nested function/class scopes — the binding
+  // is only "returned" if the enclosing function returns it.
+  if (
+    node.type === "FunctionDeclaration" ||
+    node.type === "FunctionExpression" ||
+    node.type === "ArrowFunctionExpression" ||
+    node.type === "ClassDeclaration" ||
+    node.type === "ClassExpression"
+  ) {
+    return false;
+  }
+
+  if (
+    node.type === "ReturnStatement" &&
+    usesIdentifier(node.argument, idName)
+  ) {
+    return true;
+  }
+
+  if (
+    node.type === "YieldExpression" &&
+    usesIdentifier(node.argument, idName)
+  ) {
+    return true;
   }
 
   for (const key of Object.keys(node)) {
     if (key === "parent") continue;
     const value = (node as any)[key];
-    if (Array.isArray(value)) {
+    if (globalThis.Array.isArray(value)) {
       for (const item of value) {
-        if (hasYieldedIdentifier(item, idName, seen)) return true;
+        if (hasReturnOrYieldOfIdentifier(item, idName, seen)) return true;
       }
     } else if (value && typeof value === "object") {
-      if (hasYieldedIdentifier(value, idName, seen)) return true;
+      if (hasReturnOrYieldOfIdentifier(value, idName, seen)) return true;
     }
   }
 

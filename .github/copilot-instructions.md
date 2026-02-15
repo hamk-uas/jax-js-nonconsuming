@@ -3001,6 +3001,87 @@ const result = forward(input);
 that does not exist in the codebase. The JIT compiler's internal `recycle` pass and the WebGPU
 buffer pool already provide buffer reuse without a user-facing donation API.
 
+### Disposal patterns guide
+
+Common disposal patterns for library users, ordered by frequency of use:
+
+**1. `using` for intermediates (the 80% case):**
+
+```ts
+using x = np.array([1, 2, 3]);
+using y = x.mul(np.array([2, 2, 2]));
+const result = y.sum();
+// x, y auto-disposed at block end; result is returned or disposed separately
+```
+
+**2. Block scope + `using` for early disposal:**
+
+Free memory before continuing with non-array work:
+
+```ts
+let values;
+{
+  using result = tree.makeDisposable(await lax.scan(step, init, xs));
+  values = await result[0].data(); // extract raw JS data
+}
+// GPU memory is freed here, values is a plain TypedArray
+```
+
+**3. Scan carry and output disposal — most dangerous leak site:**
+
+After `lax.scan`, the carry is a fresh allocation. Forgetting to dispose it is silent. Use
+`tree.dispose()` or `tree.makeDisposable()`:
+
+```ts
+// Option A: tree.dispose for manual cleanup
+const [carry, ys] = lax.scan(step, init, xs);
+// ... use carry and ys ...
+tree.dispose(carry); // disposes carry.x, carry.C, etc.
+tree.dispose(ys); // disposes ys.x_pred, ys.K, etc.
+
+// Option B: tree.makeDisposable for auto-cleanup
+{
+  using result = tree.makeDisposable(lax.scan(step, init, xs));
+  const [carry, ys] = result;
+  // ... use carry and ys ...
+} // all arrays in result auto-disposed
+```
+
+**4. "Extract and dispose" at the JS boundary:**
+
+Use `consumeData()` to read data and dispose in one call:
+
+```ts
+const floats = await arr.consumeData();
+// arr is disposed, floats is a plain Float32Array
+```
+
+**5. `tree.makeDisposable` for result structs:**
+
+Attach `Symbol.dispose` to any object containing arrays:
+
+```ts
+using result = tree.makeDisposable({ x: np.array([1]), y: np.array([2]) });
+// result.x and result.y auto-disposed at block end
+```
+
+**6. JIT output pytree aliasing guarantee:**
+
+When a JIT function returns the same tracer under multiple output keys (e.g.,
+`{ xf_0, yhat: xf_0 }`), the materialised result contains independent `np.Array` instances — one per
+key. Each can be disposed independently.
+
+### Migration guide from move semantics
+
+For users migrating from the `.ref` / move-semantics model:
+
+1. **Remove all `.ref` calls** — operations no longer consume inputs
+2. **Replace `disposeAll(a, b, c)` with `using` / `.dispose()`** — or use `tree.dispose()`
+3. **`using` for intermediates, `.dispose()` for object properties** — or wrap in
+   `tree.makeDisposable()`
+4. **`.data()` no longer auto-disposes** — add `.dispose()` after reading, or use `.consumeData()`
+5. **Never use `using` on values that are returned** — `using` disposes at scope end
+
 ### `checkLeaks` diagnostic (implemented)
 
 A zero-overhead leak detection tool that enforces ownership correctness at test time. When active,

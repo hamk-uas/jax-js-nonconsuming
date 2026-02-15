@@ -908,6 +908,32 @@ export class Array extends Tracer {
   }
 
   /**
+   * Read the underlying data and dispose this array in one step.
+   *
+   * This is a convenience for the very common "extract and dispose" pattern
+   * at the boundary between jax-js and plain JavaScript:
+   * ```ts
+   * const floats = await arr.consumeData();
+   * // arr is now disposed — no separate .dispose() needed
+   * ```
+   */
+  async consumeData(): Promise<DataArray> {
+    const result = await this.data();
+    this.dispose();
+    return result;
+  }
+
+  /**
+   * Synchronous variant of `consumeData()`. Reads the data and disposes this
+   * array. Prefer the async `consumeData()` for better performance.
+   */
+  consumeDataSync(): DataArray {
+    const result = this.dataSync();
+    this.dispose();
+    return result;
+  }
+
+  /**
    * Copy an element of an array to a numeric scalar and return it.
    *
    * Throws an error if the array does not have a single element. The array must
@@ -1586,8 +1612,10 @@ export function array(
         `Jagged shape: ${JSON.stringify(shape)} vs ${flat.length}`,
       );
     }
-    if (size === 0) return markAnonymousIfTracing(zeros(shape, { dtype, device }));
-    if (size === 1) return markAnonymousIfTracing(full(shape, flat[0], { dtype, device }));
+    if (size === 0)
+      return markAnonymousIfTracing(zeros(shape, { dtype, device }));
+    if (size === 1)
+      return markAnonymousIfTracing(full(shape, flat[0], { dtype, device }));
     if (typeof flat[0] === "boolean") {
       dtype = dtype ?? DType.Bool;
       const data = new Int32Array(flat.map((x) => (x ? 1 : 0)));

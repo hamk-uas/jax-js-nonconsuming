@@ -674,6 +674,19 @@ The `jax.tree` module is available but differs significantly in how it is implem
 based on nested JavaScript objects and arrays similar to JSON format, and it has generic TypeScript
 bindings.
 
+Available `tree` utilities:
+
+- `tree.flatten(tree)` — flatten a structured object, returning the tree definition
+- `tree.unflatten(treedef, leaves)` — reconstruct a structured object from the flattened
+  representation
+- `tree.leaves(tree)` — get the leaves of a tree
+- `tree.structure(tree)` — get the treedef for a tree
+- `tree.map(fn, tree, ...rest)` — map a function over pytree leaves
+- `tree.ref(tree)` — take a reference of every array in a tree
+- `tree.dispose(tree)` — dispose every array in a tree
+- `tree.makeDisposable(obj)` — make any object `Disposable` (for `using`) by recursively disposing
+  all array leaves when `[Symbol.dispose]()` is called
+
 These modules are unimplemented:
 
 - `jax.scipy`
