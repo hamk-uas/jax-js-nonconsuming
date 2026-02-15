@@ -3145,6 +3145,8 @@ To add syntax headroom for anonymous intermediates without move semantics, we ma
 - Return chains:
   - `return a.op1(...).op2(...);`
 - Expression-statement chains where result is intentionally discarded.
+- Callback-local return chains (e.g., `array.map(x => x.op1(...).op2(...))`) — transformed only
+  inside the callback's own function body.
 
 **Lowering strategy (conceptual):**
 
@@ -3158,6 +3160,8 @@ To add syntax headroom for anonymous intermediates without move semantics, we ma
 - Optional chaining or computed dynamic call targets with unclear side effects.
 - Patterns where a chain subexpression escapes/aliases before completion.
 - Cases where ordering cannot be preserved without duplicating side effects.
+- Cross-callback / higher-order-function boundaries (never rewrite a chain so that temp/dispose
+  logic spans multiple function bodies).
 
 When a bailout triggers, keep original code and optionally emit a non-blocking diagnostic: "chain
 not transformed; consider `using` temporaries".
