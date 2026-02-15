@@ -7552,7 +7552,8 @@ const transposeRules = {
 			else if (i < numConsts + numCarry) result.push(ctCarryRunning[ctCarryIdx++]);
 			else result.push(ctXsStacked[ctXIdx++]);
 		}
-		if (ctConstsAccum) for (let i = ctConstIdx; i < ctConstsAccum.length; i++) ctConstsAccum[i].dispose();
+		const remainingCtConsts = ctConstsAccum ?? [];
+		for (let i = ctConstIdx; i < remainingCtConsts.length; i++) remainingCtConsts[i].dispose();
 		for (let i = ctCarryIdx; i < ctCarryRunning.length; i++) ctCarryRunning[i].dispose();
 		for (let i = ctXIdx; i < ctXsStacked.length; i++) ctXsStacked[i].dispose();
 		primalForwardJaxpr.dispose();
@@ -12145,6 +12146,16 @@ const logit = jit$1(function logit$1(x) {
 /** @file Polyfills for using this library. */
 Symbol.dispose ??= Symbol.for("Symbol.dispose");
 Symbol.asyncDispose ??= Symbol.for("Symbol.asyncDispose");
+if (typeof globalThis.SuppressedError === "undefined") globalThis.SuppressedError = class SuppressedError$1 extends Error {
+	error;
+	suppressed;
+	constructor(error, suppressed, message) {
+		super(message);
+		this.name = "SuppressedError";
+		this.error = error;
+		this.suppressed = suppressed;
+	}
+};
 
 //#endregion
 //#region src/index.ts

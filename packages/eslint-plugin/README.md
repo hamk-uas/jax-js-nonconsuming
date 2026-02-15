@@ -109,9 +109,16 @@ export default [
 
 ## Rules
 
+Each rule reports warnings and can offer automatic code changes through ESLint:
+
+- **Autofix** (ESLint _fix_) — applied automatically on save or via `eslint --fix`. The rule has
+  verified that the change is safe for the specific code it flagged.
+- **Suggestion** (ESLint _suggestion_) — shown as a 💡 lightbulb quick fix in your editor. Requires
+  manual confirmation because the change may need review.
+
 ### `jax-js/require-using`
 
-**Fixable:** suggestion (auto-convertible via IDE quick-fix)
+**Fixable:** 💡 suggestion (converts `const`/`let` to `using`)
 
 Enforces `using` declarations for short-lived local array bindings. Catches the most common source
 of memory leaks: forgetting to `.dispose()` temporary arrays.
@@ -164,7 +171,7 @@ const specialCase = np.zeros([3, 3]);
 
 ### `jax-js/no-use-after-dispose`
 
-**Type:** problem (error by default)
+**Type:** problem (error by default) · no autofix
 
 Catches reads or writes to a variable after `.dispose()` has been called on it. This prevents
 `UseAfterFreeError` at runtime. The error message includes the line number of the `.dispose()` call
@@ -186,11 +193,11 @@ boundaries or through aliases.
 
 ### `jax-js/no-dispose-then-reassign-param`
 
-**Type:** problem (`warn` in recommended, `error` in strict)
+**Type:** problem (`warn` in recommended, `error` in strict) · no autofix
 
-Catches a common callback ownership footgun: disposing a state variable and immediately assigning it
-from a callback parameter. If both identifiers alias the same object, this is a dispose-then-reuse
-bug.
+Catches a common callback ownership footgun: disposing a state variable and immediately reassigning
+it from a callback parameter. If both identifiers alias the same object, the disposal destroys live
+data.
 
 ```ts
 // ❌ Warn: possible alias-dispose bug
@@ -211,7 +218,7 @@ function onParamsUpdate(params) {
 
 ### `jax-js/no-unnecessary-ref`
 
-**Fixable:** autofix (removes `.ref` automatically with `--fix`)
+**Fixable:** ✅ autofix (removes `.ref` automatically with `--fix` or on save)
 
 Flags `.ref` property access. In the non-consuming ownership model, `.ref` is never needed in user
 code — operations do not consume inputs. The only legitimate uses are deep inside the framework
@@ -243,7 +250,7 @@ import { ... } from "...";
 
 ### `jax-js/no-array-chain`
 
-**Type:** suggestion (off by default, enabled in strict config)
+**Type:** suggestion (off by default, enabled in strict config) · no autofix
 
 Flags deep fluent method chains that create unnamed eager-mode temporaries. These intermediates
 can't be `using`-managed and may accumulate in GPU memory until GC runs.
@@ -279,24 +286,56 @@ Svelte currently does not parse `using` declarations in component scripts.
 - In component code, use explicit `.dispose()` with clear ownership handoff guards.
 - Apply `require-using` primarily to non-Svelte source files.
 
-## Suppression directives
+## Suppressing warnings
 
-Each rule supports its own suppression comment placed on the line immediately before the flagged
-code:
+Sometimes a warning is intentional (e.g., you knowingly keep an array alive in a cache). In those
+cases, prefer disabling the specific rule as locally as possible, and include a short reason.
 
-| Rule                             | Suppression comment                                                 |
-| -------------------------------- | ------------------------------------------------------------------- |
-| `require-using`                  | `// jax-js-lint: allow-non-using`                                   |
-| `no-unnecessary-ref`             | `// jax-js-lint: allow-ref`                                         |
-| `no-use-after-dispose`           | `// eslint-disable-next-line jax-js/no-use-after-dispose`           |
-| `no-dispose-then-reassign-param` | `// eslint-disable-next-line jax-js/no-dispose-then-reassign-param` |
-| `no-array-chain`                 | `// eslint-disable-next-line jax-js/no-array-chain`                 |
+### Plugin-specific directives
 
-Standard `eslint-disable` directives work for all rules as well:
+Some rules support purpose-built suppression comments placed on the line immediately before the
+flagged code:
+
+| Rule                 | Suppression comment                | Scope           |
+| -------------------- | ---------------------------------- | --------------- |
+| `require-using`      | `// jax-js-lint: allow-non-using`  | Next line       |
+| `no-unnecessary-ref` | `// jax-js-lint: allow-ref`        | Next line       |
+| `no-unnecessary-ref` | `// jax-js-lint: allow-ref` (top)  | Entire file     |
+
+### Standard ESLint directives
+
+All rules support the standard ESLint disable comments:
+
+**Single line:**
 
 ```ts
-// eslint-disable-next-line jax-js/require-using
-const x = np.array([1, 2, 3]);
+// eslint-disable-next-line jax-js/require-using -- intentionally leaked until process exit
+const cached = np.zeros([1024]);
+```
+
+**Block:**
+
+```ts
+/* eslint-disable jax-js/require-using -- constructing a global cache */
+const CACHE_A = np.zeros([128]);
+const CACHE_B = np.ones([128]);
+/* eslint-enable jax-js/require-using */
+```
+
+**Config-level:**
+
+```ts
+// eslint.config.ts
+import jaxJs from "@jax-js/eslint-plugin";
+
+export default [
+  jaxJs.configs.recommended,
+  {
+    rules: {
+      "jax-js/no-array-chain": "off", // turn off a rule entirely
+    },
+  },
+];
 ```
 
 ## How it works
@@ -311,49 +350,122 @@ recognizes array-producing patterns by:
 
 This means the rules work without a TypeScript type-checker running, keeping lint fast (~1 s for the
 full jax-js codebase). The tradeoff is occasional false positives on non-jax-js code that happens to
-use the same method names — suppress those with the directives above.
+use the same method names — suppress those with the [directives above](#suppressing-warnings).
 
-**Known heuristic boundaries:**
+### Design decisions & known limitations
 
-- Aliased imports (`import { array as arr }`) — factory name `arr` won't be recognized
-- Dynamic method calls (`x[methodName]()`) — not tracked
-- Cross-function disposal tracking — `no-use-after-dispose` is function-local only
-- Complex control-flow re-assignment after dispose — mostly not tracked (basic callback alias
-  pattern is tracked by `no-dispose-then-reassign-param`)
+- **Heuristic-based, no import tracking.** The rules identify jax-js arrays by recognizing factory
+  calls, method names, and namespace prefixes. They do not resolve imports, so:
+  - Aliased imports (`import { array as arr }`) — factory name `arr` won't be recognized.
+  - Dynamic method calls (`x[methodName]()`) — not tracked.
+  - This is conservative overall — it avoids false positives at the cost of occasional false
+    negatives for unusual import patterns.
+- **Function-local scope only.** `no-use-after-dispose` tracks variables within a single function.
+  Cross-function disposal (e.g., disposing in a helper, using in the caller) is not detected.
+- **Adjacent-statement pattern for `no-dispose-then-reassign-param`.** The rule detects the
+  `dispose(x); x = param;` pattern only when the two statements are adjacent in a function body.
+  Re-assignment separated by intervening statements is not caught.
+- **`no-array-chain` only tracks known JAX methods.** JavaScript collection methods like `.map()`,
+  `.filter()`, `.reduce()` are ignored — only JAX array methods increase the chain depth counter.
 
 ## IDE integration
 
+These lint rules are designed to give you immediate feedback as you write jax-js code. Any editor or
+IDE that supports ESLint will show warnings inline (red/yellow squiggles) and offer quick-fix
+suggestions.
+
 ### VS Code
 
-Install the
-[ESLint extension](https://marketplace.visualstudio.com/items?itemName=dbaeumer.vscode-eslint)
-(v3+). It picks up flat configs automatically. Warnings and errors appear inline with quick-fix
-suggestions for `require-using`.
+1. Install the
+   [ESLint extension](https://marketplace.visualstudio.com/items?itemName=dbaeumer.vscode-eslint)
+   (`dbaeumer.vscode-eslint`, v3+).
+2. The extension auto-detects your `eslint.config.ts` — no extra configuration needed.
+3. You will see inline warnings for leak patterns, and **Code Actions** (💡 lightbulb) to apply
+   autofixes and suggestions.
 
-Recommended workspace settings (`.vscode/settings.json`):
+Optional settings for a better experience (add to `.vscode/settings.json`):
 
-```json
+```jsonc
 {
-  "eslint.validate": ["javascript", "javascriptreact", "typescript", "typescriptreact"],
+  // Lint as you type for immediate feedback (use "onSave" if you prefer less frequent diagnostics)
+  "eslint.run": "onType",
+
+  // Validate TypeScript and JavaScript files
+  "eslint.validate": ["typescript", "javascript", "typescriptreact", "javascriptreact"],
+
+  // Auto-fix fixable rules on save (e.g., removes unnecessary .ref)
   "editor.codeActionsOnSave": {
-    "source.fixAll.eslint": "always"
-  },
-  "editor.formatOnSave": true
+    "source.fixAll.eslint": "explicit"
+  }
 }
 ```
 
-If diagnostics do not appear after adding the plugin/config:
+### WebStorm / IntelliJ IDEA
 
-1. Run `ESLint: Restart ESLint Server` from the command palette.
-2. Run `TypeScript: Restart TS Server`.
-3. Reload the window.
+1. Go to **Settings → Languages & Frameworks → JavaScript → Code Quality Tools → ESLint**.
+2. Select **Automatic ESLint configuration** (or point to your config manually).
+3. Check **Run eslint --fix on save** if you want autofixes applied automatically.
+4. Warnings from `@jax-js/eslint-plugin` will appear inline in the editor.
 
-### CLI
+### Neovim
+
+If you use [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig) with the ESLint language
+server:
+
+```lua
+-- In your Neovim LSP config
+require('lspconfig').eslint.setup({
+  -- ESLint will automatically pick up eslint.config.ts
+})
+```
+
+Or with [none-ls](https://github.com/nvimtools/none-ls.nvim) /
+[efm-langserver](https://github.com/mattn/efm-langserver), configure ESLint as a diagnostics
+source.
+
+### Sublime Text
+
+Install [SublimeLinter](https://github.com/SublimeLinter/SublimeLinter) and
+[SublimeLinter-eslint](https://github.com/SublimeLinter/SublimeLinter-eslint). The plugin will be
+picked up automatically from your ESLint config.
+
+### Command line
 
 ```bash
 npx eslint src/
 npx eslint --rule 'jax-js/require-using:error' src/my-model.ts
 ```
+
+Or add it as a script in your `package.json`:
+
+```json
+{
+  "scripts": {
+    "lint": "eslint src/"
+  }
+}
+```
+
+### Troubleshooting
+
+**Diagnostics not appearing in VS Code:**
+
+1. Run `ESLint: Restart ESLint Server` from the command palette (Ctrl/Cmd+Shift+P).
+2. Check the **ESLint** output channel (View → Output → select "ESLint") for errors.
+3. Ensure your `eslint.config.ts` has `files` patterns that match your `.ts` files.
+4. Reload the window (Developer: Reload Window).
+
+**`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING` when loading the plugin:**
+
+If your ESLint config is `eslint.config.js` (not `.ts`), Node's built-in type stripping does not
+apply to files inside `node_modules`. **Fix:** rename your config to `eslint.config.ts`. ESLint
+then uses `jiti` to load the config and the plugin, bypassing the restriction.
+
+**Rules fire on non-jax-js code:**
+
+The rules use heuristic pattern matching and may flag variables from non-jax-js libraries that
+happen to use the same method names. Narrow the `files` glob to your jax-js source directories, or
+suppress individual false positives with `eslint-disable-next-line`.
 
 ## Comparison with `@hamk-uas/eslint-plugin-jax-js`
 

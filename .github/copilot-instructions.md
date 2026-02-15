@@ -2848,17 +2848,13 @@ The eager column shows worse _performance_ characteristics — that's expected a
 row is the last one: ownership correctness must hold in _both_ modes. JIT should only make things
 faster, never fix ownership bugs.
 
-### Static analysis: ESLint plugin (upstream jax-js)
+### Static analysis: ESLint plugin
 
 The community [`@hamk-uas/eslint-plugin-jax-js`](https://github.com/hamk-uas/eslint-plugin-jax-js)
-ESLint plugin catches array ownership violations statically for the upstream (move-semantics)
-jax-js. It embodies the same ownership-correctness principle — it warns inside `jit()` callbacks on
-purpose, because ownership-correct code should work in both modes.
-
-The upstream plugin's three rules (`no-use-after-consume`, `no-unnecessary-ref`, `require-consume`)
-target move semantics and are not directly applicable to this non-consuming fork. However, the
-**design philosophy is identical**: code that is correct in eager mode will be correct under
-`jit()`.
+ESLint plugin targets the **upstream move-semantics** jax-js. Its three rules
+(`no-use-after-consume`, `no-unnecessary-ref`, `require-consume`) are not directly applicable to
+this non-consuming fork, but the **design philosophy is identical**: code that is correct in eager
+mode will be correct under `jit()`.
 
 **In-repo plugin (publish-ready, v0.1.0):**
 
@@ -2923,7 +2919,8 @@ Current semantics in the in-repo implementation:
   (`if (stateVar !== paramName) ...`) before disposal.
 
 See `packages/eslint-plugin/README.md` for full user-facing documentation, rule details, IDE
-integration, and comparison with the community HAMK plugin.
+integration (VS Code, WebStorm, Neovim, Sublime Text), troubleshooting, and comparison with the
+community HAMK plugin.
 
 ### Memory management ergonomics
 

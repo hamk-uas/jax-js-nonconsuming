@@ -191,10 +191,13 @@ result.dispose(); // caller disposes the output when done
 f.dispose(); // free captured constants when the function is no longer needed
 ```
 
+The `@jax-js/eslint-plugin` catches the most common memory leaks (missing `using`, use-after-dispose,
+unnecessary `.ref`) at edit time — see the [plugin README](packages/eslint-plugin) for setup.
+
 ### grad(), vmap() and jit()
 
 JAX's signature composable transformations are also supported in jax-js. Here is a simple example of
-using `grad` and `vmap` to compute the derivaive of a function:
+using `grad` and `vmap` to compute the derivative of a function:
 
 ```ts
 import { numpy as np, grad, vmap } from "@jax-js/jax";
@@ -302,7 +305,7 @@ self-contained way in other projects.
 
 ### Performance
 
-The WebGPU runtime includes an ML compiler with tile-aware optimizations, tuned for indiidual
+The WebGPU runtime includes an ML compiler with tile-aware optimizations, tuned for individual
 browsers. Also, this library uniquely has the `jit()` feature that fuses operations together and
 records an execution graph. jax-js achieves **over 7000 GFLOP/s** for matrix multiplication on an
 Apple M4 Max chip ([try it](https://jax-js.com/bench/matmul)).
@@ -339,7 +342,7 @@ files to ensure code quality.
 You can also run linting and formatting manually:
 
 ```bash
-pnpm lint          # Run ESLint
+pnpm lint          # Run ESLint (includes @jax-js/eslint-plugin ownership rules)
 pnpm format        # Format all files with Prettier
 pnpm format:check  # Check formatting without writing
 pnpm check         # Run TypeScript type checking
