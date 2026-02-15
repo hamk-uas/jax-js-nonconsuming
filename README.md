@@ -1,11 +1,20 @@
 <h1 align="center">jax-js: JAX in pure JavaScript</h1>
 
+<p align="center"><em>Non-consuming ownership fork</em></p>
+
 <p align="center"><strong>
   <a href="https://jax-js.com">Website</a> |
   <a href="https://jax-js.com/docs/">API Reference</a> |
   <a href="./FEATURES.md">Compatibility Table</a> |
   <a href="https://discord.gg/BW6YsCd4Tf">Discord</a>
 </strong></p>
+
+> **Fork notice:** This is a fork of [ekzhang/jax-js](https://github.com/ekzhang/jax-js) with a
+> **non-consuming ownership model**. Operations leave inputs alive (no `.ref` needed), and `using`
+> declarations provide deterministic GPU/WASM memory cleanup. If you are looking for the upstream
+> version (move semantics, `.ref` required), see the
+> [original repository](https://github.com/ekzhang/jax-js). See
+> [Differences from upstream](#differences-from-upstream) for a full comparison.
 
 **jax-js** is a machine learning framework for the browser. It aims to bring
 [JAX](https://jax.dev)-style, high-performance CPU and GPU kernels to JavaScript, so you can run
@@ -374,6 +383,46 @@ To start a Vite dev server running the website, demos and REPL:
 ```bash
 pnpm -C website dev
 ```
+
+## Differences from upstream
+
+This fork replaces the upstream **move-semantics** ownership model with a **non-consuming** model.
+The API is otherwise identical — all NumPy/JAX functions, `jit`, `grad`, `vmap`, `scan`, backends,
+and demos work the same way.
+
+| Aspect                             | Upstream (ekzhang/jax-js)                   | This fork (non-consuming)                              |
+| ---------------------------------- | ------------------------------------------- | ------------------------------------------------------ |
+| **Ownership model**                | Move semantics                              | Non-consuming                                          |
+| **Operations consume inputs?**     | Yes — every op decrements refcount          | No — inputs stay alive                                 |
+| **`.ref` needed to reuse arrays?** | Yes — `x.ref` before passing to a second op | Never                                                  |
+| **`UseAfterFreeError` risk**       | Common if `.ref` is forgotten               | Eliminated by design                                   |
+| **`using` declarations**           | Not used                                    | First-class — auto-dispose at block end                |
+| **ESLint plugin**                  | `@hamk-uas/eslint-plugin-jax-js` (move)     | `@jax-js/eslint-plugin` (non-consuming)                |
+| **`lax.scan`**                     | Not implemented                             | Full support (JIT, autodiff, vmap, native compilation) |
+| **Buffer recycling**               | Not implemented                             | JIT-level `recycle` step + WebGPU buffer pool          |
+| **`tree.makeDisposable`**          | Not available                               | Wraps any object for `using`-based cleanup             |
+| **`Array.consumeData()`**          | Not available                               | Reads data and disposes in one call                    |
+| **`checkLeaks` diagnostic**        | Not available                               | Runtime leak detection with stack traces               |
+
+### Which version should I use?
+
+- **Use this fork** if you want a simpler ownership model where arrays can be freely reused, `using`
+  declarations handle cleanup, and `lax.scan` is available.
+- **Use upstream** if you are already invested in the move-semantics model and the `@hamk-uas`
+  ESLint plugin, or if you need to stay on the upstream release cadence.
+
+The two versions are **not mix-and-match** — code written for one ownership model will not work
+correctly with the other. The `@jax-js/eslint-plugin` included here enforces the non-consuming
+patterns and will flag `.ref` usage as unnecessary.
+
+### Migrating from upstream
+
+1. **Remove all `.ref` calls** — operations no longer consume inputs.
+2. **Replace manual refcount juggling with `using`** — `using x = np.array(...)` auto-disposes at
+   block end.
+3. **Call `.dispose()` explicitly for long-lived arrays** — or wrap in `tree.makeDisposable()`.
+4. **Install `@jax-js/eslint-plugin`** — it catches leaks, use-after-dispose, and unnecessary `.ref`
+   at edit time. See the [plugin README](packages/eslint-plugin) for setup.
 
 ## Future work / help wanted
 
