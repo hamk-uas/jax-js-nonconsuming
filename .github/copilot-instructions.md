@@ -2896,10 +2896,11 @@ under plugin name `jax-js`.
 
 Current rollout in this repo:
 
-- `jax-js/require-using`: `warn` on `src/**`, `test/**`, `packages/**`
-- `jax-js/no-unnecessary-ref`: `warn` on `src/**`, `test/**`, `packages/**`
-- `jax-js/no-use-after-dispose`: `warn` on `src/**`, `test/**`, `packages/**`
+- `jax-js/require-using`: `warn` on `src/**`, `packages/**`
+- `jax-js/no-unnecessary-ref`: `warn` on `src/**`, `packages/**`
+- `jax-js/no-use-after-dispose`: `warn` on `src/**`, `packages/**`
 - `jax-js/no-array-chain`: `off`
+- all `jax-js/*` rules: `off` on `test/**`
 
 Implemented rules:
 
