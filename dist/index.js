@@ -1049,6 +1049,19 @@ function currentTraceLevel() {
 	return traceStack[traceStack.length - 1].level;
 }
 /**
+* Flag set only during scan body tracing. Arrays created while this is true
+* are tagged as anonymous builder-owned consts (via anonymousConstArrays).
+* Unlike insideTrace(), this doesn't fire during jit/vmap/other traces where
+* the ClosedJaxpr is cached and consts must survive beyond compilation.
+*/
+let _scanBodyTraceActiveFlag = false;
+function isScanBodyTraceActive() {
+	return _scanBodyTraceActiveFlag;
+}
+function setScanBodyTraceActive(v) {
+	_scanBodyTraceActiveFlag = v;
+}
+/**
 * Returns true if any abstract (graph-building) trace is on the stack.
 *
 * Unlike `insideTrace()`, this returns false when only concrete-value traces
@@ -4826,10 +4839,10 @@ function array(values, { shape: shape$1, dtype, device } = {}) {
 		if (shape$1 && !deepEqual(values.shape, shape$1)) values = values.reshape(shape$1);
 		if (dtype && values.dtype !== dtype) values = values.astype(dtype);
 		return values;
-	} else if (ArrayBuffer.isView(values)) return arrayFromData(values, shape$1 ?? [values.length], {
+	} else if (ArrayBuffer.isView(values)) return markAnonymousIfTracing(arrayFromData(values, shape$1 ?? [values.length], {
 		dtype,
 		device
-	});
+	}));
 	else {
 		if (!shape$1) {
 			shape$1 = [];
@@ -4842,29 +4855,29 @@ function array(values, { shape: shape$1, dtype, device } = {}) {
 		const size$1 = prod(shape$1);
 		const flat = recursiveFlatten(values);
 		if (flat.length !== size$1) throw new Error(`Jagged shape: ${JSON.stringify(shape$1)} vs ${flat.length}`);
-		if (size$1 === 0) return zeros(shape$1, {
+		if (size$1 === 0) return markAnonymousIfTracing(zeros(shape$1, {
 			dtype,
 			device
-		});
-		if (size$1 === 1) return full(shape$1, flat[0], {
+		}));
+		if (size$1 === 1) return markAnonymousIfTracing(full(shape$1, flat[0], {
 			dtype,
 			device
-		});
+		}));
 		if (typeof flat[0] === "boolean") {
 			dtype = dtype ?? DType.Bool;
 			const data = new Int32Array(flat.map((x) => x ? 1 : 0));
-			return arrayFromData(data, shape$1, {
+			return markAnonymousIfTracing(arrayFromData(data, shape$1, {
 				dtype,
 				device
-			});
+			}));
 		} else {
 			const weakType = dtype == void 0 && shape$1.length === 0;
 			dtype = dtype ?? DType.Float32;
 			const data = dtypedJsArray(dtype, flat);
-			return arrayFromData(data, shape$1, {
+			return markAnonymousIfTracing(arrayFromData(data, shape$1, {
 				dtype,
 				device
-			}, weakType);
+			}, weakType));
 		}
 	}
 }
@@ -4928,6 +4941,15 @@ function dataToJs(dtype, data, shape$1) {
 * which would leak when the ClosedJaxpr is disposed.
 */
 const anonymousConstArrays = /* @__PURE__ */ new WeakSet();
+/**
+* Tags an array as anonymous builder-owned if we're inside a scan body trace.
+* This prevents getOrMakeConstTracer from calling .ref on inline np.array()
+* constants, which would leak when the ClosedJaxpr is disposed.
+*/
+const markAnonymousIfTracing = (arr) => {
+	if (isScanBodyTraceActive()) anonymousConstArrays.add(arr);
+	return arr;
+};
 function pureArray(x) {
 	if (x instanceof Tracer) return x;
 	else {
@@ -10752,7 +10774,13 @@ function scan(f, init$1, xs, options) {
 		return [...newCarryFlat, ...yFlat];
 	};
 	const traceAvals = [...carryAvals, ...xSliceAvals];
-	const { jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr$1(traceFn)(...traceAvals);
+	setScanBodyTraceActive(true);
+	let closedJaxpr, _outTreedef;
+	try {
+		({jaxpr: closedJaxpr, treedef: _outTreedef} = makeJaxpr$1(traceFn)(...traceAvals));
+	} finally {
+		setScanBodyTraceActive(false);
+	}
 	const jaxpr = closedJaxpr.jaxpr;
 	const consts = closedJaxpr.consts;
 	if (n === 0) {

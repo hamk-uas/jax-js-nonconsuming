@@ -45,6 +45,92 @@ function getSlotCount(): number {
   return backend.slotCount();
 }
 
+async function measurePeakGpuBytesDuring(
+  run: () => Promise<void>,
+): Promise<{ baseline: number; peak: number; delta: number; end: number }> {
+  const backend = getBackend() as any;
+  const origMalloc = backend.malloc.bind(backend);
+  const origDecRef = backend.decRef.bind(backend);
+
+  const baseline = getGpuBytes();
+  let peak = baseline;
+  const sample = () => {
+    const current = getGpuBytes();
+    if (current > peak) peak = current;
+  };
+
+  backend.malloc = (...args: any[]) => {
+    const out = origMalloc(...args);
+    sample();
+    return out;
+  };
+  backend.decRef = (...args: any[]) => {
+    const out = origDecRef(...args);
+    sample();
+    return out;
+  };
+
+  try {
+    sample();
+    await run();
+    sample();
+  } finally {
+    backend.malloc = origMalloc;
+    backend.decRef = origDecRef;
+  }
+
+  const end = getGpuBytes();
+  return {
+    baseline,
+    peak,
+    delta: peak - baseline,
+    end,
+  };
+}
+
+async function measurePeakSlotsDuring(
+  run: () => Promise<void>,
+): Promise<{ baseline: number; peak: number; delta: number; end: number }> {
+  const backend = getBackend() as any;
+  const origMalloc = backend.malloc.bind(backend);
+  const origDecRef = backend.decRef.bind(backend);
+
+  const baseline = getSlotCount();
+  let peak = baseline;
+  const sample = () => {
+    const current = getSlotCount();
+    if (current > peak) peak = current;
+  };
+
+  backend.malloc = (...args: any[]) => {
+    const out = origMalloc(...args);
+    sample();
+    return out;
+  };
+  backend.decRef = (...args: any[]) => {
+    const out = origDecRef(...args);
+    sample();
+    return out;
+  };
+
+  try {
+    sample();
+    await run();
+    sample();
+  } finally {
+    backend.malloc = origMalloc;
+    backend.decRef = origDecRef;
+  }
+
+  const end = getSlotCount();
+  return {
+    baseline,
+    peak,
+    delta: peak - baseline,
+    end,
+  };
+}
+
 // Initialize WebGPU once for all tests
 if (hasWebGPU) {
   const devices = await init();
@@ -176,6 +262,55 @@ Deno.test({
     xLarge.dispose();
     fSmall.dispose();
     fLarge.dispose();
+  }),
+});
+
+// ---------------------------------------------------------------------------
+// Test: Eager and JIT have near-parity peak deltas with explicit temporaries
+// ---------------------------------------------------------------------------
+Deno.test({
+  name: "pool: eager vs jit peak-memory parity (explicit temporaries)",
+  ignore: !hasWebGPU,
+  fn: withLeakCheck(async () => {
+    const shape = [4096];
+
+    using x = np.ones(shape);
+    using addV = np.ones(shape);
+    using mulV = np.full(shape, 2);
+    // Include a routine (`sort`) so JIT cannot collapse everything into one
+    // kernel. This gives a meaningful eager-vs-jit parity comparison.
+    using fJit = jit((a: any, b: any, c: any) => a.sort().add(b).mul(c));
+
+    const eagerRun = async () => {
+      using t1 = x.sort();
+      using t2 = t1.add(addV);
+      using out = t2.mul(mulV);
+      await out.data();
+    };
+    const jitRun = async () => {
+      using out = fJit(x, addV, mulV);
+      await out.data();
+    };
+
+    // Warmup JIT compile outside measurement.
+    await jitRun();
+
+    const eagerPeak = await measurePeakSlotsDuring(eagerRun);
+    const jitPeak = await measurePeakSlotsDuring(jitRun);
+
+    // We expect near parity in peak live slots for non-fully-fusable pipelines.
+    // Allow one-slot wiggle room due to scheduling differences.
+    const slotGap = Math.abs(eagerPeak.delta - jitPeak.delta);
+    assert(
+      slotGap <= 1,
+      [
+        "Eager/JIT peak live-slot gap exceeded 1 slot",
+        `shape=${JSON.stringify(shape)}`,
+        `eagerDeltaSlots=${eagerPeak.delta} jitDeltaSlots=${jitPeak.delta}`,
+        `eagerBaseline=${eagerPeak.baseline} jitBaseline=${jitPeak.baseline}`,
+        `eagerEnd=${eagerPeak.end} jitEnd=${jitPeak.end}`,
+      ].join(" | "),
+    );
   }),
 });
 

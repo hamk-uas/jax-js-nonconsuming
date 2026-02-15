@@ -987,14 +987,11 @@ suite("depth-5 stress tests", () => {
 });
 
 // ============================================================
-// Previously KNOWN_BUG tests — regression coverage for fixed patterns
+// Previously KNOWN_BUG tests — now regression coverage for fixed patterns.
 //
-// This suite still contains active KNOWN_BUG-tagged tests plus nearby
-// regression coverage for patterns that were fixed.
-//
-// Active KNOWN_BUG tests use KNOWN_BUG(<id>) in their names for grepability.
+// No active KNOWN_BUG tests remain in this suite.
 // ============================================================
-suite("KNOWN_BUG: framework issues under active development", () => {
+suite("Regression: previously known bug patterns", () => {
   test("grad(grad(grad(grad(f)))) should not leak", () => {
     using r = grad(grad(grad(grad(fn))))(X);
     expect(r).toBeAllclose(F4);

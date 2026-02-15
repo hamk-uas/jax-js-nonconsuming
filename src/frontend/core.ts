@@ -685,6 +685,22 @@ export function insideTrace(): boolean {
 }
 
 /**
+ * Flag set only during scan body tracing. Arrays created while this is true
+ * are tagged as anonymous builder-owned consts (via anonymousConstArrays).
+ * Unlike insideTrace(), this doesn't fire during jit/vmap/other traces where
+ * the ClosedJaxpr is cached and consts must survive beyond compilation.
+ */
+let _scanBodyTraceActiveFlag = false;
+
+export function isScanBodyTraceActive(): boolean {
+  return _scanBodyTraceActiveFlag;
+}
+
+export function setScanBodyTraceActive(v: boolean): void {
+  _scanBodyTraceActiveFlag = v;
+}
+
+/**
  * Returns true if any abstract (graph-building) trace is on the stack.
  *
  * Unlike `insideTrace()`, this returns false when only concrete-value traces

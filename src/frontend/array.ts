@@ -45,6 +45,7 @@ import {
   exp as coreExp,
   mul as coreMul,
   getAval,
+  isScanBodyTraceActive,
   ndim,
   newMain,
   Primitive,
@@ -1562,10 +1563,12 @@ export function array(
     }
     return values;
   } else if (ArrayBuffer.isView(values)) {
-    return arrayFromData(values, shape ?? [values.length], {
-      dtype,
-      device,
-    });
+    return markAnonymousIfTracing(
+      arrayFromData(values, shape ?? [values.length], {
+        dtype,
+        device,
+      }),
+    );
   } else {
     // Assume this is a nested array object, infer the shape.
     if (!shape) {
@@ -1583,17 +1586,21 @@ export function array(
         `Jagged shape: ${JSON.stringify(shape)} vs ${flat.length}`,
       );
     }
-    if (size === 0) return zeros(shape, { dtype, device });
-    if (size === 1) return full(shape, flat[0], { dtype, device });
+    if (size === 0) return markAnonymousIfTracing(zeros(shape, { dtype, device }));
+    if (size === 1) return markAnonymousIfTracing(full(shape, flat[0], { dtype, device }));
     if (typeof flat[0] === "boolean") {
       dtype = dtype ?? DType.Bool;
       const data = new Int32Array(flat.map((x) => (x ? 1 : 0)));
-      return arrayFromData(data, shape, { dtype, device });
+      return markAnonymousIfTracing(
+        arrayFromData(data, shape, { dtype, device }),
+      );
     } else {
       const weakType = dtype == undefined && shape.length === 0;
       dtype = dtype ?? DType.Float32;
       const data = dtypedJsArray(dtype, flat as number[]);
-      return arrayFromData(data, shape, { dtype, device }, weakType);
+      return markAnonymousIfTracing(
+        arrayFromData(data, shape, { dtype, device }, weakType),
+      );
     }
   }
 }
@@ -1686,6 +1693,16 @@ function dataToJs(
  * which would leak when the ClosedJaxpr is disposed.
  */
 export const anonymousConstArrays = new WeakSet<Array>();
+
+/**
+ * Tags an array as anonymous builder-owned if we're inside a scan body trace.
+ * This prevents getOrMakeConstTracer from calling .ref on inline np.array()
+ * constants, which would leak when the ClosedJaxpr is disposed.
+ */
+const markAnonymousIfTracing = (arr: Array): Array => {
+  if (isScanBodyTraceActive()) anonymousConstArrays.add(arr);
+  return arr;
+};
 
 export function pureArray(x: TracerValue): Tracer {
   if (x instanceof Tracer) {

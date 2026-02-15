@@ -143,10 +143,6 @@ Husky runs `lint-staged` on commit, which auto-fixes ESLint and Prettier issues 
 pre-commit hook also runs the full Vitest suite and Deno WebGPU tests (`pnpm vitest run` +
 `pnpm run build` + `pnpm run test:deno`).
 
-> **TEMPORARY (`feat/non-consuming-ops` branch):** The pre-commit hook uses `|| true` so known test
-> failures don't block commits. Search `.husky/pre-commit` for `TODO(merge-to-main)` to find the
-> relaxed lines. See `MERGE_CHECKLIST.md` for the full list of items to resolve before merge.
-
 **Before any commit**, also run these checks manually to catch issues early:
 
 ```bash
@@ -926,6 +922,13 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
   non-contiguous input (reshape/transpose/flatten), (2) static argnums on jit, and (3) consts
   created inside the jit body (placed on trace-time device, becoming first arg so `#computeBackend`
   picks CPU).
+- **`no-unnecessary-ref` autofix vs internal tracer `.ref` propagation**: The
+  `jax-js/no-unnecessary-ref` eslint rule has autofix (`--fix` removes `.ref`). This is safe for
+  user code but **unsafe for internal tracer plumbing** where `.ref` must propagate to inner values
+  (e.g., `BatchTracer.ref` in `vmap.ts` must call `this.val.ref` so that `dispose()` remains
+  balanced). Use `// eslint-disable-next-line jax-js/no-unnecessary-ref` on such lines. Commit
+  `b5d4274` accidentally autofix'd `BatchTracer.ref`, causing `vmap(grad(erf))` to crash with
+  `UseAfterFreeError`; fixed in `af96e54`.
 
 ## Known flaky tests
 
@@ -935,31 +938,20 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
 
 ## Known framework bugs (`KNOWN_BUG` tests)
 
-The `feat/non-consuming-ops` branch has known framework bugs tracked as regular `test()` calls
-tagged with `KNOWN_BUG(<id>)` in the test name and a comment above. These tests exercise the actual
-broken patterns (not workarounds) and are expected to fail. When a framework fix lands, the test
-starts passing automatically — no clerical changes needed.
-
-**Policy:**
+All known framework bugs have been resolved. The `KNOWN_BUG` tagging convention is retained for
+future use if needed:
 
 1. Write the test as it SHOULD work — the ideal behavior, no workarounds.
 2. Tag the test name: `test("KNOWN_BUG(my-tag): description", () => { ... })`
 3. Add a `// KNOWN_BUG(my-tag): explanation` comment above the test.
 4. Keep the working workaround test nearby (e.g., jit-wrapped version, depth-3 cap).
-5. Add the bug to the inventory in `MERGE_CHECKLIST.md`.
-
-**Finding all known bugs:**
 
 ```bash
-grep -rn 'KNOWN_BUG(' test/
+grep -rn 'KNOWN_BUG(' test/   # Should return nothing
 ```
 
-**Current inventory:**
-
-All KNOWN_BUGs have been resolved. No remaining inventory.
-
-**Test status:** See `pnpm vitest run` output. Known failures are expected and tracked above. The LU
-JVP finite-difference test was previously failing because the WASM LU routine uses native f32
+**Test status:** See `pnpm vitest run` output. No active KNOWN_BUG failures are expected. The LU JVP
+finite-difference test was previously failing because the WASM LU routine uses native f32
 arithmetic; fixed by using larger eps and looser tolerance. All previously-failing cross-device
 tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync` in
 [Common pitfalls](#common-pitfalls).
@@ -992,7 +984,7 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 6. Export new public symbols from `src/index.ts`
 7. Update `FEATURES.md` for user-visible changes
 8. If you **fix** a `KNOWN_BUG` test (it starts passing), celebrate — then remove the `KNOWN_BUG`
-   tag and update the inventory in both this file and `MERGE_CHECKLIST.md`
+   tag and update the inventory in this file
 
 ## Documentation files
 
@@ -1001,7 +993,6 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 | `README.md`                       | Main project intro, tutorial               | Major features, API changes    |
 | `FEATURES.md`                     | JAX/NumPy API compatibility table          | New supported functions        |
 | `.github/copilot-instructions.md` | AI agent onboarding, scan feature tracking | New patterns, scan development |
-| `MERGE_CHECKLIST.md`              | Branch merge tasks & KNOWN_BUG inventory   | New/fixed known bugs           |
 | `packages/*/README.md`            | Package-specific docs                      | Package feature changes        |
 
 ## Where to start reading
@@ -2700,40 +2691,18 @@ bugs, and design decisions about eager-mode memory management.
 
 ## Known Friction Points
 
-### Anonymous constants in scan bodies leak 1 slot
+### Anonymous constants in scan bodies (fixed)
 
-**Problem:** If you create an anonymous `np.array(...)` inside a scan body, it leaks:
+Inline `np.array(...)` constants created inside traced scan/jit bodies are now treated as
+builder-owned anonymous consts. Arrays created from raw literals during tracing are tagged in
+`array()`, so `getOrMakeConstTracer` skips the extra `.ref` and `ClosedJaxpr.dispose()` fully
+balances ownership.
 
-```ts
-// ⚠️ LEAKS: the np.array([2, 3]) has rc=1 (creation), getOrMakeConstTracer adds rc=2,
-// closedJaxpr.dispose() drops to rc=1, but nobody holds a reference to call dispose() again
-const step = (carry, x) => {
-  return [np.add(carry, x), np.multiply(x, np.array([2, 3]))]; // anonymous const leaks!
-};
-lax.scan(step, init, xs);
-```
+Regression coverage:
 
-**Workaround:** Extract anonymous constants to named variables and dispose them after the scan:
-
-```ts
-const factor = np.array([2, 3]);
-const step = (carry, x) => {
-  return [np.add(carry, x), np.multiply(x, factor)];
-};
-const [carry, ys] = lax.scan(step, init, xs);
-carry.dispose();
-ys.dispose();
-factor.dispose(); // user explicitly frees the constant
-```
-
-**Root cause:** `getOrMakeConstTracer` does `val.ref` (rc → 2). `closedJaxpr.dispose()` drops it to
-rc=1. For user-held consts (like `factor`), the user's dispose drops it to 0. For anonymous consts,
-nobody ever calls the final dispose.
-
-**Potential fix (not yet implemented):** Track anonymous constants separately in the scan path —
-constants whose only reference is the `ClosedJaxpr` could be freed fully by `closedJaxpr.dispose()`
-without the extra `.ref`. This requires distinguishing "user-held" from "anonymous" consts at trace
-time, which is not straightforward.
+- `test/leak-diagnostic.test.ts`: `body with inline np.array constant does not leak`
+- `test/leak-diagnostic.test.ts`:
+  `inline np.array constants with xs=null length 0 and 1 do not leak`
 
 ### PETracer cascade sensitivity
 
@@ -2926,7 +2895,9 @@ Current semantics in the in-repo implementation:
   avoiding false positives from shadowed names. Error messages include the line number of the
   `.dispose()` call for easy cross-referencing.
 - `jax-js/no-unnecessary-ref` has autofix: `--fix` removes `.ref` (the dot and property) from the
-  chain. Safe because `.ref` is never needed in the non-consuming model.
+  chain. Safe for user code because `.ref` is never needed in the non-consuming model. **Unsafe for
+  internal tracer `.ref` propagation** — see [Common pitfalls](#common-pitfalls) for the
+  `BatchTracer.ref` incident. Lines with internal `.ref` plumbing need `eslint-disable-next-line`.
 - `jax-js/no-array-chain` deduplicates: only the outermost qualifying chain is reported, avoiding
   noisy depth-N + depth-(N-1) + ... reports for a single expression.
 
@@ -3095,12 +3066,13 @@ statically at edit time, complementing the runtime `checkLeaks` diagnostic.
 
 ## Future Work
 
-| Priority   | Feature                                   | Notes                                                                                                                                                                                         |
-| ---------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ~~High~~   | ~~`checkLeaks` diagnostic~~               | ✅ Implemented in `src/frontend/check-leaks.ts`                                                                                                                                               |
-| ~~High~~   | ~~unreachable Const PETracer leak~~       | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                         |
-| ~~High~~   | ~~user-disposed const over-disposal~~     | ✅ Fixed via `refCount <= 1` protection in `linearizeFlat`/`vjpFlat`                                                                                                                          |
-| Medium     | Anonymous constant leak fix               | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                     |
-| ~~Medium~~ | ~~ESLint plugin for non-consuming model~~ | ✅ Implemented as `@jax-js/eslint-plugin` v0.1.0 — `require-using`, `no-use-after-dispose`, `no-unnecessary-ref`, `no-array-chain`                                                            |
-| Medium     | `scatter_add` primitive                   | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices. |
-| ~~Low~~    | ~~`using` declaration examples~~          | ✅ Documented in copilot-instructions + README                                                                                                                                                |
+| Priority   | Feature                                   | Notes                                                                                                                                                                                           |
+| ---------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~High~~   | ~~`checkLeaks` diagnostic~~               | ✅ Implemented in `src/frontend/check-leaks.ts`                                                                                                                                                 |
+| ~~High~~   | ~~unreachable Const PETracer leak~~       | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                           |
+| ~~High~~   | ~~user-disposed const over-disposal~~     | ✅ Fixed via `refCount <= 1` protection in `linearizeFlat`/`vjpFlat`                                                                                                                            |
+| Medium     | Anonymous constant leak fix               | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                       |
+| ~~Medium~~ | ~~ESLint plugin for non-consuming model~~ | ✅ Implemented as `@jax-js/eslint-plugin` v0.1.0 — `require-using`, `no-use-after-dispose`, `no-unnecessary-ref`, `no-array-chain`                                                              |
+| Low        | Chain→temporaries RFC (design-only)       | Keep implementation deferred. Scope RFC to assignment/return chains only, preserve evaluation order + exceptions, and require measured eager-memory wins / lint-pressure before implementation. |
+| Medium     | `scatter_add` primitive                   | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.   |
+| ~~Low~~    | ~~`using` declaration examples~~          | ✅ Documented in copilot-instructions + README                                                                                                                                                  |

@@ -99,7 +99,10 @@ describe("scan fallback leak detection (CPU)", () => {
     await ys.data();
     carry.dispose();
     ys.dispose();
-    expect(checkLeaks.stop().leaked).toBe(0);
+    const report = checkLeaks.stop();
+    expect(report.leaked, `${report.summary}\n${report.details.join("\n")}`).toBe(
+      0,
+    );
 
     xs.dispose();
     initC.dispose();
@@ -132,6 +135,31 @@ describe("scan fallback leak detection (CPU)", () => {
     factor.dispose();
   });
 
+  it("body with inline np.array constant does not leak", async () => {
+    const xs = np.array([
+      [1, 2],
+      [3, 4],
+      [5, 6],
+    ]);
+    const initC = np.array([10, 20]);
+
+    const step = (carry: any, x: any): [any, any] => {
+      const newC = np.add(carry, x);
+      return [newC, np.multiply(x, np.array([2, 3]))];
+    };
+
+    checkLeaks.start();
+    const [carry, ys] = lax.scan(step, initC, xs);
+    await carry.data();
+    await ys.data();
+    carry.dispose();
+    ys.dispose();
+    expect(checkLeaks.stop().leaked).toBe(0);
+
+    xs.dispose();
+    initC.dispose();
+  });
+
   it("xs=null carry-only scan does not leak", async () => {
     const initC = np.array([10, 20]);
     const increment = np.array([1, 2]);
@@ -150,6 +178,29 @@ describe("scan fallback leak detection (CPU)", () => {
 
     initC.dispose();
     increment.dispose();
+  });
+
+  it("inline np.array constants with xs=null length 0 and 1 do not leak", async () => {
+    const step = (carry: any, _x: any): [any, any] => {
+      const newC = np.add(carry, np.array([1, 2]));
+      return [newC, np.multiply(newC, np.array([2, 3]))];
+    };
+
+    for (const length of [0, 1]) {
+      checkLeaks.start();
+      const initC = np.array([10, 20]);
+      const [carry, ys] = lax.scan(step, initC, null, { length });
+      await carry.data();
+      await ys.data();
+
+      // length=0 returns init carry directly; avoid double-dispose.
+      if (carry !== initC) carry.dispose();
+      ys.dispose();
+      initC.dispose();
+
+      const report = checkLeaks.stop();
+      expect(report.leaked, `length=${length} ${report.summary}`).toBe(0);
+    }
   });
 
   it("pytree carry does not leak", async () => {
