@@ -80,12 +80,12 @@ const _libSrcPrefix = (() => {
 })();
 /**
 * Detect which package a raw frame URL belongs to.
-* Returns the package name (e.g. "@jax-js/jax", "some-lib") or null for user code.
+* Returns the package name (e.g. "@hamk-uas/jax-js-nonconsuming", "some-lib") or null for user code.
 */
 function detectPackage(rawUrl) {
 	const nm = rawUrl.match(/node_modules\/((?:@[^/]+\/)?[^/]+)/);
 	if (nm) return nm[1];
-	if (_libSrcPrefix !== null && rawUrl.startsWith(_libSrcPrefix)) return "@jax-js/jax";
+	if (_libSrcPrefix !== null && rawUrl.startsWith(_libSrcPrefix)) return "@hamk-uas/jax-js-nonconsuming";
 	return null;
 }
 /** Convert a Vite/V8 stack location to a workspace-relative path. */
