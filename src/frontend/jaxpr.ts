@@ -43,7 +43,6 @@ import {
   Trace,
   Tracer,
   TracerValue,
-  UseAfterFreeError,
 } from "./core";
 
 /**

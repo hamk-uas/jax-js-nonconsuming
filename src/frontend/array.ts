@@ -1183,7 +1183,7 @@ export class Array extends Tracer {
       [Primitive.TriangularSolve]: Array.#routine(Primitive.TriangularSolve),
       [Primitive.Cholesky]: Array.#routine(Primitive.Cholesky),
       [Primitive.LU]: Array.#routine(Primitive.LU),
-      [Primitive.Jit](args, { jaxpr, name }) {
+      [Primitive.Jit](args, { jaxpr, name: _name }) {
         if (jaxpr.inBinders.length !== args.length) {
           throw new Error(
             `jit expects ${jaxpr.inBinders.length} args, got ${args.length}`,
@@ -1353,8 +1353,8 @@ export class Array extends Tracer {
         // jaxpr inputs: [...consts, ...carry, ...x_slice]
         // jaxpr outputs: [...newCarry, ...y_slice]
 
-        const consts = args.slice(0, numConsts);
-        const initCarry = args.slice(numConsts, numConsts + numCarry);
+        const _consts = args.slice(0, numConsts);
+        const _initCarry = args.slice(numConsts, numConsts + numCarry);
         const xs = args.slice(numConsts + numCarry);
 
         const numX = xs.length;

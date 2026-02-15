@@ -1,9 +1,5 @@
 <script lang="ts">
-  import {
-    defaultDevice,
-    init,
-    numpy as np,
-  } from "@jax-js-nonconsuming/jax";
+  import { defaultDevice, init, numpy as np } from "@jax-js-nonconsuming/jax";
   import { opfs, safetensors, tokenizers } from "@jax-js-nonconsuming/loaders";
   import { BookMarkedIcon, FileTextIcon } from "@lucide/svelte";
 

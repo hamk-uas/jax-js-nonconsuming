@@ -5,7 +5,6 @@
  * "recycle" step that reuses the backend Slot, avoiding alloc/free overhead.
  */
 import {
-  checkLeaks,
   defaultDevice,
   grad,
   init,

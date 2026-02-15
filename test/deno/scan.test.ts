@@ -17,14 +17,7 @@
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import { assertThrows } from "https://deno.land/std@0.224.0/assert/mod.ts";
 
-import {
-  numpy as np,
-  lax,
-  jit,
-  grad,
-  jvp,
-  vmap,
-} from "../../dist/index.js";
+import { numpy as np, lax, jit, grad, jvp, vmap } from "../../dist/index.js";
 
 import {
   initWebGPU,
@@ -126,11 +119,7 @@ Deno.test({
     using initB = np.array([0.0]);
     using xs = np.array([[1.0], [2.0], [3.0]]);
 
-    const [finalCarry, outputs] = lax.scan(
-      step,
-      { a: initA, b: initB },
-      xs,
-    );
+    const [finalCarry, outputs] = lax.scan(step, { a: initA, b: initB }, xs);
     using _fcA = finalCarry.a;
     using _fcB = finalCarry.b;
     using _out = outputs;
@@ -217,9 +206,7 @@ Deno.test({
     using initCount = np.array([0.0]);
     using xs = np.array([[1.0], [2.0], [3.0]]);
 
-    using f = jit(() =>
-      lax.scan(step, { sum: initSum, count: initCount }, xs),
-    );
+    using f = jit(() => lax.scan(step, { sum: initSum, count: initCount }, xs));
 
     const [finalCarry, outputs] = f();
     using _fcSum = finalCarry.sum;
@@ -275,21 +262,15 @@ Deno.test({
 
     using initA = np.array([0.0]);
     using initB = np.array([1.0]);
-    const [finalCarry, outputs] = lax.scan(
-      step,
-      { a: initA, b: initB },
-      null,
-      { length: 8 },
-    );
+    const [finalCarry, outputs] = lax.scan(step, { a: initA, b: initB }, null, {
+      length: 8,
+    });
     using _fcA = finalCarry.a;
     using _fcB = finalCarry.b;
     using _out = outputs;
 
     const data = await outputs.data();
-    assertEquals(
-      Array.from(data),
-      [0, 1, 1, 2, 3, 5, 8, 13],
-    );
+    assertEquals(Array.from(data), [0, 1, 1, 2, 3, 5, 8, 13]);
   }),
 });
 
@@ -375,12 +356,9 @@ Deno.test({
     using initA = np.array([0.0]);
     using initB = np.array([1.0]);
 
-    const [finalCarry, outputs] = lax.scan(
-      step,
-      { a: initA, b: initB },
-      null,
-      { length: 5 },
-    );
+    const [finalCarry, outputs] = lax.scan(step, { a: initA, b: initB }, null, {
+      length: 5,
+    });
     using _fcA = finalCarry.a;
     using _fcB = finalCarry.b;
     using _out = outputs;
@@ -841,9 +819,7 @@ Deno.test({
     using initP = np.array([1.0]);
     using xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
 
-    using f = jit(() =>
-      lax.scan(step, { state: initState, P: initP }, xs),
-    );
+    using f = jit(() => lax.scan(step, { state: initState, P: initP }, xs));
     const [finalCarry, outputs] = f();
     using _fcState = finalCarry.state;
     using _fcP = finalCarry.P;
@@ -887,12 +863,9 @@ Deno.test({
     };
 
     using initRev = np.array([0.0]);
-    const [revFinal, _revOutputs] = lax.scan(
-      reverseStep,
-      initRev,
-      fwdOutputs,
-      { reverse: true },
-    );
+    const [revFinal, _revOutputs] = lax.scan(reverseStep, initRev, fwdOutputs, {
+      reverse: true,
+    });
     using _fc = revFinal;
     using __revOutputs = _revOutputs;
 
@@ -920,9 +893,7 @@ Deno.test({
     using initSum = np.array([0.0]);
     using initCount = np.array([0.0]);
 
-    using f = jit(() =>
-      lax.scan(step, { sum: initSum, count: initCount }, xs),
-    );
+    using f = jit(() => lax.scan(step, { sum: initSum, count: initCount }, xs));
     const [finalCarry, outputs] = f();
     using _fcSum = finalCarry.sum;
     using _fcCount = finalCarry.count;

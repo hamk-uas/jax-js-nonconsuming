@@ -1,10 +1,4 @@
-import {
-  jit,
-  lax,
-  nn,
-  numpy as np,
-  random,
-} from "@jax-js-nonconsuming/jax";
+import { jit, lax, nn, numpy as np, random } from "@jax-js-nonconsuming/jax";
 
 import { fetchMnist } from "$lib/dataset/mnist";
 

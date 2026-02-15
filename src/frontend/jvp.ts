@@ -366,7 +366,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Dot]: bilinearTangentsJvp(Primitive.Dot),
   [Primitive.Conv]: bilinearTangentsJvp(Primitive.Conv),
   [Primitive.Compare]: zeroTangentsJvp(Primitive.Compare),
-  [Primitive.Where]([cond, x, y], [dcond, dx, dy]) {
+  [Primitive.Where]([cond, x, y], [_dcond, dx, dy]) {
     return [[where(cond, x, y)], [where(cond, dx, dy)]];
   },
   [Primitive.Concatenate]: linearTangentsJvp(Primitive.Concatenate),
@@ -523,7 +523,11 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const [primalsOut, tangentsOut] = [outs.slice(0, n), outs.slice(n)];
     return [primalsOut, tangentsOut];
   },
-  [Primitive.DynamicUpdateSlice]([dst, src], [ddst, dsrc], { offset, axis }) {
+  [Primitive.DynamicUpdateSlice](
+    [_dst, _src],
+    [_ddst, _dsrc],
+    { offset: _offset, axis: _axis },
+  ) {
     // JVP for dynamic update slice is not implemented. Throw to avoid silent errors.
     throw new Error("JVP: dynamic_update_slice is not implemented");
   },

@@ -6,9 +6,8 @@ import {
   jit,
   jvp,
   numpy as np,
-  vmap,
 } from "@jax-js-nonconsuming/jax";
-import { beforeEach, expect, onTestFinished, suite, test } from "vitest";
+import { beforeEach, expect, suite, test } from "vitest";
 
 const devicesAvailable = await init();
 

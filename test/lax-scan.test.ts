@@ -440,7 +440,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
         [0.01, 0],
         [0, 0.01],
       ]);
-      using R = np.array([[0.1]]);
+      using _R = np.array([[0.1]]);
 
       type Carry = { state: np.Array; cov: np.Array };
       type X = { obs: np.Array };

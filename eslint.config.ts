@@ -101,6 +101,28 @@ export default defineConfig([
       "jax-js/require-scan-result-dispose": "warn",
     },
   },
+  // Internal framework code manipulates Slots, shapes, Jaxprs — not np.Arrays.
+  // Disable require-using there to avoid pervasive false positives.
+  {
+    files: [
+      "src/frontend/**/*.ts",
+      "src/library/**/*.ts",
+      "src/backend/**/*.ts",
+      "src/tuner.ts",
+      "src/*.test.ts",
+    ],
+    ignores: ["**/*.test.ts"],
+    rules: {
+      "jax-js/require-using": "off",
+    },
+  },
+  // Also disable for .test.ts files inside src/ (they test internals)
+  {
+    files: ["src/**/*.test.ts"],
+    rules: {
+      "jax-js/require-using": "off",
+    },
+  },
   {
     files: ["test/**/*.{js,mjs,cjs,ts}"],
     rules: {

@@ -5,7 +5,6 @@
  * Memory is managed via explicit .dispose() or the `using` keyword.
  */
 import {
-  checkLeaks,
   grad,
   jit,
   lax,

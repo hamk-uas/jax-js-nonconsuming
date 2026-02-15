@@ -3,7 +3,6 @@ import {
   Device,
   grad,
   init,
-  jit,
   jvp,
   numpy as np,
   random,
