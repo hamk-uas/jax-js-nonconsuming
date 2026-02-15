@@ -215,6 +215,15 @@ function hasPersistedSinkForAnyIdentifier(
     expr?.type === "CallExpression" &&
     expr.callee?.type === "MemberExpression"
   ) {
+    if (
+      expr.callee.object?.type === "Identifier" &&
+      expr.callee.object.name === "tree" &&
+      getMemberName(expr.callee.property) === "makeDisposable" &&
+      expr.arguments.some((arg: any) => usesAnyIdentifier(arg, names))
+    ) {
+      return true;
+    }
+
     const name = getMemberName(expr.callee.property);
     if (
       name &&

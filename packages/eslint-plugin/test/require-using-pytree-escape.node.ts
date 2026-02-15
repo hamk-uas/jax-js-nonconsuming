@@ -58,6 +58,19 @@ function store(x, y, holder) {
   assert.equal(messages.length, 0);
 });
 
+test("require-using: tree.makeDisposable ownership handoff does not warn", async () => {
+  const code = `
+function capture(x, y) {
+  const a = np.add(x, y);
+  const owner = tree.makeDisposable({ a });
+  return owner;
+}
+`;
+
+  const messages = await lintRequireUsing(code);
+  assert.equal(messages.length, 0);
+});
+
 test("require-using: non-escaping local still warns", async () => {
   const code = `
 function shortLived(x, y) {

@@ -257,12 +257,38 @@ import { ... } from "...";
 Flags deep fluent method chains that create unnamed eager-mode temporaries. These intermediates
 can't be `using`-managed and may accumulate in GPU memory until GC runs.
 
+Only the outermost chain is reported — inner subchains don't produce duplicate diagnostics.
+
+```ts
+// ❌ Error (depth 3): Array call chain depth 3 creates unnamed eager temporaries
+const y = x.mul(weights).add(bias).tanh();
+// (reported once, not once per subchain)
+
+// ✅ OK: explicit intermediates with deterministic cleanup
+using a = x.mul(weights);
+using b = a.add(bias);
+const y = b.tanh();
+```
+
+**Options:**
+
+| Option     | Type    | Default | Description                          |
+| ---------- | ------- | ------- | ------------------------------------ |
+| `minDepth` | integer | `2`     | Minimum chain depth to trigger error |
+
+**Scope:** Only tracks known JAX array methods (`add`, `sub`, `mul`, `div`, `reshape`, `transpose`,
+`sum`, `mean`, `exp`, `log`, `sin`, `cos`, `tanh`, `sqrt`, `matmul`, etc.). JavaScript collection
+methods like `.map()`, `.filter()`, `.reduce()` are ignored.
+
 ### `jax-js/require-scan-result-dispose`
 
 **Type:** problem (`warn` in recommended, `error` in strict) · no autofix
 
 Requires destructured `lax.scan(...)` outputs to be either disposed in the same scope (for example
 via `tree.dispose(carry)` / `tree.dispose(ys)`) or returned to caller-owned scope.
+
+Underscore-prefixed bindings (for example `_ys`) are treated as intentional ignores.
+`tree.makeDisposable({ carry, ys })` is also treated as explicit ownership handoff.
 
 ```ts
 // ❌ Warn: scan outputs are dropped without dispose/return
@@ -287,30 +313,35 @@ function forward(step, initCarry, xs) {
   const [carry, ys] = lax.scan(step, initCarry, xs);
   return { carry, ys };
 }
+
+// ✅ OK: ownership transferred to disposable wrapper
+function owned(step, initCarry, xs) {
+  const [carry, ys] = lax.scan(step, initCarry, xs);
+  return tree.makeDisposable({ carry, ys });
+}
 ```
 
-Only the outermost chain is reported — inner subchains don't produce duplicate diagnostics.
+### Recommended ownership patterns
 
 ```ts
-// ❌ Error (depth 3): Array call chain depth 3 creates unnamed eager temporaries
-const y = x.mul(weights).add(bias).tanh();
-// (reported once, not once per subchain)
+// Pattern 1: short-lived intermediates
+using tmp = np.add(x, y);
+return tmp.sum();
 
-// ✅ OK: explicit intermediates with deterministic cleanup
-using a = x.mul(weights);
-using b = a.add(bias);
-const y = b.tanh();
+// Pattern 2: scan outputs disposed in same scope
+const [carry, ys] = lax.scan(step, initCarry, xs);
+tree.dispose(carry);
+try {
+  return np.add(ys.pred, ys.pred);
+} finally {
+  tree.dispose(ys);
+}
+
+// Pattern 3: ownership handoff to disposable wrapper
+const [carry2, ys2] = lax.scan(step, initCarry, xs);
+using owned = tree.makeDisposable({ carry: carry2, ys: ys2 });
+return await owned.carry.consumeData();
 ```
-
-**Options:**
-
-| Option     | Type    | Default | Description                          |
-| ---------- | ------- | ------- | ------------------------------------ |
-| `minDepth` | integer | `2`     | Minimum chain depth to trigger error |
-
-**Scope:** Only tracks known JAX array methods (`add`, `sub`, `mul`, `div`, `reshape`, `transpose`,
-`sum`, `mean`, `exp`, `log`, `sin`, `cos`, `tanh`, `sqrt`, `matmul`, etc.). JavaScript collection
-methods like `.map()`, `.filter()`, `.reduce()` are ignored.
 
 ### Svelte note (`.svelte`, `.svelte.ts`)
 

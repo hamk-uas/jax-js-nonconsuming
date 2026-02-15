@@ -73,3 +73,28 @@ function f(step, initCarry, xs) {
   const messages = await lintScanDispose(code);
   assert.equal(messages.length, 0);
 });
+
+test("require-scan-result-dispose: no warn when makeDisposable takes ownership", async () => {
+  const code = `
+function f(step, initCarry, xs) {
+  const [carry, ys] = lax.scan(step, initCarry, xs);
+  const owned = tree.makeDisposable({ carry, ys });
+  return owned;
+}
+`;
+
+  const messages = await lintScanDispose(code);
+  assert.equal(messages.length, 0);
+});
+
+test("require-scan-result-dispose: underscore-prefixed outputs are ignored", async () => {
+  const code = `
+function f(step, initCarry, xs) {
+  const [final, _ys] = lax.scan(step, initCarry, xs);
+  return final;
+}
+`;
+
+  const messages = await lintScanDispose(code);
+  assert.equal(messages.length, 0);
+});

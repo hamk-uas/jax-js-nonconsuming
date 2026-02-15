@@ -118,6 +118,44 @@ function hasDisposeCallForIdentifier(
   return false;
 }
 
+function hasMakeDisposableHandoffForIdentifier(
+  node: any,
+  idName: string,
+  seen: WeakSet<object> = new WeakSet(),
+): boolean {
+  if (!node || typeof node !== "object") return false;
+  if (seen.has(node)) return false;
+  seen.add(node);
+
+  if (
+    node.type === "CallExpression" &&
+    node.callee?.type === "MemberExpression" &&
+    node.callee.object?.type === "Identifier" &&
+    node.callee.object.name === "tree" &&
+    getMemberName(node.callee.property) === "makeDisposable"
+  ) {
+    return node.arguments.some((arg: any) => usesIdentifier(arg, idName));
+  }
+
+  for (const key of Object.keys(node)) {
+    if (key === "parent") continue;
+    const value = (node as any)[key];
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (hasMakeDisposableHandoffForIdentifier(item, idName, seen)) {
+          return true;
+        }
+      }
+    } else if (value && typeof value === "object") {
+      if (hasMakeDisposableHandoffForIdentifier(value, idName, seen)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 function isLaxScanCall(node: any): boolean {
   if (!node || node.type !== "CallExpression") return false;
   if (node.callee?.type !== "MemberExpression") return false;
@@ -144,6 +182,10 @@ function collectTopLevelArrayPatternIds(pattern: any): string[] {
   return ids;
 }
 
+function isIgnoredBindingName(name: string): boolean {
+  return name.startsWith("_");
+}
+
 function hasReturnOrDisposeAfterDeclaration(
   declStmt: any,
   idName: string,
@@ -157,6 +199,9 @@ function hasReturnOrDisposeAfterDeclaration(
   for (let i = idx + 1; i < statements.length; i++) {
     if (hasReturnOrYieldOfIdentifier(statements[i], idName)) return true;
     if (hasDisposeCallForIdentifier(statements[i], idName)) return true;
+    if (hasMakeDisposableHandoffForIdentifier(statements[i], idName)) {
+      return true;
+    }
   }
 
   return false;
@@ -184,6 +229,7 @@ const rule: Rule.RuleModule = {
           if (ids.length === 0) continue;
 
           for (const idName of ids) {
+            if (isIgnoredBindingName(idName)) continue;
             if (hasReturnOrDisposeAfterDeclaration(node, idName)) continue;
 
             context.report({
