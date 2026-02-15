@@ -15,7 +15,7 @@
 >
 > **Why this fork?** The original jax-js uses move semantics, where operations consume their inputs.
 > This fork was created for teams familiar with MATLAB or Python (NumPy) where move semantics are
-> unexpected. We also fast-tracked a `lax.scan` implementation in this fork.
+> unexpected. We also fast-tracked a `lax.scan` implementation.
 >
 > See [Differences from upstream](#differences-from-upstream) for a full comparison between the
 > original and this fork.
