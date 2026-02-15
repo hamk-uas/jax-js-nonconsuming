@@ -2898,7 +2898,7 @@ Current rollout in this repo:
 
 - `jax-js/require-using`: `warn` on `src/**`, `test/**`, `packages/**`
 - `jax-js/no-unnecessary-ref`: `warn` on `src/**`, `test/**`, `packages/**`
-- `jax-js/no-use-after-dispose`: `off`
+- `jax-js/no-use-after-dispose`: `warn` on `src/**`, `test/**`, `packages/**`
 - `jax-js/no-array-chain`: `off`
 
 Implemented rules:

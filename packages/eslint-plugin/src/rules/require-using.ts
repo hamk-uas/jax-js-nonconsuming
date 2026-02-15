@@ -110,18 +110,25 @@ function hasExplicitDisposeAfterDeclaration(
   return false;
 }
 
-function usesIdentifier(node: any, idName: string): boolean {
+function usesIdentifier(
+  node: any,
+  idName: string,
+  seen: WeakSet<object> = new WeakSet(),
+): boolean {
   if (!node || typeof node !== "object") return false;
+  if (seen.has(node)) return false;
+  seen.add(node);
   if (node.type === "Identifier" && node.name === idName) return true;
 
   for (const key of Object.keys(node)) {
+    if (key === "parent") continue;
     const value = (node as any)[key];
     if (Array.isArray(value)) {
       for (const item of value) {
-        if (usesIdentifier(item, idName)) return true;
+        if (usesIdentifier(item, idName, seen)) return true;
       }
     } else if (value && typeof value === "object") {
-      if (usesIdentifier(value, idName)) return true;
+      if (usesIdentifier(value, idName, seen)) return true;
     }
   }
 

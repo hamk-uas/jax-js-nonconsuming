@@ -88,7 +88,7 @@ export default defineConfig([
     rules: {
       "jax-js/no-array-chain": "off",
       "jax-js/no-unnecessary-ref": "warn",
-      "jax-js/no-use-after-dispose": "off",
+      "jax-js/no-use-after-dispose": "warn",
       "jax-js/require-using": "warn",
     },
   },
