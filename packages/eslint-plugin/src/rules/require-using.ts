@@ -179,21 +179,48 @@ function isArrayProducingCall(node: any): boolean {
   return false;
 }
 
-function isReturnedAfterDeclaration(declStmt: any, idName: string): boolean {
-  const block = declStmt.parent;
-  if (!block || block.type !== "BlockStatement") return false;
-  const statements = block.body as any[];
-  const idx = statements.indexOf(declStmt);
-  if (idx < 0) return false;
+function usesAnyIdentifier(node: any, names: ReadonlySet<string>): boolean {
+  for (const name of names) {
+    if (usesIdentifier(node, name)) return true;
+  }
+  return false;
+}
 
-  for (let i = idx + 1; i < statements.length; i++) {
-    // Direct return/yield of this identifier
-    if (hasReturnOrYieldOfIdentifier(statements[i], idName)) {
-      return true;
-    }
-    // Single-hop indirect return: `const out = { a }; return out;`
-    // Check if idName is assigned into a variable that is later returned.
-    if (isAssignedToReturnedVariable(statements, i, idName)) {
+function hasReturnOrYieldOfAnyIdentifier(
+  node: any,
+  names: ReadonlySet<string>,
+): boolean {
+  for (const name of names) {
+    if (hasReturnOrYieldOfIdentifier(node, name)) return true;
+  }
+  return false;
+}
+
+function hasPersistedSinkForAnyIdentifier(
+  stmt: any,
+  names: ReadonlySet<string>,
+): boolean {
+  if (stmt.type !== "ExpressionStatement") return false;
+  const expr = stmt.expression;
+
+  if (
+    expr?.type === "AssignmentExpression" &&
+    usesAnyIdentifier(expr.right, names) &&
+    expr.left?.type !== "Identifier"
+  ) {
+    return true;
+  }
+
+  if (
+    expr?.type === "CallExpression" &&
+    expr.callee?.type === "MemberExpression"
+  ) {
+    const name = getMemberName(expr.callee.property);
+    if (
+      name &&
+      ["set", "push", "unshift", "add"].includes(name) &&
+      expr.arguments.some((arg: any) => usesAnyIdentifier(arg, names))
+    ) {
       return true;
     }
   }
@@ -202,36 +229,43 @@ function isReturnedAfterDeclaration(declStmt: any, idName: string): boolean {
 }
 
 /**
- * Single-hop indirect return detection.
+ * Lightweight escape tracking for pytrees and object-property flows.
  *
- * Checks if `statements[stmtIdx]` is a variable declaration whose initializer
- * contains `idName`, AND that variable is later returned/yielded.
- *
- * Covers the common pattern:
- *   const a = np.add(x, y);
- *   const output = { a, b };  // ← stmtIdx points here
- *   return output;            // ← a escapes via output
+ * Tracks transitive aliases within the same block:
+ *   a -> obj -> node -> result
+ * If any tracked alias is returned/yielded or persisted to non-local storage,
+ * treat the original binding as escaping and do not require `using`.
  */
-function isAssignedToReturnedVariable(
-  statements: any[],
-  stmtIdx: number,
-  idName: string,
-): boolean {
-  const stmt = statements[stmtIdx];
-  if (stmt.type !== "VariableDeclaration") return false;
+function hasEscapedUseAfterDeclaration(declStmt: any, idName: string): boolean {
+  const block = declStmt.parent;
+  if (!block || block.type !== "BlockStatement") return false;
+  const statements = block.body as any[];
+  const idx = statements.indexOf(declStmt);
+  if (idx < 0) return false;
 
-  for (const decl of stmt.declarations as any[]) {
-    if (!decl.init || decl.id?.type !== "Identifier") continue;
-    // Check if the initializer of this variable references our target id
-    if (!usesIdentifier(decl.init, idName)) continue;
-    // Now check if THIS variable is returned/yielded later
-    const varName = decl.id.name;
-    for (let j = stmtIdx + 1; j < statements.length; j++) {
-      if (hasReturnOrYieldOfIdentifier(statements[j], varName)) {
-        return true;
+  const escapedNames = new Set<string>([idName]);
+
+  for (let i = idx + 1; i < statements.length; i++) {
+    const stmt = statements[i];
+
+    if (hasReturnOrYieldOfAnyIdentifier(stmt, escapedNames)) {
+      return true;
+    }
+
+    if (hasPersistedSinkForAnyIdentifier(stmt, escapedNames)) {
+      return true;
+    }
+
+    if (stmt.type === "VariableDeclaration") {
+      for (const decl of stmt.declarations as any[]) {
+        if (!decl.init || decl.id?.type !== "Identifier") continue;
+        if (usesAnyIdentifier(decl.init, escapedNames)) {
+          escapedNames.add(decl.id.name);
+        }
       }
     }
   }
+
   return false;
 }
 
@@ -366,49 +400,6 @@ function usesIdentifier(
   return false;
 }
 
-function hasPersistedUseAfterDeclaration(
-  declStmt: any,
-  idName: string,
-): boolean {
-  const block = declStmt.parent;
-  if (!block || block.type !== "BlockStatement") return false;
-  const statements = block.body as any[];
-  const idx = statements.indexOf(declStmt);
-  if (idx < 0) return false;
-
-  for (let i = idx + 1; i < statements.length; i++) {
-    const stmt = statements[i];
-
-    if (stmt.type === "ExpressionStatement") {
-      const expr = stmt.expression;
-
-      if (
-        expr?.type === "AssignmentExpression" &&
-        usesIdentifier(expr.right, idName) &&
-        expr.left?.type !== "Identifier"
-      ) {
-        return true;
-      }
-
-      if (
-        expr?.type === "CallExpression" &&
-        expr.callee?.type === "MemberExpression"
-      ) {
-        const name = getMemberName(expr.callee.property);
-        if (
-          name &&
-          ["set", "push", "unshift", "add"].includes(name) &&
-          expr.arguments.some((arg: any) => usesIdentifier(arg, idName))
-        ) {
-          return true;
-        }
-      }
-    }
-  }
-
-  return false;
-}
-
 const rule: Rule.RuleModule = {
   meta: {
     type: "problem",
@@ -437,9 +428,8 @@ const rule: Rule.RuleModule = {
         for (const decl of node.declarations as any[]) {
           if (!decl.init || decl.id?.type !== "Identifier") continue;
           if (!isArrayProducingCall(decl.init)) continue;
-          if (isReturnedAfterDeclaration(node, decl.id.name)) continue;
+          if (hasEscapedUseAfterDeclaration(node, decl.id.name)) continue;
           if (hasExplicitDisposeAfterDeclaration(node, decl.id.name)) continue;
-          if (hasPersistedUseAfterDeclaration(node, decl.id.name)) continue;
 
           context.report({
             node: decl.id,
