@@ -190,13 +190,28 @@ Flags `.ref` property access. In the non-consuming ownership model, `.ref` is ne
 code — operations do not consume inputs. The only legitimate uses are deep inside the framework
 internals.
 
+**Automatically skipped contexts** (not flagged):
+
+- `UpdateExpression`: `buffer.ref++`, `buffer.ref--` — plain numeric property mutations
+- `BinaryExpression`: `buffer.ref === 0` — property reads in comparisons
+
+**Suppression comments:**
+
+- **Per-line:** `// jax-js-lint: allow-ref` on the line before the flagged code
+- **File-level:** `// jax-js-lint: allow-ref` in a leading comment (before any imports) suppresses
+  all `.ref` warnings in the entire file
+
 ```ts
 // ❌ Error: `.ref` is usually unnecessary in non-consuming jax-js
 const copy = myArray.ref;
 
-// ✅ OK: suppressed for framework internals
+// ✅ OK: suppressed for framework internals (per-line)
 // jax-js-lint: allow-ref
 const copy = myArray.ref;
+
+// ✅ OK: file-level suppression (at top of file, before imports)
+// jax-js-lint: allow-ref — .ref is the core mechanism in this module
+import { ... } from "...";
 ```
 
 ### `jax-js/no-array-chain`

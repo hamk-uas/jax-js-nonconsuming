@@ -926,9 +926,14 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
   `jax-js/no-unnecessary-ref` eslint rule has autofix (`--fix` removes `.ref`). This is safe for
   user code but **unsafe for internal tracer plumbing** where `.ref` must propagate to inner values
   (e.g., `BatchTracer.ref` in `vmap.ts` must call `this.val.ref` so that `dispose()` remains
-  balanced). Use `// eslint-disable-next-line jax-js/no-unnecessary-ref` on such lines. Commit
-  `b5d4274` accidentally autofix'd `BatchTracer.ref`, causing `vmap(grad(erf))` to crash with
-  `UseAfterFreeError`; fixed in `af96e54`.
+  balanced). Commit `b5d4274` accidentally autofix'd `BatchTracer.ref`, causing `vmap(grad(erf))`
+  to crash with `UseAfterFreeError`; fixed in `af96e54`. The rule now skips `.ref` in
+  `UpdateExpression` and `BinaryExpression` contexts (e.g., `buffer.ref++`, `buffer.ref === 0`) to
+  avoid false positives on backend buffer tracking objects. For files with many intentional `.ref`
+  calls, a file-level `// jax-js-lint: allow-ref` directive (in leading comments) suppresses all
+  warnings. Per-line `// jax-js-lint: allow-ref` comments are used for isolated sites (vmap.ts,
+  jaxpr.ts, tree.ts, onnx/tensor.ts, optax/transform.ts). `linearize.ts` uses the file-level
+  directive (31 internal `.ref` calls in the autodiff system).
 
 ## Known flaky tests
 
@@ -2897,7 +2902,11 @@ Current semantics in the in-repo implementation:
 - `jax-js/no-unnecessary-ref` has autofix: `--fix` removes `.ref` (the dot and property) from the
   chain. Safe for user code because `.ref` is never needed in the non-consuming model. **Unsafe for
   internal tracer `.ref` propagation** — see [Common pitfalls](#common-pitfalls) for the
-  `BatchTracer.ref` incident. Lines with internal `.ref` plumbing need `eslint-disable-next-line`.
+  `BatchTracer.ref` incident. The rule automatically skips `.ref` in `UpdateExpression` and
+  `BinaryExpression` contexts (e.g., `buffer.ref++`, `buffer.ref === 0`) to avoid false positives
+  on backend buffer tracking objects. For files with many intentional `.ref` calls, a file-level
+  `// jax-js-lint: allow-ref` directive (in leading comments) suppresses all warnings. Per-line
+  `// jax-js-lint: allow-ref` comments are used for isolated sites.
 - `jax-js/no-array-chain` deduplicates: only the outermost qualifying chain is reported, avoiding
   noisy depth-N + depth-(N-1) + ... reports for a single expression.
 

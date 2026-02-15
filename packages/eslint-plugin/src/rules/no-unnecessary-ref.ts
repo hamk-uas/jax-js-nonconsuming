@@ -21,6 +21,15 @@ const rule: Rule.RuleModule = {
       MemberExpression(node: any) {
         const name = getMemberName(node.property);
         if (name !== "ref") return;
+        // Skip `.ref` in update expressions (e.g. `buffer.ref++`, `buffer.ref--`)
+        // and comparisons (e.g. `buffer.ref === 0`).
+        // These are plain numeric property accesses, not the Array `.ref` accessor.
+        const parentType = node.parent?.type;
+        if (
+          parentType === "UpdateExpression" ||
+          parentType === "BinaryExpression"
+        )
+          return;
         if (hasAllowComment(context, node, "jax-js-lint: allow-ref")) return;
         context.report({
           node: node.property,

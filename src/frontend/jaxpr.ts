@@ -660,6 +660,7 @@ class JaxprTrace extends Trace {
       if (!ownedByBuilder) {
         // Take a ref so ClosedJaxpr owns the const independently of the caller.
         // This protects the const from PETracer cascade in linearize transforms.
+        // jax-js-lint: allow-ref
         val.ref;
       }
       this.builder.addConst(tracer, val);

@@ -22,6 +22,13 @@ export function hasAllowComment(
   const nodeLine = node.loc?.start.line;
   if (nodeLine === undefined) return false;
 
+  // Check file-level leading comments (top-of-file directive).
+  const program = source.ast;
+  const progComments = source.getCommentsBefore(program.body[0] ?? program);
+  for (const c of progComments) {
+    if (c.value.includes(marker)) return true;
+  }
+
   let current: any = node;
   while (current) {
     const comments = source.getCommentsBefore(current);

@@ -91,6 +91,7 @@ export function operandToJax(op: Operand): np.Array {
 }
 
 export function operandRef(op: Operand): Operand {
+  // jax-js-lint: allow-ref
   return op instanceof StaticArray ? op : op.ref;
 }
 

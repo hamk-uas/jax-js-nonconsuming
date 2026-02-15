@@ -1,4 +1,5 @@
 /** @file Implementations of vjp() and partial evaluation. */
+// jax-js-lint: allow-ref — .ref is the core ownership mechanism in autodiff internals
 
 import { AluOp, isFloatDtype } from "../alu";
 import {

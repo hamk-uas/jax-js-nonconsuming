@@ -295,6 +295,7 @@ export function trace({
         // Standard momentum: updates = new_trace
         // Ref the tree so chain can safely dispose intermediate updates
         // without affecting the state's reference.
+        // jax-js-lint: allow-ref
         finalUpdates = tree.ref(newTrace) as typeof updates;
       }
 

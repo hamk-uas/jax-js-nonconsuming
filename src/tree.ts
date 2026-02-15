@@ -188,6 +188,7 @@ export function map<T, U, Tree extends JsTree<T>>(
 
 /** Take a reference of every array in a tree. */
 export function ref<Tree extends JsTree<any>>(tree: Tree): Tree {
+  // jax-js-lint: allow-ref
   return map((x) => (x instanceof Tracer ? x.ref : x), tree) as unknown as Tree;
 }
 

@@ -99,8 +99,7 @@ class BatchTracer extends Tracer {
 
   get ref() {
     // Must propagate to inner value so dispose() remains balanced.
-    // (eslint jax-js/no-unnecessary-ref is wrong here — this is internal plumbing)
-    // eslint-disable-next-line jax-js/no-unnecessary-ref
+    // jax-js-lint: allow-ref
     this.val.ref;
     return this;
   }
