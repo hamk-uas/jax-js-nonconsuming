@@ -39,7 +39,7 @@ export function scaleByAdam({
       const nu = treeZerosLike(params); // second moment
       return { count: u32(0), mu, nu };
     },
-    update(updates, state, params) {
+    update(updates, state, _params) {
       const {
         count: oldCount,
         mu: oldMu,
@@ -104,7 +104,7 @@ export function scaleByAdam({
 export function scale(stepSize: number): GradientTransformation {
   return {
     init: initEmptyState,
-    update(updates, state, params) {
+    update(updates, state, _params) {
       updates = tree.map((g: np.Array) => g.mul(stepSize), updates);
       return [updates, state];
     },

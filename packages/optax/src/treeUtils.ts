@@ -118,6 +118,7 @@ export function treeNorm(
       result.dispose();
       return sq;
     }
+    // eslint-disable-next-line jax-js/no-use-after-dispose -- dispose is conditional (squared branch only)
     return result;
   } else if (ord === "inf" || ord === "infinity" || ord === Infinity) {
     const absTree = tree.map(np.abs, tr);
@@ -128,6 +129,7 @@ export function treeNorm(
       result.dispose();
       return sq;
     }
+    // eslint-disable-next-line jax-js/no-use-after-dispose -- dispose is conditional (squared branch only)
     return result;
   } else {
     throw new Error(`Unsupported ord: ${ord}`);

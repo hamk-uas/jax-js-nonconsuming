@@ -2,6 +2,8 @@ import { expect, test } from "vitest";
 
 import { AluExp, AluOp, DType } from "./alu";
 
+/* eslint-disable jax-js/require-using -- AluExp are plain JS objects, not np.Arrays */
+
 test("AluExp can be evaluated", () => {
   const e = AluExp.i32(3);
   expect(e.evaluate({})).toEqual(3);

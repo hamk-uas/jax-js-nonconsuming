@@ -119,7 +119,7 @@ export function MaxPool(
   }
   const x = operandToJax(xOp);
   const n = kernelShape.length;
-  const xSpatial = x.shape.slice(2);
+  const xSpatial = x.shape.slice(2); // eslint-disable-line jax-js/require-using -- number[], not np.Array
   if (xSpatial.length !== n) {
     throw new Error(
       `MaxPool: input spatial dims ${xSpatial.length} must match kernel dims ${n}`,

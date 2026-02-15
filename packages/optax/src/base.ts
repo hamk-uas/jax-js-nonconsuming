@@ -40,7 +40,7 @@ export function identity(): GradientTransformation {
     update<Params extends JsTree<np.Array>>(
       updates: Params,
       state: OptState,
-      params?: Params,
+      _params?: Params,
     ): [Params, OptState] {
       return [updates, state];
     },
@@ -54,7 +54,7 @@ export function setToZero(): GradientTransformation {
     update<Params extends JsTree<np.Array>>(
       updates: Params,
       state: OptState,
-      params?: Params,
+      _params?: Params,
     ): [Params, OptState] {
       const zeros = tree.map((g: np.Array) => np.zerosLike(g), updates);
       return [zeros, state];
