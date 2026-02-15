@@ -1510,7 +1510,7 @@ declare namespace lax_linalg_d_exports {
  *
  * @example
  * ```ts
- * import { lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+ * import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
  *
  * const x = np.array([[2., 1.], [1., 2.]]);
  *
@@ -1544,7 +1544,7 @@ declare function cholesky$1(a: ArrayLike, {
  *
  * @example
  * ```ts
- * import { lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+ * import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
  *
  * const A = np.array([[4., 3.], [6., 3.]]);
  * const [lu, pivots, permutation] = lax.linalg.lu(A);
@@ -1562,7 +1562,7 @@ declare function lu(x: ArrayLike): [Array, Array, Array];
  *
  * @example
  * ```ts
- * import { lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+ * import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
  *
  * const L = np.array([[2., 0.], [1., 3.]]);
  * const b = np.array([4., 7.]).reshape([2, 1]);
@@ -1730,7 +1730,7 @@ interface ScanOptions {
  *
  * @example Cumulative sum
  * ```ts
- * import { lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
+ * import { lax, numpy as np } from '@jax-js-nonconsuming/jax';
  *
  * const step = (carry, x) => {
  *   const sum = np.add(carry, x);
@@ -1832,7 +1832,7 @@ interface ScanOptions {
  *
  * @example jit(scan) - Compile the entire scan loop
  * ```ts
- * import { jit, lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
+ * import { jit, lax, numpy as np } from '@jax-js-nonconsuming/jax';
  *
  * // Wrap scan in jit to compile the entire loop into optimized native code.
  * // This is the most common and efficient pattern for production use.
@@ -1853,7 +1853,7 @@ interface ScanOptions {
  *
  * @example scan(jit(body)) - JIT-compile only the step function
  * ```ts
- * import { jit, lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
+ * import { jit, lax, numpy as np } from '@jax-js-nonconsuming/jax';
  *
  * // JIT-compile just the step function. Each iteration calls compiled code,
  * // but the loop itself runs in JavaScript. Useful when step is expensive
@@ -1873,7 +1873,7 @@ interface ScanOptions {
  *
  * @example With grad for differentiation
  * ```ts
- * import { grad, lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
+ * import { grad, lax, numpy as np } from '@jax-js-nonconsuming/jax';
  *
  * const loss = (init, xs) => {
  *   const [final, ys] = lax.scan(step, init, xs);
@@ -2467,7 +2467,7 @@ declare function tensordot(x: ArrayLike, y: ArrayLike, axes?: number | [number[]
  *
  * @example
  * ```ts
- * import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+ * import { numpy as np } from "@jax-js-nonconsuming/jax";
  *
  * const a = np.ones([2, 3]);
  * const b = np.ones([3]);
@@ -2480,7 +2480,7 @@ declare function einsum(subscripts: string, ...operands: ArrayLike[]): Array;
  *
  * @example
  * ```ts
- * import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+ * import { numpy as np } from "@jax-js-nonconsuming/jax";
  *
  * const a = np.ones([2, 3]);
  * const b = np.ones([3]);
@@ -2982,7 +2982,7 @@ declare function standardize(x: ArrayLike, axis?: Axis, opts?: {
  * `numClasses`, with a 1 at the index position specified by its value.
  *
  * ```js
- * import { nn, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
+ * import { nn, numpy as np } from '@jax-js-nonconsuming/jax';
  *
  * nn.oneHot(np.array([1, 1, 2], { dtype: np.int32 }), 3);
  * // Output:

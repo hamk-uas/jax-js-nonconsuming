@@ -80,12 +80,12 @@ const _libSrcPrefix = (() => {
 })();
 /**
 * Detect which package a raw frame URL belongs to.
-* Returns the package name (e.g. "@hamk-uas/jax-js-nonconsuming", "some-lib") or null for user code.
+* Returns the package name (e.g. "@jax-js-nonconsuming/jax", "some-lib") or null for user code.
 */
 function detectPackage(rawUrl) {
 	const nm = rawUrl.match(/node_modules\/((?:@[^/]+\/)?[^/]+)/);
 	if (nm) return nm[1];
-	if (_libSrcPrefix !== null && rawUrl.startsWith(_libSrcPrefix)) return "@hamk-uas/jax-js-nonconsuming";
+	if (_libSrcPrefix !== null && rawUrl.startsWith(_libSrcPrefix)) return "@jax-js-nonconsuming/jax";
 	return null;
 }
 /** Convert a Vite/V8 stack location to a workspace-relative path. */
@@ -10504,7 +10504,7 @@ var import_usingCtx$3 = /* @__PURE__ */ __toESM(require_usingCtx(), 1);
 *
 * @example
 * ```ts
-* import { lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+* import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
 *
 * const x = np.array([[2., 1.], [1., 2.]]);
 *
@@ -10545,7 +10545,7 @@ function cholesky$1(a, { upper = false } = {}) {
 *
 * @example
 * ```ts
-* import { lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+* import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
 *
 * const A = np.array([[4., 3.], [6., 3.]]);
 * const [lu, pivots, permutation] = lax.linalg.lu(A);
@@ -10565,7 +10565,7 @@ function lu(x) {
 *
 * @example
 * ```ts
-* import { lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+* import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
 *
 * const L = np.array([[2., 0.], [1., 3.]]);
 * const b = np.array([4., 7.]).reshape([2, 1]);
@@ -10687,7 +10687,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 *
 * @example Cumulative sum
 * ```ts
-* import { lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
+* import { lax, numpy as np } from '@jax-js-nonconsuming/jax';
 *
 * const step = (carry, x) => {
 *   const sum = np.add(carry, x);
@@ -10789,7 +10789,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 *
 * @example jit(scan) - Compile the entire scan loop
 * ```ts
-* import { jit, lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
+* import { jit, lax, numpy as np } from '@jax-js-nonconsuming/jax';
 *
 * // Wrap scan in jit to compile the entire loop into optimized native code.
 * // This is the most common and efficient pattern for production use.
@@ -10810,7 +10810,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 *
 * @example scan(jit(body)) - JIT-compile only the step function
 * ```ts
-* import { jit, lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
+* import { jit, lax, numpy as np } from '@jax-js-nonconsuming/jax';
 *
 * // JIT-compile just the step function. Each iteration calls compiled code,
 * // but the loop itself runs in JavaScript. Useful when step is expensive
@@ -10830,7 +10830,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 *
 * @example With grad for differentiation
 * ```ts
-* import { grad, lax, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
+* import { grad, lax, numpy as np } from '@jax-js-nonconsuming/jax';
 *
 * const loss = (init, xs) => {
 *   const [final, ys] = lax.scan(step, init, xs);
@@ -11767,7 +11767,7 @@ function standardize(x, axis = -1, opts = {}) {
 * `numClasses`, with a 1 at the index position specified by its value.
 *
 * ```js
-* import { nn, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
+* import { nn, numpy as np } from '@jax-js-nonconsuming/jax';
 *
 * nn.oneHot(np.array([1, 1, 2], { dtype: np.int32 }), 3);
 * // Output:

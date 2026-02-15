@@ -34,6 +34,31 @@ function isIdentifierReference(node: any, parent: any): boolean {
   return true;
 }
 
+/**
+ * Check if a `.dispose()` call is inside a callback/closure (arrow function or
+ * function expression) rather than at the current statement level.  Deferred
+ * callbacks like `onTestFinished(() => x.dispose())` should not mark the
+ * variable as disposed in the enclosing scope.
+ */
+function isInsideCallback(node: any): boolean {
+  let current = node.parent;
+  while (current) {
+    if (
+      current.type === "ArrowFunctionExpression" ||
+      current.type === "FunctionExpression"
+    ) {
+      return true;
+    }
+    // Stop walking at function/program boundaries — these are the scope
+    // boundaries we care about.
+    if (current.type === "FunctionDeclaration" || current.type === "Program") {
+      return false;
+    }
+    current = current.parent;
+  }
+  return false;
+}
+
 const rule: Rule.RuleModule = {
   meta: {
     type: "problem",
@@ -59,6 +84,12 @@ const rule: Rule.RuleModule = {
         if (node.arguments.length > 0) return;
         const obj = node.callee.object;
         if (obj?.type !== "Identifier") return;
+
+        // Ignore .dispose() calls inside callbacks / closures — they execute
+        // deferred (e.g. onTestFinished(() => x.dispose())), so the variable
+        // is NOT disposed at the call-site in the enclosing scope.
+        if (isInsideCallback(node)) return;
+
         const variable = resolveVariable(context, obj);
         if (!variable) return;
         disposedAt.set(variable, {
@@ -66,6 +97,17 @@ const rule: Rule.RuleModule = {
           line: node.loc?.start?.line ?? 0,
         });
       },
+
+      // Clear disposed state when a variable is reassigned.
+      // `params.dispose(); params = newParams;` — subsequent uses are fine.
+      AssignmentExpression(node: any) {
+        if (node.left?.type !== "Identifier") return;
+        const variable = resolveVariable(context, node.left);
+        if (variable && disposedAt.has(variable)) {
+          disposedAt.delete(variable);
+        }
+      },
+
       Identifier(node: any) {
         const variable = resolveVariable(context, node);
         if (!variable) return;
