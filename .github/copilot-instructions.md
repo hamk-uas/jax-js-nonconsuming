@@ -2889,6 +2889,20 @@ A future jax-js-specific linter for the non-consuming model could enforce:
 This would catch leaks and use-after-free bugs at edit time, before they surface as
 `UseAfterFreeError` at runtime or silent memory leaks.
 
+**Current in-repo status (initial implementation):**
+
+An in-repo plugin now exists at `packages/eslint-plugin` and is wired into root `eslint.config.ts`
+under plugin name `jax-js` (rules default to `off` for gradual rollout).
+
+Implemented rules:
+
+- `jax-js/require-using`
+- `jax-js/no-use-after-dispose`
+- `jax-js/no-unnecessary-ref`
+- `jax-js/no-array-chain`
+
+This provides a baseline Layer 1 enforcement path that can evolve with jax-js in the same repo.
+
 **Layer 1 ESLint rule contract (implementation spec):**
 
 1. **`jax-js/require-using`** (default: error)

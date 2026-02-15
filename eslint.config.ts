@@ -4,6 +4,8 @@ import * as eslintImport from "eslint-plugin-import";
 import globals from "globals";
 import ts from "typescript-eslint";
 
+import jaxJsPlugin from "./packages/eslint-plugin/src/index";
+
 export default defineConfig([
   globalIgnores(["**/dist/", "docs/", "website/", "coverage/", "test/deno/"]),
   js.configs.recommended,
@@ -21,7 +23,7 @@ export default defineConfig([
     },
   },
   {
-    plugins: { import: eslintImport },
+    plugins: { import: eslintImport, "jax-js": jaxJsPlugin },
     rules: {
       "@typescript-eslint/consistent-type-exports": "error",
       "@typescript-eslint/no-array-constructor": "off",
@@ -71,6 +73,10 @@ export default defineConfig([
           memberSyntaxSortOrder: ["none", "all", "multiple", "single"],
         },
       ],
+      "jax-js/no-array-chain": "off",
+      "jax-js/no-unnecessary-ref": "off",
+      "jax-js/no-use-after-dispose": "off",
+      "jax-js/require-using": "off",
     },
   },
 ]);
