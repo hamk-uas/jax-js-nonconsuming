@@ -3,6 +3,8 @@
 
   import { getWebgpuDevice, importTfjs, runBenchmark } from "$lib/benchmark";
 
+  import { createJaxJsMatmulStrategy } from "./jaxStrategy";
+
   const n = 4096;
 
   let result: Record<string, number> = $state({});
@@ -834,38 +836,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     }
   }
 
-  class JaxJsStrategy extends Strategy {
-    name: string;
-    fp16: boolean;
-
-    constructor(fp16: boolean = false) {
-      super();
-      this.fp16 = fp16;
-      this.name = fp16 ? "jax-js-fp16" : "jax-js";
-    }
-
-    async run(): Promise<number> {
-      const jax = await import("@jax-js/jax");
-      await jax.init();
-      jax.defaultDevice("webgpu");
-      const np = jax.numpy;
-
-      const a = np
-        .array(randomBuffer, { shape: [n, n] })
-        .astype(this.fp16 ? np.float16 : np.float32);
-      const b = np
-        .array(randomBuffer, { shape: [n, n] })
-        .astype(this.fp16 ? np.float16 : np.float32);
-      await jax.blockUntilReady([a, b]); // Make sure tensors are ready.
-
-      return await runBenchmark("jax", async () => {
-        const c = np.dot(a, b);
-        const ar = (await c.data()) as Float16Array;
-        printBufferItems(ar);
-      });
-    }
-  }
-
   const strategiesList: Strategy[] = [
     new NaiveStrategy(1),
     new NaiveStrategy(16),
@@ -885,8 +855,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     new OnnxStrategy(true),
     new TfjsStrategy(),
     new TfjsStrategy(true),
-    new JaxJsStrategy(),
-    new JaxJsStrategy(true),
+    createJaxJsMatmulStrategy(n, randomBuffer, printBufferItems),
+    createJaxJsMatmulStrategy(n, randomBuffer, printBufferItems, true),
   ];
 
   const strategies = Object.fromEntries(strategiesList.map((s) => [s.name, s]));

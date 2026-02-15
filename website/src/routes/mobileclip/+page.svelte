@@ -1,33 +1,22 @@
 <script lang="ts">
-  import {
-    defaultDevice,
-    init,
-    jit,
-    numpy as np,
-    tree,
-    vmap,
-  } from "@jax-js/jax";
+  import { defaultDevice, init, numpy as np } from "@jax-js/jax";
   import { opfs, safetensors, tokenizers } from "@jax-js/loaders";
   import { BookMarkedIcon, FileTextIcon } from "@lucide/svelte";
 
   import DownloadManager from "$lib/common/DownloadManager.svelte";
   import { type Book, downloadBook } from "./books";
+  import { fromSafetensors, type MobileCLIP } from "./clipInference";
   import {
-    fromSafetensors,
-    type MobileCLIP,
-    runMobileCLIPTextEncoder,
-  } from "./clipInference";
+    computeEmbeddings,
+    getTextParamCount,
+    searchEmbeddings,
+    tokenizeExcerpts,
+  } from "./embedding";
 
   // Cached large objects to download.
   let _weights: safetensors.File | null = null;
   let _model: MobileCLIP | null = null;
   let _tokenizer: tokenizers.BpeEncoding | null = null;
-
-  // Rough estimate for FLOPs per text embed.
-  // - 38e6 ~= number of non-embedding parameters in text encoder
-  // - 77 = clip context length
-  const GFLOP_PER_TEXT_EMBED = (2 * 38e6 * 77) / 1e9;
-  const D_EMBED = 512;
 
   let downloadManager: DownloadManager;
 
@@ -93,8 +82,6 @@
       : 0,
   );
 
-  const runEncoder = jit(vmap(runMobileCLIPTextEncoder, [null, 0]));
-
   async function setupBook(bookId: string) {
     const devices = await init("webgpu");
     if (!devices.includes("webgpu")) {
@@ -120,77 +107,50 @@
     console.log($state.snapshot(book));
     hasData = true;
 
-    const numExcerpts = book.chapters
-      .map((c) => c.excerpts.length)
-      .reduce((a, b) => a + b, 0);
-    console.log(`Total excerpts: ${numExcerpts}`);
-
-    // Tokenization and build excerpt list
     const startTime = performance.now();
-    const tokens: number[][] = [];
-    const excerptToChapter: number[] = []; // Maps excerpt index to chapter index
+    const { tokens, excerptToChapter } = tokenizeExcerpts(
+      book.chapters,
+      tokenizer,
+    );
+    console.log(`Total excerpts: ${tokens.length}`);
+    const endTime = performance.now();
+    console.log(
+      `Tokenized ${tokens.length} excerpts in ${endTime - startTime} ms`,
+    );
+
     excerptList = [];
     for (let ci = 0; ci < book.chapters.length; ci++) {
       for (let ei = 0; ei < book.chapters[ci].excerpts.length; ei++) {
-        const excerpt = book.chapters[ci].excerpts[ei];
-        tokens.push(tokenizer.encode(excerpt));
-        excerptToChapter.push(ci);
-        excerptList.push({ chapterIdx: ci, excerptIdx: ei, text: excerpt });
+        excerptList.push({
+          chapterIdx: ci,
+          excerptIdx: ei,
+          text: book.chapters[ci].excerpts[ei],
+        });
       }
     }
-    const endTime = performance.now();
-    console.log(
-      `Tokenized ${numExcerpts} excerpts in ${endTime - startTime} ms`,
-    );
 
-    const ar = np.array(tokens, { dtype: np.uint32 });
-
-    // Initialize progress tracking
     embeddingProgress = new Array(book.chapters.length).fill(0);
     embeddingTotal = 0;
 
-    // We'll append to this array as we compute embeddings.
-    embeddingArray = np.zeros([0, D_EMBED], { dtype: np.float16 });
-
     try {
-      console.log(
-        "total params:",
-        tree
-          .flatten(model.text)[0]
-          .map((x) => x.size)
-          .reduce((a, b) => a + b, 0),
-      );
+      console.log("total params:", getTextParamCount(model));
 
-      for (let i = 0; i < ar.shape[0]; i += 16) {
-        const batch = ar.slice([i, Math.min(i + 16, ar.shape[0])]);
-        const batchSize = batch.shape[0];
-        performance.mark("clip-start");
-        const t0 = performance.now();
-        const result = runEncoder(model.text, batch);
-        await result.blockUntilReady();
-        const t1 = performance.now();
-        performance.mark("clip-end");
-        performance.measure("clip", "clip-start", "clip-end");
-
-        embeddingArray = np.concatenate([embeddingArray, result], 0);
-        await embeddingArray.blockUntilReady();
-
-        // Update progress for each excerpt in this batch
-        for (let j = i; j < i + batchSize; j++) {
-          const chapterIdx = excerptToChapter[j];
-          embeddingProgress[chapterIdx]++;
+      embeddingArray = await computeEmbeddings(model, tokens, (info) => {
+        embeddingArray = info.embeddings;
+        for (
+          let j = info.batchStart;
+          j < info.batchStart + info.batchSize;
+          j++
+        ) {
+          embeddingProgress[excerptToChapter[j]]++;
         }
-        embeddingProgress = embeddingProgress; // Trigger reactivity
-        embeddingTotal += batchSize;
-
-        const gflopsPerSec =
-          (GFLOP_PER_TEXT_EMBED * batchSize) / (1e-3 * (t1 - t0));
-        embeddingGflops = gflopsPerSec;
+        embeddingProgress = embeddingProgress;
+        embeddingTotal += info.batchSize;
+        embeddingGflops = info.gflopsPerSec;
         console.log(
-          `Processed rows ${i} to ${i + batchSize} in ${t1 - t0} ms (${gflopsPerSec} GFLOP/s)`,
+          `Processed rows ${info.batchStart} to ${info.batchStart + info.batchSize} (${info.gflopsPerSec.toFixed(1)} GFLOP/s)`,
         );
-      }
-      ar.dispose();
+      });
     } catch (error) {
       console.error("Error in main:", error);
     }
@@ -200,7 +160,6 @@
   let searchInProgress = false;
 
   async function search(query: string) {
-    // If a search is in progress, queue this query for later
     if (searchInProgress) {
       pendingQuery = query;
       return;
@@ -217,31 +176,17 @@
       const model = await getModel();
       const tokenizer = await getTokenizer();
 
-      // Tokenize the query
-      const queryTokens = tokenizer.encode(query);
-      const queryArray = np.array([queryTokens], { dtype: np.uint32 });
+      const results = await searchEmbeddings(
+        model,
+        tokenizer,
+        embeddingArray,
+        query,
+        10,
+      );
 
-      // Run the encoder to get embeddings (~100 ms?)
-      const queryEmbed = runEncoder(model.text, queryArray).slice(0);
-
-      // Compute cosine similarity scores: query @ embeddings.T
-      // queryEmbed is [D_EMBED], embeddingArray is [N, D_EMBED]
-      const scores: number[] = await np
-        .dot(
-          embeddingArray.astype(np.float32),
-          queryEmbed.astype(np.float32),
-        )
-        .jsAsync();
-
-      // Argsort descending
-      const indices = Array.from({ length: scores.length }, (_, i) => i);
-      indices.sort((a, b) => scores[b] - scores[a]);
-
-      // Get top 10 results
-      const topK = 10;
-      searchResults = indices.slice(0, topK).map((idx) => ({
-        ...excerptList[idx],
-        score: scores[idx],
+      searchResults = results.map((r) => ({
+        ...excerptList[r.index],
+        score: r.score,
       }));
     } catch (error) {
       console.error("Search error:", error);
@@ -249,7 +194,6 @@
       searchInProgress = false;
       isSearching = false;
 
-      // If there's a pending query, run it now
       if (pendingQuery !== null) {
         const nextQuery = pendingQuery;
         pendingQuery = null;

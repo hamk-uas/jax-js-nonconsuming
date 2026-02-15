@@ -1,9 +1,14 @@
 <script lang="ts">
-  import { defaultDevice, init, jit, lax, numpy as np } from "@jax-js/jax";
+  import { defaultDevice, init } from "@jax-js/jax";
   import { onMount } from "svelte";
 
-  const width = 1000;
-  const height = 800;
+  import {
+    calculateMandelbrot,
+    calculateMandelbrotJitLoop,
+    calculateMandelbrotScan,
+    height,
+    width,
+  } from "./mandelbrot";
 
   let milliseconds = $state(0);
 
@@ -11,119 +16,6 @@
     await init("webgpu");
     defaultDevice("webgpu");
   });
-
-  function mandelbrotIteration(
-    A: np.Array,
-    B: np.Array,
-    V: np.Array,
-    X: np.Array,
-    Y: np.Array,
-  ) {
-    const Asq = A.mul(A);
-    const Bsq = B.mul(B);
-    V = V.add(Asq.add(Bsq).less(100).astype(np.float32));
-    const A2 = np.clip(Asq.sub(Bsq).add(X), -50, 50);
-    const B2 = np.clip(A.mul(B).mul(2).add(Y), -50, 50);
-    return [A2, B2, V];
-  }
-
-  const mandelbrotMultiple = (iters: number) =>
-    jit((A: np.Array, B: np.Array, V: np.Array, X: np.Array, Y: np.Array) => {
-      for (let i = 0; i < iters; i++) {
-        [A, B, V] = mandelbrotIteration(A, B, V, X, Y);
-      }
-      X.dispose();
-      Y.dispose();
-      return [A, B, V];
-    });
-
-  function calculateMandelbrot(iters: number) {
-    const x = np.linspace(-2, 0.5, width);
-    const y = np.linspace(-1, 1, height);
-
-    const [X, Y] = np.meshgrid([x, y]);
-
-    const f = jit(mandelbrotIteration);
-
-    let A = np.zeros(X.shape);
-    let B = np.zeros(Y.shape);
-    let V = np.zeros(X.shape);
-    for (let i = 0; i < iters; i++) {
-      [A, B, V] = f(A, B, V, X, Y);
-    }
-    X.dispose();
-    Y.dispose();
-    A.dispose();
-    B.dispose();
-    f.dispose();
-
-    return V;
-  }
-
-  function calculateMandelbrotJitLoop(iters: number) {
-    const x = np.linspace(-2, 0.5, width);
-    const y = np.linspace(-1, 1, height);
-
-    const [X, Y] = np.meshgrid([x, y]);
-
-    const f = mandelbrotMultiple(iters);
-
-    const A = np.zeros(X.shape);
-    const B = np.zeros(Y.shape);
-    const V = np.zeros(X.shape);
-    const [_A2, _B2, V2] = f(A, B, V, X, Y);
-    f.dispose();
-    _A2.dispose();
-    _B2.dispose();
-
-    return V2;
-  }
-
-  function calculateMandelbrotScan(iters: number) {
-    const x = np.linspace(-2, 0.5, width);
-    const y = np.linspace(-1, 1, height);
-
-    const [X, Y] = np.meshgrid([x, y]);
-
-    // Use lax.scan with Y=null (no output stacking needed)
-    const f = jit(
-      (
-        A: np.Array,
-        B: np.Array,
-        V: np.Array,
-        X: np.Array,
-        Y: np.Array,
-      ): [np.Array, np.Array, np.Array] => {
-        type Carry = { A: np.Array; B: np.Array; V: np.Array };
-
-        const step = (carry: Carry, _x: null): [Carry, null] => {
-          const { A, B, V } = carry;
-          const Asq = A.mul(A);
-          const Bsq = B.mul(B);
-          const newV = V.add(Asq.add(Bsq).less(100).astype(np.float32));
-          const newA = np.clip(Asq.sub(Bsq).add(X), -50, 50);
-          const newB = np.clip(A.mul(B).mul(2).add(Y), -50, 50);
-          return [{ A: newA, B: newB, V: newV }, null];
-        };
-
-        const init: Carry = { A, B, V };
-        const [final, _ys] = lax.scan(step, init, null, { length: iters });
-        X.dispose();
-        Y.dispose();
-        return [final.A, final.B, final.V];
-      },
-    );
-
-    const A = np.zeros(X.shape);
-    const B = np.zeros(Y.shape);
-    const V = np.zeros(X.shape);
-    const [_A2, _B2, V2] = f(A, B, V, X, Y);
-    f.dispose();
-    _A2.dispose();
-    _B2.dispose();
-
-    return V2;
-  }
 
   let canvas: HTMLCanvasElement;
 
@@ -155,38 +47,40 @@
     <button
       onmousedown={async () => {
         const start = performance.now();
-        const result = (await calculateMandelbrot(100).data()) as Int32Array;
+        const arr = calculateMandelbrot(100);
+        const result = (await arr.data()) as Int32Array;
+        arr.dispose();
         milliseconds = performance.now() - start;
         renderMandelbrot(result);
       }}
     >
-      JS loop + jit(iter)
+      for(jit)
     </button>
 
     <button
       onmousedown={async () => {
         const start = performance.now();
-        const result = (await calculateMandelbrotJitLoop(
-          100,
-        ).data()) as Int32Array;
+        const arr = calculateMandelbrotJitLoop(100);
+        const result = (await arr.data()) as Int32Array;
+        arr.dispose();
         milliseconds = performance.now() - start;
         renderMandelbrot(result);
       }}
     >
-      jit(for loop)
+      jit(for)
     </button>
 
     <button
       onmousedown={async () => {
         const start = performance.now();
-        const result = (await calculateMandelbrotScan(
-          100,
-        ).data()) as Int32Array;
+        const arr = calculateMandelbrotScan(100);
+        const result = (await arr.data()) as Int32Array;
+        arr.dispose();
         milliseconds = performance.now() - start;
         renderMandelbrot(result);
       }}
     >
-      jit(lax.scan) (fused GPU loop)
+      jit(lax.scan)
     </button>
   </div>
 

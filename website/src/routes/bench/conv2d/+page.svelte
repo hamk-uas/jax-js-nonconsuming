@@ -5,6 +5,8 @@
 
   import { getWebgpuDevice, importTfjs, runBenchmark } from "$lib/benchmark";
 
+  import { createJaxJsConv2dStrategy } from "./jaxStrategy";
+
   const batchSize = 1;
   const channels = 64;
   const height = 256;
@@ -446,42 +448,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     }
   }
 
-  class JaxJsStrategy extends Strategy {
-    name: string;
-    fp16: boolean;
-
-    constructor(fp16: boolean = false) {
-      super();
-      this.fp16 = fp16;
-      this.name = fp16 ? "jax-js-fp16" : "jax-js";
-    }
-
-    async run(): Promise<number> {
-      const jax = await import("@jax-js/jax");
-      await jax.init();
-      jax.defaultDevice("webgpu");
-      const np = jax.numpy;
-
-      const x = np
-        .array(randomInput, {
-          shape: [batchSize, channels, height, width],
-        })
-        .astype(this.fp16 ? np.float16 : np.float32);
-      const filter = np
-        .array(randomFilter, {
-          shape: [outChannels, channels, filterHeight, filterWidth],
-        })
-        .astype(this.fp16 ? np.float16 : np.float32);
-      await jax.blockUntilReady([x, filter]);
-
-      return await runBenchmark("jax", async () => {
-        const output = jax.lax.convGeneralDilated(x, filter, [1, 1], "SAME");
-        const ar = (await output.data()) as Float32Array;
-        printBufferItems(ar);
-      });
-    }
-  }
-
   const strategiesList: Strategy[] = [
     new NaiveStrategy(8),
     new NaiveStrategy(16),
@@ -490,8 +456,31 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     new OnnxStrategy(true),
     new TfjsStrategy(),
     new TfjsStrategy(true),
-    new JaxJsStrategy(),
-    new JaxJsStrategy(true),
+    createJaxJsConv2dStrategy(
+      batchSize,
+      channels,
+      height,
+      width,
+      outChannels,
+      filterHeight,
+      filterWidth,
+      randomInput,
+      randomFilter,
+      printBufferItems,
+    ),
+    createJaxJsConv2dStrategy(
+      batchSize,
+      channels,
+      height,
+      width,
+      outChannels,
+      filterHeight,
+      filterWidth,
+      randomInput,
+      randomFilter,
+      printBufferItems,
+      true,
+    ),
   ];
 
   const strategies = Object.fromEntries(strategiesList.map((s) => [s.name, s]));

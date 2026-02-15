@@ -68,31 +68,34 @@ export function runFlowLMStep(
   noiseClamp: number | null = null,
   eosThreshold: number = -4.0,
 ): { latent: np.Array; isEos: np.Array; state: FlowLMState } {
-  // unused fields
-  bosEmb.dispose();
-  conditionerEmbed.dispose();
-  embMean.dispose();
-  embStd.dispose();
-  speakerProjWeight.dispose();
-
   const ldim = bosEmb.shape[0];
 
   // Project input from 32 -> 1024
   let input = runLinear(inputLinear, sequence);
 
   // Concatenate text/voice embeddings with input
-  if (embeds !== null) input = np.concatenate([embeds, input], 0);
+  if (embeds !== null) {
+    const oldInput = input;
+    input = np.concatenate([embeds, oldInput], 0);
+    oldInput.dispose();
+  }
 
   for (let i = 0; i < transformer.length; i++) {
     // If kv cache is not large enough, expand it to next multiple of 64.
     if (kvCacheLen > 0 && kvCaches[i].key.shape[0] === kvCacheLen) {
       const newCapacity = Math.ceil((kvCacheLen + 1) / 64) * 64;
-      kvCaches[i].key = np.pad(kvCaches[i].key, {
-        0: [0, newCapacity - kvCacheLen],
-      });
-      kvCaches[i].value = np.pad(kvCaches[i].value, {
-        0: [0, newCapacity - kvCacheLen],
-      });
+      {
+        const oldKey = kvCaches[i].key;
+        kvCaches[i].key = np.pad(oldKey, { 0: [0, newCapacity - kvCacheLen] });
+        oldKey.dispose();
+      }
+      {
+        const oldValue = kvCaches[i].value;
+        kvCaches[i].value = np.pad(oldValue, {
+          0: [0, newCapacity - kvCacheLen],
+        });
+        oldValue.dispose();
+      }
     }
     const layer = transformer[i];
     [input, kvCaches[i]] = runStreamingTransformerLayer(
@@ -106,28 +109,33 @@ export function runFlowLMStep(
   }
   kvCacheLen += input.shape[0];
 
-  let transformerOut = runLayerNorm(outNorm, input);
+  using fullTransformerOut = runLayerNorm(outNorm, input);
+  input.dispose();
 
   // Get last position output (for next token prediction)
-  transformerOut = transformerOut.slice([-1]); // [1, dim]
+  const transformerOut = fullTransformerOut.slice([-1]); // [1, dim]
 
   // Check EOS
-  const eosLogit = runLinear(outEos, transformerOut);
+  using eosLogit = runLinear(outEos, transformerOut);
   const isEos = np.greater(eosLogit, eosThreshold); // [1, 1]
 
   const noiseShape = [1, ldim]; // [T, ldim] with T=1
   const std = Math.sqrt(temperature);
-  let noise = random.normal(key, noiseShape).mul(std);
+  using normalNoise = random.normal(key, noiseShape);
+  let noise = normalNoise.mul(std);
   if (noiseClamp !== null) {
     // Truncated normal - clamp to [-noiseClamp, noiseClamp]
-    noise = np.clip(noise, -noiseClamp, noiseClamp);
+    const oldNoise = noise;
+    noise = np.clip(oldNoise, -noiseClamp, noiseClamp);
+    oldNoise.dispose();
   }
 
   // Decode using LSD
   const conditionedFlow = (s: np.Array, t: np.Array, x: np.Array) =>
     runSimpleMLPAdaLN(flowNet, transformerOut, s, t, x);
   const latent = lsdDecode(conditionedFlow, noise, lsdDecodeSteps);
-  tree.dispose([flowNet, transformerOut]);
+  noise.dispose();
+  transformerOut.dispose();
 
   return { latent, isEos, state: { kvCaches, kvCacheLen } };
 }
@@ -260,10 +268,7 @@ export function runMimiStreamingMultiheadAttention(
     // Decode step
     // Update kvCache with new k,v
     const capacity = kvCache.key.shape[0];
-    const cacheMask = np
-      .arange(capacity)
-      .reshape([-1, 1, 1])
-      .less(kvCacheLen);
+    const cacheMask = np.arange(capacity).reshape([-1, 1, 1]).less(kvCacheLen);
     kvCache.key = np.where(
       cacheMask,
       kvCache.key,
@@ -572,7 +577,6 @@ export function runMimiEncode(
   }: MimiModel,
   x: np.Array, // [C, T] - audio waveform at 24kHz
 ): np.Array {
-  tree.dispose([decoder, decoderTransformer, quantizer, upsample]);
   x = runSEANetEncoder(encoder, x);
 
   // Encoder transformer (with transpose for [T, D] format)
@@ -580,14 +584,10 @@ export function runMimiEncode(
   const offset = np.array(0, { dtype: np.int32, device: x.device });
   for (const layer of encoderTransformer) {
     let kvCache = emptyKVCache();
-    [x, kvCache] = runStreamingTransformerLayer(
-      layer,
-      kvCache,
-      x,
-      offset,
-      0,
-      { context: 250, numHeads: 8 },
-    );
+    [x, kvCache] = runStreamingTransformerLayer(layer, kvCache, x, offset, 0, {
+      context: 250,
+      numHeads: 8,
+    });
     tree.dispose(kvCache);
   }
   offset.dispose();
@@ -637,11 +637,12 @@ export function runMimiDecode(
   latent: np.Array, // [T, 32] - bottleneck representation
   offset: number, // scalar, position offset
 ): [np.Array, MimiDecodeState] {
-  tree.dispose([encoder, encoderTransformer, downsample]);
-
   // Run through "dummy quantizer"
-  latent = np.expandDims(latent.transpose([1, 0]), 0); // [1, 32, T]
-  latent = lax.conv(latent, quantizer.outputProj.weight, [1], "VALID"); // [1, 512, T]
+  {
+    using transposed = latent.transpose([1, 0]);
+    using expanded = np.expandDims(transposed, 0); // [1, 32, T]
+    latent = lax.conv(expanded, quantizer.outputProj.weight, [1], "VALID"); // [1, 512, T]
+  }
 
   // Upsample (stride 16), depthwise
   let x: np.Array;
@@ -678,16 +679,34 @@ export function runMimiDecode(
     // Pad it to a constant [272] in length, more than 250 context + 16 for next pass.
     const padAmount = 272 - kvCaches[0].key.shape[0];
     for (const c of kvCaches) {
-      c.key = np.pad(c.key, { 0: [0, padAmount] });
-      c.value = np.pad(c.value, { 0: [0, padAmount] });
+      {
+        const old = c.key;
+        c.key = np.pad(old, { 0: [0, padAmount] });
+        old.dispose();
+      }
+      {
+        const old = c.value;
+        c.value = np.pad(old, { 0: [0, padAmount] });
+        old.dispose();
+      }
     }
   }
   if (kvCacheLen === 272) {
     // Cycle room for one more kv cache entry.
     kvCacheLen -= 16;
     for (const c of kvCaches) {
-      c.key = np.pad(c.key.slice([16]), { 0: [0, 16] });
-      c.value = np.pad(c.value.slice([16]), { 0: [0, 16] });
+      {
+        const oldKey = c.key;
+        using slicedKey = oldKey.slice([16]);
+        c.key = np.pad(slicedKey, { 0: [0, 16] });
+        oldKey.dispose();
+      }
+      {
+        const oldValue = c.value;
+        using slicedValue = oldValue.slice([16]);
+        c.value = np.pad(slicedValue, { 0: [0, 16] });
+        oldValue.dispose();
+      }
     }
   }
 
@@ -713,10 +732,13 @@ export function lsdDecode(
   for (let i = 0; i < numSteps; i++) {
     const s = i / numSteps;
     const t = (i + 1) / numSteps;
-    const sArr = np.full(x0.shape.slice(0, -1).concat([1]), s);
-    const tArr = np.full(x0.shape.slice(0, -1).concat([1]), t);
-    const flowDir = flowNet(sArr, tArr, current);
-    current = current.add(flowDir.div(numSteps));
+    using sArr = np.full(x0.shape.slice(0, -1).concat([1]), s);
+    using tArr = np.full(x0.shape.slice(0, -1).concat([1]), t);
+    using flowDir = flowNet(sArr, tArr, current);
+    using delta = flowDir.div(numSteps);
+    const oldCurrent = current;
+    current = oldCurrent.add(delta);
+    if (oldCurrent !== x0) oldCurrent.dispose(); // don't dispose caller's input
   }
   return current;
 }

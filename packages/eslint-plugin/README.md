@@ -39,12 +39,13 @@ export default [
 
 This enables:
 
-| Rule                          | Level   | What it catches                               |
-| ----------------------------- | ------- | --------------------------------------------- |
-| `jax-js/require-using`        | `warn`  | Local array bindings missing `using`          |
-| `jax-js/no-use-after-dispose` | `error` | Reading/writing a variable after `.dispose()` |
-| `jax-js/no-unnecessary-ref`   | `warn`  | `.ref` calls (unnecessary in non-consuming)   |
-| `jax-js/no-array-chain`       | `off`   | Deep fluent chains (strict-mode only)         |
+| Rule                                    | Level   | What it catches                                        |
+| --------------------------------------- | ------- | ------------------------------------------------------ |
+| `jax-js/require-using`                  | `warn`  | Local array bindings missing `using`                   |
+| `jax-js/no-use-after-dispose`           | `error` | Reading/writing a variable after `.dispose()`          |
+| `jax-js/no-dispose-then-reassign-param` | `warn`  | Callback alias hazard: `dispose(state); state = param` |
+| `jax-js/no-unnecessary-ref`             | `warn`  | `.ref` calls (unnecessary in non-consuming)            |
+| `jax-js/no-array-chain`                 | `off`   | Deep fluent chains (strict-mode only)                  |
 
 ### Strict config
 
@@ -73,6 +74,7 @@ export default [
     rules: {
       "jax-js/require-using": "error",
       "jax-js/no-use-after-dispose": "error",
+      "jax-js/no-dispose-then-reassign-param": "warn",
       "jax-js/no-unnecessary-ref": "warn",
       "jax-js/no-array-chain": ["error", { minDepth: 3 }],
     },
@@ -182,6 +184,31 @@ x.dispose();
 **Scope:** Tracks variables lexically within the same function scope. Does not track across function
 boundaries or through aliases.
 
+### `jax-js/no-dispose-then-reassign-param`
+
+**Type:** problem (`warn` in recommended, `error` in strict)
+
+Catches a common callback ownership footgun: disposing a state variable and immediately assigning it
+from a callback parameter. If both identifiers alias the same object, this is a dispose-then-reuse
+bug.
+
+```ts
+// ❌ Warn: possible alias-dispose bug
+function onParamsUpdate(params) {
+  tree.dispose(latestParams);
+  latestParams = params;
+}
+
+// ✅ OK: guard alias case
+function onParamsUpdate(params) {
+  if (latestParams !== params) tree.dispose(latestParams);
+  latestParams = params;
+}
+```
+
+**Current scope:** Adjacent statement pattern in function bodies:
+`dispose(stateVar); stateVar = paramName;`.
+
 ### `jax-js/no-unnecessary-ref`
 
 **Fixable:** autofix (removes `.ref` automatically with `--fix`)
@@ -244,17 +271,26 @@ const y = b.tanh();
 `sum`, `mean`, `exp`, `log`, `sin`, `cos`, `tanh`, `sqrt`, `matmul`, etc.). JavaScript collection
 methods like `.map()`, `.filter()`, `.reduce()` are ignored.
 
+### Svelte note (`.svelte`, `.svelte.ts`)
+
+Svelte currently does not parse `using` declarations in component scripts.
+
+- Prefer extracting compute logic to plain `.ts` modules where `using` works.
+- In component code, use explicit `.dispose()` with clear ownership handoff guards.
+- Apply `require-using` primarily to non-Svelte source files.
+
 ## Suppression directives
 
 Each rule supports its own suppression comment placed on the line immediately before the flagged
 code:
 
-| Rule                   | Suppression comment                                       |
-| ---------------------- | --------------------------------------------------------- |
-| `require-using`        | `// jax-js-lint: allow-non-using`                         |
-| `no-unnecessary-ref`   | `// jax-js-lint: allow-ref`                               |
-| `no-use-after-dispose` | `// eslint-disable-next-line jax-js/no-use-after-dispose` |
-| `no-array-chain`       | `// eslint-disable-next-line jax-js/no-array-chain`       |
+| Rule                             | Suppression comment                                                 |
+| -------------------------------- | ------------------------------------------------------------------- |
+| `require-using`                  | `// jax-js-lint: allow-non-using`                                   |
+| `no-unnecessary-ref`             | `// jax-js-lint: allow-ref`                                         |
+| `no-use-after-dispose`           | `// eslint-disable-next-line jax-js/no-use-after-dispose`           |
+| `no-dispose-then-reassign-param` | `// eslint-disable-next-line jax-js/no-dispose-then-reassign-param` |
+| `no-array-chain`                 | `// eslint-disable-next-line jax-js/no-array-chain`                 |
 
 Standard `eslint-disable` directives work for all rules as well:
 
@@ -282,7 +318,8 @@ use the same method names — suppress those with the directives above.
 - Aliased imports (`import { array as arr }`) — factory name `arr` won't be recognized
 - Dynamic method calls (`x[methodName]()`) — not tracked
 - Cross-function disposal tracking — `no-use-after-dispose` is function-local only
-- Re-assignment after dispose — not tracked (would need control-flow analysis)
+- Complex control-flow re-assignment after dispose — mostly not tracked (basic callback alias
+  pattern is tracked by `no-dispose-then-reassign-param`)
 
 ## IDE integration
 
@@ -290,8 +327,26 @@ use the same method names — suppress those with the directives above.
 
 Install the
 [ESLint extension](https://marketplace.visualstudio.com/items?itemName=dbaeumer.vscode-eslint)
-(v3+). It picks up flat configs automatically. No extra settings needed — warnings and errors appear
-inline with quick-fix suggestions for `require-using`.
+(v3+). It picks up flat configs automatically. Warnings and errors appear inline with quick-fix
+suggestions for `require-using`.
+
+Recommended workspace settings (`.vscode/settings.json`):
+
+```json
+{
+  "eslint.validate": ["javascript", "javascriptreact", "typescript", "typescriptreact"],
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "always"
+  },
+  "editor.formatOnSave": true
+}
+```
+
+If diagnostics do not appear after adding the plugin/config:
+
+1. Run `ESLint: Restart ESLint Server` from the command palette.
+2. Run `TypeScript: Restart TS Server`.
+3. Reload the window.
 
 ### CLI
 
@@ -337,6 +392,7 @@ pnpm exec eslint --rule 'jax-js/no-array-chain:error' src/library/numpy.ts
 pnpm exec eslint --rule 'jax-js/require-using:error' \
                   --rule 'jax-js/no-array-chain:error' \
                   --rule 'jax-js/no-use-after-dispose:error' \
+                  --rule 'jax-js/no-dispose-then-reassign-param:error' \
                   --rule 'jax-js/no-unnecessary-ref:error' \
                   src/library/
 ```

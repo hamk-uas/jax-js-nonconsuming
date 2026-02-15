@@ -7,7 +7,14 @@ import ts from "typescript-eslint";
 import jaxJsPlugin from "./packages/eslint-plugin/src/index";
 
 export default defineConfig([
-  globalIgnores(["**/dist/", "docs/", "website/", "coverage/", "test/deno/"]),
+  globalIgnores([
+    "**/dist/",
+    "docs/",
+    "website/",
+    "coverage/",
+    "test/deno/",
+    "tmp/",
+  ]),
   js.configs.recommended,
   ts.configs.recommendedTypeChecked,
   {
@@ -74,6 +81,7 @@ export default defineConfig([
         },
       ],
       "jax-js/no-array-chain": "off",
+      "jax-js/no-dispose-then-reassign-param": "off",
       "jax-js/no-unnecessary-ref": "off",
       "jax-js/no-use-after-dispose": "off",
       "jax-js/require-using": "off",
@@ -83,6 +91,7 @@ export default defineConfig([
     files: ["src/**/*.{js,mjs,cjs,ts}", "packages/**/*.{js,mjs,cjs,ts}"],
     rules: {
       "jax-js/no-array-chain": "off",
+      "jax-js/no-dispose-then-reassign-param": "warn",
       "jax-js/no-unnecessary-ref": "warn",
       "jax-js/no-use-after-dispose": "warn",
       "jax-js/require-using": "warn",
@@ -92,6 +101,7 @@ export default defineConfig([
     files: ["test/**/*.{js,mjs,cjs,ts}"],
     rules: {
       "jax-js/no-array-chain": "off",
+      "jax-js/no-dispose-then-reassign-param": "off",
       "jax-js/no-unnecessary-ref": "off",
       "jax-js/no-use-after-dispose": "off",
       "jax-js/require-using": "off",

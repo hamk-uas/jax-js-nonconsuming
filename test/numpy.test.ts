@@ -874,7 +874,7 @@ suite.each(devices)("device:%s", (device) => {
       using y = np.array([5, 4, 3, 2]);
 
       const results: np.Array[] = [];
-      const e = (...args: Parameters<typeof np.einsum>) => {
+      const e = (...args: any[]) => {
         const r = np.einsum(...args);
         results.push(r);
         return r;

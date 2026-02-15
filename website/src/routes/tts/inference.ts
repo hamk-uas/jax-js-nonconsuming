@@ -34,18 +34,20 @@ export async function playTTS(
 
   if (seed === null) seed = Math.floor(Math.random() * 2 ** 32);
   let key = random.key(seed);
+  let flowLMState = createFlowLMState(model.flowLM);
+  let mimiState = createMimiDecodeState(model.mimi);
 
   try {
-    let flowLMState = createFlowLMState(model.flowLM);
-    let mimiState = createMimiDecodeState(model.mimi);
     let eosStep: number | null = null;
 
     console.log("Starting TTS generation...");
     let lastTimestamp = performance.now();
 
     for (let step = 0; step < 1000; step++) {
+      const oldKey = key;
       let stepKey: np.Array;
-      [key, stepKey] = random.split(key);
+      [key, stepKey] = random.split(oldKey);
+      oldKey.dispose();
       const {
         latent,
         isEos,
@@ -62,8 +64,10 @@ export async function playTTS(
         noiseClamp,
       );
       flowLMState = newFlowLMState;
+      stepKey.dispose();
 
       const isEosData = await isEos.data();
+      isEos.dispose();
       if (isEosData[0] && eosStep === null) {
         console.log(`🛑 EOS at step ${step}!`);
         eosStep = step;
@@ -76,7 +80,12 @@ export async function playTTS(
         break;
       }
 
-      sequence = np.concatenate([sequence, latent]);
+      {
+        const oldSeq = sequence;
+        sequence = np.concatenate([oldSeq, latent]);
+        oldSeq.dispose();
+      }
+      latent.dispose();
 
       const timestamp = performance.now();
       console.log(
@@ -84,10 +93,9 @@ export async function playTTS(
       );
       lastTimestamp = timestamp;
 
-      let mimiInput = sequence.slice([-1]);
-      mimiInput = mimiInput
-        .mul(model.flowLM.embStd)
-        .add(model.flowLM.embMean);
+      using mimiInputSlice = sequence.slice([-1]);
+      using mimiInputScaled = mimiInputSlice.mul(model.flowLM.embStd);
+      using mimiInput = mimiInputScaled.add(model.flowLM.embMean);
 
       const [audio, newMimiState] = runMimiDecode(
         model.mimi,
@@ -99,10 +107,11 @@ export async function playTTS(
 
       const lastAudioPromise = audioPromise;
       audioPromise = (async () => {
-        const audioPcm = (await np
-          .clip(audio.slice(0), -1, 1)
-          .astype(np.float32)
-          .data()) as Float32Array;
+        using sliced = audio.slice(0);
+        using clipped = np.clip(sliced, -1, 1);
+        using asFloat = clipped.astype(np.float32);
+        const audioPcm = (await asFloat.data()) as Float32Array;
+        audio.dispose();
         if (audioPcm.length !== 1920) {
           throw new Error(
             `expected 1920 audio samples, got ${audioPcm.length}`,
@@ -113,7 +122,10 @@ export async function playTTS(
       })();
     }
   } finally {
+    key.dispose();
     sequence.dispose();
+    tree.dispose(flowLMState);
+    tree.dispose(mimiState);
     tree.dispose([model, embeds]);
     await audioPromise;
   }

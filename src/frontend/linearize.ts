@@ -2102,10 +2102,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       }
     }
 
-    if (ctConstsAccum) {
-      for (let i = ctConstIdx; i < ctConstsAccum.length; i++) {
-        ctConstsAccum[i].dispose();
-      }
+    const remainingCtConsts: Tracer[] = ctConstsAccum ?? [];
+    for (let i = ctConstIdx; i < remainingCtConsts.length; i++) {
+      remainingCtConsts[i].dispose();
     }
     for (let i = ctCarryIdx; i < ctCarryRunning.length; i++) {
       ctCarryRunning[i].dispose();

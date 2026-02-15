@@ -262,7 +262,13 @@ Canonical examples: `test/refcount.test.ts`, `test/leak-diagnostic.test.ts`,
 jax-js supports the `using` keyword
 ([TC39 proposal](https://github.com/tc39/proposal-explicit-resource-management)) via
 `[Symbol.dispose]()` on Arrays and jit functions. A polyfill in `src/polyfills.ts` ensures
-`Symbol.dispose` exists in environments that don't have it yet.
+`Symbol.dispose`, `Symbol.asyncDispose`, and `SuppressedError` exist in environments that don't have
+them yet (notably Safari).
+
+**Svelte limitation:** Svelte's parser does not support the `using` keyword in `.svelte` files
+(sveltejs/svelte#16192 is a draft PR). `.svelte` and `.svelte.ts` files must use explicit
+`.dispose()` instead. The website's `src/polyfills.ts` + root layout import ensures the runtime
+globals exist for any plain `.ts` files that do use `using`.
 
 **Arrays — auto-dispose at block end:**
 
@@ -926,8 +932,8 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
   `jax-js/no-unnecessary-ref` eslint rule has autofix (`--fix` removes `.ref`). This is safe for
   user code but **unsafe for internal tracer plumbing** where `.ref` must propagate to inner values
   (e.g., `BatchTracer.ref` in `vmap.ts` must call `this.val.ref` so that `dispose()` remains
-  balanced). Commit `b5d4274` accidentally autofix'd `BatchTracer.ref`, causing `vmap(grad(erf))`
-  to crash with `UseAfterFreeError`; fixed in `af96e54`. The rule now skips `.ref` in
+  balanced). Commit `b5d4274` accidentally autofix'd `BatchTracer.ref`, causing `vmap(grad(erf))` to
+  crash with `UseAfterFreeError`; fixed in `af96e54`. The rule now skips `.ref` in
   `UpdateExpression` and `BinaryExpression` contexts (e.g., `buffer.ref++`, `buffer.ref === 0`) to
   avoid false positives on backend buffer tracking objects. For files with many intentional `.ref`
   calls, a file-level `// jax-js-lint: allow-ref` directive (in leading comments) suppresses all
@@ -2865,13 +2871,14 @@ Current rollout in this repo:
 - `jax-js/require-using`: `warn` on `src/**`, `packages/**`
 - `jax-js/no-unnecessary-ref`: `warn` on `src/**`, `packages/**`
 - `jax-js/no-use-after-dispose`: `warn` on `src/**`, `packages/**`
+- `jax-js/no-dispose-then-reassign-param`: `warn` on `src/**`, `packages/**`
 - `jax-js/no-array-chain`: `off`
 - all `jax-js/*` rules: `off` on `test/**`
 
 **Shared configs:**
 
 - `configs.recommended` — `require-using: warn`, `no-use-after-dispose: error`,
-  `no-unnecessary-ref: warn`, `no-array-chain: off`
+  `no-dispose-then-reassign-param: warn`, `no-unnecessary-ref: warn`, `no-array-chain: off`
 - `configs.strict` — all rules at `error` level, including `no-array-chain`
 
 **User setup (external consumers):**
@@ -2886,6 +2893,8 @@ Implemented rules:
 
 - `jax-js/require-using` — suggestion fix (converts `const`/`let` to `using`)
 - `jax-js/no-use-after-dispose` — includes `.dispose()` line number in message
+- `jax-js/no-dispose-then-reassign-param` — flags `dispose(state); state = param` callback alias
+  hazards
 - `jax-js/no-unnecessary-ref` — **autofix** (removes `.ref` with `--fix`)
 - `jax-js/no-array-chain` — reports outermost chain only (no duplicate subchain reports)
 
@@ -2903,12 +2912,15 @@ Current semantics in the in-repo implementation:
   chain. Safe for user code because `.ref` is never needed in the non-consuming model. **Unsafe for
   internal tracer `.ref` propagation** — see [Common pitfalls](#common-pitfalls) for the
   `BatchTracer.ref` incident. The rule automatically skips `.ref` in `UpdateExpression` and
-  `BinaryExpression` contexts (e.g., `buffer.ref++`, `buffer.ref === 0`) to avoid false positives
-  on backend buffer tracking objects. For files with many intentional `.ref` calls, a file-level
+  `BinaryExpression` contexts (e.g., `buffer.ref++`, `buffer.ref === 0`) to avoid false positives on
+  backend buffer tracking objects. For files with many intentional `.ref` calls, a file-level
   `// jax-js-lint: allow-ref` directive (in leading comments) suppresses all warnings. Per-line
   `// jax-js-lint: allow-ref` comments are used for isolated sites.
 - `jax-js/no-array-chain` deduplicates: only the outermost qualifying chain is reported, avoiding
   noisy depth-N + depth-(N-1) + ... reports for a single expression.
+- `jax-js/no-dispose-then-reassign-param` scans function bodies for adjacent
+  `dispose(stateVar); stateVar = paramName;` patterns and recommends an alias guard
+  (`if (stateVar !== paramName) ...`) before disposal.
 
 See `packages/eslint-plugin/README.md` for full user-facing documentation, rule details, IDE
 integration, and comparison with the community HAMK plugin.
@@ -3081,7 +3093,7 @@ statically at edit time, complementing the runtime `checkLeaks` diagnostic.
 | ~~High~~   | ~~unreachable Const PETracer leak~~       | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                           |
 | ~~High~~   | ~~user-disposed const over-disposal~~     | ✅ Fixed via `refCount <= 1` protection in `linearizeFlat`/`vjpFlat`                                                                                                                            |
 | Medium     | Anonymous constant leak fix               | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                       |
-| ~~Medium~~ | ~~ESLint plugin for non-consuming model~~ | ✅ Implemented as `@jax-js/eslint-plugin` v0.1.0 — `require-using`, `no-use-after-dispose`, `no-unnecessary-ref`, `no-array-chain`                                                              |
+| ~~Medium~~ | ~~ESLint plugin for non-consuming model~~ | ✅ Implemented as `@jax-js/eslint-plugin` v0.1.0 — `require-using`, `no-use-after-dispose`, `no-dispose-then-reassign-param`, `no-unnecessary-ref`, `no-array-chain`                            |
 | Low        | Chain→temporaries RFC (design-only)       | Keep implementation deferred. Scope RFC to assignment/return chains only, preserve evaluation order + exceptions, and require measured eager-memory wins / lint-pressure before implementation. |
 | Medium     | `scatter_add` primitive                   | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.   |
 | ~~Low~~    | ~~`using` declaration examples~~          | ✅ Documented in copilot-instructions + README                                                                                                                                                  |

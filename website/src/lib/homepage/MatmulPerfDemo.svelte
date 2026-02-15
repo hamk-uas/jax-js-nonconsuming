@@ -3,130 +3,9 @@
   import { onMount } from "svelte";
   import { fade } from "svelte/transition";
 
-  interface PerfResults {
-    flops: {
-      Wasm: number;
-      WebGPU: number;
-      "WebGPU-fp16": number | undefined;
-    };
-    browser: string;
-    live: boolean;
-  }
-
-  // Fall back to these if
-  const ericLaptopResults: PerfResults = {
-    flops: {
-      Wasm: 2.72,
-      WebGPU: 2071,
-      "WebGPU-fp16": 3343,
-    },
-    browser: "Chrome on Apple M3 Pro",
-    live: false,
-  };
+  import { fallbackResults, measurePerf, type PerfResults } from "./benchFlops";
 
   let results = $state<PerfResults | null>(null);
-
-  async function benchFlops(
-    n: number,
-    device: any,
-    dtype: any,
-  ): Promise<number> {
-    try {
-      const jax = await import("@jax-js/jax");
-      await jax.init(device);
-      jax.defaultDevice(device);
-
-      const np = jax.numpy;
-
-      const measurements: number[] = [];
-
-      // 1 warmup + 2 timed runs
-      for (let i = 0; i < 3; i++) {
-        const key = jax.random.key(0);
-        const [k1, k2] = jax.random.split(key, 2);
-
-        const A = jax.random.uniform(k1, [n, n]).astype(dtype);
-        const B = jax.random.uniform(k2, [n, n]).astype(dtype);
-        await jax.blockUntilReady([A, B]);
-
-        const start = performance.now();
-        const C = np.matmul(A, B);
-        await jax.blockUntilReady(C);
-        C.dispose();
-        const end = performance.now();
-
-        if (i > 0) {
-          measurements.push((end - start) / 1000);
-        }
-      }
-
-      const gflops = (2 * n * n * n) / 1e9;
-      const seconds =
-        measurements.reduce((a, b) => a + b, 0) / measurements.length;
-
-      return gflops / seconds;
-    } catch (error: any) {
-      console.error("Benchmark error:", error);
-      return 0;
-    }
-  }
-
-  async function measurePerf(): Promise<PerfResults> {
-    // See if the current browser supports WebGPU.
-    if (!navigator?.gpu?.requestAdapter) {
-      // Fall back to laptop results if WebGPU is not supported.
-      return ericLaptopResults;
-    }
-
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) return ericLaptopResults;
-    const hasF16 = adapter.features.has("shader-f16");
-
-    const isApple = /iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent);
-    const isMobile = /Mobi/.test(navigator.userAgent);
-    const isNvidia = /NVIDIA/i.test(adapter.info.vendor);
-    const isGoodGpu = /NVIDIA|AMD|Qualcomm|ARM/i.test(adapter.info.vendor); // "Good" GPUs, probably won't crash
-
-    // Large matmuls put pressure on mobile browsers like iOS Safari, and it can
-    // lead to page crashes. Also the measured FLOPs is lower.
-    //
-    // It also looks like some Windows PCs have trouble with GPU, keeping things
-    // suitably small to really avoid accidentally crashing someone's browser on
-    // page load. Nvidia GPUs are definitely fine though.
-    //
-    // Trying to get as good of a first impression as possible while not
-    // stressing out people's computers too much.
-    //
-    // References:
-    // - https://github.com/gpuweb/gpuweb/blob/WGSLv1/design/AdapterIdentifiers.md
-    // - https://github.com/gpuweb/gpuweb/pull/2660
-    // - https://github.com/milhidaka/webgpu-blas
-    // - https://github.com/chromium/chromium/blob/145.0.7583.2/content/utility/on_device_model/on_device_model_sandbox_init.cc#L41-L44
-    // - https://github.com/ProfSynapse/nexus/blob/3.2.0/src/services/llm/adapters/webllm/WebLLMVRAMDetector.ts
-    // - https://github.com/1karess/wasm-fingerprint/blob/main/src/webgpu-detection.js#L726-L740
-    let gpuDim: number;
-    if (isApple) {
-      gpuDim = isMobile ? 2048 : 4096;
-    } else if (isNvidia) {
-      gpuDim = 4096;
-    } else if (isGoodGpu) {
-      gpuDim = isMobile ? 1024 : 2048;
-    } else {
-      gpuDim = 1024;
-    }
-
-    return {
-      flops: {
-        Wasm: await benchFlops(128, "wasm", "float32"),
-        WebGPU: await benchFlops(gpuDim, "webgpu", "float32"),
-        "WebGPU-fp16": hasF16
-          ? await benchFlops(gpuDim, "webgpu", "float16")
-          : undefined,
-      },
-      browser: "Your browser (live)",
-      live: true,
-    };
-  }
 
   let measuring = $state(false);
 
@@ -172,7 +51,7 @@
       ? Math.max(
           ...allBackends.map((b) => results!.flops[b]).filter((v) => v != null),
         )
-      : ericLaptopResults.flops["WebGPU-fp16"]!,
+      : fallbackResults.flops["WebGPU-fp16"]!,
   );
 
   // Get bar height as a percentage (0-1)

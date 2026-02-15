@@ -1,6 +1,8 @@
 import type { Device, numpy as np } from "@jax-js/jax";
 import type { Plugin } from "@rollup/browser";
 
+import { arrayToDataUrl } from "./displayImage";
+
 export type ConsoleLine = {
   level: "log" | "info" | "warn" | "error" | "image";
   data: string[];
@@ -145,66 +147,7 @@ async function _runProgram(
   // Builtins for the REPL environment.
   const np = jax.numpy;
   const displayImage = async (ar: np.Array) => {
-    if (ar.ndim !== 2 && ar.ndim !== 3) {
-      throw new Error(
-        "displayImage() only supports 2D (H, W) or 3D (H, W, C) array",
-      );
-    }
-    await ar.blockUntilReady();
-
-    if (ar.ndim === 2) {
-      // If 2D, convert to (H, W, 1)
-      ar = ar.reshape([...ar.shape, 1]);
-    }
-    const height = ar.shape[0];
-    const width = ar.shape[1];
-    const channels = ar.shape[2];
-
-    if (ar.dtype === np.float32 || ar.dtype === np.float16) {
-      // If float32, normalize [0, 1) to [0, 256)
-      ar = np.clip(ar.mul(256), 0, 255).astype(np.uint32);
-    } else if (ar.dtype === np.bool) {
-      // If bool, convert to 0 or 255
-      ar = ar.astype(np.uint32).mul(255);
-    }
-
-    let rgbaArray: np.Array;
-    if (channels === 1) {
-      ar = np.repeat(ar, 3, 2);
-      const alphas = np.full([height, width, 1], 255, {
-        dtype: ar.dtype,
-        device: ar.device,
-      });
-      rgbaArray = np.concatenate([ar, alphas], 2);
-    } else if (channels === 3) {
-      const alphas = np.full([height, width, 1], 255, {
-        dtype: ar.dtype,
-        device: ar.device,
-      });
-      rgbaArray = np.concatenate([ar, alphas], 2);
-    } else if (channels === 4) {
-      rgbaArray = ar;
-    } else {
-      throw new Error(
-        "displayImage() only supports 1, 3, or 4 channels in the last dimension",
-      );
-    }
-
-    const buf = await rgbaArray.data();
-    const dataArray = new Uint8ClampedArray(buf);
-    const imageData = new ImageData(dataArray, width, height, {
-      colorSpace: "srgb",
-    });
-
-    // Create a temporary <canvas> to draw and produce a data URL.
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext("2d")!;
-    ctx.putImageData(imageData, 0, 0);
-    const dataUrl = canvas.toDataURL();
-
-    // Append the image to the console output.
+    const dataUrl = await arrayToDataUrl(ar);
     runner.consoleLines.push({
       level: "image",
       data: [dataUrl],
