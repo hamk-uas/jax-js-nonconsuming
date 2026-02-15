@@ -155,12 +155,13 @@ Arrays can have mathematical operations applied to them. For example:
 ```ts
 import { numpy as np, scipySpecial as special } from "@jax-js/jax";
 
-const x = np.arange(100).astype(np.float32); // array of integers [0..99]
+using x = np.arange(100).astype(np.float32); // array of integers [0..99]
 
-const y1 = x.add(x); // x + x
-const y2 = np.sin(x); // sin(x)
-const y3 = np.tanh(x).mul(5); // 5 * tanh(x)
-const y4 = special.erfc(x); // erfc(x)
+using y1 = x.add(x); // x + x
+using y2 = np.sin(x); // sin(x)
+using tanhX = np.tanh(x);
+using y3 = tanhX.mul(5); // 5 * tanh(x)
+using y4 = special.erfc(x); // erfc(x)
 ```
 
 ### Memory management
@@ -176,8 +177,10 @@ its memory, or use JavaScript's `using` keyword for automatic disposal:
 ```ts
 {
   using x = np.array([1, 2, 3]);
-  const y = x.add(x).mul(x); // x used three times — no problem
-  // x is automatically disposed at end of block
+  using doubled = x.add(x);
+  const y = doubled.mul(x); // x used three times — no problem
+  y.dispose();
+  // x and doubled are automatically disposed at end of block
 }
 ```
 
@@ -185,14 +188,19 @@ For best performance, wrap compute-heavy code in `jit()`. The JIT compiler autom
 intermediate buffers — allocating, reusing, and freeing them at the optimal points:
 
 ```ts
-const f = jit((x: np.Array) => np.sqrt(x.mul(x).sum()));
+const f = jit((x: np.Array) => {
+  using sq = x.mul(x);
+  using s = sq.sum();
+  return np.sqrt(s);
+});
 const result = f(x); // intermediates freed automatically inside jit
 result.dispose(); // caller disposes the output when done
 f.dispose(); // free captured constants when the function is no longer needed
 ```
 
-The `@jax-js/eslint-plugin` catches the most common memory leaks (missing `using`, use-after-dispose,
-unnecessary `.ref`) at edit time — see the [plugin README](packages/eslint-plugin) for setup.
+The `@jax-js/eslint-plugin` catches the most common memory leaks (missing `using`,
+use-after-dispose, unnecessary `.ref`) at edit time — see the
+[plugin README](packages/eslint-plugin) for setup.
 
 ### grad(), vmap() and jit()
 
@@ -202,10 +210,10 @@ using `grad` and `vmap` to compute the derivative of a function:
 ```ts
 import { numpy as np, grad, vmap } from "@jax-js/jax";
 
-const x = np.linspace(-10, 10, 1000);
+using x = np.linspace(-10, 10, 1000);
 
-const y1 = vmap(grad(np.sin))(x); // d/dx sin(x) = cos(x)
-const y2 = np.cos(x);
+using y1 = vmap(grad(np.sin))(x); // d/dx sin(x) = cos(x)
+using y2 = np.cos(x);
 
 np.allclose(y1, y2); // => true
 ```
@@ -217,7 +225,10 @@ accelerators, which is the bottleneck on GPU rather than raw FLOPs. For instance
 
 ```ts
 export const hypot = jit(function hypot(x1: np.Array, x2: np.Array) {
-  return np.sqrt(np.square(x1).add(np.square(x2)));
+  using x1sq = np.square(x1);
+  using x2sq = np.square(x2);
+  using sum = x1sq.add(x2sq);
+  return np.sqrt(sum);
 });
 ```
 
@@ -237,8 +248,8 @@ type Params = {
 };
 
 function getSums(p: Params) {
-  const fooSum = p.foo.sum();
-  const barSum = p.bar.map((x) => x.sum()).reduce(np.add);
+  using fooSum = p.foo.sum();
+  using barSum = p.bar.map((x) => x.sum()).reduce(np.add);
   return fooSum.add(barSum);
 }
 

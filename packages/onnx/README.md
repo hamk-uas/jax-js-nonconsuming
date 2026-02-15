@@ -13,7 +13,7 @@ import { numpy as np } from "@jax-js/jax";
 const modelBytes = await fetch("./model.onnx").then((r) => r.bytes());
 const model = new ONNXModel(modelBytes);
 
-const input = np.ones([1, 3, 224, 224]);
+using input = np.ones([1, 3, 224, 224]);
 const { output } = model.run({ input });
 ```
 
@@ -23,13 +23,14 @@ best performance.
 ```ts
 import { grad, jit } from "@jax-js/jax";
 
-const run = jit(model.run);
+using run = jit(model.run);
 const runGrad = grad((input: np.Array) => {
   const { output } = run({ input });
-  return computeLoss(output).mean();
+  using loss = computeLoss(output);
+  return loss.mean();
 });
 
-const dx = runGrad(input);
+using dx = runGrad(input);
 ```
 
 After you're done, you can free the model weights.

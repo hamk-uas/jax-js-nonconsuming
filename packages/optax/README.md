@@ -12,13 +12,21 @@ let params = np.array([1.0, 2.0, 3.0]);
 
 const solver = adam(1e-3);
 let optState = solver.init(params);
-let updates: np.Array;
 
-const f = (x: np.Array) => squaredError(x, np.ones([3])).sum();
+using target = np.ones([3]);
+const f = (x: np.Array) => {
+  using err = squaredError(x, target);
+  return err.sum();
+};
 
 for (let i = 0; i < 100; i++) {
-  const paramsGrad = grad(f)(params);
-  [updates, optState] = solver.update(paramsGrad, optState);
-  params = applyUpdates(params, updates);
+  using paramsGrad = grad(f)(params);
+  const [newUpdates, newOptState] = solver.update(paramsGrad, optState);
+  const newParams = applyUpdates(params, newUpdates);
+  params.dispose();
+  tree.dispose(optState);
+  newUpdates.dispose();
+  params = newParams;
+  optState = newOptState;
 }
 ```

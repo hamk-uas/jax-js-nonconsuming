@@ -104,8 +104,11 @@ export default [
     rules: {
       "jax-js/require-using": "off",
       "jax-js/no-use-after-dispose": "off",
+      "jax-js/no-dispose-then-reassign-param": "off",
+      "jax-js/no-make-disposable-alias": "off",
       "jax-js/no-unnecessary-ref": "off",
       "jax-js/no-array-chain": "off",
+      "jax-js/require-scan-result-dispose": "off",
     },
   },
 ];
@@ -360,7 +363,7 @@ try {
 // Pattern 3: ownership handoff to disposable wrapper
 const [carry2, ys2] = lax.scan(step, initCarry, xs);
 using owned = tree.makeDisposable({ carry: carry2, ys: ys2 });
-return await owned.carry.consumeData();
+return await owned.carry.data(); // read data; owned disposes all leaves at block end
 
 // Pattern 4: avoid accidental aliasing in handoff literals
 const xf_0 = np.add(x, y);
