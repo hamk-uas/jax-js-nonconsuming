@@ -126,7 +126,9 @@
   }
 
   async function handleRun() {
+    replEditor.setLeakMarkers([]);
     await replRunner.runProgram(replEditor.getText(), device);
+    replEditor.setLeakMarkers(replRunner.leakMarkers);
   }
 </script>
 

@@ -51,6 +51,24 @@
     }
   }
 
+  export function setLeakMarkers(markers: { line: number; message: string }[]) {
+    if (!monaco || !editor) return;
+    const model = editor.getModel();
+    if (!model) return;
+    monaco.editor.setModelMarkers(
+      model,
+      "leak-diagnostics",
+      markers.map((m) => ({
+        startLineNumber: m.line,
+        startColumn: 1,
+        endLineNumber: m.line,
+        endColumn: model.getLineMaxColumn(m.line),
+        message: m.message,
+        severity: monaco.MarkerSeverity.Warning,
+      })),
+    );
+  }
+
   onMount(async () => {
     monaco = (await import("$lib/monaco")).default;
 

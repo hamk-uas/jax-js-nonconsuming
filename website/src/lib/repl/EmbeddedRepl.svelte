@@ -36,7 +36,9 @@
   let runDurationMs = $derived(runner.runDurationMs);
 
   async function handleRun() {
+    editor.setLeakMarkers([]);
     await runner.runProgram(editor.getText(), device);
+    editor.setLeakMarkers(runner.leakMarkers);
   }
 </script>
 

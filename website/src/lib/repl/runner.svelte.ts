@@ -22,12 +22,32 @@ const consoleMethods = [
   "warn",
 ] as const;
 
+export interface LeakMarker {
+  line: number;
+  message: string;
+}
+
+function parseLeakMarkers(reportDetails: string[]): LeakMarker[] {
+  const markers: LeakMarker[] = [];
+  for (const detail of reportDetails) {
+    const m = detail.match(/^(.+?) created at index\.ts:(\d+):(\d+)$/);
+    if (m) {
+      markers.push({
+        line: parseInt(m[2]),
+        message: `Leaked: ${m[1]}. Use \`using\` or call .dispose()`,
+      });
+    }
+  }
+  return markers;
+}
+
 export class ReplRunner {
   running = $state(false);
   finished = $state(false);
   consoleLines: ConsoleLine[] = $state([]);
   runDurationMs = $state<number | null>(null);
-  detailedLeakDiagnostics = $state(false);
+  detailedLeakDiagnostics = $state(true);
+  leakMarkers: LeakMarker[] = $state([]);
   consoleTimers = new Map<string, number>();
   mockConsole: Console;
 
@@ -53,6 +73,7 @@ export class ReplRunner {
     this.running = true;
     this.finished = false;
     this.runDurationMs = null;
+    this.leakMarkers = [];
     const startedRunAt = performance.now();
     try {
       const result = await _runProgram(
@@ -312,6 +333,7 @@ async function _runProgram(
         const report = jax.checkLeaks.stop();
         detailedLeakSummary = report.summary;
         detailedLeakCount = report.leaked;
+        runner.leakMarkers = parseLeakMarkers(report.details);
       } catch {
         // Ignore checkLeaks reporting failures in REPL.
       }
@@ -349,6 +371,7 @@ async function _runProgram(
         const report = jax.checkLeaks.stop();
         detailedLeakSummary = report.summary;
         detailedLeakCount = report.leaked;
+        runner.leakMarkers = parseLeakMarkers(report.details);
       } catch {
         // Ignore checkLeaks reporting failures in REPL.
       }
