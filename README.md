@@ -8,7 +8,7 @@
   />
 </p>
 
-<p align="center">jax-js-nonconsuming<br><em>Non-consuming ownership fork</em></p>
+<p align="center"><em>Non-consuming ownership fork</em></p>
 
 <p align="center"><strong>
   <a href="https://hamk-uas.github.io/jax-js-nonconsuming/">Website</a> |
