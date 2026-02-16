@@ -406,8 +406,10 @@ suite("jax.grad()", () => {
     //     .sum(-2)
     //     .add(params.b);
 
-    const dense = (params: Params, x: np.Array) =>
-      np.dot(x, params.w).add(params.b);
+    const dense = (params: Params, x: np.Array) => {
+      using dot = np.dot(x, params.w);
+      return dot.add(params.b);
+    };
 
     const loss = (params: Params, x: np.Array) =>
       nn.logSoftmax(dense(params, x)).slice([], 0).sum().mul(0.5);

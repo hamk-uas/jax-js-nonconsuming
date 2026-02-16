@@ -17,6 +17,7 @@ import {
   init,
   lax,
   numpy as np,
+  tree,
 } from "@jax-js-nonconsuming/jax";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -181,6 +182,7 @@ describe("scan fallback leak detection (CPU)", () => {
     expect(ys).toBeNull();
     await carry.data();
     carry.dispose();
+    tree.dispose(ys);
     expect(checkLeaks.stop().leaked).toBe(0);
 
     initC.dispose();
@@ -232,8 +234,7 @@ describe("scan fallback leak detection (CPU)", () => {
     await (carry as any).a.data();
     await (carry as any).b.data();
     await ys.data();
-    (carry as any).a.dispose();
-    (carry as any).b.dispose();
+    tree.dispose(carry);
     ys.dispose();
     expect(checkLeaks.stop().leaked).toBe(0);
 

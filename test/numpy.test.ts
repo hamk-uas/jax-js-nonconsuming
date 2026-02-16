@@ -37,6 +37,7 @@ suite.each(devices)("device:%s", (device) => {
     test("is identity on empty axes", () => {
       using _x = np.arange(24);
       using x = _x.reshape([2, 3, 4]);
+      // eslint-disable-next-line jax-js/require-using -- sum([]) may return same backing object
       const y = x.sum([]); // may return same object — no using
       expect(x.js()).toEqual(y.js());
     });

@@ -23,17 +23,17 @@
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 
 // Import jax-js from local build
+import { withLeakCheck } from "./harness.ts";
 import {
-  init,
   defaultDevice,
-  numpy as np,
-  lax,
-  jit,
   grad,
+  init,
+  jit,
+  lax,
+  numpy as np,
 } from "../../dist/index.js";
 
 // Import leak detection harness
-import { withLeakCheck } from "./harness.ts";
 
 // Check if WebGPU is available
 const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;

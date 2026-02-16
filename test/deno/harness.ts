@@ -16,11 +16,10 @@
  *   });
  */
 
-import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import {
   checkLeaks,
-  getBackend,
   defaultDevice,
+  getBackend,
   init,
   numpy as np,
 } from "../../dist/index.js";
@@ -59,6 +58,7 @@ export function assertAllclose(
   expected: any,
   options?: { rtol?: number; atol?: number },
 ): void {
+  // eslint-disable-next-line jax-js/require-using -- np.allclose returns a plain boolean, not an array
   const pass = np.allclose(actual, expected, options);
   if (!pass) {
     const actualJs =
@@ -176,19 +176,22 @@ export function withLeakCheck(
 
   return async () => {
     checkLeaks.start();
+    let testError: unknown;
     try {
       await fn();
-    } finally {
-      const report = checkLeaks.stop();
-      if (report.leaked > allowedLeaks) {
-        const details =
-          report.details.length > 0
-            ? `\n${report.details.map((d: string) => `  - ${d}`).join("\n")}`
-            : "";
-        throw new Error(
-          `Memory leak: ${report.leaked} slot(s) leaked (allowed=${allowedLeaks})${details}`,
-        );
-      }
+    } catch (e) {
+      testError = e;
+    }
+    const report = checkLeaks.stop();
+    if (testError) throw testError;
+    if (report.leaked > allowedLeaks) {
+      const details =
+        report.details.length > 0
+          ? `\n${report.details.map((d: string) => `  - ${d}`).join("\n")}`
+          : "";
+      throw new Error(
+        `Memory leak: ${report.leaked} slot(s) leaked (allowed=${allowedLeaks})${details}`,
+      );
     }
   };
 }

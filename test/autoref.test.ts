@@ -214,6 +214,7 @@ describe("non-consuming ownership model", () => {
     });
 
     it(".ref still works for backward compat", () => {
+      // jax-js-lint: allow-ref — intentional test of backward-compat .ref
       using f = jit((x: np.Array) => x.ref.mul(x));
       using x = np.array([2, 3]);
       using result = f(x);

@@ -16,12 +16,12 @@
  */
 
 import {
-  init,
-  defaultDevice,
-  numpy as np,
-  lax,
-  jit,
   blockUntilReady,
+  defaultDevice,
+  init,
+  jit,
+  lax,
+  numpy as np,
 } from "../../dist/index.js";
 
 // Initialize WebGPU backend

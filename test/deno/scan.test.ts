@@ -17,14 +17,13 @@
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import { assertThrows } from "https://deno.land/std@0.224.0/assert/mod.ts";
 
-import { numpy as np, lax, jit, grad, jvp, vmap } from "../../dist/index.js";
-
 import {
-  initWebGPU,
-  hasWebGPU,
   assertAllcloseAsync,
+  hasWebGPU,
+  initWebGPU,
   withLeakCheck,
 } from "./harness.ts";
+import { grad, jit, jvp, lax, numpy as np, vmap } from "../../dist/index.js";
 
 // ============================================================================
 // Basic scan
@@ -390,12 +389,12 @@ Deno.test({
     };
 
     using initVal = np.array([0.0]);
-    const [finalCarry, ys] = lax.scan(step, initVal, null, { length: 5 });
+    const [finalCarry, _ys] = lax.scan(step, initVal, null, { length: 5 });
     using _fc = finalCarry;
 
     const data = await finalCarry.data();
     assertEquals(Math.round(data[0] * 100) / 100, 5);
-    assertEquals(ys, null);
+    assertEquals(_ys, null);
   }),
 });
 
@@ -437,11 +436,11 @@ Deno.test({
 
     using initVal = np.array([0.0]);
     using xs = np.array([[1.0], [2.0], [3.0]]);
-    const [finalCarry, ys] = lax.scan(step, initVal, xs);
+    const [finalCarry, _ys] = lax.scan(step, initVal, xs);
     using _fc = finalCarry;
 
     await assertAllcloseAsync(finalCarry, [6.0]);
-    assertEquals(ys, null);
+    assertEquals(_ys, null);
   }),
 });
 

@@ -50,7 +50,7 @@ kernels in WebAssembly and WebGPU.
 
 The original jax-js was written from scratch with zero zero external dependencies. jax-js and this
 fork maintain close API compatibility with NumPy/JAX. Since everything runs client-side, jax-js is
-likely the most portable GPU ML framework, since it runs anywhere a browser can run.
+one of the most portable GPU ML frameworks, since it runs anywhere a browser can run.
 
 ## Quickstart
 
@@ -77,14 +77,14 @@ import { numpy as np } from "@jax-js-nonconsuming/jax";
 
 ## Feature comparison
 
-Here's a quick, high-level comparison with other popular web ML runtimes:
+Here's a quick, high-level comparison with other popular web ML runtimes. Performance labels are
+workload- and hardware-dependent.
 
 | Feature                         | jax-js-nonconsuming | jax-js v0.1.9 | TensorFlow.js   | onnxruntime-web    |
 | ------------------------------- | ------------------- | ------------- | --------------- | ------------------ |
 | **Overview**                    |                     |               |                 |                    |
 | API style                       | JAX/NumPy           | JAX/NumPy     | TensorFlow-like | Static ONNX graphs |
-| Latest release                  | 2026                | 2026          | ⚠️ 2024         | 2026               |
-| Speed                           | Fastest             | Fastest       | Fast            | Fastest            |
+| Speed                           | Very fast           | Very fast     | Fast            | Very fast          |
 | Bundle size (gzip)              | 107 KB              | 80 KB         | 269 KB          | 90 KB + 24 MB Wasm |
 | **Autodiff & JIT**              |                     |               |                 |                    |
 | Gradients                       | ✅                  | ✅            | ✅              | ❌                 |
@@ -221,6 +221,12 @@ The `@jax-js-nonconsuming/eslint-plugin-jax-js` catches the most common memory l
 `using`, use-after-dispose, unnecessary `.ref`) at edit time — see the
 [plugin README](packages/eslint-plugin) for setup.
 
+**Ownership invariance principle:** write code that is ownership-correct in both eager mode and
+`jit()` mode. `jit()` is a performance optimization (fusion, recycling), not a semantics change. If
+code leaks or relies on different ownership behavior in eager mode, treat it as a real bug. For CI
+enforcement in user code, use `jaxJs.configs.invariance` from
+`@jax-js-nonconsuming/eslint-plugin-jax-js`.
+
 ### grad(), vmap() and jit()
 
 JAX's signature composable transformations are also supported in jax-js. Here is a simple example of
@@ -346,10 +352,10 @@ browsers. Also, this library uniquely has the `jit()` feature that fuses operati
 records an execution graph. jax-js achieves **over 7000 GFLOP/s** for matrix multiplication on an
 Apple M4 Max chip ([try it](https://hamk-uas.github.io/jax-js-nonconsuming/bench/matmul)).
 
-For that example, it's significantly faster than both
+In that specific benchmark run, it was faster than both
 [TensorFlow.js](https://github.com/tensorflow/tfjs) and
 [ONNX Runtime Web](https://www.npmjs.com/package/onnxruntime-web), which both use handwritten
-libraries of custom kernels.
+libraries of custom kernels. Results vary by model, operator mix, and hardware.
 
 It's still early though. There's a lot of low-hanging fruit to continue optimizing the library, as
 well as unique optimizations such as FlashAttention variants.
@@ -567,9 +573,10 @@ improvements, core tracing), please file them
 [upstream at ekzhang/jax-js](https://github.com/ekzhang/jax-js/issues) instead. This avoids
 duplicate work and ensures fixes land in both codebases.
 
-**Upstream sync policy:** We are likely to periodically rebase onto upstream to pick up new features
-and fixes, but there may be delays or pauses. Development of this fork may stop at any time — if
-that happens, upstream jax-js continues independently.
+**Upstream sync policy:** We may periodically rebase onto upstream to pick up new features and
+fixes, but there is no guarantee of continuous updates. Maintenance debt can accumulate across
+projects, and this fork may be reduced in scope or paused if priorities shift. Upstream jax-js
+continues independently.
 
 Before submitting a PR, run the full CI checks locally:
 

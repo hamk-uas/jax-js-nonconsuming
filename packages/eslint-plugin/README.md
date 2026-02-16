@@ -64,6 +64,22 @@ export default [
 Strict promotes everything to `error` and enables `no-array-chain` — useful for library code and CI
 enforcement.
 
+### Invariance config (eager/JIT parity)
+
+```ts
+// eslint.config.ts
+import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
+
+export default [
+  jaxJs.configs.invariance,
+  // ... your other configs
+];
+```
+
+`invariance` is a purpose-built profile for user code that enforces ownership patterns equally in
+eager mode and inside `jit()` bodies. It sets the same user-facing ownership rules as strict to
+`error` so `jit()` cannot be used as a workaround for eager-mode ownership bugs.
+
 ### Internal transform config (maintainers)
 
 For framework internals (transform wrappers, retained handles, dispose ordering), use:
@@ -326,6 +342,22 @@ const y = b.tanh();
 | Option     | Type    | Default | Description                          |
 | ---------- | ------- | ------- | ------------------------------------ |
 | `minDepth` | integer | `2`     | Minimum chain depth to trigger error |
+
+**Traced-context suppression:** Chains inside tracing transform bodies are automatically suppressed,
+because the JIT compiler manages intermediate lifetimes — no eager temporaries are created. This
+applies to functions passed directly as the first argument to `jit`, `grad`, `valueAndGrad`, `jvp`,
+`vjp`, `vmap`, `jacfwd`, `jacrev`, `hessian`, `linearize`, `makeJaxpr`, and `lax.scan`. Named
+function references are also resolved: if a `const`/`let` function variable is passed to a transform
+elsewhere in the same scope, chains inside that function are suppressed.
+
+```ts
+// ✅ OK: chain inside jit body — JIT manages intermediates
+const f = jit((x) => x.mul(weights).add(bias).tanh());
+
+// ✅ OK: named function passed to grad
+const loss = (x) => x.mul(x).sum();
+const dloss = grad(loss);
+```
 
 **Scope:** Only tracks known JAX array methods (`add`, `sub`, `mul`, `div`, `reshape`, `transpose`,
 `sum`, `mean`, `exp`, `log`, `sin`, `cos`, `tanh`, `sqrt`, `matmul`, etc.). JavaScript collection

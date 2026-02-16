@@ -98,3 +98,31 @@ function f(step, initCarry, xs) {
   const messages = await lintScanDispose(code);
   assert.equal(messages.length, 0);
 });
+
+test("require-scan-result-dispose: using alias handoff is recognized", async () => {
+  const code = `
+async function f() {
+  const [finalCarry, outputs] = lax.scan(step, initVal, xs);
+  using _fc = finalCarry;
+  using _out = outputs;
+  await assertAllcloseAsync(finalCarry, [6.0]);
+}
+`;
+
+  const messages = await lintScanDispose(code);
+  assert.equal(messages.length, 0);
+});
+
+test("require-scan-result-dispose: using alias of member also works", async () => {
+  const code = `
+async function f() {
+  const [finalCarry, outputs] = lax.scan(step, init, xs);
+  using _a = finalCarry.a;
+  using _b = finalCarry.b;
+  using _out = outputs;
+}
+`;
+
+  const messages = await lintScanDispose(code);
+  assert.equal(messages.length, 0);
+});

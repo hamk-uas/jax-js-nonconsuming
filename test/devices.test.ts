@@ -68,7 +68,7 @@ test("devicePut works with scalars", async () => {
   expect(y.dtype).toBe(np.float32);
   expect(y.weakType).toBe(true);
 
-  const z = x.add(y);
+  using z = x.add(y);
   expect(z.device).toBe("wasm");
   expect(z.js()).toBe(15);
 });

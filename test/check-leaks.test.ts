@@ -112,6 +112,7 @@ describe("checkLeaks", () => {
   it("trackRefs records .ref call sites", () => {
     checkLeaks.start({ trackRefs: true });
     const x = np.array([1, 2, 3]);
+    // jax-js-lint: allow-ref — intentional test of .ref tracking
     const y = x.ref; // extra ref
     const snap = checkLeaks.snapshot();
     expect(snap.length).toBe(1);

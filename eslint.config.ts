@@ -7,14 +7,7 @@ import ts from "typescript-eslint";
 import jaxJsPlugin from "./packages/eslint-plugin/src/index";
 
 export default defineConfig([
-  globalIgnores([
-    "**/dist/",
-    "docs/",
-    "website/",
-    "coverage/",
-    "test/deno/",
-    "tmp/",
-  ]),
+  globalIgnores(["**/dist/", "docs/", "website/", "coverage/", "tmp/"]),
   js.configs.recommended,
   ts.configs.recommendedTypeChecked,
   {
@@ -104,15 +97,7 @@ export default defineConfig([
   },
   {
     files: ["src/**/*.{js,mjs,cjs,ts}", "packages/**/*.{js,mjs,cjs,ts}"],
-    rules: {
-      "jax-js/no-array-chain": "off",
-      "jax-js/no-dispose-then-reassign-param": "warn",
-      "jax-js/no-make-disposable-alias": "warn",
-      "jax-js/no-unnecessary-ref": "warn",
-      "jax-js/no-use-after-dispose": "warn",
-      "jax-js/require-using": "warn",
-      "jax-js/require-scan-result-dispose": "warn",
-    },
+    ...(jaxJsPlugin.configs!.invariance as any),
   },
   // Internal framework code manipulates Slots, shapes, Jaxprs — not np.Arrays.
   // Disable require-using there to avoid pervasive false positives.
@@ -133,23 +118,19 @@ export default defineConfig([
   {
     files: ["src/**/*.test.ts"],
     rules: {
+      "jax-js/no-array-chain": "off",
       "jax-js/require-using": "off",
     },
   },
   {
     files: ["test/**/*.{js,mjs,cjs,ts}"],
-    rules: {
-      "jax-js/no-array-chain": "off",
-      "jax-js/no-dispose-then-reassign-param": "off",
-      "jax-js/no-make-disposable-alias": "off",
-      "jax-js/require-retained-release": "off",
-      "jax-js/require-try-finally-symmetry": "off",
-      "jax-js/require-wrapper-dispose-symmetry": "off",
-      "jax-js/no-unnecessary-ref": "off",
-      "jax-js/no-use-after-dispose": "off",
-      "jax-js/require-using": "off",
-      "jax-js/require-scan-result-dispose": "off",
-    },
+    ...(jaxJsPlugin.configs!.invariance as any),
+  },
+  // Deno tests use URL imports (https://deno.land/...) and dist/ imports that
+  // typescript-eslint's project service can't resolve. Disable type-checked rules.
+  {
+    files: ["test/deno/**/*.ts"],
+    ...ts.configs.disableTypeChecked,
   },
   {
     files: ["scripts/**/*.mjs"],

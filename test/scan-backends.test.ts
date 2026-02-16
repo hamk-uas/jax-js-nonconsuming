@@ -37,11 +37,13 @@ describe("lax.scan backend coverage", () => {
           const newC = np.add(c, x);
           return [newC, newC];
         };
-        const initVal = await devicePut(np.zeros([1]), device);
-        const xs = await devicePut(np.ones([10, 1]), device);
-        const [final, _] = lax.scan(step, initVal, xs);
+        using initVal = await devicePut(np.zeros([1]), device);
+        using xs = await devicePut(np.ones([10, 1]), device);
+        const [final, ys] = lax.scan(step, initVal, xs);
         const finalData = await final.data();
         expect(finalData[0]).toBe(10);
+        final.dispose();
+        ys.dispose();
       }
 
       // 2. Check copyBufferToBuffer (required for fallback)
@@ -74,12 +76,14 @@ describe("lax.scan backend coverage", () => {
           return lax.scan(step, init, xs);
         });
 
-        const initVal = await devicePut(np.zeros([1]), device);
-        const xs = await devicePut(np.ones([5, 1]), device);
+        using initVal = await devicePut(np.zeros([1]), device);
+        using xs = await devicePut(np.ones([5, 1]), device);
         // eslint-disable-next-line @typescript-eslint/await-thenable
-        const [final, _] = await run(initVal, xs);
+        const [final, ys] = await run(initVal, xs);
 
         expect((await final.data())[0]).toBe(5);
+        final.dispose();
+        ys.dispose();
         run.dispose();
       }
 
@@ -89,7 +93,7 @@ describe("lax.scan backend coverage", () => {
           const step = (c: np.Array, x: np.Array): [np.Array, np.Array] => {
             return [np.add(c, x), c];
           };
-          const initVal = np.zeros([1]);
+          using initVal = np.zeros([1]);
           const [final, _] = lax.scan(step, initVal, xs);
           return np.sum(final);
         };

@@ -97,11 +97,11 @@ describe("lax.scan", () => {
       using xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
 
       const [finalCarry, outputs] = lax.scan(step, initVal, xs);
-      using _finalCarry = finalCarry;
-      using _outputs = outputs;
 
       expect(finalCarry).toBeAllclose([15.0]);
       expect(outputs).toBeAllclose([[1], [3], [6], [10], [15]]);
+      finalCarry.dispose();
+      outputs.dispose();
     });
 
     it("computes factorial-like recurrence", () => {
@@ -114,11 +114,11 @@ describe("lax.scan", () => {
       using ts = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
 
       const [final, outputs] = lax.scan(step, initVal, ts);
-      using _final = final;
-      using _outputs = outputs;
 
       expect(final).toBeAllclose([120.0]);
       expect(outputs).toBeAllclose([[1], [2], [6], [24], [120]]);
+      final.dispose();
+      outputs.dispose();
     });
 
     it("handles length-0 scans with xs array (returns init and empty ys)", () => {
@@ -131,11 +131,11 @@ describe("lax.scan", () => {
       using xs = np.zeros([0, 1]);
 
       const [final, outputs] = lax.scan(step, initVal, xs);
-      using _final = final;
-      using _outputs = outputs;
 
       expect(final).toBeAllclose([42.0]);
       expect(outputs.shape).toEqual([0, 1]);
+      final.dispose();
+      outputs.dispose();
     });
 
     it("handles xs=null length-0 scans with explicit length (returns init and empty ys)", () => {
@@ -146,11 +146,11 @@ describe("lax.scan", () => {
       using initVal = np.array([7.0]);
 
       const [final, outputs] = lax.scan(step, initVal, null, { length: 0 });
-      using _final = final;
-      using _outputs = outputs;
 
       expect(final).toBeAllclose([7.0]);
       expect(outputs.shape).toEqual([0, 1]);
+      final.dispose();
+      outputs.dispose();
     });
 
     it("length-0 scan with pytree Y returns empty per-leaf arrays", () => {
@@ -168,14 +168,13 @@ describe("lax.scan", () => {
       using xs = np.zeros([0, 1]);
 
       const [final, ys] = lax.scan(step, initVal, xs);
-      using _final = final;
-      expect(final).toBeAllclose([3.0]);
 
+      expect(final).toBeAllclose([3.0]);
       expect(ys).not.toBeNull();
       expect(ys.a.shape[0]).toBe(0);
       expect(ys.b.shape[0]).toBe(0);
-      ys.a.dispose();
-      ys.b.dispose();
+      final.dispose();
+      tree.dispose(ys);
     });
 
     it("length-0 scan with Y=null returns null", () => {
@@ -188,9 +187,11 @@ describe("lax.scan", () => {
       using xs = np.zeros([0, 1]);
 
       const [final, ys] = lax.scan(step, initVal, xs);
-      using _final = final;
+
       expect(final).toBeAllclose([5.0]);
       expect(ys).toBeNull();
+      final.dispose();
+      tree.dispose(ys);
     });
   });
 
@@ -209,7 +210,6 @@ describe("lax.scan", () => {
       using xs = np.array([[2.0], [4.0], [6.0], [8.0]]);
 
       const [final, runningMeans] = lax.scan(step, initVal, xs);
-      using _runningMeans = runningMeans;
 
       expect(final.sum).toBeAllclose([20.0]);
       expect(final.count).toBeAllclose([4.0]);
@@ -217,8 +217,8 @@ describe("lax.scan", () => {
       expect(runningMeans).toBeAllclose([[2], [3], [4], [5]]);
       initVal.sum.dispose();
       initVal.count.dispose();
-      final.sum.dispose();
-      final.count.dispose();
+      tree.dispose(final);
+      runningMeans.dispose();
     });
   });
 
@@ -241,13 +241,13 @@ describe("lax.scan", () => {
       };
 
       const [final, _outputs] = lax.scan(step, initVal, xs);
-      using _final = final;
-      using __outputs = _outputs;
 
       // (1+10) + (2+20) + (3+30) = 11 + 22 + 33 = 66
       expect(final).toBeAllclose([66.0]);
       xs.a.dispose();
       xs.b.dispose();
+      final.dispose();
+      _outputs.dispose();
     });
   });
 });
@@ -273,11 +273,11 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     using xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
 
     const [finalCarry, outputs] = lax.scan(step, initCarry, xs);
-    using _finalCarry = finalCarry;
-    using _outputs = outputs;
 
     expect(finalCarry).toBeAllclose([15.0]);
     expect(outputs).toBeAllclose([[1], [3], [6], [10], [15]]);
+    finalCarry.dispose();
+    outputs.dispose();
   });
 
   test("jit + scan", () => {
@@ -290,11 +290,11 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     using xs = np.array([[1.0], [2.0], [3.0]]);
 
     const [finalCarry, outputs] = lax.scan(step, initCarry, xs);
-    using _finalCarry = finalCarry;
-    using _outputs = outputs;
 
     expect(finalCarry).toBeAllclose([6.0]);
     expect(outputs).toBeAllclose([[1], [3], [6]]);
+    finalCarry.dispose();
+    outputs.dispose();
   });
 
   test("pytree carry with multiple arrays", () => {
@@ -310,15 +310,14 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     using xs = np.array([[2.0], [3.0], [4.0]]);
 
     const [final, outputs] = lax.scan(step, initCarry, xs);
-    using _outputs = outputs;
 
     expect(final.sum).toBeAllclose([9.0]); // 2+3+4
     expect(final.product).toBeAllclose([24.0]); // 2*3*4
     expect(outputs).toBeAllclose([[2], [5], [9]]);
     initCarry.sum.dispose();
     initCarry.product.dispose();
-    final.sum.dispose();
-    final.product.dispose();
+    tree.dispose(final);
+    outputs.dispose();
   });
 
   test("larger iteration count", () => {
@@ -332,10 +331,10 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     using xs = np.ones([n, 1]);
 
     const [finalCarry, _outputs] = lax.scan(step, initCarry, xs);
-    using _finalCarry = finalCarry;
-    using __outputs = _outputs;
 
     expect(finalCarry).toBeAllclose([n]);
+    finalCarry.dispose();
+    _outputs.dispose();
   });
 
   test("elementwise ops in scan body", async () => {
@@ -488,10 +487,8 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const finalStateData = await finalCarry.state.data();
       expect(Math.abs(finalStateData[0])).toBeGreaterThan(0.1);
 
-      finalCarry.state.dispose();
-      finalCarry.cov.dispose();
-      outputs.pred.dispose();
-      outputs.innovation.dispose();
+      tree.dispose(finalCarry);
+      tree.dispose(outputs);
     });
 
     test("with reduction (dot product accumulation)", () => {
@@ -509,11 +506,11 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       ]);
 
       const [finalCarry, outputs] = lax.scan(step, initCarry, xs);
-      using _finalCarry = finalCarry;
-      using _outputs = outputs;
 
       expect(finalCarry).toBeAllclose([24.0]);
       expect(outputs).toBeAllclose([[10], [20], [24]]);
+      finalCarry.dispose();
+      outputs.dispose();
     });
   });
 
@@ -530,13 +527,13 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const [finalCarry, outputs] = lax.scan(step, initCarry, xs, {
         reverse: true,
       });
-      using _finalCarry = finalCarry;
-      using _outputs = outputs;
 
       expect(finalCarry).toBeAllclose([6.0]);
       // Reverse: processes xs[2]=3, xs[1]=2, xs[0]=1
       // outputs[2]=3, outputs[1]=5, outputs[0]=6
       expect(outputs).toBeAllclose([[6], [5], [3]]);
+      finalCarry.dispose();
+      outputs.dispose();
     });
   });
 
@@ -553,11 +550,11 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const [finalCarry, outputs] = lax.scan(step, initCarry, null, {
         length: 5,
       });
-      using _finalCarry = finalCarry;
-      using _outputs = outputs;
 
       expect(finalCarry).toBeAllclose([5.0]);
       expect(outputs).toBeAllclose([[0], [1], [2], [3], [4]]);
+      finalCarry.dispose();
+      outputs.dispose();
     });
 
     test("generates fibonacci sequence", async () => {
@@ -631,12 +628,12 @@ suite.each(devices)("lax.scan device:%s", (device) => {
         length: 5,
         reverse: true,
       });
-      using _finalCarry = finalCarry;
-      using _outputs = outputs;
 
       expect(finalCarry).toBeAllclose([5.0]);
       // Reverse: outputs = [4, 3, 2, 1, 0] (carry values in reverse stacking order)
       expect(outputs).toBeAllclose([[4], [3], [2], [1], [0]]);
+      finalCarry.dispose();
+      outputs.dispose();
     });
 
     test("with pytree carry", async () => {
@@ -664,8 +661,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       expect(Array.from(outputData)).toEqual([0, 1, 3, 6, 10]);
       initCarry.a.dispose();
       initCarry.b.dispose();
-      finalCarry.a.dispose();
-      finalCarry.b.dispose();
+      tree.dispose(finalCarry);
       outputs.dispose();
     });
   });
@@ -685,6 +681,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       expect(data[0]).toBeCloseTo(5.0);
       expect(ys).toBeNull();
       finalCarry.dispose();
+      tree.dispose(ys);
     });
 
     test("Y=null with jit", () => {
@@ -721,6 +718,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       expect(data[0]).toBeCloseTo(15.0);
       expect(ys).toBeNull();
       finalCarry.dispose();
+      tree.dispose(ys);
     });
 
     test("Y=null with pytree carry", async () => {
@@ -744,8 +742,8 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       expect(ys).toBeNull();
       initVal.sum.dispose();
       initVal.count.dispose();
-      finalCarry.sum.dispose();
-      finalCarry.count.dispose();
+      tree.dispose(finalCarry);
+      tree.dispose(ys);
     });
   });
 
@@ -761,11 +759,11 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       using initVal = np.array([0.0]);
 
       const [finalCarry, outputs] = lax.scan(step, initVal, xs);
-      using _finalCarry = finalCarry;
-      using _outputs = outputs;
 
       expect(finalCarry).toBeAllclose([9.0]); // 2 + 3 + 4
       expect(outputs).toBeAllclose([[2], [5], [9]]); // cumsum of [2,3,4]
+      finalCarry.dispose();
+      outputs.dispose();
     });
 
     it("scan over transposed xs", () => {
@@ -783,14 +781,14 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       using initVal = np.zeros([3]);
 
       const [finalCarry, outputs] = lax.scan(step, initVal, xs);
-      using _finalCarry = finalCarry;
-      using _outputs = outputs;
 
       expect(finalCarry).toBeAllclose([3, 7, 11]);
       expect(outputs).toBeAllclose([
         [1, 3, 5],
         [3, 7, 11],
       ]);
+      finalCarry.dispose();
+      outputs.dispose();
     });
 
     it("jit(scan) over sliced xs", () => {
@@ -840,11 +838,11 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       using initVal = np.array([0.0]);
 
       const [finalCarry, outputs] = lax.scan(step, initVal, xs);
-      using _finalCarry = finalCarry;
-      using _outputs = outputs;
 
       expect(finalCarry).toBeAllclose([78.0]);
       expect(outputs).toBeAllclose([[21.0], [78.0]]);
+      finalCarry.dispose();
+      outputs.dispose();
     });
   });
 
@@ -1250,8 +1248,7 @@ describe("jit(scan) DLM patterns", () => {
     expect(outputs.shape).toEqual([5, 1]);
     initCarry.state.dispose();
     initCarry.P.dispose();
-    finalCarry.state.dispose();
-    finalCarry.P.dispose();
+    tree.dispose(finalCarry);
     outputs.dispose();
   });
 
@@ -1268,8 +1265,6 @@ describe("jit(scan) DLM patterns", () => {
     using xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
     using initFwd = np.array([0.0]);
     const [_fwdFinal, fwdOutputs] = lax.scan(forwardStep, initFwd, xs);
-    using __fwdFinal = _fwdFinal;
-    using _fwdOutputs = fwdOutputs;
 
     // Reverse pass: use forward outputs as input, accumulate backwards
     const reverseStep = (
@@ -1284,12 +1279,14 @@ describe("jit(scan) DLM patterns", () => {
     const [revFinal, _revOutputs] = lax.scan(reverseStep, initRev, fwdOutputs, {
       reverse: true,
     });
-    using __revOutputs = _revOutputs;
 
     const revData = await revFinal.data();
     // Sum of cumulative sums = 1 + 3 + 6 + 10 + 15 = 35
     expect(revData[0]).toBeCloseTo(35.0);
     revFinal.dispose();
+    _fwdFinal.dispose();
+    fwdOutputs.dispose();
+    _revOutputs.dispose();
   });
 
   test("scan with pytree carry + output + slicing", async () => {
@@ -1781,11 +1778,11 @@ describe("native scan paths (P2+)", () => {
     const [finalCarry, _outputs] = lax.scan(step, initCarry, xs, {
       acceptPath: ["compiled-loop", "preencoded-routine"],
     });
-    using _finalCarry = finalCarry;
-    using __outputs = _outputs;
 
     using _expected = np.full([size], 10.0);
     expect(finalCarry).toBeAllclose(_expected);
+    finalCarry.dispose();
+    _outputs.dispose();
   });
 
   test("native scan with constants", () => {
@@ -1805,11 +1802,11 @@ describe("native scan paths (P2+)", () => {
     const [finalCarry, outputs] = lax.scan(step, initCarry, xs, {
       acceptPath: ["compiled-loop", "preencoded-routine"],
     });
-    using _finalCarry = finalCarry;
-    using _outputs = outputs;
 
     expect(finalCarry).toBeAllclose([15.0]);
     expect(outputs).toBeAllclose([[3], [8], [15]]);
+    finalCarry.dispose();
+    outputs.dispose();
   });
 
   test("native scan with reduction in body", () => {
@@ -1829,11 +1826,11 @@ describe("native scan paths (P2+)", () => {
     const [finalCarry, outputs] = lax.scan(step, initCarry, xs, {
       acceptPath: ["compiled-loop", "preencoded-routine"],
     });
-    using _finalCarry = finalCarry;
-    using _outputs = outputs;
 
     expect(finalCarry).toBeAllclose([24.0]);
     expect(outputs).toBeAllclose([[10], [20], [24]]);
+    finalCarry.dispose();
+    outputs.dispose();
   });
 
   test("large native scan (many iterations)", () => {
@@ -1849,11 +1846,11 @@ describe("native scan paths (P2+)", () => {
     const [finalCarry, _] = lax.scan(step, initCarry, xs, {
       acceptPath: ["compiled-loop", "preencoded-routine"],
     });
-    using _finalCarry = finalCarry;
-    using __ = _;
 
     using _expectedLarge = np.full([64], n);
     expect(finalCarry).toBeAllclose(_expectedLarge);
+    finalCarry.dispose();
+    _.dispose();
   });
 
   test("routine body: matmul in native scan", () => {
@@ -1872,11 +1869,11 @@ describe("native scan paths (P2+)", () => {
     const [finalCarry, _] = lax.scan(step, initCarry, xs, {
       acceptPath: ["compiled-loop", "preencoded-routine"],
     });
-    using _finalCarry = finalCarry;
-    using __ = _;
 
     using _e3 = np.eye(4);
     using _expectedMatmul = _e3.mul(6);
     expect(finalCarry).toBeAllclose(_expectedMatmul);
+    finalCarry.dispose();
+    _.dispose();
   });
 });

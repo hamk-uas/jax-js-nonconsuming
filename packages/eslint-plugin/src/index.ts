@@ -77,6 +77,26 @@ const strict: Linter.Config = {
 };
 
 /**
+ * Invariance config — enforces ownership patterns that should behave the same
+ * in eager mode and inside `jit()` bodies.
+ *
+ * Use this for user code when you want explicit eager/JIT semantic invariance
+ * gates in CI.
+ */
+const invariance: Linter.Config = {
+  plugins: { "jax-js": plugin },
+  rules: {
+    "jax-js/require-using": "error",
+    "jax-js/no-use-after-dispose": "error",
+    "jax-js/no-dispose-then-reassign-param": "error",
+    "jax-js/no-make-disposable-alias": "error",
+    "jax-js/no-unnecessary-ref": "error",
+    "jax-js/no-array-chain": "error",
+    "jax-js/require-scan-result-dispose": "error",
+  },
+};
+
+/**
  * Internal transform-ownership config — high-signal checks for wrapper/retention
  * symmetry in framework internals (e.g. transform plumbing).
  */
@@ -92,7 +112,12 @@ const internalTransforms: Linter.Config = {
 // Attach configs to plugin object for flat-config consumers:
 //   import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
 //   export default [ jaxJs.configs.recommended, ... ];
-(plugin as any).configs = { recommended, strict, internalTransforms };
+(plugin as any).configs = {
+  recommended,
+  strict,
+  invariance,
+  internalTransforms,
+};
 
 export default plugin;
-export { recommended, strict, internalTransforms };
+export { recommended, strict, invariance, internalTransforms };

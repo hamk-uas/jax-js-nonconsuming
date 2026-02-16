@@ -41,6 +41,7 @@ suite("refCount property", () => {
   test("refCount increments after .ref", () => {
     const x = np.array([1, 2, 3]);
     expect(x.refCount).toBe(1);
+    // jax-js-lint: allow-ref — intentional test of refCount increment
     const y = x.ref;
     expect(x.refCount).toBe(2);
     expect(y.refCount).toBe(2); // same array

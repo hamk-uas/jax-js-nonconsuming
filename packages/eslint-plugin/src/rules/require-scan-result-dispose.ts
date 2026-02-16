@@ -186,6 +186,21 @@ function isIgnoredBindingName(name: string): boolean {
   return name.startsWith("_");
 }
 
+/**
+ * Detect `using _alias = scanOutput;` or `using _alias = scanOutput.member;`
+ * pattern — a valid ownership handoff via `using` declaration.
+ */
+function hasUsingAliasOfIdentifier(node: any, idName: string): boolean {
+  if (node?.type !== "VariableDeclaration" || node.kind !== "using") {
+    return false;
+  }
+  for (const decl of node.declarations as any[]) {
+    if (!decl.init) continue;
+    if (usesIdentifier(decl.init, idName)) return true;
+  }
+  return false;
+}
+
 function hasReturnOrDisposeAfterDeclaration(
   declStmt: any,
   idName: string,
@@ -202,6 +217,7 @@ function hasReturnOrDisposeAfterDeclaration(
     if (hasMakeDisposableHandoffForIdentifier(statements[i], idName)) {
       return true;
     }
+    if (hasUsingAliasOfIdentifier(statements[i], idName)) return true;
   }
 
   return false;

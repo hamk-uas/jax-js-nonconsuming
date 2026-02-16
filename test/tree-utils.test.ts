@@ -5,8 +5,8 @@ import { expect, suite, test } from "vitest";
 
 suite("tree.dispose", () => {
   test("disposes all arrays in a flat object", () => {
-    const a = np.array([1, 2]);
-    const b = np.array([3, 4]);
+    using a = np.array([1, 2]);
+    using b = np.array([3, 4]);
     const obj = { a, b };
     tree.dispose(obj);
     expect(a.refCount).toBe(0);
@@ -14,9 +14,9 @@ suite("tree.dispose", () => {
   });
 
   test("disposes nested tree of arrays", () => {
-    const a = np.array([1]);
-    const b = np.array([2]);
-    const c = np.array([3]);
+    using a = np.array([1]);
+    using b = np.array([2]);
+    using c = np.array([3]);
     const nested = { carry: { a, b }, output: [c] };
     tree.dispose(nested);
     expect(a.refCount).toBe(0);
@@ -30,7 +30,7 @@ suite("tree.dispose", () => {
   });
 
   test("handles aliased leaves without double-dispose", () => {
-    const base = np.add(np.array([1.0]), np.array([2.0]));
+    using base = np.add(np.array([1.0]), np.array([2.0]));
     const aliased = { xf_0: base, yhat: base };
 
     expect(() => tree.dispose(aliased)).not.toThrow();
@@ -40,8 +40,8 @@ suite("tree.dispose", () => {
 
 suite("tree.makeDisposable", () => {
   test("returns same object with Symbol.dispose", () => {
-    const a = np.array([1, 2]);
-    const b = np.array([3, 4]);
+    using a = np.array([1, 2]);
+    using b = np.array([3, 4]);
     const obj = tree.makeDisposable({ a, b });
     expect(obj.a).toBe(a);
     expect(obj.b).toBe(b);
@@ -66,8 +66,8 @@ suite("tree.makeDisposable", () => {
   });
 
   test("works with scan-like tuple result", () => {
-    const carry = np.array([10]);
-    const ys = np.array([1, 2, 3]);
+    using carry = np.array([10]);
+    using ys = np.array([1, 2, 3]);
     {
       using result = tree.makeDisposable([carry, ys]);
       expect(result[0].js()).toEqual([10]);
@@ -78,7 +78,8 @@ suite("tree.makeDisposable", () => {
   });
 
   test("works with aliased object result", () => {
-    const base = np.add(np.array([1.0]), np.array([2.0]));
+    using base = np.add(np.array([1.0]), np.array([2.0]));
+    // eslint-disable-next-line jax-js/no-make-disposable-alias
     const result = tree.makeDisposable({ xf_0: base, yhat: base });
 
     expect(() => result[Symbol.dispose]()).not.toThrow();
@@ -88,14 +89,14 @@ suite("tree.makeDisposable", () => {
 
 suite("Array.consumeData", () => {
   test("consumeData returns data and disposes", async () => {
-    const x = np.array([1, 2, 3]);
+    using x = np.array([1, 2, 3]);
     const data = await x.consumeData();
     expect([...data]).toEqual([1, 2, 3]);
     expect(x.refCount).toBe(0);
   });
 
   test("consumeDataSync returns data and disposes", () => {
-    const x = np.array([4, 5, 6]);
+    using x = np.array([4, 5, 6]);
     const data = x.consumeDataSync();
     expect([...data]).toEqual([4, 5, 6]);
     expect(x.refCount).toBe(0);

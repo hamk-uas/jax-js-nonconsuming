@@ -12,20 +12,18 @@
  *   pnpm build && deno test --no-check --unstable-webgpu --allow-read --allow-env test/deno/pool-memory.test.ts
  */
 
-import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import { assert } from "https://deno.land/std@0.224.0/assert/mod.ts";
 
-import {
-  init,
-  defaultDevice,
-  numpy as np,
-  lax,
-  jit,
-  getBackend,
-  blockUntilReady,
-} from "../../dist/index.js";
-
 import { withLeakCheck } from "./harness.ts";
+import {
+  blockUntilReady,
+  defaultDevice,
+  getBackend,
+  init,
+  jit,
+  lax,
+  numpy as np,
+} from "../../dist/index.js";
 
 // Check if WebGPU is available
 const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
@@ -45,7 +43,7 @@ function getSlotCount(): number {
   return backend.slotCount();
 }
 
-async function measurePeakGpuBytesDuring(
+async function _measurePeakGpuBytesDuring(
   run: () => Promise<void>,
 ): Promise<{ baseline: number; peak: number; delta: number; end: number }> {
   const backend = getBackend() as any;
