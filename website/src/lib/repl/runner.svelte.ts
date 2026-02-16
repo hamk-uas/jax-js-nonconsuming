@@ -287,9 +287,14 @@ async function _runProgram(
     const map = output[0].map;
     generatedSourceMap = map as SourceMapLike;
     if (map && map.mappings) {
-      // Prepend one ";" to shift all mappings down by 1 generated line,
-      // accounting for the single-line header.
-      map.mappings = ";" + map.mappings;
+      // Prepend ";;;" to shift all mappings down by 3 generated lines:
+      //   +2 lines for the AsyncFunction wrapper that V8 adds
+      //      (line 1: `async function anonymous(_MODULES,_BUILTINS`, line 2: `) {`)
+      //   +1 line for the single-line header we prepend to bundledCode
+      // V8 reports Error.stack positions relative to the full AsyncFunction
+      // source (including the wrapper lines), so the source map must account
+      // for all 3 extra lines before the Rollup output begins.
+      map.mappings = ";;;" + map.mappings;
     }
 
     const bundledCode =

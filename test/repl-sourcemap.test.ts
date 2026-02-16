@@ -186,32 +186,34 @@ describe("parseLeakMarkers", () => {
 // ---------------------------------------------------------------------------
 describe("realistic REPL scenario", () => {
   // User writes 3 lines of TypeScript.
-  // After TS → Rollup system-format → header, the generated bundle is:
-  //   line 1:  ;                                (header—no mapping)
-  //   line 2:  System.register(["jax"], ...)    (boilerplate)
-  //   line 3:    var np;                        (boilerplate)
-  //   line 4:    return { execute: async ... {  (boilerplate)
-  //   line 5:      const x = np.array([1,2,3]);  ← user line 2
-  //   line 6:      console.log(await x.data());   ← user line 3
-  //   line 7:    }};                            (boilerplate)
+  // After TS → Rollup system-format → AsyncFunction + header, V8 sees:
+  //   line 1:  async function anonymous(_MODULES, _BUILTINS  (AsyncFunction wrapper)
+  //   line 2:  ) {                              (AsyncFunction wrapper)
+  //   line 3:  <header>                         (no mapping)
+  //   line 4:  System.register(["jax"], ...)    (boilerplate)
+  //   line 5:    var np;                        (boilerplate)
+  //   line 6:    return { execute: async ... {  (boilerplate)
+  //   line 7:      const x = np.array([1,2,3]);  ← user line 2
+  //   line 8:      console.log(await x.data());   ← user line 3
+  //   line 9:    }};                            (boilerplate)
   //
-  // Source map (with leading ";" for the header, ";;;" for boilerplate):
-  //   ;;;;IACA;IACA
-  //   Line 5: IACA = genCol+4, src+0, srcLine+1, srcCol+0  → src line 2, col 1
-  //   Line 6: IACA = genCol+4, src+0, srcLine+1, srcCol+0  → src line 3, col 1
-  const replMap = { mappings: ";;;;IACA;IACA" };
+  // Source map (";;;" for AsyncFunction + header, ";;;" for boilerplate):
+  //   ;;;;;;IACA;IACA
+  //   Line 7: IACA = genCol+4, src+0, srcLine+1, srcCol+0  → src line 2, col 1
+  //   Line 8: IACA = genCol+4, src+0, srcLine+1, srcCol+0  → src line 3, col 1
+  const replMap = { mappings: ";;;;;;IACA;IACA" };
 
   test("checkLeaks detail is remapped to user source line", () => {
-    // V8 reports the generated position (line 5, col 5 for the np.array call)
-    const detail = "Array:float32[3] rc=1 created at index.ts:5:5";
+    // V8 reports the generated position (line 7, col 5 for the np.array call)
+    const detail = "Array:float32[3] rc=1 created at index.ts:7:5";
     const remapped = remapReplLocationText(detail, replMap);
     expect(remapped).toBe("Array:float32[3] rc=1 created at index.ts:2:1");
   });
 
   test("full pipeline: remap then parse markers", () => {
     const rawDetails = [
-      "Array:float32[3] rc=1 created at index.ts:5:5",
-      "Array:float32[3] rc=1 created at index.ts:6:5",
+      "Array:float32[3] rc=1 created at index.ts:7:5",
+      "Array:float32[3] rc=1 created at index.ts:8:5",
     ];
     const remapped = remapLeakDetails(rawDetails, replMap);
     expect(remapped).toEqual([
@@ -234,7 +236,7 @@ describe("realistic REPL scenario", () => {
   });
 
   test("boilerplate lines return null (no marker created)", () => {
-    // Line 2 is boilerplate — no source mapping
+    // Line 2 is AsyncFunction wrapper — no source mapping
     const detail = "something at index.ts:2:1";
     const remapped = remapReplLocationText(detail, replMap);
     // No mapping found → position is left unchanged
@@ -285,10 +287,10 @@ describe("TS transpile source map coverage", () => {
     expect(pos!.line).toBe(3);
   });
 
-  test("ESNext + header: np.array at gen line 3 maps to original line 2", () => {
-    // REPL prepends ";" for header → shift all mappings by 1 generated line
-    const adjusted = { mappings: ";" + esnextMap.mappings };
-    const pos = mapGeneratedPositionToSource(adjusted, 3, 1);
+  test("ESNext + AsyncFunction + header: np.array at gen line 5 maps to original line 2", () => {
+    // REPL prepends ";;;" (2 for AsyncFunction wrapper + 1 for header)
+    const adjusted = { mappings: ";;;" + esnextMap.mappings };
+    const pos = mapGeneratedPositionToSource(adjusted, 5, 1);
     expect(pos).not.toBeNull();
     expect(pos!.line).toBe(2);
   });
