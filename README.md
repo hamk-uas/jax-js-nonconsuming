@@ -521,6 +521,15 @@ and demos work the same way. Mandelbrot has been updated with `scan` though.
 
 The non-consuming model makes some things easier and other things harder. Here are the real costs:
 
+**Important context: JIT neutralizes most intermediate-lifetime differences.** Under `jit()`, both
+ownership models compile to the same Jaxpr graph, and the compiler derives buffer lifetimes from
+that graph — not from the ownership model. Intermediates are freed at their exact last use, buffers
+are recycled, and peak memory is identical regardless of which model you use. The tradeoffs below
+apply primarily to **eager mode** — the mode you use for debugging, prototyping, and the REPL.
+Production hot paths should be JIT-wrapped anyway for performance (kernel fusion), which narrows the
+practical ownership-model gap to JIT boundaries (who disposes inputs, outputs, and the `jit`
+function itself) and any code that runs outside `jit()`.
+
 **Silent leaks replace noisy crashes.** Move semantics crash immediately (`UseAfterFreeError`) when
 you forget `.ref` — painful, but the error points straight at the bug. The non-consuming model never
 crashes from reuse, but a forgotten `.dispose()` leaks GPU memory silently. You may not notice until
@@ -533,9 +542,9 @@ fail-fast default makes those cases rarer in practice.)
 intermediate arrays that linger until GC or explicit disposal. With move semantics, each
 intermediate is freed as soon as the next operation consumes it. In the non-consuming model, all
 intermediates stay alive simultaneously — for large tensors this can significantly increase peak
-memory (the exact factor depends on chain length and tensor size). `jit()` solves this (it tracks
-last-use and frees at the optimal point), but the problem is real in eager mode — the exact mode you
-use for debugging.
+memory (the exact factor depends on chain length and tensor size). Under `jit()`, both models free
+intermediates at the optimal point — this is purely an eager-mode difference. But eager mode is
+where you debug, and debugging with 3× the memory footprint is a real obstacle.
 
 **JavaScript GC doesn't know about GPU memory.** The JS garbage collector tracks JS heap pressure,
 not the 4 GB of VRAM on your GPU. A leaked 512×512 `f32` buffer is 1 MB of GPU memory but only ~64
@@ -544,10 +553,11 @@ This problem affects both ownership models — any jax-js program must eventuall
 explicitly. The non-consuming model simply makes it easier to forget, because nothing crashes when
 you do.
 
-**Method chains become a pain point.** `a.mul(b).add(c).div(d)` is natural in NumPy. In the
-non-consuming model, each `.method()` allocates a new GPU buffer that nobody frees. You need `using`
-declarations (which require separate statements) or explicit `.dispose()`. This makes fluent API
-style impractical for large tensors:
+**Method chains become a pain point in eager mode.** `a.mul(b).add(c).div(d)` is natural in NumPy.
+In the non-consuming model, each `.method()` allocates a new GPU buffer that nobody frees. You need
+`using` declarations (which require separate statements) or explicit `.dispose()`. Under `jit()`,
+these chains produce tracers (not real GPU buffers) and the compiler manages everything — so the
+problem only appears in eager code. Still, eager code is where you prototype and learn the API:
 
 ```ts
 // ❌ Leaks two intermediate GPU buffers in eager mode:
@@ -557,6 +567,8 @@ const result = a.mul(b).add(c).div(d);
 using t1 = a.mul(b);
 using t2 = t1.add(c);
 const result = t2.div(d);
+
+// Under jit(), the first form is fine — intermediates are tracers, not real buffers.
 ```
 
 **`using` has ecosystem gaps.** The TC39 Explicit Resource Management proposal is not yet supported
@@ -571,9 +583,10 @@ between — because the language itself won't tell you when you forgot `.dispose
 
 **Neither model is free.** Move semantics pay with `UseAfterFreeError` bugs, `.ref` boilerplate, and
 their own leak surfaces (over-ref, retained refs). The non-consuming model pays with silent leaks,
-higher eager-mode memory, and heavier reliance on tooling. Both models need discipline; they just
-fail in different ways. This fork bets that silent-leak-plus-tooling is easier to manage for teams
-coming from Python/MATLAB — but it is a genuine tradeoff, not a free lunch.
+higher eager-mode memory, and heavier reliance on tooling. Under `jit()`, the two models converge —
+the compiled programs are identical. Both models need discipline; they just fail in different ways.
+This fork bets that silent-leak-plus-tooling is easier to manage for teams coming from Python/MATLAB
+— but it is a genuine tradeoff, not a free lunch.
 
 ### Which version should I use?
 
