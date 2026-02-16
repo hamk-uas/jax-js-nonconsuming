@@ -12,9 +12,16 @@ function mandelbrotIteration(
 ) {
   using Asq = A.mul(A);
   using Bsq = B.mul(B);
-  V = V.add(Asq.add(Bsq).less(100).astype(np.float32));
-  const A2 = np.clip(Asq.sub(Bsq).add(X), -50, 50);
-  const B2 = np.clip(A.mul(B).mul(2).add(Y), -50, 50);
+  using magSq = Asq.add(Bsq);
+  using mask = magSq.less(100).astype(np.float32);
+  V = V.add(mask);
+  using diffSq = Asq.sub(Bsq);
+  using realShifted = diffSq.add(X);
+  const A2 = np.clip(realShifted, -50, 50);
+  using cross = A.mul(B);
+  using crossScaled = cross.mul(2);
+  using imagShifted = crossScaled.add(Y);
+  const B2 = np.clip(imagShifted, -50, 50);
   return [A2, B2, V];
 }
 
@@ -97,9 +104,16 @@ export function calculateMandelbrotScan(iters: number): np.Array {
         const { A, B, V } = carry;
         using Asq = A.mul(A);
         using Bsq = B.mul(B);
-        const newV = V.add(Asq.add(Bsq).less(100).astype(np.float32));
-        const newA = np.clip(Asq.sub(Bsq).add(X), -50, 50);
-        const newB = np.clip(A.mul(B).mul(2).add(Y), -50, 50);
+        using magSq = Asq.add(Bsq);
+        using mask = magSq.less(100).astype(np.float32);
+        const newV = V.add(mask);
+        using diffSq = Asq.sub(Bsq);
+        using realShifted = diffSq.add(X);
+        const newA = np.clip(realShifted, -50, 50);
+        using cross = A.mul(B);
+        using crossScaled = cross.mul(2);
+        using imagShifted = crossScaled.add(Y);
+        const newB = np.clip(imagShifted, -50, 50);
         return [{ A: newA, B: newB, V: newV }, null];
       };
 

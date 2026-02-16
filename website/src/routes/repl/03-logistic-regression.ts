@@ -27,8 +27,14 @@ const y = (() => {
 using lossFn = jit((w: np.Array) => {
   using logits = np.dot(X, w);
   using logP = nn.logSigmoid(logits);
-  using logNotP = nn.logSigmoid(np.negative(logits));
-  const loss = np.add(y.mul(logP), np.subtract(1, y).mul(logNotP)).mean().neg();
+  using negLogits = np.negative(logits);
+  using logNotP = nn.logSigmoid(negLogits);
+  using yLogP = y.mul(logP);
+  using oneMinusY = np.subtract(1, y);
+  using yBarLogNotP = oneMinusY.mul(logNotP);
+  using sumTerms = np.add(yLogP, yBarLogNotP);
+  using meanTerms = sumTerms.mean();
+  const loss = meanTerms.neg();
   return loss;
 });
 

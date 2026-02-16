@@ -87,11 +87,17 @@ export function runMobileCLIPTextEncoder(
     old.dispose();
   }
 
-  using finalFeatures = x.slice(np.argmax(textTokens, -1));
-  using output = np.dot(textProjection.transpose(), finalFeatures); // [D_out]
+  using argmaxIdx = np.argmax(textTokens, -1);
+  using finalFeatures = x.slice(argmaxIdx);
+  using projT = textProjection.transpose();
+  using output = np.dot(projT, finalFeatures); // [D_out]
 
   // Normalize output to be a unit vector
-  return output.div(np.sqrt(np.sum(np.square(output))).add(1e-3));
+  using sq = np.square(output);
+  using sumSq = np.sum(sq);
+  using norm = np.sqrt(sumSq);
+  using normEps = norm.add(1e-3);
+  return output.div(normEps);
 }
 
 export type MobileCLIPTextBlock = {
@@ -155,13 +161,11 @@ export function runMultiHeadAttention(
   using qkv = runLinear(qkvProj, x); // [seqLen, 3 * embed]
   const [q, k, v] = np.split(qkv, 3, -1);
 
-  using output = nn
-    .dotProductAttention(
-      q.reshape([seqLen, numHeads, headDim]),
-      k.reshape([seqLen, numHeads, headDim]),
-      v.reshape([seqLen, numHeads, headDim]),
-    )
-    .reshape([seqLen, embed]);
+  using qR = q.reshape([seqLen, numHeads, headDim]);
+  using kR = k.reshape([seqLen, numHeads, headDim]);
+  using vR = v.reshape([seqLen, numHeads, headDim]);
+  using attnResult = nn.dotProductAttention(qR, kR, vR);
+  using output = attnResult.reshape([seqLen, embed]);
   q.dispose();
   k.dispose();
   v.dispose();
@@ -176,7 +180,9 @@ export type Linear = {
 };
 
 export function runLinear({ weight, bias }: Linear, x: np.Array): np.Array {
-  return np.dot(x, weight.transpose()).add(bias);
+  using wT = weight.transpose();
+  using dot = np.dot(x, wT);
+  return dot.add(bias);
 }
 
 export type LayerNorm = {
@@ -196,13 +202,11 @@ export function runLayerNorm(
     x = old.sub(avg);
     old.dispose();
   }
-  using denom = np
-    .sqrt(
-      np
-        .square(x)
-        .mul(1 / dimSize)
-        .sum(-1, { keepdims: true }),
-    )
-    .add(1e-5);
-  return x.div(denom).mul(weight).add(bias);
+  using sq = np.square(x);
+  using variance = sq.mul(1 / dimSize).sum(-1, { keepdims: true });
+  using stddev = np.sqrt(variance);
+  using denom = stddev.add(1e-5);
+  using normalized = x.div(denom);
+  using scaled = normalized.mul(weight);
+  return scaled.add(bias);
 }

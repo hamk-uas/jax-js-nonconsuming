@@ -45,12 +45,15 @@ export const MLP: ModelType = {
   },
 
   predict: jit((params: Params, x: np.Array): np.Array => {
-    x = x.reshape([-1, 784]);
-    const z1 = np.dot(x, params.w1).add(params.b1);
-    const a1 = nn.relu(z1);
-    const z2 = np.dot(a1, params.w2).add(params.b2);
-    const a2 = nn.relu(z2);
-    const z3 = np.dot(a2, params.w3).add(params.b3);
+    using xFlat = x.reshape([-1, 784]);
+    using z1dot = np.dot(xFlat, params.w1);
+    using z1 = z1dot.add(params.b1);
+    using a1 = nn.relu(z1);
+    using z2dot = np.dot(a1, params.w2);
+    using z2 = z2dot.add(params.b2);
+    using a2 = nn.relu(z2);
+    using z3dot = np.dot(a2, params.w3);
+    using z3 = z3dot.add(params.b3);
     return nn.logSoftmax(z3);
   }),
 };
@@ -94,19 +97,21 @@ export const ConvNet: ModelType = {
   },
 
   predict: jit((params: Params, x: np.Array): np.Array => {
-    x = x.reshape([-1, 1, 28, 28]);
-    const z1 = maxPool2x2(
-      lax.convGeneralDilated(x, params.w1, [1, 1], "VALID").add(params.b1),
-    );
-    const a1 = nn.relu(z1); // [batch, 24, 12, 12]
-    const z2 = maxPool2x2(
-      lax.convGeneralDilated(a1, params.w2, [1, 1], "VALID").add(params.b2),
-    );
-    const a2 = nn.relu(z2); // [batch, 32, 5, 5]
-    const a2flat = a2.reshape([-1, 800]); // Flatten to [batch, 800]
-    const z3 = np.dot(a2flat, params.w3).add(params.b3);
-    const a3 = nn.relu(z3);
-    const z4 = np.dot(a3, params.w4).add(params.b4);
+    using xReshaped = x.reshape([-1, 1, 28, 28]);
+    using conv1 = lax.convGeneralDilated(xReshaped, params.w1, [1, 1], "VALID");
+    using conv1b = conv1.add(params.b1);
+    using z1 = maxPool2x2(conv1b);
+    using a1 = nn.relu(z1); // [batch, 24, 12, 12]
+    using conv2 = lax.convGeneralDilated(a1, params.w2, [1, 1], "VALID");
+    using conv2b = conv2.add(params.b2);
+    using z2 = maxPool2x2(conv2b);
+    using a2 = nn.relu(z2); // [batch, 32, 5, 5]
+    using a2flat = a2.reshape([-1, 800]); // Flatten to [batch, 800]
+    using z3dot = np.dot(a2flat, params.w3);
+    using z3 = z3dot.add(params.b3);
+    using a3 = nn.relu(z3);
+    using z4dot = np.dot(a3, params.w4);
+    using z4 = z4dot.add(params.b4);
     return nn.logSoftmax(z4);
   }),
 };
@@ -114,11 +119,11 @@ export const ConvNet: ModelType = {
 export function lossFn(predict: (params: Params, x: np.Array) => np.Array) {
   return (params: Params, x: np.Array, y: np.Array): np.Array => {
     const batchSize = y.shape[0];
-    const logits = predict(params, x);
-    return logits
-      .mul(nn.oneHot(y, 10))
-      .sum()
-      .mul(-1 / batchSize);
+    using logits = predict(params, x);
+    using targets = nn.oneHot(y, 10);
+    using elemLoss = logits.mul(targets);
+    using totalLoss = elemLoss.sum();
+    return totalLoss.mul(-1 / batchSize);
   };
 }
 
@@ -129,47 +134,58 @@ export async function loadData(): Promise<{
   y_test: np.Array;
 }> {
   const mnist = await fetchMnist();
+
+  using trainRaw = np.array(new Float32Array(mnist.train.images.data));
+  using trainScaled = trainRaw.mul(1 / 255);
+  const X_train = trainScaled.reshape([-1, 28, 28]);
+
+  using testRaw = np.array(new Float32Array(mnist.test.images.data));
+  using testScaled = testRaw.mul(1 / 255);
+  const X_test = testScaled.reshape([-1, 28, 28]);
+
   return {
-    X_train: np
-      .array(new Float32Array(mnist.train.images.data))
-      .mul(1 / 255)
-      .reshape([-1, 28, 28]),
+    X_train,
     y_train: np.array(mnist.train.labels.data),
-    X_test: np
-      .array(new Float32Array(mnist.test.images.data))
-      .mul(1 / 255)
-      .reshape([-1, 28, 28]),
+    X_test,
     y_test: np.array(mnist.test.labels.data),
   };
 }
 
 export function normalizeImage(X: np.Array): np.Array {
   // X.shape === [28, 28]
-  using xgrid = np.meshgrid(
-    [np.arange(28).astype(np.float32), np.arange(28).astype(np.float32)],
-    { indexing: "ij" },
-  )[0];
-  using ygrid = np.meshgrid(
-    [np.arange(28).astype(np.float32), np.arange(28).astype(np.float32)],
-    { indexing: "ij" },
-  )[1];
-  const dx = Math.round(13.5 - X.mul(xgrid).sum().div(X.sum()).js());
-  const dy = Math.round(13.5 - X.mul(ygrid).sum().div(X.sum()).js());
+  using rawArange = np.arange(28);
+  using arange = rawArange.astype(np.float32);
+  const [xgrid, ygrid] = np.meshgrid([arange, arange], { indexing: "ij" });
+  using xSum = X.sum();
+  using xWeightedX = X.mul(xgrid);
+  using xWeightedXSum = xWeightedX.sum();
+  using xCenterX = xWeightedXSum.div(xSum);
+  const dx = Math.round(13.5 - (xCenterX.js() as number));
+  using xWeightedY = X.mul(ygrid);
+  using xWeightedYSum = xWeightedY.sum();
+  using yCenterY = xWeightedYSum.div(xSum);
+  const dy = Math.round(13.5 - (yCenterY.js() as number));
+  xgrid.dispose();
+  ygrid.dispose();
   if (dx > 0) {
     using old = X;
-    X = np.pad(old, { 0: [dx, 0] }).slice([0, 28], []);
+    using padded = np.pad(old, { 0: [dx, 0] });
+    X = padded.slice([0, 28], []);
   }
   if (dx < 0) {
     using old = X;
-    X = np.pad(old, { 0: [0, -dx] }).slice([-dx], []);
+    using padded = np.pad(old, { 0: [0, -dx] });
+    X = padded.slice([-dx], []);
   }
   if (dy > 0) {
     using old = X;
-    X = np.pad(old, { 1: [dy, 0] }).slice([], [0, 28]);
+    using padded = np.pad(old, { 1: [dy, 0] });
+    X = padded.slice([], [0, 28]);
   }
   if (dy < 0) {
     using old = X;
-    X = np.pad(old, { 1: [0, -dy] }).slice([], [-dy]);
+    using padded = np.pad(old, { 1: [0, -dy] });
+    X = padded.slice([], [-dy]);
   }
   return X;
 }
@@ -182,9 +198,12 @@ export async function runInference(
   params: Params,
   imageData: Float32Array,
 ): Promise<number[]> {
-  using image = normalizeImage(
-    np.array(imageData as Float32Array<ArrayBuffer>).reshape([28, 28]),
-  );
-  using logits = model.predict(params, image.reshape([1, 28, 28]));
-  return (await np.exp(logits).slice(0).jsAsync()) as number[];
+  using rawArr = np.array(imageData as Float32Array<ArrayBuffer>);
+  using rawImage = rawArr.reshape([28, 28]);
+  using image = normalizeImage(rawImage);
+  using imageInput = image.reshape([1, 28, 28]);
+  using logits = model.predict(params, imageInput);
+  using probs = np.exp(logits);
+  using probSlice = probs.slice(0);
+  return (await probSlice.jsAsync()) as number[];
 }
