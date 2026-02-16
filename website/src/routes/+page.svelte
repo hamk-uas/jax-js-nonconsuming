@@ -206,7 +206,11 @@
     <EmbeddedRepl
       initialText={String.raw`import { grad, numpy as np, vmap } from "@jax-js-nonconsuming/jax";
 
-const f = (x: np.Array) => np.sqrt(x.mul(x).sum());
+const f = (x: np.Array) => {
+  using sq = x.mul(x);
+  using s = sq.sum();
+  return np.sqrt(s);
+};
 
 {
   using x = np.array([1, 2, 3, 4]);

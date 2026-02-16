@@ -48,7 +48,8 @@ function calculateMandelbrot(iters: number) {
 }
 
 using ar = calculateMandelbrot(100);
-using image = np.subtract(1, ar.div(100));
+using arScaled = ar.div(100);
+using image = np.subtract(1, arScaled);
 
 // The REPL has a displayImage() builtin for drawing image pixels.
 await displayImage(image);

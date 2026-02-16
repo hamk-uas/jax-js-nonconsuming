@@ -17,7 +17,11 @@ using wTrue = np.array([2.0, -1.0, 0.5, -1.5]);
 
 using key = random.key(0);
 const X = random.uniform(key, [500, 4], { minval: -1, maxval: 1 });
-const y = np.dot(X, wTrue).greater(0).astype(np.float32);
+const y = (() => {
+  using dot = np.dot(X, wTrue);
+  using gt = dot.greater(0);
+  return gt.astype(np.float32);
+})();
 
 // Define loss function (binary cross-entropy).
 using lossFn = jit((w: np.Array) => {

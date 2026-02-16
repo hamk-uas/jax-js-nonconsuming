@@ -32,11 +32,14 @@ export async function arrayToDataUrl(ar: np.Array): Promise<string> {
   if (ar.dtype === np.float32 || ar.dtype === np.float16) {
     // If float, normalize [0, 1) to [0, 256)
     using old = ar;
-    ar = np.clip(old.mul(256), 0, 255).astype(np.uint32);
+    using scaled = old.mul(256);
+    using clipped = np.clip(scaled, 0, 255);
+    ar = clipped.astype(np.uint32);
   } else if (ar.dtype === np.bool) {
     // If bool, convert to 0 or 255
     using old = ar;
-    ar = old.astype(np.uint32).mul(255);
+    using asUint = old.astype(np.uint32);
+    ar = asUint.mul(255);
   }
 
   let rgbaArray: np.Array;
@@ -47,20 +50,22 @@ export async function arrayToDataUrl(ar: np.Array): Promise<string> {
       device: ar.device,
     });
     rgbaArray = np.concatenate([expanded, alphas], 2);
+    ar.dispose();
   } else if (channels === 3) {
     using alphas = np.full([height, width, 1], 255, {
       dtype: ar.dtype,
       device: ar.device,
     });
     rgbaArray = np.concatenate([ar, alphas], 2);
+    ar.dispose();
   } else if (channels === 4) {
     rgbaArray = ar;
   } else {
+    ar.dispose();
     throw new Error(
       "displayImage() only supports 1, 3, or 4 channels in the last dimension",
     );
   }
-  ar.dispose();
 
   const buf = await rgbaArray.data();
   rgbaArray.dispose();

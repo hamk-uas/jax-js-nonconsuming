@@ -42,7 +42,7 @@
 
 <div
   class="flex flex-col border border-gray-200 rounded-lg"
-  style:height={expanded ? "720px" : "360px"}
+  style:height={expanded ? "1080px" : "720px"}
 >
   <div
     class="shrink-0 border-b border-gray-200 flex items-center px-2 py-1.5 gap-2"
@@ -92,7 +92,7 @@
   <div class="flex-1 min-h-0 split-pane-container">
     <SplitPane
       type="vertical"
-      pos="-112px"
+      pos="-224px"
       min="40px"
       max="-40px"
       --color="var(--color-gray-200)"
