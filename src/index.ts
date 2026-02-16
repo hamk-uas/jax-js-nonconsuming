@@ -305,7 +305,8 @@ export { jacrev as jacobian };
  * @example
  * ```ts
  * const f = (x: np.Array) => np.sum(x.mul(x).mul(x)); // x^3
- * const H = hessian(f)(np.array([1, 2, 3]));
+ * using x = np.array([1, 2, 3]);
+ * using H = hessian(f)(x);
  * // H[i,j] = d^2f / dx_i dx_j
  * ```
  */

@@ -7,6 +7,7 @@ processing and optimization. It includes implementations of common algorithms li
 
 ```ts
 import { adam } from "@jax-js-nonconsuming/optax";
+import { grad, numpy as np, tree } from "@jax-js-nonconsuming/jax";
 
 let params = np.array([1.0, 2.0, 3.0]);
 
@@ -29,4 +30,7 @@ for (let i = 0; i < 100; i++) {
   params = newParams;
   optState = newOptState;
 }
+
+params.dispose();
+tree.dispose(optState);
 ```

@@ -27,6 +27,7 @@ export class ReplRunner {
   finished = $state(false);
   consoleLines: ConsoleLine[] = $state([]);
   runDurationMs = $state<number | null>(null);
+  detailedLeakDiagnostics = $state(false);
   consoleTimers = new Map<string, number>();
   mockConsole: Console;
 
@@ -54,7 +55,12 @@ export class ReplRunner {
     this.runDurationMs = null;
     const startedRunAt = performance.now();
     try {
-      const result = await _runProgram(source, device, this);
+      const result = await _runProgram(
+        source,
+        device,
+        this,
+        this.detailedLeakDiagnostics,
+      );
       const endedRunAt = performance.now();
       if (endedRunAt - startedRunAt < 100) {
         // Take at least 100ms, otherwise it's unclear it actually ran.
@@ -133,6 +139,7 @@ async function _runProgram(
   source: string,
   device: Device,
   runner: ReplRunner,
+  detailedLeakDiagnostics: boolean,
 ): Promise<RunResult> {
   const [jax, optax, loaders] = await Promise.all([
     import("@jax-js-nonconsuming/jax"),
@@ -155,6 +162,9 @@ async function _runProgram(
     return null;
   };
   const slotsBefore = getSlotCount();
+  let detailedLeakTrackingStarted = false;
+  let detailedLeakSummary: string | null = null;
+  let detailedLeakCount = 0;
 
   // Builtins for the REPL environment.
   const np = jax.numpy;
@@ -250,6 +260,15 @@ async function _runProgram(
       .constructor as any;
 
     const startTime = performance.now();
+    if (detailedLeakDiagnostics && jax.checkLeaks?.start) {
+      try {
+        jax.checkLeaks.start();
+        detailedLeakTrackingStarted = true;
+      } catch {
+        // Fall back to lightweight slot diagnostics.
+      }
+    }
+
     await new AsyncFunction("_MODULES", "_BUILTINS", bundledCode)(
       // _MODULES
       {
@@ -263,6 +282,17 @@ async function _runProgram(
         displayImage: displayImage,
       },
     );
+
+    if (detailedLeakTrackingStarted && jax.checkLeaks?.stop) {
+      try {
+        const report = jax.checkLeaks.stop();
+        detailedLeakSummary = report.summary;
+        detailedLeakCount = report.leaked;
+      } catch {
+        // Ignore checkLeaks reporting failures in REPL.
+      }
+    }
+
     const slotsAfter = getSlotCount();
     if (
       slotsBefore !== null &&
@@ -270,15 +300,36 @@ async function _runProgram(
       slotsAfter > slotsBefore
     ) {
       const leaked = slotsAfter - slotsBefore;
-      mockConsole.warn(
-        `REPL note: ${leaked} array slot(s) still live after this run. Use using declarations or .dispose() for arrays you create.`,
-      );
+      if (
+        detailedLeakDiagnostics &&
+        detailedLeakCount > 0 &&
+        detailedLeakSummary
+      ) {
+        mockConsole.warn(
+          `REPL note: ${leaked} array slot(s) still live after this run. Detailed leak diagnostics:`,
+        );
+        mockConsole.warn(detailedLeakSummary);
+      } else {
+        mockConsole.warn(
+          `REPL note: ${leaked} array slot(s) still live after this run. Use using declarations or .dispose() for arrays you create. Enable Detailed leak diagnostics and run again to see leak origins.`,
+        );
+      }
     }
     return {
       success: true,
       duration: performance.now() - startTime,
     };
   } catch (e: any) {
+    if (detailedLeakTrackingStarted && jax.checkLeaks?.stop) {
+      try {
+        const report = jax.checkLeaks.stop();
+        detailedLeakSummary = report.summary;
+        detailedLeakCount = report.leaked;
+      } catch {
+        // Ignore checkLeaks reporting failures in REPL.
+      }
+    }
+
     const slotsAfter = getSlotCount();
     if (
       slotsBefore !== null &&
@@ -286,9 +337,20 @@ async function _runProgram(
       slotsAfter > slotsBefore
     ) {
       const leaked = slotsAfter - slotsBefore;
-      mockConsole.warn(
-        `REPL note: ${leaked} array slot(s) still live after this run. Use using declarations or .dispose() for arrays you create.`,
-      );
+      if (
+        detailedLeakDiagnostics &&
+        detailedLeakCount > 0 &&
+        detailedLeakSummary
+      ) {
+        mockConsole.warn(
+          `REPL note: ${leaked} array slot(s) still live after this run. Detailed leak diagnostics:`,
+        );
+        mockConsole.warn(detailedLeakSummary);
+      } else {
+        mockConsole.warn(
+          `REPL note: ${leaked} array slot(s) still live after this run. Use using declarations or .dispose() for arrays you create. Enable Detailed leak diagnostics and run again to see leak origins.`,
+        );
+      }
     }
     mockConsole.error(e);
     return { success: false, duration: 0 };

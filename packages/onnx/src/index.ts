@@ -38,8 +38,13 @@ import {
  * const modelBytes = await fetch("./model.onnx").then((r) => r.bytes());
  * const model = new ONNXModel(modelBytes);
  *
- * const input = np.ones([1, 3, 224, 224]);
- * const { output } = model.run({ input });
+ * try {
+ *   using input = np.ones([1, 3, 224, 224]);
+ *   const { output } = model.run({ input });
+ *   output.dispose();
+ * } finally {
+ *   model.dispose();
+ * }
  * ```
  */
 export class ONNXModel {

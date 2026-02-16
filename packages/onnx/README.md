@@ -13,8 +13,13 @@ import { numpy as np } from "@jax-js-nonconsuming/jax";
 const modelBytes = await fetch("./model.onnx").then((r) => r.bytes());
 const model = new ONNXModel(modelBytes);
 
-using input = np.ones([1, 3, 224, 224]);
-const { output } = model.run({ input });
+try {
+  using input = np.ones([1, 3, 224, 224]);
+  const { output } = model.run({ input });
+  output.dispose();
+} finally {
+  model.dispose();
+}
 ```
 
 Loaded models are ordinary functions and can be differentiated through. Use JIT when possible for
@@ -30,6 +35,7 @@ const runGrad = grad((input: np.Array) => {
   return loss.mean();
 });
 
+using input = np.ones([1, 3, 224, 224]);
 using dx = runGrad(input);
 ```
 

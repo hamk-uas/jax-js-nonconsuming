@@ -734,10 +734,10 @@ export function squeeze(a: ArrayLike, axis: core.Axis = null): Array {
  *
  * @example
  * ```ts
- * const x = np.array([1, 2]);
- * np.expandDims(x, 0); // Shape [1, 2]
- * np.expandDims(x, 1); // Shape [2, 1]
- * np.expandDims(x, [0, 2]); // Shape [1, 2, 1]
+ * using x = np.array([1, 2]);
+ * using x0 = np.expandDims(x, 0); // Shape [1, 2]
+ * using x1 = np.expandDims(x, 1); // Shape [2, 1]
+ * using x2 = np.expandDims(x, [0, 2]); // Shape [1, 2, 1]
  * ```
  */
 export function expandDims(a: ArrayLike, axis: number | number[]): Array {
@@ -1073,9 +1073,9 @@ export function tensordot(
  * ```ts
  * import { numpy as np } from "@jax-js-nonconsuming/jax";
  *
- * const a = np.ones([2, 3]);
- * const b = np.ones([3]);
- * np.einsum("ij,j", a, b); // Shape [2]
+ * using a = np.ones([2, 3]);
+ * using b = np.ones([3]);
+ * using out = np.einsum("ij,j", a, b); // Shape [2]
  * ```
  */
 export function einsum(subscripts: string, ...operands: ArrayLike[]): Array;
@@ -1087,9 +1087,9 @@ export function einsum(subscripts: string, ...operands: ArrayLike[]): Array;
  * ```ts
  * import { numpy as np } from "@jax-js-nonconsuming/jax";
  *
- * const a = np.ones([2, 3]);
- * const b = np.ones([3]);
- * np.einsum(a, [0, 1], b, [1]); // Shape [2]
+ * using a = np.ones([2, 3]);
+ * using b = np.ones([3]);
+ * using out = np.einsum(a, [0, 1], b, [1]); // Shape [2]
  * ```
  */
 export function einsum(...args: (ArrayLike | number[])[]): Array;

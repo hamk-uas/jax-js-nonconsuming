@@ -765,9 +765,9 @@ export interface AbstractValue {
    * by the actual `dtype` field.
    *
    * ```ts
-   * const x = np.array(3); // weakType = true, dtype = float32
-   * const y = np.array([1, 2], { dtype: np.int32 }); // weakType = false, dtype = int32
-   * const z = x.add(y); // z has dtype int32 because x is weakly typed
+   * using x = np.array(3); // weakType = true, dtype = float32
+   * using y = np.array([1, 2], { dtype: np.int32 }); // weakType = false, dtype = int32
+   * using z = x.add(y); // z has dtype int32 because x is weakly typed
    * ```
    *
    * Weak types are present in JIT programs in their spec (e.g., Jaxpr inputs
@@ -821,8 +821,8 @@ export abstract class Tracer {
    * an explicit `.dispose()` call or `using` block.
    *
    * ```
-   * const x = np.array([1, 2, 3]);
-   * const y = np.add(x, x); // works — x is not consumed
+   * using x = np.array([1, 2, 3]);
+   * using y = np.add(x, x); // works — x is not consumed
    * ```
    */
   abstract get ref(): this;
@@ -1110,10 +1110,12 @@ export abstract class Tracer {
    * This can be used to destructure arrays. For example:
    *
    * ```js
-   * let x = np.array([[1, 2], [3, 4]]);
-   * let [a, b] = x;
+   * using x = np.array([[1, 2], [3, 4]]);
+   * const [a, b] = x;
    * console.log(a.js()); // [1, 2]
    * console.log(b.js()); // [3, 4]
+   * a.dispose();
+   * b.dispose();
    * ```
    */
   *[Symbol.iterator](): IterableIterator<this> {

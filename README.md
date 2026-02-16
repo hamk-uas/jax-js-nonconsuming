@@ -47,8 +47,10 @@ likely the most portable GPU ML framework, since it runs anywhere a browser can 
 import { numpy as np } from "@jax-js-nonconsuming/jax";
 
 // Array operations, compatible with JAX/NumPy.
-const x = np.array([1, 2, 3]);
-const y = x.mul(4); // [4, 8, 12]
+{
+  using x = np.array([1, 2, 3]);
+  using y = x.mul(4); // [4, 8, 12]
+}
 ```
 
 ## Demos
@@ -124,20 +126,20 @@ Create an array with `np.array()`:
 ```ts
 import { numpy as np } from "@jax-js-nonconsuming/jax";
 
-const ar = np.array([1, 2, 3]);
+using ar = np.array([1, 2, 3]);
 ```
 
 By default, this is a float32 array, but you can specify a different dtype:
 
 ```ts
-const ar = np.array([1, 2, 3], { dtype: np.int32 });
+using ar = np.array([1, 2, 3], { dtype: np.int32 });
 ```
 
 For more efficient construction, create an array from a JS `TypedArray` buffer:
 
 ```ts
 const buf = new Float32Array([10, 20, 30, 100, 200, 300]);
-const ar = np.array(buf).reshape([2, 3]);
+using ar = np.array(buf).reshape([2, 3]);
 ```
 
 Once you're done with it, you can unwrap a `jax.Array` back into JavaScript. This will also apply
@@ -151,6 +153,9 @@ await ar.jsAsync(); // Faster, non-blocking
 // 2) Returns a flat TypedArray data buffer.
 ar.dataSync();
 await ar.data(); // Fastest, non-blocking
+
+// If you don't need the array after reading data:
+const floats = await ar.consumeData();
 ```
 
 Arrays can have mathematical operations applied to them. For example:
@@ -243,7 +248,7 @@ All functional transformations can take typed `JsTree` of inputs and outputs. Th
 nested JavaScript objects and arrays. For instance:
 
 ```ts
-import { grad, numpy as np } from "@jax-js-nonconsuming/jax";
+import { grad, numpy as np, tree } from "@jax-js-nonconsuming/jax";
 
 type Params = {
   foo: np.Array;
@@ -252,14 +257,18 @@ type Params = {
 
 function getSums(p: Params) {
   using fooSum = p.foo.sum();
-  using barSum = p.bar.map((x) => x.sum()).reduce(np.add);
+  using bar0 = p.bar[0].sum();
+  using bar1 = p.bar[1].sum();
+  using barSum = bar0.add(bar1);
   return fooSum.add(barSum);
 }
 
-grad(getSums)({
-  foo: np.array([1, 2, 3]),
-  bar: [np.array([10]), np.array([11, 12])],
-});
+using g = tree.makeDisposable(
+  grad(getSums)({
+    foo: np.array([1, 2, 3]),
+    bar: [np.array([10]), np.array([11, 12])],
+  }),
+);
 // => { foo: [1, 1, 1], bar: [[1], [1, 1]] }
 ```
 
@@ -302,7 +311,7 @@ You can also place individual arrays on specific devices:
 ```ts
 import { devicePut, numpy as np } from "@jax-js-nonconsuming/jax";
 
-const ar = np.array([1, 2, 3]); // Starts with device="wasm"
+using ar = np.array([1, 2, 3]); // Starts with device="wasm"
 await devicePut(ar, "webgpu"); // Now device="webgpu"
 ```
 

@@ -220,6 +220,16 @@
                 Share
               </button>
 
+              <label
+                class="ml-2 flex items-center gap-1.5 text-xs text-gray-600 select-none"
+              >
+                <input
+                  type="checkbox"
+                  bind:checked={replRunner.detailedLeakDiagnostics}
+                />
+                Detailed leak diagnostics
+              </label>
+
               <!-- Device selector -->
               <select
                 bind:value={device}

@@ -19,14 +19,14 @@ import * as core from "../frontend/core";
  * ```ts
  * import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
  *
- * const x = np.array([[2., 1.], [1., 2.]]);
+ * using x = np.array([[2., 1.], [1., 2.]]);
  *
  * // Lower Cholesky factorization (default):
- * const L = lax.linalg.cholesky(x);
+ * using L = lax.linalg.cholesky(x);
  * // L ≈ [[1.4142135, 0], [0.70710677, 1.2247449]]
  *
  * // Upper Cholesky factorization:
- * const U = lax.linalg.cholesky(x, { upper: true });
+ * using U = lax.linalg.cholesky(x, { upper: true });
  * // U ≈ [[1.4142135, 0.70710677], [0, 1.2247449]]
  * ```
  */
@@ -64,6 +64,11 @@ export function cholesky(
  * // lu ≈ [[6., 3.], [0.6666667, 1.0]]
  * // pivots = [1, 1]
  * // permutation = [1, 0]
+ *
+ * A.dispose();
+ * lu.dispose();
+ * pivots.dispose();
+ * permutation.dispose();
  * ```
  */
 export function lu(x: ArrayLike): [Array, Array, Array] {
@@ -80,11 +85,11 @@ export function lu(x: ArrayLike): [Array, Array, Array] {
  * ```ts
  * import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
  *
- * const L = np.array([[2., 0.], [1., 3.]]);
- * const b = np.array([4., 7.]).reshape([2, 1]);
+ * using L = np.array([[2., 0.], [1., 3.]]);
+ * using b = np.array([4., 7.]).reshape([2, 1]);
  *
  * // Solve L @ x = b
- * const x = lax.linalg.triangularSolve(L, b, { leftSide: true, lower: true });
+ * using x = lax.linalg.triangularSolve(L, b, { leftSide: true, lower: true });
  * // x = [[2.], [5./3.]]
  * ```
  */

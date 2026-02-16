@@ -175,8 +175,8 @@ export interface ScanOptions {
  *   return [sum, sum];  // same array can be used in both outputs
  * };
  *
- * const init = np.array([0.0]);
- * const xs = np.array([[1], [2], [3], [4], [5]]);
+ * using init = np.array([0.0]);
+ * using xs = np.array([[1], [2], [3], [4], [5]]);
  * const [final, sums] = await lax.scan(step, init, xs);
  *
  * console.log(await final.data());  // [15]
@@ -194,18 +194,22 @@ export interface ScanOptions {
  *   return [next, next];
  * };
  *
- * const init = np.array([1]);
- * const xs = np.array([[1], [2], [3], [4], [5]]);
+ * using init = np.array([1]);
+ * using xs = np.array([[1], [2], [3], [4], [5]]);
  * const [final, factorials] = await lax.scan(step, init, xs);
  * // factorials = [[1], [2], [6], [24], [120]]
+ *
+ * final.dispose();
+ * factorials.dispose();
  * ```
  *
  * @example Pytree carry (multiple state variables)
  * ```ts
  * // Track both sum and count
+ * using one = np.array([1]);
  * const step = (carry, x) => {
  *   const newSum = np.add(carry.sum, x);
- *   const newCount = np.add(carry.count, np.array([1]));
+ *   const newCount = np.add(carry.count, one);
  *   return [
  *     { sum: newSum, count: newCount },
  *     { sum: newSum, count: newCount }
@@ -213,9 +217,16 @@ export interface ScanOptions {
  * };
  *
  * const init = { sum: np.array([0]), count: np.array([0]) };
- * const xs = np.array([[10], [20], [30]]);
+ * using xs = np.array([[10], [20], [30]]);
  * const [final, history] = await lax.scan(step, init, xs);
  * // final.sum = [60], final.count = [3]
+ *
+ * init.sum.dispose();
+ * init.count.dispose();
+ * final.sum.dispose();
+ * final.count.dispose();
+ * history.sum.dispose();
+ * history.count.dispose();
  * ```
  *
  * @example Reverse scan
@@ -243,14 +254,18 @@ export interface ScanOptions {
  * @example xs=null: Carry-only scan
  * ```ts
  * // Generate a sequence without allocating input arrays
+ * using one = np.array([1.0]);
  * const step = (carry, _x) => {
- *   const next = np.add(carry, np.array([1.0]));
+ *   const next = np.add(carry, one);
  *   return [next, carry];  // output is old carry value
  * };
  *
- * const init = np.array([0.0]);
+ * using init = np.array([0.0]);
  * const [final, ys] = await lax.scan(step, init, null, { length: 5 });
  * // ys = [[0], [1], [2], [3], [4]], final = [5]
+ *
+ * final.dispose();
+ * ys.dispose();
  * ```
  *
  * @example Y=null: Skip output stacking
@@ -263,9 +278,18 @@ export interface ScanOptions {
  *   return [{ A: newA, count: newCount }, null];  // null skips Y stacking
  * };
  *
- * const init = { A: np.zeros([100]), count: np.zeros([100], np.int32) };
+ * const init = {
+ *   A: np.zeros([100]),
+ *   count: np.zeros([100], { dtype: np.int32 }),
+ * };
+ * using xs = np.ones([10, 100]);
  * const [final, ys] = await lax.scan(step, init, xs);
  * // ys is null — no memory allocated for intermediate outputs
+ *
+ * init.A.dispose();
+ * init.count.dispose();
+ * final.A.dispose();
+ * final.count.dispose();
  * ```
  *
  * @example jit(scan) - Compile the entire scan loop
@@ -281,11 +305,13 @@ export interface ScanOptions {
  *
  * const scanFn = jit((init, xs) => lax.scan(step, init, xs));
  *
- * const init = np.array([0.0]);
- * const xs = np.array([[1.0], [2.0], [3.0]]);
+ * using init = np.array([0.0]);
+ * using xs = np.array([[1.0], [2.0], [3.0]]);
  * const [final, ys] = await scanFn(init, xs);
  *
  * console.log(await final.data());  // [6]
+ * final.dispose();
+ * ys.dispose();
  * scanFn.dispose();  // Free compiled program
  * ```
  *
@@ -301,11 +327,13 @@ export interface ScanOptions {
  *   return [newCarry, newCarry];
  * });
  *
- * const init = np.array([0.0]);
- * const xs = np.array([[1.0], [2.0], [3.0]]);
+ * using init = np.array([0.0]);
+ * using xs = np.array([[1.0], [2.0], [3.0]]);
  * const [final, ys] = await lax.scan(step, init, xs);
  *
  * console.log(await final.data());  // [6]
+ * final.dispose();
+ * ys.dispose();
  * step.dispose();  // Free compiled step function
  * ```
  *
@@ -315,12 +343,17 @@ export interface ScanOptions {
  *
  * const loss = (init, xs) => {
  *   const [final, ys] = lax.scan(step, init, xs);
- *   final.dispose();
+ *   using _final = final;
+ *   using _ys = ys;
  *   return np.sum(ys);
  * };
  *
  * const gradLoss = grad(loss);
+ * using init = np.array([0.0]);
+ * using xs = np.array([[1.0], [2.0], [3.0]]);
  * const [dInit, dXs] = await gradLoss(init, xs);
+ * dInit.dispose();
+ * dXs.dispose();
  * ```
  *
  * @see {@link https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html | JAX lax.scan}

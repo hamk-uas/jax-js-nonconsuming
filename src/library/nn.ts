@@ -475,7 +475,8 @@ export function standardize(
  * ```js
  * import { nn, numpy as np } from '@jax-js-nonconsuming/jax';
  *
- * nn.oneHot(np.array([1, 1, 2], { dtype: np.int32 }), 3);
+ * using x = np.array([1, 1, 2], { dtype: np.int32 });
+ * using y = nn.oneHot(x, 3);
  * // Output:
  * // [[0, 1, 0],
  * //  [0, 1, 0],
