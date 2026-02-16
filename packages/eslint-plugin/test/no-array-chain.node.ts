@@ -30,6 +30,37 @@ async function lintArrayChain(code: string) {
   return result.messages.filter((m) => m.ruleId === "jax-js/no-array-chain");
 }
 
+async function lintArrayChainWithFix(code: string) {
+  const eslint = new ESLint({
+    fix: true,
+    overrideConfigFile: true,
+    overrideConfig: [
+      {
+        languageOptions: {
+          ecmaVersion: "latest",
+          sourceType: "module",
+        },
+        plugins: {
+          "jax-js": plugin as any,
+        },
+        rules: {
+          "jax-js/no-array-chain": "error",
+        },
+      },
+    ],
+  });
+
+  const [result] = await eslint.lintText(code, {
+    filePath: "array-chain.js",
+  });
+  return {
+    output: result.output ?? code,
+    messages: result.messages.filter(
+      (m) => m.ruleId === "jax-js/no-array-chain",
+    ),
+  };
+}
+
 // --- True positives: should warn ---
 
 test("no-array-chain: warns for depth-2 chain in eager code", async () => {
@@ -50,6 +81,40 @@ const y = x.add(1).mul(2).sub(3);
   const messages = await lintArrayChain(code);
   assert.equal(messages.length, 1);
   assert.match(messages[0].message, /depth 3/);
+});
+
+test("no-array-chain: autofix rewrites variable assignment chains", async () => {
+  const code = `
+const x = createArray();
+const y = x.add(1).mul(2).sub(3);
+`;
+  const { output, messages } = await lintArrayChainWithFix(code);
+  assert.equal(messages.length, 0);
+  assert.match(output, /using _jaxChain\d+ = x\.add\(1\);/);
+  assert.match(output, /using _jaxChain\d+ = _jaxChain\d+\.mul\(2\);/);
+  assert.match(output, /const y = _jaxChain\d+\.sub\(3\);/);
+});
+
+test("no-array-chain: autofix rewrites expression statement chains", async () => {
+  const code = `
+const x = createArray();
+x.add(1).mul(2);
+`;
+  const { output, messages } = await lintArrayChainWithFix(code);
+  assert.equal(messages.length, 0);
+  assert.match(output, /using _jaxChain\d+ = x\.add\(1\);/);
+  assert.match(output, /using _jaxChain\d+ = _jaxChain\d+\.mul\(2\);/);
+});
+
+test("no-array-chain: does not autofix return-expression chains", async () => {
+  const code = `
+function f(x) {
+  return x.add(1).mul(2);
+}
+`;
+  const { output, messages } = await lintArrayChainWithFix(code);
+  assert.equal(messages.length, 1);
+  assert.equal(output, code);
 });
 
 // --- Traced-context suppression: should NOT warn ---

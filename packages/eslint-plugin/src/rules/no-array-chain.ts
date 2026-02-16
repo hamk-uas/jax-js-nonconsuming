@@ -80,6 +80,153 @@ function findVariable(scope: any, name: string): any {
   return null;
 }
 
+function getChainCalls(node: any): any[] {
+  const calls: any[] = [];
+  let current = node;
+  while (
+    current?.type === "CallExpression" &&
+    current.callee?.type === "MemberExpression"
+  ) {
+    const method = getMemberName(current.callee.property);
+    if (!method || !CHAINABLE_ARRAY_METHODS.has(method)) break;
+    calls.unshift(current);
+    current = current.callee.object;
+  }
+  return calls;
+}
+
+function getIndent(sourceText: string, start: number): string {
+  const lineStart = sourceText.lastIndexOf("\n", start - 1) + 1;
+  const prefix = sourceText.slice(lineStart, start);
+  const match = prefix.match(/^\s*/);
+  return match?.[0] ?? "";
+}
+
+function collectUsedNames(scope: any): Set<string> {
+  const names = new Set<string>();
+  let current = scope;
+  while (current) {
+    for (const variable of current.variables ?? []) {
+      if (variable?.name) names.add(variable.name);
+    }
+    current = current.upper;
+  }
+  return names;
+}
+
+function nextTempName(used: Set<string>): string {
+  let i = 1;
+  while (used.has(`_jaxChain${i}`)) i++;
+  const name = `_jaxChain${i}`;
+  used.add(name);
+  return name;
+}
+
+function replaceCallObjectText(
+  sourceText: string,
+  callNode: any,
+  objectText: string,
+): string {
+  const callText = sourceText.slice(callNode.range[0], callNode.range[1]);
+  const objectNode = callNode.callee.object;
+  const relStart = objectNode.range[0] - callNode.range[0];
+  const relEnd = objectNode.range[1] - callNode.range[0];
+  return callText.slice(0, relStart) + objectText + callText.slice(relEnd);
+}
+
+function findRewriteStatement(node: any, context: Rule.RuleContext): any {
+  const sourceCode = context.sourceCode ?? context.getSourceCode();
+  const ancestors = sourceCode.getAncestors(node);
+  for (let i = ancestors.length - 1; i >= 0; i--) {
+    const ancestor = ancestors[i];
+    if (
+      ancestor.type === "VariableDeclaration" ||
+      ancestor.type === "ExpressionStatement"
+    ) {
+      return ancestor;
+    }
+  }
+  return null;
+}
+
+function buildChainRewrite(
+  node: any,
+  context: Rule.RuleContext,
+): string | null {
+  const sourceCode = context.sourceCode ?? context.getSourceCode();
+  const sourceText = sourceCode.getText();
+  const chainCalls = getChainCalls(node);
+  if (chainCalls.length < 2) return null;
+
+  const scope = sourceCode.getScope(node);
+  const usedNames = collectUsedNames(scope);
+
+  const statement = findRewriteStatement(node, context);
+  if (!statement) return null;
+
+  const indent = getIndent(sourceText, statement.range[0]);
+
+  if (statement.type === "VariableDeclaration") {
+    if (statement.declarations.length !== 1) return null;
+    if (statement.kind !== "const" && statement.kind !== "let") return null;
+
+    const [decl] = statement.declarations;
+    if (decl.init !== node || !decl.id) return null;
+
+    const lines: string[] = [];
+    // jax-js-lint: allow-non-using
+    let currentObjectText = sourceText.slice(
+      chainCalls[0].callee.object.range[0],
+      chainCalls[0].callee.object.range[1],
+    );
+
+    for (let i = 0; i < chainCalls.length - 1; i++) {
+      const callText = replaceCallObjectText(
+        sourceText,
+        chainCalls[i],
+        currentObjectText,
+      );
+      const temp = nextTempName(usedNames);
+      lines.push(`${indent}using ${temp} = ${callText};`);
+      currentObjectText = temp;
+    }
+
+    const lastCallText = replaceCallObjectText(
+      sourceText,
+      chainCalls[chainCalls.length - 1],
+      currentObjectText,
+    );
+    const idText = sourceText.slice(decl.id.range[0], decl.id.range[1]);
+    lines.push(`${indent}${statement.kind} ${idText} = ${lastCallText};`);
+    return lines.join("\n");
+  }
+
+  if (statement.type === "ExpressionStatement") {
+    if (statement.expression !== node) return null;
+    const lines: string[] = [];
+    // jax-js-lint: allow-non-using
+    let currentObjectText = sourceText.slice(
+      chainCalls[0].callee.object.range[0],
+      chainCalls[0].callee.object.range[1],
+    );
+
+    for (let i = 0; i < chainCalls.length; i++) {
+      const callText = replaceCallObjectText(
+        sourceText,
+        chainCalls[i],
+        currentObjectText,
+      );
+      const temp = nextTempName(usedNames);
+      lines.push(`${indent}using ${temp} = ${callText};`);
+      currentObjectText = temp;
+    }
+
+    return lines.join("\n");
+  }
+
+  return null;
+}
+
 /**
  * Walk up the AST from `node`.  If we find a function expression / arrow
  * function that is used as the **body argument** of a tracing transform,
@@ -140,6 +287,7 @@ function isInsideTracedBody(node: any, context: Rule.RuleContext): boolean {
 const rule: Rule.RuleModule = {
   meta: {
     type: "suggestion",
+    fixable: "code",
     docs: {
       description:
         "Disallow deep array method chains that create unnamed eager intermediates",
@@ -202,6 +350,13 @@ const rule: Rule.RuleModule = {
           node,
           messageId: "noArrayChain",
           data: { depth: String(depth) },
+          fix(fixer) {
+            const statement = findRewriteStatement(node, context);
+            if (!statement) return null;
+            const replacement = buildChainRewrite(node, context);
+            if (!replacement) return null;
+            return fixer.replaceTextRange(statement.range, replacement);
+          },
         });
       },
     };

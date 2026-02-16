@@ -319,12 +319,20 @@ import { ... } from "...";
 
 ### `jax-js/no-array-chain`
 
-**Type:** suggestion (off by default, enabled in strict config) · no autofix
+**Type:** suggestion (off by default, enabled in strict config) · autofix for simple chains
 
 Flags deep fluent method chains that create unnamed eager-mode temporaries. These intermediates
 can't be `using`-managed and may accumulate in GPU memory until GC runs.
 
 Only the outermost chain is reported — inner subchains don't produce duplicate diagnostics.
+
+For migration, `--fix` rewrites straightforward eager chains into `using` temporaries:
+
+- Variable assignment chains: `const y = x.add(1).mul(2)`
+- Expression-statement chains: `x.add(1).mul(2)`
+
+More complex sites (for example `return x.add(1).mul(2)`) are intentionally left as diagnostics
+without rewrite.
 
 ```ts
 // ❌ Error (depth 3): Array call chain depth 3 creates unnamed eager temporaries
