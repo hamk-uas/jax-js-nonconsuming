@@ -92,6 +92,20 @@ naturally.
   new primitive gets autodiff for free, every `jit`-wrapped function gets kernel fusion
   automatically. Prioritize work that compounds.
 
+### Ownership invariants (maintainer rubric)
+
+For transform and tracing internals, use this short review rubric before merging:
+
+1. **Conserve handles** — every handle created/received has exactly one terminal path: transfer,
+   dispose, or explicit retained ownership.
+2. **Make retention boundaries explicit** — if a value outlives scope (captured consts, caches,
+   pending work, closures), retain an independent handle intentionally.
+3. **Release retained handles symmetrically** — retained handles must have a single release path,
+   including error paths (`try/finally` parity).
+
+This rubric is orthogonal to the non-consuming API model. It applies to internal ownership plumbing
+where `.ref` still exists as a low-level mechanism.
+
 ### Development priorities
 
 When deciding what to work on, prefer work in this order:
@@ -136,8 +150,12 @@ pnpm run build                     # tsdown → dist/*.js, dist/*.d.ts
 pnpm run build:watch               # watch mode
 pnpm exec playwright install       # one-time: install Chromium for WebGPU tests
 pnpm test                          # Vitest + Playwright (browser + node)
+pnpm run test:policy:strict        # strict test policy: zero failures, zero expected-failure debt
+pnpm run test:arch                 # architectural mode: failures must match .ci/expected-failures.json
+pnpm run test:arch:record          # record current failing tests into expected-failure manifest
 pnpm run test:all                  # Vitest + Deno WebGPU (auto-fallback)
 pnpm run test:deno                 # Deno WebGPU tests only (headless GPU)
+pnpm run lint:ownership:internal   # maintainer-only transform ownership lint checks
 pnpm test test/conv.test.ts        # single file
 pnpm run check                     # tsc type-check
 pnpm run lint && pnpm run format   # ESLint + Prettier
@@ -161,6 +179,17 @@ pnpm run test:deno                 # Run Deno WebGPU tests
 ```
 
 These match the checks in `.github/workflows/ci.yaml`.
+
+### Testing policy modes
+
+The repository supports two test policies:
+
+- **Strict mode (default):** no failing tests and no expected-failure entries.
+- **Architectural mode (opt-in):** failures are allowed only if listed in
+  `.ci/expected-failures.json` with owner, reason, and expiry.
+
+Use `JAX_ARCH_MODE=1 git commit -m "..."` to run architectural mode from pre-commit. See
+`docs/testing-policy.md` for workflow and review guidance.
 
 ### Rebase to main
 
@@ -2883,6 +2912,8 @@ Current rollout in this repo:
 - `configs.recommended` — `require-using: warn`, `no-use-after-dispose: error`,
   `no-dispose-then-reassign-param: warn`, `no-unnecessary-ref: warn`, `no-array-chain: off`
 - `configs.strict` — all rules at `error` level, including `no-array-chain`
+- `configs.internalTransforms` — maintainer-focused retention symmetry checks:
+  `require-retained-release`, `require-try-finally-symmetry`, `require-wrapper-dispose-symmetry`
 
 **User setup (external consumers):**
 
@@ -2900,6 +2931,10 @@ Implemented rules:
   hazards
 - `jax-js/no-unnecessary-ref` — **autofix** (removes `.ref` with `--fix`)
 - `jax-js/no-array-chain` — reports outermost chain only (no duplicate subchain reports)
+- `jax-js/require-retained-release` — retained `.ref` handles must have explicit terminal paths
+- `jax-js/require-try-finally-symmetry` — `.ref` temporaries in `try` must be cleaned in `finally`
+- `jax-js/require-wrapper-dispose-symmetry` — wrapper `dispose()` should release retained state
+  before `this.inner.dispose()`
 
 Current semantics in the in-repo implementation:
 

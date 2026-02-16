@@ -14,6 +14,7 @@
   <a href="https://hamk-uas.github.io/jax-js-nonconsuming/">Website</a> |
   <a href="https://hamk-uas.github.io/jax-js-nonconsuming/docs/">API Reference</a> |
   <a href="./FEATURES.md">Compatibility Table</a> |
+  <a href="./.github/copilot-instructions.md">Copilot Instructions</a> |
   <a href="https://discord.gg/BW6YsCd4Tf">jax-js Discord</a>
 </strong></p>
 
@@ -360,7 +361,7 @@ That's all for this short tutorial. Please see the generated
 
 ## Development
 
-_The following technical details are for contributing to jax-js-consuming and modifying its
+_The following technical details are for contributing to jax-js-nonconsuming and modifying its
 internals._
 
 This repository is managed by [`pnpm`](https://pnpm.io/). You can compile and build all packages in
@@ -372,8 +373,13 @@ pnpm run build:watch
 ```
 
 The `pnpm install` command automatically sets up Git hooks via
-[Husky](https://typicode.github.io/husky/). Pre-commit hooks will run ESLint and Prettier on staged
-files to ensure code quality.
+[Husky](https://typicode.github.io/husky/). This repository intentionally shifts verification left:
+we run the necessary quality and release-safety checks in local pre-commit rather than relying on
+heavy CI gates for GitHub Pages deployment confidence.
+
+### Local check workflow
+
+Run checks iteratively while developing:
 
 You can also run linting and formatting manually:
 
@@ -382,6 +388,8 @@ pnpm lint          # Run ESLint (includes @jax-js-nonconsuming/eslint-plugin-jax
 pnpm format        # Format all files with Prettier
 pnpm format:check  # Check formatting without writing
 pnpm check         # Run TypeScript type checking
+pnpm run test:eslint-plugin   # Rule-level tests for in-repo ESLint plugin
+pnpm run lint:ownership:internal  # Maintainer transform ownership checks
 ```
 
 Then you can run tests in a headless browser using [Vitest](https://vitest.dev/).
@@ -389,7 +397,69 @@ Then you can run tests in a headless browser using [Vitest](https://vitest.dev/)
 ```bash
 pnpm exec playwright install
 pnpm test
+pnpm run test:policy:strict  # Strict mode: no expected-failure debt
+pnpm run test:arch           # Architectural mode: failures gated by manifest
+pnpm run test:deno           # Deno WebGPU tests (isolated files)
+pnpm run test:website:smoke  # Website build + smoke checks
 ```
+
+Architectural mode is intended for large refactors and uses `.ci/expected-failures.json` as an
+explicit, expiring debt ledger. See `docs/testing-policy.md` for workflow details.
+
+For maintainer-only transform ownership checks in framework internals, run:
+
+```bash
+pnpm run lint:ownership:internal
+```
+
+For website ownership checks used by demos/repl:
+
+```bash
+pnpm run lint:ownership:website
+```
+
+### Pre-commit policy
+
+Pre-commit is branch-aware and runs via `scripts/precommit.sh`.
+
+- **Feature profile** (default on non-main branches):
+  - `build`, `check`, `lint`, `format:check`
+  - `test:eslint-plugin`
+  - `lint:ownership:internal`, `lint:ownership:website`
+  - core invariants: `vitest run test/refcount.test.ts test/transform-compositions.test.ts`
+- **Full profile** (default on `main`, `master`, `release/*`, `hotfix/*`):
+  - everything in feature profile
+  - `test:policy:strict`
+  - `test:deno`
+  - `test:website:smoke`
+
+This keeps day-to-day feature iteration fast while enforcing release-grade checks when committing on
+main/release branches.
+
+For large refactors with explicit, expiring expected-failure debt, use architectural mode:
+
+```bash
+JAX_ARCH_MODE=1 git commit -m "your message"
+```
+
+Architectural mode still enforces strict core invariant suites before applying manifest-based
+failure accounting. See `docs/testing-policy.md` for workflow details.
+
+You can override profile selection explicitly:
+
+```bash
+JAX_PRECOMMIT_PROFILE=feature git commit -m "..."
+JAX_PRECOMMIT_PROFILE=full git commit -m "..."
+```
+
+Before merging to `main`, run one commit (or dry run) with full profile:
+
+```bash
+JAX_PRECOMMIT_PROFILE=full git commit -m "chore: pre-merge full local checks"
+```
+
+Inspiration from `hamk-uas/eslint-plugin-jax-js`: keep hooks explicit and developer-visible, and
+keep maintainer release checks documented and reproducible.
 
 We are currently on an older version of Playwright that supports using WebGPU in headless mode;
 newer versions skip the WebGPU tests.
@@ -430,8 +500,18 @@ git pull --ff-only
 ```bash
 pnpm build
 pnpm check
-pnpm test
+pnpm run test:policy:strict
 pnpm run test:deno
+pnpm run test:website:smoke
+pnpm run test:eslint-plugin
+pnpm run lint:ownership:internal
+pnpm run lint:ownership:website
+```
+
+Equivalent single-gate approach (uses the same full profile as main-branch pre-commit):
+
+```bash
+JAX_PRECOMMIT_PROFILE=full scripts/precommit.sh
 ```
 
 3. Bump `package.json` version (for the first stable release: `0.2.0`).
@@ -494,7 +574,7 @@ that happens, upstream jax-js continues independently.
 Before submitting a PR, run the full CI checks locally:
 
 ```bash
-pnpm build && pnpm check && pnpm test && pnpm run test:deno
+pnpm build && pnpm check && pnpm run test:policy:strict && pnpm run test:deno && pnpm run test:website:smoke && pnpm run test:eslint-plugin && pnpm run lint:ownership:internal && pnpm run lint:ownership:website
 ```
 
 ## Differences from upstream

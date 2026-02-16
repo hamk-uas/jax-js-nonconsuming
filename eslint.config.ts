@@ -30,6 +30,16 @@ export default defineConfig([
     },
   },
   {
+    files: ["scripts/**/*.mjs"],
+    ...ts.configs.disableTypeChecked,
+  },
+  {
+    files: ["scripts/**/*.mjs"],
+    rules: {
+      "@typescript-eslint/consistent-type-exports": "off",
+    },
+  },
+  {
     plugins: { import: eslintImport, "jax-js": jaxJsPlugin },
     rules: {
       "@typescript-eslint/consistent-type-exports": "error",
@@ -83,6 +93,9 @@ export default defineConfig([
       "jax-js/no-array-chain": "off",
       "jax-js/no-dispose-then-reassign-param": "off",
       "jax-js/no-make-disposable-alias": "off",
+      "jax-js/require-retained-release": "off",
+      "jax-js/require-try-finally-symmetry": "off",
+      "jax-js/require-wrapper-dispose-symmetry": "off",
       "jax-js/no-unnecessary-ref": "off",
       "jax-js/no-use-after-dispose": "off",
       "jax-js/require-using": "off",
@@ -129,10 +142,23 @@ export default defineConfig([
       "jax-js/no-array-chain": "off",
       "jax-js/no-dispose-then-reassign-param": "off",
       "jax-js/no-make-disposable-alias": "off",
+      "jax-js/require-retained-release": "off",
+      "jax-js/require-try-finally-symmetry": "off",
+      "jax-js/require-wrapper-dispose-symmetry": "off",
       "jax-js/no-unnecessary-ref": "off",
       "jax-js/no-use-after-dispose": "off",
       "jax-js/require-using": "off",
       "jax-js/require-scan-result-dispose": "off",
+    },
+  },
+  {
+    files: ["scripts/**/*.mjs"],
+    languageOptions: { globals: globals.node },
+  },
+  {
+    files: ["scripts/**/*.mjs"],
+    rules: {
+      "@typescript-eslint/consistent-type-exports": "off",
     },
   },
 ]);

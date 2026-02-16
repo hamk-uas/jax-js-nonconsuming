@@ -5,8 +5,11 @@ import noDisposeThenReassignParam from "./rules/no-dispose-then-reassign-param";
 import noMakeDisposableAlias from "./rules/no-make-disposable-alias";
 import noUnnecessaryRef from "./rules/no-unnecessary-ref";
 import noUseAfterDispose from "./rules/no-use-after-dispose";
+import requireRetainedRelease from "./rules/require-retained-release";
 import requireScanResultDispose from "./rules/require-scan-result-dispose";
+import requireTryFinallySymmetry from "./rules/require-try-finally-symmetry";
 import requireUsing from "./rules/require-using";
+import requireWrapperDisposeSymmetry from "./rules/require-wrapper-dispose-symmetry";
 
 const plugin: ESLint.Plugin = {
   meta: {
@@ -21,6 +24,9 @@ const plugin: ESLint.Plugin = {
     "no-unnecessary-ref": noUnnecessaryRef,
     "no-array-chain": noArrayChain,
     "require-scan-result-dispose": requireScanResultDispose,
+    "require-retained-release": requireRetainedRelease,
+    "require-try-finally-symmetry": requireTryFinallySymmetry,
+    "require-wrapper-dispose-symmetry": requireWrapperDisposeSymmetry,
   },
 };
 
@@ -70,10 +76,23 @@ const strict: Linter.Config = {
   },
 };
 
+/**
+ * Internal transform-ownership config — high-signal checks for wrapper/retention
+ * symmetry in framework internals (e.g. transform plumbing).
+ */
+const internalTransforms: Linter.Config = {
+  plugins: { "jax-js": plugin },
+  rules: {
+    "jax-js/require-retained-release": "warn",
+    "jax-js/require-try-finally-symmetry": "warn",
+    "jax-js/require-wrapper-dispose-symmetry": "warn",
+  },
+};
+
 // Attach configs to plugin object for flat-config consumers:
 //   import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
 //   export default [ jaxJs.configs.recommended, ... ];
-(plugin as any).configs = { recommended, strict };
+(plugin as any).configs = { recommended, strict, internalTransforms };
 
 export default plugin;
-export { recommended, strict };
+export { recommended, strict, internalTransforms };

@@ -64,6 +64,28 @@ export default [
 Strict promotes everything to `error` and enables `no-array-chain` — useful for library code and CI
 enforcement.
 
+### Internal transform config (maintainers)
+
+For framework internals (transform wrappers, retained handles, dispose ordering), use:
+
+```ts
+// eslint.config.ts
+import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
+
+export default [
+  {
+    files: ["src/frontend/{jaxpr,jit,jvp,linearize,vmap}.ts"],
+    ...jaxJs.configs.internalTransforms,
+  },
+];
+```
+
+This enables:
+
+- `jax-js/require-retained-release`
+- `jax-js/require-try-finally-symmetry`
+- `jax-js/require-wrapper-dispose-symmetry`
+
 ### Individual rule control
 
 ```ts
@@ -81,6 +103,9 @@ export default [
       "jax-js/no-unnecessary-ref": "warn",
       "jax-js/no-array-chain": ["error", { minDepth: 3 }],
       "jax-js/require-scan-result-dispose": "warn",
+      "jax-js/require-retained-release": "warn",
+      "jax-js/require-try-finally-symmetry": "warn",
+      "jax-js/require-wrapper-dispose-symmetry": "warn",
     },
   },
 ];
@@ -109,6 +134,9 @@ export default [
       "jax-js/no-unnecessary-ref": "off",
       "jax-js/no-array-chain": "off",
       "jax-js/require-scan-result-dispose": "off",
+      "jax-js/require-retained-release": "off",
+      "jax-js/require-try-finally-symmetry": "off",
+      "jax-js/require-wrapper-dispose-symmetry": "off",
     },
   },
 ];
@@ -343,6 +371,23 @@ function owned(step, initCarry, xs) {
   return tree.makeDisposable({ carry, ys });
 }
 ```
+
+### `jax-js/require-retained-release` (internal)
+
+Flags retained handles created from `.ref` that never show a terminal action in scope.
+
+Accepted terminals include `.dispose()`, transfer as function argument, return/yield, and ownership
+handoff via assignment/object/array construction.
+
+### `jax-js/require-try-finally-symmetry` (internal)
+
+Flags `.ref` temporaries created inside `try` blocks when cleanup is not guaranteed in the matching
+`finally` block.
+
+### `jax-js/require-wrapper-dispose-symmetry` (internal)
+
+In wrapper `dispose()` methods, enforces retained-state cleanup before `this.inner.dispose()`. If
+`this.inner.dispose()` appears, it must be the last `.dispose()` call in the method body.
 
 ### Recommended ownership patterns
 
