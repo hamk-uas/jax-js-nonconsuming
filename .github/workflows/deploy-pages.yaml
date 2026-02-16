@@ -32,10 +32,8 @@ jobs:
       # Build the library (needed by website and typedoc)
       - run: pnpm build
 
-      # Build the website with the GitHub Pages base path
+      # Build the website (deployed at the root of GitHub Pages)
       - run: pnpm -C website build
-        env:
-          BASE_PATH: /jax-js-nonconsuming
 
       # Generate typedoc API docs and copy into the website build
       - run: pnpm run docs && cp -r docs/ website/build/docs
