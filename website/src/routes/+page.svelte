@@ -4,7 +4,7 @@
 
   import { ArrowUpRight, ExternalLinkIcon } from "@lucide/svelte";
 
-  import logo from "$lib/assets/logo.svg";
+  import logo from "$lib/assets/logo-nonconsuming.svg";
   import MatmulPerfDemo from "$lib/homepage/MatmulPerfDemo.svelte";
   import EmbeddedRepl from "$lib/repl/EmbeddedRepl.svelte";
 
@@ -57,7 +57,7 @@
 </script>
 
 <svelte:head>
-  <title>jax-js-nonconsuming – ML for the web</title>
+  <title>jax-js-nonconsuming (Fork) – ML for the web</title>
 </svelte:head>
 
 <!-- Header -->
@@ -99,6 +99,22 @@
             >a machine learning</span
           ><span class="sm:hidden">an ML</span> library and compiler for the web
         </h1>
+        <div
+          class="mb-8 p-4 bg-amber-50 border-l-4 border-amber-400 text-amber-900 rounded-r shadow-sm"
+        >
+          <p class="font-bold mb-1">Fork Notice</p>
+          <p class="text-sm">
+            This is a <strong>non-consuming ownership fork</strong> of
+            <a
+              href="https://github.com/ekzhang/jax-js"
+              class="underline hover:text-amber-700"
+              target="_blank"
+              rel="noopener noreferrer">ekzhang/jax-js</a
+            >. Operations leave inputs alive (no manual
+            <code class="bg-amber-100 px-1 rounded">.ref</code> needed), designed
+            for teams familiar with NumPy or MATLAB.
+          </p>
+        </div>
         <p class="text-lg text-gray-700 leading-snug mb-8 max-w-2xl">
           High-performance WebGPU and WebAssembly kernels in JavaScript. Run
           neural networks, image algorithms, simulations, and numerical code,

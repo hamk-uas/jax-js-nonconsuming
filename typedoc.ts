@@ -54,7 +54,7 @@ await Promise.all(cmds);
 // Merge all package docs into a single HTML output.
 await sh`
 pnpm typedoc \
-  --name jax-js \
+  --name "jax-js-nonconsuming (Fork)" \
   --entryPointStrategy merge \
   --favicon website/static/favicon.ico \
   --titleLink "https://hamk-uas.github.io/jax-js-nonconsuming/" \

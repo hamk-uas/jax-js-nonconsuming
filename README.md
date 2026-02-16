@@ -45,6 +45,17 @@ const x = np.array([1, 2, 3]);
 const y = x.mul(4); // [4, 8, 12]
 ```
 
+## Demos
+
+- [Training neural networks on MNIST](https://hamk-uas.github.io/jax-js-nonconsuming/mnist)
+- [Voice cloning: Kyutai Pocket TTS](https://hamk-uas.github.io/jax-js-nonconsuming/tts)
+- [CLIP embeddings for books in-browser](https://hamk-uas.github.io/jax-js-nonconsuming/mobileclip)
+- [Object detection: DETR ResNet-50 (ONNX)](https://hamk-uas.github.io/jax-js-nonconsuming/detr-resnet-50)
+- [In-browser REPL](https://hamk-uas.github.io/jax-js-nonconsuming/repl)
+- [Matmul benchmark](https://hamk-uas.github.io/jax-js-nonconsuming/bench/matmul)
+- [Conv2d benchmark](https://hamk-uas.github.io/jax-js-nonconsuming/bench/conv2d)
+- [Mandelbrot set](https://hamk-uas.github.io/jax-js-nonconsuming/mandelbrot)
+
 ## Feature comparison
 
 Here's a quick, high-level comparison with other popular web ML runtimes:

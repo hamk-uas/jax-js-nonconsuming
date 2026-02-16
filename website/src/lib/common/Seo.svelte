@@ -1,7 +1,7 @@
 <script lang="ts">
   const {
-    title = "jax-js-nonconsuming – Open-source web ML framework",
-    description = "Machine learning library and compiler for the web, written in pure JavaScript. Run high-performance WebAssembly and WebGPU kernels.",
+    title = "jax-js-nonconsuming – Open-source web ML framework (Fork)",
+    description = "Non-consuming ownership fork of jax-js. Machine learning library and compiler for the web, written in pure JavaScript. Run high-performance WebAssembly and WebGPU kernels.",
   }: { title?: string; description?: string } = $props();
 </script>
 
