@@ -25,7 +25,7 @@
 > **Why this fork?** The original jax-js uses move semantics, where operations consume their inputs.
 > This fork was created for teams familiar with MATLAB or Python (NumPy) where move semantics are
 > unexpected. We also fast-tracked a `lax.scan` implementation. The tradeoff is that forgetting
-> `.dispose()` leaks silently instead of crashing on reuse — see
+> `.dispose()` can leak silently instead of crashing on reuse — see
 > [Tradeoffs](#tradeoffs-of-the-non-consuming-model) for an honest comparison.
 >
 > See [Differences from upstream](#differences-from-upstream) for a full comparison between the
@@ -587,14 +587,15 @@ pnpm build && pnpm check && pnpm run test:policy:strict && pnpm run test:deno &&
 ## Differences from upstream
 
 This fork replaces the upstream **move-semantics** ownership model with a **non-consuming** model.
-The API is otherwise identical — all NumPy/JAX functions, `jit`, `grad`, `vmap`, `scan`, backends,
-and demos work the same way. Mandelbrot has been updated with `scan` though.
+Outside ownership semantics and fork-specific features, the APIs are broadly aligned for common
+NumPy/JAX usage (`jit`, `grad`, `vmap`, backends, demos), with some intentional divergence (for
+example `scan`, `checkLeaks`, and ownership tooling).
 
 | Aspect                             | Upstream (ekzhang/jax-js)                   | This fork (non-consuming)                                   |
 | ---------------------------------- | ------------------------------------------- | ----------------------------------------------------------- |
 | **Ownership model**                | Move semantics                              | Non-consuming                                               |
 | **Operations consume inputs?**     | Yes — every op decrements refcount          | No — inputs stay alive                                      |
-| **`.ref` needed to reuse arrays?** | Yes — `x.ref` before passing to a second op | Never                                                       |
+| **`.ref` needed to reuse arrays?** | Yes — `x.ref` before passing to a second op | Not in user code                                            |
 | **`UseAfterFreeError` risk**       | Common if `.ref` is forgotten               | Gone for reuse; still possible after explicit `.dispose()`  |
 | **`using` declarations**           | Not used                                    | First-class — auto-dispose at block end                     |
 | **ESLint plugin**                  | `@hamk-uas/eslint-plugin-jax-js` (move)     | `@jax-js-nonconsuming/eslint-plugin-jax-js` (non-consuming) |
@@ -610,9 +611,9 @@ The non-consuming model makes some things easier and other things harder. Here a
 
 **Important context: JIT neutralizes most intermediate-lifetime differences.** Under `jit()`, both
 ownership models compile to the same Jaxpr graph, and the compiler derives buffer lifetimes from
-that graph — not from the ownership model. Intermediates are freed at their exact last use, buffers
-are recycled, and peak memory is identical regardless of which model you use. The tradeoffs below
-apply primarily to **eager mode** — the mode you use for debugging, prototyping, and the REPL.
+that graph — not from the ownership model. Intermediates and buffers are freed at exact last use; in
+many common workloads this makes peak-memory behavior very similar across models. The tradeoffs
+below apply primarily to **eager mode** — the mode you use for debugging, prototyping, and the REPL.
 Production hot paths should be JIT-wrapped anyway for performance (kernel fusion), which narrows the
 practical ownership-model gap to JIT boundaries (who disposes inputs, outputs, and the `jit`
 function itself) and any code that runs outside `jit()`.
@@ -683,9 +684,10 @@ This fork bets that silent-leak-plus-tooling is easier to manage for teams comin
   already invested in the move-semantics model and the `@hamk-uas` ESLint plugin, or if you need to
   stay on the upstream release cadence.
 
-The two versions are **not mix-and-match** — code written for one ownership model will not work
-correctly with the other. The `@jax-js-nonconsuming/eslint-plugin-jax-js` included here enforces the
-non-consuming patterns and will flag `.ref` usage as unnecessary.
+The two versions are **not drop-in interchangeable** — ownership patterns from one model can behave
+incorrectly or awkwardly in the other, especially around `.ref` and disposal discipline. The
+`@jax-js-nonconsuming/eslint-plugin-jax-js` included here enforces the non-consuming patterns and
+will flag `.ref` usage as unnecessary.
 
 ### Migrating from upstream
 

@@ -32,7 +32,8 @@
  * 1 from user code, 1 in @jax-js-nonconsuming/jax.
  *
  * 3 slot(s) not in tracked list (created before start() or by internal buffers).
- * rc=1 → never disposed. Prefer `using` for local temporaries, or call .dispose() when done.
+ * rc=1 → never disposed. Use `using` for local temporaries, and call .dispose() at end-of-life
+ * (including early .dispose() when a value is no longer needed to reduce peak memory).
  * ```
  *
  * ## How it works
@@ -506,7 +507,7 @@ export const checkLeaks = {
     }
     if (sorted.some(([, g]) => !g.pkg && g.maxRc === 1)) {
       tips.push(
-        "rc=1 → never disposed. Prefer `using` for local temporaries, or call .dispose() at end-of-life.",
+        "rc=1 → never disposed. Use `using` for local temporaries, and call .dispose() at end-of-life (including early .dispose() when no longer needed to reduce peak memory).",
       );
     }
     if (sorted.some(([, g]) => g.maxRc >= 2)) {
