@@ -6,7 +6,7 @@
   <a href="https://hamk-uas.github.io/jax-js-nonconsuming/">Website</a> |
   <a href="https://hamk-uas.github.io/jax-js-nonconsuming/docs/">API Reference</a> |
   <a href="./FEATURES.md">Compatibility Table</a> |
-  <a href="https://discord.gg/BW6YsCd4Tf">Discord</a>
+  <a href="https://discord.gg/BW6YsCd4Tf">jax-js Discord</a>
 </strong></p>
 
 > **Fork notice:** This is a fork of [ekzhang/jax-js](https://github.com/ekzhang/jax-js) with a
@@ -25,7 +25,13 @@
 numerical applications on the web.
 
 ```bash
-npm i @jax-js-nonconsuming/jax
+npm install github:hamk-uas/jax-js-nonconsuming
+```
+
+To pin a specific release tag (once available):
+
+```bash
+npm install github:hamk-uas/jax-js-nonconsuming#v0.2.0
 ```
 
 Under the hood, it translates array operations into a compiler representation, then synthesizes

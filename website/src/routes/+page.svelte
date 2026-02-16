@@ -9,16 +9,11 @@
   import EmbeddedRepl from "$lib/repl/EmbeddedRepl.svelte";
 
   const installText = {
-    npm: `npm install @jax-js-nonconsuming/jax`,
-    web:
-      `<` +
-      String.raw`script type="module">
-  import * as jax from "https://esm.sh/@jax-js-nonconsuming/jax";
-</script` +
-      `>`,
+    npm: `npm install github:hamk-uas/jax-js-nonconsuming`,
+    pin: `npm install github:hamk-uas/jax-js-nonconsuming#v0.2.0`,
   };
 
-  let installMode = $state<"npm" | "web">("npm");
+  let installMode = $state<"npm" | "pin">("npm");
 
   const links = [
     {
@@ -127,24 +122,23 @@
             Add jax-js-nonconsuming to your project
           </h2>
           <p class="text-gray-600 text-sm mb-4">
-            Zero dependencies. All major browsers, with <button
-              class="enabled:underline"
-              onclick={() => (installMode = "npm")}
-              disabled={installMode === "npm"}>bundlers</button
-            >
-            and in
+            Zero dependencies. All major browsers. Install from
             <button
               class="enabled:underline"
-              onclick={() => (installMode = "web")}
-              disabled={installMode === "web"}>JS modules</button
+              onclick={() => (installMode = "npm")}
+              disabled={installMode === "npm"}>GitHub</button
+            >
+            or
+            <button
+              class="enabled:underline"
+              onclick={() => (installMode = "pin")}
+              disabled={installMode === "pin"}>pin a tag</button
             >.
           </p>
           <div
             class="bg-primary/5 border-1 border-primary rounded-lg px-3 py-2 font-mono whitespace-pre-wrap"
           >
-            <span
-              class="text-primary/50 select-none"
-              class:hidden={installMode === "web"}>&gt;&nbsp;</span
+            <span class="text-primary/50 select-none">&gt;&nbsp;</span
             >{installText[installMode]}
           </div>
         </div>
