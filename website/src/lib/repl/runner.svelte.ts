@@ -226,7 +226,12 @@ async function _runProgram(
         const result = ts.transpileModule(code, {
           compilerOptions: {
             module: ts.ModuleKind.ESNext,
-            target: ts.ScriptTarget.ES2022,
+            // ESNext emits `using` declarations natively (just strips types).
+            // ES2022 downleveled `using` into 80+ lines of try/catch/finally
+            // helper code whose source map had gaps, breaking leak diagnostic
+            // line remapping. All browsers with WebGPU (REPL prerequisite)
+            // support `using` natively (Chrome 134+, Firefox 134+, Safari 18.2+).
+            target: ts.ScriptTarget.ESNext,
             sourceMap: true,
           },
           fileName: id,

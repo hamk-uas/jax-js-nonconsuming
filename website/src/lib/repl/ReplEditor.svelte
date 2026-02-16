@@ -55,10 +55,12 @@
     if (!monaco || !editor) return;
     const model = editor.getModel();
     if (!model) return;
+    const lineCount = model.getLineCount();
+    const valid = markers.filter((m) => m.line >= 1 && m.line <= lineCount);
     monaco.editor.setModelMarkers(
       model,
       "leak-diagnostics",
-      markers.map((m) => ({
+      valid.map((m) => ({
         startLineNumber: m.line,
         startColumn: 1,
         endLineNumber: m.line,

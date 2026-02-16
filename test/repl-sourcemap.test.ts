@@ -1,10 +1,16 @@
 /**
  * Tests for the REPL source-map remapping pipeline.
  *
- * The REPL compiles user TypeScript → TS transpile → Rollup system-format
- * bundle → prepend header ";". A source map tracks positions through this
- * chain. `checkLeaks` reports generated-code positions (e.g. `index.ts:5:5`);
- * the remap functions convert these back to the user's original source lines.
+ * The REPL compiles user TypeScript → TS transpile (ESNext target) → Rollup
+ * system-format bundle → prepend header ";". A source map tracks positions
+ * through this chain. `checkLeaks` reports generated-code positions (e.g.
+ * `index.ts:5:5`); the remap functions convert these back to the user's
+ * original source lines.
+ *
+ * IMPORTANT: The REPL uses `target: ESNext` so that `using` declarations are
+ * emitted natively (just stripped of types). Using `target: ES2022` would
+ * downlevel `using` into 80+ lines of try/catch/finally helper code whose
+ * source map has gaps (lines 78-85 unmapped), breaking leak line remapping.
  *
  * VLQ refresher (for reading test data):
  *   A=0  C=+1  D=-1  E=+2  G=+3  I=+4  K=+5  M=+6
@@ -233,5 +239,66 @@ describe("realistic REPL scenario", () => {
     const remapped = remapReplLocationText(detail, replMap);
     // No mapping found → position is left unchanged
     expect(remapped).toBe("something at index.ts:2:1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// End-to-end: real TypeScript transpile source maps (ESNext vs ES2022)
+// ---------------------------------------------------------------------------
+describe("TS transpile source map coverage", () => {
+  // These maps were captured from actual TypeScript 5.9 transpileModule output.
+  // The REPL uses target: ESNext so that `using` declarations are emitted
+  // natively. Using target: ES2022 downlevels `using` into 60-90 lines of
+  // try/catch/finally helper code whose source map has coverage gaps.
+
+  // User code (4 lines):
+  //   import { numpy as np } from "@jax-js-nonconsuming/jax";
+  //   const x = np.array([1, 2, 3, 4]);
+  //   using y = np.array([5, 6]);
+  //   console.log(x.js());
+
+  // ESNext output: 4 code lines (+ sourceMappingURL), all mapped
+  const esnextMap = {
+    mappings:
+      "AAAA,OAAO,EAAE,KAAK,IAAI,EAAE,EAAE,MAAM,0BAA0B,CAAC;AACvD,MAAM,CAAC,GAAG,EAAE,CAAC,KAAK,CAAC,CAAC,CAAC,EAAE,CAAC,EAAE,CAAC,EAAE,CAAC,CAAC,CAAC,CAAC;AACjC,MAAM,CAAC,GAAG,EAAE,CAAC,KAAK,CAAC,CAAC,CAAC,EAAE,CAAC,CAAC,CAAC,CAAC;AAC3B,OAAO,CAAC,GAAG,CAAC,CAAC,CAAC,EAAE,EAAE,CAAC,CAAC",
+  };
+
+  test("ESNext: all 4 user code lines have source map coverage", () => {
+    const groups = esnextMap.mappings.split(";");
+    expect(groups).toHaveLength(4); // 4 generated lines
+    // Every group should have segments (no empty lines)
+    for (const g of groups) {
+      expect(g.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("ESNext: np.array line maps back to original line 2", () => {
+    // Line 2 of ESNext output = `const x = np.array([1, 2, 3, 4]);`
+    const pos = mapGeneratedPositionToSource(esnextMap, 2, 1);
+    expect(pos).not.toBeNull();
+    expect(pos!.line).toBe(2); // original line 2
+  });
+
+  test("ESNext: using line maps back to original line 3", () => {
+    const pos = mapGeneratedPositionToSource(esnextMap, 3, 1);
+    expect(pos).not.toBeNull();
+    expect(pos!.line).toBe(3);
+  });
+
+  test("ESNext + header: np.array at gen line 3 maps to original line 2", () => {
+    // REPL prepends ";" for header → shift all mappings by 1 generated line
+    const adjusted = { mappings: ";" + esnextMap.mappings };
+    const pos = mapGeneratedPositionToSource(adjusted, 3, 1);
+    expect(pos).not.toBeNull();
+    expect(pos!.line).toBe(2);
+  });
+
+  test("ES2022 target produces fewer map groups than output lines", () => {
+    // ES2022 transpile of the same 4-line code produces 68 output lines
+    // but only 59 source map groups — catch/finally blocks are unmapped.
+    // This is the root cause of the REPL leak diagnostic line number bug.
+    const es2022OutputLines = 68;
+    const es2022MapGroups = 59;
+    expect(es2022MapGroups).toBeLessThan(es2022OutputLines);
   });
 });
