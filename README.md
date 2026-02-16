@@ -24,9 +24,10 @@
 >
 > **Why this fork?** The original jax-js uses move semantics, where operations consume their inputs.
 > This fork was created for teams familiar with MATLAB or Python (NumPy) where move semantics are
-> unexpected. We also fast-tracked a `lax.scan` implementation. The tradeoff is that forgetting
-> `.dispose()` leaks silently — `using` declarations, the ESLint plugin, and the built-in
-> `checkLeaks` diagnostic mitigate this but don't eliminate it. See
+> unexpected. We also fast-tracked a `lax.scan` implementation. `using` declarations handle
+> the common case — block-scoped arrays are disposed automatically — but patterns like method
+> chains, loop-carried state, and nested results still need manual care. A built-in `checkLeaks`
+> diagnostic and ESLint plugin help catch what `using` misses. See
 > [Tradeoffs](#tradeoffs-of-the-non-consuming-model) for an honest comparison.
 >
 > See [Differences from upstream](#differences-from-upstream) for a full comparison between the
@@ -621,19 +622,25 @@ function itself) and any code that runs outside `jit()`.
 
 **Silent leaks replace noisy crashes.** Move semantics crash immediately (`UseAfterFreeError`) when
 you forget `.ref` — painful, but the error points straight at the bug. The non-consuming model never
-crashes from reuse, but a forgotten `.dispose()` leaks GPU memory silently. You may not notice until
-the GPU is out of memory hundreds of iterations later. The `checkLeaks` diagnostic and the ESLint
-plugin exist specifically to compensate for this, but they are opt-in tools, not a built-in safety
-net. (Move semantics can also leak — e.g. an over-`.ref`'d array or a retained reference — but the
-fail-fast default makes those cases rarer in practice.)
+crashes from reuse, but a missing `.dispose()` leaks GPU memory silently. For the common case —
+block-scoped arrays — `using` declarations prevent this: arrays are disposed automatically at block
+exit. But `using` can't help everywhere: method chains create anonymous intermediates that nobody
+names (and thus nobody disposes), nested results from `scan`/`grad` need `tree.dispose()`, and
+loop-carried state or arrays stored in caches require manual discipline. The `checkLeaks` diagnostic
+(built into the test suite so every test is leak-checked) and the ESLint plugin catch many of these
+cases, but they are developer tools, not a runtime safety net. (Move semantics can also leak — e.g.
+an over-`.ref`'d array or a retained reference — but the fail-fast default for *reuse* bugs makes
+those easier to spot.)
 
 **Higher peak memory in eager mode.** Expression chains like `x.mul(y).add(z).sub(w)` create
 intermediate arrays that linger until GC or explicit disposal. With move semantics, each
 intermediate is freed as soon as the next operation consumes it. In the non-consuming model, all
 intermediates stay alive simultaneously — for large tensors this can significantly increase peak
-memory (the exact factor depends on chain length and tensor size). Under `jit()`, both models free
-intermediates at the optimal point — this is purely an eager-mode difference. But eager mode is
-where you debug, and debugging with 3× the memory footprint is a real obstacle.
+memory (the exact factor depends on chain length and tensor size). Breaking chains into `using`
+temporaries solves this (intermediates are disposed at block exit), but the code is more verbose
+than the NumPy equivalent. Under `jit()`, both models free intermediates at the optimal point —
+this is purely an eager-mode difference. But eager mode is where you debug, and debugging with
+higher memory footprint is a real obstacle.
 
 **JavaScript GC doesn't know about GPU memory.** The JS garbage collector tracks JS heap pressure,
 not the 4 GB of VRAM on your GPU. A leaked 512×512 `f32` buffer is 1 MB of GPU memory but only ~64
@@ -643,10 +650,10 @@ explicitly. The non-consuming model simply makes it easier to forget, because no
 you do.
 
 **Method chains become a pain point in eager mode.** `a.mul(b).add(c).div(d)` is natural in NumPy.
-In the non-consuming model, each `.method()` allocates a new GPU buffer that nobody frees. You need
-`using` declarations (which require separate statements) or explicit `.dispose()`. Under `jit()`,
-these chains produce tracers (not real GPU buffers) and the compiler manages everything — so the
-problem only appears in eager code. Still, eager code is where you prototype and learn the API:
+In the non-consuming model, each `.method()` allocates a new GPU buffer. The fix is `using`
+declarations, but they require separate statements — one per intermediate. Under `jit()`, these
+chains produce tracers (not real GPU buffers) and the compiler manages everything — so the memory
+cost only appears in eager code. Still, eager code is where you prototype and learn the API:
 
 ```ts
 // ❌ Leaks two intermediate GPU buffers in eager mode:
@@ -666,18 +673,20 @@ const result = t2.div(d);
 everywhere — Svelte's parser can't handle `using` in `.svelte` files, and older bundlers may need
 transpilation. A polyfill is included, but it adds friction.
 
-**More tooling required.** Move semantics fail fast for reuse mistakes, but still benefit from lint
-rules and discipline for other leak patterns (over-`.ref`, retained references, forgotten
-`vjpFn.dispose()`). The non-consuming model leans harder on voluntary tooling — the ESLint plugin
-for static analysis, `checkLeaks` for runtime detection, and developer discipline for everything in
-between — because the language itself won't tell you when you forgot `.dispose()`.
+**More tooling required for edge cases.** `using` handles the most common pattern (block-scoped
+arrays) at the language level. But for patterns it doesn't cover — method chains, pytree results,
+loop-carried state, long-lived closures — the non-consuming model leans on voluntary tooling: the
+ESLint plugin for static analysis and `checkLeaks` for runtime detection. Move semantics fail fast
+for *reuse* mistakes, but have their own blind spots (over-`.ref`, retained references, forgotten
+`vjpFn.dispose()`) that also need tooling and discipline.
 
 **Neither model is free.** Move semantics pay with `UseAfterFreeError` bugs, `.ref` boilerplate, and
-their own leak surfaces (over-ref, retained refs). The non-consuming model pays with silent leaks,
-higher eager-mode memory, and heavier reliance on tooling. Under `jit()`, the two models converge —
-the compiled programs are identical. Both models need discipline; they just fail in different ways.
-This fork bets that silent-leak-plus-tooling is easier to manage for teams coming from Python/MATLAB
-— but it is a genuine tradeoff, not a free lunch.
+their own leak surfaces (over-ref, retained refs). The non-consuming model eliminates those costs
+but introduces its own: silent leaks for patterns that `using` can't cover, higher eager-mode memory
+for unchained intermediates, and reliance on `checkLeaks`/ESLint for the gaps. Under `jit()`, the
+two models converge — the compiled programs are identical. Both models need discipline; they just
+fail in different ways. This fork bets that `using`-by-default plus opt-in tooling is easier to
+manage for teams coming from Python/MATLAB — but it is a genuine tradeoff, not a free lunch.
 
 ### Which version should I use?
 
