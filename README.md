@@ -25,7 +25,8 @@
 > **Why this fork?** The original jax-js uses move semantics, where operations consume their inputs.
 > This fork was created for teams familiar with MATLAB or Python (NumPy) where move semantics are
 > unexpected. We also fast-tracked a `lax.scan` implementation. The tradeoff is that forgetting
-> `.dispose()` can leak silently instead of crashing on reuse — see
+> `.dispose()` leaks silently — `using` declarations, the ESLint plugin, and the built-in
+> `checkLeaks` diagnostic mitigate this but don't eliminate it. See
 > [Tradeoffs](#tradeoffs-of-the-non-consuming-model) for an honest comparison.
 >
 > See [Differences from upstream](#differences-from-upstream) for a full comparison between the
@@ -656,7 +657,9 @@ using t1 = a.mul(b);
 using t2 = t1.add(c);
 const result = t2.div(d);
 
-// Under jit(), the first form is fine — intermediates are tracers, not real buffers.
+// Under jit(), intermediates are tracers (not real buffers), so the chain
+// doesn't leak GPU memory in practice. But write the second form anyway —
+// code should be ownership-correct in both eager and jit mode.
 ```
 
 **`using` has ecosystem gaps.** The TC39 Explicit Resource Management proposal is not yet supported
