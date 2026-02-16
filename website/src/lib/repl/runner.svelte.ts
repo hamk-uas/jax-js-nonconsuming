@@ -27,6 +27,142 @@ export interface LeakMarker {
   message: string;
 }
 
+type SourceMapLike = {
+  mappings?: string;
+};
+
+const BASE64 =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function decodeVlq(mappings: string, start: number): [number, number] {
+  let result = 0;
+  let shift = 0;
+  let index = start;
+  let continuation = false;
+
+  do {
+    if (index >= mappings.length) {
+      return [0, index];
+    }
+    const digit = BASE64.indexOf(mappings[index++]);
+    if (digit < 0) {
+      return [0, index];
+    }
+    continuation = (digit & 32) !== 0;
+    const value = digit & 31;
+    result += value << shift;
+    shift += 5;
+  } while (continuation);
+
+  const isNegative = (result & 1) === 1;
+  result >>= 1;
+  return [isNegative ? -result : result, index];
+}
+
+function mapGeneratedPositionToSource(
+  map: SourceMapLike | null,
+  generatedLine: number,
+  generatedColumn: number,
+): { line: number; column: number } | null {
+  const mappings = map?.mappings;
+  if (!mappings || generatedLine <= 0 || generatedColumn <= 0) return null;
+
+  let index = 0;
+  let line = 1;
+  let source = 0;
+  let sourceLine = 0;
+  let sourceColumn = 0;
+  let name = 0;
+
+  while (index <= mappings.length) {
+    let generatedColumnState = 0;
+    let best: { line: number; column: number } | null = null;
+
+    while (index < mappings.length) {
+      const ch = mappings[index];
+      if (ch === ";") {
+        index++;
+        break;
+      }
+      if (ch === ",") {
+        index++;
+        continue;
+      }
+
+      let delta = 0;
+      [delta, index] = decodeVlq(mappings, index);
+      generatedColumnState += delta;
+
+      let hasSource = false;
+      if (
+        index < mappings.length &&
+        mappings[index] !== "," &&
+        mappings[index] !== ";"
+      ) {
+        hasSource = true;
+        [delta, index] = decodeVlq(mappings, index);
+        source += delta;
+        [delta, index] = decodeVlq(mappings, index);
+        sourceLine += delta;
+        [delta, index] = decodeVlq(mappings, index);
+        sourceColumn += delta;
+
+        if (
+          index < mappings.length &&
+          mappings[index] !== "," &&
+          mappings[index] !== ";"
+        ) {
+          [delta, index] = decodeVlq(mappings, index);
+          name += delta;
+        }
+      }
+
+      if (
+        line === generatedLine &&
+        hasSource &&
+        generatedColumnState <= generatedColumn - 1
+      ) {
+        best = {
+          line: sourceLine + 1,
+          column: sourceColumn + 1,
+        };
+      }
+    }
+
+    if (line === generatedLine) {
+      return best;
+    }
+
+    if (index >= mappings.length) break;
+    line++;
+  }
+
+  return null;
+}
+
+function remapReplLocationText(
+  text: string,
+  map: SourceMapLike | null,
+): string {
+  return text.replace(
+    /((?:.*\/)?(?:index|main)\.ts):(\d+):(\d+)/g,
+    (_all, filePath: string, lineRaw: string, colRaw: string) => {
+      const line = parseInt(lineRaw, 10);
+      const col = parseInt(colRaw, 10);
+      const mapped = mapGeneratedPositionToSource(map, line, col);
+      if (!mapped) return `${filePath}:${line}:${col}`;
+      return `${filePath}:${mapped.line}:${mapped.column}`;
+    },
+  );
+}
+
+function remapLeakDetails(
+  reportDetails: string[],
+  map: SourceMapLike | null,
+): string[] {
+  return reportDetails.map((detail) => remapReplLocationText(detail, map));
+}
+
 function parseLeakMarkers(reportDetails: string[]): LeakMarker[] {
   const markers: LeakMarker[] = [];
   for (const detail of reportDetails) {
@@ -188,6 +324,7 @@ async function _runProgram(
   let detailedLeakTrackingStarted = false;
   let detailedLeakSummary: string | null = null;
   let detailedLeakCount = 0;
+  let generatedSourceMap: SourceMapLike | null = null;
 
   // Builtins for the REPL environment.
   const np = jax.numpy;
@@ -281,6 +418,7 @@ async function _runProgram(
     // down by 1 line (accounting for the single-line header).
     let sourceMapComment = "";
     const map = output[0].map;
+    generatedSourceMap = map as SourceMapLike;
     if (map && map.mappings) {
       map.mappings = ";" + map.mappings;
       const json = JSON.stringify(map);
@@ -333,9 +471,16 @@ async function _runProgram(
     if (detailedLeakTrackingStarted && jax.checkLeaks?.stop) {
       try {
         const report = jax.checkLeaks.stop();
-        detailedLeakSummary = report.summary;
+        const remappedDetails = remapLeakDetails(
+          report.details,
+          generatedSourceMap,
+        );
+        detailedLeakSummary = remapReplLocationText(
+          report.summary,
+          generatedSourceMap,
+        );
         detailedLeakCount = report.leaked;
-        runner.leakMarkers = parseLeakMarkers(report.details);
+        runner.leakMarkers = parseLeakMarkers(remappedDetails);
       } catch {
         // Ignore checkLeaks reporting failures in REPL.
       }
@@ -371,9 +516,16 @@ async function _runProgram(
     if (detailedLeakTrackingStarted && jax.checkLeaks?.stop) {
       try {
         const report = jax.checkLeaks.stop();
-        detailedLeakSummary = report.summary;
+        const remappedDetails = remapLeakDetails(
+          report.details,
+          generatedSourceMap,
+        );
+        detailedLeakSummary = remapReplLocationText(
+          report.summary,
+          generatedSourceMap,
+        );
         detailedLeakCount = report.leaked;
-        runner.leakMarkers = parseLeakMarkers(report.details);
+        runner.leakMarkers = parseLeakMarkers(remappedDetails);
       } catch {
         // Ignore checkLeaks reporting failures in REPL.
       }
