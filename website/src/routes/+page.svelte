@@ -212,18 +212,16 @@ const f = (x: np.Array) => {
   return np.sqrt(s);
 };
 
-{
-  using x = np.array([1, 2, 3, 4]);
+using x = np.array([1, 2, 3, 4]);
 
-  using y0 = f(x);
-  console.log(y0.js());
+using y0 = f(x);
+console.log(y0.js());
 
-  using y1 = grad(f)(x);
-  console.log(y1.js());
+using y1 = grad(f)(x);
+console.log(y1.js());
 
-  using y2 = vmap(grad(np.square))(x);
-  console.log(y2.js());
-}
+using y2 = vmap(grad(np.square))(x);
+console.log(y2.js());
 `}
     />
   </section>
