@@ -23,7 +23,9 @@
 >
 > **Why this fork?** The original jax-js uses move semantics, where operations consume their inputs.
 > This fork was created for teams familiar with MATLAB or Python (NumPy) where move semantics are
-> unexpected. We also fast-tracked a `lax.scan` implementation.
+> unexpected. We also fast-tracked a `lax.scan` implementation. The tradeoff is that leaks are
+> silent instead of crashing — see [Tradeoffs](#tradeoffs-of-the-non-consuming-model) for an honest
+> comparison.
 >
 > See [Differences from upstream](#differences-from-upstream) for a full comparison between the
 > original and this fork.
@@ -506,7 +508,7 @@ and demos work the same way. Mandelbrot has been updated with `scan` though.
 | **Ownership model**                | Move semantics                              | Non-consuming                                               |
 | **Operations consume inputs?**     | Yes — every op decrements refcount          | No — inputs stay alive                                      |
 | **`.ref` needed to reuse arrays?** | Yes — `x.ref` before passing to a second op | Never                                                       |
-| **`UseAfterFreeError` risk**       | Common if `.ref` is forgotten               | Eliminated by design                                        |
+| **`UseAfterFreeError` risk**       | Common if `.ref` is forgotten               | Eliminated (but leaks become silent — see tradeoffs below)  |
 | **`using` declarations**           | Not used                                    | First-class — auto-dispose at block end                     |
 | **ESLint plugin**                  | `@hamk-uas/eslint-plugin-jax-js` (move)     | `@jax-js-nonconsuming/eslint-plugin-jax-js` (non-consuming) |
 | **`lax.scan`**                     | Not implemented                             | Full support (JIT, autodiff, vmap, native compilation)      |
@@ -515,12 +517,65 @@ and demos work the same way. Mandelbrot has been updated with `scan` though.
 | **`Array.consumeData()`**          | Not available                               | Reads data and disposes in one call                         |
 | **`checkLeaks` diagnostic**        | Not available                               | Runtime leak detection with stack traces                    |
 
+### Tradeoffs of the non-consuming model
+
+The non-consuming model makes some things easier and other things harder. Here are the real costs:
+
+**Silent leaks replace noisy crashes.** Move semantics crash immediately (`UseAfterFreeError`) when
+you forget `.ref` — painful, but the error points straight at the bug. The non-consuming model never
+crashes from reuse, but a forgotten `.dispose()` leaks GPU memory silently. You may not notice until
+the GPU is out of memory hundreds of iterations later. The `checkLeaks` diagnostic and the ESLint
+plugin exist specifically to compensate for this, but they are opt-in tools, not a built-in safety
+net.
+
+**Higher peak memory in eager mode.** Expression chains like `x.mul(y).add(z).sub(w)` create
+intermediate arrays that linger until GC or explicit disposal. With move semantics, each
+intermediate is freed as soon as the next operation consumes it. In the non-consuming model, all
+intermediates stay alive simultaneously. For large tensors this can double or triple peak memory.
+`jit()` solves this (it tracks last-use and frees at the optimal point), but the problem is real in
+eager mode — the exact mode you use for debugging.
+
+**JavaScript GC doesn't know about GPU memory.** The JS garbage collector tracks JS heap pressure,
+not the 4 GB of VRAM on your GPU. A leaked 512×512 `f32` buffer is 1 MB of GPU memory but only ~64
+bytes of JS heap. GC may never run. `FinalizationRegistry` is too slow and unpredictable to rely on.
+This means leaks from forgotten `.dispose()` calls accumulate indefinitely in practice.
+
+**Method chains become a pain point.** `a.mul(b).add(c).div(d)` is natural in NumPy. In the
+non-consuming model, each `.method()` allocates a new GPU buffer that nobody frees. You need `using`
+declarations (which require separate statements) or explicit `.dispose()`. This makes fluent API
+style impractical for large tensors:
+
+```ts
+// ❌ Leaks two intermediate GPU buffers in eager mode:
+const result = a.mul(b).add(c).div(d);
+
+// ✅ Correct, but more verbose than the NumPy equivalent:
+using t1 = a.mul(b);
+using t2 = t1.add(c);
+const result = t2.div(d);
+```
+
+**`using` has ecosystem gaps.** The TC39 Explicit Resource Management proposal is not yet supported
+everywhere — Svelte's parser can't handle `using` in `.svelte` files, and older bundlers may need
+transpilation. A polyfill is included, but it adds friction.
+
+**More tooling required.** Move semantics enforce discipline automatically (the program crashes if
+you get it wrong). The non-consuming model relies on voluntary tooling: the ESLint plugin for static
+analysis, `checkLeaks` for runtime detection, and developer discipline for everything in between. If
+you skip the tooling, bugs are harder to find.
+
+**Neither model is free.** Move semantics pay with `UseAfterFreeError` bugs and `.ref` boilerplate.
+The non-consuming model pays with silent leaks, higher eager-mode memory, and more reliance on
+tooling. This fork bets that the second set of problems is easier to manage for teams coming from
+Python/MATLAB — but it is a genuine tradeoff, not a free lunch.
+
 ### Which version should I use?
 
 - **Use this fork** if you want a simpler ownership model where arrays can be freely reused, `using`
   declarations handle cleanup, and `lax.scan` is available.
-- **Use upstream** if you are already invested in the move-semantics model and the `@hamk-uas`
-  ESLint plugin, or if you need to stay on the upstream release cadence.
+- **Use upstream** if you prefer fail-fast ownership enforcement (crashes over silent leaks), are
+  already invested in the move-semantics model and the `@hamk-uas` ESLint plugin, or if you need to
+  stay on the upstream release cadence.
 
 The two versions are **not mix-and-match** — code written for one ownership model will not work
 correctly with the other. The `@jax-js-nonconsuming/eslint-plugin-jax-js` included here enforces the

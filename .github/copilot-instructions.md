@@ -76,6 +76,13 @@ naturally.
 - **Explicit disposal over GC** — operations don't consume inputs, but GPU/WASM buffers must be
   freed explicitly via `.dispose()` when no longer needed. See
   [Memory management](#memory-management--ownership) for details.
+- **Silent leaks over noisy crashes** — move semantics crash immediately (`UseAfterFreeError`) when
+  you forget `.ref`, pointing at the bug. The non-consuming model never crashes from reuse, but a
+  forgotten `.dispose()` leaks GPU memory silently. `checkLeaks` and the ESLint plugin compensate,
+  but they're opt-in. Method chains (`a.mul(b).add(c)`) are particularly dangerous because every
+  intermediate allocates a GPU buffer nobody frees in eager mode. The bet is that silent leaks +
+  tooling is more manageable than `UseAfterFreeError` + `.ref` boilerplate, especially for teams
+  from Python/MATLAB — but it's a genuine tradeoff.
 - **Ownership-correct in both modes** — code must dispose correctly in eager mode **and** under
   `jit()` tracing. `jit()` is a pure performance optimization (kernel fusion, buffer recycling); it
   must not change ownership semantics. If code leaks or double-disposes in eager mode, that is a
