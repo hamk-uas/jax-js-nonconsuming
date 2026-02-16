@@ -30,7 +30,9 @@ export interface LeakMarker {
 function parseLeakMarkers(reportDetails: string[]): LeakMarker[] {
   const markers: LeakMarker[] = [];
   for (const detail of reportDetails) {
-    const m = detail.match(/^(.+?) created at index\.ts:(\d+):(\d+)$/);
+    const m = detail.match(
+      /^(.+?) created at (?:(?:.*\/)?(?:index|main)\.ts):(\d+):(\d+)$/,
+    );
     if (m) {
       markers.push({
         line: parseInt(m[2]),

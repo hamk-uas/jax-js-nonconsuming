@@ -79,7 +79,7 @@
 
     <label class="hidden md:flex items-center gap-1 text-xs text-gray-600">
       <input type="checkbox" bind:checked={runner.detailedLeakDiagnostics} />
-      Detailed leaks
+      Detailed leak diagnostics
     </label>
 
     <div class="ml-auto"></div>

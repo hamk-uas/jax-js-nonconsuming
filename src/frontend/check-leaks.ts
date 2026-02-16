@@ -183,6 +183,7 @@ function findCreationSite(err: Error): CreationSite {
 
   let lastDepLoc: string | null = null;
   let lastDepPkg: string | null = null;
+  let firstUserSite: CreationSite | null = null;
   /** Dep function names (innermost-first) for building via chain. */
   const depChain: string[] = [];
   let prevClean: string | null = null;
@@ -232,7 +233,21 @@ function findCreationSite(err: Error): CreationSite {
     // Found a user-code frame — build via chain (outermost → innermost call order)
     const chain = depChain.reverse().slice(0, 2);
     const via = chain.length > 0 ? chain.join(" → ") : null;
-    return { location, via, pkg: null };
+    const site = { location, via, pkg: null };
+
+    // In browser REPLs, bundled runtime frames may appear before the virtual
+    // source-mapped user frame. Prefer explicit virtual module frames when found.
+    if (/(?:^|\/)(?:index|main)\.ts:\d+:\d+$/.test(location)) {
+      return site;
+    }
+
+    if (firstUserSite === null) {
+      firstUserSite = site;
+    }
+  }
+
+  if (firstUserSite !== null) {
+    return firstUserSite;
   }
 
   return {
