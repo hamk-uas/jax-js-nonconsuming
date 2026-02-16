@@ -24,9 +24,9 @@
 >
 > **Why this fork?** The original jax-js uses move semantics, where operations consume their inputs.
 > This fork was created for teams familiar with MATLAB or Python (NumPy) where move semantics are
-> unexpected. We also fast-tracked a `lax.scan` implementation. The tradeoff is that leaks are
-> silent instead of crashing — see [Tradeoffs](#tradeoffs-of-the-non-consuming-model) for an honest
-> comparison.
+> unexpected. We also fast-tracked a `lax.scan` implementation. The tradeoff is that forgetting
+> `.dispose()` leaks silently instead of crashing on reuse — see
+> [Tradeoffs](#tradeoffs-of-the-non-consuming-model) for an honest comparison.
 >
 > See [Differences from upstream](#differences-from-upstream) for a full comparison between the
 > original and this fork.
