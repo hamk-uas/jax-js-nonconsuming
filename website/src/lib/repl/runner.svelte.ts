@@ -211,12 +211,15 @@ async function _runProgram(
     name: "typescript",
     transform(code, id) {
       if (id.endsWith(".ts")) {
-        return ts.transpileModule(code, {
+        const result = ts.transpileModule(code, {
           compilerOptions: {
             module: ts.ModuleKind.ESNext,
             target: ts.ScriptTarget.ES2022,
+            sourceMap: true,
           },
-        }).outputText;
+          fileName: id,
+        });
+        return { code: result.outputText, map: result.sourceMapText };
       }
       return null;
     },
@@ -235,25 +238,46 @@ async function _runProgram(
     });
 
     // We use the "system" format because it allows you to use async/await.
+    // Source map is "hidden" — we collect it but position it ourselves.
     // https://rollupjs.org/repl/
     const { output } = await bundle.generate({
       file: "bundle.js",
       format: "system",
+      sourcemap: "hidden",
     });
 
-    const header = `
-      const console = _BUILTINS.console;
-      const displayImage = _BUILTINS.displayImage;
+    // Single-line header so the source map is only off by 1 line.
+    const header =
+      "const console=_BUILTINS.console,displayImage=_BUILTINS.displayImage," +
+      "System={register(e,f){const{execute:x,setters:s}=f();" +
+      "for(let i=0;i<e.length;i++)s[i](_MODULES[e[i]]);this.f=x}};";
+    const trailer = ";await(async()=>System.f())()";
 
-      const System = { register(externals, f) {
-        const { execute, setters } = f();
-        for (let i = 0; i < externals.length; i++) {
-          setters[i](_MODULES[externals[i]]);
-        }
-        this.f = execute;
-      } };`;
-    const trailer = `;await (async () => System.f())()`;
-    const bundledCode = header + output[0].code + trailer;
+    // Build inline source map so checkLeaks can map stack positions back to
+    // the user's original TypeScript. Prepend one ";" to shift all mappings
+    // down by 1 line (accounting for the single-line header).
+    let sourceMapComment = "";
+    const map = output[0].map;
+    if (map && map.mappings) {
+      map.mappings = ";" + map.mappings;
+      const json = JSON.stringify(map);
+      const bytes = new TextEncoder().encode(json);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++)
+        binary += String.fromCharCode(bytes[i]);
+      sourceMapComment =
+        "\n//# sourceMappingURL=data:application/json;charset=utf-8;base64," +
+        btoa(binary);
+    }
+
+    const bundledCode =
+      header +
+      "\n" +
+      output[0].code +
+      "\n" +
+      trailer +
+      sourceMapComment +
+      "\n//# sourceURL=index.ts";
 
     // AsyncFunction constructor, analogous to Function.
     const AsyncFunction: typeof Function = async function () {}

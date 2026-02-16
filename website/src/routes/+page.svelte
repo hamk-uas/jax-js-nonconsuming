@@ -90,7 +90,7 @@
     <div class="grid md:grid-cols-[5fr_3fr] gap-x-12 gap-y-16">
       <div class="lg:py-8">
         <h1 class="text-3xl sm:text-4xl mb-6 leading-tight max-w-2xl">
-          jax-js-nonconsuming is <span class="hidden sm:inline"
+          jax-js-nonconsuming (fork) is <span class="hidden sm:inline"
             >a machine learning</span
           ><span class="sm:hidden">an ML</span> library and compiler for the web
         </h1>
