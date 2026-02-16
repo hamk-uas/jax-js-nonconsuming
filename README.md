@@ -1,6 +1,6 @@
 <h1 align="center">jax-js: JAX in pure JavaScript</h1>
 
-<p align="center"><em>Non-consuming ownership fork</em></p>
+<p align="center"><em>Non-consuming ownership fork — jax-js-nonconsuming</em></p>
 
 <p align="center"><strong>
   <a href="https://hamk-uas.github.io/jax-js-nonconsuming/">Website</a> |
