@@ -206,16 +206,16 @@
 </script>
 
 <svelte:head>
-  <title>mnist + jax-js</title>
+  <title>mnist + jax-js-nonconsuming</title>
 </svelte:head>
 
 <main class="p-4">
   <section class="max-w-3xl">
-    <h1 class="text-2xl mb-4">mnist + jax-js</h1>
+    <h1 class="text-2xl mb-4">mnist + jax-js-nonconsuming</h1>
 
     <p class="mb-4">
       Let's train a neural network to classify MNIST digits, in your browser
-      with <code>jax-js</code>.
+      with <code>jax-js-nonconsuming</code>.
     </p>
 
     <p class="mb-4">

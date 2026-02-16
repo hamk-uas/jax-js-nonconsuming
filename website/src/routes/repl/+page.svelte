@@ -131,7 +131,7 @@
 </script>
 
 <svelte:head>
-  <title>jax-js REPL</title>
+  <title>jax-js-nonconsuming REPL</title>
 </svelte:head>
 
 <div class="h-dvh">
@@ -150,14 +150,14 @@
       >
         <h1 class="text-xl font-light mb-4">
           <a target="_blank" href={resolve("/")}
-            ><span class="font-medium">jax-js</span> REPL</a
+            ><span class="font-medium">jax-js-nonconsuming</span> REPL</a
           >
         </h1>
 
         <hr class="mb-6 border-gray-200" />
 
         <p class="text-sm mb-4">
-          Try out jax-js. Numerical and GPU computing for the web!
+          Try out jax-js-nonconsuming. Numerical and GPU computing for the web!
         </p>
         <p class="text-sm mb-4">
           The goal is having NumPy and JAX-like APIs <em>in the browser</em>, on

@@ -7,7 +7,7 @@ export function createJaxJsMatmulStrategy(
   fp16: boolean = false,
 ) {
   return {
-    name: fp16 ? "jax-js-fp16" : "jax-js",
+    name: fp16 ? "jax-js-nonconsuming-fp16" : "jax-js-nonconsuming",
     async run(): Promise<number> {
       const jax = await import("@jax-js-nonconsuming/jax");
       await jax.init();

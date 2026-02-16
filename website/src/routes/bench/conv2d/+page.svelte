@@ -509,7 +509,9 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     <li>"naive" is a simple nested-loop WebGPU kernel</li>
     <li>"onnx" runs a <code>Conv</code> operator in onnxruntime-web</li>
     <li>"tfjs" runs <code>tf.conv2d()</code> with NHWC format</li>
-    <li>"jax-js" runs <code>jax.lax.convGeneralDilated()</code></li>
+    <li>
+      "jax-js-nonconsuming" runs <code>jax.lax.convGeneralDilated()</code>
+    </li>
   </ul>
 
   <div class="flex flex-wrap gap-2 mb-4">

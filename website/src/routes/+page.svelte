@@ -24,7 +24,8 @@
     {
       title: "GitHub Repository",
       href: "https://github.com/hamk-uas/jax-js-nonconsuming",
-      description: "Get started with jax-js and check out the tutorial.",
+      description:
+        "Get started with jax-js-nonconsuming and check out the tutorial.",
     },
     {
       title: "REPL",
@@ -56,7 +57,7 @@
 </script>
 
 <svelte:head>
-  <title>jax-js – ML for the web</title>
+  <title>jax-js-nonconsuming – ML for the web</title>
 </svelte:head>
 
 <!-- Header -->
@@ -65,7 +66,7 @@
 >
   <div class="flex items-center gap-3 shrink-0">
     <a href={resolve("/")}>
-      <img src={logo} alt="jax-js logo" class="h-8" />
+      <img src={logo} alt="jax-js-nonconsuming logo" class="h-8" />
     </a>
   </div>
   <nav class="flex items-center gap-6">
@@ -94,7 +95,8 @@
     <div class="grid md:grid-cols-[5fr_3fr] gap-x-12 gap-y-16">
       <div class="lg:py-8">
         <h1 class="text-3xl sm:text-4xl mb-6 leading-tight max-w-2xl">
-          jax-js is <span class="hidden sm:inline">a machine learning</span
+          jax-js-nonconsuming is <span class="hidden sm:inline"
+            >a machine learning</span
           ><span class="sm:hidden">an ML</span> library and compiler for the web
         </h1>
         <p class="text-lg text-gray-700 leading-snug mb-8 max-w-2xl">
@@ -105,7 +107,9 @@
 
         <!-- Add to project box -->
         <div class="bg-primary/5 rounded-lg p-4">
-          <h2 class="text-xl font-medium mb-1.5">Add jax-js to your project</h2>
+          <h2 class="text-xl font-medium mb-1.5">
+            Add jax-js-nonconsuming to your project
+          </h2>
           <p class="text-gray-600 text-sm mb-4">
             Zero dependencies. All major browsers, with <button
               class="enabled:underline"
@@ -144,8 +148,8 @@
         </h2>
 
         <p class="mb-6">
-          jax-js is a end-to-end ML library inspired by JAX, but in pure
-          JavaScript:
+          jax-js-nonconsuming is an end-to-end ML library inspired by JAX, but
+          in pure JavaScript:
         </p>
 
         <ul
@@ -163,16 +167,16 @@
         </ul>
 
         <p class="mb-6">
-          jax-js is likely the most portable GPU ML framework, since it runs
-          anywhere a browser can run. It's also simple but optimized, including
-          a lightweight compiler that translates your high-level operations into
-          WebGPU and WebAssembly kernels.
+          jax-js-nonconsuming is likely the most portable GPU ML framework,
+          since it runs anywhere a browser can run. It's also simple but
+          optimized, including a lightweight compiler that translates your
+          high-level operations into WebGPU and WebAssembly kernels.
         </p>
 
         <p>
-          The goal of jax-js is to make numerical code accessible and deployable
-          to everyone, so compute-intensive apps can run fast and locally on
-          consumer hardware.
+          The goal of jax-js-nonconsuming is to make numerical code accessible
+          and deployable to everyone, so compute-intensive apps can run fast and
+          locally on consumer hardware.
         </p>
       </div>
     </div>

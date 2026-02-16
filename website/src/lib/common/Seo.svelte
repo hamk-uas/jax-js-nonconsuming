@@ -1,6 +1,6 @@
 <script lang="ts">
   const {
-    title = "jax-js – Open-source web ML framework",
+    title = "jax-js-nonconsuming – Open-source web ML framework",
     description = "Machine learning library and compiler for the web, written in pure JavaScript. Run high-performance WebAssembly and WebGPU kernels.",
   }: { title?: string; description?: string } = $props();
 </script>
@@ -9,7 +9,7 @@
   <meta name="description" content={description} />
 
   <meta property="og:type" content="website" />
-  <meta property="og:site_name" content="jax-js" />
+  <meta property="og:site_name" content="jax-js-nonconsuming" />
   <meta property="og:title" content={title} />
   <meta property="og:description" content={description} />
   <!-- Needs to be an absolute URL, so this is hardcoded. -->

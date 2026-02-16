@@ -1,10 +1,10 @@
 /**
  * @file Browser polyfills for the `using` keyword (TC39 Explicit Resource Management).
  *
- * This runs before any @jax-js/jax import so that `using` declarations
+ * This runs before any @jax-js-nonconsuming/jax import so that `using` declarations
  * work in Safari and other browsers that lack native support.
  *
- * The core library (`@jax-js/jax`) also ships these polyfills, but the
+ * The core library (`@jax-js-nonconsuming/jax`) also ships these polyfills, but the
  * website layout imports this file first to guarantee the globals exist
  * before any component code runs.
  */

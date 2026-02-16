@@ -182,7 +182,7 @@
   <p class="text-lg text-gray-500">
     Text-to-speech AI voice model, running in your browser with <a
       href={resolve("/")}
-      class="text-primary hover:underline">jax-js</a
+      class="text-primary hover:underline">jax-js-nonconsuming</a
     >.
   </p>
 

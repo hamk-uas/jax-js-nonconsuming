@@ -1,7 +1,7 @@
 import { numpy as np } from "@jax-js-nonconsuming/jax";
 
 /**
- * Convert a jax-js array (2D grayscale, 3D RGB/RGBA) to a data URL.
+ * Convert a jax-js-nonconsuming array (2D grayscale, 3D RGB/RGBA) to a data URL.
  *
  * Supports:
  * - 2D (H, W) → grayscale

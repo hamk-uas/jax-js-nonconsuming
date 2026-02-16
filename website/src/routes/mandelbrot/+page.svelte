@@ -39,7 +39,7 @@
 </script>
 
 <main class="p-4">
-  <h1 class="text-2xl mb-2">mandelbrot in jax-js</h1>
+  <h1 class="text-2xl mb-2">mandelbrot in jax-js-nonconsuming</h1>
 
   <p class="mb-4">NumPy + GPU + JIT, in JavaScript!</p>
 

@@ -315,7 +315,7 @@
 
     console.log(`Forward pass took ${seconds.toFixed(3)} s`);
     console.log(
-      `jax-js dispatch count: ${dispatchCount()}, buffer creates: ${bufferCreateCount()}`,
+      `jax-js-nonconsuming dispatch count: ${dispatchCount()}, buffer creates: ${bufferCreateCount()}`,
     );
 
     detections = await processOutput(logitsData!, boxesData!);
@@ -426,7 +426,7 @@
             loadAndRun();
           }}
         >
-          Load & Run (jax-js)
+          Load & Run (jax-js-nonconsuming)
         </button>
         <button
           onclick={() => {
