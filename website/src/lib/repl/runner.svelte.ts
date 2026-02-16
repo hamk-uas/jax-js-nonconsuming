@@ -143,6 +143,18 @@ async function _runProgram(
   const { rollup } = await import("@rollup/browser");
 
   const mockConsole = runner.mockConsole;
+  const getSlotCount = (): number | null => {
+    try {
+      const backend = (jax as any).getBackend?.();
+      if (backend && typeof backend.slotCount === "function") {
+        return backend.slotCount();
+      }
+    } catch {
+      // Ignore leak diagnostics errors in REPL.
+    }
+    return null;
+  };
+  const slotsBefore = getSlotCount();
 
   // Builtins for the REPL environment.
   const np = jax.numpy;
@@ -251,11 +263,33 @@ async function _runProgram(
         displayImage: displayImage,
       },
     );
+    const slotsAfter = getSlotCount();
+    if (
+      slotsBefore !== null &&
+      slotsAfter !== null &&
+      slotsAfter > slotsBefore
+    ) {
+      const leaked = slotsAfter - slotsBefore;
+      mockConsole.warn(
+        `REPL note: ${leaked} array slot(s) still live after this run. Use using declarations or .dispose() for arrays you create.`,
+      );
+    }
     return {
       success: true,
       duration: performance.now() - startTime,
     };
   } catch (e: any) {
+    const slotsAfter = getSlotCount();
+    if (
+      slotsBefore !== null &&
+      slotsAfter !== null &&
+      slotsAfter > slotsBefore
+    ) {
+      const leaked = slotsAfter - slotsBefore;
+      mockConsole.warn(
+        `REPL note: ${leaked} array slot(s) still live after this run. Use using declarations or .dispose() for arrays you create.`,
+      );
+    }
     mockConsole.error(e);
     return { success: false, duration: 0 };
   }

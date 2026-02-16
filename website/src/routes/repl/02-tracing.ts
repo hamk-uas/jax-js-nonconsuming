@@ -4,9 +4,12 @@ import { jvp, makeJaxpr, numpy as np } from "@jax-js-nonconsuming/jax";
 const f = (x: np.Array) => x.add(2).mul(x);
 
 // fdot(x) = 2 * x + 2
-const fdot = (x: np.Array) => jvp(f, [x], [np.array(1)])[1];
+using one = np.array(1);
+const fdot = (x: np.Array) => jvp(f, [x], [one])[1];
 
-console.log(makeJaxpr(f)(np.array(2)).jaxpr.toString());
+using x0 = np.array(2);
+console.log(makeJaxpr(f)(x0).jaxpr.toString());
 
-const { jaxpr } = makeJaxpr(fdot)(np.array(2));
+using x1 = np.array(2);
+const { jaxpr } = makeJaxpr(fdot)(x1);
 console.log(jaxpr.toString());
