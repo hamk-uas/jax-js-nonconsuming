@@ -389,6 +389,31 @@ To start a Vite dev server running the website, demos and REPL:
 pnpm -C website dev
 ```
 
+## Contributing
+
+Contributions are welcome! Please open issues and PRs on this repository for topics **specific to
+the non-consuming fork**, such as:
+
+- The non-consuming ownership model and `using`-based patterns
+- The `@jax-js-nonconsuming/eslint-plugin-jax-js` linter
+- `lax.scan`, buffer recycling, `checkLeaks`, or other fork-only features
+- Documentation, demos, or examples specific to this fork
+
+For feature requests or bugs that apply to **both branches** (e.g., new NumPy/JAX ops, backend
+improvements, core tracing), please file them
+[upstream at ekzhang/jax-js](https://github.com/ekzhang/jax-js/issues) instead. This avoids
+duplicate work and ensures fixes land in both codebases.
+
+**Upstream sync policy:** We periodically rebase onto upstream to pick up new features and fixes,
+but there may be delays or pauses. Development of this fork may stop at any time — if that happens,
+upstream jax-js continues independently.
+
+Before submitting a PR, run the full CI checks locally:
+
+```bash
+pnpm build && pnpm check && pnpm test && pnpm run test:deno
+```
+
 ## Differences from upstream
 
 This fork replaces the upstream **move-semantics** ownership model with a **non-consuming** model.
