@@ -213,11 +213,19 @@
       initialText={String.raw`import { grad, numpy as np, vmap } from "@jax-js-nonconsuming/jax";
 
 const f = (x: np.Array) => np.sqrt(x.mul(x).sum());
-const x = np.array([1, 2, 3, 4]);
 
-console.log(f(x));
-console.log(grad(f)(x));
-console.log(vmap(grad(np.square))(x));
+{
+  using x = np.array([1, 2, 3, 4]);
+
+  using y0 = f(x);
+  console.log(y0.js());
+
+  using y1 = grad(f)(x);
+  console.log(y1.js());
+
+  using y2 = vmap(grad(np.square))(x);
+  console.log(y2.js());
+}
 `}
     />
   </section>
