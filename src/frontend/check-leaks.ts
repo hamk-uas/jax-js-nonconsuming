@@ -32,7 +32,7 @@
  * 1 from user code, 1 in @jax-js-nonconsuming/jax.
  *
  * 3 slot(s) not in tracked list (created before start() or by internal buffers).
- * rc=1 → never disposed. Call .dispose() when done.
+ * rc=1 → never disposed. Prefer `using` for local temporaries, or call .dispose() when done.
  * ```
  *
  * ## How it works
@@ -505,7 +505,9 @@ export const checkLeaks = {
       );
     }
     if (sorted.some(([, g]) => !g.pkg && g.maxRc === 1)) {
-      tips.push("rc=1 → never disposed. Call .dispose() when done.");
+      tips.push(
+        "rc=1 → never disposed. Prefer `using` for local temporaries, or call .dispose() at end-of-life.",
+      );
     }
     if (sorted.some(([, g]) => g.maxRc >= 2)) {
       tips.push("rc≥2 → extra .ref without matching .dispose().");
@@ -514,7 +516,9 @@ export const checkLeaks = {
       tips.push("Package-tagged leaks are library bugs, not user error.");
     }
     if (tips.length === 0) {
-      tips.push("Call .dispose() on unused results.");
+      tips.push(
+        "Prefer `using` for local temporaries; call .dispose() for values kept across scopes.",
+      );
     }
     lines.push("", ...tips);
 
