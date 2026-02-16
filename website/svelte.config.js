@@ -1,6 +1,12 @@
 import adapter from "@sveltejs/adapter-static";
 import { vitePreprocess } from "@sveltejs/vite-plugin-svelte";
 
+const isDev = process.argv.includes("dev");
+const repoName = process.env.GITHUB_REPOSITORY?.split("/")[1];
+const inferredBasePath =
+  process.env.BASE_PATH ??
+  (repoName && !repoName.endsWith(".github.io") ? `/${repoName}` : "");
+
 /** @type {import("@sveltejs/kit").Config} */
 const config = {
   preprocess: vitePreprocess(),
@@ -13,7 +19,7 @@ const config = {
       "$app.css": "src/app.css",
     },
     paths: {
-      base: process.argv.includes("dev") ? "" : process.env.BASE_PATH,
+      base: isDev ? "" : inferredBasePath,
     },
   },
 };

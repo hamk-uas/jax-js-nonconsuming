@@ -32,8 +32,16 @@ jobs:
       # Build the library (needed by website and typedoc)
       - run: pnpm build
 
-      # Build the website (deployed at the root of GitHub Pages)
-      - run: pnpm -C website build
+      # Build the website (project pages path: /<repo>, user/org pages root: /)
+      - run: |
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          if [[ "$REPO_NAME" == *.github.io ]]; then
+            BASE_PATH=""
+          else
+            BASE_PATH="/$REPO_NAME"
+          fi
+          echo "Using BASE_PATH='$BASE_PATH'"
+          BASE_PATH="$BASE_PATH" pnpm -C website build
 
       # Generate typedoc API docs and copy into the website build
       - run: pnpm run docs && cp -r docs/ website/build/docs

@@ -1,6 +1,14 @@
 <h1 align="center">jax-js: JAX in pure JavaScript</h1>
 
-<p align="center"><em>Non-consuming ownership fork — jax-js-nonconsuming</em></p>
+<p align="center">
+  <img
+    src="https://raw.githubusercontent.com/hamk-uas/jax-js-nonconsuming/main/website/src/lib/assets/logo-nonconsuming.svg"
+    alt="jax-js-nonconsuming logo"
+    width="200"
+  />
+</p>
+
+<p align="center">jax-js-nonconsuming<br><em>Non-consuming ownership fork</em></p>
 
 <p align="center"><strong>
   <a href="https://hamk-uas.github.io/jax-js-nonconsuming/">Website</a> |
@@ -178,9 +186,9 @@ Big Arrays take up a lot of memory. Python ML libraries override the `__del__()`
 memory, but JavaScript has no such API for running object destructors
 ([cf.](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/FinalizationRegistry)).
 
-In jax-js, operations **do not consume** their inputs — you can freely reuse an array in multiple
-expressions without any special syntax. When you're done with an array, call `.dispose()` to free
-its memory, or use JavaScript's `using` keyword for automatic disposal:
+In jax-js-nonconsuming, operations **do not consume** their inputs — you can freely reuse an array
+in multiple expressions without any special syntax. When you're done with an array, call
+`.dispose()` to free its memory, or use JavaScript's `using` keyword for automatic disposal:
 
 ```ts
 {
@@ -317,8 +325,8 @@ await devicePut(ar, "webgpu"); // Now device="webgpu"
 
 ### Helper libraries
 
-There are other libraries in the `@hamk-uas` namespace that can work with jax-js, or be used in a
-self-contained way in other projects.
+There are other libraries in the `@jax-js-nonconsuming` namespace that can work with jax-js, or be
+used in a self-contained way in other projects.
 
 - [**`@jax-js-nonconsuming/loaders`**](packages/loaders) can load tensors from various formats like
   Safetensors, includes a fast and compliant implementation of BPE, and caches HTTP requests for
@@ -350,7 +358,8 @@ That's all for this short tutorial. Please see the generated
 
 ## Development
 
-_The following technical details are for contributing to jax-js and modifying its internals._
+_The following technical details are for contributing to jax-js-consuming and modifying its
+internals._
 
 This repository is managed by [`pnpm`](https://pnpm.io/). You can compile and build all packages in
 watch mode with:
@@ -389,6 +398,78 @@ To start a Vite dev server running the website, demos and REPL:
 pnpm -C website dev
 ```
 
+## Maintainer Guide
+
+This section is for maintainers preparing releases for the public repository.
+
+### First public tag (recommended)
+
+The package version is currently `0.2.0-alpha.1`. For the first public stable tag, use:
+
+- **`v0.2.0`** (recommended)
+
+Why: upstream `ekzhang/jax-js` is in the `0.1.x` line, and this fork already includes substantial
+fork-only behavior changes (`scan`, non-consuming ownership, buffer recycling, `checkLeaks`).
+Starting stable tags at `0.2.0` keeps the fork's semver clear and avoids looking older than the
+current pre-release lineage.
+
+### Release steps
+
+1. Ensure clean state and up-to-date `main`:
+
+```bash
+git fetch origin
+git checkout main
+git pull --ff-only
+```
+
+2. Run release checks:
+
+```bash
+pnpm build
+pnpm check
+pnpm test
+pnpm run test:deno
+```
+
+3. Bump `package.json` version (for the first stable release: `0.2.0`).
+
+4. Commit release metadata:
+
+```bash
+git add package.json pnpm-lock.yaml
+git commit -m "chore(release): v0.2.0"
+```
+
+5. Create and push tag:
+
+```bash
+git tag v0.2.0
+git push origin main
+git push origin v0.2.0
+```
+
+6. Create GitHub Release from `v0.2.0` and include summary notes (ownership model, scan,
+   compatibility notes).
+
+### Versioning policy (fork vs upstream)
+
+- Use **independent semver** for this fork.
+- Track upstream compatibility in notes/docs, but do not mirror upstream tags exactly.
+- Suggested bump rules:
+  - **Patch**: bug fixes, docs-only release notes updates, internal refactors without API changes.
+  - **Minor**: new public APIs/features (e.g., new transformations, backend capabilities).
+  - **Major**: breaking API or ownership-model behavior changes.
+- When rebasing/syncing from upstream, choose bump level by user-visible impact in this fork.
+
+### Install snippet update after first tag
+
+After creating the first tag, keep install examples pinned to a stable tag:
+
+```bash
+npm install github:hamk-uas/jax-js-nonconsuming#v0.2.0
+```
+
 ## Contributing
 
 Contributions are welcome! Please open issues and PRs on this repository for topics **specific to
@@ -404,9 +485,9 @@ improvements, core tracing), please file them
 [upstream at ekzhang/jax-js](https://github.com/ekzhang/jax-js/issues) instead. This avoids
 duplicate work and ensures fixes land in both codebases.
 
-**Upstream sync policy:** We periodically rebase onto upstream to pick up new features and fixes,
-but there may be delays or pauses. Development of this fork may stop at any time — if that happens,
-upstream jax-js continues independently.
+**Upstream sync policy:** We are likely to periodically rebase onto upstream to pick up new features
+and fixes, but there may be delays or pauses. Development of this fork may stop at any time — if
+that happens, upstream jax-js continues independently.
 
 Before submitting a PR, run the full CI checks locally:
 
