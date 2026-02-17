@@ -41,7 +41,12 @@
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.10.2",
-    "@jax-js-nonconsuming/jax": "workspace:^",
     "onnx-buf": "^1.20.0-1"
+  },
+  "peerDependencies": {
+    "@jax-js-nonconsuming/jax": ">=0.2.0"
+  },
+  "devDependencies": {
+    "@jax-js-nonconsuming/jax": "workspace:^"
   }
 }

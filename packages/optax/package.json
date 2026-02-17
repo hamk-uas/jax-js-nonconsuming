@@ -39,7 +39,10 @@
     "prepublishOnly": "pnpm -C ../.. build",
     "postpublish": "git tag optax/v$npm_package_version && git push --tags"
   },
-  "dependencies": {
+  "peerDependencies": {
+    "@jax-js-nonconsuming/jax": ">=0.2.0"
+  },
+  "devDependencies": {
     "@jax-js-nonconsuming/jax": "workspace:^"
   }
 }

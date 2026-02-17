@@ -336,16 +336,37 @@ await devicePut(ar, "webgpu"); // Now device="webgpu"
 
 ### Helper libraries
 
-There are other libraries in the `@jax-js-nonconsuming` namespace that can work with jax-js, or be
-used in a self-contained way in other projects.
+jax-js includes three helper libraries:
 
-- [**`@jax-js-nonconsuming/loaders`**](packages/loaders) can load tensors from various formats like
-  Safetensors, includes a fast and compliant implementation of BPE, and caches HTTP requests for
-  large assets like model weights in OPFS.
-- [**`@jax-js-nonconsuming/onnx`**](packages/onnx) is a model loader from the
-  [ONNX](https://onnx.ai/) format into native jax-js functions.
-- [**`@jax-js-nonconsuming/optax`**](packages/optax) provides implementations of optimizers like
-  Adam and SGD.
+- [**optax**](packages/optax) — optimizers (Adam, SGD) and gradient processing
+- [**loaders**](packages/loaders) — Safetensors, BPE tokenizers, OPFS-cached downloads
+- [**onnx**](packages/onnx) — load [ONNX](https://onnx.ai/) models into native jax-js functions
+
+**Install as separate packages** (recommended for pnpm):
+
+```bash
+# Install the main library
+pnpm add @jax-js-nonconsuming/jax@"github:hamk-uas/jax-js-nonconsuming"
+
+# Install any helper libraries you need
+pnpm add @jax-js-nonconsuming/optax@"github:hamk-uas/jax-js-nonconsuming&path:packages/optax"
+pnpm add @jax-js-nonconsuming/loaders@"github:hamk-uas/jax-js-nonconsuming&path:packages/loaders"
+pnpm add @jax-js-nonconsuming/onnx@"github:hamk-uas/jax-js-nonconsuming&path:packages/onnx"
+```
+
+```ts
+import { adam } from "@jax-js-nonconsuming/optax";
+import { cachedFetch, safetensors } from "@jax-js-nonconsuming/loaders";
+import { ONNXModel } from "@jax-js-nonconsuming/onnx";
+```
+
+**Or use sub-path exports** (single install, no extra packages):
+
+```ts
+import { adam } from "@jax-js-nonconsuming/jax/optax";
+import { cachedFetch, safetensors } from "@jax-js-nonconsuming/jax/loaders";
+import { ONNXModel } from "@jax-js-nonconsuming/jax/onnx";
+```
 
 ### Performance
 

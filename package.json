@@ -19,13 +19,34 @@
   },
   "type": "module",
   "files": [
-    "/dist/*.{js,cjs,d.ts,d.cts}"
+    "/dist/*.{js,cjs,d.ts,d.cts}",
+    "/packages/optax/dist/*.{js,cjs,d.ts,d.cts}",
+    "/packages/loaders/dist/*.{js,cjs,d.ts,d.cts}",
+    "/packages/loaders/dist/chunk-*.js",
+    "/packages/onnx/dist/*.{js,cjs,d.ts,d.cts}",
+    "/packages/eslint-plugin/dist/*.{js,cjs,d.ts,d.cts}"
   ],
   "main": "dist/index.js",
   "exports": {
     ".": {
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./optax": {
+      "import": "./packages/optax/dist/index.js",
+      "require": "./packages/optax/dist/index.cjs"
+    },
+    "./loaders": {
+      "import": "./packages/loaders/dist/index.js",
+      "require": "./packages/loaders/dist/index.cjs"
+    },
+    "./onnx": {
+      "import": "./packages/onnx/dist/index.js",
+      "require": "./packages/onnx/dist/index.cjs"
+    },
+    "./eslint-plugin": {
+      "import": "./packages/eslint-plugin/dist/index.js",
+      "require": "./packages/eslint-plugin/dist/index.cjs"
     },
     "./dist/index.d.ts": {
       "import": "./dist/index.d.ts",
@@ -83,6 +104,11 @@
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.46.4",
     "vitest": "^4.0.9"
+  },
+  "optionalDependencies": {
+    "@bufbuild/protobuf": "^2.10.2",
+    "sentencepiece-buf": "^0.2.1-0",
+    "onnx-buf": "^1.20.0-1"
   },
   "packageManager": "pnpm@10.22.0",
   "engines": {
