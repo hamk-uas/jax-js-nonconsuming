@@ -5,7 +5,7 @@ import {
   nn,
   numpy as np,
   scipySpecial as special,
-} from "@jax-js-nonconsuming/jax";
+} from "@hamk-uas/jax-js-nonconsuming";
 
 import {
   onnxDtypeToJax,

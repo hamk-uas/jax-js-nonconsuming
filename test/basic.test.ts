@@ -6,7 +6,7 @@ import {
   jvp,
   numpy as np,
   vmap,
-} from "@jax-js-nonconsuming/jax";
+} from "@hamk-uas/jax-js-nonconsuming";
 import { expect, suite, test } from "vitest";
 
 test("can create array", () => {

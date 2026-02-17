@@ -1,4 +1,4 @@
-import { grad, numpy as np } from "@jax-js-nonconsuming/jax";
+import { grad, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 const f = (x: np.Array) => {
   using sq = x.mul(x);

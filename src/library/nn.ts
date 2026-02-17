@@ -473,7 +473,7 @@ export function standardize(
  * `numClasses`, with a 1 at the index position specified by its value.
  *
  * ```js
- * import { nn, numpy as np } from '@jax-js-nonconsuming/jax';
+ * import { nn, numpy as np } from '@hamk-uas/jax-js-nonconsuming';
  *
  * using x = np.array([1, 1, 2], { dtype: np.int32 });
  * using y = nn.oneHot(x, 3);

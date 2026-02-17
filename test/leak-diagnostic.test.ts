@@ -18,7 +18,7 @@ import {
   lax,
   numpy as np,
   tree,
-} from "@jax-js-nonconsuming/jax";
+} from "@hamk-uas/jax-js-nonconsuming";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 let previousDevice: string | undefined;

@@ -1,4 +1,4 @@
-import { jit, lax, numpy as np } from "@jax-js-nonconsuming/jax";
+import { jit, lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 // Mandelbrot set using lax.scan — the entire iteration loop compiles to native code.
 const width = 750;

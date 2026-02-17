@@ -1,4 +1,4 @@
-import { jvp, makeJaxpr, numpy as np } from "@jax-js-nonconsuming/jax";
+import { jvp, makeJaxpr, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 // f(x) = (x + 2) * x
 const f = (x: np.Array) => x.add(2).mul(x);

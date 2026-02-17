@@ -1,4 +1,4 @@
-# @jax-js-nonconsuming/loaders
+# @hamk-uas/jax-js-nonconsuming-loaders
 
 Utility package for `jax-js` that can load tensors from various formats and cache large downloads.
 
@@ -8,7 +8,7 @@ Utility package for `jax-js` that can load tensors from various formats and cach
 - [WeightMapper](#weightmapper)
 
 It has zero dependencies (except Protobuf) and can be used independently of
-`@jax-js-nonconsuming/jax`.
+`@hamk-uas/jax-js-nonconsuming`.
 
 ## OPFS
 
@@ -25,7 +25,7 @@ The basic `opfs` object allows you to access the file system and store data. Key
 not just typical file names.
 
 ```ts
-import { opfs } from "@jax-js-nonconsuming/loaders";
+import { opfs } from "@hamk-uas/jax-js-nonconsuming-loaders";
 
 await opfs.write("foo", new Uint8Array([1, 2, 3]));
 await opfs.read("foo"); // => Uint8Array
@@ -34,7 +34,7 @@ await opfs.read("foo"); // => Uint8Array
 These methods return `FileInfo` objects, which have a `name`, `lastModified`, and `size` (in bytes).
 
 ```ts
-import { opfs } from "@jax-js-nonconsuming/loaders";
+import { opfs } from "@hamk-uas/jax-js-nonconsuming-loaders";
 
 await opfs.info("foo"); // => FileInfo | null
 await opfs.list(); // => FileInfo[]
@@ -46,7 +46,7 @@ The library also supports a convenient `fetch()` wrapper that caches the request
 by URL.
 
 ```ts
-import { cachedFetch } from "@jax-js-nonconsuming/loaders";
+import { cachedFetch } from "@hamk-uas/jax-js-nonconsuming-loaders";
 
 const url = "https://huggingface.co/ekzhang/jax-js-models/resolve/main/mobileclip_s0.safetensors";
 
@@ -60,7 +60,7 @@ tensors as native
 [typed array views](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Typed_arrays).
 
 ```ts
-import { safetensors } from "@jax-js-nonconsuming/loaders";
+import { safetensors } from "@hamk-uas/jax-js-nonconsuming-loaders";
 
 const buf = await fetch("model.safetensors").then((resp) => resp.bytes());
 safetensors.parse(buf); // => { tensors: { ... } };
@@ -77,7 +77,7 @@ Since tokenizer definitions can be nontrivially large (~1 MB), their data is fet
 needed.
 
 ```ts
-import { tokenizers } from "@jax-js-nonconsuming/loaders";
+import { tokenizers } from "@hamk-uas/jax-js-nonconsuming-loaders";
 
 const enc = await tokenizers.getBpe("clip");
 
@@ -93,7 +93,7 @@ Utility for translating object keys based on matching substrings or prefixes/suf
 loading model weights from a different format.
 
 ```ts
-import { WeightMapper } from "@jax-js-nonconsuming/loaders";
+import { WeightMapper } from "@hamk-uas/jax-js-nonconsuming-loaders";
 
 const weightMapper = new WeightMapper({
   prefix: {

@@ -1,4 +1,4 @@
-import { jit, lax, numpy as np } from "@jax-js-nonconsuming/jax";
+import { jit, lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 export const width = 1000;
 export const height = 800;

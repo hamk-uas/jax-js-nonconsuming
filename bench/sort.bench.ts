@@ -4,7 +4,7 @@ import {
   init,
   numpy as np,
   random,
-} from "@jax-js-nonconsuming/jax";
+} from "@hamk-uas/jax-js-nonconsuming";
 import { afterAll, bench, suite } from "vitest";
 
 const devices = await init("wasm", "webgpu");

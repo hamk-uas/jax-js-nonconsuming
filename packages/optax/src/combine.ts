@@ -1,4 +1,4 @@
-import { tree } from "@jax-js-nonconsuming/jax";
+import { tree } from "@hamk-uas/jax-js-nonconsuming";
 
 import { GradientTransformation, OptState } from "./base";
 

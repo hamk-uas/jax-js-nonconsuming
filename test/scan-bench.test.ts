@@ -3,7 +3,7 @@
  * Run with: pnpm vitest run test/scan-bench.test.ts
  */
 
-import { init, jit, lax, numpy as np } from "@jax-js-nonconsuming/jax";
+import { init, jit, lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, it } from "vitest";
 
 async function timeMs(fn: () => void, warmup = 3, runs = 10): Promise<number> {

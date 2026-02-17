@@ -1,6 +1,6 @@
 // Make sure refcount and dispose mechanics work correctly.
 
-import { checkLeaks, grad, numpy as np } from "@jax-js-nonconsuming/jax";
+import { checkLeaks, grad, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 import { expect, suite, test } from "vitest";
 
 suite("refcount through grad", () => {

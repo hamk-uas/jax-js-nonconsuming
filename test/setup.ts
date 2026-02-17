@@ -1,4 +1,4 @@
-import { checkLeaks, numpy as np } from "@jax-js-nonconsuming/jax";
+import { checkLeaks, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 import { afterEach, beforeEach, expect } from "vitest";
 
 beforeEach(() => {

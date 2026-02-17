@@ -204,7 +204,7 @@
     </p>
 
     <EmbeddedRepl
-      initialText={String.raw`import { grad, numpy as np, vmap } from "@jax-js-nonconsuming/jax";
+      initialText={String.raw`import { grad, numpy as np, vmap } from "@hamk-uas/jax-js-nonconsuming";
 
 const f = (x: np.Array) => {
   using sq = x.mul(x);

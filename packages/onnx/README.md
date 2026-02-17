@@ -1,4 +1,4 @@
-# @jax-js-nonconsuming/onnx
+# @hamk-uas/jax-js-nonconsuming-onnx
 
 ONNX model loader for jax-js.
 
@@ -7,8 +7,8 @@ ONNX model loader for jax-js.
 Fetch a model from external path and load it.
 
 ```ts
-import { ONNXModel } from "@jax-js-nonconsuming/onnx";
-import { numpy as np } from "@jax-js-nonconsuming/jax";
+import { ONNXModel } from "@hamk-uas/jax-js-nonconsuming-onnx";
+import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 const modelBytes = await fetch("./model.onnx").then((r) => r.bytes());
 const model = new ONNXModel(modelBytes);
@@ -26,7 +26,7 @@ Loaded models are ordinary functions and can be differentiated through. Use JIT 
 best performance.
 
 ```ts
-import { grad, jit } from "@jax-js-nonconsuming/jax";
+import { grad, jit } from "@hamk-uas/jax-js-nonconsuming";
 
 using run = jit(model.run);
 const runGrad = grad((input: np.Array) => {

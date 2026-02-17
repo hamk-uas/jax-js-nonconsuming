@@ -1,4 +1,4 @@
-import type { Device, DType } from "@jax-js-nonconsuming/jax";
+import type { Device, DType } from "@hamk-uas/jax-js-nonconsuming";
 
 export async function benchFlops(
   n: number,
@@ -6,7 +6,7 @@ export async function benchFlops(
   dtype: DType,
 ): Promise<number> {
   try {
-    const jax = await import("@jax-js-nonconsuming/jax");
+    const jax = await import("@hamk-uas/jax-js-nonconsuming");
     await jax.init(device);
     jax.defaultDevice(device);
 

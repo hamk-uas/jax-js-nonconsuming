@@ -1,5 +1,5 @@
 {
-  "name": "@jax-js-nonconsuming/eslint-plugin-jax-js",
+  "name": "@hamk-uas/eslint-plugin-jax-js",
   "version": "0.1.0",
   "description": "ESLint rules for jax-js array ownership — enforces deterministic disposal and prevents memory leaks",
   "type": "module",
