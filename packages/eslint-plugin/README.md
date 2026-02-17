@@ -634,9 +634,10 @@ Or add it as a script in your `package.json`:
 
 **`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING` when loading the plugin:**
 
-If your ESLint config is `eslint.config.js` (not `.ts`), Node's built-in type stripping does not
-apply to files inside `node_modules`. **Fix:** rename your config to `eslint.config.ts`. ESLint then
-uses `jiti` to load the config and the plugin, bypassing the restriction.
+This error occurs on Node 22+ when a `.ts` file is loaded from inside `node_modules/`. Since v0.2.2,
+the plugin's `package.json` exports point to pre-built `dist/` files, so this should not happen. If
+you see this error, ensure you have the latest version installed (`prepare` must run successfully to
+build `dist/`).
 
 **Rules fire on non-jax-js code:**
 

@@ -7,7 +7,14 @@ import ts from "typescript-eslint";
 import jaxJsPlugin from "./packages/eslint-plugin/src/index";
 
 export default defineConfig([
-  globalIgnores(["**/dist/", "docs/", "website/", "coverage/", "tmp/"]),
+  globalIgnores([
+    "**/dist/",
+    "docs/",
+    "website/",
+    "coverage/",
+    "tmp/",
+    "*.config.mjs",
+  ]),
   js.configs.recommended,
   ts.configs.recommendedTypeChecked,
   {

@@ -3,10 +3,17 @@
   "version": "0.1.0",
   "description": "ESLint rules for jax-js array ownership — enforces deterministic disposal and prevents memory leaks",
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./dist/index.js",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
   },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "/dist/*.{js,cjs,d.ts,d.cts}"
+  ],
   "keywords": [
     "eslint",
     "eslintplugin",
