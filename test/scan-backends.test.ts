@@ -48,7 +48,7 @@ describe("lax.scan backend coverage", () => {
 
       // 2. Check copyBufferToBuffer (required for fallback)
       {
-        const { getBackend } = await import("@jax-js-nonconsuming/jax");
+        const { getBackend } = await import("@hamk-uas/jax-js-nonconsuming");
         const backend = getBackend(device) as any;
 
         if (typeof backend.copyBufferToBuffer === "function") {

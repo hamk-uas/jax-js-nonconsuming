@@ -1,4 +1,4 @@
-# @jax-js-nonconsuming/optax
+# @hamk-uas/jax-js-nonconsuming-optax
 
 This is a port of [Optax](https://github.com/google-deepmind/optax) to jax-js, for gradient
 processing and optimization. It includes implementations of common algorithms like Adam.
@@ -6,8 +6,8 @@ processing and optimization. It includes implementations of common algorithms li
 ## Example
 
 ```ts
-import { adam } from "@jax-js-nonconsuming/optax";
-import { grad, numpy as np, tree } from "@jax-js-nonconsuming/jax";
+import { adam } from "@hamk-uas/jax-js-nonconsuming-optax";
+import { grad, numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
 
 let params = np.array([1.0, 2.0, 3.0]);
 

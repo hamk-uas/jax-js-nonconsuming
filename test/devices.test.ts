@@ -3,7 +3,7 @@ import {
   devicePut,
   devices,
   numpy as np,
-} from "@jax-js-nonconsuming/jax";
+} from "@hamk-uas/jax-js-nonconsuming";
 import { expect, test } from "vitest";
 
 defaultDevice("cpu");

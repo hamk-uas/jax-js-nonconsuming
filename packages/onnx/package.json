@@ -1,5 +1,5 @@
 {
-  "name": "@jax-js-nonconsuming/onnx",
+  "name": "@hamk-uas/jax-js-nonconsuming-onnx",
   "version": "0.0.0",
   "description": "Load ONNX models and run inference natively with jax-js.",
   "keywords": [
@@ -44,9 +44,9 @@
     "onnx-buf": "^1.20.0-1"
   },
   "peerDependencies": {
-    "@jax-js-nonconsuming/jax": ">=0.2.0"
+    "@hamk-uas/jax-js-nonconsuming": ">=0.2.0"
   },
   "devDependencies": {
-    "@jax-js-nonconsuming/jax": "workspace:^"
+    "@hamk-uas/jax-js-nonconsuming": "workspace:^"
   }
 }

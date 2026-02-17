@@ -6,11 +6,11 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "paths": {
-      "@jax-js-nonconsuming/jax": ["."],
-      "@jax-js-nonconsuming/optax": ["./packages/optax/src"],
-      "@jax-js-nonconsuming/onnx": ["./packages/onnx/src"],
-      "@jax-js-nonconsuming/loaders": ["./packages/loaders/src"],
-      "@jax-js-nonconsuming/eslint-plugin-jax-js": [
+      "@hamk-uas/jax-js-nonconsuming": ["."],
+      "@hamk-uas/jax-js-nonconsuming-optax": ["./packages/optax/src"],
+      "@hamk-uas/jax-js-nonconsuming-onnx": ["./packages/onnx/src"],
+      "@hamk-uas/jax-js-nonconsuming-loaders": ["./packages/loaders/src"],
+      "@hamk-uas/eslint-plugin-jax-js": [
         "./packages/eslint-plugin/src"
       ]
     },

@@ -1,4 +1,4 @@
-import { JsTree, numpy as np, tree } from "@jax-js-nonconsuming/jax";
+import { JsTree, numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
 
 import {
   GradientTransformation,

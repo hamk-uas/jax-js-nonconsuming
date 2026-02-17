@@ -7,7 +7,7 @@ import {
   lax,
   numpy as np,
   random,
-} from "@jax-js-nonconsuming/jax";
+} from "@hamk-uas/jax-js-nonconsuming";
 import { beforeEach, expect, suite, test } from "vitest";
 
 const devicesAvailable = await init();

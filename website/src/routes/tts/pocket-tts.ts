@@ -5,8 +5,8 @@ import {
   numpy as np,
   random,
   tree,
-} from "@jax-js-nonconsuming/jax";
-import { safetensors, WeightMapper } from "@jax-js-nonconsuming/loaders";
+} from "@hamk-uas/jax-js-nonconsuming";
+import { safetensors, WeightMapper } from "@hamk-uas/jax-js-nonconsuming-loaders";
 
 // Kyutai Pocket TTS model weights interfaces and forward pass.
 

@@ -1,5 +1,5 @@
 {
-  "name": "@jax-js-nonconsuming/optax",
+  "name": "@hamk-uas/jax-js-nonconsuming-optax",
   "version": "0.1.2",
   "description": "Gradient processing and optimization library for jax-js",
   "keywords": [
@@ -40,9 +40,9 @@
     "postpublish": "git tag optax/v$npm_package_version && git push --tags"
   },
   "peerDependencies": {
-    "@jax-js-nonconsuming/jax": ">=0.2.0"
+    "@hamk-uas/jax-js-nonconsuming": ">=0.2.0"
   },
   "devDependencies": {
-    "@jax-js-nonconsuming/jax": "workspace:^"
+    "@hamk-uas/jax-js-nonconsuming": "workspace:^"
   }
 }

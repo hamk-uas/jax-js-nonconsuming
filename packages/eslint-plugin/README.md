@@ -1,4 +1,4 @@
-# @jax-js-nonconsuming/eslint-plugin-jax-js
+# @hamk-uas/eslint-plugin-jax-js
 
 ESLint rules for **jax-js array ownership** — enforces deterministic disposal, prevents GPU/WASM
 memory leaks, and catches use-after-dispose bugs at edit time.
@@ -14,7 +14,7 @@ explicitly `.dispose()`'d (or auto-disposed via `using`), and `.ref` is never ne
 
 ```bash
 # From the jax-js monorepo (workspace dependency):
-pnpm add -D @jax-js-nonconsuming/eslint-plugin-jax-js
+pnpm add -D @hamk-uas/eslint-plugin-jax-js
 ```
 
 **Requirements:**
@@ -29,7 +29,7 @@ pnpm add -D @jax-js-nonconsuming/eslint-plugin-jax-js
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js";
 
 export default [
   jaxJs.configs.recommended,
@@ -53,7 +53,7 @@ This enables:
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js";
 
 export default [
   jaxJs.configs.strict,
@@ -68,7 +68,7 @@ enforcement.
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js";
 
 export default [
   jaxJs.configs.invariance,
@@ -86,7 +86,7 @@ For framework internals (transform wrappers, retained handles, dispose ordering)
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js";
 
 export default [
   {
@@ -106,7 +106,7 @@ This enables:
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js";
 
 export default [
   {
@@ -131,7 +131,7 @@ export default [
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js";
 
 export default [
   // Enable for source, disable for tests
@@ -504,7 +504,7 @@ const CACHE_B = np.ones([128]);
 
 ```ts
 // eslint.config.ts
-import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
+import jaxJs from "@hamk-uas/eslint-plugin-jax-js";
 
 export default [
   jaxJs.configs.recommended,
@@ -583,7 +583,7 @@ Optional settings for a better experience (add to `.vscode/settings.json`):
 1. Go to **Settings → Languages & Frameworks → JavaScript → Code Quality Tools → ESLint**.
 2. Select **Automatic ESLint configuration** (or point to your config manually).
 3. Check **Run eslint --fix on save** if you want autofixes applied automatically.
-4. Warnings from `@jax-js-nonconsuming/eslint-plugin-jax-js` will appear inline in the editor.
+4. Warnings from `@hamk-uas/eslint-plugin-jax-js` will appear inline in the editor.
 
 ### Neovim
 
@@ -651,7 +651,7 @@ The community [`@hamk-uas/eslint-plugin-jax-js`](https://github.com/hamk-uas/esl
 plugin targets the **upstream move-semantics** jax-js. This plugin targets the **non-consuming
 fork** where operations leave inputs alive.
 
-| Aspect                | `@hamk-uas/eslint-plugin-jax-js`               | `@jax-js-nonconsuming/eslint-plugin-jax-js`  |
+| Aspect                | `@hamk-uas/eslint-plugin-jax-js`               | `@hamk-uas/eslint-plugin-jax-js`  |
 | --------------------- | ---------------------------------------------- | -------------------------------------------- |
 | Ownership model       | Move semantics (consuming)                     | Non-consuming                                |
 | `.ref` guidance       | Sometimes necessary                            | Never needed in user code                    |

@@ -1,4 +1,4 @@
-import type { Device, numpy as np } from "@jax-js-nonconsuming/jax";
+import type { Device, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 import type { Plugin } from "@rollup/browser";
 
 import { arrayToDataUrl } from "./displayImage";
@@ -153,9 +153,9 @@ async function _runProgram(
   detailedLeakDiagnostics: boolean,
 ): Promise<RunResult> {
   const [jax, optax, loaders] = await Promise.all([
-    import("@jax-js-nonconsuming/jax"),
-    import("@jax-js-nonconsuming/optax"),
-    import("@jax-js-nonconsuming/loaders"),
+    import("@hamk-uas/jax-js-nonconsuming"),
+    import("@hamk-uas/jax-js-nonconsuming-optax"),
+    import("@hamk-uas/jax-js-nonconsuming-loaders"),
   ]);
   const ts = await import("typescript");
   const { rollup } = await import("@rollup/browser");
@@ -255,9 +255,9 @@ async function _runProgram(
       input: "index.ts",
       plugins: [typescriptPlugin, virtualPlugin],
       external: [
-        "@jax-js-nonconsuming/jax",
-        "@jax-js-nonconsuming/optax",
-        "@jax-js-nonconsuming/loaders",
+        "@hamk-uas/jax-js-nonconsuming",
+        "@hamk-uas/jax-js-nonconsuming-optax",
+        "@hamk-uas/jax-js-nonconsuming-loaders",
       ],
     });
 
@@ -322,9 +322,9 @@ async function _runProgram(
     await new AsyncFunction("_MODULES", "_BUILTINS", bundledCode)(
       // _MODULES
       {
-        "@jax-js-nonconsuming/jax": jax,
-        "@jax-js-nonconsuming/optax": optax,
-        "@jax-js-nonconsuming/loaders": loaders,
+        "@hamk-uas/jax-js-nonconsuming": jax,
+        "@hamk-uas/jax-js-nonconsuming-optax": optax,
+        "@hamk-uas/jax-js-nonconsuming-loaders": loaders,
       },
       // _BUILTINS
       {

@@ -1,5 +1,5 @@
 {
-  "name": "@jax-js-nonconsuming/jax",
+  "name": "@hamk-uas/jax-js-nonconsuming",
   "version": "0.2.2",
   "description": "Numerical computing and ML in the browser",
   "keywords": [

@@ -4,7 +4,7 @@
  * checkLeaks uses backend slot count deltas (same as slotCount()) for accurate
  * leak detection, plus a tracking map for diagnostic details.
  */
-import { checkLeaks, init, jit, numpy as np } from "@jax-js-nonconsuming/jax";
+import { checkLeaks, init, jit, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, it } from "vitest";
 
 await init();

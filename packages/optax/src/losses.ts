@@ -1,4 +1,4 @@
-import { numpy as np } from "@jax-js-nonconsuming/jax";
+import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
 function checkSameShape(a: np.Array, b: np.Array) {
   if (

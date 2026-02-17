@@ -11,7 +11,7 @@ import {
   jit,
   lax,
   numpy as np,
-} from "@jax-js-nonconsuming/jax";
+} from "@hamk-uas/jax-js-nonconsuming";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 describe("buffer recycling", () => {

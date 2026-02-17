@@ -254,7 +254,7 @@ describe("TS transpile source map coverage", () => {
   // try/catch/finally helper code whose source map has coverage gaps.
 
   // User code (4 lines):
-  //   import { numpy as np } from "@jax-js-nonconsuming/jax";
+  //   import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
   //   const x = np.array([1, 2, 3, 4]);
   //   using y = np.array([5, 6]);
   //   console.log(x.js());

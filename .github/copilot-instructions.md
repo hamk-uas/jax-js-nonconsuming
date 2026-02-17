@@ -240,7 +240,7 @@ file operations without manual approval in VS Code.
 **IMPORTANT:** Do NOT use environment variables like `DEBUG=1`. Use the runtime function:
 
 ```typescript
-import { setDebug } from "@jax-js-nonconsuming/jax";
+import { setDebug } from "@hamk-uas/jax-js-nonconsuming";
 setDebug(1); // Enable debug logging BEFORE any jit compilation
 ```
 
@@ -1589,7 +1589,7 @@ await lax.scan(f, init, xs, { acceptPath: [] });
 **Enable debug logging:**
 
 ```ts
-import { setDebug } from "@jax-js-nonconsuming/jax";
+import { setDebug } from "@hamk-uas/jax-js-nonconsuming";
 setDebug(1); // Shows scan path selection reason
 setDebug(2); // Shows shader/WASM code
 ```
@@ -3195,7 +3195,7 @@ matches existing leak detection behavior. Used in the global test setup (`test/s
 every test with automatic leak checking — **every single test in the suite must be leak-free**.
 
 ```ts
-import { checkLeaks } from "@jax-js-nonconsuming/jax";
+import { checkLeaks } from "@hamk-uas/jax-js-nonconsuming";
 
 checkLeaks.start(); // snapshot slot count + enable stack capture
 // ... user code ...

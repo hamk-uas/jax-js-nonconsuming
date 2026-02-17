@@ -1,5 +1,5 @@
-import { grad, JsTree, numpy as np, tree } from "@jax-js-nonconsuming/jax";
-import { adamw, applyUpdates, squaredError } from "@jax-js-nonconsuming/optax";
+import { grad, JsTree, numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
+import { adamw, applyUpdates, squaredError } from "@hamk-uas/jax-js-nonconsuming-optax";
 import { expect, test } from "vitest";
 
 test("adamw optimizer", () => {

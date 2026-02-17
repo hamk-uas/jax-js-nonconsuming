@@ -17,7 +17,7 @@ import * as core from "../frontend/core";
  *
  * @example
  * ```ts
- * import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
+ * import { lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
  *
  * using x = np.array([[2., 1.], [1., 2.]]);
  *
@@ -57,7 +57,7 @@ export function cholesky(
  *
  * @example
  * ```ts
- * import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
+ * import { lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
  *
  * const A = np.array([[4., 3.], [6., 3.]]);
  * const [lu, pivots, permutation] = lax.linalg.lu(A);
@@ -83,7 +83,7 @@ export function lu(x: ArrayLike): [Array, Array, Array] {
  *
  * @example
  * ```ts
- * import { lax, numpy as np } from "@jax-js-nonconsuming/jax";
+ * import { lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
  *
  * using L = np.array([[2., 0.], [1., 3.]]);
  * using b = np.array([4., 7.]).reshape([2, 1]);

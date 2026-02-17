@@ -27,7 +27,7 @@ import {
   numpy as np,
   tree,
   vmap,
-} from "@jax-js-nonconsuming/jax";
+} from "@hamk-uas/jax-js-nonconsuming";
 import {
   beforeAll,
   beforeEach,

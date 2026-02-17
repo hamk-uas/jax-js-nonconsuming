@@ -13,7 +13,7 @@ import requireWrapperDisposeSymmetry from "./rules/require-wrapper-dispose-symme
 
 const plugin: ESLint.Plugin = {
   meta: {
-    name: "@jax-js-nonconsuming/eslint-plugin-jax-js",
+    name: "@hamk-uas/eslint-plugin-jax-js",
     version: "0.1.0",
   },
   rules: {
@@ -110,7 +110,7 @@ const internalTransforms: Linter.Config = {
 };
 
 // Attach configs to plugin object for flat-config consumers:
-//   import jaxJs from "@jax-js-nonconsuming/eslint-plugin-jax-js";
+//   import jaxJs from "@hamk-uas/eslint-plugin-jax-js";
 //   export default [ jaxJs.configs.recommended, ... ];
 (plugin as any).configs = {
   recommended,

@@ -4,13 +4,13 @@
     init,
     numpy as np,
     tree,
-  } from "@jax-js-nonconsuming/jax";
+  } from "@hamk-uas/jax-js-nonconsuming";
   import { resolve } from "$app/paths";
   import {
     cachedFetch,
     safetensors,
     tokenizers,
-  } from "@jax-js-nonconsuming/loaders";
+  } from "@hamk-uas/jax-js-nonconsuming-loaders";
   import { AudioLinesIcon, DownloadIcon, GithubIcon } from "@lucide/svelte";
 
   import DownloadManager from "$lib/common/DownloadManager.svelte";
