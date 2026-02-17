@@ -44,7 +44,7 @@ npm install github:hamk-uas/jax-js-nonconsuming
 To pin a specific release tag (once available):
 
 ```bash
-npm install github:hamk-uas/jax-js-nonconsuming#v0.2.0
+npm install github:hamk-uas/jax-js-nonconsuming#v0.2.2
 ```
 
 Under the hood, it translates array operations into a compiler representation, then synthesizes

@@ -1,6 +1,6 @@
 {
   "name": "@jax-js-nonconsuming/jax",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Numerical computing and ML in the browser",
   "keywords": [
     "machine learning",
