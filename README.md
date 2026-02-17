@@ -336,37 +336,22 @@ await devicePut(ar, "webgpu"); // Now device="webgpu"
 
 ### Helper libraries
 
-jax-js includes three helper libraries:
+jax-js includes three helper libraries, available as **sub-path exports** from the main package:
 
 - [**optax**](packages/optax) — optimizers (Adam, SGD) and gradient processing
 - [**loaders**](packages/loaders) — Safetensors, BPE tokenizers, OPFS-cached downloads
 - [**onnx**](packages/onnx) — load [ONNX](https://onnx.ai/) models into native jax-js functions
-
-**Install as separate packages** (recommended for pnpm):
-
-```bash
-# Install the main library
-pnpm add @jax-js-nonconsuming/jax@"github:hamk-uas/jax-js-nonconsuming"
-
-# Install any helper libraries you need
-pnpm add @jax-js-nonconsuming/optax@"github:hamk-uas/jax-js-nonconsuming&path:packages/optax"
-pnpm add @jax-js-nonconsuming/loaders@"github:hamk-uas/jax-js-nonconsuming&path:packages/loaders"
-pnpm add @jax-js-nonconsuming/onnx@"github:hamk-uas/jax-js-nonconsuming&path:packages/onnx"
-```
-
-```ts
-import { adam } from "@jax-js-nonconsuming/optax";
-import { cachedFetch, safetensors } from "@jax-js-nonconsuming/loaders";
-import { ONNXModel } from "@jax-js-nonconsuming/onnx";
-```
-
-**Or use sub-path exports** (single install, no extra packages):
 
 ```ts
 import { adam } from "@jax-js-nonconsuming/jax/optax";
 import { cachedFetch, safetensors } from "@jax-js-nonconsuming/jax/loaders";
 import { ONNXModel } from "@jax-js-nonconsuming/jax/onnx";
 ```
+
+No extra install needed — they're included when you install `@jax-js-nonconsuming/jax`. The
+`loaders` and `onnx` sub-packages have optional native dependencies (`@bufbuild/protobuf`,
+`sentencepiece-buf`, `onnx-buf`) that are listed in the main package's `optionalDependencies` and
+installed automatically if available for your platform.
 
 ### Performance
 
