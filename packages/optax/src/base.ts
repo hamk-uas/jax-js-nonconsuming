@@ -22,7 +22,16 @@ export interface GradientTransformation {
   ): [Params, OptState];
 }
 
-/** @inline */
+/**
+ * A learning rate or weight decay schedule function.
+ *
+ * **Not JIT-compatible.** Schedule functions take a plain JS number, so they
+ * cannot be traced by `jit()`. Use a scalar learning rate with `adam(0.001)`
+ * for JIT-compatible optimizers. Schedule-based transforms (`scaleBySchedule`,
+ * `addDecayedWeights` with a schedule) fall back to eager execution.
+ *
+ * @inline
+ */
 export type Schedule = (count: number) => number;
 
 /** @inline */

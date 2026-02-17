@@ -111,7 +111,13 @@ export function scale(stepSize: number): GradientTransformation {
   };
 }
 
-/** Scale updates using a custom schedule for the step size. */
+/**
+ * Scale updates using a custom schedule for the step size.
+ *
+ * **Not JIT-compatible.** Uses `count.item()` to extract a concrete step
+ * number for the schedule callback. Use `scale()` with a scalar for
+ * JIT-compatible constant scaling.
+ */
 export function scaleBySchedule(stepSizeFn: Schedule): GradientTransformation {
   return {
     init(_params) {
@@ -173,7 +179,12 @@ export type AddDecayedWeightsOptions = {
   mask?: JsTree<np.Array> | MaskFn | null;
 };
 
-/** Add parameter scaled by weight decay. */
+/** Add parameter scaled by weight decay.
+ *
+ * JIT-compatible when `weightDecay` is a scalar (default).
+ * **Not JIT-compatible** when `weightDecay` is a `Schedule` function
+ * (uses `count.item()` to extract the concrete step number).
+ */
 export function addDecayedWeights({
   weightDecay = 0.0,
   mask = null,
