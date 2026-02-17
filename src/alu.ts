@@ -1569,6 +1569,18 @@ export class Reduction implements FpHashable {
       }
     } else if (isFloatDtype(this.dtype)) {
       if (this.op === AluOp.Add) {
+        // Kahan compensated summation for Float64 to reduce O(n·ε) error to O(ε²).
+        if (this.dtype === DType.Float64) {
+          let sum = 0;
+          let c = 0;
+          for (const v of values) {
+            const y = v - c;
+            const t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
+          }
+          return sum;
+        }
         return values.reduce((a: number, b: number) => a + b, 0);
       } else if (this.op === AluOp.Mul) {
         return values.reduce((a: number, b: number) => a * b, 1);
