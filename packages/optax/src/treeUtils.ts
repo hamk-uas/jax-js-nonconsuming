@@ -1,4 +1,9 @@
-import { DType, JsTree, numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
+import {
+  DType,
+  JsTree,
+  numpy as np,
+  tree,
+} from "@hamk-uas/jax-js-nonconsuming";
 
 export function treeZerosLike(
   tr: JsTree<np.Array>,
@@ -50,13 +55,23 @@ export function treeUpdateMoment(
   );
 }
 
-/** Performs bias correction, dividing by 1-decay^count. */
+/**
+ * Performs bias correction, dividing by 1-decay^count.
+ *
+ * Uses array operations instead of `.item()` so this function is
+ * compatible with JIT tracing (count can be a tracer).
+ */
 export function treeBiasCorrection(
   moments: JsTree<np.Array>,
   decay: number,
   count: np.Array,
 ): JsTree<np.Array> {
-  const correction = 1 / (1 - Math.pow(decay, count.item()));
+  using countFloat = np.astype(count, np.float32);
+  using decayArr = np.array(decay);
+  using decayPow = np.power(decayArr, countFloat);
+  using one = np.array(1.0);
+  using oneMinusDecayPow = one.sub(decayPow);
+  using correction = one.div(oneMinusDecayPow);
   return tree.map((t: np.Array) => t.mul(correction), moments);
 }
 

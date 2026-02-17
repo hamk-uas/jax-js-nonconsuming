@@ -1,5 +1,16 @@
-import { grad, JsTree, numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
-import { adamw, applyUpdates, squaredError } from "@hamk-uas/jax-js-nonconsuming-optax";
+import {
+  grad,
+  jit,
+  JsTree,
+  numpy as np,
+  tree,
+} from "@hamk-uas/jax-js-nonconsuming";
+import {
+  adamw,
+  applyUpdates,
+  scaleByAdam,
+  squaredError,
+} from "@hamk-uas/jax-js-nonconsuming-optax";
 import { expect, test } from "vitest";
 
 test("adamw optimizer", () => {
@@ -95,4 +106,35 @@ test("adamw with callable mask", () => {
   expect(params.dtype).toEqual(np.float32);
   params.dispose();
   tree.dispose(optState);
+});
+
+test("scaleByAdam update works inside jit", () => {
+  using params = np.array([1.0, 2.0, 3.0]);
+  using updates = np.array([0.1, 0.2, 0.3]);
+
+  const solver = scaleByAdam();
+
+  // Run scaleByAdam.update under jit — this verifies treeBiasCorrection
+  // works with tracers (uses np.power instead of count.item()).
+  const jitState = solver.init(params);
+  const { count, mu, nu } = jitState as {
+    count: np.Array;
+    mu: np.Array;
+    nu: np.Array;
+  };
+  using jitUpdate = jit(
+    (g: np.Array, p: np.Array, c: np.Array, m: np.Array, n: np.Array) => {
+      const state = { count: c, mu: m, nu: n };
+      const [upd, _newState] = solver.update(g, state, p);
+      tree.dispose(_newState);
+      return upd;
+    },
+  );
+  using jitUpdates = jitUpdate(updates, params, count, mu, nu);
+
+  // Adam with count=0→1 on [0.1,0.2,0.3] should produce ≈ [1, 1, 1]
+  // (mu_hat/sqrt(nu_hat) with both bias-corrected at step 1)
+  expect(jitUpdates).toBeAllclose([1.0, 1.0, 1.0], { atol: 0.01 });
+
+  tree.dispose(jitState);
 });

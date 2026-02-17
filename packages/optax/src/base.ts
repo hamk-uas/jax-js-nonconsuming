@@ -22,8 +22,19 @@ export interface GradientTransformation {
   ): [Params, OptState];
 }
 
-/** @inline */
-export type Schedule = (count: number) => number;
+/**
+ * A learning rate or weight decay schedule function.
+ *
+ * Takes and returns `np.Array` scalars so the schedule body can be traced
+ * by `jit()`. Write schedule logic using `np.*` array operations:
+ *
+ * ```ts
+ * const schedule: Schedule = (count) => np.power(np.array(0.9), count);
+ * ```
+ *
+ * @inline
+ */
+export type Schedule = (count: np.Array) => np.Array;
 
 /** @inline */
 export type ScalarOrSchedule = number | Schedule;
