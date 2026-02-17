@@ -44,8 +44,23 @@ npm install github:hamk-uas/jax-js-nonconsuming
 To pin a specific release tag (once available):
 
 ```bash
-npm install github:hamk-uas/jax-js-nonconsuming#v0.2.2
+npm install github:hamk-uas/jax-js-nonconsuming#v0.3.0
 ```
+
+**pnpm users:** pnpm requires explicit permission to run build scripts from Git dependencies. Add
+this to your `package.json`:
+
+```json
+{
+  "pnpm": {
+    "onlyBuiltDependencies": ["@hamk-uas/jax-js-nonconsuming"]
+  }
+}
+```
+
+Without this, `pnpm install` fails with `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`. The `prepare`
+script runs `tsdown` to build the package and its sub-packages (optax, loaders, onnx,
+eslint-plugin).
 
 Under the hood, it translates array operations into a compiler representation, then synthesizes
 kernels in WebAssembly and WebGPU.

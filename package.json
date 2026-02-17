@@ -1,6 +1,6 @@
 {
   "name": "@hamk-uas/jax-js-nonconsuming",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Numerical computing and ML in the browser",
   "keywords": [
     "machine learning",
