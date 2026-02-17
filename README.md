@@ -24,10 +24,10 @@
 >
 > **Why this fork?** The original jax-js uses move semantics, where operations consume their inputs.
 > This fork was created for teams familiar with MATLAB or Python (NumPy) where move semantics are
-> unexpected. We also fast-tracked a `lax.scan` implementation. `using` declarations handle
-> the common case — block-scoped arrays are disposed automatically — but patterns like method
-> chains, loop-carried state, and nested results still need manual care. A built-in `checkLeaks`
-> diagnostic and ESLint plugin help catch what `using` misses. See
+> unexpected. We also fast-tracked a `lax.scan` implementation. `using` declarations handle the
+> common case — block-scoped arrays are disposed automatically — but patterns like method chains,
+> loop-carried state, and nested results still need manual care. A built-in `checkLeaks` diagnostic
+> and ESLint plugin help catch what `using` misses. See
 > [Tradeoffs](#tradeoffs-of-the-non-consuming-model) for an honest comparison.
 >
 > See [Differences from upstream](#differences-from-upstream) for a full comparison between the
@@ -523,13 +523,13 @@ npm install github:hamk-uas/jax-js-nonconsuming#v0.2.1
 
 #### Version numbering
 
-| Change type                                                   | Bump  | Example                                            |
-| ------------------------------------------------------------- | ----- | -------------------------------------------------- |
-| Documentation only (README, comments, copilot-instructions)   | none  | Users on `main` get it automatically               |
-| Bug fix, precision improvement, internal refactor             | patch | Kahan summation, ownership fix, test improvements  |
-| New jax-js/NumPy ops added to API surface                     | patch | New `numpy.foo()` function                         |
-| New public API or feature (transform, backend capability)     | minor | `lax.scan`, buffer recycling, new ESLint rule      |
-| Breaking API or ownership-model behavior change               | major | Removing a public function, changing dispose rules |
+| Change type                                                 | Bump  | Example                                            |
+| ----------------------------------------------------------- | ----- | -------------------------------------------------- |
+| Documentation only (README, comments, copilot-instructions) | none  | Users on `main` get it automatically               |
+| Bug fix, precision improvement, internal refactor           | patch | Kahan summation, ownership fix, test improvements  |
+| New jax-js/NumPy ops added to API surface                   | patch | New `numpy.foo()` function                         |
+| New public API or feature (transform, backend capability)   | minor | `lax.scan`, buffer recycling, new ESLint rule      |
+| Breaking API or ownership-model behavior change             | major | Removing a public function, changing dispose rules |
 
 This fork uses **independent semver** — it does not mirror upstream `ekzhang/jax-js` tags. Track
 upstream compatibility in release notes, and choose bump level by user-visible impact in this fork.
@@ -612,7 +612,7 @@ names (and thus nobody disposes), nested results from `scan`/`grad` need `tree.d
 loop-carried state or arrays stored in caches require manual discipline. The `checkLeaks` diagnostic
 (built into the test suite so every test is leak-checked) and the ESLint plugin catch many of these
 cases, but they are developer tools, not a runtime safety net. (Move semantics can also leak — e.g.
-an over-`.ref`'d array or a retained reference — but the fail-fast default for *reuse* bugs makes
+an over-`.ref`'d array or a retained reference — but the fail-fast default for _reuse_ bugs makes
 those easier to spot.)
 
 **Higher peak memory in eager mode.** Expression chains like `x.mul(y).add(z).sub(w)` create
@@ -621,9 +621,9 @@ intermediate is freed as soon as the next operation consumes it. In the non-cons
 intermediates stay alive simultaneously — for large tensors this can significantly increase peak
 memory (the exact factor depends on chain length and tensor size). Breaking chains into `using`
 temporaries solves this (intermediates are disposed at block exit), but the code is more verbose
-than the NumPy equivalent. Under `jit()`, both models free intermediates at the optimal point —
-this is purely an eager-mode difference. But eager mode is where you debug, and debugging with
-higher memory footprint is a real obstacle.
+than the NumPy equivalent. Under `jit()`, both models free intermediates at the optimal point — this
+is purely an eager-mode difference. But eager mode is where you debug, and debugging with higher
+memory footprint is a real obstacle.
 
 **JavaScript GC doesn't know about GPU memory.** The JS garbage collector tracks JS heap pressure,
 not the 4 GB of VRAM on your GPU. A leaked 512×512 `f32` buffer is 1 MB of GPU memory but only ~64
@@ -660,7 +660,7 @@ transpilation. A polyfill is included, but it adds friction.
 arrays) at the language level. But for patterns it doesn't cover — method chains, pytree results,
 loop-carried state, long-lived closures — the non-consuming model leans on voluntary tooling: the
 ESLint plugin for static analysis and `checkLeaks` for runtime detection. Move semantics fail fast
-for *reuse* mistakes, but have their own blind spots (over-`.ref`, retained references, forgotten
+for _reuse_ mistakes, but have their own blind spots (over-`.ref`, retained references, forgotten
 `vjpFn.dispose()`) that also need tooling and discipline.
 
 **Neither model is free.** Move semantics pay with `UseAfterFreeError` bugs, `.ref` boilerplate, and

@@ -415,11 +415,11 @@ where f64 precision is required and naive summation of large arrays introduces v
 
 Implemented in three places:
 
-| Location                    | Mechanism                                                                   |
-| --------------------------- | --------------------------------------------------------------------------- |
-| `src/alu.ts`                | `Reduction.evaluate()` — early-return Kahan loop for Float64 Add            |
-| `src/backend/cpu.ts`        | `useKahan` flag + inline compensation loop in CPU kernel execution          |
-| `src/backend/wasm.ts`       | `codegenReductionAccumulate()` optional `kahanComp` parameter; WASM codegen |
+| Location              | Mechanism                                                                   |
+| --------------------- | --------------------------------------------------------------------------- |
+| `src/alu.ts`          | `Reduction.evaluate()` — early-return Kahan loop for Float64 Add            |
+| `src/backend/cpu.ts`  | `useKahan` flag + inline compensation loop in CPU kernel execution          |
+| `src/backend/wasm.ts` | `codegenReductionAccumulate()` optional `kahanComp` parameter; WASM codegen |
 
 The WASM implementation integrates with scan via the shared `emitKernelBody()` function — any scan
 body containing a Float64 Add reduction automatically gets Kahan compensation.
@@ -529,8 +529,8 @@ computed internally — only computed primals are disposed at cleanup.
 This section explains WebGPU constraints relevant to jax-js development. Assumes familiarity with
 GPU concepts (buffers, shaders, workgroups) but not WebGPU-specific details.
 
-> **No Float64 on WebGPU.** WGSL has no `f64` type — `dtypeToWgsl()` throws on `DType.Float64`.
-> All f64 work runs on WASM/CPU. See [Float64 support](#float64-support--numerical-precision).
+> **No Float64 on WebGPU.** WGSL has no `f64` type — `dtypeToWgsl()` throws on `DType.Float64`. All
+> f64 work runs on WASM/CPU. See [Float64 support](#float64-support--numerical-precision).
 
 ### WebGPU compute model primer
 
@@ -1069,12 +1069,12 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 
 ## Documentation files
 
-| File                              | Purpose                                    | When to update                 |
-| --------------------------------- | ------------------------------------------ | ------------------------------ |
+| File                              | Purpose                                        | When to update                        |
+| --------------------------------- | ---------------------------------------------- | ------------------------------------- |
 | `README.md`                       | Main project intro, tutorial, Maintainer Guide | Major features, API changes, releases |
-| `FEATURES.md`                     | JAX/NumPy API compatibility table          | New supported functions        |
-| `.github/copilot-instructions.md` | AI agent onboarding, scan feature tracking | New patterns, scan development |
-| `packages/*/README.md`            | Package-specific docs                      | Package feature changes        |
+| `FEATURES.md`                     | JAX/NumPy API compatibility table              | New supported functions               |
+| `.github/copilot-instructions.md` | AI agent onboarding, scan feature tracking     | New patterns, scan development        |
+| `packages/*/README.md`            | Package-specific docs                          | Package feature changes               |
 
 ## Where to start reading
 

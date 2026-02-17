@@ -159,7 +159,7 @@ export class CpuBackend implements Backend {
           if (useKahan) {
             const y = item - comp;
             const t = acc + y;
-            comp = (t - acc) - y;
+            comp = t - acc - y;
             acc = t;
           } else {
             acc = kernel.reduction.evaluate(acc, item);

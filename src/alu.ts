@@ -1576,7 +1576,7 @@ export class Reduction implements FpHashable {
           for (const v of values) {
             const y = v - c;
             const t = sum + y;
-            c = (t - sum) - y;
+            c = t - sum - y;
             sum = t;
           }
           return sum;
