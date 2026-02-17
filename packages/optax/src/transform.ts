@@ -114,9 +114,7 @@ export function scale(stepSize: number): GradientTransformation {
 /**
  * Scale updates using a custom schedule for the step size.
  *
- * **Not JIT-compatible.** Uses `count.item()` to extract a concrete step
- * number for the schedule callback. Use `scale()` with a scalar for
- * JIT-compatible constant scaling.
+ * JIT-compatible when the schedule body uses `np.*` array operations.
  */
 export function scaleBySchedule(stepSizeFn: Schedule): GradientTransformation {
   return {
@@ -125,11 +123,19 @@ export function scaleBySchedule(stepSizeFn: Schedule): GradientTransformation {
     },
     update(updates, state, _params) {
       const { count } = state as { count: np.Array };
-      const countInt = count.item();
+      using countFloat = np.astype(count, np.float32);
+      const stepSize = stepSizeFn(countFloat);
+      updates = tree.map(
+        (g: np.Array) => {
+          const result = g.mul(stepSize);
+          return result;
+        },
+        updates,
+      ) as typeof updates;
+      stepSize.dispose();
+      const newCount = count.add(1);
       count.dispose();
-      const stepSize = stepSizeFn(countInt);
-      updates = tree.map((g: np.Array) => g.mul(stepSize), updates);
-      return [updates, { count: u32(countInt + 1) }];
+      return [updates, { count: newCount }];
     },
   };
 }
@@ -142,7 +148,12 @@ export function scaleByLearningRate(
   if (learningRate === undefined) return identity();
   const m = flipSign ? -1 : 1;
   if (typeof learningRate === "function") {
-    return scaleBySchedule((count) => m * learningRate(count));
+    return scaleBySchedule((count: np.Array) => {
+      const lr = learningRate(count);
+      const result = lr.mul(m);
+      lr.dispose();
+      return result;
+    });
   }
   return scale(m * learningRate);
 }
@@ -181,9 +192,7 @@ export type AddDecayedWeightsOptions = {
 
 /** Add parameter scaled by weight decay.
  *
- * JIT-compatible when `weightDecay` is a scalar (default).
- * **Not JIT-compatible** when `weightDecay` is a `Schedule` function
- * (uses `count.item()` to extract the concrete step number).
+ * JIT-compatible with both scalar and schedule `weightDecay`.
  */
 export function addDecayedWeights({
   weightDecay = 0.0,
@@ -205,14 +214,15 @@ export function addDecayedWeights({
       }
 
       let newState: typeof state;
-      let currentWeightDecay: number;
+      let currentWeightDecay: number | np.Array;
 
       if (isSchedule) {
         const { count } = state as { count: np.Array };
-        const countInt = count.item();
-        currentWeightDecay = (weightDecay as Schedule)(countInt);
+        using countFloat = np.astype(count, np.float32);
+        currentWeightDecay = (weightDecay as Schedule)(countFloat);
+        const newCount = count.add(1);
         count.dispose();
-        newState = { count: u32(countInt + 1) };
+        newState = { count: newCount };
       } else {
         currentWeightDecay = weightDecay as number;
         newState = state;
@@ -245,6 +255,8 @@ export function addDecayedWeights({
           params,
         );
       }
+
+      if (typeof currentWeightDecay !== "number") currentWeightDecay.dispose();
 
       updates = tree.map(
         (g: np.Array, d: np.Array) => g.add(d),

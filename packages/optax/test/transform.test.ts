@@ -1,4 +1,4 @@
-import { numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
+import { jit, numpy as np, tree } from "@hamk-uas/jax-js-nonconsuming";
 import {
   addDecayedWeights,
   scaleByLearningRate,
@@ -42,7 +42,10 @@ test("addDecayedWeights function with schedule", () => {
   using updates = np.array([0.1, 0.2, 0.3]);
 
   // Weight decay schedule that increases: 0.01, 0.02, 0.03, ...
-  const weightDecaySchedule = (step: number) => 0.01 * (step + 1);
+  const weightDecaySchedule = (step: np.Array) => {
+    using s = step.add(1);
+    return s.mul(0.01);
+  };
   const transform = addDecayedWeights({ weightDecay: weightDecaySchedule });
   let state = transform.init(params);
 
@@ -93,7 +96,10 @@ test("scaleBySchedule function with dynamic learning rate", () => {
   using updates = np.array([0.1, 0.2, 0.3]);
 
   // Learning rate starts at 1.0 and decreases by 10% each step
-  const schedule = (step: number) => Math.pow(0.9, step);
+  const schedule = (step: np.Array) => {
+    using base = np.array(0.9);
+    return np.power(base, step);
+  };
   const transform = scaleBySchedule(schedule);
   let state = transform.init(params);
 
@@ -149,4 +155,30 @@ test("trace transformation with nesterov", () => {
   expect(newUpdates.dtype).toEqual(np.float32);
   tree.dispose(newUpdates);
   tree.dispose(state);
+});
+
+test("scaleBySchedule works inside jit", () => {
+  using params = np.array([1.0, 2.0, 3.0]);
+  using updates = np.array([0.1, 0.2, 0.3]);
+
+  const schedule = (step: np.Array) => {
+    using base = np.array(0.9);
+    return np.power(base, step);
+  };
+  const transform = scaleBySchedule(schedule);
+  const state = transform.init(params);
+  const { count } = state as { count: np.Array };
+
+  // Run scaleBySchedule.update under jit
+  using jitUpdate = jit((g: np.Array, c: np.Array) => {
+    const s = { count: c };
+    const [upd, newState] = transform.update(g, s, params);
+    tree.dispose(newState);
+    return upd;
+  });
+  using result = jitUpdate(updates, count);
+
+  // step 0: 0.9^0 = 1.0, so updates unchanged
+  expect(result).toBeAllclose([0.1, 0.2, 0.3]);
+  count.dispose();
 });

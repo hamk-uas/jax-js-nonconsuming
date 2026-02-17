@@ -25,14 +25,16 @@ export interface GradientTransformation {
 /**
  * A learning rate or weight decay schedule function.
  *
- * **Not JIT-compatible.** Schedule functions take a plain JS number, so they
- * cannot be traced by `jit()`. Use a scalar learning rate with `adam(0.001)`
- * for JIT-compatible optimizers. Schedule-based transforms (`scaleBySchedule`,
- * `addDecayedWeights` with a schedule) fall back to eager execution.
+ * Takes and returns `np.Array` scalars so the schedule body can be traced
+ * by `jit()`. Write schedule logic using `np.*` array operations:
+ *
+ * ```ts
+ * const schedule: Schedule = (count) => np.power(np.array(0.9), count);
+ * ```
  *
  * @inline
  */
-export type Schedule = (count: number) => number;
+export type Schedule = (count: np.Array) => np.Array;
 
 /** @inline */
 export type ScalarOrSchedule = number | Schedule;
