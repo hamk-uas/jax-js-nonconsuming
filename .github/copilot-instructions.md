@@ -180,6 +180,30 @@ pnpm run test:deno                 # Run Deno WebGPU tests
 
 These match the checks in `.github/workflows/ci.yaml`.
 
+### CI timing profile (measured Feb 2026)
+
+Full-profile pre-commit takes ~82s total. The breakdown:
+
+| Step                 | Wall time | Notes                                       |
+| -------------------- | --------- | ------------------------------------------- |
+| `test:website:smoke` | **49s**   | SvelteKit build dominates (test itself 1ms) |
+| `lint`               | 7s        | ESLint across full codebase                 |
+| `test:policy:strict` | 5s        | Full Vitest (1300+ tests, 46 files)         |
+| `test:deno`          | 4s        | Deno WebGPU (53 tests)                      |
+| `format:check`       | 4s        | Prettier                                    |
+| `build`              | 3s        | tsdown (5 packages)                         |
+| `check`              | 3s        | TypeScript type checking                    |
+| `lint:ownership:*`   | 5s        | Internal + website ownership checks         |
+| `core invariants`    | 2s        | refcount + transform-compositions           |
+| `test:eslint-plugin` | 1s        | Plugin unit tests                           |
+
+**Bottleneck:** `test:website:smoke` is 60% of CI time. It builds the full SvelteKit website to
+catch import breakage from `src/index.ts` — `pnpm check` (tsc) doesn't type-check `.svelte` files.
+This only runs in the **full profile** (main-branch commits); feature branches skip it (~33s total).
+The cost is acceptable given the safety it provides — do not try to cache or skip it, because the
+website imports from the library and stale `.svelte-kit/` cache can silently pass when a fresh build
+would fail.
+
 ### Testing policy modes
 
 The repository supports two test policies:
