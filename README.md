@@ -480,32 +480,14 @@ pnpm -C website dev
 
 ## Maintainer Guide
 
-This section is for maintainers preparing releases for the public repository.
+This section is for maintainers who create releases.
 
-### First public tag (recommended)
+### Releasing
 
-The package version is currently `0.2.0-alpha.1`. For the first public stable tag, use:
-
-- **`v0.2.0`** (recommended)
-
-Why: upstream `ekzhang/jax-js` is in the `0.1.x` line, and this fork already includes substantial
-fork-only behavior changes (`scan`, non-consuming ownership, buffer recycling, `checkLeaks`).
-Starting stable tags at `0.2.0` keeps the fork's semver clear and avoids looking older than the
-current pre-release lineage.
-
-### Release steps
-
-1. Ensure clean state and up-to-date `main`:
+#### Steps
 
 ```bash
-git fetch origin
-git checkout main
-git pull --ff-only
-```
-
-2. Run release checks:
-
-```bash
+# 1. Make sure all checks pass
 pnpm build
 pnpm check
 pnpm run test:policy:strict
@@ -514,51 +496,52 @@ pnpm run test:website:smoke
 pnpm run test:eslint-plugin
 pnpm run lint:ownership:internal
 pnpm run lint:ownership:website
-```
 
-Equivalent single-gate approach (uses the same full profile as main-branch pre-commit):
-
-```bash
+# Or equivalently (same full profile as main-branch pre-commit):
 JAX_PRECOMMIT_PROFILE=full scripts/precommit.sh
-```
 
-3. Bump `package.json` version (for the first stable release: `0.2.0`).
-
-4. Commit release metadata:
-
-```bash
+# 2. Bump the version in package.json (choose patch / minor / major as
+#    appropriate — see Version numbering below).
+#    Then commit and tag:
 git add package.json pnpm-lock.yaml
-git commit -m "chore(release): v0.2.0"
+git commit -m "chore(release): v0.2.1"
+git tag v0.2.1
+
+# 3. Push the commit and tag
+git push && git push --tags
+
+# 4. Create a GitHub release
+#    Go to https://github.com/hamk-uas/jax-js-nonconsuming/releases/new
+#    Select the tag, write release notes summarizing changes.
 ```
 
-5. Create and push tag:
+Users install specific tags, so after releasing they can upgrade with:
 
 ```bash
-git tag v0.2.0
-git push origin main
-git push origin v0.2.0
+npm install github:hamk-uas/jax-js-nonconsuming#v0.2.1
 ```
 
-6. Create GitHub Release from `v0.2.0` and include summary notes (ownership model, scan,
-   compatibility notes).
+#### Version numbering
 
-### Versioning policy (fork vs upstream)
+| Change type                                                   | Bump  | Example                                            |
+| ------------------------------------------------------------- | ----- | -------------------------------------------------- |
+| Documentation only (README, comments, copilot-instructions)   | none  | Users on `main` get it automatically               |
+| Bug fix, precision improvement, internal refactor             | patch | Kahan summation, ownership fix, test improvements  |
+| New jax-js/NumPy ops added to API surface                     | patch | New `numpy.foo()` function                         |
+| New public API or feature (transform, backend capability)     | minor | `lax.scan`, buffer recycling, new ESLint rule      |
+| Breaking API or ownership-model behavior change               | major | Removing a public function, changing dispose rules |
 
-- Use **independent semver** for this fork.
-- Track upstream compatibility in notes/docs, but do not mirror upstream tags exactly.
-- Suggested bump rules:
-  - **Patch**: bug fixes, docs-only release notes updates, internal refactors without API changes.
-  - **Minor**: new public APIs/features (e.g., new transformations, backend capabilities).
-  - **Major**: breaking API or ownership-model behavior changes.
-- When rebasing/syncing from upstream, choose bump level by user-visible impact in this fork.
+This fork uses **independent semver** — it does not mirror upstream `ekzhang/jax-js` tags. Track
+upstream compatibility in release notes, and choose bump level by user-visible impact in this fork.
+When rebasing/syncing from upstream, the bump level depends on what user-facing changes come along.
 
-### Install snippet update after first tag
+### Releasing a bug fix
 
-After creating the first tag, keep install examples pinned to a stable tag:
+For simple bug-fix PRs (the common case):
 
-```bash
-npm install github:hamk-uas/jax-js-nonconsuming#v0.2.0
-```
+1. Merge the PR to `main`.
+2. Version & tag — bug fixes are always a patch bump. Follow the releasing steps above.
+3. Create a GitHub release with notes describing the fix.
 
 ## Contributing
 
