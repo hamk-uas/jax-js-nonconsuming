@@ -1,4 +1,4 @@
-import { AluOp, dtypedArray, Kernel } from "../alu";
+import { AluOp, DType, dtypedArray, Kernel } from "../alu";
 import { Backend, Device, Executable, Slot, SlotError } from "../backend";
 import { Routine, runCpuRoutine } from "../routine";
 import { tuneNullopt } from "../tuner";
@@ -148,11 +148,22 @@ export class CpuBackend implements Backend {
         outputArray[i] = exp.evaluate({ gidx: i }, globals);
       }
     } else {
+      const useKahan =
+        kernel.reduction.dtype === DType.Float64 &&
+        kernel.reduction.op === AluOp.Add;
       for (let i = 0; i < kernel.size; i++) {
         let acc = kernel.reduction.identity;
+        let comp = 0; // Kahan compensation
         for (let j = 0; j < kernel.reduction.size; j++) {
           const item = exp.evaluate({ gidx: i, ridx: j }, globals);
-          acc = kernel.reduction.evaluate(acc, item);
+          if (useKahan) {
+            const y = item - comp;
+            const t = acc + y;
+            comp = (t - acc) - y;
+            acc = t;
+          } else {
+            acc = kernel.reduction.evaluate(acc, item);
+          }
         }
         outputArray[i] = epilogue!.evaluate({ acc, gidx: i }, globals);
       }

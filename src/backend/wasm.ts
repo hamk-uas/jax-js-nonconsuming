@@ -974,8 +974,42 @@ function codegenReductionAccumulate(
   cg: CodeGenerator,
   re: { op: AluOp; dtype: DType; size: number; identity: number },
   acc: number,
+  kahanComp?: number,
 ): void {
   if (re.op === AluOp.Add) {
+    if (kahanComp !== undefined && re.dtype === DType.Float64) {
+      // Kahan compensated summation for Float64:
+      //   y = val - comp;  t = acc + y;  comp = (t - acc) - y;  acc = t;
+      const val = cg.local.declare(cg.f64);
+      cg.local.set(val); // pop expression result into val
+
+      // y = val - comp
+      const y = cg.local.declare(cg.f64);
+      cg.local.get(val);
+      cg.local.get(kahanComp);
+      cg.f64.sub();
+      cg.local.set(y);
+
+      // t = acc + y
+      const t = cg.local.declare(cg.f64);
+      cg.local.get(acc);
+      cg.local.get(y);
+      cg.f64.add();
+      cg.local.set(t);
+
+      // comp = (t - acc) - y
+      cg.local.get(t);
+      cg.local.get(acc);
+      cg.f64.sub();
+      cg.local.get(y);
+      cg.f64.sub();
+      cg.local.set(kahanComp);
+
+      // acc = t
+      cg.local.get(t);
+      cg.local.set(acc);
+      return;
+    }
     cg.local.get(acc);
     if (re.dtype === DType.Bool) cg.i32.or();
     else dty(cg, re.op, re.dtype).add();
@@ -1064,6 +1098,15 @@ function emitKernelBody(opts: {
       dty(cg, null, kernel.exp.dtype).const(re.identity);
       cg.local.set(acc);
 
+      // Kahan compensation local for Float64 Add reductions.
+      const useKahan = re.dtype === DType.Float64 && re.op === AluOp.Add;
+      let kahanComp: number | undefined;
+      if (useKahan) {
+        kahanComp = cg.local.declare(cg.f64);
+        cg.f64.const(0);
+        cg.local.set(kahanComp);
+      }
+
       const ridx = cg.local.declare(cg.i32);
       cg.i32.const(0);
       cg.local.set(ridx);
@@ -1077,7 +1120,7 @@ function emitKernelBody(opts: {
         cg.br_if(0);
 
         emitExp(tune.exp, { ridx });
-        codegenReductionAccumulate(cg, re, acc);
+        codegenReductionAccumulate(cg, re, acc, kahanComp);
 
         cg.local.get(ridx);
         cg.i32.const(1);

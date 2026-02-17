@@ -79,4 +79,49 @@ suite.each(devices)("device:%s", (device) => {
     const b: number = await diff.jsAsync();
     expect(b).toBeCloseTo(1e-15, 15);
   });
+
+  test("Kahan compensated summation in f64 dot product", async () => {
+    // Test that f64 dot product uses compensated summation.
+    // Without Kahan, naive summation of many small terms loses precision.
+    // Sum 10000 copies of 1e-8: exact answer is 1e-4.
+    const n = 10000;
+    using a = np.ones([n], { dtype: np.float64 }).mul(
+      np.array([1e-8], { dtype: np.float64 }),
+    );
+    using s = np.sum(a);
+    const result: number = await s.jsAsync();
+    // Kahan gives ~1e-16 relative error; naive gives ~1e-12 for n=10000.
+    expect(Math.abs(result - 1e-4) / 1e-4).toBeLessThan(1e-13);
+  });
+
+  test("Kahan compensated summation in f64 dot product (large)", async () => {
+    // Dot product of 50000 small values where naive summation loses precision.
+    // Each product is 1e-8, so exact dot = 50000 * 1e-8 = 5e-4.
+    const n = 50000;
+    using a = np.ones([n], { dtype: np.float64 }).mul(
+      np.array([1e-4], { dtype: np.float64 }),
+    );
+    using b = np.ones([n], { dtype: np.float64 }).mul(
+      np.array([1e-4], { dtype: np.float64 }),
+    );
+    using result = np.dot(a, b);
+    const val: number = await result.jsAsync();
+    // Each a[i]*b[i] = 1e-8, dot = 50000 * 1e-8 = 5e-4.
+    // Kahan keeps relative error < 1e-13.
+    expect(Math.abs(val - 5e-4) / 5e-4).toBeLessThan(1e-10);
+  });
+
+  test("jit f64 dot product with Kahan summation", async () => {
+    // Verify compensated summation works under JIT too.
+    using f = jit((x: np.Array, y: np.Array) => np.dot(x, y));
+    const n = 5000;
+    using a = np.ones([n], { dtype: np.float64 }).mul(
+      np.array([1e-8], { dtype: np.float64 }),
+    );
+    using b = np.ones([n], { dtype: np.float64 });
+    using result = f(a, b);
+    const val: number = await result.jsAsync();
+    // dot(a, b) = sum of 5000 copies of 1e-8 = 5e-5
+    expect(Math.abs(val - 5e-5) / 5e-5).toBeLessThan(1e-13);
+  });
 });
