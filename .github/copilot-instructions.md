@@ -402,6 +402,36 @@ A **Slot** is jax-js's internal handle to a backend memory allocation (WASM poin
 | Zero on alloc   | **Yes** — `.fill(0)` on free-list reuse     | **Fresh only** — `createBuffer` zeros; pool does not  |
 | Zero on recycle | N/A (JIT recycle = slot rename)             | N/A (JIT recycle = slot rename)                       |
 
+### Float64 support & numerical precision
+
+**Float64 runs only on WASM and CPU — never on WebGPU.** WGSL has no 64-bit floating-point type;
+`dtypeToWgsl()` in `src/backend/webgpu/codegen.ts` throws on `DType.Float64`. This means any f64
+computation is dispatched to the WASM or CPU backend, which have full f64 support.
+
+**Kahan compensated summation:** Float64 Add reductions use
+[Kahan summation](https://en.wikipedia.org/wiki/Kahan_summation_algorithm) to reduce accumulation
+error from O(n·ε) to O(ε²). This matters for workloads like dynamic linear models (Kalman filters)
+where f64 precision is required and naive summation of large arrays introduces visible drift.
+
+Implemented in three places:
+
+| Location                    | Mechanism                                                                   |
+| --------------------------- | --------------------------------------------------------------------------- |
+| `src/alu.ts`                | `Reduction.evaluate()` — early-return Kahan loop for Float64 Add            |
+| `src/backend/cpu.ts`        | `useKahan` flag + inline compensation loop in CPU kernel execution          |
+| `src/backend/wasm.ts`       | `codegenReductionAccumulate()` optional `kahanComp` parameter; WASM codegen |
+
+The WASM implementation integrates with scan via the shared `emitKernelBody()` function — any scan
+body containing a Float64 Add reduction automatically gets Kahan compensation.
+
+**Why not on GPU?** Kahan compensation requires f64 arithmetic for the compensation variable. Since
+WGSL has no f64 type, it's not possible. Running Kahan with f32 compensation provides no benefit
+because the compensation term is rounded away by f32 precision (ε ≈ 6×10⁻⁸ for f32 vs ε ≈ 1.1×10⁻¹⁶
+for f64).
+
+**Test coverage:** `test/dtype-f64.test.ts` — includes small-sum (n=10000, tol 1e-13), large
+dot-product (n=50000, tol 1e-10), and JIT dot-product (n=5000, tol 1e-13) tests.
+
 ### Ownership internals
 
 This section describes how the non-consuming ownership model works across different execution
@@ -498,6 +528,9 @@ computed internally — only computed primals are disposed at cleanup.
 
 This section explains WebGPU constraints relevant to jax-js development. Assumes familiarity with
 GPU concepts (buffers, shaders, workgroups) but not WebGPU-specific details.
+
+> **No Float64 on WebGPU.** WGSL has no `f64` type — `dtypeToWgsl()` throws on `DType.Float64`.
+> All f64 work runs on WASM/CPU. See [Float64 support](#float64-support--numerical-precision).
 
 ### WebGPU compute model primer
 
@@ -1032,12 +1065,13 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 7. Update `FEATURES.md` for user-visible changes
 8. If you **fix** a `KNOWN_BUG` test (it starts passing), celebrate — then remove the `KNOWN_BUG`
    tag and update the inventory in this file
+9. For **releases** (version bump + tag + push), follow the Maintainer Guide in `README.md`
 
 ## Documentation files
 
 | File                              | Purpose                                    | When to update                 |
 | --------------------------------- | ------------------------------------------ | ------------------------------ |
-| `README.md`                       | Main project intro, tutorial               | Major features, API changes    |
+| `README.md`                       | Main project intro, tutorial, Maintainer Guide | Major features, API changes, releases |
 | `FEATURES.md`                     | JAX/NumPy API compatibility table          | New supported functions        |
 | `.github/copilot-instructions.md` | AI agent onboarding, scan feature tracking | New patterns, scan development |
 | `packages/*/README.md`            | Package-specific docs                      | Package feature changes        |
