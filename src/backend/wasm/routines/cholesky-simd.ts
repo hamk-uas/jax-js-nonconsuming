@@ -92,51 +92,51 @@ function genCholeskySimd(cg: CodeGenerator, n: number): number {
           cg.i32.const(0);
           cg.local.set(k);
 
+          cg.block(cg.void);
           cg.loop(cg.void);
           {
-            // if (k < jFloor4) { body; continue }
+            // if (k >= jFloor4) break
             cg.local.get(k);
             cg.local.get(jFloor4);
-            cg.i32.lt_s();
-            cg.if(cg.void);
-            {
-              // vec += L[i, k:k+4] * L[j, k:k+4]
-              cg.local.get(vec);
+            cg.i32.ge_s();
+            cg.br_if(1);
 
-              // Load L[i, k:k+4] from rowI + k * 4
-              cg.local.get(rowI);
-              cg.local.get(k);
-              cg.i32.const(4);
-              cg.i32.mul();
-              cg.i32.add();
-              cg.v128.load(2); // alignment log2(4)
+            // vec += L[i, k:k+4] * L[j, k:k+4]
+            cg.local.get(vec);
 
-              // Load L[j, k:k+4] from rowJ + k * 4
-              cg.local.get(rowJ);
-              cg.local.get(k);
-              cg.i32.const(4);
-              cg.i32.mul();
-              cg.i32.add();
-              cg.v128.load(2);
+            // Load L[i, k:k+4] from rowI + k * 4
+            cg.local.get(rowI);
+            cg.local.get(k);
+            cg.i32.const(4);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.v128.load(2); // alignment log2(4)
 
-              // Multiply
-              cg.f32x4.mul();
+            // Load L[j, k:k+4] from rowJ + k * 4
+            cg.local.get(rowJ);
+            cg.local.get(k);
+            cg.i32.const(4);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.v128.load(2);
 
-              // Add to accumulator
-              cg.f32x4.add();
-              cg.local.set(vec);
+            // Multiply
+            cg.f32x4.mul();
 
-              // k += 4
-              cg.local.get(k);
-              cg.i32.const(4);
-              cg.i32.add();
-              cg.local.set(k);
+            // Add to accumulator
+            cg.f32x4.add();
+            cg.local.set(vec);
 
-              cg.br(1); // continue loop
-            }
-            cg.end(); // end if
+            // k += 4
+            cg.local.get(k);
+            cg.i32.const(4);
+            cg.i32.add();
+            cg.local.set(k);
+
+            cg.br(0);
           }
-          cg.end(); // end loop
+          cg.end();
+          cg.end();
 
           // Horizontal sum of vec and subtract from sum
           cg.local.get(sum);

@@ -847,100 +847,6 @@ SIMD is automatically selected for Cholesky when `dtype === "f32" && n >= 32`.
 wasmblr modules. This avoids code duplication (each routine is 1-3KB) while keeping the entire loop
 in native code. See `codegenNativeScanGeneral()` in `src/backend/wasm.ts`.
 
-### wasmblr peephole optimizer
-
-An opt-in post-emission optimization pass that rewrites WASM function body bytecodes before binary
-encoding. Lives in `src/backend/wasm/wasmblr-peephole.ts`, toggled globally via `setWasmPeephole()`.
-**Enabled by default.**
-
-**Design constraints:**
-
-- Zero external dependencies (self-contained in the wasmblr pipeline).
-- Only applies semantics-preserving, block-local rewrites.
-- Fail-safe: unknown opcodes abort the pass and return original bytes unchanged.
-- Inter-pass compaction: deleted instructions are compacted between passes, enabling cascading
-  optimizations (e.g., constant fold → offset absorption across 2 passes).
-
-**Loop codegen optimization (wasmblr-hl.ts):**
-
-All loop helpers (`forLoop`, `forLoopDown`, `whileLoop`, SIMD reduction loops) and the kernel/scan
-codegen in `wasm.ts` use a compact `loop/if` pattern instead of the traditional `block/loop/br_if`
-pattern. This saves 2 bytes per loop (the `block void` instruction). `whileLoop` additionally
-eliminates the `i32.eqz` byte by using `if` directly on the condition.
-
-```wasm
-;; Old pattern (block/loop, 2 bytes larger):
-block void
-  loop void
-    condition
-    br_if 1          ;; break out of block
-    body
-    br 0             ;; continue loop
-  end
-end
-
-;; New pattern (loop/if):
-loop void
-  flipped_condition
-  if void
-    body
-    br 1             ;; continue loop
-  end
-end
-```
-
-**Rewrite rules (inspired by [Binaryen](https://github.com/WebAssembly/binaryen)):**
-
-| Rule | Pattern                                                     | Optimization                                                             |
-| ---- | ----------------------------------------------------------- | ------------------------------------------------------------------------ |
-| 1    | `local.set X ; local.get X` → `local.tee X`                 | Fuse set+get                                                             |
-| 2    | `i32.const IDENTITY ; op` → (remove both)                   | Identity element removal (9 ops: add/sub/mul/and/or/xor/shl/shr_s/shr_u) |
-| 3    | `i32.const N ; i32.mul` → `i32.const log₂N ; i32.shl`       | Strength reduction (N = power of 2, N > 1)                               |
-| 4    | `local.tee X ; drop` → `local.set X`                        | Canonicalize                                                             |
-| 5    | `local.set X ; local.set X` → `drop ; local.set X`          | Dead set elimination (Binaryen RedundantSetElimination)                  |
-| 6    | `i32.const A ; i32.const B ; binop` → `i32.const (A op B)`  | Constant folding (Binaryen Precompute)                                   |
-| 7    | `i32.const N ; i32.add ; load offset=M` → `load offset=M+N` | Offset absorption (loads only; stores excluded — see below)              |
-| 8    | Leading `i32.const 0 ; local.set X` → remove                | Zero-init elimination (WASM locals default to 0)                         |
-| 9    | `i32.const 1 ; i32.lt_u` → `i32.eqz`                        | Comparison simplification (also: `i32.const 0 ; i32.eq` → `i32.eqz`)     |
-
-Rules 6 and 7 use a 3-instruction window. Constant folding uses correct i32 semantics (`Math.imul`,
-`| 0`, `& 31` masking). Offset absorption only applies to loads (0x28-0x2f), NOT stores: for
-`i32.store`, the `i32.add` modifies the value (top of stack), not the address, so absorbing into
-`offset` would change semantics. Offset absorption only folds non-negative constants to avoid
-unsigned overflow. Rule 9 exploits the fact that `x <u 1` is equivalent to `x == 0` for unsigned
-integers.
-
-**Performance profile:**
-
-| Body size    | Peephole time | Notes                |
-| ------------ | ------------- | -------------------- |
-| ~100 instrs  | ~7 µs         | Typical small kernel |
-| ~500 instrs  | ~32 µs        | Typical scan kernel  |
-| ~1000 instrs | ~68 µs        | Large scan body      |
-
-This is a one-time cost at JIT compilation, amortized over all subsequent executions. Adds ~10–30%
-to WASM compilation time while improving steady-state execution by ~7% on Kalman filter benchmarks.
-
-**Key files:**
-
-| File                                   | Purpose                                                     |
-| -------------------------------------- | ----------------------------------------------------------- |
-| `src/backend/wasm/wasmblr-peephole.ts` | Parser, rewriter, encoder, stats                            |
-| `src/backend/wasm/wasmblr.ts`          | Integration point (`finish()` calls `optimizeFunctionBody`) |
-| `test/peephole.test.ts`                | 25 tests (correctness + unit rules)                         |
-| `bench/peephole.bench.ts`              | Kalman, cumsum, chain benchmarks                            |
-
-**Usage:**
-
-The peephole optimizer is enabled by default. Use `setWasmPeephole` to disable it or enable debug
-logging:
-
-```ts
-import { setWasmPeephole } from "@hamk-uas/jax-js-nonconsuming";
-setWasmPeephole(true, true); // enable with debug logging (prints stats per function)
-setWasmPeephole(false); // disable
-```
-
 ### Autodiff of routines
 
 Routines remain **opaque primitives** — the Jaxpr just contains `cholesky a`. The internal algorithm
@@ -2122,13 +2028,12 @@ Routines are compiled at runtime using wasmblr — no separate build step requir
 
 **Key files:**
 
-| File                                   | Purpose                                         |
-| -------------------------------------- | ----------------------------------------------- |
-| `src/backend/wasm/wasmblr.ts`          | Low-level WASM bytecode assembler               |
-| `src/backend/wasm/wasmblr-hl.ts`       | High-level helper layer (WasmHl class)          |
-| `src/backend/wasm/wasmblr-peephole.ts` | Peephole optimizer (9 rules, Binaryen-inspired) |
-| `src/backend/wasm/routines/*.ts`       | Size-specialized routine codegen                |
-| `src/backend/wasm/routine-provider.ts` | 64-entry LRU module cache (by size)             |
+| File                                   | Purpose                                |
+| -------------------------------------- | -------------------------------------- |
+| `src/backend/wasm/wasmblr.ts`          | Low-level WASM bytecode assembler      |
+| `src/backend/wasm/wasmblr-hl.ts`       | High-level helper layer (WasmHl class) |
+| `src/backend/wasm/routines/*.ts`       | Size-specialized routine codegen       |
+| `src/backend/wasm/routine-provider.ts` | 64-entry LRU module cache (by size)    |
 
 ### Adding a new routine (checklist)
 
@@ -2427,8 +2332,6 @@ contributors should be aware of:
 | `test/lax-scan.test.ts`         | Main scan test suite (~1880 lines)             |
 | `test/scan-backends.test.ts`    | Backend coverage & `copyBufferToBuffer` checks |
 | `test/scan-bench.test.ts`       | Scan benchmark tests                           |
-| `test/peephole.test.ts`         | Peephole optimizer (25 tests)                  |
-| `bench/peephole.bench.ts`       | Peephole benchmarks (Kalman, cumsum, chain)    |
 | `test/deno/webgpu.test.ts`      | Headless WebGPU tests via Deno                 |
 | `test/deno/pool-memory.test.ts` | Pool peak memory guarantee (Deno WebGPU)       |
 | `test/deno/scan.bench.ts`       | Deno WebGPU scan benchmarks                    |

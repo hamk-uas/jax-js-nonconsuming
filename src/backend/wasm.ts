@@ -1082,78 +1082,78 @@ function emitKernelBody(opts: {
   cg.local.set(gidx);
   cg.loop(cg.void);
   {
-    // if (gidx < size) { body; gidx++; continue }
+    // if (gidx >= size) break;
+    cg.block(cg.void);
     cg.local.get(gidx);
     cg.i32.const(kernel.size);
-    cg.i32.lt_u();
-    cg.if(cg.void);
-    {
-      // Push output address for this element.
-      emitOutputAddr();
+    cg.i32.ge_u();
+    cg.br_if(0);
 
-      if (re) {
-        // Reduction: accumulator + inner ridx loop.
-        const acc = cg.local.declare(dty(cg, null, kernel.exp.dtype));
-        dty(cg, null, kernel.exp.dtype).const(re.identity);
-        cg.local.set(acc);
+    // Push output address for this element.
+    emitOutputAddr();
 
-        // Kahan compensation local for Float64 Add reductions.
-        const useKahan = re.dtype === DType.Float64 && re.op === AluOp.Add;
-        let kahanComp: number | undefined;
-        if (useKahan) {
-          kahanComp = cg.local.declare(cg.f64);
-          cg.f64.const(0);
-          cg.local.set(kahanComp);
-        }
+    if (re) {
+      // Reduction: accumulator + inner ridx loop.
+      const acc = cg.local.declare(dty(cg, null, kernel.exp.dtype));
+      dty(cg, null, kernel.exp.dtype).const(re.identity);
+      cg.local.set(acc);
 
-        const ridx = cg.local.declare(cg.i32);
-        cg.i32.const(0);
+      // Kahan compensation local for Float64 Add reductions.
+      const useKahan = re.dtype === DType.Float64 && re.op === AluOp.Add;
+      let kahanComp: number | undefined;
+      if (useKahan) {
+        kahanComp = cg.local.declare(cg.f64);
+        cg.f64.const(0);
+        cg.local.set(kahanComp);
+      }
+
+      const ridx = cg.local.declare(cg.i32);
+      cg.i32.const(0);
+      cg.local.set(ridx);
+
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(ridx);
+        cg.i32.const(re.size);
+        cg.i32.ge_u();
+        cg.br_if(0);
+
+        emitExp(tune.exp, { ridx });
+        codegenReductionAccumulate(cg, re, acc, kahanComp);
+
+        cg.local.get(ridx);
+        cg.i32.const(1);
+        cg.i32.add();
         cg.local.set(ridx);
 
-        cg.loop(cg.void);
-        {
-          cg.local.get(ridx);
-          cg.i32.const(re.size);
-          cg.i32.lt_u();
-          cg.if(cg.void);
-          {
-            emitExp(tune.exp, { ridx });
-            codegenReductionAccumulate(cg, re, acc, kahanComp);
-
-            cg.local.get(ridx);
-            cg.i32.const(1);
-            cg.i32.add();
-            cg.local.set(ridx);
-
-            cg.br(1); // continue ridx loop
-          }
-          cg.end(); // end ridx if
-        }
-        cg.end(); // end ridx loop
-
-        emitExp(tune.epilogue!, { acc });
-      } else {
-        emitExp(tune.exp, {});
+        cg.br(1);
+        cg.end();
       }
+      cg.end();
 
-      // Store result.
-      if (emitStore) {
-        emitStore();
-      } else {
-        dty(cg, null, kernel.dtype).store(storeAlign);
-      }
-
-      // gidx++
-      cg.local.get(gidx);
-      cg.i32.const(1);
-      cg.i32.add();
-      cg.local.set(gidx);
-
-      cg.br(1); // continue gidx loop
+      emitExp(tune.epilogue!, { acc });
+    } else {
+      emitExp(tune.exp, {});
     }
-    cg.end(); // end gidx if
+
+    // Store result.
+    if (emitStore) {
+      emitStore();
+    } else {
+      dty(cg, null, kernel.dtype).store(storeAlign);
+    }
+
+    // gidx++
+    cg.local.get(gidx);
+    cg.i32.const(1);
+    cg.i32.add();
+    cg.local.set(gidx);
+
+    cg.br(1); // continue gidx loop
+    cg.end();
   }
-  cg.end(); // end gidx loop
+  cg.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -1499,241 +1499,239 @@ function codegenNativeScanGeneral(
 
     cg.loop(cg.void);
     {
+      cg.block(cg.void);
       cg.local.get(iter);
       cg.i32.const(length);
-      cg.i32.lt_u();
-      cg.if(cg.void);
-      {
-        // Compute dataIdx = reverse ? (length - 1 - iter) : iter
-        if (reverse) {
-          cg.i32.const(length - 1);
-          cg.local.get(iter);
-          cg.i32.sub();
-          cg.local.set(dataIdx);
-        } else {
-          cg.local.get(iter);
-          cg.local.set(dataIdx);
-        }
+      cg.i32.ge_u();
+      cg.br_if(0);
 
-        // Step 2a: Execute each step (Kernel), writing to internal buffers
-        for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
-          const step = steps[stepIdx];
-          const internalIdx = step.outputInternalIdx;
+      // Compute dataIdx = reverse ? (length - 1 - iter) : iter
+      if (reverse) {
+        cg.i32.const(length - 1);
+        cg.local.get(iter);
+        cg.i32.sub();
+        cg.local.set(dataIdx);
+      } else {
+        cg.local.get(iter);
+        cg.local.set(dataIdx);
+      }
 
-          if (step.source instanceof Kernel) {
-            // Single-output Kernel step — delegate to shared emitKernelBody.
-            const kernel = step.source;
-            const dw = directWriteMap.get(internalIdx);
-            const bw = byteWidth(kernel.dtype);
-            const needsDualStore = dw && dw.yIdx !== undefined;
+      // Step 2a: Execute each step (Kernel), writing to internal buffers
+      for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+        const step = steps[stepIdx];
+        const internalIdx = step.outputInternalIdx;
 
-            emitKernelBody({
-              cg,
-              funcs,
-              kernel,
-              gidx,
-              emitOutputAddr: () => {
-                if (dw) {
-                  cg.local.get(carryOutBase + dw.carryIdx);
-                } else {
-                  cg.local.get(internalsBase + internalIdx);
-                }
-                cg.local.get(gidx);
-                cg.i32.const(bw);
-                cg.i32.mul();
-                cg.i32.add();
-              },
-              emitExp: (exp, extra) => {
-                const scanCtx = makeScanContext();
-                if (extra.ridx !== undefined) scanCtx.ridx = extra.ridx;
-                if (extra.acc !== undefined) scanCtx.acc = extra.acc;
-                translateExpWithGeneralScanContext(cg, funcs, exp, scanCtx);
-              },
-              emitStore: needsDualStore
-                ? () => {
-                    const storeAlign = Math.log2(bw);
-                    const tmpVal = cg.local.declare(
-                      dty(cg, null, kernel.dtype),
-                    );
-                    cg.local.tee(tmpVal);
-                    dty(cg, null, kernel.dtype).store(storeAlign);
-                    // Store to ysStacked
-                    cg.local.get(ysStackedBase + dw!.yIdx!);
-                    cg.local.get(dataIdx);
-                    cg.i32.const(ysStrides[dw!.yIdx!]);
-                    cg.i32.mul();
-                    cg.i32.add();
-                    cg.local.get(gidx);
-                    cg.i32.const(bw);
-                    cg.i32.mul();
-                    cg.i32.add();
-                    cg.local.get(tmpVal);
-                    dty(cg, null, kernel.dtype).store(storeAlign);
-                  }
-                : undefined,
-            });
-          }
-          // Routine step: call the imported routine function
-          if (step.source instanceof Routine) {
-            const callInfo = step.routineCallInfo!;
-            const funcIdx = routineFuncIndices[callInfo.routineInfoIdx];
-            const routineType = routineInfos![callInfo.routineInfoIdx].routine;
+        if (step.source instanceof Kernel) {
+          // Single-output Kernel step — delegate to shared emitKernelBody.
+          const kernel = step.source;
+          const dw = directWriteMap.get(internalIdx);
+          const bw = byteWidth(kernel.dtype);
+          const needsDualStore = dw && dw.yIdx !== undefined;
 
-            // Helper to push a slot pointer onto the stack
-            const pushSlotPtr = (slotIdx: number) => {
-              if (slotIdx < numConsts) {
-                cg.local.get(constsBase + slotIdx);
-              } else if (slotIdx < numConsts + numCarry) {
-                cg.local.get(carryOutBase + (slotIdx - numConsts));
-              } else if (slotIdx < numConsts + numCarry + numX) {
-                // xs input: base + dataIdx * stride
-                const xIdx = slotIdx - numConsts - numCarry;
-                cg.local.get(xsBase + xIdx);
-                cg.local.get(dataIdx);
-                cg.i32.const(xsStrides[xIdx]);
-                cg.i32.mul();
-                cg.i32.add();
+          emitKernelBody({
+            cg,
+            funcs,
+            kernel,
+            gidx,
+            emitOutputAddr: () => {
+              if (dw) {
+                cg.local.get(carryOutBase + dw.carryIdx);
               } else {
-                // Internal buffer
-                const intIdx = slotIdx - numConsts - numCarry - numX;
-                cg.local.get(internalsBase + intIdx);
+                cg.local.get(internalsBase + internalIdx);
               }
-            };
+              cg.local.get(gidx);
+              cg.i32.const(bw);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+            emitExp: (exp, extra) => {
+              const scanCtx = makeScanContext();
+              if (extra.ridx !== undefined) scanCtx.ridx = extra.ridx;
+              if (extra.acc !== undefined) scanCtx.acc = extra.acc;
+              translateExpWithGeneralScanContext(cg, funcs, exp, scanCtx);
+            },
+            emitStore: needsDualStore
+              ? () => {
+                  const storeAlign = Math.log2(bw);
+                  const tmpVal = cg.local.declare(dty(cg, null, kernel.dtype));
+                  cg.local.tee(tmpVal);
+                  dty(cg, null, kernel.dtype).store(storeAlign);
+                  // Store to ysStacked
+                  cg.local.get(ysStackedBase + dw!.yIdx!);
+                  cg.local.get(dataIdx);
+                  cg.i32.const(ysStrides[dw!.yIdx!]);
+                  cg.i32.mul();
+                  cg.i32.add();
+                  cg.local.get(gidx);
+                  cg.i32.const(bw);
+                  cg.i32.mul();
+                  cg.i32.add();
+                  cg.local.get(tmpVal);
+                  dty(cg, null, kernel.dtype).store(storeAlign);
+                }
+              : undefined,
+          });
+        }
+        // Routine step: call the imported routine function
+        if (step.source instanceof Routine) {
+          const callInfo = step.routineCallInfo!;
+          const funcIdx = routineFuncIndices[callInfo.routineInfoIdx];
+          const routineType = routineInfos![callInfo.routineInfoIdx].routine;
 
-            if (routineType === Routines.Cholesky) {
-              pushSlotPtr(step.inputSlots[0]); // inPtr
-              cg.local.get(internalsBase + internalIdx); // outPtr
-            } else if (routineType === Routines.Sort) {
-              // Copy input to internal buffer first (sort is in-place)
-              const sortSize = callInfo.staticParams[0];
-              const elemSize = params.elementSize ?? 4;
-              const copySize = sortSize * elemSize;
-
-              cg.local.get(internalsBase + internalIdx); // dst
-              pushSlotPtr(step.inputSlots[0]); // src
-              cg.i32.const(copySize); // len
-              cg.memory.copy();
-
-              cg.local.get(internalsBase + internalIdx); // dataPtr (in-place)
-              cg.local.get(auxArgIdx); // auxPtr
-            } else if (routineType === Routines.TriangularSolve) {
-              pushSlotPtr(step.inputSlots[0]); // aPtr
-              pushSlotPtr(step.inputSlots[1]); // bPtr
-              cg.local.get(internalsBase + internalIdx); // xPtr (output)
-            } else if (routineType === Routines.LU) {
-              const outIndices = step.outputInternalIndices!;
-              pushSlotPtr(step.inputSlots[0]); // aPtr
-              cg.local.get(internalsBase + outIndices[0]); // luPtr
-              cg.local.get(internalsBase + outIndices[1]); // pivPtr
-              cg.local.get(internalsBase + outIndices[2]); // permPtr
-            } else if (routineType === Routines.Argsort) {
-              const outIndices = step.outputInternalIndices!;
-              pushSlotPtr(step.inputSlots[0]); // dataPtr
-              cg.local.get(internalsBase + outIndices[0]); // outPtr
-              cg.local.get(internalsBase + outIndices[1]); // idxPtr
-              cg.local.get(auxArgIdx); // auxPtr
+          // Helper to push a slot pointer onto the stack
+          const pushSlotPtr = (slotIdx: number) => {
+            if (slotIdx < numConsts) {
+              cg.local.get(constsBase + slotIdx);
+            } else if (slotIdx < numConsts + numCarry) {
+              cg.local.get(carryOutBase + (slotIdx - numConsts));
+            } else if (slotIdx < numConsts + numCarry + numX) {
+              // xs input: base + dataIdx * stride
+              const xIdx = slotIdx - numConsts - numCarry;
+              cg.local.get(xsBase + xIdx);
+              cg.local.get(dataIdx);
+              cg.i32.const(xsStrides[xIdx]);
+              cg.i32.mul();
+              cg.i32.add();
             } else {
-              pushSlotPtr(step.inputSlots[0]);
-              cg.local.get(internalsBase + internalIdx);
+              // Internal buffer
+              const intIdx = slotIdx - numConsts - numCarry - numX;
+              cg.local.get(internalsBase + intIdx);
             }
+          };
 
-            cg.call(funcIdx);
-          }
-        }
+          if (routineType === Routines.Cholesky) {
+            pushSlotPtr(step.inputSlots[0]); // inPtr
+            cg.local.get(internalsBase + internalIdx); // outPtr
+          } else if (routineType === Routines.Sort) {
+            // Copy input to internal buffer first (sort is in-place)
+            const sortSize = callInfo.staticParams[0];
+            const elemSize = params.elementSize ?? 4;
+            const copySize = sortSize * elemSize;
 
-        // Step 2b: Copy Y outputs to ysStacked at iteration offset
-        // NOTE: Must run BEFORE carry update (2c) so passthrough reads OLD carry values
-        for (let y = 0; y < numY; y++) {
-          const source = yOutputSources[y];
-
-          // Skip if this Y output was already direct-written by the kernel
-          if (
-            source.type === "internal" &&
-            directWriteMap.has(source.internalIdx) &&
-            directWriteMap.get(source.internalIdx)!.yIdx === y
-          ) {
-            continue;
-          }
-
-          const yStride = ysStrides[y];
-
-          if (source.type === "passthrough") {
-            const srcArgIdx = carryOutBase + source.carryIdx;
-            const size = carrySizes[source.carryIdx];
-            // dst = ysStacked[y] + dataIdx * yStride
-            cg.local.get(ysStackedBase + y);
-            cg.local.get(dataIdx);
-            cg.i32.const(yStride);
-            cg.i32.mul();
-            cg.i32.add();
-            cg.local.get(srcArgIdx);
-            cg.i32.const(size);
+            cg.local.get(internalsBase + internalIdx); // dst
+            pushSlotPtr(step.inputSlots[0]); // src
+            cg.i32.const(copySize); // len
             cg.memory.copy();
-          } else if (source.type === "xs-passthrough") {
-            const xsPassthroughIdx = source.xsIdx;
-            const size = xsStrides[xsPassthroughIdx];
-            // dst = ysStacked[y] + dataIdx * yStride
-            cg.local.get(ysStackedBase + y);
-            cg.local.get(dataIdx);
-            cg.i32.const(yStride);
-            cg.i32.mul();
-            cg.i32.add();
-            // src = xs[xsIdx] + dataIdx * xsStrides[xsIdx]
-            cg.local.get(xsBase + xsPassthroughIdx);
-            cg.local.get(dataIdx);
-            cg.i32.const(xsStrides[xsPassthroughIdx]);
-            cg.i32.mul();
-            cg.i32.add();
-            cg.i32.const(size);
-            cg.memory.copy();
+
+            cg.local.get(internalsBase + internalIdx); // dataPtr (in-place)
+            cg.local.get(auxArgIdx); // auxPtr
+          } else if (routineType === Routines.TriangularSolve) {
+            pushSlotPtr(step.inputSlots[0]); // aPtr
+            pushSlotPtr(step.inputSlots[1]); // bPtr
+            cg.local.get(internalsBase + internalIdx); // xPtr (output)
+          } else if (routineType === Routines.LU) {
+            const outIndices = step.outputInternalIndices!;
+            pushSlotPtr(step.inputSlots[0]); // aPtr
+            cg.local.get(internalsBase + outIndices[0]); // luPtr
+            cg.local.get(internalsBase + outIndices[1]); // pivPtr
+            cg.local.get(internalsBase + outIndices[2]); // permPtr
+          } else if (routineType === Routines.Argsort) {
+            const outIndices = step.outputInternalIndices!;
+            pushSlotPtr(step.inputSlots[0]); // dataPtr
+            cg.local.get(internalsBase + outIndices[0]); // outPtr
+            cg.local.get(internalsBase + outIndices[1]); // idxPtr
+            cg.local.get(auxArgIdx); // auxPtr
           } else {
-            // internal
-            const srcArgIdx = internalsBase + source.internalIdx;
-            const size = internalSizes[source.internalIdx];
-            // dst = ysStacked[y] + dataIdx * yStride
-            cg.local.get(ysStackedBase + y);
-            cg.local.get(dataIdx);
-            cg.i32.const(yStride);
-            cg.i32.mul();
-            cg.i32.add();
-            cg.local.get(srcArgIdx);
-            cg.i32.const(size);
-            cg.memory.copy();
+            pushSlotPtr(step.inputSlots[0]);
+            cg.local.get(internalsBase + internalIdx);
           }
+
+          cg.call(funcIdx);
+        }
+      }
+
+      // Step 2b: Copy Y outputs to ysStacked at iteration offset
+      // NOTE: Must run BEFORE carry update (2c) so passthrough reads OLD carry values
+      for (let y = 0; y < numY; y++) {
+        const source = yOutputSources[y];
+
+        // Skip if this Y output was already direct-written by the kernel
+        if (
+          source.type === "internal" &&
+          directWriteMap.has(source.internalIdx) &&
+          directWriteMap.get(source.internalIdx)!.yIdx === y
+        ) {
+          continue;
         }
 
-        // Step 2c: Copy carry outputs from internal buffers to carryOut
-        for (let c = 0; c < numCarry; c++) {
-          const source = carryOutSources[c];
+        const yStride = ysStrides[y];
 
-          // Skip if this carry output was already direct-written
-          if (
-            source.type === "internal" &&
-            directWriteMap.has(source.internalIdx)
-          ) {
-            continue;
-          }
-
-          const size = carrySizes[c];
-          const srcLocal =
-            source.type === "passthrough"
-              ? carryInBase + source.carryIdx
-              : internalsBase + source.internalIdx;
-
-          cg.local.get(carryOutBase + c);
-          cg.local.get(srcLocal);
+        if (source.type === "passthrough") {
+          const srcArgIdx = carryOutBase + source.carryIdx;
+          const size = carrySizes[source.carryIdx];
+          // dst = ysStacked[y] + dataIdx * yStride
+          cg.local.get(ysStackedBase + y);
+          cg.local.get(dataIdx);
+          cg.i32.const(yStride);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.get(srcArgIdx);
+          cg.i32.const(size);
+          cg.memory.copy();
+        } else if (source.type === "xs-passthrough") {
+          const xsPassthroughIdx = source.xsIdx;
+          const size = xsStrides[xsPassthroughIdx];
+          // dst = ysStacked[y] + dataIdx * yStride
+          cg.local.get(ysStackedBase + y);
+          cg.local.get(dataIdx);
+          cg.i32.const(yStride);
+          cg.i32.mul();
+          cg.i32.add();
+          // src = xs[xsIdx] + dataIdx * xsStrides[xsIdx]
+          cg.local.get(xsBase + xsPassthroughIdx);
+          cg.local.get(dataIdx);
+          cg.i32.const(xsStrides[xsPassthroughIdx]);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.i32.const(size);
+          cg.memory.copy();
+        } else {
+          // internal
+          const srcArgIdx = internalsBase + source.internalIdx;
+          const size = internalSizes[source.internalIdx];
+          // dst = ysStacked[y] + dataIdx * yStride
+          cg.local.get(ysStackedBase + y);
+          cg.local.get(dataIdx);
+          cg.i32.const(yStride);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.get(srcArgIdx);
           cg.i32.const(size);
           cg.memory.copy();
         }
-
-        // iter++
-        cg.local.get(iter);
-        cg.i32.const(1);
-        cg.i32.add();
-        cg.local.set(iter);
-
-        cg.br(1);
       }
+
+      // Step 2c: Copy carry outputs from internal buffers to carryOut
+      for (let c = 0; c < numCarry; c++) {
+        const source = carryOutSources[c];
+
+        // Skip if this carry output was already direct-written
+        if (
+          source.type === "internal" &&
+          directWriteMap.has(source.internalIdx)
+        ) {
+          continue;
+        }
+
+        const size = carrySizes[c];
+        const srcLocal =
+          source.type === "passthrough"
+            ? carryInBase + source.carryIdx
+            : internalsBase + source.internalIdx;
+
+        cg.local.get(carryOutBase + c);
+        cg.local.get(srcLocal);
+        cg.i32.const(size);
+        cg.memory.copy();
+      }
+
+      // iter++
+      cg.local.get(iter);
+      cg.i32.const(1);
+      cg.i32.add();
+      cg.local.set(iter);
+
+      cg.br(1);
       cg.end();
     }
     cg.end();
