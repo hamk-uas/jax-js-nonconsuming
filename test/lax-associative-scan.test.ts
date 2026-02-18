@@ -28,6 +28,20 @@ await init();
 // ============================================================================
 
 describe("lax.associativeScan — 1-D basic", () => {
+  test("simple cumsum with split points", () => {
+    const values = Array.from({ length: 17 }, (_, i) => i + 1);
+    const expected = values.reduce<number[]>((acc, v, i) => {
+      acc.push((acc[i - 1] ?? 0) + v);
+      return acc;
+    }, []);
+    using xs = np.array(values);
+    using result = lax.associativeScan(
+      (a: np.Array, b: np.Array) => np.add(a, b),
+      xs,
+    );
+    expect(result).toBeAllclose(expected);
+  });
+
   test("cumulative sum", () => {
     using xs = np.array([1.0, 2.0, 3.0, 4.0, 5.0]);
     using result = lax.associativeScan(
