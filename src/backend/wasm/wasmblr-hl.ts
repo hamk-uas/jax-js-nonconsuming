@@ -60,31 +60,31 @@ export class WasmHl {
     }
     cg.local.set(i);
 
-    cg.block(cg.void);
+    // loop { if (i < end) { body; i++; br loop } }
     cg.loop(cg.void);
     {
-      // if (i >= end) break
       cg.local.get(i);
       if (typeof end === "number") {
         cg.i32.const(end);
       } else {
         end();
       }
-      cg.i32.ge_s();
-      cg.br_if(1);
+      cg.i32.lt_s();
+      cg.if(cg.void);
+      {
+        body();
 
-      body();
+        // i++
+        cg.local.get(i);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(i);
 
-      // i++
-      cg.local.get(i);
-      cg.i32.const(1);
-      cg.i32.add();
-      cg.local.set(i);
-
-      cg.br(0);
+        cg.br(1); // continue loop (depth: if→loop)
+      }
+      cg.end(); // end if
     }
-    cg.end();
-    cg.end();
+    cg.end(); // end loop
   }
 
   /**
@@ -113,27 +113,27 @@ export class WasmHl {
     }
     cg.local.set(i);
 
-    cg.block(cg.void);
+    // loop { if (i >= end) { body; i--; br loop } }
     cg.loop(cg.void);
     {
-      // if (i < end) break
       cg.local.get(i);
       cg.i32.const(end);
-      cg.i32.lt_s();
-      cg.br_if(1);
+      cg.i32.ge_s();
+      cg.if(cg.void);
+      {
+        body();
 
-      body();
+        // i--
+        cg.local.get(i);
+        cg.i32.const(1);
+        cg.i32.sub();
+        cg.local.set(i);
 
-      // i--
-      cg.local.get(i);
-      cg.i32.const(1);
-      cg.i32.sub();
-      cg.local.set(i);
-
-      cg.br(0);
+        cg.br(1); // continue loop (depth: if→loop)
+      }
+      cg.end(); // end if
     }
-    cg.end();
-    cg.end();
+    cg.end(); // end loop
   }
 
   /**
@@ -145,19 +145,19 @@ export class WasmHl {
   whileLoop(cond: () => void, body: () => void): void {
     const { cg } = this;
 
-    cg.block(cg.void);
+    // loop { cond(); if { body; br loop } }
     cg.loop(cg.void);
     {
       cond();
-      cg.i32.eqz();
-      cg.br_if(1);
+      cg.if(cg.void);
+      {
+        body();
 
-      body();
-
-      cg.br(0);
+        cg.br(1); // continue loop (depth: if→loop)
+      }
+      cg.end(); // end if
     }
-    cg.end();
-    cg.end();
+    cg.end(); // end loop
   }
 
   /**
@@ -624,48 +624,48 @@ export class WasmHl {
     cg.i32.const(0);
     cg.local.set(k);
 
-    cg.block(cg.void);
     cg.loop(cg.void);
     {
       cg.local.get(k);
       cg.local.get(endFloor4);
-      cg.i32.ge_s();
-      cg.br_if(1);
+      cg.i32.lt_s();
+      cg.if(cg.void);
+      {
+        // vec = vec op (A[k:k+4] * B[k:k+4])
+        cg.local.get(vec);
 
-      // vec = vec op (A[k:k+4] * B[k:k+4])
-      cg.local.get(vec);
+        // Load A[k:k+4] from rowABase + k * 4 bytes
+        cg.local.get(rowABase);
+        cg.local.get(k);
+        cg.i32.const(4);
+        cg.i32.mul();
+        cg.i32.add();
+        cg.v128.load(2);
 
-      // Load A[k:k+4] from rowABase + k * 4 bytes
-      cg.local.get(rowABase);
-      cg.local.get(k);
-      cg.i32.const(4);
-      cg.i32.mul();
-      cg.i32.add();
-      cg.v128.load(2);
+        // Load B[k:k+4] from rowBBase + k * 4 bytes
+        cg.local.get(rowBBase);
+        cg.local.get(k);
+        cg.i32.const(4);
+        cg.i32.mul();
+        cg.i32.add();
+        cg.v128.load(2);
 
-      // Load B[k:k+4] from rowBBase + k * 4 bytes
-      cg.local.get(rowBBase);
-      cg.local.get(k);
-      cg.i32.const(4);
-      cg.i32.mul();
-      cg.i32.add();
-      cg.v128.load(2);
+        cg.f32x4.mul();
+        if (op === "add") cg.f32x4.add();
+        else cg.f32x4.sub();
+        cg.local.set(vec);
 
-      cg.f32x4.mul();
-      if (op === "add") cg.f32x4.add();
-      else cg.f32x4.sub();
-      cg.local.set(vec);
+        // k += 4
+        cg.local.get(k);
+        cg.i32.const(4);
+        cg.i32.add();
+        cg.local.set(k);
 
-      // k += 4
-      cg.local.get(k);
-      cg.i32.const(4);
-      cg.i32.add();
-      cg.local.set(k);
-
-      cg.br(0);
+        cg.br(1); // continue loop
+      }
+      cg.end(); // end if
     }
-    cg.end();
-    cg.end();
+    cg.end(); // end loop
 
     // Horizontal sum and combine with scalar accumulator
     cg.local.get(acc);
@@ -676,7 +676,6 @@ export class WasmHl {
     cg.local.set(acc);
 
     // Scalar tail: k = endFloor4 .. end
-    cg.block(cg.void);
     cg.loop(cg.void);
     {
       cg.local.get(k);
@@ -685,33 +684,34 @@ export class WasmHl {
       } else {
         end();
       }
-      cg.i32.ge_s();
-      cg.br_if(1);
+      cg.i32.lt_s();
+      cg.if(cg.void);
+      {
+        // acc = acc op (A[k] * B[k])
+        cg.local.get(acc);
 
-      // acc = acc op (A[k] * B[k])
-      cg.local.get(acc);
+        // Load A[k] from rowABase + k * 4
+        this.load("f32", rowABase, this.getExpr(k));
 
-      // Load A[k] from rowABase + k * 4
-      this.load("f32", rowABase, this.getExpr(k));
+        // Load B[k] from rowBBase + k * 4
+        this.load("f32", rowBBase, this.getExpr(k));
 
-      // Load B[k] from rowBBase + k * 4
-      this.load("f32", rowBBase, this.getExpr(k));
+        cg.f32.mul();
+        if (op === "add") cg.f32.add();
+        else cg.f32.sub();
+        cg.local.set(acc);
 
-      cg.f32.mul();
-      if (op === "add") cg.f32.add();
-      else cg.f32.sub();
-      cg.local.set(acc);
+        // k++
+        cg.local.get(k);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(k);
 
-      // k++
-      cg.local.get(k);
-      cg.i32.const(1);
-      cg.i32.add();
-      cg.local.set(k);
-
-      cg.br(0);
+        cg.br(1); // continue loop
+      }
+      cg.end(); // end if
     }
-    cg.end();
-    cg.end();
+    cg.end(); // end loop
   }
 
   /**
@@ -751,47 +751,47 @@ export class WasmHl {
     cg.i32.const(0);
     cg.local.set(k);
 
-    cg.block(cg.void);
     cg.loop(cg.void);
     {
       cg.local.get(k);
       cg.local.get(endFloor2);
-      cg.i32.ge_s();
-      cg.br_if(1);
+      cg.i32.lt_s();
+      cg.if(cg.void);
+      {
+        cg.local.get(vec);
 
-      cg.local.get(vec);
+        // Load A[k:k+2] from rowABase + k * 8 bytes
+        cg.local.get(rowABase);
+        cg.local.get(k);
+        cg.i32.const(8);
+        cg.i32.mul();
+        cg.i32.add();
+        cg.v128.load(3); // alignment log2(8)
 
-      // Load A[k:k+2] from rowABase + k * 8 bytes
-      cg.local.get(rowABase);
-      cg.local.get(k);
-      cg.i32.const(8);
-      cg.i32.mul();
-      cg.i32.add();
-      cg.v128.load(3); // alignment log2(8)
+        // Load B[k:k+2] from rowBBase + k * 8 bytes
+        cg.local.get(rowBBase);
+        cg.local.get(k);
+        cg.i32.const(8);
+        cg.i32.mul();
+        cg.i32.add();
+        cg.v128.load(3);
 
-      // Load B[k:k+2] from rowBBase + k * 8 bytes
-      cg.local.get(rowBBase);
-      cg.local.get(k);
-      cg.i32.const(8);
-      cg.i32.mul();
-      cg.i32.add();
-      cg.v128.load(3);
+        cg.f64x2.mul();
+        if (op === "add") cg.f64x2.add();
+        else cg.f64x2.sub();
+        cg.local.set(vec);
 
-      cg.f64x2.mul();
-      if (op === "add") cg.f64x2.add();
-      else cg.f64x2.sub();
-      cg.local.set(vec);
+        // k += 2
+        cg.local.get(k);
+        cg.i32.const(2);
+        cg.i32.add();
+        cg.local.set(k);
 
-      // k += 2
-      cg.local.get(k);
-      cg.i32.const(2);
-      cg.i32.add();
-      cg.local.set(k);
-
-      cg.br(0);
+        cg.br(1); // continue loop
+      }
+      cg.end(); // end if
     }
-    cg.end();
-    cg.end();
+    cg.end(); // end loop
 
     // Horizontal sum
     cg.local.get(acc);
@@ -802,7 +802,6 @@ export class WasmHl {
     cg.local.set(acc);
 
     // Scalar tail
-    cg.block(cg.void);
     cg.loop(cg.void);
     {
       cg.local.get(k);
@@ -811,25 +810,26 @@ export class WasmHl {
       } else {
         end();
       }
-      cg.i32.ge_s();
-      cg.br_if(1);
+      cg.i32.lt_s();
+      cg.if(cg.void);
+      {
+        cg.local.get(acc);
+        this.load("f64", rowABase, this.getExpr(k));
+        this.load("f64", rowBBase, this.getExpr(k));
+        cg.f64.mul();
+        if (op === "add") cg.f64.add();
+        else cg.f64.sub();
+        cg.local.set(acc);
 
-      cg.local.get(acc);
-      this.load("f64", rowABase, this.getExpr(k));
-      this.load("f64", rowBBase, this.getExpr(k));
-      cg.f64.mul();
-      if (op === "add") cg.f64.add();
-      else cg.f64.sub();
-      cg.local.set(acc);
+        cg.local.get(k);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(k);
 
-      cg.local.get(k);
-      cg.i32.const(1);
-      cg.i32.add();
-      cg.local.set(k);
-
-      cg.br(0);
+        cg.br(1); // continue loop
+      }
+      cg.end(); // end if
     }
-    cg.end();
-    cg.end();
+    cg.end(); // end loop
   }
 }

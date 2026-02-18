@@ -1,5 +1,6 @@
 import { DType } from "./alu";
 import { defaultDevice, Device, devices, getBackend, init } from "./backend";
+import { setWasmPeephole } from "./backend/wasm/wasmblr";
 import { Array, ArrayLike } from "./frontend/array";
 import {
   checkLeaks,
@@ -43,6 +44,7 @@ export {
   type OwnedFunction,
   random,
   setDebug,
+  setWasmPeephole,
   scipySpecial,
   type ScanPath,
   type SnapshotEntry,

@@ -9,8 +9,36 @@
  * Reference: https://pengowray.github.io/wasm-ops/.
  */
 
+import {
+  formatPeepholeStats,
+  newPeepholeStats,
+  optimizeFunctionBody,
+} from "./wasmblr-peephole";
+
 const magicModuleHeader = [0x00, 0x61, 0x73, 0x6d];
 const moduleVersion = [0x01, 0x00, 0x00, 0x00];
+
+// ---------------------------------------------------------------------------
+// Global peephole toggle
+// ---------------------------------------------------------------------------
+
+let _peepholeEnabled = false;
+let _peepholeDebug = false;
+
+/**
+ * Enable or disable the wasmblr peephole optimizer globally.
+ *
+ * When enabled, all WASM modules produced by `CodeGenerator.finish()` are
+ * post-processed with safe peephole rewrites (set+get→tee, identity removal,
+ * strength reduction).
+ *
+ * @param enabled  Turn the peephole pass on (`true`) or off (`false`).
+ * @param debug    When `true`, log rewrite statistics to the console.
+ */
+export function setWasmPeephole(enabled: boolean, debug = false): void {
+  _peepholeEnabled = enabled;
+  _peepholeDebug = debug;
+}
 
 function assert(condition: boolean, message?: string): asserts condition {
   if (!condition) {
@@ -513,13 +541,23 @@ export class CodeGenerator {
       this.#curBytes = [];
       f.emit();
       this.end();
-      const bodyBytes = [...this.#curBytes];
+      let bodyBytes = [...this.#curBytes];
+
+      // Peephole optimization pass (opt-in).
+      if (_peepholeEnabled) {
+        const stats = _peepholeDebug ? newPeepholeStats() : undefined;
+        bodyBytes = optimizeFunctionBody(bodyBytes, stats);
+        if (_peepholeDebug && stats) {
+          console.info(formatPeepholeStats(stats));
+        }
+      }
+
       this.#curBytes = [];
       // Header: local declarations
       concat(this.#curBytes, encodeUnsigned(f.locals.length));
-      for (const l of f.locals) {
+      for (let li = 0; li < f.locals.length; li++) {
         this._emit(0x01);
-        this._emit(l.typeId);
+        this._emit(f.locals[li].typeId);
       }
       const headerBytes = [...this.#curBytes];
       const fnSize = headerBytes.length + bodyBytes.length;
@@ -533,8 +571,26 @@ export class CodeGenerator {
     concat(emittedBytes, encodeUnsigned(codeSectionBytes.length));
     concat(emittedBytes, codeSectionBytes);
 
-    return new Uint8Array(emittedBytes);
+    const result = new Uint8Array(emittedBytes);
+
+    // Module-level collection hook for offline analysis.
+    if (_moduleCollector) _moduleCollector(result);
+
+    return result;
   }
+}
+
+/** Optional callback to collect full WASM module bytes. */
+let _moduleCollector: ((bytes: Uint8Array) => void) | null = null;
+
+/**
+ * Set a callback to collect all WASM modules produced by CodeGenerator.finish().
+ * Pass null to stop collecting.
+ */
+export function setModuleCollector(
+  cb: ((bytes: Uint8Array) => void) | null,
+): void {
+  _moduleCollector = cb;
 }
 
 ////////////////////////////////////////
