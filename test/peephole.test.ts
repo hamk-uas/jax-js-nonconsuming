@@ -549,4 +549,28 @@ describe.skipIf(!hasWasm)("wasmblr peephole optimizer", () => {
       0x45, // i32.eqz
     ]);
   });
+
+  test("peephole unit: offset absorption does NOT apply to stores", () => {
+    // For i32.store, the i32.add modifies the VALUE (top of stack), not the address.
+    // i32.store offset=N adds N to the ADDRESS, which is semantically different.
+    // addr ; value ; i32.const 10 ; i32.add ; i32.store
+    // must NOT become: addr ; value ; i32.store offset=10
+    const bytes = [
+      0x20,
+      0x00, // local.get 0 (address)
+      0x20,
+      0x01, // local.get 1 (value)
+      0x41,
+      0x0a, // i32.const 10
+      0x6a, // i32.add (value + 10)
+      0x36,
+      0x02,
+      0x00, // i32.store align=2 offset=0
+    ];
+    const stats = newPeepholeStats();
+    const out = optimizeFunctionBody(bytes, stats);
+    expect(stats.offsetAbsorb).toBe(0); // Must NOT absorb into store
+    // Bytes should be unchanged (no offset absorption on stores)
+    expect(out).toEqual(bytes);
+  });
 });

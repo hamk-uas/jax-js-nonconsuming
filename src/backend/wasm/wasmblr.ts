@@ -22,15 +22,15 @@ const moduleVersion = [0x01, 0x00, 0x00, 0x00];
 // Global peephole toggle
 // ---------------------------------------------------------------------------
 
-let _peepholeEnabled = false;
+let _peepholeEnabled = true;
 let _peepholeDebug = false;
 
 /**
  * Enable or disable the wasmblr peephole optimizer globally.
  *
- * When enabled, all WASM modules produced by `CodeGenerator.finish()` are
- * post-processed with safe peephole rewrites (set+get→tee, identity removal,
- * strength reduction).
+ * The optimizer is **enabled by default**. All WASM modules produced by
+ * `CodeGenerator.finish()` are post-processed with safe peephole rewrites
+ * (set+get→tee, identity removal, strength reduction, etc.).
  *
  * @param enabled  Turn the peephole pass on (`true`) or off (`false`).
  * @param debug    When `true`, log rewrite statistics to the console.

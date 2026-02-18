@@ -851,6 +851,7 @@ in native code. See `codegenNativeScanGeneral()` in `src/backend/wasm.ts`.
 
 An opt-in post-emission optimization pass that rewrites WASM function body bytecodes before binary
 encoding. Lives in `src/backend/wasm/wasmblr-peephole.ts`, toggled globally via `setWasmPeephole()`.
+**Enabled by default.**
 
 **Design constraints:**
 
@@ -890,21 +891,24 @@ end
 
 **Rewrite rules (inspired by [Binaryen](https://github.com/WebAssembly/binaryen)):**
 
-| Rule | Pattern                                                                 | Optimization                                                             |
-| ---- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| 1    | `local.set X ; local.get X` → `local.tee X`                             | Fuse set+get                                                             |
-| 2    | `i32.const IDENTITY ; op` → (remove both)                               | Identity element removal (9 ops: add/sub/mul/and/or/xor/shl/shr_s/shr_u) |
-| 3    | `i32.const N ; i32.mul` → `i32.const log₂N ; i32.shl`                   | Strength reduction (N = power of 2, N > 1)                               |
-| 4    | `local.tee X ; drop` → `local.set X`                                    | Canonicalize                                                             |
-| 5    | `local.set X ; local.set X` → `drop ; local.set X`                      | Dead set elimination (Binaryen RedundantSetElimination)                  |
-| 6    | `i32.const A ; i32.const B ; binop` → `i32.const (A op B)`              | Constant folding (Binaryen Precompute)                                   |
-| 7    | `i32.const N ; i32.add ; load/store offset=M` → `load/store offset=M+N` | Offset absorption (Binaryen OptimizeAddedConstants, N ≥ 0)               |
-| 8    | Leading `i32.const 0 ; local.set X` → remove                            | Zero-init elimination (WASM locals default to 0)                         |
-| 9    | `i32.const 1 ; i32.lt_u` → `i32.eqz`                                    | Comparison simplification (also: `i32.const 0 ; i32.eq` → `i32.eqz`)     |
+| Rule | Pattern                                                     | Optimization                                                             |
+| ---- | ----------------------------------------------------------- | ------------------------------------------------------------------------ |
+| 1    | `local.set X ; local.get X` → `local.tee X`                 | Fuse set+get                                                             |
+| 2    | `i32.const IDENTITY ; op` → (remove both)                   | Identity element removal (9 ops: add/sub/mul/and/or/xor/shl/shr_s/shr_u) |
+| 3    | `i32.const N ; i32.mul` → `i32.const log₂N ; i32.shl`       | Strength reduction (N = power of 2, N > 1)                               |
+| 4    | `local.tee X ; drop` → `local.set X`                        | Canonicalize                                                             |
+| 5    | `local.set X ; local.set X` → `drop ; local.set X`          | Dead set elimination (Binaryen RedundantSetElimination)                  |
+| 6    | `i32.const A ; i32.const B ; binop` → `i32.const (A op B)`  | Constant folding (Binaryen Precompute)                                   |
+| 7    | `i32.const N ; i32.add ; load offset=M` → `load offset=M+N` | Offset absorption (loads only; stores excluded — see below)              |
+| 8    | Leading `i32.const 0 ; local.set X` → remove                | Zero-init elimination (WASM locals default to 0)                         |
+| 9    | `i32.const 1 ; i32.lt_u` → `i32.eqz`                        | Comparison simplification (also: `i32.const 0 ; i32.eq` → `i32.eqz`)     |
 
 Rules 6 and 7 use a 3-instruction window. Constant folding uses correct i32 semantics (`Math.imul`,
-`| 0`, `& 31` masking). Offset absorption only folds non-negative constants to avoid unsigned
-overflow. Rule 9 exploits the fact that `x <u 1` is equivalent to `x == 0` for unsigned integers.
+`| 0`, `& 31` masking). Offset absorption only applies to loads (0x28-0x2f), NOT stores: for
+`i32.store`, the `i32.add` modifies the value (top of stack), not the address, so absorbing into
+`offset` would change semantics. Offset absorption only folds non-negative constants to avoid
+unsigned overflow. Rule 9 exploits the fact that `x <u 1` is equivalent to `x == 0` for unsigned
+integers.
 
 **Performance profile:**
 
@@ -928,9 +932,11 @@ to WASM compilation time while improving steady-state execution by ~7% on Kalman
 
 **Usage:**
 
+The peephole optimizer is enabled by default. Use `setWasmPeephole` to disable it or enable debug
+logging:
+
 ```ts
 import { setWasmPeephole } from "@hamk-uas/jax-js-nonconsuming";
-setWasmPeephole(true); // enable globally
 setWasmPeephole(true, true); // enable with debug logging (prints stats per function)
 setWasmPeephole(false); // disable
 ```

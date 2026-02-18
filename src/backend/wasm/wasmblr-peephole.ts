@@ -22,8 +22,9 @@
  *   5. local.set X ; local.set X →  drop ; local.set X  (dead set)
  *   6. i32.const A ; i32.const B ; i32.binop → i32.const (A op B)
  *      (constant folding for add, sub, mul, and, or, xor, shl, shr_s, shr_u)
- *   7. i32.const N ; i32.add ; load/store offset=M → load/store offset=M+N
- *      (offset absorption, inspired by Binaryen OptimizeAddedConstants, N ≥ 0)
+ *   7. i32.const N ; i32.add ; load offset=M → load offset=M+N
+ *      (offset absorption for loads only; stores excluded because the add
+ *       modifies the value, not the address. Inspired by Binaryen.)
  *   8. Leading i32.const 0 ; local.set X → remove
  *      (WASM locals default to 0 at function entry — zero-init is redundant)
  *   9. i32.const 1 ; i32.lt_u  → i32.eqz   (comparison simplification)
@@ -721,13 +722,17 @@ function peepholeRewrite(instrs: Instr[], stats: PeepholeStats): void {
         }
       }
 
-      // Rule 7: i32.const N ; i32.add ; load/store offset=M → offset=M+N
+      // Rule 7: i32.const N ; i32.add ; load offset=M → load offset=M+N
       //         (inspired by Binaryen OptimizeAddedConstants)
+      //         Only for loads (0x28-0x2f), NOT stores: for i32.store the
+      //         i32.add modifies the value (top of stack), not the address.
       if (
         a.op === 0x41 &&
         a.i32Value! >= 0 &&
         b.op === 0x6a && // i32.add
-        c.memOffset !== undefined
+        c.memOffset !== undefined &&
+        c.op >= 0x28 &&
+        c.op <= 0x2f // loads only
       ) {
         const newOffset = a.i32Value! + c.memOffset!;
         if (newOffset <= 0xffffffff) {
