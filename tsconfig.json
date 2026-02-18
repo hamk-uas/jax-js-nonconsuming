@@ -10,9 +10,7 @@
       "@hamk-uas/jax-js-nonconsuming-optax": ["./packages/optax/src"],
       "@hamk-uas/jax-js-nonconsuming-onnx": ["./packages/onnx/src"],
       "@hamk-uas/jax-js-nonconsuming-loaders": ["./packages/loaders/src"],
-      "@hamk-uas/eslint-plugin-jax-js": [
-        "./packages/eslint-plugin/src"
-      ]
+      "@hamk-uas/eslint-plugin-jax-js": ["./packages/eslint-plugin/src"]
     },
     "types": ["@webgpu/types"],
     "noEmit": true,

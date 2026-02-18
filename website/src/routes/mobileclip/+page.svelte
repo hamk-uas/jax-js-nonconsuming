@@ -1,6 +1,14 @@
 <script lang="ts">
-  import { defaultDevice, init, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
-  import { opfs, safetensors, tokenizers } from "@hamk-uas/jax-js-nonconsuming-loaders";
+  import {
+    defaultDevice,
+    init,
+    numpy as np,
+  } from "@hamk-uas/jax-js-nonconsuming";
+  import {
+    opfs,
+    safetensors,
+    tokenizers,
+  } from "@hamk-uas/jax-js-nonconsuming-loaders";
   import { BookMarkedIcon, FileTextIcon } from "@lucide/svelte";
 
   import DownloadManager from "$lib/common/DownloadManager.svelte";

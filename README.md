@@ -24,10 +24,10 @@
 >
 > **Why this fork?** The original jax-js uses move semantics, where operations consume their inputs.
 > This fork was created for teams familiar with MATLAB or Python (NumPy) where move semantics are
-> unexpected. We also fast-tracked a `lax.scan` implementation. `using` declarations handle the
-> common case — block-scoped arrays are disposed automatically — but patterns like method chains,
-> loop-carried state, and nested results still need manual care. A built-in `checkLeaks` diagnostic
-> and ESLint plugin help catch what `using` misses. See
+> unexpected. We also fast-tracked `lax.scan` and `lax.associativeScan` implementations. `using`
+> declarations handle the common case — block-scoped arrays are disposed automatically — but
+> patterns like method chains, loop-carried state, and nested results still need manual care. A
+> built-in `checkLeaks` diagnostic and ESLint plugin help catch what `using` misses. See
 > [Tradeoffs](#tradeoffs-of-the-non-consuming-model) for an honest comparison.
 >
 > See [Differences from upstream](#differences-from-upstream) for a full comparison between the
@@ -58,9 +58,8 @@ this to your `package.json`:
 }
 ```
 
-Without this, `pnpm install` fails with `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`. The `prepare`
-script runs `tsdown` to build the package and its sub-packages (optax, loaders, onnx,
-eslint-plugin).
+Without this, `pnpm install` fails with `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`. The `prepare` script
+runs `tsdown` to build the package and its sub-packages (optax, loaders, onnx, eslint-plugin).
 
 Under the hood, it translates array operations into a compiler representation, then synthesizes
 kernels in WebAssembly and WebGPU.
@@ -97,50 +96,51 @@ import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 Here's a quick, high-level comparison with other popular web ML runtimes. Performance labels are
 workload- and hardware-dependent.
 
-| Feature                         | jax-js-nonconsuming | jax-js v0.1.9 | TensorFlow.js   | onnxruntime-web    |
-| ------------------------------- | ------------------- | ------------- | --------------- | ------------------ |
-| **Overview**                    |                     |               |                 |                    |
-| API style                       | JAX/NumPy           | JAX/NumPy     | TensorFlow-like | Static ONNX graphs |
-| Speed                           | Very fast           | Very fast     | Fast            | Very fast          |
-| Bundle size (gzip)              | 107 KB              | 80 KB         | 269 KB          | 90 KB + 24 MB Wasm |
-| **Autodiff & JIT**              |                     |               |                 |                    |
-| Gradients                       | ✅                  | ✅            | ✅              | ❌                 |
-| Jacobian and Hessian            | ✅                  | ✅            | ❌              | ❌                 |
-| `jvp()` forward differentiation | ✅                  | ✅            | ❌              | ❌                 |
-| `jit()` kernel fusion           | ✅                  | ✅            | ❌              | ❌                 |
-| `vmap()` auto-vectorization     | ✅                  | ✅            | ❌              | ❌                 |
-| `scan()` scan over leading axis | ✅                  | ❌            | ❌              | ❌                 |
-| Graph capture                   | ✅                  | ✅            | ❌              | ✅                 |
-| **Backends & Data**             |                     |               |                 |                    |
-| WebGPU backend                  | ✅                  | ✅            | 🟡 Preview      | ✅                 |
-| WebGL backend                   | ✅                  | ✅            | ✅              | ✅                 |
-| Wasm (CPU) backend              | ✅                  | ✅            | ✅              | ✅                 |
-| Eager array API                 | ✅                  | ✅            | ✅              | ❌                 |
-| Run ONNX models                 | 🟡 Partial          | 🟡 Partial    | ❌              | ✅                 |
-| Read safetensors                | ✅                  | ✅            | ❌              | ❌                 |
-| Float64                         | ✅                  | ✅            | ❌              | ❌                 |
-| Float32                         | ✅                  | ✅            | ✅              | ✅                 |
-| Float16                         | ✅                  | ✅            | ❌              | ✅                 |
-| BFloat16                        | ❌                  | ❌            | ❌              | ❌                 |
-| Packed Uint8                    | ❌                  | ❌            | ❌              | 🟡 Partial         |
-| Mixed precision                 | ✅                  | ✅            | ❌              | ✅                 |
-| Mixed devices                   | ✅                  | ✅            | ❌              | ❌                 |
-| **Ops & Numerics**              |                     |               |                 |                    |
-| Arithmetic functions            | ✅                  | ✅            | ✅              | ✅                 |
-| Matrix multiplication           | ✅                  | ✅            | ✅              | ✅                 |
-| General einsum                  | ✅                  | ✅            | 🟡 Partial      | 🟡 Partial         |
-| Sorting                         | ✅                  | ✅            | ❌              | ❌                 |
-| Activation functions            | ✅                  | ✅            | ✅              | ✅                 |
-| NaN/Inf numerics                | ✅                  | ✅            | ✅              | ✅                 |
-| Basic convolutions              | ✅                  | ✅            | ✅              | ✅                 |
-| n-d convolutions                | ✅                  | ✅            | ❌              | ✅                 |
-| Strided/dilated convolution     | ✅                  | ✅            | ✅              | ✅                 |
-| Cholesky, Lstsq                 | ✅                  | ✅            | ❌              | ❌                 |
-| LU, Solve, Determinant          | ✅                  | ✅            | ❌              | ❌                 |
-| SVD                             | ❌                  | ❌            | ❌              | ❌                 |
-| FFT                             | ✅                  | ✅            | ✅              | ✅                 |
-| Basic RNG (Uniform, Normal)     | ✅                  | ✅            | ✅              | ✅                 |
-| Advanced RNG                    | ✅                  | ✅            | ❌              | ❌                 |
+| Feature                                  | jax-js-nonconsuming | jax-js v0.1.9 | TensorFlow.js   | onnxruntime-web    |
+| ---------------------------------------- | ------------------- | ------------- | --------------- | ------------------ |
+| **Overview**                             |                     |               |                 |                    |
+| API style                                | JAX/NumPy           | JAX/NumPy     | TensorFlow-like | Static ONNX graphs |
+| Speed                                    | Very fast           | Very fast     | Fast            | Very fast          |
+| Bundle size (gzip)                       | 107 KB              | 80 KB         | 269 KB          | 90 KB + 24 MB Wasm |
+| **Autodiff & JIT**                       |                     |               |                 |                    |
+| Gradients                                | ✅                  | ✅            | ✅              | ❌                 |
+| Jacobian and Hessian                     | ✅                  | ✅            | ❌              | ❌                 |
+| `jvp()` forward differentiation          | ✅                  | ✅            | ❌              | ❌                 |
+| `jit()` kernel fusion                    | ✅                  | ✅            | ❌              | ❌                 |
+| `vmap()` auto-vectorization              | ✅                  | ✅            | ❌              | ❌                 |
+| `scan()` scan over leading axis          | ✅                  | ❌            | ❌              | ❌                 |
+| `associativeScan()` parallel prefix scan | ✅                  | ❌            | ❌              | ❌                 |
+| Graph capture                            | ✅                  | ✅            | ❌              | ✅                 |
+| **Backends & Data**                      |                     |               |                 |                    |
+| WebGPU backend                           | ✅                  | ✅            | 🟡 Preview      | ✅                 |
+| WebGL backend                            | ✅                  | ✅            | ✅              | ✅                 |
+| Wasm (CPU) backend                       | ✅                  | ✅            | ✅              | ✅                 |
+| Eager array API                          | ✅                  | ✅            | ✅              | ❌                 |
+| Run ONNX models                          | 🟡 Partial          | 🟡 Partial    | ❌              | ✅                 |
+| Read safetensors                         | ✅                  | ✅            | ❌              | ❌                 |
+| Float64                                  | ✅                  | ✅            | ❌              | ❌                 |
+| Float32                                  | ✅                  | ✅            | ✅              | ✅                 |
+| Float16                                  | ✅                  | ✅            | ❌              | ✅                 |
+| BFloat16                                 | ❌                  | ❌            | ❌              | ❌                 |
+| Packed Uint8                             | ❌                  | ❌            | ❌              | 🟡 Partial         |
+| Mixed precision                          | ✅                  | ✅            | ❌              | ✅                 |
+| Mixed devices                            | ✅                  | ✅            | ❌              | ❌                 |
+| **Ops & Numerics**                       |                     |               |                 |                    |
+| Arithmetic functions                     | ✅                  | ✅            | ✅              | ✅                 |
+| Matrix multiplication                    | ✅                  | ✅            | ✅              | ✅                 |
+| General einsum                           | ✅                  | ✅            | 🟡 Partial      | 🟡 Partial         |
+| Sorting                                  | ✅                  | ✅            | ❌              | ❌                 |
+| Activation functions                     | ✅                  | ✅            | ✅              | ✅                 |
+| NaN/Inf numerics                         | ✅                  | ✅            | ✅              | ✅                 |
+| Basic convolutions                       | ✅                  | ✅            | ✅              | ✅                 |
+| n-d convolutions                         | ✅                  | ✅            | ❌              | ✅                 |
+| Strided/dilated convolution              | ✅                  | ✅            | ✅              | ✅                 |
+| Cholesky, Lstsq                          | ✅                  | ✅            | ❌              | ❌                 |
+| LU, Solve, Determinant                   | ✅                  | ✅            | ❌              | ❌                 |
+| SVD                                      | ❌                  | ❌            | ❌              | ❌                 |
+| FFT                                      | ✅                  | ✅            | ✅              | ✅                 |
+| Basic RNG (Uniform, Normal)              | ✅                  | ✅            | ✅              | ✅                 |
+| Advanced RNG                             | ✅                  | ✅            | ❌              | ❌                 |
 
 ## Tutorial
 
@@ -234,15 +234,14 @@ result.dispose(); // caller disposes the output when done
 f.dispose(); // free captured constants when the function is no longer needed
 ```
 
-The `@hamk-uas/eslint-plugin-jax-js` catches the most common memory leaks (missing
-`using`, use-after-dispose, unnecessary `.ref`) at edit time — see the
+The `@hamk-uas/eslint-plugin-jax-js` catches the most common memory leaks (missing `using`,
+use-after-dispose, unnecessary `.ref`) at edit time — see the
 [plugin README](packages/eslint-plugin) for setup.
 
 **Ownership invariance principle:** write code that is ownership-correct in both eager mode and
 `jit()` mode. `jit()` is a performance optimization (fusion, recycling), not a semantics change. If
 code leaks or relies on different ownership behavior in eager mode, treat it as a real bug. For CI
-enforcement in user code, use `jaxJs.configs.invariance` from
-`@hamk-uas/eslint-plugin-jax-js`.
+enforcement in user code, use `jaxJs.configs.invariance` from `@hamk-uas/eslint-plugin-jax-js`.
 
 ### grad(), vmap() and jit()
 
@@ -597,19 +596,20 @@ Outside ownership semantics and fork-specific features, the APIs are broadly ali
 NumPy/JAX usage (`jit`, `grad`, `vmap`, backends, demos), with some intentional divergence (for
 example `scan`, `checkLeaks`, and ownership tooling).
 
-| Aspect                             | Upstream (ekzhang/jax-js)                   | This fork (non-consuming)                                   |
-| ---------------------------------- | ------------------------------------------- | ----------------------------------------------------------- |
-| **Ownership model**                | Move semantics                              | Non-consuming                                               |
-| **Operations consume inputs?**     | Yes — every op decrements refcount          | No — inputs stay alive                                      |
-| **`.ref` needed to reuse arrays?** | Yes — `x.ref` before passing to a second op | Not in user code                                            |
-| **`UseAfterFreeError` risk**       | Common if `.ref` is forgotten               | Gone for reuse; still possible after explicit `.dispose()`  |
-| **`using` declarations**           | Not used                                    | First-class — auto-dispose at block end                     |
-| **ESLint plugin**                  | `@hamk-uas/eslint-plugin-jax-js` (move)     | `@hamk-uas/eslint-plugin-jax-js` (non-consuming) |
-| **`lax.scan`**                     | Not implemented                             | Full support (JIT, autodiff, vmap, native compilation)      |
-| **Buffer recycling**               | Not implemented                             | JIT-level `recycle` step + WebGPU buffer pool               |
-| **`tree.makeDisposable`**          | Not available                               | Wraps any object for `using`-based cleanup                  |
-| **`Array.consumeData()`**          | Not available                               | Reads data and disposes in one call                         |
-| **`checkLeaks` diagnostic**        | Not available                               | Runtime leak detection with stack traces                    |
+| Aspect                             | Upstream (ekzhang/jax-js)                   | This fork (non-consuming)                                              |
+| ---------------------------------- | ------------------------------------------- | ---------------------------------------------------------------------- |
+| **Ownership model**                | Move semantics                              | Non-consuming                                                          |
+| **Operations consume inputs?**     | Yes — every op decrements refcount          | No — inputs stay alive                                                 |
+| **`.ref` needed to reuse arrays?** | Yes — `x.ref` before passing to a second op | Not in user code                                                       |
+| **`UseAfterFreeError` risk**       | Common if `.ref` is forgotten               | Gone for reuse; still possible after explicit `.dispose()`             |
+| **`using` declarations**           | Not used                                    | First-class — auto-dispose at block end                                |
+| **ESLint plugin**                  | `@hamk-uas/eslint-plugin-jax-js` (move)     | `@hamk-uas/eslint-plugin-jax-js` (non-consuming)                       |
+| **`lax.scan`**                     | Not implemented                             | Full support (JIT, autodiff, vmap, native compilation)                 |
+| **`lax.associativeScan`**          | Not implemented                             | Kogge-Stone parallel prefix scan; pytrees, any axis, reverse, autodiff |
+| **Buffer recycling**               | Not implemented                             | JIT-level `recycle` step + WebGPU buffer pool                          |
+| **`tree.makeDisposable`**          | Not available                               | Wraps any object for `using`-based cleanup                             |
+| **`Array.consumeData()`**          | Not available                               | Reads data and disposes in one call                                    |
+| **`checkLeaks` diagnostic**        | Not available                               | Runtime leak detection with stack traces                               |
 
 ### Tradeoffs of the non-consuming model
 
@@ -702,8 +702,8 @@ manage for teams coming from Python/MATLAB — but it is a genuine tradeoff, not
 
 The two versions are **not drop-in interchangeable** — ownership patterns from one model can behave
 incorrectly or awkwardly in the other, especially around `.ref` and disposal discipline. The
-`@hamk-uas/eslint-plugin-jax-js` included here enforces the non-consuming patterns and
-will flag `.ref` usage as unnecessary.
+`@hamk-uas/eslint-plugin-jax-js` included here enforces the non-consuming patterns and will flag
+`.ref` usage as unnecessary.
 
 ### Migrating from upstream
 
@@ -711,8 +711,8 @@ will flag `.ref` usage as unnecessary.
 2. **Replace manual refcount juggling with `using`** — `using x = np.array(...)` auto-disposes at
    block end.
 3. **Call `.dispose()` explicitly for long-lived arrays** — or wrap in `tree.makeDisposable()`.
-4. **Install `@hamk-uas/eslint-plugin-jax-js`** — it catches leaks, use-after-dispose,
-   and unnecessary `.ref` at edit time. See the [plugin README](packages/eslint-plugin) for setup.
+4. **Install `@hamk-uas/eslint-plugin-jax-js`** — it catches leaks, use-after-dispose, and
+   unnecessary `.ref` at edit time. See the [plugin README](packages/eslint-plugin) for setup.
 
 ### AI-assisted development
 

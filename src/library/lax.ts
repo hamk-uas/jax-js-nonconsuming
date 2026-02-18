@@ -16,6 +16,8 @@ import { checkAxis, deepEqual, prod, range, rep, zipn } from "../utils";
 export * as linalg from "./lax-linalg";
 export { scan } from "./lax-scan";
 export type { ScanOptions } from "./lax-scan";
+export { associativeScan } from "./lax-associative-scan";
+export type { AssociativeScanOptions } from "./lax-associative-scan";
 
 /**
  * Dimension numbers for general `dot()` primitive.

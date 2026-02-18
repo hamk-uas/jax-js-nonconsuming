@@ -6,7 +6,10 @@ import {
   random,
   tree,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { safetensors, WeightMapper } from "@hamk-uas/jax-js-nonconsuming-loaders";
+import {
+  safetensors,
+  WeightMapper,
+} from "@hamk-uas/jax-js-nonconsuming-loaders";
 
 // Kyutai Pocket TTS model weights interfaces and forward pass.
 

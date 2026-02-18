@@ -4,6 +4,9 @@ These notes help AI coding agents be immediately productive. The document has tw
 
 1. **Repository Overview** — General jax-js knowledge for any development work
 2. **Scan Feature Reference** — `lax.scan` implementation details and backend-specific behavior
+3. **Buffer Recycling & WebGPU Buffer Pool** — JIT `recycle` step and pool architecture
+4. **Ownership Friction Points, Debugging & Future Work** — edge cases, debugging strategies
+5. **Associative Scan** — `lax.associativeScan` Kogge-Stone parallel prefix scan
 
 ---
 
@@ -136,6 +139,8 @@ When deciding what to work on, prefer work in this order:
     `jvp.ts`/`linearize.ts` (forward/reverse AD), `vmap.ts` (vectorization), `convolution.ts`.
   - Library namespaces in `src/library/`: `numpy.ts`, `lax.ts`, `nn.ts`, `random.ts`,
     `scipy-special.ts`, `numpy-linalg.ts`, `numpy-fft.ts`.
+  - Scan operations in `src/library/`: `lax-scan.ts` (`lax.scan`, sequential carry threading),
+    `lax-associative-scan.ts` (`lax.associativeScan`, Kogge-Stone parallel prefix scan).
 - **Backends** (`src/backend/`): `cpu.ts` (debug only), `wasm.ts` + `wasm/`, `webgl.ts` + `webgl/`,
   `webgpu.ts` + `webgpu/` (ML compiler & shader codegen).
 - **Aux packages**: `packages/loaders` (safetensors, OPFS cache, BPE tokenizers), `packages/onnx`
@@ -943,6 +948,7 @@ All public symbols must be exported from `src/index.ts`. Key exports:
 - Device control: `init`, `defaultDevice`, `devicePut`, `blockUntilReady`, `devices`, `getBackend`
 - Namespaces: `numpy`, `lax`, `nn`, `random`, `scipySpecial`, `tree`
 - Testing utilities: `ScanPath` (type)
+- Types: `AssociativeScanOptions`
 
 ## Extending the codebase
 
@@ -1108,6 +1114,8 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 - Demos: `website/src/routes/repl/`, `website/src/routes/mobileclip/`
 - Deno WebGPU tests: `test/deno/webgpu.test.ts` — headless hardware GPU testing
 - Scan tests: `test/lax-scan.test.ts` — comprehensive scan suite (~1880 lines)
+- Associative scan tests: `test/lax-associative-scan.test.ts` — 15 tests covering correctness,
+  reverse, non-zero axis, pytrees, autodiff, parallel Kalman filter
 
 ---
 
@@ -3277,5 +3285,250 @@ statically at edit time, complementing the runtime `checkLeaks` diagnostic.
 | Medium     | Anonymous constant leak fix               | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                       |
 | ~~Medium~~ | ~~ESLint plugin for non-consuming model~~ | ✅ Implemented as `@jax-js/eslint-plugin` v0.1.0 — `require-using`, `no-use-after-dispose`, `no-dispose-then-reassign-param`, `no-unnecessary-ref`, `no-array-chain`                            |
 | Low        | Chain→temporaries RFC (design-only)       | Keep implementation deferred. Scope RFC to assignment/return chains only, preserve evaluation order + exceptions, and require measured eager-memory wins / lint-pressure before implementation. |
-| Medium     | `scatter_add` primitive                   | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.   |
-| ~~Low~~    | ~~`using` declaration examples~~          | ✅ Documented in copilot-instructions + README                                                                                                                                                  |
+
+---
+
+# Part 5: Associative Scan (`lax.associativeScan`)
+
+## Overview
+
+`lax.associativeScan` applies an **associative** binary operator as a parallel prefix scan —
+computing the cumulative result at every position in O(log N) parallel rounds instead of O(N)
+sequential steps. Unlike `lax.scan` (which threads explicit carry state step-by-step),
+`associativeScan` requires only associativity of `fn` and exploits it for GPU-friendly parallelism.
+
+**Signature:**
+
+```ts
+const result = lax.associativeScan(fn, elems, options);
+// fn: (a: T, b: T) => T          — associative binary operator
+// elems: T                        — pytree of Arrays with scan axis of length N
+// options: { axis?: number, reverse?: boolean }
+// result: T                       — same shape/structure as elems
+```
+
+**Result semantics:**
+
+```
+result[0] = elems[0]
+result[i] = fn(result[i-1], elems[i])   for i ≥ 1
+```
+
+**Options:**
+
+- `axis?: number` — Axis to scan along (default `0`).
+- `reverse?: boolean` — If `true`, scan right-to-left:
+  `result[i] = fn(elems[i], fn(... fn(elems[i+1], elems[N-1]))...)` (default `false`).
+
+**Key file:** `src/library/lax-associative-scan.ts`
+
+**Export path:** `lax.associativeScan` (re-exported from `src/library/lax.ts`)
+
+**Test file:** `test/lax-associative-scan.test.ts` — 15 tests
+
+---
+
+## Algorithm: Kogge-Stone Doubling
+
+Each round doubles the reach of accumulated prefix results:
+
+```
+Round 1 (stride=1): result[i] = fn(result[i-1], result[i])   for i ≥ 1
+Round 2 (stride=2): result[i] = fn(result[i-2], result[i])   for i ≥ 2
+Round 3 (stride=4): result[i] = fn(result[i-4], result[i])   for i ≥ 4
+...
+```
+
+Each round calls `fn` once with batched inputs of shape `[N-stride, ...]` — fully parallel across
+all positions. The result array for round k is:
+
+```
+next = concat(current[0:stride], fn(current[0:N-stride], current[stride:N]))
+```
+
+After `ceil(log₂ N)` rounds, `result[i]` = prefix up to `i`. Complexity: O(N log N) total work,
+O(log N) depth.
+
+**Why this maps well to GPU kernels:** Each round is a single batched `fn` invocation on arrays that
+can be `jit()`-fused into one kernel dispatch. `ceil(log₂ 1024) = 10` dispatches vs. 1024 for a
+sequential scan.
+
+---
+
+## Implementation Details
+
+### Backend behaviour
+
+`associativeScan` is implemented entirely in terms of high-level array primitives: `core.shrink`
+(O(1) ShapeTracker slice views), `core.flip`, `core.concatenate`, and `moveaxis`. There is **no
+special compiled-loop, no WASM module, and no WebGPU shader** for associative scan — every round is
+dispatched through the normal JIT/eager kernel path.
+
+| Backend    | What each Kogge-Stone round does                                                                      | Performance vs `lax.scan`                                                                                                                                                |
+| ---------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **WebGPU** | 1 GPU kernel dispatch over N elements; JIT fuses elementwise `fn` ops                                 | **Faster** for N≳1024: ceil(log₂ N) parallel dispatches vs 1 dispatch with N sequential in-shader iterations on 1 GPU thread                                             |
+| **WASM**   | 1 JS→WASM kernel call per `fn` step + 1 `concat` allocation per leaf per round; O(N log N) total work | **Slower** than `lax.scan`: scan compiled-loop runs all N iterations in a single WASM invocation (~62M iter/sec); assocScan pays the JS→WASM boundary ceil(log₂ N) times |
+| **CPU**    | Same as WASM (interpreted JS TypedArray ops per round)                                                | **Slower** for the same reasons                                                                                                                                          |
+| **WebGL**  | 1 WebGL shader dispatch per round (scan uses JS fallback on WebGL)                                    | Likely faster than `lax.scan` on WebGL since scan has no compiled-loop there; untested                                                                                   |
+
+**No WASM threading today.** Making assocScan fast on WASM would require running each round's
+elements in parallel across WASM workers. That requires `SharedArrayBuffer` (gated on
+`Cross-Origin-Isolation` HTTP headers, not generally available) and a redesigned dispatch model —
+currently Low priority (see WASM feature opportunities table in Part 1).
+
+### Ownership model
+
+The function never consumes its inputs (`elems` leaves). Internal intermediates are tracked via
+explicit `owned: boolean[]` parallel arrays — no identity-comparison tricks. Disposal is precise:
+
+| Array                        | When disposed                                        |
+| ---------------------------- | ---------------------------------------------------- |
+| `moveaxis` views (axis≠0)    | After reverse-flip or directly after use             |
+| `flip` views (reverse=true)  | After the main loop; after post-reverse flip         |
+| `sliceAxis` left/right views | Immediately after `fn` returns (before concat)       |
+| `fn` output leaves           | After all `next[i] = concat(prefix, output[i])` done |
+| Previous `current[i]`        | After `next` array is fully built                    |
+| Post-reverse flips           | After moveaxis-back                                  |
+
+`fn` is responsible for disposing its own internal intermediates. The fn output pytree leaves are
+owned by `associativeScan` and are disposed after being consumed into `next` via concat.
+
+### Slicing strategy
+
+All input slices use `core.shrink(a, slice)` — O(1) ShapeTracker views with no allocation. The only
+allocations per round are the `fn` output leaves and the `concat` results for `next`.
+
+### Pytree support
+
+`tree.flatten<Array>(elems)` extracts all leaf arrays. `tree.unflatten(treedef, leaves)` rebuilds
+the pytree for `fn` calls. The caller's pytree structure is preserved in the result. All leaves must
+have the same size on the scan axis.
+
+### Reverse scan
+
+A reverse scan is implemented by:
+
+1. Flip all input leaves along the scan axis (`core.flip(a, [0])` after `moveaxis`)
+2. Run the standard forward scan
+3. Flip the result back before returning
+
+This is equivalent to JAX's approach and produces the inclusive right-to-left prefix:
+`result[i] = fn(elems[i], fn(elems[i+1], ... fn(elems[N-2], elems[N-1])...))`
+
+---
+
+## API Contract
+
+**Inputs NOT consumed:**
+
+```ts
+using xs = np.array([1, 2, 3, 4]);
+const ys = lax.associativeScan((a, b) => np.add(a, b), xs);
+// xs is still alive — xs was NOT consumed
+ys.dispose();
+```
+
+**Caller owns the result:**
+
+```ts
+// For non-pytree inputs, use `using`:
+using result = lax.associativeScan((a, b) => a.mul(b), xs);
+// For pytree results, dispose leaves manually or use tree.makeDisposable:
+using result2 = tree.makeDisposable(lax.associativeScan(compose, { a: aArr, b: bArr }));
+```
+
+**`fn` must dispose its own intermediates:**
+
+```ts
+// CORRECT — dispose the intermediate q.a.mul(p.b) before returning:
+const compose = (p: { a: Array; b: Array }, q: { a: Array; b: Array }) => {
+  const newA = p.a.mul(q.a) as Array;
+  using tmp = q.a.mul(p.b) as Array; // auto-disposed at block end
+  const newB = tmp.add(q.b) as Array;
+  return { a: newA, b: newB };
+};
+
+// LEAKS — the intermediate q.a.mul(p.b) is never disposed:
+const composeLeak = (p, q) => ({
+  a: p.a.mul(q.a),
+  b: q.a.mul(p.b).add(q.b), // q.a.mul(p.b) leaks!
+});
+```
+
+**Common patterns:**
+
+| Pattern              | Code                                                                 |
+| -------------------- | -------------------------------------------------------------------- |
+| Cumulative sum       | `lax.associativeScan((a, b) => np.add(a, b), xs)`                    |
+| Cumulative product   | `lax.associativeScan((a, b) => a.mul(b), xs)`                        |
+| Running maximum      | `lax.associativeScan((a, b) => np.maximum(a, b), xs)`                |
+| Reverse suffix sum   | `lax.associativeScan((a, b) => np.add(a, b), xs, { reverse: true })` |
+| Along axis 1         | `lax.associativeScan(fn, xs, { axis: 1 })`                           |
+| Pytree (affine maps) | `lax.associativeScan(compose, { a: aArr, b: bArr })`                 |
+
+---
+
+## Difference from `lax.scan`
+
+| Aspect                       | `lax.scan`                               | `lax.associativeScan`                                      |
+| ---------------------------- | ---------------------------------------- | ---------------------------------------------------------- |
+| Algorithm                    | Sequential recurrence with carry         | Parallel prefix (Kogge-Stone)                              |
+| `fn` signature               | `(carry, x) => [newCarry, y]`            | `(a: T, b: T) => T`                                        |
+| `fn` can be non-associative? | Yes                                      | No — must be associative                                   |
+| Output                       | `[finalCarry, stackedYs]`                | Full prefix result (same shape as input)                   |
+| Complexity                   | O(N) sequential depth                    | O(N log N) total work, O(log N) depth                      |
+| WebGPU dispatch rounds       | N (fallback) or 1 (compiled-loop)        | ceil(log₂ N) parallel kernel dispatches                    |
+| WASM/CPU dispatch rounds     | 1 compiled WASM invocation (entire loop) | ceil(log₂ N) JS→WASM round-trips + concat allocs per round |
+| Reverse option               | ✅                                       | ✅                                                         |
+| Pytrees                      | ✅                                       | ✅                                                         |
+| `xs=null` / `Y=null`         | ✅                                       | N/A                                                        |
+| Carry state threading        | ✅                                       | N/A (output IS the prefix)                                 |
+| Autodiff                     | ✅                                       | ✅ (via standard AD through fn)                            |
+
+**When to use which:**
+
+- Use `lax.scan` for sequential recurrences where `fn` is not associative, or when you need carry
+  state that differs from output (e.g., RNNs, Kalman filter with complex state).
+- **On WebGPU:** use `lax.associativeScan` when `fn` is associative and N is large enough that
+  `log₂(N) × dispatch_cost < N × per_iter_GPU_cost`. The crossover is around N≈1024 on typical
+  hardware. Ideal for cumulative reductions, compositional transforms, and parallel Kalman filters.
+- **On WASM/CPU:** `lax.associativeScan` is generally **slower** than `lax.scan` for large N. Scan's
+  compiled-loop runs the entire N-iteration loop inside a single WASM module invocation (~62M
+  iter/sec); assocScan does O(N log N) total work split across ceil(log₂ N) separate JS→WASM kernel
+  dispatches plus a `concat` allocation per round. There is no speed advantage on WASM today. Prefer
+  `lax.scan` on WASM for any N > a few hundred.
+
+---
+
+## Test Coverage
+
+`test/lax-associative-scan.test.ts` — 15 tests:
+
+| Category                    | Tests | Notes                                                                                                                                                                          | File                                      |
+| --------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------- |
+| 1-D basic                   | 6     | cumsum, cumprod, running max, N=1, N=8, N=7 (non-power-of-two)                                                                                                                 | `test/lax-associative-scan.test.ts`       |
+| Reverse                     | 2     | reverse cumsum, reverse cummax                                                                                                                                                 | `test/lax-associative-scan.test.ts`       |
+| Non-zero axis               | 2     | axis=1 and axis=0 on 2-D arrays                                                                                                                                                | `test/lax-associative-scan.test.ts`       |
+| Pytree (affine composition) | 1     | Composition of arity-2 pytree with internal intermediate disposal                                                                                                              | `test/lax-associative-scan.test.ts`       |
+| Autodiff                    | 2     | `grad` through scan, `grad(jit(scan))`                                                                                                                                         | `test/lax-associative-scan.test.ts`       |
+| Parallel Kalman filter      | 2     | Sequential vs parallel correctness (8 obs), differentiable wrt obs                                                                                                             | `test/lax-associative-scan.test.ts`       |
+| Deno WebGPU perf            | 1     | N=65536 prefix product: assocScan (16 parallel rounds) must be ≥3× faster than scan (65536 sequential in-shader iterations on 1 GPU thread); measured ~5–8× on tested hardware | `test/deno/associative-scan-perf.test.ts` |
+
+**Kalman filter test:** Scalar constant-coefficient Kalman filter expressed as a prefix scan of
+affine maps `x_t = A_t * x_{t-1} + b_t`. The composition rule
+`compose(p, q) = (p.a*q.a, q.a*p.b + q.b)` is associative — applying p first then q. Sequential
+reference and parallel scan results are compared to 5 decimal places.
+
+---
+
+## Future Work
+
+| Priority | Feature                          | Notes                                                                                                                                                                                                                                                                               |
+| -------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Medium   | JIT-fused rounds                 | Wrap each round's `fn` call in `jit()` for kernel fusion across the scan body                                                                                                                                                                                                       |
+| Medium   | `jit(associativeScan)` caching   | The function currently re-traces on every call; adding a JIT wrapper avoids re-tracing                                                                                                                                                                                              |
+| Low      | N=0 test                         | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                |
+| Low      | WASM native path                 | Compile the entire Kogge-Stone ladder into a single WASM module (analogous to scan's `compiled-loop`). Currently `lax.scan` compiled-loop is faster on WASM for all practical N. True parallelism additionally needs `SharedArrayBuffer`+workers (cross-origin isolation required). |
+| Low      | WebGL performance                | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                               |
+| Medium   | `scatter_add` primitive          | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.                                                                                       |
+| ~~Low~~  | ~~`using` declaration examples~~ | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                      |

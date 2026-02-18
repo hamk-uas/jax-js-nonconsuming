@@ -1,4 +1,10 @@
-import { jit, lax, nn, numpy as np, random } from "@hamk-uas/jax-js-nonconsuming";
+import {
+  jit,
+  lax,
+  nn,
+  numpy as np,
+  random,
+} from "@hamk-uas/jax-js-nonconsuming";
 
 import { fetchMnist } from "$lib/dataset/mnist";
 
