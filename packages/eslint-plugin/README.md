@@ -220,6 +220,9 @@ const specialCase = np.zeros([3, 3]);
 - Values with explicit `.dispose()` calls later in the same block
 - `Math.*` calls (not array-producing)
 
+> **Inside `grad` / `jit` / `lax.scan` bodies?** `using` is safe and correct there too — see the
+> [FAQ](#i-m-inside-a-grad--valueandgrad--jit-body--arent-arrays-managed-by-the-tracer).
+
 ### `jax-js/no-use-after-dispose`
 
 **Type:** problem (error by default) · no autofix
@@ -516,6 +519,81 @@ export default [
 ];
 ```
 
+## FAQ
+
+### "I'm inside a `grad` / `valueAndGrad` / `jit` body — aren't arrays managed by the tracer?"
+
+No. **The ownership rules are identical in eager and traced contexts.** `using` is safe and
+recommended everywhere, including inside `grad`, `valueAndGrad`, `jit`, and `lax.scan` step
+functions. The library itself uses `using` extensively inside traced bodies (`lax.ts`, `random.ts`,
+`numpy-fft.ts`).
+
+What each tracer type does when `[Symbol.dispose]()` is called:
+
+| Context                                       | Tracer type   | `dispose()` behaviour                                                                                                                                         |
+| --------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Inside `jit(...)` body                        | `JaxprTracer` | **No-op.** Harmless.                                                                                                                                          |
+| Inside `grad(...)` / `valueAndGrad(...)` body | `JVPTracer`   | Decrements its own `#rc`. When rc hits 0, primal + tangent are freed — **correct**, because the operation that used them has already captured what it needed. |
+| Concrete `Array` (captured constant / input)  | `Array`       | Normal reference-counted disposal — **correct and required**.                                                                                                 |
+
+The critical distinction: `using` on a _named_ intermediate is always correct because you own that
+intermediate. The `no-array-chain` rule does suppress warnings for _unnamed_ chain intermediates
+inside traced bodies (because chains create anonymous temporaries that can't be `using`-managed),
+but that is a separate rule with a separate rationale.
+
+**The rule of thumb:** write ownership the same way regardless of whether your function is wrapped
+by `grad`, `jit`, or called directly. `jit()` is a pure performance optimisation — it must not
+change ownership semantics, and correct code must work identically in both modes.
+
+```ts
+// ✅ Correct inside grad body — identical to eager mode
+const loss = (x: np.Array) => {
+  using I = np.eye(x.shape[0]);
+  using Ax = np.matmul(x, I);
+  return Ax.sum();
+};
+const dx = grad(loss)(x);
+
+// ❌ Incorrect workaround — silences the lint warning but leaks in eager mode
+/* eslint-disable jax-js/require-using */
+const loss = (x: np.Array) => {
+  const I = np.eye(x.shape[0]); // leaks if loss() is ever called outside grad
+  const Ax = np.matmul(x, I);
+  return Ax.sum();
+};
+```
+
+### "`using` inside a Kalman filter / scan step function seems excessive"
+
+It is not — the scan step function is called with real `Array` objects in eager mode (or when
+compiling the JIT body). Each intermediate is a real GPU/WASM buffer. Without `using`, the buffers
+live until garbage collection, which can exhaust WASM heap or GPU memory on long scans.
+
+For a scan body with a tight inner structure, `using` keeps peak memory proportional to the step
+code rather than the number of iterations.
+
+### "I got a `UseAfterFreeError` when I added `using` to a traced body"
+
+This means you disposed something that was still needed — not a tracing issue but a real ownership
+bug in the step function itself. Check whether you wrote `using result = ...` and then returned
+`result`: `using` disposes at block end, which is before the return value is consumed. Rename to
+`const result = ...` (which the rule will not flag because it is returned) or restructure to return
+before `using` scope ends.
+
+```ts
+// ❌ Disposes before caller can use it
+const step = (carry, x) => {
+  using newCarry = np.add(carry, x);
+  return [newCarry, newCarry]; // newCarry already disposed here!
+};
+
+// ✅ Correct — returned value is not `using`-managed
+const step = (carry, x) => {
+  const newCarry = np.add(carry, x); // fine: returned immediately
+  return [newCarry, newCarry];
+};
+```
+
 ## How it works
 
 The plugin uses **heuristic static analysis** — no import resolution, no type information. It
@@ -651,7 +729,7 @@ The community [`@hamk-uas/eslint-plugin-jax-js`](https://github.com/hamk-uas/esl
 plugin targets the **upstream move-semantics** jax-js. This plugin targets the **non-consuming
 fork** where operations leave inputs alive.
 
-| Aspect                | `@hamk-uas/eslint-plugin-jax-js`               | `@hamk-uas/eslint-plugin-jax-js`  |
+| Aspect                | `@hamk-uas/eslint-plugin-jax-js`               | `@hamk-uas/eslint-plugin-jax-js`             |
 | --------------------- | ---------------------------------------------- | -------------------------------------------- |
 | Ownership model       | Move semantics (consuming)                     | Non-consuming                                |
 | `.ref` guidance       | Sometimes necessary                            | Never needed in user code                    |

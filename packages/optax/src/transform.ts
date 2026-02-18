@@ -125,13 +125,10 @@ export function scaleBySchedule(stepSizeFn: Schedule): GradientTransformation {
       const { count } = state as { count: np.Array };
       using countFloat = np.astype(count, np.float32);
       const stepSize = stepSizeFn(countFloat);
-      updates = tree.map(
-        (g: np.Array) => {
-          const result = g.mul(stepSize);
-          return result;
-        },
-        updates,
-      ) as typeof updates;
+      updates = tree.map((g: np.Array) => {
+        const result = g.mul(stepSize);
+        return result;
+      }, updates) as typeof updates;
       stepSize.dispose();
       const newCount = count.add(1);
       count.dispose();
@@ -220,6 +217,7 @@ export function addDecayedWeights({
         const { count } = state as { count: np.Array };
         using countFloat = np.astype(count, np.float32);
         currentWeightDecay = (weightDecay as Schedule)(countFloat);
+        // jax-js-lint: allow-non-using — transferred into returned newState
         const newCount = count.add(1);
         count.dispose();
         newState = { count: newCount };

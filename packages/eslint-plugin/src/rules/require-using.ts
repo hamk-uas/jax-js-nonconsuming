@@ -420,7 +420,9 @@ const rule: Rule.RuleModule = {
     hasSuggestions: true,
     messages: {
       requireUsing:
-        "Local array binding `{{name}}` should use `using` (or be explicitly exempted).",
+        "Local array binding `{{name}}` should use `using` (or be explicitly exempted). " +
+        "`using` is safe and correct inside grad/jit/scan bodies — " +
+        "tracers have no-op or reference-counted dispose, so ownership rules are identical in eager and traced contexts.",
       suggestUsing: "Convert `const`/`let` to `using`.",
     },
   },
