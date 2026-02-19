@@ -1138,7 +1138,7 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 - Demos: `website/src/routes/repl/`, `website/src/routes/mobileclip/`
 - Deno WebGPU tests: `test/deno/webgpu.test.ts` — headless hardware GPU testing
 - Scan tests: `test/lax-scan.test.ts` — comprehensive scan suite (~1880 lines)
-- Associative scan tests: `test/lax-associative-scan.test.ts` — 15 tests covering correctness,
+- Associative scan tests: `test/lax-associative-scan.test.ts` — 17 tests covering correctness,
   reverse, non-zero axis, pytrees, autodiff, parallel Kalman filter
 
 ---
@@ -3383,17 +3383,18 @@ sequential scan.
 
 ### Backend behaviour
 
-`associativeScan` is implemented entirely in terms of high-level array primitives: `core.shrink`
-(O(1) ShapeTracker slice views), `core.flip`, `core.concatenate`, and `moveaxis`. There is **no
-special compiled-loop, no WASM module, and no WebGPU shader** for associative scan — every round is
-dispatched through the normal JIT/eager kernel path.
+`associativeScan` is implemented in terms of high-level array primitives: `core.shrink` (O(1)
+ShapeTracker slice views), `core.flip`, `core.concatenate`, and `moveaxis`. There is still **no
+dedicated backend primitive** (no scan-style compiled-loop / custom WASM module / custom WebGPU
+shader), but eager execution now routes through a cached whole-call `jit` wrapper (outside abstract
+tracing), so round orchestration is not executed as op-by-op eager dispatches.
 
-| Backend    | What each Kogge-Stone round does                                                                      | Performance vs `lax.scan`                                                                                                                                                |
-| ---------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **WebGPU** | 1 GPU kernel dispatch over N elements; JIT fuses elementwise `fn` ops                                 | **Faster** for N≳1024: ceil(log₂ N) parallel dispatches vs 1 dispatch with N sequential in-shader iterations on 1 GPU thread                                             |
-| **WASM**   | 1 JS→WASM kernel call per `fn` step + 1 `concat` allocation per leaf per round; O(N log N) total work | **Slower** than `lax.scan`: scan compiled-loop runs all N iterations in a single WASM invocation (~62M iter/sec); assocScan pays the JS→WASM boundary ceil(log₂ N) times |
-| **CPU**    | Same as WASM (interpreted JS TypedArray ops per round)                                                | **Slower** for the same reasons                                                                                                                                          |
-| **WebGL**  | 1 WebGL shader dispatch per round (scan uses JS fallback on WebGL)                                    | Likely faster than `lax.scan` on WebGL since scan has no compiled-loop there; untested                                                                                   |
+| Backend    | What each Kogge-Stone round does                                                                                       | Performance vs `lax.scan`                                                                                                                                                |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **WebGPU** | 1 GPU kernel dispatch over N elements; eager mode uses cached whole-call `jit`, and explicit `jit` wrappers still work | **Faster** for N≳1024: ceil(log₂ N) parallel dispatches vs 1 dispatch with N sequential in-shader iterations on 1 GPU thread                                             |
+| **WASM**   | 1 JS→WASM kernel call per `fn` step + 1 `concat` allocation per leaf per round; O(N log N) total work                  | **Slower** than `lax.scan`: scan compiled-loop runs all N iterations in a single WASM invocation (~62M iter/sec); assocScan pays the JS→WASM boundary ceil(log₂ N) times |
+| **CPU**    | Same as WASM (interpreted JS TypedArray ops per round)                                                                 | **Slower** for the same reasons                                                                                                                                          |
+| **WebGL**  | 1 WebGL shader dispatch per round (scan uses JS fallback on WebGL)                                                     | Likely faster than `lax.scan` on WebGL since scan has no compiled-loop there; untested                                                                                   |
 
 **No WASM threading today.** Making assocScan fast on WASM would require running each round's
 elements in parallel across WASM workers. That requires `SharedArrayBuffer` (gated on
@@ -3547,12 +3548,11 @@ reference and parallel scan results are compared to 5 decimal places.
 
 ## Future Work
 
-| Priority | Feature                          | Notes                                                                                                                                                                                                                                                                               |
-| -------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Medium   | JIT-fused rounds                 | Wrap each round's `fn` call in `jit()` for kernel fusion across the scan body                                                                                                                                                                                                       |
-| Medium   | `jit(associativeScan)` caching   | The function currently re-traces on every call; adding a JIT wrapper avoids re-tracing                                                                                                                                                                                              |
-| Low      | N=0 test                         | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                |
-| Low      | WASM native path                 | Compile the entire Kogge-Stone ladder into a single WASM module (analogous to scan's `compiled-loop`). Currently `lax.scan` compiled-loop is faster on WASM for all practical N. True parallelism additionally needs `SharedArrayBuffer`+workers (cross-origin isolation required). |
-| Low      | WebGL performance                | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                               |
-| Medium   | `scatter_add` primitive          | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.                                                                                       |
-| ~~Low~~  | ~~`using` declaration examples~~ | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                      |
+| Priority | Feature                              | Notes                                                                                                                                                                                                                                                                               |
+| -------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Medium   | Dedicated native assocScan primitive | Add a true backend-native compiled path (scan-style loop primitive) for associative scans to reduce remaining overhead vs explicitly jitted wrappers.                                                                                                                               |
+| Low      | N=0 test                             | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                |
+| Low      | WASM native path                     | Compile the entire Kogge-Stone ladder into a single WASM module (analogous to scan's `compiled-loop`). Currently `lax.scan` compiled-loop is faster on WASM for all practical N. True parallelism additionally needs `SharedArrayBuffer`+workers (cross-origin isolation required). |
+| Low      | WebGL performance                    | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                               |
+| Medium   | `scatter_add` primitive              | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.                                                                                       |
+| ~~Low~~  | ~~`using` declaration examples~~     | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                      |

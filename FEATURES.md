@@ -551,7 +551,8 @@ A few functions in `jax.lax` have been implemented:
 - `scan()` for sequential loops with carry state (supports JIT, autodiff with √N checkpointing,
   vmap, and native compilation on WASM/WebGPU)
 - `associativeScan()` for parallel prefix scans via any associative binary operator (Kogge-Stone
-  O(log N) depth algorithm, supports pytrees, arbitrary axis, reverse, and full autodiff)
+  O(log N) depth algorithm, supports pytrees, arbitrary axis, reverse, and full autodiff; eager mode
+  uses a cached whole-call JIT wrapper outside abstract tracing)
 - `linalg.triangular_solve()` for triangular system solving
 
 In the future, the library may need a rework to add support for more `lax` operations, which are
