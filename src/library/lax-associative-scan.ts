@@ -40,11 +40,42 @@
 
 import type { Array } from "../frontend/array";
 import * as core from "../frontend/core";
+import { insideAbstractTrace } from "../frontend/core";
 import { jit } from "../frontend/jaxpr";
 import { moveaxis } from "../frontend/vmap";
 import * as tree from "../tree";
 import type { JsTree } from "../tree";
 import { checkAxis } from "../utils";
+
+type AssocFn = (a: any, b: any) => any;
+type AssocCompiled = ReturnType<typeof jit<(elems: any) => any>>;
+
+const associativeScanJitCache = new WeakMap<
+  AssocFn,
+  Map<string, AssocCompiled>
+>();
+
+function getOrCreateAssociativeScanJit(
+  fn: AssocFn,
+  axis: number,
+  reverse: boolean,
+): AssocCompiled {
+  let byOpts = associativeScanJitCache.get(fn);
+  if (!byOpts) {
+    byOpts = new Map<string, AssocCompiled>();
+    associativeScanJitCache.set(fn, byOpts);
+  }
+
+  const key = `${axis}|${reverse ? 1 : 0}`;
+  let compiled = byOpts.get(key);
+  if (!compiled) {
+    compiled = jit((elems: any) =>
+      associativeScanCore(fn as any, elems, { axis, reverse }),
+    );
+    byOpts.set(key, compiled);
+  }
+  return compiled;
+}
 
 /**
  * Options for {@link associativeScan}.
@@ -65,63 +96,68 @@ export interface AssociativeScanOptions {
   reverse?: boolean;
 }
 
-// Slice an Array along `axis` from `start` (inclusive) to `end` (exclusive).
-// Returns a zero-copy ShapeTracker view — no allocation.
-function sliceAxis(a: Array, axis: number, start: number, end: number): Array {
-  const slice = a.shape.map<[number, number]>((size, i) =>
-    i === axis ? [start, end] : [0, size],
-  );
-  return core.shrink(a, slice) as Array;
-}
-
-/**
- * Apply an associative binary operator for a parallel prefix scan.
- *
- * `fn` must be **associative** (need not be commutative). Result satisfies:
- * ```
- * result[0] = elems[0]
- * result[i] = fn(result[i-1], elems[i])
- * ```
- *
- * Implemented via the Kogge-Stone doubling algorithm: O(log N) rounds of
- * parallel pair-wise combination instead of O(N) sequential steps. Each
- * round is a single batched `fn` call that can be kernel-fused by `jit()`.
- *
- * @param fn - Associative binary operator. Takes and returns pytrees with the
- *   same leaf shapes as `elems`. Must not close over mutable state. Any Arrays
- *   created internally by `fn` that are not part of the returned pytree must
- *   be disposed by `fn`.
- * @param elems - The input sequence. A pytree of Arrays whose `axis`-th dim
- *   has length N. All leaves must agree on N.
- * @param options - `{ axis?, reverse? }`
- * @returns A pytree matching `elems` structure and shape, where position i
- *   holds the prefix result up to (and including) position i. Caller owns
- *   all returned leaf Arrays and must dispose them.
- *
- * @example Cumulative sum
- * ```ts
- * using xs = np.array([1, 2, 3, 4]);
- * using ys = lax.associativeScan((a, b) => np.add(a, b), xs);
- * // ys ≈ [1, 3, 6, 10]
- * ```
- *
- * @example Parallel Kalman filter via affine-map composition
- * ```ts
- * // compose((a1,b1), (a2,b2)) = (a2*a1, a2*b1 + b2)
- * const compose = (p, q) => ({ a: q.a.mul(p.a), b: q.a.mul(p.b).add(q.b) });
- * const result = lax.associativeScan(compose, { a: aArr, b: bArr });
- * ```
- */
-export function associativeScan<T extends JsTree<Array>>(
+function associativeScanCore<T extends JsTree<Array>>(
   fn: (a: T, b: T) => T,
   elems: T,
   { axis = 0, reverse = false }: AssociativeScanOptions = {},
 ): T {
-  // JIT the associative compose function once per call.
-  // This enables kernel fusion/caching for each Kogge-Stone round and aligns
-  // eager associativeScan behavior more closely with jit(scan)-style fused
-  // body execution.
-  using fusedFn = jit(fn as any);
+  // In eager mode, we compile the whole associative scan at the public wrapper.
+  // In abstract traces (jit/grad/vmap tracing), avoid creating nested JIT
+  // wrappers here so the outer trace can see and optimize the full body.
+  const runStep = fn;
+
+  // Slice an Array along `axis` from `start` (inclusive) to `end` (exclusive).
+  // Returns a zero-copy ShapeTracker view — no allocation.
+  function sliceAxis(
+    a: Array,
+    axis: number,
+    start: number,
+    end: number,
+  ): Array {
+    const slice = a.shape.map<[number, number]>((size, i) =>
+      i === axis ? [start, end] : [0, size],
+    );
+    return core.shrink(a, slice) as Array;
+  }
+
+  /**
+   * Apply an associative binary operator for a parallel prefix scan.
+   *
+   * `fn` must be **associative** (need not be commutative). Result satisfies:
+   * ```
+   * result[0] = elems[0]
+   * result[i] = fn(result[i-1], elems[i])
+   * ```
+   *
+   * Implemented via the Kogge-Stone doubling algorithm: O(log N) rounds of
+   * parallel pair-wise combination instead of O(N) sequential steps. Each
+   * round is a single batched `fn` call that can be kernel-fused by `jit()`.
+   *
+   * @param fn - Associative binary operator. Takes and returns pytrees with the
+   *   same leaf shapes as `elems`. Must not close over mutable state. Any Arrays
+   *   created internally by `fn` that are not part of the returned pytree must
+   *   be disposed by `fn`.
+   * @param elems - The input sequence. A pytree of Arrays whose `axis`-th dim
+   *   has length N. All leaves must agree on N.
+   * @param options - `{ axis?, reverse? }`
+   * @returns A pytree matching `elems` structure and shape, where position i
+   *   holds the prefix result up to (and including) position i. Caller owns
+   *   all returned leaf Arrays and must dispose them.
+   *
+   * @example Cumulative sum
+   * ```ts
+   * using xs = np.array([1, 2, 3, 4]);
+   * using ys = lax.associativeScan((a, b) => np.add(a, b), xs);
+   * // ys ≈ [1, 3, 6, 10]
+   * ```
+   *
+   * @example Parallel Kalman filter via affine-map composition
+   * ```ts
+   * // compose((a1,b1), (a2,b2)) = (a2*a1, a2*b1 + b2)
+   * const compose = (p, q) => ({ a: q.a.mul(p.a), b: q.a.mul(p.b).add(q.b) });
+   * const result = lax.associativeScan(compose, { a: aArr, b: bArr });
+   * ```
+   */
 
   // ------------------------------------------------------------------
   // 1. Flatten pytree and validate.
@@ -215,7 +251,7 @@ export function associativeScan<T extends JsTree<Array>>(
 
     // Call fn — fn may produce intermediates; those are fn's responsibility.
     // fn returns a pytree whose leaves we own.
-    const combined = fusedFn(leftTree, rightTree) as T;
+    const combined = runStep(leftTree, rightTree) as T;
 
     // Dispose slice views — they are always fresh ShapeTracker views.
     for (const a of flatLeft) a.dispose();
@@ -274,4 +310,23 @@ export function associativeScan<T extends JsTree<Array>>(
   });
 
   return tree.unflatten(treedef, result) as T;
+}
+
+export function associativeScan<T extends JsTree<Array>>(
+  fn: (a: T, b: T) => T,
+  elems: T,
+  { axis = 0, reverse = false }: AssociativeScanOptions = {},
+): T {
+  // In eager mode, run through a cached whole-function JIT so round orchestration
+  // does not execute as op-by-op eager dispatches. During abstract tracing,
+  // execute core directly so transforms can see the full computation graph.
+  if (!insideAbstractTrace()) {
+    const compiled = getOrCreateAssociativeScanJit(
+      fn as AssocFn,
+      axis,
+      reverse,
+    );
+    return compiled(elems as any) as T;
+  }
+  return associativeScanCore(fn, elems, { axis, reverse });
 }
