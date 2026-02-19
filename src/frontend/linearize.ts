@@ -1506,11 +1506,36 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     return cts;
   },
   [Primitive.Concatenate]([ct], inputs, { axis }) {
-    // The backprop of concatenate is split.
-    if (inputs.some((x) => !(x instanceof UndefPrimal)))
+    // The backprop of concatenate is split along `axis`.
+    //
+    // Inputs that are `UndefPrimal` are tangent variables (unknown in the
+    // residual sense). Inputs that are concrete arrays arise from
+    // `linearTangentsJvp` substituting `zeros_like(primal)` for the zero
+    // tangent of a constant-inside-the-function (e.g. `np.ones(...)` called
+    // inside a `grad`-traced body). These are semantically zero tangents, so
+    // no gradient flows back to them — they are NOT primal values leaking into
+    // the tangent computation.
+    //
+    // If ALL inputs are concrete (no tangent variables at all), the
+    // concatenate is truly nonlinear (a primal leaked in) — throw.
+    if (inputs.every((x) => !(x instanceof UndefPrimal)))
       throw new NonlinearError(Primitive.Concatenate);
+
     const sizes = inputs.map((x) => x.aval.shape[axis]);
-    return split(ct, axis, sizes);
+    const splits = split(ct, axis, sizes);
+
+    // Fast path: all inputs are tangent variables.
+    if (inputs.every((x) => x instanceof UndefPrimal)) return splits;
+
+    // Mixed case: some inputs are concrete zero-tangent constants.
+    // Return the corresponding split for tangent-variable inputs, and
+    // dispose the unused split + return null for known-constant inputs
+    // (null signals "no cotangent needed for this known input").
+    return inputs.map((inp, i) => {
+      if (inp instanceof UndefPrimal) return splits[i];
+      splits[i].dispose();
+      return null;
+    });
   },
   [Primitive.Split](cts, [x], { axis }) {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Split);

@@ -479,6 +479,63 @@ describe("parallel Kalman filter via associativeScan", () => {
     dys.dispose();
   });
 
+  test("grad works when pytree has constant elements (regression: NonlinearError for concatenate)", () => {
+    // Regression test for: grad(associativeScan) throwing
+    // "Nonlinear operation in backward pass for concatenate" when the pytree
+    // elems contain a constant array (one not depending on the grad argument).
+    //
+    // Root cause: linearTangentsJvp substitutes zeros_like(primal) for UndefPrimal
+    // tangents of constants. When two linearTangentsJvp calls interact (e.g.,
+    // add(zeros_like, tangentVar)), the concatenate JVP receives a mix of
+    // concrete-zeros and tangent-variables as inputs. The Concatenate transpose
+    // rule previously threw NonlinearError for any non-UndefPrimal input; now
+    // it handles them correctly (they represent zero-tangent constants).
+    const N = 4;
+
+    const f = (theta: np.Array): np.Array => {
+      const ones4 = np.ones([N]);
+      // a and b depend on theta; c is constant (does NOT depend on theta)
+      const a_elems = ones4.mul(theta) as np.Array;
+      const b_elems = ones4.mul(theta) as np.Array;
+      const c_elems = np.ones([N]); // constant — tangent is zero
+
+      const [a_scan, b_scan, c_scan] = lax.associativeScan(
+        (
+          lhs: [np.Array, np.Array, np.Array],
+          rhs: [np.Array, np.Array, np.Array],
+        ): [np.Array, np.Array, np.Array] => [
+          // All three components use rhs[0] (theta-dependent), so round 2+
+          // produces concat([theta-dep elem, zero-tangent elem]) for c.
+          np.multiply(rhs[0], lhs[0]) as np.Array,
+          np.add(np.multiply(rhs[0], lhs[1]) as np.Array, rhs[1]) as np.Array,
+          np.add(np.multiply(rhs[0], lhs[2]) as np.Array, rhs[2]) as np.Array,
+        ],
+        [a_elems, b_elems, c_elems],
+      ) as [np.Array, np.Array, np.Array];
+
+      using ab = np.add(a_scan, b_scan);
+      using abc = np.add(ab, c_scan);
+      const loss = np.sum(abc);
+      a_scan.dispose();
+      b_scan.dispose();
+      c_scan.dispose();
+      a_elems.dispose();
+      b_elems.dispose();
+      c_elems.dispose();
+      ones4.dispose();
+      return loss;
+    };
+
+    using theta0 = np.array([0.5]);
+    const dtheta = grad(f)(theta0);
+    // Gradient must be finite (not NaN or +-Infinity).
+    expect(dtheta.shape).toEqual([1]);
+    const [gv] = Array.from(dtheta.dataSync());
+    expect(isFinite(gv)).toBe(true);
+    expect(gv).toBeGreaterThan(0);
+    dtheta.dispose();
+  });
+
   test("jit(associativeScan) matches eager on DLM-like einsum compose", () => {
     const N = 8;
 
