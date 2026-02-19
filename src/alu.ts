@@ -1221,6 +1221,38 @@ export class AluExp implements FpHashable {
     });
   }
 
+  /**
+   * Estimate the computational cost of this expression subtree.
+   *
+   * Used by the WASM backend to decide whether `Where` should use true
+   * branching (`if/else`) instead of the branchless `select` instruction.
+   * Transcendental function calls (exp, log, sin, erf, …) each cost ~20-100
+   * cycles; a branch mispredict on Wasm costs ~15-20 cycles. When the
+   * expensive arm is behind a branch that is usually not taken, skipping the
+   * call is a clear win.
+   *
+   * Costs are intentionally coarse — we only need to distinguish "trivial"
+   * (constants, loads, cheap arithmetic) from "expensive" (function calls).
+   */
+  estimateCost(): number {
+    return this.fold<number>((node, childCosts) => {
+      const childSum = childCosts.reduce((a, b) => a + b, 0);
+      // Expensive: transcendental function calls
+      if (AluGroup.Expensive.has(node.op)) return childSum + 20;
+      // Threefry PRNG is also a function call
+      if (node.op === AluOp.Threefry2x32) return childSum + 15;
+      // Free: constants, variables, specials
+      if (
+        node.op === AluOp.Const ||
+        node.op === AluOp.Variable ||
+        node.op === AluOp.Special
+      )
+        return 0;
+      // Cheap: everything else (arithmetic, loads, casts, compares)
+      return childSum + 1;
+    });
+  }
+
   /** Generic fold() operation with a reducer over the expression tree. */
   fold<T = void>(reducer: (exp: AluExp, mappedSrc: T[]) => T): T {
     const visited = new Map<AluExp, T>();
@@ -1370,6 +1402,17 @@ export const AluGroup = {
     AluOp.GlobalView,
   ]),
   Reduce: new Set([AluOp.Add, AluOp.Mul, AluOp.Min, AluOp.Max]),
+  /** Ops that are implemented as function calls in WASM (costly to evaluate). */
+  Expensive: new Set([
+    AluOp.Sin,
+    AluOp.Cos,
+    AluOp.Asin,
+    AluOp.Atan,
+    AluOp.Exp,
+    AluOp.Log,
+    AluOp.Erf,
+    AluOp.Erfc,
+  ]),
   RequiredFloat: new Set([
     AluOp.Sin,
     AluOp.Cos,
