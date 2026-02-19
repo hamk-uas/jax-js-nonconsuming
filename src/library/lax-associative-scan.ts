@@ -40,6 +40,7 @@
 
 import type { Array } from "../frontend/array";
 import * as core from "../frontend/core";
+import { jit } from "../frontend/jaxpr";
 import { moveaxis } from "../frontend/vmap";
 import * as tree from "../tree";
 import type { JsTree } from "../tree";
@@ -116,6 +117,12 @@ export function associativeScan<T extends JsTree<Array>>(
   elems: T,
   { axis = 0, reverse = false }: AssociativeScanOptions = {},
 ): T {
+  // JIT the associative compose function once per call.
+  // This enables kernel fusion/caching for each Kogge-Stone round and aligns
+  // eager associativeScan behavior more closely with jit(scan)-style fused
+  // body execution.
+  using fusedFn = jit(fn as any);
+
   // ------------------------------------------------------------------
   // 1. Flatten pytree and validate.
   // ------------------------------------------------------------------
@@ -208,7 +215,7 @@ export function associativeScan<T extends JsTree<Array>>(
 
     // Call fn — fn may produce intermediates; those are fn's responsibility.
     // fn returns a pytree whose leaves we own.
-    const combined = fn(leftTree, rightTree);
+    const combined = fusedFn(leftTree, rightTree) as T;
 
     // Dispose slice views — they are always fresh ShapeTracker views.
     for (const a of flatLeft) a.dispose();
