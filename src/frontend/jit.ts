@@ -1316,12 +1316,27 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
   let p2idx = 0;
   while (p2idx < jaxpr.eqns.length) {
     const eqn = jaxpr.eqns[p2idx++];
-    // Skip equations whose outputs are already all black — they won't be
-    // fused into a kernel (e.g., Scan, Routines), so maxArgs doesn't apply.
-    if (eqn.outBinders.every((v) => blackNodes.has(v))) {
+    // Non-kernel black nodes (Scan, Routines) handle their own buffer bindings
+    // internally and don't go through the WebGPU kernel compiler, so maxArgs
+    // doesn't apply to them. Skip the dep check for these.
+    //
+    // NOTE: elementwise black nodes (e.g. Jaxpr outputs, multi-use nodes) DO
+    // get compiled as WebGPU kernels and DO need the dep count check even when
+    // all their outBinders are already in blackNodes. The former "skip all
+    // all-black equations" early-continue was a bug: it allowed those kernel
+    // endpoints to accumulate too many fused inputs without backtracking.
+    const isNonKernelBlack =
+      eqn.outBinders.every((v) => blackNodes.has(v)) &&
+      (specialBlackPrimitives.includes(eqn.primitive) ||
+        routinePrimitives.has(eqn.primitive));
+    if (isNonKernelBlack) {
       for (const out of eqn.outBinders) p2Deps.set(out, new Set([out]));
       continue;
     }
+    // For all-black kernel endpoints the output is already materialized, so
+    // p2Deps should represent it as a single "base" dep rather than propagating
+    // its transitive dep set to downstream equations.
+    const isAllBlack = eqn.outBinders.every((v) => blackNodes.has(v));
     const deps: Set<Var>[] = [];
     for (const input of eqn.inputs) {
       if (input instanceof Var) {
@@ -1367,8 +1382,13 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
         blackNodes.add(out);
       }
     } else {
-      const s = new Set(depCounter.keys());
-      for (const out of eqn.outBinders) p2Deps.set(out, s);
+      if (isAllBlack) {
+        // Black kernel endpoint: output is materialized, treat as a single base dep.
+        for (const out of eqn.outBinders) p2Deps.set(out, new Set([out]));
+      } else {
+        const s = new Set(depCounter.keys());
+        for (const out of eqn.outBinders) p2Deps.set(out, s);
+      }
     }
   }
 

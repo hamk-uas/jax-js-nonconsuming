@@ -13,6 +13,7 @@
  */
 
 import {
+  DType,
   grad,
   init,
   jit,
@@ -582,5 +583,74 @@ describe("parallel Kalman filter via associativeScan", () => {
       compiled?.S.dispose();
       assocJit.dispose();
     }
+  });
+
+  test("jit(grad(assocScan)) with 3-tuple compose doesn't exceed WebGPU buffer limit (regression)", () => {
+    // Regression test for: "Too many buffers (9) for WebGPU pipeline (max: 8)"
+    // when jit(grad/valueAndGrad of assocScan) uses a 3-tuple compose. The P2
+    // pass in splitGraphDataflow skipped the input-count check for equations
+    // whose outputs were already black, allowing black kernel endpoints to
+    // accumulate too many fused inputs. Fixed by applying the dep-count check
+    // and backtrack to all kernel-dispatched equations, not just white ones.
+    //
+    // This mirrors the DLM-js Kalman-filter pattern: (A, b, c) 3-tuple compose.
+    // The 3-tuple pytree causes the backward-pass Jaxpr to reference many saved
+    // activations simultaneously. Prior to the fix, N=20 (5 Kogge-Stone rounds)
+    // produced a kernel with 9 input+output buffers, exceeding the WebGPU max.
+    const N = 20;
+    const dtype = DType.Float32;
+
+    const compose3 = (
+      lhs: [np.Array, np.Array, np.Array],
+      rhs: [np.Array, np.Array, np.Array],
+    ): [np.Array, np.Array, np.Array] => {
+      using rb = np.multiply(rhs[0], lhs[1]);
+      using rc_prod = np.multiply(rhs[0], lhs[2]);
+      return [
+        np.multiply(rhs[0], lhs[0]) as np.Array,
+        np.add(rb, rhs[1]) as np.Array,
+        np.add(rc_prod, rhs[2]) as np.Array,
+      ];
+    };
+
+    // Use canonical jit(grad(fn)) pattern — same structure as the DLM-js repro.
+    // ones_n and c_const are closed over (captured as JIT consts).
+    // jGrad.dispose() releases them; they're freed explicitly below.
+    const ones_n = np.ones([N], { dtype });
+    const c_const = np.ones([N], { dtype });
+    const lossFn = (theta: np.Array): np.Array => {
+      const expT = np.exp(theta) as np.Array;
+      const a_elems = ones_n.mul(expT) as np.Array;
+      const b_elems = ones_n.mul(expT) as np.Array;
+      expT.dispose();
+      const [a_scan, b_scan, c_scan] = lax.associativeScan(compose3, [
+        a_elems,
+        b_elems,
+        c_const,
+      ]) as [np.Array, np.Array, np.Array];
+      using ab = np.add(a_scan, b_scan);
+      using abc = np.add(ab, c_scan);
+      const lik = np.sum(abc);
+      a_scan.dispose();
+      b_scan.dispose();
+      c_scan.dispose();
+      a_elems.dispose();
+      b_elems.dispose();
+      return lik;
+    };
+
+    using jGrad = jit(grad(lossFn));
+    using theta0 = np.array([0.5], { dtype });
+    const dtheta = jGrad(theta0);
+    // Must be finite — "Too many buffers" would throw before reaching this.
+    expect(dtheta.shape).toEqual([1]);
+    const [dthetaV] = Array.from(dtheta.dataSync());
+    expect(isFinite(dthetaV)).toBe(true);
+    expect(dthetaV).toBeGreaterThan(0);
+    dtheta.dispose();
+    // jGrad disposed by `using` (releases const refs on ones_n, c_const)
+    // theta0 disposed by `using`
+    ones_n.dispose();
+    c_const.dispose();
   });
 });
