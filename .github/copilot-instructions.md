@@ -2255,14 +2255,15 @@ epilogue via `codegenReductionAccumulate()`, gidx increment, and loop branching.
 
 ### Current limitations
 
-| Limitation                            | Workaround                           | Backend |
-| ------------------------------------- | ------------------------------------ | ------- |
-| `numCarry ≠ numY` on WebGPU           | Falls back to JS loop                | WebGPU  |
-| WebGPU internal buffer deps in scan   | Falls back to JS loop                | WebGPU  |
-| Mixed kernel+routine bodies on WebGPU | Falls back to JS loop                | WebGPU  |
-| `grad(scan)` ~2× compute overhead     | Use `{ checkpoint: false }` for O(N) | All     |
-| Sort in scan body on WebGPU           | Uses JS loop (uniforms)              | WebGPU  |
-| Mixed-dtype carries on WebGPU         | Use WASM backend or same-dtype carry | WebGPU  |
+| Limitation                                           | Workaround                                                                                                             | Backend |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ------- |
+| `numCarry ≠ numY` on WebGPU                          | Falls back to JS loop                                                                                                  | WebGPU  |
+| WebGPU internal buffer deps in scan                  | Falls back to JS loop (O(N) dispatches)                                                                                | WebGPU  |
+| Mixed kernel+routine bodies on WebGPU                | Falls back to JS loop                                                                                                  | WebGPU  |
+| **`grad(scan)` backward on WebGPU with linalg body** | **O(N) dispatches** — transposed body has intra-step deps; reformulate backward pass as `associativeScan`, or use WASM | WebGPU  |
+| `grad(scan)` ~2× compute overhead                    | Use `{ checkpoint: false }` for O(N)                                                                                   | All     |
+| Sort in scan body on WebGPU                          | Uses JS loop (uniforms)                                                                                                | WebGPU  |
+| Mixed-dtype carries on WebGPU                        | Use WASM backend or same-dtype carry                                                                                   | WebGPU  |
 
 **WebGPU preencoded-routine requirements:** WebGPU can only use `preencoded-routine` for scan bodies
 that are:
@@ -2286,13 +2287,39 @@ const step = (carry, x) => {
   operations (kernels), so the body has multiple steps.
 - **LU**: Returns `[lu, pivots, permutation]` — three outputs, so numCarry ≠ numY.
 - **lstsq/solve**: Combines Cholesky + TriangularSolve + TriangularSolve — multiple routines.
-- **Kalman filters**: Mix matmul (kernel) + routines in one body.
+- **Kalman filter forward pass**: Mixes matmul (kernel) + routines in one body → mixed
+  kernel+routine → fallback.
+- **Kalman/DLM backward pass (RTS smoother)**: The autodiff-transposed body produced by
+  `jit(grad(scan))` contains sequential matmul→matmul→add chains where each step reads from the
+  previous step's output. This is **internal buffer dependency** — the defining condition that
+  triggers WebGPU fallback. Each of the N scan iterations requires multiple sequential GPU
+  dispatches orchestrated from JS, giving **O(N) total dispatch calls**. For N=1600 this causes ~1 s
+  latency per call on typical hardware. **This is the dominant performance bottleneck for any
+  `grad(scan)` over a linalg-heavy body on WebGPU.**
 
-**This is a minor limitation** because:
+**Why autodiff-transposed bodies predictably produce internal buffer deps:** The chain rule for a
+multi-step forward body `B = f(A); C = g(B, x)` transposes to `dA = f_T(dB); dB = dB + g_T(dC)` — a
+sequential dependency chain. No matter how simple the forward body is, if it contains two or more
+operations that compose (output of one feeds input of next), the transposed body will have internal
+deps. This is not a fixable code path in the scan executor; it is a consequence of autodiff algebra.
 
-1. WASM `compiled-loop` handles all these cases natively via imports
-2. Complex linalg patterns (Kalman, Newton, etc.) fall back regardless
-3. WebGPU fallback still keeps data on GPU — the overhead is command encoding, not data transfer
+**Workarounds for the backward pass O(N) bottleneck:**
+
+1. **Reformulate as `associativeScan`** — if the backward recursion can be expressed as a parallel
+   prefix over associative affine maps (as in the Solin/Särkkä parallel Kalman smoother), it gets
+   O(log N) dispatches on WebGPU. This requires mathematical reformulation, not a code-level fix.
+   See: Särkkä, S. & García-Fernández, Á. F. (2020). "Temporal Parallelization of Bayesian
+   Smoothers." _IEEE Transactions on Automatic Control_.
+   [arXiv:1905.13002](https://arxiv.org/abs/1905.13002)
+2. **Use WASM backend** — WASM compiled-loop handles internal buffer deps by allocating temporaries
+   inside the module, running the entire N-iteration backward pass in a single WASM invocation.
+
+**This limitation is significant** for any dynamical model using `grad(scan)` on WebGPU:
+
+1. WASM `compiled-loop` handles all these cases natively — WebGPU is the affected backend
+2. WebGPU fallback is **not** just command encoding overhead; it is a full JS↔GPU round-trip per
+   iteration
+3. O(N) dispatch cost dominates all other costs for N ≳ 100
 
 **Note on Sort in scan body:** Sort already uses a uniform buffer for its configuration, which
 conflicts with the scan offset uniform.
@@ -3373,9 +3400,11 @@ next = concat(current[0:stride], fn(current[0:N-stride], current[stride:N]))
 After `ceil(log₂ N)` rounds, `result[i]` = prefix up to `i`. Complexity: O(N log N) total work,
 O(log N) depth.
 
-**Why this maps well to GPU kernels:** Each round is a single batched `fn` invocation on arrays that
-can be `jit()`-fused into one kernel dispatch. `ceil(log₂ 1024) = 10` dispatches vs. 1024 for a
-sequential scan.
+**Why this maps well to GPU kernels:** Each round's `fn` is a batched elementwise operation over N
+elements — fully parallel across all positions. The JIT graph forces materialization before each
+`Concatenate`, so each round costs exactly 1 dispatch (for elementwise `fn`). `ceil(log₂ 1024) = 10`
+dispatches vs. 1024 for a sequential scan. This is also the **floor**: Kogge-Stone needs a global
+barrier between rounds, which WebGPU cannot provide within a single dispatch.
 
 ---
 
@@ -3386,20 +3415,36 @@ sequential scan.
 `associativeScan` is implemented in terms of high-level array primitives: `core.shrink` (O(1)
 ShapeTracker slice views), `core.flip`, `core.concatenate`, and `moveaxis`. There is still **no
 dedicated backend primitive** (no scan-style compiled-loop / custom WASM module / custom WebGPU
-shader), but eager execution now routes through a cached whole-call `jit` wrapper (outside abstract
+shader), but eager execution routes through a cached whole-call `jit` wrapper (outside abstract
 tracing), so round orchestration is not executed as op-by-op eager dispatches.
 
-| Backend    | What each Kogge-Stone round does                                                                                       | Performance vs `lax.scan`                                                                                                                                                |
-| ---------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **WebGPU** | 1 GPU kernel dispatch over N elements; eager mode uses cached whole-call `jit`, and explicit `jit` wrappers still work | **Faster** for N≳1024: ceil(log₂ N) parallel dispatches vs 1 dispatch with N sequential in-shader iterations on 1 GPU thread                                             |
-| **WASM**   | 1 JS→WASM kernel call per `fn` step + 1 `concat` allocation per leaf per round; O(N log N) total work                  | **Slower** than `lax.scan`: scan compiled-loop runs all N iterations in a single WASM invocation (~62M iter/sec); assocScan pays the JS→WASM boundary ceil(log₂ N) times |
-| **CPU**    | Same as WASM (interpreted JS TypedArray ops per round)                                                                 | **Slower** for the same reasons                                                                                                                                          |
-| **WebGL**  | 1 WebGL shader dispatch per round (scan uses JS fallback on WebGL)                                                     | Likely faster than `lax.scan` on WebGL since scan has no compiled-loop there; untested                                                                                   |
+On **WebGPU**, the resulting ceil(log₂ N) dispatches is the **hardware-imposed floor**: the JIT
+graph forces each round's `fn` output to be materialized before `Concatenate` (which requires clean
+inputs), producing one dispatch per round for elementwise `fn`. More fundamentally, Kogge-Stone
+requires every thread to see each complete round's results before the next round — WebGPU provides
+no cross-workgroup global barrier, making a single-dispatch compiled-loop architecturally
+impossible. The current implementation is already optimal for WebGPU. If `fn` contains reductions
+(e.g., matmul or `sum()`), those add extra dispatches per round.
 
-**No WASM threading today.** Making assocScan fast on WASM would require running each round's
-elements in parallel across WASM workers. That requires `SharedArrayBuffer` (gated on
-`Cross-Origin-Isolation` HTTP headers, not generally available) and a redesigned dispatch model —
-currently Low priority (see WASM feature opportunities table in Part 1).
+On **WASM**, a true compiled-loop is achievable: the entire Kogge-Stone ladder — stride-doubling
+loop plus ping-pong buffers — could be compiled into a single WASM module analogous to scan's
+`codegenNativeScanGeneral`, reducing ceil(log₂ N) JS→WASM crossings to one. It remains future work.
+
+| Backend    | What each Kogge-Stone round does                                                                                                                                                                                                                                               | Performance vs `lax.scan`                                                                                                                                                                                                                  |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **WebGPU** | ceil(log₂ N) JS-driven kernel dispatches total: one per round (fn output materialized before each Concatenate). Hardware-imposed floor — no cross-workgroup global barrier exists. Reductions in `fn` add extra dispatches per round. Eager mode uses cached whole-call `jit`. | **Faster** for N≳1024: ceil(log₂ N) dispatches vs N sequential in-shader iterations (scan compiled-loop). Already optimal for WebGPU. Measured ~5–8× for N=65536 scalar prefix product.                                                    |
+| **WASM**   | 1 JS→WASM kernel call per `fn` step + 1 `concat` allocation per leaf per round; O(N log N) total work                                                                                                                                                                          | **Slower** than `lax.scan`: scan compiled-loop runs all N iterations in a single WASM invocation (~62M iter/sec); assocScan pays the JS→WASM boundary ceil(log₂ N) times. A WASM compiled-loop path is achievable but not yet implemented. |
+| **CPU**    | Same as WASM (interpreted JS TypedArray ops per round)                                                                                                                                                                                                                         | **Slower** for the same reasons                                                                                                                                                                                                            |
+| **WebGL**  | 1 WebGL shader dispatch per round (scan uses JS fallback on WebGL)                                                                                                                                                                                                             | Likely faster than `lax.scan` on WebGL since scan has no compiled-loop there; untested                                                                                                                                                     |
+
+**WASM improvement paths.** Two orthogonal wins are possible on WASM:
+
+1. **Compiled-loop (near-term):** Eliminate the ceil(log₂ N) JS→WASM boundary crossings by compiling
+   the entire Kogge-Stone ladder into a single WASM module (see Future Work below). Each round still
+   runs the N elements sequentially inside WASM, but all round orchestration stays in native code.
+2. **Element-level parallelism (long-term):** Run each round's N elements in parallel across WASM
+   workers via `SharedArrayBuffer`. Requires `Cross-Origin-Isolation` HTTP headers and a redesigned
+   dispatch model — currently Low priority (see WASM feature opportunities table in Part 1).
 
 ### Ownership model
 
@@ -3439,6 +3484,67 @@ A reverse scan is implemented by:
 
 This is equivalent to JAX's approach and produces the inclusive right-to-left prefix:
 `result[i] = fn(elems[i], fn(elems[i+1], ... fn(elems[N-2], elems[N-1])...))`
+
+### Autodiff architecture (trace-through, no dedicated primitive)
+
+Unlike `lax.scan` (which registers `Primitive.Scan` with dedicated JVP, transpose, PE, and vmap
+rules), `associativeScan` has **no dedicated primitive**. This matches Python JAX's design — JAX's
+`associative_scan` is also not a primitive.
+
+**How it works:** When `grad(f)` or `valueAndGrad(f)` traces through `associativeScan`, the
+`insideAbstractTrace()` check returns `true`, so `associativeScanCore()` executes directly. This
+unrolls `ceil(log₂ N)` Kogge-Stone rounds into the traced Jaxpr. Each round composes standard
+operations (`core.shrink`, `core.concatenate`, user `fn`), all of which already have JVP and
+transpose rules. The AD system automatically differentiates through the unrolled loop.
+
+**Jaxpr size — O(log N):** The unrolled Jaxpr grows linearly in `ceil(log₂ N)`, NOT exponentially:
+
+| N   | Equations (add body) | Equations (matmul compose) | Rounds |
+| --- | -------------------- | -------------------------- | ------ |
+| 4   | 13                   | 36                         | 2      |
+| 8   | 19                   | 57                         | 3      |
+| 16  | 25                   | 78                         | 4      |
+| 32  | 31                   | 99                         | 5      |
+| 64  | 37                   | —                          | 6      |
+| 128 | 43                   | —                          | 7      |
+
+This is ~6 equations/round for add and ~20 for matmul compose — constant overhead per round.
+
+**Why no primitive is needed (unlike `lax.scan`):**
+
+- `lax.scan` is inherently sequential (O(N) depth). Without a primitive, AD would trace N
+  iterations, producing an O(N) Jaxpr with O(N) intermediate residuals. The primitive + √N
+  checkpointing trades 2× compute for O(√N) memory.
+- `associativeScan` already has O(log N) depth. The unrolled graph has O(body_ops × log N)
+  equations. AD through this graph naturally produces O(log N) depth gradient computation. There is
+  no sequential bottleneck to optimize away — a primitive would add complexity without benefit.
+
+**Measured `grad` runtime (Feb 2026):**
+
+_WASM backend:_
+
+| N    | `grad(assocScan)` | `grad(scan)` | Speedup    |
+| ---- | ----------------- | ------------ | ---------- |
+| 64   | 0.021 ms          | 0.097 ms     | 4.6×       |
+| 256  | 0.035 ms          | 0.448 ms     | 12.9×      |
+| 1024 | 0.027 ms          | 1.037 ms     | 38.6×      |
+| 4096 | 0.025 ms          | 4.757 ms     | **187.7×** |
+
+_WebGPU backend (Deno wgpu-rs, Intel Core Ultra 5 125H):_
+
+| N    | `grad(assocScan)` | `grad(scan)` | Speedup   |
+| ---- | ----------------- | ------------ | --------- |
+| 64   | 0.058 ms          | 0.360 ms     | 6.2×      |
+| 256  | 0.076 ms          | 1.020 ms     | 13.5×     |
+| 1024 | 0.143 ms          | 3.831 ms     | 26.9×     |
+| 4096 | 0.194 ms          | 15.148 ms    | **78.2×** |
+
+`valueAndGrad` with matmul compose (the parallel Kalman filter pattern) scales correctly: 0.2 ms →
+1.3 ms across N=64→1024 on WebGPU.
+
+**Key insight:** `grad(associativeScan)` maintains O(log N) parallel depth on both backends. The
+gradient computation benefits from the same Kogge-Stone structure as the forward pass — the backward
+pass transposes O(log N) rounds of standard operations, producing O(log N) transposed rounds.
 
 ---
 
@@ -3495,20 +3601,20 @@ const composeLeak = (p, q) => ({
 
 ## Difference from `lax.scan`
 
-| Aspect                       | `lax.scan`                               | `lax.associativeScan`                                      |
-| ---------------------------- | ---------------------------------------- | ---------------------------------------------------------- |
-| Algorithm                    | Sequential recurrence with carry         | Parallel prefix (Kogge-Stone)                              |
-| `fn` signature               | `(carry, x) => [newCarry, y]`            | `(a: T, b: T) => T`                                        |
-| `fn` can be non-associative? | Yes                                      | No — must be associative                                   |
-| Output                       | `[finalCarry, stackedYs]`                | Full prefix result (same shape as input)                   |
-| Complexity                   | O(N) sequential depth                    | O(N log N) total work, O(log N) depth                      |
-| WebGPU dispatch rounds       | N (fallback) or 1 (compiled-loop)        | ceil(log₂ N) parallel kernel dispatches                    |
-| WASM/CPU dispatch rounds     | 1 compiled WASM invocation (entire loop) | ceil(log₂ N) JS→WASM round-trips + concat allocs per round |
-| Reverse option               | ✅                                       | ✅                                                         |
-| Pytrees                      | ✅                                       | ✅                                                         |
-| `xs=null` / `Y=null`         | ✅                                       | N/A                                                        |
-| Carry state threading        | ✅                                       | N/A (output IS the prefix)                                 |
-| Autodiff                     | ✅                                       | ✅ (via standard AD through fn)                            |
+| Aspect                       | `lax.scan`                               | `lax.associativeScan`                                                                                                                             |
+| ---------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Algorithm                    | Sequential recurrence with carry         | Parallel prefix (Kogge-Stone)                                                                                                                     |
+| `fn` signature               | `(carry, x) => [newCarry, y]`            | `(a: T, b: T) => T`                                                                                                                               |
+| `fn` can be non-associative? | Yes                                      | No — must be associative                                                                                                                          |
+| Output                       | `[finalCarry, stackedYs]`                | Full prefix result (same shape as input)                                                                                                          |
+| Complexity                   | O(N) sequential depth                    | O(N log N) total work, O(log N) depth                                                                                                             |
+| WebGPU dispatch rounds       | N (fallback) or 1 (compiled-loop)        | ceil(log₂ N) JS-driven dispatches — already the hardware-imposed floor (no cross-workgroup global barrier on WebGPU; more if `fn` has reductions) |
+| WASM/CPU dispatch rounds     | 1 compiled WASM invocation (entire loop) | ceil(log₂ N) JS→WASM round-trips + concat allocs per round                                                                                        |
+| Reverse option               | ✅                                       | ✅                                                                                                                                                |
+| Pytrees                      | ✅                                       | ✅                                                                                                                                                |
+| `xs=null` / `Y=null`         | ✅                                       | N/A                                                                                                                                               |
+| Carry state threading        | ✅                                       | N/A (output IS the prefix)                                                                                                                        |
+| Autodiff                     | ✅ (dedicated JVP/transpose rules)       | ✅ (trace-through, O(log N) depth preserved — see [Autodiff architecture](#autodiff-architecture-trace-through-no-dedicated-primitive))           |
 
 **When to use which:**
 
@@ -3517,6 +3623,10 @@ const composeLeak = (p, q) => ({
 - **On WebGPU:** use `lax.associativeScan` when `fn` is associative and N is large enough that
   `log₂(N) × dispatch_cost < N × per_iter_GPU_cost`. The crossover is around N≈1024 on typical
   hardware. Ideal for cumulative reductions, compositional transforms, and parallel Kalman filters.
+  **Autodiff preserves O(log N) depth** — `grad(associativeScan)` is 78× faster than `grad(scan)` at
+  N=4096 on WebGPU. For the RTS backward smoother specifically, see: Särkkä, S. & García-Fernández,
+  Á. F. (2020). "Temporal Parallelization of Bayesian Smoothers." _IEEE Transactions on Automatic
+  Control_. [arXiv:1905.13002](https://arxiv.org/abs/1905.13002)
 - **On WASM/CPU:** `lax.associativeScan` is generally **slower** than `lax.scan` for large N. Scan's
   compiled-loop runs the entire N-iteration loop inside a single WASM module invocation (~62M
   iter/sec); assocScan does O(N log N) total work split across ceil(log₂ N) separate JS→WASM kernel
@@ -3529,15 +3639,15 @@ const composeLeak = (p, q) => ({
 
 `test/lax-associative-scan.test.ts` — 15 tests:
 
-| Category                    | Tests | Notes                                                                                                                                                                          | File                                      |
-| --------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------- |
-| 1-D basic                   | 6     | cumsum, cumprod, running max, N=1, N=8, N=7 (non-power-of-two)                                                                                                                 | `test/lax-associative-scan.test.ts`       |
-| Reverse                     | 2     | reverse cumsum, reverse cummax                                                                                                                                                 | `test/lax-associative-scan.test.ts`       |
-| Non-zero axis               | 2     | axis=1 and axis=0 on 2-D arrays                                                                                                                                                | `test/lax-associative-scan.test.ts`       |
-| Pytree (affine composition) | 1     | Composition of arity-2 pytree with internal intermediate disposal                                                                                                              | `test/lax-associative-scan.test.ts`       |
-| Autodiff                    | 2     | `grad` through scan, `grad(jit(scan))`                                                                                                                                         | `test/lax-associative-scan.test.ts`       |
-| Parallel Kalman filter      | 2     | Sequential vs parallel correctness (8 obs), differentiable wrt obs                                                                                                             | `test/lax-associative-scan.test.ts`       |
-| Deno WebGPU perf            | 1     | N=65536 prefix product: assocScan (16 parallel rounds) must be ≥3× faster than scan (65536 sequential in-shader iterations on 1 GPU thread); measured ~5–8× on tested hardware | `test/deno/associative-scan-perf.test.ts` |
+| Category                    | Tests | Notes                                                                                                                                                                                             | File                                      |
+| --------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| 1-D basic                   | 6     | cumsum, cumprod, running max, N=1, N=8, N=7 (non-power-of-two)                                                                                                                                    | `test/lax-associative-scan.test.ts`       |
+| Reverse                     | 2     | reverse cumsum, reverse cummax                                                                                                                                                                    | `test/lax-associative-scan.test.ts`       |
+| Non-zero axis               | 2     | axis=1 and axis=0 on 2-D arrays                                                                                                                                                                   | `test/lax-associative-scan.test.ts`       |
+| Pytree (affine composition) | 1     | Composition of arity-2 pytree with internal intermediate disposal                                                                                                                                 | `test/lax-associative-scan.test.ts`       |
+| Autodiff                    | 2     | `grad` through scan, `grad(jit(scan))`                                                                                                                                                            | `test/lax-associative-scan.test.ts`       |
+| Parallel Kalman filter      | 2     | Sequential vs parallel correctness (8 obs), differentiable wrt obs                                                                                                                                | `test/lax-associative-scan.test.ts`       |
+| Deno WebGPU perf            | 1     | N=65536 prefix product: assocScan (16 JS-driven rounds, ceil(log₂ 65536)) must be ≥3× faster than scan (65536 sequential in-shader iterations on 1 GPU thread); measured ~5–8× on tested hardware | `test/deno/associative-scan-perf.test.ts` |
 
 **Kalman filter test:** Scalar constant-coefficient Kalman filter expressed as a prefix scan of
 affine maps `x_t = A_t * x_{t-1} + b_t`. The composition rule
@@ -3548,11 +3658,10 @@ reference and parallel scan results are compared to 5 decimal places.
 
 ## Future Work
 
-| Priority | Feature                              | Notes                                                                                                                                                                                                                                                                               |
-| -------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Medium   | Dedicated native assocScan primitive | Add a true backend-native compiled path (scan-style loop primitive) for associative scans to reduce remaining overhead vs explicitly jitted wrappers.                                                                                                                               |
-| Low      | N=0 test                             | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                |
-| Low      | WASM native path                     | Compile the entire Kogge-Stone ladder into a single WASM module (analogous to scan's `compiled-loop`). Currently `lax.scan` compiled-loop is faster on WASM for all practical N. True parallelism additionally needs `SharedArrayBuffer`+workers (cross-origin isolation required). |
-| Low      | WebGL performance                    | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                               |
-| Medium   | `scatter_add` primitive              | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.                                                                                       |
-| ~~Low~~  | ~~`using` declaration examples~~     | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                      |
+| Priority | Feature                          | Notes                                                                                                                                                                                                                                                                                                                                     |
+| -------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Medium   | WASM compiled-loop for assocScan | Compile the full Kogge-Stone ladder into a single WASM module (analogous to scan's `codegenNativeScanGeneral`), reducing ceil(log₂ N) JS→WASM crossings to one. WebGPU: a single-dispatch compiled-loop is architecturally impossible (no cross-workgroup global barrier); ceil(log₂ N) dispatches is already the hardware-imposed floor. |
+| Low      | N=0 test                         | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                                                                      |
+| Low      | WebGL performance                | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                                                                                     |
+| Medium   | `scatter_add` primitive          | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.                                                                                                                                             |
+| ~~Low~~  | ~~`using` declaration examples~~ | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                                                                            |

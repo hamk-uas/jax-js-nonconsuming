@@ -11,10 +11,18 @@
 // fusion via JIT (ceil(log₂ N) dispatch roundtrips instead of N).
 //
 // Backend performance notes:
-//   WebGPU: each round dispatches a kernel over all N elements in parallel.
+//   WebGPU: ceil(log₂ N) JS-driven kernel dispatches total — one per
+//     Kogge-Stone round. The JIT graph forces each round's `fn` output to
+//     be materialized before `Concatenate` (which requires clean inputs),
+//     yielding one dispatch per round for elementwise `fn`; reductions in
+//     `fn` (e.g., matmul, sum) add extra dispatches per round.
+//     This count is the hardware-imposed floor: Kogge-Stone requires all
+//     threads to see round k's complete results before round k+1 begins,
+//     and WebGPU provides no cross-workgroup global barrier — a
+//     single-dispatch compiled-loop is architecturally impossible.
 //     For large N, ceil(log₂ N) × dispatch_cost << N × per_iter_GPU_cost,
-//     so associativeScan is significantly faster than lax.scan (measured
-//     ~5–8× for N=65536 scalar prefix product on tested hardware).
+//     so associativeScan is still significantly faster than lax.scan
+//     fallback (measured ~5–8× for N=65536 scalar prefix product).
 //   WASM: each round is a separate JS→WASM kernel call plus a concat
 //     allocation per leaf. lax.scan's compiled-loop runs the full N-step
 //     loop in a single WASM invocation (~62M iter/sec), making it faster
