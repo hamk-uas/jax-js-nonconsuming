@@ -59,28 +59,32 @@ function isInsideCallback(node: any): boolean {
   return false;
 }
 
+/** Methods that consume the array — any use after calling these is a bug. */
+const CONSUMING_METHODS = new Set(["dispose", "consumeData"]);
+
 const rule: Rule.RuleModule = {
   meta: {
     type: "problem",
     docs: {
-      description: "Disallow using local variables after calling .dispose()",
+      description:
+        "Disallow using local variables after calling .dispose() or .consumeData()",
     },
     schema: [],
     messages: {
       useAfterDispose:
-        "`{{name}}` is used after `.dispose()` on line {{disposeLine}}.",
+        "`{{name}}` is used after `.{{method}}()` on line {{consumeLine}}.",
     },
   },
   create(context) {
-    const disposedAt = new Map<any, { end: number; line: number }>();
+    const disposedAt = new Map<any, { end: number; line: number; method: string }>();
 
     return {
       CallExpression(node: any) {
         if (node.callee?.type !== "MemberExpression") return;
         const prop = getMemberName(node.callee.property);
-        if (prop !== "dispose") return;
+        if (!CONSUMING_METHODS.has(prop)) return;
         // tree.dispose(arg) disposes arg, not the receiver `tree`.
-        // Only mark the receiver as disposed for zero-argument .dispose() calls.
+        // Only mark the receiver as consumed for zero-argument calls.
         if (node.arguments.length > 0) return;
         const obj = node.callee.object;
         if (obj?.type !== "Identifier") return;
@@ -92,9 +96,15 @@ const rule: Rule.RuleModule = {
 
         const variable = resolveVariable(context, obj);
         if (!variable) return;
+        // Don't let a .dispose() call overwrite a prior .consumeData() marker.
+        // The .dispose() itself will be caught by the Identifier visitor as a
+        // use-after-consumeData error.
+        const existing = disposedAt.get(variable);
+        if (existing && existing.method !== "dispose") return;
         disposedAt.set(variable, {
           end: node.range[1],
           line: node.loc?.start?.line ?? 0,
+          method: prop,
         });
       },
 
@@ -117,7 +127,10 @@ const rule: Rule.RuleModule = {
         if (!isIdentifierReference(node, node.parent)) return;
 
         const parent = node.parent;
+        // Allow a second .dispose() call on an already-disposed variable
+        // (idempotent no-op). But .dispose() after .consumeData() IS a bug.
         if (
+          info.method === "dispose" &&
           parent?.type === "MemberExpression" &&
           parent.object === node &&
           getMemberName(parent.property) === "dispose"
@@ -130,7 +143,8 @@ const rule: Rule.RuleModule = {
           messageId: "useAfterDispose",
           data: {
             name: node.name,
-            disposeLine: String(info.line),
+            method: info.method,
+            consumeLine: String(info.line),
           },
         });
       },

@@ -188,3 +188,58 @@ function f() {
   // tree.dispose(x) has arguments, so `tree` should not be marked as disposed
   assert.equal(messages.length, 0);
 });
+
+// --- consumeData() as a consuming method ---
+
+test("no-use-after-dispose: warns for dispose() after consumeData()", async () => {
+  const code = `
+async function f() {
+  const grad = computeGrad();
+  const gradV = (await grad.consumeData())[0];
+  grad.dispose();
+}
+`;
+  const messages = await lintUseAfterDispose(code);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /`grad` is used after `.consumeData\(\)`/);
+});
+
+test("no-use-after-dispose: warns for method call after consumeData()", async () => {
+  const code = `
+async function f() {
+  const arr = createArray();
+  const raw = await arr.consumeData();
+  const d = arr.data();
+}
+`;
+  const messages = await lintUseAfterDispose(code);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /`arr` is used after `.consumeData\(\)`/);
+});
+
+test("no-use-after-dispose: no warn for use before consumeData()", async () => {
+  const code = `
+async function f() {
+  const arr = createArray();
+  const v = arr.add(1);
+  const raw = await arr.consumeData();
+}
+`;
+  const messages = await lintUseAfterDispose(code);
+  assert.equal(messages.length, 0);
+});
+
+test("no-use-after-dispose: message includes method name for consumeData", async () => {
+  const code = `
+async function f() {
+  const x = createArray();
+  await x.consumeData();
+  x.dispose();
+}
+`;
+  const messages = await lintUseAfterDispose(code);
+  assert.equal(messages.length, 1);
+  // Message should say consumeData, not dispose
+  assert.match(messages[0].message, /`.consumeData\(\)`/);
+  assert.doesNotMatch(messages[0].message, /`.dispose\(\)`/);
+});

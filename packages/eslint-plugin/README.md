@@ -42,7 +42,7 @@ This enables:
 | Rule                                    | Level   | What it catches                                        |
 | --------------------------------------- | ------- | ------------------------------------------------------ |
 | `jax-js/require-using`                  | `warn`  | Local array bindings missing `using`                   |
-| `jax-js/no-use-after-dispose`           | `error` | Reading/writing a variable after `.dispose()`          |
+| `jax-js/no-use-after-dispose`           | `error` | Reading/writing a variable after `.dispose()` or `.consumeData()`          |
 | `jax-js/no-dispose-then-reassign-param` | `warn`  | Callback alias hazard: `dispose(state); state = param` |
 | `jax-js/no-make-disposable-alias`       | `warn`  | Duplicate references in `tree.makeDisposable(...)`     |
 | `jax-js/no-unnecessary-ref`             | `warn`  | `.ref` calls (unnecessary in non-consuming)            |
@@ -227,9 +227,13 @@ const specialCase = np.zeros([3, 3]);
 
 **Type:** problem (error by default) · no autofix
 
-Catches reads or writes to a variable after `.dispose()` has been called on it. This prevents
-`UseAfterFreeError` at runtime. The error message includes the line number of the `.dispose()` call
-for easy navigation.
+Catches reads or writes to a variable after `.dispose()` or `.consumeData()` has been called on it.
+This prevents `UseAfterFreeError` at runtime. The error message includes the consuming method name
+and line number for easy navigation.
+
+Both `.dispose()` and `.consumeData()` are treated as consuming calls. Calling `.dispose()` after
+`.consumeData()` (double-free) is flagged; calling `.dispose()` after `.dispose()` is allowed
+(idempotent no-op at `rc=0`).
 
 ```ts
 const x = np.array([1, 2, 3]);
@@ -240,6 +244,13 @@ const y = x.add(np.array([4, 5, 6]));
 
 // ✅ OK: redundant dispose is fine (no-op at rc=0)
 x.dispose();
+
+// ❌ Error: `grad` is used after `.consumeData()` on line N
+async function f() {
+  const grad = computeGrad();
+  const v = (await grad.consumeData())[0]; // consumes + disposes grad
+  grad.dispose();                           // double-free: caught!
+}
 ```
 
 **Scope:** Tracks variables lexically within the same function scope. Does not track across function
@@ -739,7 +750,7 @@ fork** where operations leave inputs alive.
 | Flat config (`>=v9`)  | Yes (`configs.recommended`)                    | Yes (`configs.recommended`)                  |
 | Suggested fixes       | `require-consume`, `no-use-after-consume`      | `require-using`                              |
 | Autofix               | `no-unnecessary-ref`                           | `no-unnecessary-ref`                         |
-| Dispose line in error | `no-use-after-consume` includes consuming line | `no-use-after-dispose` includes dispose line |
+| Dispose line in error | `no-use-after-consume` includes consuming line | `no-use-after-dispose` includes consuming method + line |
 | Suppression directive | `// @jax-borrow`                               | `// jax-js-lint: allow-*`                    |
 
 If you're using the upstream jax-js (move semantics), use the HAMK plugin. If you're using this fork
