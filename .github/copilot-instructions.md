@@ -596,8 +596,8 @@ if (kernel.nargs > maxArgs) {
 }
 ```
 
-`splitGraphDataflow()`'s **P2 pass** prevents this by counting transitive fused dependencies
-for every kernel-dispatched equation and backtracking (splitting the fusion boundary) when
+`splitGraphDataflow()`'s **P2 pass** prevents this by counting transitive fused dependencies for
+every kernel-dispatched equation and backtracking (splitting the fusion boundary) when
 `depCounter.size > maxArgs`. This check applies to **all kernel-dispatched equations** — including
 black kernel endpoints (Jaxpr outputs, multi-use vars) — not just white (fusable) ops. Non-kernel
 blacks (Scan, Routines, DUS) are exempt since they use dedicated JIT step types, not the kernel
@@ -1061,13 +1061,13 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
   non-contiguous input (reshape/transpose/flatten), (2) static argnums on jit, and (3) consts
   created inside the jit body (placed on trace-time device, becoming first arg so `#computeBackend`
   picks CPU).
-- **`splitGraphDataflow` P2 black-node distinction**: Black nodes are either *non-kernel* (Scan,
-  Routine, DUS — their own JIT step, exempt from `maxArgs`) or *kernel-endpoint* (output vars,
+- **`splitGraphDataflow` P2 black-node distinction**: Black nodes are either _non-kernel_ (Scan,
+  Routine, DUS — their own JIT step, exempt from `maxArgs`) or _kernel-endpoint_ (output vars,
   multi-use vars — still compiled as kernels, must pass `depCount ≤ maxArgs`). If adding a new
   black-node class, decide which category it belongs to and set `isNonKernelBlack` accordingly.
   Previously the P2 pass skipped ALL all-black-output equations, allowing kernel endpoints to
-  accumulate arbitrarily many fused inputs — causing `Too many buffers (N) for WebGPU pipeline`
-  in `jit(grad(assocScan))` with 3-tuple pytrees. Fixed in commit `3d6e450`.
+  accumulate arbitrarily many fused inputs — causing `Too many buffers (N) for WebGPU pipeline` in
+  `jit(grad(assocScan))` with 3-tuple pytrees. Fixed in commit `3d6e450`.
 - **`no-unnecessary-ref` autofix vs internal tracer `.ref` propagation**: The
   `jax-js/no-unnecessary-ref` eslint rule has autofix (`--fix` removes `.ref`). This is safe for
   user code but **unsafe for internal tracer plumbing** where `.ref` must propagate to inner values

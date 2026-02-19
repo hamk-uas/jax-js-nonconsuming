@@ -39,15 +39,15 @@ export default [
 
 This enables:
 
-| Rule                                    | Level   | What it catches                                        |
-| --------------------------------------- | ------- | ------------------------------------------------------ |
-| `jax-js/require-using`                  | `warn`  | Local array bindings missing `using`                   |
-| `jax-js/no-use-after-dispose`           | `error` | Reading/writing a variable after `.dispose()` or `.consumeData()`          |
-| `jax-js/no-dispose-then-reassign-param` | `warn`  | Callback alias hazard: `dispose(state); state = param` |
-| `jax-js/no-make-disposable-alias`       | `warn`  | Duplicate references in `tree.makeDisposable(...)`     |
-| `jax-js/no-unnecessary-ref`             | `warn`  | `.ref` calls (unnecessary in non-consuming)            |
-| `jax-js/no-array-chain`                 | `off`   | Deep fluent chains (strict-mode only)                  |
-| `jax-js/require-scan-result-dispose`    | `warn`  | Undisposed destructured `lax.scan(...)` results        |
+| Rule                                    | Level   | What it catches                                                                          |
+| --------------------------------------- | ------- | ---------------------------------------------------------------------------------------- |
+| `jax-js/require-using`                  | `warn`  | Local array bindings missing `using`                                                     |
+| `jax-js/no-use-after-dispose`           | `error` | Reading/writing a variable after `.dispose()`, `.consumeData()`, or `.consumeDataSync()` |
+| `jax-js/no-dispose-then-reassign-param` | `warn`  | Callback alias hazard: `dispose(state); state = param`                                   |
+| `jax-js/no-make-disposable-alias`       | `warn`  | Duplicate references in `tree.makeDisposable(...)`                                       |
+| `jax-js/no-unnecessary-ref`             | `warn`  | `.ref` calls (unnecessary in non-consuming)                                              |
+| `jax-js/no-array-chain`                 | `off`   | Deep fluent chains (strict-mode only)                                                    |
+| `jax-js/require-scan-result-dispose`    | `warn`  | Undisposed destructured `lax.scan(...)` results                                          |
 
 ### Strict config
 
@@ -227,13 +227,13 @@ const specialCase = np.zeros([3, 3]);
 
 **Type:** problem (error by default) · no autofix
 
-Catches reads or writes to a variable after `.dispose()` or `.consumeData()` has been called on it.
-This prevents `UseAfterFreeError` at runtime. The error message includes the consuming method name
-and line number for easy navigation.
+Catches reads or writes to a variable after `.dispose()`, `.consumeData()`, or `.consumeDataSync()`
+has been called on it. This prevents `UseAfterFreeError` at runtime. The error message includes the
+consuming method name and line number for easy navigation.
 
-Both `.dispose()` and `.consumeData()` are treated as consuming calls. Calling `.dispose()` after
-`.consumeData()` (double-free) is flagged; calling `.dispose()` after `.dispose()` is allowed
-(idempotent no-op at `rc=0`).
+`.dispose()`, `.consumeData()`, and `.consumeDataSync()` are all treated as consuming calls. Calling
+`.dispose()` after `.consumeData()` or `.consumeDataSync()` (double-free) is flagged; calling
+`.dispose()` after `.dispose()` is allowed (idempotent no-op at `rc=0`).
 
 ```ts
 const x = np.array([1, 2, 3]);
@@ -249,7 +249,7 @@ x.dispose();
 async function f() {
   const grad = computeGrad();
   const v = (await grad.consumeData())[0]; // consumes + disposes grad
-  grad.dispose();                           // double-free: caught!
+  grad.dispose(); // double-free: caught!
 }
 ```
 
@@ -740,18 +740,18 @@ The community [`@hamk-uas/eslint-plugin-jax-js`](https://github.com/hamk-uas/esl
 plugin targets the **upstream move-semantics** jax-js. This plugin targets the **non-consuming
 fork** where operations leave inputs alive.
 
-| Aspect                | `@hamk-uas/eslint-plugin-jax-js`               | `@hamk-uas/eslint-plugin-jax-js`             |
-| --------------------- | ---------------------------------------------- | -------------------------------------------- |
-| Ownership model       | Move semantics (consuming)                     | Non-consuming                                |
-| `.ref` guidance       | Sometimes necessary                            | Never needed in user code                    |
-| Dispose terminology   | "consume" (input consumed by op)               | "dispose" (explicit cleanup)                 |
-| `using` support       | Not mentioned                                  | First-class (`require-using`)                |
-| Chain detection       | No                                             | `no-array-chain` rule                        |
-| Flat config (`>=v9`)  | Yes (`configs.recommended`)                    | Yes (`configs.recommended`)                  |
-| Suggested fixes       | `require-consume`, `no-use-after-consume`      | `require-using`                              |
-| Autofix               | `no-unnecessary-ref`                           | `no-unnecessary-ref`                         |
+| Aspect                | `@hamk-uas/eslint-plugin-jax-js`               | `@hamk-uas/eslint-plugin-jax-js`                        |
+| --------------------- | ---------------------------------------------- | ------------------------------------------------------- |
+| Ownership model       | Move semantics (consuming)                     | Non-consuming                                           |
+| `.ref` guidance       | Sometimes necessary                            | Never needed in user code                               |
+| Dispose terminology   | "consume" (input consumed by op)               | "dispose" (explicit cleanup)                            |
+| `using` support       | Not mentioned                                  | First-class (`require-using`)                           |
+| Chain detection       | No                                             | `no-array-chain` rule                                   |
+| Flat config (`>=v9`)  | Yes (`configs.recommended`)                    | Yes (`configs.recommended`)                             |
+| Suggested fixes       | `require-consume`, `no-use-after-consume`      | `require-using`                                         |
+| Autofix               | `no-unnecessary-ref`                           | `no-unnecessary-ref`                                    |
 | Dispose line in error | `no-use-after-consume` includes consuming line | `no-use-after-dispose` includes consuming method + line |
-| Suppression directive | `// @jax-borrow`                               | `// jax-js-lint: allow-*`                    |
+| Suppression directive | `// @jax-borrow`                               | `// jax-js-lint: allow-*`                               |
 
 If you're using the upstream jax-js (move semantics), use the HAMK plugin. If you're using this fork
 (non-consuming model with `using`), use this plugin.

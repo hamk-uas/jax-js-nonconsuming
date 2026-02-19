@@ -243,3 +243,49 @@ async function f() {
   assert.match(messages[0].message, /`.consumeData\(\)`/);
   assert.doesNotMatch(messages[0].message, /`.dispose\(\)`/);
 });
+
+// --- consumeDataSync() as a consuming method ---
+
+test("no-use-after-dispose: warns for dispose() after consumeDataSync()", async () => {
+  const code = `
+function f() {
+  const arr = createArray();
+  const raw = arr.consumeDataSync();
+  arr.dispose();
+}
+`;
+  const messages = await lintUseAfterDispose(code);
+  assert.equal(messages.length, 1);
+  assert.match(
+    messages[0].message,
+    /`arr` is used after `.consumeDataSync\(\)`/,
+  );
+});
+
+test("no-use-after-dispose: warns for method call after consumeDataSync()", async () => {
+  const code = `
+function f() {
+  const arr = createArray();
+  const raw = arr.consumeDataSync();
+  const d = arr.data();
+}
+`;
+  const messages = await lintUseAfterDispose(code);
+  assert.equal(messages.length, 1);
+  assert.match(
+    messages[0].message,
+    /`arr` is used after `.consumeDataSync\(\)`/,
+  );
+});
+
+test("no-use-after-dispose: no warn for use before consumeDataSync()", async () => {
+  const code = `
+function f() {
+  const arr = createArray();
+  const v = arr.add(1);
+  const raw = arr.consumeDataSync();
+}
+`;
+  const messages = await lintUseAfterDispose(code);
+  assert.equal(messages.length, 0);
+});

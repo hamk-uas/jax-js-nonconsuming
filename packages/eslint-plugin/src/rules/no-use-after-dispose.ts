@@ -60,14 +60,18 @@ function isInsideCallback(node: any): boolean {
 }
 
 /** Methods that consume the array — any use after calling these is a bug. */
-const CONSUMING_METHODS = new Set(["dispose", "consumeData"]);
+const CONSUMING_METHODS = new Set([
+  "dispose",
+  "consumeData",
+  "consumeDataSync",
+]);
 
 const rule: Rule.RuleModule = {
   meta: {
     type: "problem",
     docs: {
       description:
-        "Disallow using local variables after calling .dispose() or .consumeData()",
+        "Disallow using local variables after calling .dispose(), .consumeData(), or .consumeDataSync()",
     },
     schema: [],
     messages: {
@@ -76,7 +80,10 @@ const rule: Rule.RuleModule = {
     },
   },
   create(context) {
-    const disposedAt = new Map<any, { end: number; line: number; method: string }>();
+    const disposedAt = new Map<
+      any,
+      { end: number; line: number; method: string }
+    >();
 
     return {
       CallExpression(node: any) {
