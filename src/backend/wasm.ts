@@ -890,10 +890,58 @@ function translateExpCore(
         }
       } else throw new UnsupportedOpError(op, dtype, "wasm");
     } else if (op === AluOp.Where) {
-      gen(src[1]); // t
-      gen(src[2]); // f
-      gen(src[0]); // cond
-      cg.select();
+      // Cost-based decision: use if/else true branching when at least one
+      // arm is expensive (contains transcendental function calls like exp,
+      // log, sin, erf). Branch overhead is ~5 cycles on WASM; a function
+      // call costs ~20-100 cycles. Skipping the expensive arm when not
+      // taken is a net win per element.
+      const costT = src[1].estimateCost();
+      const costF = src[2].estimateCost();
+      if (Math.max(costT, costF) >= 15) {
+        // 1) Evaluate condition first — leaves i32 on stack for `if`.
+        gen(src[0]);
+
+        // 2) Pre-evaluate shared subexpressions in the arms to prevent
+        //    CSE locals from being uninitialized in the untaken branch.
+        //    Any arm node with refcount > 1 might be cached by CSE on
+        //    first eval — if that first eval is inside one branch, the
+        //    other branch (or code after the Where) would read default-zero
+        //    from the uninitialised local. Evaluating them here, before
+        //    the branch, guarantees the local is always set.
+        const armNodes = new Set<AluExp>();
+        const collectArmNodes = (node: AluExp) => {
+          if (armNodes.has(node)) return;
+          armNodes.add(node);
+          for (const s of node.src) collectArmNodes(s);
+        };
+        collectArmNodes(src[1]);
+        collectArmNodes(src[2]);
+        for (const node of armNodes) {
+          if (
+            (references.get(node) ?? 0) > 1 &&
+            !expContext.has(node) &&
+            node.op !== AluOp.Const &&
+            node.op !== AluOp.Variable &&
+            node.op !== AluOp.Special
+          ) {
+            gen(node);
+            cg.drop();
+          }
+        }
+
+        // 3) Emit if/else — only the taken branch executes.
+        cg.if(dty(cg, null, dtype));
+        gen(src[1]); // true arm
+        cg.else();
+        gen(src[2]); // false arm
+        cg.end();
+      } else {
+        // Branchless path: both arms are cheap — select is faster.
+        gen(src[1]); // t
+        gen(src[2]); // f
+        gen(src[0]); // cond
+        cg.select();
+      }
     } else if (op === AluOp.Threefry2x32) {
       for (let i = 0; i < 4; i++) gen(src[i]);
       cg.call(funcs.threefry2x32);
