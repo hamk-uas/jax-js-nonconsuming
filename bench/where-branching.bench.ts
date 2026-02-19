@@ -9,7 +9,6 @@
  *   pnpm exec vitest bench bench/where-branching.bench.ts
  */
 import {
-  blockUntilReady,
   defaultDevice,
   init,
   jit,
@@ -49,9 +48,7 @@ suite.skipIf(!devices.includes("wasm"))("wasm where branching", () => {
   // ── SELU ──────────────────────────────────────────────────────────────
   {
     const N = 4096;
-    const x = np.array(
-      Array.from({ length: N }, (_, i) => (i / N) * 8 - 2),
-    );
+    const x = np.array(Array.from({ length: N }, (_, i) => (i / N) * 8 - 2));
     const seluJit = jit((x: np.Array) => nn.selu(x));
     const warmup = seluJit(x);
     warmup.dispose();
@@ -143,9 +140,7 @@ suite.skipIf(!devices.includes("wasm"))("wasm where branching", () => {
   // ── Control: cheap arms (relu) — should NOT benefit from branching ────
   {
     const N = 4096;
-    const x = np.array(
-      Array.from({ length: N }, (_, i) => (i / N) * 8 - 2),
-    );
+    const x = np.array(Array.from({ length: N }, (_, i) => (i / N) * 8 - 2));
     const reluJit = jit((x: np.Array) => nn.relu(x));
     const warmup = reluJit(x);
     warmup.dispose();

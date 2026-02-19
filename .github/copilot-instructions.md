@@ -756,6 +756,30 @@ Understanding this structure is essential for adding scan codegen paths.
 | `emitKernelBody()`              | Shared gidx loop + reduction + store for one kernel |
 | `codegenWasm()`                 | Single entry point for kernel codegen               |
 
+**`AluOp.Where` — cost-based branching (WASM only):**
+
+Within `translateExpCore()`, `AluOp.Where` uses a cost model to choose between two code strategies:
+
+- **Branchless `select`** — when both arms are cheap (estimated cost < 15): evaluates all three
+  operands unconditionally, ~1 cycle. Used for patterns like `relu`, `clamp`, integer ternaries.
+- **True `if/else/end` branching** — when at least one arm is expensive (cost ≥ 15): only the taken
+  branch executes per element. Used when arms contain transcendental function calls.
+
+`AluExp.estimateCost()` walks the expression tree via `fold()` and sums: **20** per op in
+`AluGroup.Expensive` (sin, cos, asin, atan, exp, log, erf, erfc), **15** for `Threefry2x32`, **1**
+for cheap arithmetic/comparisons/casts, **0** for leaves (Const/Variable/Special). The threshold
+`max(costT, costF) >= 15` triggers branching.
+
+**CSE safety:** The CSE mechanism in `translateExpCore` saves computed values to WASM locals via
+`local.tee`. If a shared subexpression is first evaluated inside one `if` branch, its local would be
+uninitialized (default 0) in the other branch. The codegen pre-evaluates all arm nodes with
+`references > 1` that haven't already been cached, before the branch, to guarantee the local is
+always set before use.
+
+**WebGPU note:** This optimization is WASM-only. WebGPU executes all SIMD lanes in a workgroup
+simultaneously — there is no per-element branching, so an `if/else` in WGSL evaluates both sides
+regardless. The `select` instruction remains the correct strategy there.
+
 Scan adds `translateExpWithGeneralScanContext()` (const/carry/xs/internal classification) and
 `codegenNativeScanGeneral()` (full scan loop codegen). Both `codegenWasm` and
 `codegenNativeScanGeneral` call `emitKernelBody()` for the inner per-element loop, injecting

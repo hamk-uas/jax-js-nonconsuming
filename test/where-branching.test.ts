@@ -14,9 +14,9 @@ import {
   grad,
   init,
   jit,
-  numpy as np,
-  nn,
   lax,
+  nn,
+  numpy as np,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { beforeEach, expect, suite, test } from "vitest";
 
@@ -56,10 +56,7 @@ suite.each(devices)("device:%s", (device) => {
       using expX = np.exp(x);
       using zeros = np.array([0, 0, 0, 0]);
       using result = np.where(cond, expX, zeros);
-      expect(result).toBeAllclose(
-        [1, 2, 3, 4].map(Math.exp),
-        { atol: 1e-4 },
-      );
+      expect(result).toBeAllclose([1, 2, 3, 4].map(Math.exp), { atol: 1e-4 });
     });
 
     test("where with expensive arm — all-false condition", () => {
@@ -69,10 +66,7 @@ suite.each(devices)("device:%s", (device) => {
       using zeros = np.array([0, 0, 0, 0]);
       using logX = np.log(x);
       using result = np.where(cond, zeros, logX);
-      expect(result).toBeAllclose(
-        [1, 2, 3, 4].map(Math.log),
-        { atol: 1e-4 },
-      );
+      expect(result).toBeAllclose([1, 2, 3, 4].map(Math.log), { atol: 1e-4 });
     });
 
     test("where with expensive arm — mixed condition", () => {
@@ -80,9 +74,7 @@ suite.each(devices)("device:%s", (device) => {
       using cond = x.greater(0);
       using expX = np.exp(x);
       using result = np.where(cond, x, expX);
-      const expected = [-1, 0.5, -2, 3].map((v) =>
-        v > 0 ? v : Math.exp(v),
-      );
+      const expected = [-1, 0.5, -2, 3].map((v) => (v > 0 ? v : Math.exp(v)));
       expect(result).toBeAllclose(expected, { atol: 1e-5 });
     });
 
@@ -135,9 +127,7 @@ suite.each(devices)("device:%s", (device) => {
       using x = np.array([-1, 0.5, -2, 3]);
       using result = f(x);
       f.dispose();
-      const expected = [-1, 0.5, -2, 3].map((v) =>
-        v > 0 ? v : Math.exp(v),
-      );
+      const expected = [-1, 0.5, -2, 3].map((v) => (v > 0 ? v : Math.exp(v)));
       expect(result).toBeAllclose(expected, { atol: 1e-5 });
     });
 
@@ -152,9 +142,7 @@ suite.each(devices)("device:%s", (device) => {
       using x = np.array([-1, 0.5, -2, 3]);
       const gradF = grad(f);
       using gx = gradF(x);
-      const expected = [-1, 0.5, -2, 3].map((v) =>
-        v > 0 ? 1 : Math.exp(v),
-      );
+      const expected = [-1, 0.5, -2, 3].map((v) => (v > 0 ? 1 : Math.exp(v)));
       expect(gx).toBeAllclose(expected, { atol: 1e-4 });
     });
 
