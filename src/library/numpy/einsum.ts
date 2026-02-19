@@ -1,6 +1,7 @@
 import { range, runWithCache } from "../../utils";
 
-const bprod = (...xs: number[]) => xs.reduce((acc, x) => acc * BigInt(x), 1n);
+const bprod = (...xs: number[]) =>
+  xs.reduce((acc, x) => acc * BigInt(Number(x)), 1n);
 const uniq = <T>(arr: T[]): T[] => Array.from(new Set(arr));
 
 const EINSUM_COMPONENT_RE = /\p{ID_Start}|\.\.\./gu;

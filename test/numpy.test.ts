@@ -1,11 +1,14 @@
 import {
   defaultDevice,
   devices,
+  DType,
   grad,
   init,
   jit,
   jvp,
+  lax,
   numpy as np,
+  tree,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { beforeEach, expect, suite, test } from "vitest";
 
@@ -1040,7 +1043,116 @@ suite.each(devices)("device:%s", (device) => {
       checkEinsumShapes("ij,ij->ij", [1, 10], [5, 1], [5, 10]);
       checkEinsumShapes("...,...->...", [1, 10], [5, 1], [5, 10]);
     });
+
+    test("jit(scan) with einsum in body", async () => {
+      // Regression: jit(scan(body_with_einsum)) crashed on WebGPU because the
+      // Scan equation has many inputs (consts + carry + xs) that can exceed
+      // backend.maxArgs. splitGraphDataflow must skip the maxArgs check for
+      // equations whose outputs are already black nodes (like Scan).
+      using G = np.array(
+        [
+          [1, 0],
+          [1, 1],
+        ],
+        { dtype: DType.Float32 },
+      );
+      using W = np.array(
+        [
+          [1, 0],
+          [0, 1],
+        ],
+        { dtype: DType.Float32 },
+      );
+      using one = np.array([[1.0]], { dtype: DType.Float32 });
+
+      const step = (
+        carry: { x: np.Array; C: np.Array },
+        inp: { y: np.Array; V2: np.Array; FF: np.Array },
+      ): [{ x: np.Array; C: np.Array }, { xPred: np.Array; Cp: np.Array }] => {
+        const { x, C } = carry;
+        const yi = inp.y;
+        const FFi = inp.FF;
+        const V2i = inp.V2;
+
+        using isNan = np.isnan(yi);
+        using zero = np.zerosLike(yi);
+        using mask = np.where(isNan, zero, one);
+        using ySafe = np.where(isNan, zero, yi);
+
+        using FFx = np.matmul(FFi, x);
+        using diff = np.subtract(ySafe, FFx);
+        using v = np.multiply(mask, diff);
+        // Three-operand einsum: batched matmul-transpose pattern
+        using FCFt = np.einsum("ij,jk,lk->il", FFi, C, FFi);
+        using Cp = np.add(FCFt, V2i);
+        using GCFt = np.einsum("ij,jk,lk->il", G, C, FFi);
+        using CpInv = np.reciprocal(Cp);
+        using GCFtS = np.multiply(GCFt, CpInv);
+        using K = np.multiply(mask, GCFtS);
+        using KFF = np.matmul(K, FFi);
+        using L = np.subtract(G, KFF);
+        using Gx = np.matmul(G, x);
+        using Kv = np.matmul(K, v);
+        const xNext = np.add(Gx, Kv);
+        using GCLt = np.einsum("ij,jk,lk->il", G, C, L);
+        const CNext = np.add(GCLt, W);
+
+        return [
+          { x: xNext, C: CNext },
+          { xPred: x, Cp },
+        ];
+      };
+
+      const n = 5;
+      using yArr = np.array(
+        globalThis.Array.from({ length: n }, () => [[1000]]),
+        { dtype: DType.Float32 },
+      );
+      using V2Arr = np.array(
+        globalThis.Array.from({ length: n }, () => [[14400]]),
+        { dtype: DType.Float32 },
+      );
+      using FFBase = np.array([[[1, 0]]], { dtype: DType.Float32 });
+      using FFArr = np.tile(FFBase, [n, 1, 1]);
+      using x0 = np.array([[0], [0]], { dtype: DType.Float32 });
+      using C0 = np.array(
+        [
+          [1e7, 0],
+          [0, 1e7],
+        ],
+        { dtype: DType.Float32 },
+      );
+
+      const core = (
+        x0_: np.Array,
+        C0_: np.Array,
+        y_: np.Array,
+        V2_: np.Array,
+        FF_: np.Array,
+      ) => {
+        const [carry, out] = lax.scan(
+          step,
+          { x: x0_, C: C0_ },
+          { y: y_, V2: V2_, FF: FF_ },
+        );
+        tree.dispose(carry);
+        return out!;
+      };
+
+      using f = jit(core);
+      const out = f(x0, C0, yArr, V2Arr, FFArr) as {
+        xPred: np.Array;
+        Cp: np.Array;
+      };
+      const xPred = await out.xPred.data();
+      // First prediction should be [0, 0] (initial state)
+      expect(xPred[0]).toBeCloseTo(0, 1);
+      expect(xPred[1]).toBeCloseTo(0, 1);
+      tree.dispose(out);
+    });
   });
+
+  const _JsArray = globalThis.Array;
 
   suite("jax.numpy.meshgrid()", () => {
     test("creates xy meshgrid", () => {

@@ -1316,6 +1316,12 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
   let p2idx = 0;
   while (p2idx < jaxpr.eqns.length) {
     const eqn = jaxpr.eqns[p2idx++];
+    // Skip equations whose outputs are already all black — they won't be
+    // fused into a kernel (e.g., Scan, Routines), so maxArgs doesn't apply.
+    if (eqn.outBinders.every((v) => blackNodes.has(v))) {
+      for (const out of eqn.outBinders) p2Deps.set(out, new Set([out]));
+      continue;
+    }
     const deps: Set<Var>[] = [];
     for (const input of eqn.inputs) {
       if (input instanceof Var) {
