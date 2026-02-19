@@ -840,6 +840,74 @@ Deno.test({
 });
 
 Deno.test({
+  name: "scan: simple body uses WebGPU compiled-loop",
+  ignore: !hasWebGPU,
+  fn: withLeakCheck(async () => {
+    await initWebGPU();
+
+    const step = (carry: any, x: any) => {
+      const next = np.add(carry, x);
+      return [next, next];
+    };
+
+    using initCarry = np.array([0.0]);
+    using xs = np.array([[1.0], [2.0], [3.0], [4.0]]);
+
+    using f = jit(() =>
+      lax.scan(step, initCarry, xs, {
+        acceptPath: "compiled-loop",
+      }),
+    );
+
+    const [finalCarry, ys] = f();
+    using _finalCarry = finalCarry;
+    using _ys = ys;
+
+    await assertAllcloseAsync(finalCarry, [10.0]);
+    await assertAllcloseAsync(ys, [[1.0], [3.0], [6.0], [10.0]]);
+  }),
+});
+
+Deno.test({
+  name: "scan: DLM-like matrix carry currently falls back on WebGPU",
+  ignore: !hasWebGPU,
+  fn: withLeakCheck(async () => {
+    await initWebGPU();
+
+    type Carry = { A: any; b: any };
+
+    using I2 = np.eye(2);
+    using ones21 = np.ones([2, 1]);
+
+    const step = (carry: Carry, x: any) => {
+      using Ax = np.matmul(carry.A, x);
+      const newA = Ax.add(I2);
+      const newB = np.matmul(carry.A, carry.b).add(ones21);
+      return [{ A: newA, b: newB }, newA];
+    };
+
+    using initA = np.eye(2);
+    using initB = np.zeros([2, 1]);
+    using xs = np.full([6, 2, 2], 0.1);
+
+    using f = jit(() =>
+      lax.scan(step, { A: initA, b: initB }, xs, {
+        acceptPath: "fallback",
+      }),
+    );
+
+    const [finalCarry, ys] = f();
+    using _finalA = finalCarry.A;
+    using _finalB = finalCarry.b;
+    using _ys = ys;
+
+    assertEquals(finalCarry.A.shape, [2, 2]);
+    assertEquals(finalCarry.b.shape, [2, 1]);
+    assertEquals(ys.shape, [6, 2, 2]);
+  }),
+});
+
+Deno.test({
   name: "scan: two-pass forward + reverse (smoother-like)",
   ignore: !hasWebGPU,
   fn: withLeakCheck(async () => {

@@ -478,4 +478,52 @@ describe("parallel Kalman filter via associativeScan", () => {
     }
     dys.dispose();
   });
+
+  test("jit(associativeScan) matches eager on DLM-like einsum compose", () => {
+    const N = 8;
+
+    using A = np.full([N, 2, 2], 0.95);
+    using b = np.full([N, 2, 1], 0.1);
+    using S = np.full([N, 2, 2], 0.05);
+
+    const composeDlm = (
+      p: { A: np.Array; b: np.Array; S: np.Array },
+      q: { A: np.Array; b: np.Array; S: np.Array },
+    ) => {
+      const newA = np.einsum("nij,njk->nik", q.A, p.A) as np.Array;
+      using Ab = np.einsum("nij,njk->nik", q.A, p.b) as np.Array;
+      const newB = Ab.add(q.b) as np.Array;
+      using AS = np.einsum("nij,njk->nik", q.A, p.S) as np.Array;
+      using qAT = np.transpose(q.A, [0, 2, 1]) as np.Array;
+      using ASAT = np.einsum("nij,njk->nik", AS, qAT) as np.Array;
+      const newS = ASAT.add(q.S) as np.Array;
+      return { A: newA, b: newB, S: newS };
+    };
+
+    const eager = lax.associativeScan(composeDlm, { A, b, S }) as {
+      A: np.Array;
+      b: np.Array;
+      S: np.Array;
+    };
+
+    const assocJit = jit((AA: np.Array, bb: np.Array, SS: np.Array) =>
+      lax.associativeScan(composeDlm, { A: AA, b: bb, S: SS }),
+    );
+
+    let compiled: { A: np.Array; b: np.Array; S: np.Array } | null = null;
+    try {
+      compiled = assocJit(A, b, S) as { A: np.Array; b: np.Array; S: np.Array };
+      expect(compiled.A).toBeAllclose(eager.A, { atol: 1e-5, rtol: 1e-5 });
+      expect(compiled.b).toBeAllclose(eager.b, { atol: 1e-5, rtol: 1e-5 });
+      expect(compiled.S).toBeAllclose(eager.S, { atol: 1e-5, rtol: 1e-5 });
+    } finally {
+      eager.A.dispose();
+      eager.b.dispose();
+      eager.S.dispose();
+      compiled?.A.dispose();
+      compiled?.b.dispose();
+      compiled?.S.dispose();
+      assocJit.dispose();
+    }
+  });
 });
