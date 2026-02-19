@@ -82,7 +82,7 @@ const rule: Rule.RuleModule = {
       CallExpression(node: any) {
         if (node.callee?.type !== "MemberExpression") return;
         const prop = getMemberName(node.callee.property);
-        if (!CONSUMING_METHODS.has(prop)) return;
+        if (!prop || !CONSUMING_METHODS.has(prop)) return;
         // tree.dispose(arg) disposes arg, not the receiver `tree`.
         // Only mark the receiver as consumed for zero-argument calls.
         if (node.arguments.length > 0) return;
