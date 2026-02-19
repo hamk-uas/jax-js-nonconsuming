@@ -33,7 +33,7 @@
 > See [Differences from upstream](#differences-from-upstream) for a full comparison between the
 > original and this fork.
 >
-> 🤖 The fork code & documentation is AI-generated with gentle human supervision.
+> 🤖 The fork code & documentation commits are AI-generated with gentle human supervision.
 
 **jax-js** is a machine learning framework for the browser. It aims to bring
 [JAX](https://jax.dev)-style, high-performance CPU and GPU kernels to JavaScript, so you can run
