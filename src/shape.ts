@@ -659,6 +659,13 @@ export class ShapeTracker {
   }
 
   static fromShape(shape: number[]): ShapeTracker {
+    for (let i = 0; i < shape.length; i++) {
+      if (typeof shape[i] !== "number" || !Number.isFinite(shape[i])) {
+        throw new Error(
+          `Invalid shape dimension at index ${i}: expected integer, got ${JSON.stringify(shape[i])} (type ${typeof shape[i]}). Full shape: [${shape.map((d) => JSON.stringify(d)).join(", ")}]`,
+        );
+      }
+    }
     return new ShapeTracker([View.create(shape)]);
   }
 

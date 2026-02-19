@@ -1848,13 +1848,28 @@ export function full(
  *
  * If numCols is not provided, it defaults to numRows, i.e., a square identity
  * matrix with ones on the diagonal.
+ *
+ * Supports both `eye(N, M, { dtype })` and `eye(N, { dtype })` calling
+ * conventions. If the second argument is an object (not a number), it is treated
+ * as the options parameter and `numCols` defaults to `numRows`.
  */
 export function eye(
   numRows: number,
-  numCols?: number,
-  { dtype, device }: DTypeAndDevice = {},
+  numCols?: number | DTypeAndDevice,
+  opts?: DTypeAndDevice,
 ): Array {
-  numCols = numCols ?? numRows;
+  // Handle eye(N, { dtype }) calling convention: second arg is options, not numCols
+  if (
+    typeof numCols === "object" &&
+    numCols !== null &&
+    !globalThis.Array.isArray(numCols)
+  ) {
+    opts = numCols as DTypeAndDevice;
+    numCols = undefined;
+  }
+  const { dtype: dtypeOpt, device } = opts ?? {};
+  numCols = (numCols as number | undefined) ?? numRows;
+  let dtype = dtypeOpt;
   const weakType = dtype == undefined;
   dtype = dtype ?? DType.Float32;
 

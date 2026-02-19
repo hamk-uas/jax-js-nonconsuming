@@ -94,6 +94,28 @@ suite.each(devices)("device:%s", (device) => {
         [0, 0, -42, 0, 0],
       ]);
     });
+
+    test("eye(N, { dtype }) 2-arg form works", () => {
+      // np.eye(N, { dtype }) should treat the second arg as options, not numCols
+      using x = np.eye(3, { dtype: DType.Float32 });
+      expect(x.shape).toEqual([3, 3]);
+      expect(x.dtype).toBe(DType.Float32);
+      expect(x).toBeAllclose([
+        [1, 0, 0],
+        [0, 1, 0],
+        [0, 0, 1],
+      ]);
+    });
+
+    test("eye(N, M, { dtype }) 3-arg form works", () => {
+      using x = np.eye(2, 3, { dtype: DType.Float32 });
+      expect(x.shape).toEqual([2, 3]);
+      expect(x.dtype).toBe(DType.Float32);
+      expect(x).toBeAllclose([
+        [1, 0, 0],
+        [0, 1, 0],
+      ]);
+    });
   });
 
   suite("jax.numpy.diag()", () => {
@@ -1149,6 +1171,92 @@ suite.each(devices)("device:%s", (device) => {
       expect(xPred[0]).toBeCloseTo(0, 1);
       expect(xPred[1]).toBeCloseTo(0, 1);
       tree.dispose(out);
+    });
+
+    test("jit(scan) with einsum on carry operand", () => {
+      // Regression: einsum('ij,jk,lk->il', G, carry.C, G) must work when
+      // carry.C is a tracer inside jit(scan).
+      const m = 2;
+      using G = np.eye(m, m, { dtype: DType.Float32 });
+      using W = np.eye(m, m, { dtype: DType.Float32 });
+      const step = (
+        carry: { C: np.Array },
+        _inp: np.Array,
+      ): [{ C: np.Array }, {}] => {
+        using GCGt = np.einsum("ij,jk,lk->il", G, carry.C, G);
+        return [{ C: np.add(GCGt, W) as np.Array }, {}];
+      };
+      using dummy = np.zeros([5], { dtype: DType.Float32 });
+      using C0 = np.eye(m, m, { dtype: DType.Float32 });
+      using f = jit((C0_: np.Array, d_: np.Array) => {
+        const [carry, ys] = lax.scan(step, { C: C0_ }, d_);
+        tree.dispose(ys);
+        return carry;
+      });
+      const result = f(C0, dummy) as { C: np.Array };
+      // After 5 iterations of C = G*C*G' + W with G=I, W=I, C0=I:
+      // C = I + I = 2I, then 3I, 4I, 5I, 6I
+      expect(result.C).toBeAllclose([
+        [6, 0],
+        [0, 6],
+      ]);
+      tree.dispose(result);
+    });
+
+    test("jit(scan) with matmul + transpose on carry", () => {
+      // Regression: np.transpose(carry.K) must preserve concrete shape inside
+      // jit(scan) so matmul and broadcast succeed.
+      const m = 2;
+      using G = np.eye(m, m, { dtype: DType.Float32 });
+      const step = (
+        carry: { K: np.Array },
+        _inp: np.Array,
+      ): [{ K: np.Array }, {}] => {
+        using KKt = np.matmul(carry.K, np.transpose(carry.K));
+        return [{ K: np.add(KKt, G) as np.Array }, {}];
+      };
+      using K0 = np.zeros([m, m], { dtype: DType.Float32 });
+      using dummy = np.zeros([3], { dtype: DType.Float32 });
+      using f = jit((K0_: np.Array, d_: np.Array) => {
+        const [carry, ys] = lax.scan(step, { K: K0_ }, d_);
+        tree.dispose(ys);
+        return carry;
+      });
+      const result = f(K0, dummy) as { K: np.Array };
+      // K0=0, K1=0*0'+I=I, K2=I*I'+I=2I, K3=4I+I=5I
+      expect(result.K).toBeAllclose([
+        [5, 0],
+        [0, 5],
+      ]);
+      tree.dispose(result);
+    });
+
+    test("jit(associativeScan) with einsum compose", async () => {
+      // Regression: lax.associativeScan with einsum in compose function must
+      // work inside jit. Tests batched matmul pattern 'nij,njk->nik'.
+      const m = 2,
+        n = 4;
+      type Elem = { A: np.Array; b: np.Array };
+      const compose = (p: Elem, q: Elem): Elem => {
+        const A_comp = np.einsum("nij,njk->nik", q.A, p.A) as np.Array;
+        using tmp = np.einsum("nij,njk->nik", q.A, p.b) as np.Array;
+        const b_comp = np.add(tmp, q.b) as np.Array;
+        return { A: A_comp, b: b_comp };
+      };
+      using eyeM = np.eye(m, m, { dtype: DType.Float32 });
+      using eyeR = np.reshape(eyeM, [1, m, m]);
+      using A_arr = np.tile(eyeR, [n, 1, 1]);
+      using b_arr = np.ones([n, m, 1], { dtype: DType.Float32 });
+      using f = jit((A_: np.Array, b_: np.Array) =>
+        lax.associativeScan(compose, { A: A_, b: b_ }),
+      );
+      const result = f(A_arr, b_arr) as Elem;
+      // With identity A and ones b, cumulative composition gives b = [1,2,3,4]
+      const bData = await result.b.data();
+      // Last element b[3] should be [4, 4] (cumulative sum of ones)
+      expect(bData[6]).toBeCloseTo(4, 1);
+      expect(bData[7]).toBeCloseTo(4, 1);
+      tree.dispose(result);
     });
   });
 
