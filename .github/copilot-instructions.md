@@ -596,8 +596,13 @@ if (kernel.nargs > maxArgs) {
 }
 ```
 
-When a fused kernel would exceed the buffer limit, compilation fails. The frontend must split into
-smaller kernels (handled by `splitGraphDataflow()` in JIT).
+`splitGraphDataflow()`'s **P2 pass** prevents this by counting transitive fused dependencies
+for every kernel-dispatched equation and backtracking (splitting the fusion boundary) when
+`depCounter.size > maxArgs`. This check applies to **all kernel-dispatched equations** — including
+black kernel endpoints (Jaxpr outputs, multi-use vars) — not just white (fusable) ops. Non-kernel
+blacks (Scan, Routines, DUS) are exempt since they use dedicated JIT step types, not the kernel
+compiler. The `throw` above is a safety net for any equation that slips through; in practice
+`splitGraphDataflow` should prevent it.
 
 **Grid size handling:**
 
@@ -992,8 +997,13 @@ The JIT system lives in `src/frontend/jit.ts` and `src/frontend/jaxpr.ts`.
 1. **Tracing** – `makeJaxpr(f)` traces a function to produce a `Jaxpr` (intermediate representation
    in A-Normal Form, where every subexpression is named)
 2. **Simplification** – `jaxpr.flatten().simplify()` canonicalizes the graph
-3. **Graph splitting** – `splitGraphDataflow()` identifies "black nodes" (operations that can't be
-   fused, like reductions, routines, or `DynamicUpdateSlice`) vs fusable elementwise ops
+3. **Graph splitting** – `splitGraphDataflow()` marks vars as "black nodes" (forced materialization
+   points) and identifies fusable elementwise ops for kernel fusion. Black nodes come in two kinds:
+   - **Non-kernel blacks**: `Scan`, `Routine` primitives, `DynamicUpdateSlice` — handled by their
+     own JIT step type, never compiled as generic kernels; exempt from the P2 `maxArgs` check.
+   - **Kernel-endpoint blacks**: Jaxpr output vars and multi-use vars — still dispatched as regular
+     WebGPU/WASM kernels but forced to materialise (not fused into downstream ops); subject to the
+     P2 dep-count check.
 4. **Kernel fusion** – Consecutive elementwise ops merge into a single `Kernel`
 5. **Compilation** – `jitCompile(backend, jaxpr)` emits a `JitProgram` (list of `JitStep`s)
 6. **Execution** – `JitProgram.execute(slots)` runs steps, managing memory lifetime
@@ -1051,6 +1061,13 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
   non-contiguous input (reshape/transpose/flatten), (2) static argnums on jit, and (3) consts
   created inside the jit body (placed on trace-time device, becoming first arg so `#computeBackend`
   picks CPU).
+- **`splitGraphDataflow` P2 black-node distinction**: Black nodes are either *non-kernel* (Scan,
+  Routine, DUS — their own JIT step, exempt from `maxArgs`) or *kernel-endpoint* (output vars,
+  multi-use vars — still compiled as kernels, must pass `depCount ≤ maxArgs`). If adding a new
+  black-node class, decide which category it belongs to and set `isNonKernelBlack` accordingly.
+  Previously the P2 pass skipped ALL all-black-output equations, allowing kernel endpoints to
+  accumulate arbitrarily many fused inputs — causing `Too many buffers (N) for WebGPU pipeline`
+  in `jit(grad(assocScan))` with 3-tuple pytrees. Fixed in commit `3d6e450`.
 - **`no-unnecessary-ref` autofix vs internal tracer `.ref` propagation**: The
   `jax-js/no-unnecessary-ref` eslint rule has autofix (`--fix` removes `.ref`). This is safe for
   user code but **unsafe for internal tracer plumbing** where `.ref` must propagate to inner values
