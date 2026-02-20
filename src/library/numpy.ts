@@ -892,7 +892,7 @@ export function diag(v: ArrayLike, k = 0): Array {
   if (!Number.isInteger(k)) throw new Error(`k must be an integer, got ${k}`);
   if (a.ndim === 1) {
     const n = a.shape[0];
-    using eyeN = eye(n);
+    using eyeN = eye(n, { dtype: a.dtype });
     using mask = eyeN.equal(1);
     using zeros = zerosLike(a);
     if (k === 0) {

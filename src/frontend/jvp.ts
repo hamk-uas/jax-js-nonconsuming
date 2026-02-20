@@ -451,7 +451,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const lPadded = lPaddedNeedsDispose
       ? padAxis(lLower, -1, [0, m - k])
       : lLower;
-    using eyeM = eye(m);
+    using eyeM = eye(m, { dtype: a.dtype });
     using L = lPadded.add(eyeM);
     if (lPaddedNeedsDispose) lPadded[Symbol.dispose]();
     lLower[Symbol.dispose]();
@@ -466,7 +466,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     using uEye =
       n > k
         ? (() => {
-            using innerEye = eye(n - k);
+            using innerEye = eye(n - k, { dtype: a.dtype });
             using padded1 = padAxis(innerEye, -1, [k, 0]);
             return padAxis(padded1, -2, [k, 0]);
           })()
