@@ -1136,7 +1136,8 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 7. Update `FEATURES.md` for user-visible changes
 8. If you **fix** a `KNOWN_BUG` test (it starts passing), celebrate — then remove the `KNOWN_BUG`
    tag and update the inventory in this file
-9. For **releases** (version bump + tag + push), follow the Maintainer Guide in `README.md`
+9. For **releases** (version bump + tag + push + GitHub release), follow the Maintainer Guide in
+   `README.md`
 
 ## Documentation files
 

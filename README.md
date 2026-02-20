@@ -522,19 +522,17 @@ pnpm run lint:ownership:website
 # Or equivalently (same full profile as main-branch pre-commit):
 JAX_PRECOMMIT_PROFILE=full scripts/precommit.sh
 
-# 2. Bump the version in package.json (choose patch / minor / major as
-#    appropriate — see Version numbering below).
-#    Then commit and tag:
-git add package.json pnpm-lock.yaml
-git commit -m "chore(release): v0.2.1"
-git tag v0.2.1
+# 2. Bump version, commit, and tag in one step.
+#    Choose patch / minor / major — see Version numbering below.
+#    The -m flag sets the commit message; %s is replaced with the new version.
+npm version patch -m "chore(release): v%s"
 
 # 3. Push the commit and tag
 git push && git push --tags
 
-# 4. Create a GitHub release
-#    Go to https://github.com/hamk-uas/jax-js-nonconsuming/releases/new
-#    Select the tag, write release notes summarizing changes.
+# 4. Create a GitHub release via the gh CLI.
+#    --generate-notes auto-fills release notes from commits since the last tag.
+gh release create "v$(node -p "require('./package.json').version")" --generate-notes
 ```
 
 Users install specific tags, so after releasing they can upgrade with:
@@ -562,8 +560,8 @@ When rebasing/syncing from upstream, the bump level depends on what user-facing 
 For simple bug-fix PRs (the common case):
 
 1. Merge the PR to `main`.
-2. Version & tag — bug fixes are always a patch bump. Follow the releasing steps above.
-3. Create a GitHub release with notes describing the fix.
+2. Version, tag, push, and create the GitHub release — bug fixes are always a patch bump. Follow the
+   releasing steps above.
 
 ## Contributing
 
