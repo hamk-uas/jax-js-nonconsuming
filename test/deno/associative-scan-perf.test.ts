@@ -26,7 +26,7 @@
 
 import { assert } from "https://deno.land/std@0.224.0/assert/mod.ts";
 
-import { hasWebGPU, initWebGPU } from "./harness.ts";
+import { hasWebGPU, initWebGPU, withLeakCheck } from "./harness.ts";
 import { blockUntilReady, jit, lax, numpy as np } from "../../dist/index.js";
 
 // Number of prefix-product elements.
@@ -42,6 +42,36 @@ const TIMED_ITERS = 10;
 // Minimum speedup ratio we require: associativeScan must be this much faster.
 // Predicted ~6× on this hardware; require 3× for headroom on slower GPUs.
 const MIN_SPEEDUP = 3;
+
+/**
+ * Count compute dispatch calls while running `fn`.
+ *
+ * We instrument GPUComputePassEncoder dispatch methods, run `fn`, then restore
+ * prototypes in a finally block to avoid cross-test side effects.
+ */
+async function countGpuDispatches(fn: () => Promise<void>): Promise<number> {
+  let count = 0;
+  const proto = GPUComputePassEncoder.prototype as any;
+  const origDispatch = proto.dispatchWorkgroups;
+  const origDispatchIndirect = proto.dispatchWorkgroupsIndirect;
+
+  proto.dispatchWorkgroups = function (...args: any[]) {
+    count += 1;
+    return origDispatch.apply(this, args);
+  };
+  proto.dispatchWorkgroupsIndirect = function (...args: any[]) {
+    count += 1;
+    return origDispatchIndirect.apply(this, args);
+  };
+
+  try {
+    await fn();
+    return count;
+  } finally {
+    proto.dispatchWorkgroups = origDispatch;
+    proto.dispatchWorkgroupsIndirect = origDispatchIndirect;
+  }
+}
 
 /**
  * Measure wall-clock time (ms) for `iters` calls of `fn`.
@@ -164,4 +194,96 @@ Deno.test({
         `  assoc: ${assocMs.toFixed(1)} ms`,
     );
   },
+});
+
+Deno.test({
+  name: "associativeScan dispatch count is near log2(N) rounds on WebGPU",
+  ignore: !hasWebGPU,
+  fn: withLeakCheck(async () => {
+    const ok = await initWebGPU();
+    if (!ok) return;
+
+    const n = 1024;
+    const expectedRounds = Math.ceil(Math.log2(n));
+
+    using xs = np.full([n], 1.0001);
+    using assocJit = jit((x: any) =>
+      lax.associativeScan((a: any, b: any) => a.mul(b), x),
+    );
+
+    // Warm up compilation and pipeline caches before counting dispatches.
+    {
+      using warm = assocJit(xs);
+      await blockUntilReady(warm);
+    }
+
+    const dispatches = await countGpuDispatches(async () => {
+      using y = assocJit(xs);
+      await blockUntilReady(y);
+    });
+
+    // Lower bound: at least one dispatch per Kogge-Stone round.
+    assert(
+      dispatches >= expectedRounds,
+      `associativeScan dispatches ${dispatches} is below expected rounds ${expectedRounds}`,
+    );
+
+    // Upper bound: allow some overhead from bookkeeping/copy kernels, but
+    // ensure growth remains O(log N) rather than O(N).
+    assert(
+      dispatches <= expectedRounds * 3,
+      `associativeScan dispatches ${dispatches} too high for N=${n}; expected near log2(N)=${expectedRounds}`,
+    );
+  }),
+});
+
+Deno.test({
+  name: "associativeScan dispatch growth is logarithmic between nearby powers of two",
+  ignore: !hasWebGPU,
+  fn: withLeakCheck(async () => {
+    const ok = await initWebGPU();
+    if (!ok) return;
+
+    const n1 = 512;
+    const n2 = 1024;
+
+    using xs1 = np.full([n1], 1.0001);
+    using xs2 = np.full([n2], 1.0001);
+    using assocJit = jit((x: any) =>
+      lax.associativeScan((a: any, b: any) => a.mul(b), x),
+    );
+
+    // Warm per-shape caches so counting excludes compile/setup work.
+    {
+      using w1 = assocJit(xs1);
+      await blockUntilReady(w1);
+      using w2 = assocJit(xs2);
+      await blockUntilReady(w2);
+    }
+
+    const d1 = await countGpuDispatches(async () => {
+      using y1 = assocJit(xs1);
+      await blockUntilReady(y1);
+    });
+    const d2 = await countGpuDispatches(async () => {
+      using y2 = assocJit(xs2);
+      await blockUntilReady(y2);
+    });
+
+    const rounds1 = Math.ceil(Math.log2(n1));
+    const rounds2 = Math.ceil(Math.log2(n2));
+    const roundDelta = rounds2 - rounds1; // = 1
+
+    assert(
+      d2 >= d1,
+      `dispatches should be non-decreasing with N: N=${n1} -> ${d1}, N=${n2} -> ${d2}`,
+    );
+
+    // Doubling N adds exactly one Kogge-Stone round. Allow a small constant
+    // slack for backend bookkeeping kernels while still ruling out linear growth.
+    assert(
+      d2 <= d1 + 6,
+      `dispatch growth too high for doubling N: N=${n1}(${d1}) -> N=${n2}(${d2}); rounds +${roundDelta}`,
+    );
+  }),
 });

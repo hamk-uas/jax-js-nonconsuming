@@ -237,8 +237,15 @@ terminal from getting stuck in vim. Always use `--force-with-lease` (not `--forc
 
 ### Temporary files
 
-Use `tmp/` in the project root for temporary/scratch files. This directory is gitignored and allows
-file operations without manual approval in VS Code.
+Use `tmp/` in the project root for temporary/scratch files.
+
+**Agent default policy:** For all ad-hoc scripts, repro files, logs, and generated diagnostics
+related to this repository, write into `tmp/` (repo-local) instead of system temp directories.
+
+- ✅ Preferred: `tmp/my-repro.ts`, `tmp/debug-output.txt`
+- ❌ Avoid for repo work: `/tmp/...`, `/var/tmp/...`
+
+This directory is gitignored and allows file operations without manual approval in VS Code.
 
 ### Debug logging
 
