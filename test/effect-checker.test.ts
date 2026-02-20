@@ -1,11 +1,12 @@
-import { describe, expect, test } from "vitest";
 import {
+  type Array,
   ClosedJaxpr,
+  lax,
   makeJaxpr,
   MemoryEffect,
   numpy as np,
-  type Array,
 } from "@hamk-uas/jax-js-nonconsuming";
+import { describe, expect, test } from "vitest";
 
 describe("effect-checker", () => {
   describe("MemoryEffect enum", () => {
@@ -19,23 +20,27 @@ describe("effect-checker", () => {
 
   describe("M1 — effect tracing", () => {
     test("elementwise add assigns Borrow to inputs and Alloc to output", () => {
-      const { jaxpr: closedJaxpr } = makeJaxpr(
-        (a: Array, b: Array) => np.add(a, b),
+      const { jaxpr: closedJaxpr } = makeJaxpr((a: Array, b: Array) =>
+        np.add(a, b),
       )(np.zeros([4]), np.zeros([4]));
       expect(closedJaxpr).toBeInstanceOf(ClosedJaxpr);
       const eqn = closedJaxpr.jaxpr.eqns[0];
       expect(eqn).toBeDefined();
+      // M1.2: effects are now assigned by tracing
+      expect(eqn.inputEffects).toEqual([
+        MemoryEffect.Borrow,
+        MemoryEffect.Borrow,
+      ]);
+      expect(eqn.outputEffects).toEqual([MemoryEffect.Alloc]);
+      // Output Vars also carry the effect
+      expect(eqn.outBinders[0].effect).toBe(MemoryEffect.Alloc);
       closedJaxpr.dispose();
-      // Placeholder: effects are undefined until M1.2
-      // Once M1.2 lands, uncomment these assertions:
-      // expect(eqn.inputEffects).toEqual([MemoryEffect.Borrow, MemoryEffect.Borrow]);
-      // expect(eqn.outputEffects).toEqual([MemoryEffect.Alloc]);
     });
 
     test("pprint includes effect annotations after M1.1", () => {
-      const { jaxpr: closedJaxpr } = makeJaxpr(
-        (a: Array) => np.multiply(a, a),
-      )(np.zeros([3]));
+      const { jaxpr: closedJaxpr } = makeJaxpr((a: Array) => np.multiply(a, a))(
+        np.zeros([3]),
+      );
       const pprintStr = closedJaxpr.jaxpr.toString();
       closedJaxpr.dispose();
       // After M1.1, pprint will include effect annotations
@@ -44,8 +49,8 @@ describe("effect-checker", () => {
     });
 
     test("pprint renders effects when set manually", () => {
-      const { jaxpr: closedJaxpr } = makeJaxpr(
-        (a: Array, b: Array) => np.add(a, b),
+      const { jaxpr: closedJaxpr } = makeJaxpr((a: Array, b: Array) =>
+        np.add(a, b),
       )(np.zeros([2]), np.zeros([2]));
       const eqn = closedJaxpr.jaxpr.eqns[0];
       // Manually set effects to verify pprint rendering
@@ -57,14 +62,33 @@ describe("effect-checker", () => {
     });
 
     test("Var pprint shows effect when set", () => {
-      const { jaxpr: closedJaxpr } = makeJaxpr(
-        (a: Array) => np.add(a, a),
-      )(np.zeros([2]));
+      const { jaxpr: closedJaxpr } = makeJaxpr((a: Array) => np.add(a, a))(
+        np.zeros([2]),
+      );
       const outVar = closedJaxpr.jaxpr.eqns[0].outBinders[0];
       outVar.effect = MemoryEffect.Alloc;
       const pprintStr = closedJaxpr.jaxpr.eqns[0].pprint().toString();
       closedJaxpr.dispose();
       expect(pprintStr).toContain("{Alloc}");
+    });
+
+    test("DynamicUpdateSlice emits Mutate on its target (first input)", () => {
+      const { jaxpr: closedJaxpr } = makeJaxpr((dst: Array, src: Array) =>
+        lax.dynamicUpdateSlice(dst, src, 0),
+      )(np.zeros([6]), np.zeros([3]));
+      const eqns = closedJaxpr.jaxpr.eqns;
+      // Find the DUS equation
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-enum-comparison
+      const dusEqn = eqns.find((e) => e.primitive === "dynamic_update_slice");
+      expect(dusEqn).toBeDefined();
+      // First input (dst) should be Mutate, second input (src) should be Borrow
+      expect(dusEqn!.inputEffects).toEqual([
+        MemoryEffect.Mutate,
+        MemoryEffect.Borrow,
+      ]);
+      // Output is still Alloc (produces a new buffer in the functional model)
+      expect(dusEqn!.outputEffects).toEqual([MemoryEffect.Alloc]);
+      closedJaxpr.dispose();
     });
   });
 

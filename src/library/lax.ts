@@ -416,6 +416,31 @@ export function stopGradient(x: ArrayLike): Array {
 }
 
 /**
+ * Update a contiguous slice of `dst` along `axis` starting at `offset`.
+ *
+ * Equivalent to `dst.at[axis, offset:offset+src.shape[axis]].set(src)` in
+ * NumPy-style semantics. Returns a new array with the slice replaced.
+ *
+ * @param dst  - Target array.
+ * @param src  - Source array with matching shape on all non-updated axes.
+ * @param offset - Start index along `axis`.
+ * @param axis - Axis to update (default 0).
+ */
+export function dynamicUpdateSlice(
+  dst: ArrayLike,
+  src: ArrayLike,
+  offset: number,
+  axis: number = 0,
+): Array {
+  return core.dynamicUpdateSlice(
+    fudgeArray(dst),
+    fudgeArray(src),
+    offset,
+    axis,
+  ) as Array;
+}
+
+/**
  * Returns top `k` values and their indices along the specified axis of operand.
  *
  * This is a _stable_ algorithm: If two elements are equal, the lower-index

@@ -31,8 +31,8 @@ suite("jax.makeJaxpr()", () => {
     const { jaxpr } = makeJaxpr((x: np.Array) => np.multiply(x.add(2), x))(x);
     expect(jaxpr.toString()).toMatchInlineSnapshot(`
       "{ lambda a:float32[2,3] .
-        let b:float32[2,3] = add a 2
-            c:float32[2,3] = mul b a
+        let b:float32[2,3]{Alloc} = add a 2 {in[Borrow,Borrow] out[Alloc]}
+            c:float32[2,3]{Alloc} = mul b a {in[Borrow,Borrow] out[Alloc]}
         in ( c ) }"
     `);
     expect(jaxpr.consts).toEqual([]);
@@ -49,8 +49,8 @@ suite("jax.makeJaxpr()", () => {
     const { jaxpr } = makeJaxpr(fdot)(x);
     expect(jaxpr.toString()).toMatchInlineSnapshot(`
       "{ lambda a:float32[] .
-        let b:float32[] = add a 2
-            c:float32[] = add b a
+        let b:float32[]{Alloc} = add a 2 {in[Borrow,Borrow] out[Alloc]}
+            c:float32[]{Alloc} = add b a {in[Borrow,Borrow] out[Alloc]}
         in ( c ) }"
     `);
     expect(jaxpr.consts).toEqual([]);
@@ -65,8 +65,8 @@ suite("jax.makeJaxpr()", () => {
     expect(jaxpr.consts).toEqual([]);
     expect(jaxpr.toString()).toMatchInlineSnapshot(`
       "{ lambda a:float32[] .
-        let b:float32[] = add 1 a
-            c:float32[] = add b a
+        let b:float32[]{Alloc} = add 1 a {in[Borrow,Borrow] out[Alloc]}
+            c:float32[]{Alloc} = add b a {in[Borrow,Borrow] out[Alloc]}
         in ( c ) }"
     `);
   });
@@ -82,26 +82,26 @@ suite("jax.makeJaxpr()", () => {
     expect(jaxpr.consts).toEqual([]);
     expect(jaxpr.toString()).toMatchInlineSnapshot(`
       "{ lambda a:float32[] .
-        let b:float32[] = jit [ name=f
-                                jaxpr={ lambda a:float32[] .
-                                  let b:float32[] = add a 2
-                                      c:float32[] = mul a a
-                                      d:float32[] = add c b
-                                  in ( d ) }
-                                numConsts=0 ] a
-            c:float32[] = add b 2
-            d:float32[] = mul b b
-            e:float32[] = add d c
+        let b:float32[]{Alloc} = jit [ name=f
+                                       jaxpr={ lambda a:float32[] .
+                                         let b:float32[]{Alloc} = add a 2 {in[Borrow,Borrow] out[Alloc]}
+                                             c:float32[]{Alloc} = mul a a {in[Borrow,Borrow] out[Alloc]}
+                                             d:float32[]{Alloc} = add c b {in[Borrow,Borrow] out[Alloc]}
+                                         in ( d ) }
+                                       numConsts=0 ] a {in[Borrow] out[Alloc]}
+            c:float32[]{Alloc} = add b 2 {in[Borrow,Borrow] out[Alloc]}
+            d:float32[]{Alloc} = mul b b {in[Borrow,Borrow] out[Alloc]}
+            e:float32[]{Alloc} = add d c {in[Borrow,Borrow] out[Alloc]}
         in ( e ) }"
     `);
     expect(jaxpr.jaxpr.flatten().toString()).toMatchInlineSnapshot(`
       "{ lambda a:float32[] .
-        let b:float32[] = add a 2
-            c:float32[] = mul a a
-            d:float32[] = add c b
-            e:float32[] = add d 2
-            f:float32[] = mul d d
-            g:float32[] = add f e
+        let b:float32[] = add a 2 {in[Borrow,Borrow] out[Alloc]}
+            c:float32[] = mul a a {in[Borrow,Borrow] out[Alloc]}
+            d:float32[] = add c b {in[Borrow,Borrow] out[Alloc]}
+            e:float32[]{Alloc} = add d 2 {in[Borrow,Borrow] out[Alloc]}
+            f:float32[]{Alloc} = mul d d {in[Borrow,Borrow] out[Alloc]}
+            g:float32[]{Alloc} = add f e {in[Borrow,Borrow] out[Alloc]}
         in ( g ) }"
     `);
   });

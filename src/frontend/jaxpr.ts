@@ -61,6 +61,26 @@ export enum MemoryEffect {
 }
 
 /**
+ * Per-primitive input effect overrides.
+ *
+ * Returns an array of effects for the primitive's inputs, or `undefined` to
+ * use the default (all Borrow). Keyed by `Primitive` string value.
+ */
+const primitiveInputEffects: Partial<
+  Record<Primitive, (nInputs: number) => MemoryEffect[]>
+> = {
+  // DynamicUpdateSlice mutates its first input (dst) in place.
+  [Primitive.DynamicUpdateSlice]: (n: number) => {
+    const effects = globalThis.Array.from(
+      { length: n },
+      () => MemoryEffect.Borrow,
+    );
+    effects[0] = MemoryEffect.Mutate;
+    return effects;
+  },
+};
+
+/**
  * Function callback with an associated dispose() method.
  *
  * The dispose() method should be called to clean up any tracer resources needed
@@ -171,6 +191,13 @@ export class JaxprEqn {
     readonly params: Record<string, any>,
     readonly outBinders: Var[],
   ) {}
+
+  /** Copy effect annotations from another equation (e.g., during simplify/flatten). */
+  copyEffectsFrom(other: JaxprEqn): this {
+    if (other.inputEffects) this.inputEffects = [...other.inputEffects];
+    if (other.outputEffects) this.outputEffects = [...other.outputEffects];
+    return this;
+  }
 
   pprint(usedVars?: Set<Var>, vp = new VarPrinter()): PPrint {
     const lhs = PPrint.pp(
@@ -315,7 +342,12 @@ export class Jaxpr implements FpHashable {
       const inputs = e.inputs.map((x) =>
         x instanceof Var ? (context.get(x) ?? x) : x,
       );
-      const eqn = new JaxprEqn(e.primitive, inputs, e.params, e.outBinders);
+      const eqn = new JaxprEqn(
+        e.primitive,
+        inputs,
+        e.params,
+        e.outBinders,
+      ).copyEffectsFrom(e);
 
       if (eqn.primitive === Primitive.Add) {
         const [a, b] = inputs;
@@ -444,7 +476,12 @@ export class Jaxpr implements FpHashable {
             translation.set(v, u);
           }
           newEqns.push(
-            new JaxprEqn(ieqn.primitive, inputs, ieqn.params, outBinders),
+            new JaxprEqn(
+              ieqn.primitive,
+              inputs,
+              ieqn.params,
+              outBinders,
+            ).copyEffectsFrom(ieqn),
           );
         }
         // Add the outputs to the mapping.
@@ -460,7 +497,7 @@ export class Jaxpr implements FpHashable {
               eqn.inputs.map(varMapF),
               eqn.params,
               eqn.outBinders,
-            ),
+            ).copyEffectsFrom(eqn),
           );
         } else {
           newEqns.push(eqn);
@@ -729,6 +766,15 @@ class JaxprTrace extends Trace {
       params,
       outTracers.map((t) => this.builder.addVar(t)),
     );
+    // Assign memory effects: per-primitive overrides, else default Borrow/Alloc
+    eqn.inputEffects =
+      primitiveInputEffects[primitive]?.(eqn.inputs.length) ??
+      eqn.inputs.map(() => MemoryEffect.Borrow);
+    eqn.outputEffects = eqn.outBinders.map(() => MemoryEffect.Alloc);
+    // Also annotate output Vars
+    for (const v of eqn.outBinders) {
+      v.effect = MemoryEffect.Alloc;
+    }
     this.builder.addEqn(eqn);
     return outTracers;
   }
@@ -815,14 +861,13 @@ function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
     }
   }
 
-  const newEqns: JaxprEqn[] = jaxpr.eqns.map(
-    (eqn) =>
-      new JaxprEqn(
-        eqn.primitive,
-        eqn.inputs.map((x) => literals.get(x) ?? x),
-        eqn.params,
-        eqn.outBinders,
-      ),
+  const newEqns: JaxprEqn[] = jaxpr.eqns.map((eqn) =>
+    new JaxprEqn(
+      eqn.primitive,
+      eqn.inputs.map((x) => literals.get(x) ?? x),
+      eqn.params,
+      eqn.outBinders,
+    ).copyEffectsFrom(eqn),
   );
   const newOuts = jaxpr.outs.map((x) => literals.get(x) ?? x);
   const newJaxpr = new Jaxpr(

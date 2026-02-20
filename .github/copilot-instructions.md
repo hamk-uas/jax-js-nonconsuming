@@ -1,4 +1,3 @@
-
 These notes help AI coding agents be immediately productive. The document has two parts:
 
 1. **Repository Overview** — General jax-js knowledge for any development work

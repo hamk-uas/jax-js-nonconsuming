@@ -15,7 +15,12 @@ import {
   type SnapshotEntry,
 } from "./frontend/check-leaks";
 import * as jaxprModule from "./frontend/jaxpr";
-import { ClosedJaxpr, Jaxpr, MemoryEffect, OwnedFunction } from "./frontend/jaxpr";
+import {
+  ClosedJaxpr,
+  Jaxpr,
+  MemoryEffect,
+  OwnedFunction,
+} from "./frontend/jaxpr";
 import * as jvpModule from "./frontend/jvp";
 import * as linearizeModule from "./frontend/linearize";
 import * as vmapModule from "./frontend/vmap";
