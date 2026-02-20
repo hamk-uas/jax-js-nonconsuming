@@ -46,6 +46,21 @@ import {
 } from "./core";
 
 /**
+ * Memory effects annotating Jaxpr variables and equations.
+ *
+ * - `Alloc`: Creates a new buffer (output of a primitive).
+ * - `Borrow`: Reads a buffer without taking ownership.
+ * - `Consume`: Takes ownership; buffer cannot be used again.
+ * - `Mutate`: In-place modification (requires exclusive ownership).
+ */
+export enum MemoryEffect {
+  Alloc = "Alloc",
+  Borrow = "Borrow",
+  Consume = "Consume",
+  Mutate = "Mutate",
+}
+
+/**
  * Function callback with an associated dispose() method.
  *
  * The dispose() method should be called to clean up any tracer resources needed
@@ -63,10 +78,13 @@ export class Var {
 
   readonly id: number;
   readonly aval: ShapedArray;
+  /** Memory effect annotation (populated by M1 tracing). */
+  effect?: MemoryEffect;
 
-  constructor(aval: ShapedArray) {
+  constructor(aval: ShapedArray, effect?: MemoryEffect) {
     this.id = Var.#nextId++;
     this.aval = aval;
+    this.effect = effect;
   }
 
   toString(): string {
@@ -141,6 +159,11 @@ class VarPrinter {
 
 /** A single statement / binding in a Jaxpr, in ANF form. */
 export class JaxprEqn {
+  /** Per-input memory effects (same length as `inputs`). Populated by M1 tracing. */
+  inputEffects?: MemoryEffect[];
+  /** Per-output memory effects (same length as `outBinders`). Populated by M1 tracing. */
+  outputEffects?: MemoryEffect[];
+
   constructor(
     readonly primitive: Primitive,
     readonly inputs: Atom[],
