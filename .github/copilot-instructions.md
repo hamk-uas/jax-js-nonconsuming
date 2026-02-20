@@ -1,5 +1,23 @@
 # GitHub Copilot instructions for jax-js
 
+Session protocol (do this EVERY session, even after context summarization) 🚦
+
+- **Start of session** — before any task work:
+  1. `cat tmp/copilot-session-notes.md` — read notes left by your past self.
+  2. `pnpm run mistakes:report` — check for mistake patterns needing attention.
+  3. `pnpm run preflight -- --dry` — preview which checks apply to current changes.
+- **Before every commit** — the husky pre-commit hook runs build, check, lint, format, and tests
+  automatically. This is the primary safety net.
+- **End of session** — spend 30–60 seconds:
+  1. Ask: "What slowed me down most?"
+  2. If preventable: `pnpm run mistakes:log -- --key <id>` (with metadata if new).
+  3. If count ≥ 2 and rule is short/testable: promote into this file.
+  4. Update `tmp/copilot-session-notes.md` with decisions, traps, in-progress work.
+- **Why this section is here**: context summarization erases session memory. This file is the _only_
+  thing guaranteed to survive. If you skip this protocol, you lose the self-tuning system entirely.
+
+---
+
 These notes help AI coding agents be immediately productive. The document has two parts:
 
 1. **Repository Overview** — General jax-js knowledge for any development work

@@ -1,14 +1,7 @@
 import { execSync, spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 
-type Context =
-  | "src"
-  | "tests"
-  | "timings"
-  | "docs"
-  | "bench"
-  | "release"
-  | "general";
+type Context = "src" | "tests" | "docs" | "bench" | "release" | "general";
 
 type Check = {
   id: string;
@@ -73,29 +66,19 @@ function inferContexts(files: string[]): Set<Context> {
   const contexts = new Set<Context>();
   for (const file of files) {
     if (file.startsWith("src/")) contexts.add("src");
-    if (file.startsWith("tests/")) contexts.add("tests");
-    if (
-      file.startsWith("scripts/") &&
-      /timing|bench|collect|gen-|update-timings/.test(file)
-    ) {
-      contexts.add("timings");
-      contexts.add("bench");
-    }
-    if (
-      file.startsWith("scripts/") &&
-      !/timing|bench|collect|gen-|update-timings/.test(file)
-    ) {
-      contexts.add("general");
-    }
+    if (file.startsWith("test/")) contexts.add("tests");
+    if (file.startsWith("bench/")) contexts.add("bench");
+    if (file.startsWith("scripts/")) contexts.add("general");
+    if (file.startsWith("packages/")) contexts.add("src");
     if (file.endsWith(".md")) contexts.add("docs");
     if (file.startsWith(".github/")) contexts.add("docs");
+    if (file.startsWith("website/")) contexts.add("general");
     if (
       file === "package.json" ||
-      file === "vite.config.ts" ||
+      file === "vitest.config.ts" ||
       file === "tsconfig.json"
     )
       contexts.add("general");
-    if (file.startsWith("assets/timings/")) contexts.add("timings");
   }
   if (contexts.size === 0) contexts.add("general");
   return contexts;
@@ -111,7 +94,6 @@ function parseContexts(raw: string | undefined): Set<Context> {
     if (
       token === "src" ||
       token === "tests" ||
-      token === "timings" ||
       token === "docs" ||
       token === "bench" ||
       token === "release" ||
@@ -142,6 +124,7 @@ function buildChecks(contexts: Set<Context>, strict: boolean): Check[] {
       "pnpm run lint",
       "Catch disposal/memory issues and TypeScript lint regressions in src/",
     );
+    add("check", "pnpm run check", "TypeScript type checking");
   }
   if (contexts.has("docs")) {
     // Docs-only changes still benefit from lint if src/ was also touched
