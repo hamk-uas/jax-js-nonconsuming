@@ -1,20 +1,23 @@
-# GitHub Copilot instructions for jax-js
+Purpose
 
-Session protocol (do this EVERY session, even after context summarization) 🚦
+- Help coding agents become productive immediately: what the project _is_, how it's built/tested,
+  important conventions, and where to look for authoritative behavior.
 
-- **Start of session** — before any task work:
-  1. `cat tmp/copilot-session-notes.md` — read notes left by your past self.
-  2. `pnpm run mistakes:report` — check for mistake patterns needing attention.
-  3. `pnpm run preflight -- --dry` — preview which checks apply to current changes.
-- **Before every commit** — the husky pre-commit hook runs build, check, lint, format, and tests
-  automatically. This is the primary safety net.
-- **End of session** — spend 30–60 seconds:
-  1. Ask: "What slowed me down most?"
-  2. If preventable: `pnpm run mistakes:log -- --key <id>` (with metadata if new).
-  3. If count ≥ 2 and rule is short/testable: promote into this file.
-  4. Update `tmp/copilot-session-notes.md` with decisions, traps, in-progress work.
-- **Why this section is here**: context summarization erases session memory. This file is the _only_
-  thing guaranteed to survive. If you skip this protocol, you lose the self-tuning system entirely.
+Agent Protocol (do this EVERY task, even after context summarization) 🚦
+
+- **Start of task** — before any work, run these three commands in order:
+  1. `cat tmp/copilot-task-notes.md` — read orientation notes left by your past self.
+  2. `pnpm run mistakes:report` — check if any mistake patterns need attention.
+  3. `pnpm run preflight -- --dry` — see which checks apply to the current repo state.
+- **Before every commit** — the husky pre-commit hook runs `pnpm run preflight` automatically. This
+  is the primary safety net: even if you forget the Agent Protocol, preflight still runs at commit
+  time.
+- **End of task** — spend 30-60 seconds on the fast loop (see "Fast loop at task end" below): log
+  friction in `tmp/copilot-mistakes.json`, promote rules if threshold met, update task notes, run
+  `pnpm run preflight`.
+- **Why this section is here**: context summarization erases short-term memory. This file is the
+  _only_ thing guaranteed to survive. If you skip this protocol, you lose the self-tuning system
+  entirely.
 
 Autonomous instruction maintenance loop (self-tuning) 🔁
 
@@ -82,11 +85,6 @@ Fast loop at task end (30-60 seconds)
    work. Keep it concise — this is for your future self after context summarization.
 6. Before handoff, run `pnpm run preflight` (or `pnpm run preflight -- --strict`) so high-value
    checks are selected from context automatically.
-
-Contact & follow-ups
-
-- If anything in the instructions is unclear, ask which _behavior_ or _test_ to preserve — provide
-  the failing `tests/out/*.json` and the test name.
 
 ---
 

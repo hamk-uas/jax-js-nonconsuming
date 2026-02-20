@@ -20,6 +20,7 @@ import {
   unzip2,
 } from "../utils";
 import {
+  anonymousConstArrays,
   array,
   eye,
   Array as JaxArray,
@@ -27,6 +28,7 @@ import {
   pureArray,
   zeros,
 } from "./array";
+import { aotLinearize } from "./artifacts";
 import { _registerJitCacheDisposer } from "./check-leaks";
 import {
   _peArrayCreationTracker,
@@ -308,7 +310,7 @@ class ResidualCollector {
  * PartialEvalTracers, or other wrappers. Uses lowerAux to walk through
  * the tracer chain (JVPTracer→PETracer→concrete Array).
  */
-function collectConcreteArrays(value: any): Tracer[] {
+export function collectConcreteArrays(value: any): Tracer[] {
   const result: Tracer[] = [];
   const lowered = lowerAux(value);
   treeMap((x: any) => {
@@ -368,26 +370,37 @@ function linearizeFlat(
   primalsIn: Tracer[],
   auxStore?: { value: any },
 ): [Tracer[], (...args: Tracer[]) => Tracer[], () => void] {
-  const { primalsOut, jaxpr, collector } = linearizeFlatUtil(f, primalsIn);
-  // Protect primalsOut + concrete arrays underlying aux captures
-  const protectedVals = new Set<Tracer>(primalsOut);
-  // Protect jaxpr consts whose creation ref was already consumed by user disposal.
-  // Normal consts have rc>=2 (creation + instantiateConst); ResidualCollector.dispose
-  // safely takes the creation ref. But if user code inside the traced function
-  // disposed a const (e.g. initVal.dispose() in a grad body), rc=1 and disposal
-  // would kill ClosedJaxpr's ownership.
-  for (const c of jaxpr.consts) {
-    if (c.refCount <= 1) protectedVals.add(c);
-  }
-  if (auxStore?.value != null) {
-    for (const arr of collectConcreteArrays(auxStore.value)) {
-      protectedVals.add(arr);
-    }
-  }
-  collector.dispose(protectedVals);
+  // AOT linearize: trace f, build forward jaxpr, dispose PE intermediates.
+  // skipBackward: linearize only needs the forward jaxpr, not the backward.
+  // Pass auxStore ref (not pre-computed arrays) — auxStore.value is only
+  // populated during linearizeFlatUtil, which runs inside aotLinearize.
+  const { primal, pullback } = aotLinearize(f, primalsIn, {
+    auxStore,
+    skipBackward: true,
+  });
+
+  // Pullback is unused for linearize — dispose immediately (no-op stub).
+  pullback[Symbol.dispose]();
+
+  // Get primal outputs and residuals; residuals are only needed to keep the
+  // forward jaxpr consts alive until fLin is done — dispose them in the
+  // outer dispose function.
+  const { primalsOut, residuals } = primal.run(primalsIn);
+
+  // fLin evaluates the forward jaxpr with tangent inputs (same as before).
+  const forwardJaxpr = primal.forwardJaxpr;
   const fLin = (...tangents: Tracer[]) =>
-    evalJaxpr(jaxpr.jaxpr, [...jaxpr.consts.map((c) => c.ref), ...tangents]);
-  const dispose = () => jaxpr.dispose();
+    evalJaxpr(forwardJaxpr.jaxpr, [
+      ...forwardJaxpr.consts.map((c) => c.ref),
+      ...tangents,
+    ]);
+
+  // Dispose residuals + primal artifact (which owns the forward jaxpr).
+  const dispose = () => {
+    residuals[Symbol.dispose]();
+    primal[Symbol.dispose]();
+  };
+
   return [primalsOut, fLin, dispose];
 }
 
@@ -1107,6 +1120,7 @@ function evalJaxprTransposed(
   jaxpr: Jaxpr,
   args: (Tracer | UndefPrimal)[],
   cotangents: Tracer[],
+  { markAnonymous = false }: { markAnonymous?: boolean } = {},
 ): Tracer[] {
   // Track which variables are known (primal) vs unknown (tangent).
   // A variable is known if ALL its inputs are known (primal values propagate).
@@ -1168,6 +1182,13 @@ function evalJaxprTransposed(
       return ct;
     } else {
       const z = zeros(v.aval.shape, { dtype: v.aval.dtype });
+      // Mark as anonymous so getOrMakeConstTracer (when inside a makeJaxpr
+      // trace like transposeJaxpr) skips .ref — the ClosedJaxpr becomes
+      // the sole owner and dispose() fully frees the backing Slot.
+      // Only safe when the enclosing makeJaxpr builder is the sole capturer;
+      // when evalJaxprTransposed runs directly inside an outer jit trace,
+      // arrays may escape to the outer trace and need normal .ref there.
+      if (markAnonymous && z instanceof JaxArray) anonymousConstArrays.add(z);
       internalArrays.add(z);
       return z;
     }
@@ -1217,6 +1238,9 @@ function evalJaxprTransposed(
     const primalsIn = eqn.inputs.map((v) => {
       if (v instanceof Lit) {
         const lit = array(v.value, { dtype: v.dtype });
+        if (markAnonymous && lit instanceof JaxArray) {
+          anonymousConstArrays.add(lit);
+        }
         internalArrays.add(lit);
         return lit;
       }
@@ -2190,7 +2214,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
     // Cleanup
     primalForwardJaxpr.dispose();
-    transposedBody.dispose();
+    // NOTE: transposedBody is NOT disposed here — it's owned by
+    // transposeJaxprCache (returned from transposeJaxpr()). The cache
+    // handles disposal via _disposeAllJitCaches in checkLeaks.stop().
     for (const c of constResiduals) c.dispose();
     for (const c of carryResiduals) c.dispose();
     for (const c of xsResiduals) c.dispose();
@@ -2233,7 +2259,9 @@ function transposeJaxpr(jaxpr: Jaxpr, undefPrimals: boolean[]): ClosedJaxpr {
         if (undefPrimals[i]) args.push(new UndefPrimal(inTypes[i]));
         else args.push(forwardIn[forwardInIdx++]);
       }
-      return evalJaxprTransposed(jaxpr, args, cotangents);
+      return evalJaxprTransposed(jaxpr, args, cotangents, {
+        markAnonymous: true,
+      });
     },
     { validateRefs: false },
   )(forwardInTypes, outTypes);
@@ -2283,7 +2311,9 @@ export function buildBackwardJaxpr(forwardJaxpr: ClosedJaxpr): ClosedJaxpr {
         if (undefPrimals[i]) args.push(new UndefPrimal(inTypes[i]));
         else args.push(forwardIn[forwardInIdx++]);
       }
-      return evalJaxprTransposed(jaxpr, args, cotangents);
+      return evalJaxprTransposed(jaxpr, args, cotangents, {
+        markAnonymous: true,
+      });
     },
     { validateRefs: false },
   )(forwardInTypes, outTypes);
@@ -2291,17 +2321,32 @@ export function buildBackwardJaxpr(forwardJaxpr: ClosedJaxpr): ClosedJaxpr {
   return newJaxpr;
 }
 
+/**
+ * Check whether a Jaxpr contains any equation that `buildBackwardJaxpr`
+ * cannot trace (currently: `Primitive.Scan`, whose transpose rule creates
+ * sub-jaxprs and does concrete forward recomputation incompatible with
+ * makeJaxpr tracing — see M4 in AOT-LINEARIZATION-PLAN.md).
+ */
+function jaxprNeedsCallTimeTranspose(jaxpr: Jaxpr): boolean {
+  return jaxpr.eqns.some((eqn) => eqn.primitive === Primitive.Scan);
+}
+
 function vjpFlat(
   f: (...x: Tracer[]) => Tracer[],
   primalsIn: Tracer[],
   auxStore?: { value: any },
 ): [Tracer[], (...cotangents: Tracer[]) => Tracer[], () => void] {
-  const { primalsOut, jaxpr, collector } = linearizeFlatUtil(f, primalsIn);
-  // Protect primalsOut + concrete arrays underlying aux captures
+  // Phase 1: JVP + partial evaluation → forward jaxpr + primal outputs.
+  // We always need this, regardless of the transposition strategy.
+  const {
+    primalsOut,
+    jaxpr: forwardJaxpr,
+    collector,
+  } = linearizeFlatUtil(f, primalsIn);
+
+  // Phase 2: Dispose PE intermediates.
   const protectedVals = new Set<Tracer>(primalsOut);
-  // Protect jaxpr consts whose creation ref was already consumed by user disposal.
-  // (See same comment in linearizeFlat above.)
-  for (const c of jaxpr.consts) {
+  for (const c of forwardJaxpr.consts) {
     if (c.refCount <= 1) protectedVals.add(c);
   }
   if (auxStore?.value != null) {
@@ -2311,12 +2356,9 @@ function vjpFlat(
   }
   collector.dispose(protectedVals);
 
-  // Flush primals' pending backend dispatches. PE tracing created concrete
-  // forward-pass arrays with lazy PendingExecute chains. Submitting them
-  // here prevents orphaned Slot references: downstream operations that
-  // inherit these PEs (via pending-chain propagation) would keep Slots
-  // alive even after all arrays are disposed, because shared PE refcounts
-  // never reach zero without submission.
+  // CRITICAL: Flush primals' pending backend dispatches. PE tracing created
+  // concrete forward-pass arrays with lazy PendingExecute chains. Submitting
+  // them here prevents orphaned Slot references.
   if (!insideAbstractTrace()) {
     for (const p of primalsOut) {
       if (p instanceof JaxArray) {
@@ -2325,16 +2367,57 @@ function vjpFlat(
     }
   }
 
-  // Pullback cotangents to the UndefPrimal transpose inputs.
-  const fVjp = (...cotangents: Tracer[]) => {
-    const transposeInputs = [
-      ...jaxpr.consts,
-      // Explcitly list which arguments should be transposed.
-      ...primalsIn.map((t) => new UndefPrimal(t.aval)),
-    ];
-    return evalJaxprTransposed(jaxpr.jaxpr, transposeInputs, cotangents);
+  // Phase 3: Choose transposition strategy.
+  //
+  // Scan's transpose rule creates sub-jaxprs and does concrete forward
+  // recomputation — incompatible with `buildBackwardJaxpr`'s makeJaxpr
+  // tracing (M4 will add a dedicated scan backward artifact). For now,
+  // fall back to call-time transposition for scan-containing jaxprs.
+  if (jaxprNeedsCallTimeTranspose(forwardJaxpr.jaxpr)) {
+    // Call-time transposition: evalJaxprTransposed runs with concrete arrays
+    // when fVjp is invoked (the old, proven pattern).
+    const fVjp = (...cotangents: Tracer[]) => {
+      const transposeInputs = [
+        ...forwardJaxpr.consts,
+        ...primalsIn.map((t) => new UndefPrimal(t.aval)),
+      ];
+      return evalJaxprTransposed(
+        forwardJaxpr.jaxpr,
+        transposeInputs,
+        cotangents,
+      );
+    };
+    const dispose = () => forwardJaxpr.dispose();
+    return [primalsOut, fVjp, dispose];
+  }
+
+  // AOT transposition: build backward jaxpr eagerly.
+  const backwardJaxpr = buildBackwardJaxpr(forwardJaxpr);
+  const primal = {
+    forwardJaxpr,
+    run(_primalsIn: Tracer[]) {
+      const residualArrays = forwardJaxpr.consts.map((c) => c.ref);
+      return { primalsOut, residuals: residualArrays };
+    },
   };
-  const dispose = () => jaxpr.dispose();
+
+  // Pullback closure: evaluate backward jaxpr with residuals + cotangents.
+  const residuals = primal.run(primalsIn);
+  const fVjp = (...cotangents: Tracer[]) => {
+    return evalJaxpr(backwardJaxpr.jaxpr, [
+      ...backwardJaxpr.consts.map((c) => c.ref),
+      ...residuals.residuals.map((a) => a.ref),
+      ...cotangents.map((c) => c.ref),
+    ]);
+  };
+
+  // Dispose all owned resources.
+  const dispose = () => {
+    for (const r of residuals.residuals) r.dispose();
+    forwardJaxpr.dispose();
+    backwardJaxpr.dispose();
+  };
+
   return [primalsOut, fVjp, dispose];
 }
 

@@ -3,6 +3,7 @@ import { defaultDevice, Device, devices, getBackend, init } from "./backend";
 import { Array, ArrayLike } from "./frontend/array";
 import { aotLinearize } from "./frontend/artifacts";
 import type {
+  AotLinearizeOptions,
   AotLinearizeResult,
   PrimalArtifact,
   PullbackArtifact,
@@ -32,6 +33,7 @@ import "./polyfills";
 
 export {
   aotLinearize,
+  type AotLinearizeOptions,
   type AotLinearizeResult,
   init,
   Array,

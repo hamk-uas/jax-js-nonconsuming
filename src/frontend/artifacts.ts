@@ -12,7 +12,11 @@
 import type { Tracer } from "./core";
 import type { ClosedJaxpr } from "./jaxpr";
 import { evalJaxpr } from "./jaxpr";
-import { buildBackwardJaxpr, linearizeFlatUtil } from "./linearize";
+import {
+  buildBackwardJaxpr,
+  collectConcreteArrays,
+  linearizeFlatUtil,
+} from "./linearize";
 
 // ---------------------------------------------------------------------------
 // ResidualPack — owns concrete residual arrays from the forward pass
@@ -188,6 +192,28 @@ class PullbackArtifactImpl implements PullbackArtifact {
   }
 }
 
+/**
+ * No-op PullbackArtifact stub returned when `skipBackward` is set.
+ * Calling `run()` throws — the caller should not use this pullback.
+ */
+class NoOpPullbackArtifactImpl implements PullbackArtifact {
+  get backwardJaxpr(): ClosedJaxpr {
+    throw new Error(
+      "No backward jaxpr — aotLinearize was called with skipBackward",
+    );
+  }
+
+  run(_residuals: ResidualPack, _cotangents: Tracer[]): Tracer[] {
+    throw new Error(
+      "No backward jaxpr — aotLinearize was called with skipBackward",
+    );
+  }
+
+  [Symbol.dispose](): void {
+    // Nothing to dispose.
+  }
+}
+
 // ---------------------------------------------------------------------------
 // aotLinearize — top-level factory
 // ---------------------------------------------------------------------------
@@ -196,6 +222,27 @@ class PullbackArtifactImpl implements PullbackArtifact {
 export interface AotLinearizeResult {
   readonly primal: PrimalArtifact;
   readonly pullback: PullbackArtifact;
+}
+
+/** Options for aotLinearize(). */
+export interface AotLinearizeOptions {
+  /**
+   * Mutable aux store from `flattenFunWithAux`. When provided,
+   * `collectConcreteArrays(auxStore.value)` is called AFTER the trace
+   * (which populates `auxStore.value`) to protect concrete aux arrays
+   * from PE intermediate disposal.
+   *
+   * Must be passed as the store reference — NOT pre-computed arrays —
+   * because `auxStore.value` is only set during `linearizeFlatUtil`.
+   */
+  auxStore?: { value: any };
+
+  /**
+   * When true, skip building the backward jaxpr. The returned pullback
+   * will be a no-op stub. Use for `linearizeFlat` which only needs the
+   * forward jaxpr.
+   */
+  skipBackward?: boolean;
 }
 
 /**
@@ -218,6 +265,7 @@ export interface AotLinearizeResult {
 export function aotLinearize(
   f: (...args: Tracer[]) => Tracer[],
   exampleArgs: Tracer[],
+  options?: AotLinearizeOptions,
 ): AotLinearizeResult {
   // Phase 1: JVP + partial evaluation → forward jaxpr + primal outputs
   const {
@@ -226,20 +274,34 @@ export function aotLinearize(
     collector,
   } = linearizeFlatUtil(f, exampleArgs);
 
-  // Phase 2: Transpose → backward jaxpr
-  const backwardJaxpr = buildBackwardJaxpr(forwardJaxpr);
+  // Phase 2: Transpose → backward jaxpr (unless skipBackward)
+  const backwardJaxpr = options?.skipBackward
+    ? null
+    : buildBackwardJaxpr(forwardJaxpr);
 
   // Phase 3: Dispose PE intermediates.
-  // Protect primal outputs and forward jaxpr consts (residuals) from disposal.
+  // Protect primal outputs from disposal.
   const protectedVals = new Set<Tracer>(primalsOut);
+  // Protect forward jaxpr consts whose creation ref was already consumed by
+  // user disposal (rc <= 1). Without protection, collector.dispose would kill
+  // the ClosedJaxpr's sole ownership ref. Healthy consts (rc >= 2) get their
+  // creation ref balanced here — collector.dispose decrements from 2 to 1,
+  // leaving only the ClosedJaxpr's .ref from partialEvalGraphToJaxpr.
   for (const c of forwardJaxpr.consts) {
-    protectedVals.add(c);
+    if (c.refCount <= 1) protectedVals.add(c);
+  }
+  if (options?.auxStore?.value != null) {
+    for (const arr of collectConcreteArrays(options.auxStore.value)) {
+      protectedVals.add(arr);
+    }
   }
   collector.dispose(protectedVals);
 
   // Phase 4: Create artifacts
   const primal = new PrimalArtifactImpl(forwardJaxpr, primalsOut);
-  const pullback = new PullbackArtifactImpl(backwardJaxpr);
+  const pullback = backwardJaxpr
+    ? new PullbackArtifactImpl(backwardJaxpr)
+    : new NoOpPullbackArtifactImpl();
 
   return { primal, pullback };
 }
