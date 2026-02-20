@@ -42,6 +42,30 @@ describe("effect-checker", () => {
       // For now, just verify pprint works without errors
       expect(pprintStr).toContain("mul");
     });
+
+    test("pprint renders effects when set manually", () => {
+      const { jaxpr: closedJaxpr } = makeJaxpr(
+        (a: Array, b: Array) => np.add(a, b),
+      )(np.zeros([2]), np.zeros([2]));
+      const eqn = closedJaxpr.jaxpr.eqns[0];
+      // Manually set effects to verify pprint rendering
+      eqn.inputEffects = [MemoryEffect.Borrow, MemoryEffect.Borrow];
+      eqn.outputEffects = [MemoryEffect.Alloc];
+      const pprintStr = eqn.pprint().toString();
+      closedJaxpr.dispose();
+      expect(pprintStr).toContain("{in[Borrow,Borrow] out[Alloc]}");
+    });
+
+    test("Var pprint shows effect when set", () => {
+      const { jaxpr: closedJaxpr } = makeJaxpr(
+        (a: Array) => np.add(a, a),
+      )(np.zeros([2]));
+      const outVar = closedJaxpr.jaxpr.eqns[0].outBinders[0];
+      outVar.effect = MemoryEffect.Alloc;
+      const pprintStr = closedJaxpr.jaxpr.eqns[0].pprint().toString();
+      closedJaxpr.dispose();
+      expect(pprintStr).toContain("{Alloc}");
+    });
   });
 
   describe("M2 — borrow checker", () => {

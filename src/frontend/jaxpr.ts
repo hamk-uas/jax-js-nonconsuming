@@ -153,7 +153,8 @@ class VarPrinter {
   }
 
   nameType(v: Var): string {
-    return `${this.name(v)}:${v.aval.toString()}`;
+    const effectSuffix = v.effect ? `{${v.effect}}` : "";
+    return `${this.name(v)}:${v.aval.toString()}${effectSuffix}`;
   }
 }
 
@@ -198,6 +199,17 @@ export class JaxprEqn {
           .join(" "),
       ),
     );
+    // pprint effect annotations when present
+    if (this.inputEffects || this.outputEffects) {
+      const parts: string[] = [];
+      if (this.inputEffects) {
+        parts.push(`in[${this.inputEffects.join(",")}]`);
+      }
+      if (this.outputEffects) {
+        parts.push(`out[${this.outputEffects.join(",")}]`);
+      }
+      rhs = rhs.stack(PPrint.pp(` {${parts.join(" ")}}`));
+    }
     return lhs.stack(PPrint.pp(" = ")).stack(rhs);
   }
 
@@ -272,6 +284,13 @@ export class Jaxpr implements FpHashable {
       hasher.update(JSON.stringify(eqn.params));
       hasher.update(eqn.outBinders.length);
       for (const x of eqn.outBinders) hasher.update(vi(x));
+      // Include effect annotations in hash when present
+      if (eqn.inputEffects) {
+        for (const e of eqn.inputEffects) hasher.update(e);
+      }
+      if (eqn.outputEffects) {
+        for (const e of eqn.outputEffects) hasher.update(e);
+      }
     }
     hasher.update(this.outs.length);
     for (const x of this.outs)
