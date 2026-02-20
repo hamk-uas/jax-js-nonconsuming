@@ -209,6 +209,12 @@ The cost is acceptable given the safety it provides — do not try to cache or s
 website imports from the library and stale `.svelte-kit/` cache can silently pass when a fresh build
 would fail.
 
+**Docs-only fast path:** When all staged files are documentation (`.md`, `.txt`, `docs/`), the
+pre-commit hook skips build, tests, type-checking, and ownership lints — running only
+`format:check` + `lint`. This reduces docs-only commits from ~82s to ~11s. The detection runs in
+`scripts/precommit.sh` before the profile check. If you're committing docs alongside code, the full
+profile runs as usual.
+
 ### Testing policy modes
 
 The repository supports two test policies:
@@ -234,6 +240,22 @@ When the user asks to "rebase to main", perform these steps:
 
 **Important:** Always use `GIT_EDITOR=true` when running `git rebase --continue` to prevent the
 terminal from getting stuck in vim. Always use `--force-with-lease` (not `--force`) for the push.
+
+### Editing Prettier-managed files
+
+When editing `.md` files (especially `copilot-instructions.md`), **run Prettier on the file before
+reading it for `replace_string_in_file`**. Prettier reformats table alignment, line wrapping, and
+whitespace, so the on-disk text may differ from what you wrote. The pattern:
+
+```bash
+npx prettier --write .github/copilot-instructions.md
+```
+
+Then `read_file` to get the Prettier-canonical text, then edit. This avoids repeated
+`replace_string_in_file` failures from stale match text.
+
+For **multi-step edits** to the same Prettier-managed file, run Prettier once before the first edit,
+then again between batches if a batch triggers reformatting (e.g., table column width changes).
 
 ### Temporary files
 

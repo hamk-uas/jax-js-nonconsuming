@@ -19,6 +19,26 @@ fi
 
 echo "[pre-commit] branch=$branch_name profile=$profile"
 
+# --- Docs-only fast path ---
+# When only documentation files are staged (no code changes), skip build/test/lint
+# and only run format + lint checks. Saves ~50s on main-branch doc-only commits.
+staged_files="$(git diff --cached --name-only --diff-filter=ACMR)"
+docs_only=true
+while IFS= read -r f; do
+  case "$f" in
+    *.md|*.txt|.github/copilot-instructions.md|docs/*) ;;
+    *) docs_only=false; break ;;
+  esac
+done <<< "$staged_files"
+
+if [[ "$docs_only" == "true" && -n "$staged_files" ]]; then
+  echo "[pre-commit] docs-only commit detected — running format + lint only"
+  pnpm format:check
+  pnpm lint --max-warnings 0
+  exit 0
+fi
+# --- End docs-only fast path ---
+
 if [[ "$profile" != "feature" && "$profile" != "full" ]]; then
   echo "[pre-commit] Invalid JAX_PRECOMMIT_PROFILE='$profile' (expected: feature|full)"
   exit 1
