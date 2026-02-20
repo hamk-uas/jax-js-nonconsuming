@@ -531,8 +531,24 @@ npm version patch -m "chore(release): v%s"
 git push && git push --tags
 
 # 4. Create a GitHub release via the gh CLI.
-#    --generate-notes auto-fills release notes from commits since the last tag.
-gh release create "v$(node -p "require('./package.json').version")" --generate-notes
+#    --title: short phrase after the version number, e.g. "fix grad(solve)" or "add lax.foo"
+#    --notes: write a human-readable description (see format below) — required, don't skip this
+gh release create "v$(node -p "require('./package.json').version")" \
+  --title "v$(node -p "require('./package.json').version") — <short description>" \
+  --notes "## <Category>: <what changed>
+
+### What was wrong / motivation
+<one paragraph>
+
+### What changed
+- **\`src/...\`** — description
+
+### Upgrade
+\`\`\`bash
+npm install github:hamk-uas/jax-js-nonconsuming#v$(node -p "require('./package.json').version")
+\`\`\`
+
+**Full Changelog**: https://github.com/hamk-uas/jax-js-nonconsuming/compare/vPREV...v$(node -p "require('./package.json').version")"
 ```
 
 Users install specific tags, so after releasing they can upgrade with:
