@@ -286,7 +286,7 @@ export class Array extends Tracer {
    *
    * During PE tracing, concrete Arrays are created by PE's all-known evaluation
    * path and tracked in knownIntermediates. Their lifecycle is managed by
-   * disposePeIntermediates after PE completes. If `using` declarations in JVP
+   * ResidualCollector.dispose() after PE completes. If `using` declarations in JVP
    * helpers also dispose these arrays, the double-dispose causes
    * UseAfterFreeError when the ClosedJaxpr later accesses its consts.
    *

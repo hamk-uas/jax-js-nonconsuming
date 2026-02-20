@@ -1165,7 +1165,7 @@ export function makeJaxpr(
     // inner makeJaxpr tracing (e.g., zerosLike tangents from JVP rules)
     // don't leak into an outer partialEvalFlat's tracker.  These inner
     // Arrays become ClosedJaxpr consts (with .ref ownership) and must not
-    // be disposed by the outer PE's disposePeIntermediates.
+    // be disposed by the outer PE's ResidualCollector.dispose().
     const prevTracker = _peArrayCreationTracker;
     _setPACT(null);
     let outs: any;

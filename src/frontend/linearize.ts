@@ -240,12 +240,9 @@ function unwrapToConcreteArray(t: Tracer): Tracer {
  * Collects PE intermediates from a forward partial-evaluation pass and
  * provides a `dispose(protectedVals)` method for deterministic cleanup.
  *
- * This class encapsulates the `disposePeIntermediates` logic: it owns the
- * list of PE intermediates and literal intermediates, and disposes those
- * that are NOT in the protected set (outputs, aux captures, low-rc consts).
- *
- * Precursor to `ResidualPack` in the AOT linearization artifact model.
- * Extracted in M1.3.
+ * Owns the list of PE intermediates and literal intermediates and disposes
+ * those that are NOT in the protected set (outputs, aux captures, low-rc
+ * consts).  Extracted in M1.3.
  */
 class ResidualCollector {
   readonly peIntermediates: Tracer[];

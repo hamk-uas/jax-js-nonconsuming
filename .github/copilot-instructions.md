@@ -3063,24 +3063,77 @@ grad(f)(xs); // UseAfterFreeError in getOrComputePrimal
 
 **Root cause:** `getOrMakeConstTracer` does `val.ref` (rc → 2), but user's `.dispose()` drops rc to
 
-1. After `partialEvalGraphToJaxpr` (net zero), `disposePeIntermediates` takes the last ref (rc → 0),
-   killing the ClosedJaxpr's ownership before the backward pass reads it.
+1. After `partialEvalGraphToJaxpr` (net zero), residual cleanup takes the last ref (rc → 0), killing
+   the ClosedJaxpr's ownership before the backward pass reads it.
 
-**Fix:** In both `linearizeFlat` and `vjpFlat`, before calling `disposePeIntermediates`, protect
-jaxpr consts whose `c.refCount <= 1`. Normal consts (rc ≥ 2) are unaffected; only user-disposed
-consts (rc = 1) are protected from over-disposal.
+**Fix:** In both `linearizeFlat` and `vjpFlat`, before residual cleanup, protect jaxpr consts whose
+`c.refCount <= 1`. Normal consts (rc ≥ 2) are unaffected; only user-disposed consts (rc = 1) are
+protected from over-disposal.
+
+### AOT linearization artifacts
+
+The autodiff system uses explicit **artifact types** to encapsulate ownership of forward-pass
+residuals and backward-pass jaxprs. This replaces the earlier pattern of ad-hoc PE intermediate
+disposal with structured, `Symbol.dispose`-compatible objects.
+
+**Key types (`src/frontend/artifacts.ts`):**
+
+| Type                | Owns                                                     | Disposed by                              |
+| ------------------- | -------------------------------------------------------- | ---------------------------------------- |
+| `PrimalArtifact`    | Forward jaxpr consts, `ResidualCollector` with residuals | `[Symbol.dispose]()` or `.dispose()`     |
+| `PullbackArtifact`  | Backward jaxpr (locally-owned), residual refs            | `[Symbol.dispose]()` or `.dispose()`     |
+| `ResidualCollector` | Residual arrays collected during forward pass            | `ResidualCollector.dispose()` at cleanup |
+
+**Scan-specific (`src/frontend/scan-backward.ts`):**
+
+| Type                   | Owns                                                          | NOT owned (cache-owned)                       |
+| ---------------------- | ------------------------------------------------------------- | --------------------------------------------- |
+| `ScanPullbackArtifact` | `primalForwardJaxpr`, `tangentBody`, carry/xs/const residuals | `transposedBody` (from `transposeJaxprCache`) |
+
+**`aotLinearize` flow (`src/frontend/artifacts.ts`):**
+
+`aotLinearize(f, primals, options)` replaces the older `partialEvalFlat` + manual disposal pattern:
+
+1. Traces forward pass with `linearizeFlat` (with `skipBackward: true` — no call-time transpose)
+2. Collects residuals into a `ResidualCollector`
+3. Returns `PrimalArtifact` (owns forward jaxpr + residuals) and optionally a `PullbackArtifact`
+   (owns backward jaxpr + residual refs)
+4. Both artifacts implement `Symbol.dispose` for `using` declarations
+
+**Ownership contracts:**
+
+- `transposeJaxprCache` (Map in `linearize.ts`) — **cache-owned**. Callers of `transposeJaxpr()`
+  must NOT dispose the returned `ClosedJaxpr`. The cache is cleaned by `_registerJitCacheDisposer`.
+- `primalForwardJaxpr` and `tangentBody` in `ScanPullbackArtifact` — **locally-owned**. Created
+  fresh via `makeJaxpr`, disposed in `disposeResiduals()`.
+- `markAnonymous: true` — passed to `transposeJaxpr()` and `buildBackwardJaxpr()` (inside
+  `makeJaxpr` traces). Prevents UAF when cotangent zeros escape to outer jit traces by marking them
+  as anonymous consts owned by the builder.
+
+**Key files:**
+
+| File                            | Purpose                                                                    |
+| ------------------------------- | -------------------------------------------------------------------------- |
+| `src/frontend/artifacts.ts`     | `aotLinearize`, `PrimalArtifact`, `PullbackArtifact`, `ResidualCollector`  |
+| `src/frontend/scan-backward.ts` | `ScanBackwardSpec`, `ScanPullbackArtifact`                                 |
+| `src/frontend/linearize.ts`     | Scan transpose rule (builds spec, creates artifact), `transposeJaxprCache` |
 
 ## Debugging Ownership Issues
 
 If a `UseAfterFreeError` or `ReferenceError` appears:
 
 1. **Identify the array** — the error includes the array's shape/dtype.
-2. **Check disposal timing** — is some code path calling `.dispose()` prematurely? Common in
+2. **Check artifact ownership** — is a `PrimalArtifact`, `PullbackArtifact`, or
+   `ScanPullbackArtifact` being disposed too early? Verify that locally-owned jaxprs
+   (`primalForwardJaxpr`, `tangentBody`) are not disposed before the backward pass runs.
+3. **Check cache-owned jaxprs** — `transposeJaxpr()` returns cache-owned `ClosedJaxpr`s. Callers
+   must NOT dispose them. The cache is cleaned by `_registerJitCacheDisposer`.
+4. **Check disposal timing** — is some code path calling `.dispose()` prematurely? Common in
    `evalJaxprTransposed` (check `argPrimals` set) or PETracer cascade.
-3. **Check `getOrMakeConstTracer`** — is a constant being disposed before the jaxpr that uses it?
-4. **Add `console.log(slotCount())` checkpoints** around the failing code to narrow down where slots
+5. **Check `getOrMakeConstTracer`** — is a constant being disposed before the jaxpr that uses it?
+6. **Add `console.log(slotCount())` checkpoints** around the failing code to narrow down where slots
    are being freed.
-5. **Test with CPU backend** — CPU is simplest and has the clearest error messages.
+7. **Test with CPU backend** — CPU is simplest and has the clearest error messages.
 
 ### Leak detection
 
@@ -3476,7 +3529,8 @@ statically at edit time, complementing the runtime `checkLeaks` diagnostic.
 | ~~High~~   | ~~`checkLeaks` diagnostic~~               | ✅ Implemented in `src/frontend/check-leaks.ts`                                                                                                                                                 |
 | ~~High~~   | ~~unreachable Const PETracer leak~~       | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                           |
 | ~~High~~   | ~~user-disposed const over-disposal~~     | ✅ Fixed via `refCount <= 1` protection in `linearizeFlat`/`vjpFlat`                                                                                                                            |
-| Medium     | Anonymous constant leak fix               | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                       |
+| ~~High~~   | ~~AOT linearization artifacts~~           | ✅ Implemented: `PrimalArtifact`, `PullbackArtifact`, `ScanPullbackArtifact` in `artifacts.ts` / `scan-backward.ts`                                                                             |
+| Medium     | Anonymous constant leak fix               | Partially addressed by `markAnonymous` flag in `transposeJaxpr`/`buildBackwardJaxpr`; full fix would distinguish user-held vs anonymous consts in scan tracing                                  |
 | ~~Medium~~ | ~~ESLint plugin for non-consuming model~~ | ✅ Implemented as `@jax-js/eslint-plugin` v0.1.0 — `require-using`, `no-use-after-dispose`, `no-dispose-then-reassign-param`, `no-unnecessary-ref`, `no-array-chain`                            |
 | Low        | Chain→temporaries RFC (design-only)       | Keep implementation deferred. Scope RFC to assignment/return chains only, preserve evaluation order + exceptions, and require measured eager-memory wins / lint-pressure before implementation. |
 

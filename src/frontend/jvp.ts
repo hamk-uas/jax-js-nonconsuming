@@ -392,8 +392,8 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const [y, idx] = argsort(x);
     const gatherResult = gather(dx, [idx], [-1], -1);
     // During PE tracing (grad path), idx becomes a ClosedJaxpr const whose
-    // lifecycle is managed by disposePeIntermediates. Eagerly disposing here
-    // would free it before the VJP pullback can use it.
+    // lifecycle is managed by ResidualCollector.dispose(). Eagerly disposing
+    // here would free it before the VJP pullback can use it.
     if (!_peArrayCreationTracker) idx.dispose();
     return [[y], [gatherResult]];
   },
@@ -452,7 +452,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     // Note: lLower/uUpper are NOT declared with `using` when m<=k / n<=k
     // because in that case they alias lPadded/uPadded directly. During PE
     // tracing, [Symbol.dispose] is a no-op, so .ref's extra refcount would
-    // never be balanced. Instead we let disposePeIntermediates handle them.
+    // never be balanced. Instead we let ResidualCollector.dispose() handle them.
     const lLower = tril(luSliceL as any, -1);
     const lPaddedNeedsDispose = m > k;
     const lPadded = lPaddedNeedsDispose

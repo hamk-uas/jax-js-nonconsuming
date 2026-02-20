@@ -52,6 +52,7 @@ functions.
 | `hessian`            | 🟢      |                                                  |
 | `jvp`                | 🟢      |                                                  |
 | `linearize`          | 🟢      |                                                  |
+| `aotLinearize`       | 🟢      | jax-js extension: AOT forward/backward artifacts |
 | `linear_transpose`   | 🟠      |                                                  |
 | `vjp`                | 🟢      |                                                  |
 | `custom_gradient`    | 🔴      | core engine feature                              |
