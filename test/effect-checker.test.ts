@@ -5,6 +5,7 @@ import {
   makeJaxpr,
   MemoryEffect,
   numpy as np,
+  verifyJaxprEffects,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, test } from "vitest";
 
@@ -93,16 +94,72 @@ describe("effect-checker", () => {
   });
 
   describe("M2 — borrow checker", () => {
-    test.skip("placeholder: verifyJaxprEffects accepts safe graph", () => {
-      // Will be implemented in M2.1
+    test("verifyJaxprEffects accepts safe elementwise graph", () => {
+      const { jaxpr: closedJaxpr } = makeJaxpr((a: Array, b: Array) =>
+        np.add(a, b),
+      )(np.zeros([4]), np.zeros([4]));
+      const result = verifyJaxprEffects(closedJaxpr.jaxpr);
+      expect(result.ok).toBe(true);
+      expect(result.errors).toHaveLength(0);
+      closedJaxpr.dispose();
     });
 
-    test.skip("placeholder: verifyJaxprEffects rejects use-after-consume", () => {
-      // Will be implemented in M2.1
+    test("verifyJaxprEffects rejects use-after-consume", () => {
+      // Build a jaxpr, then manually set an input to Consume to simulate
+      // a consume followed by a borrow
+      const { jaxpr: closedJaxpr } = makeJaxpr((a: Array) => {
+        const b = np.add(a, a); // uses a twice
+        return np.multiply(b, a); // uses a again
+      })(np.zeros([2]));
+      const jaxpr = closedJaxpr.jaxpr;
+
+      // Manually set the first equation's first input to Consume
+      // (simulating a primitive that consumes its input)
+      jaxpr.eqns[0].inputEffects![0] = MemoryEffect.Consume;
+
+      const result = verifyJaxprEffects(jaxpr);
+      // The second equation also uses 'a' (as Borrow), which should fail
+      expect(result.ok).toBe(false);
+      expect(result.errors.length).toBeGreaterThan(0);
+      expect(result.errors[0]).toContain("Use-after-consume");
+      closedJaxpr.dispose();
     });
 
-    test.skip("placeholder: Mutate requires exclusive ownership", () => {
-      // Will be implemented in M2.1
+    test("Mutate exclusivity: rejects Mutate+Borrow on same var in one eqn", () => {
+      // Build a jaxpr with DUS where dst is also borrowed
+      const { jaxpr: closedJaxpr } = makeJaxpr((dst: Array, src: Array) =>
+        lax.dynamicUpdateSlice(dst, src, 0),
+      )(np.zeros([6]), np.zeros([3]));
+      const jaxpr = closedJaxpr.jaxpr;
+
+      // Find the DUS equation
+      const dusEqn = jaxpr.eqns.find(
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-enum-comparison
+        (e) => e.primitive === "dynamic_update_slice",
+      );
+      expect(dusEqn).toBeDefined();
+
+      // Normally src is a different var. Simulate aliasing by making src
+      // reference the same Var as dst, with Borrow effect
+      const dstVar = dusEqn!.inputs[0];
+      dusEqn!.inputs[1] = dstVar; // Same var as dst
+      // dst=Mutate, src(=same var)=Borrow → exclusivity violation
+      dusEqn!.inputEffects = [MemoryEffect.Mutate, MemoryEffect.Borrow];
+
+      const result = verifyJaxprEffects(jaxpr);
+      expect(result.ok).toBe(false);
+      expect(result.errors[0]).toContain("Mutate exclusivity violation");
+      closedJaxpr.dispose();
+    });
+
+    test("verifyJaxprEffects accepts graph with outputs (no consume needed)", () => {
+      // Outputs of the jaxpr don't need to be consumed
+      const { jaxpr: closedJaxpr } = makeJaxpr((a: Array, b: Array) =>
+        np.add(a, b),
+      )(np.zeros([2]), np.zeros([2]));
+      const result = verifyJaxprEffects(closedJaxpr.jaxpr);
+      expect(result.ok).toBe(true);
+      closedJaxpr.dispose();
     });
   });
 

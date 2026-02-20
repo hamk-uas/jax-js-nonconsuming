@@ -17,9 +17,11 @@ import {
 import * as jaxprModule from "./frontend/jaxpr";
 import {
   ClosedJaxpr,
+  type EffectVerificationResult,
   Jaxpr,
   MemoryEffect,
   OwnedFunction,
+  verifyJaxprEffects,
 } from "./frontend/jaxpr";
 import * as jvpModule from "./frontend/jvp";
 import * as linearizeModule from "./frontend/linearize";
@@ -48,6 +50,7 @@ export {
   type Device,
   devices,
   DType,
+  type EffectVerificationResult,
   getBackend,
   Jaxpr,
   type JsTree,
@@ -67,6 +70,7 @@ export {
   type ScanPath,
   type SnapshotEntry,
   tree,
+  verifyJaxprEffects,
 };
 
 /**

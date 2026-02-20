@@ -80,6 +80,118 @@ const primitiveInputEffects: Partial<
   },
 };
 
+/** Result of verifying memory effects on a Jaxpr. */
+export interface EffectVerificationResult {
+  /** Whether the Jaxpr is effect-safe. */
+  ok: boolean;
+  /** Human-readable error messages for each violation. */
+  errors: string[];
+}
+
+/**
+ * Static borrow checker for Jaxpr memory effects.
+ *
+ * Walks the Jaxpr equations and enforces ownership rules:
+ * 1. No `Borrow` or `Mutate` after `Consume` — once consumed, a var is dead.
+ * 2. `Mutate` requires exclusive ownership — the same var cannot appear as
+ *    both `Mutate` and `Borrow` in the same equation's inputs.
+ * 3. All `Alloc` vars must be either `Consume`d, returned as a Jaxpr output,
+ *    or unreferenced (dead code, acceptable).
+ *
+ * Equations without effect annotations are silently skipped.
+ */
+export function verifyJaxprEffects(jaxpr: Jaxpr): EffectVerificationResult {
+  const errors: string[] = [];
+
+  // Set of output Vars — these are "returned" and don't need to be consumed.
+  const outputVars = new Set<Var>();
+  for (const out of jaxpr.outs) {
+    if (out instanceof Var) outputVars.add(out);
+  }
+
+  // Track per-Var state: "alive" (usable) or "consumed" (dead).
+  // Jaxpr inBinders start alive. Equation outBinders start alive when created.
+  const consumed = new Set<Var>();
+
+  // Track which Vars were allocated (Alloc effect on output) and whether they
+  // were subsequently consumed or returned.
+  const allocatedVars = new Set<Var>();
+
+  for (const eqn of jaxpr.eqns) {
+    if (!eqn.inputEffects || !eqn.outputEffects) continue;
+
+    // Collect per-equation Mutate vars to check exclusivity
+    const mutateVarsInEqn = new Set<Var>();
+
+    // Check each input
+    for (let i = 0; i < eqn.inputs.length; i++) {
+      const atom = eqn.inputs[i];
+      if (!(atom instanceof Var)) continue;
+      const effect = eqn.inputEffects[i];
+      if (!effect) continue;
+
+      // Rule 1: No use after Consume
+      if (consumed.has(atom)) {
+        errors.push(
+          `Use-after-consume: var %${atom.id} is used with ${effect} ` +
+            `in "${eqn.primitive}" but was already consumed`,
+        );
+        continue;
+      }
+
+      if (effect === MemoryEffect.Consume) {
+        consumed.add(atom);
+      } else if (effect === MemoryEffect.Mutate) {
+        mutateVarsInEqn.add(atom);
+      }
+    }
+
+    // Rule 2: Mutate exclusivity — check that no Mutate var appears as Borrow
+    // in the same equation
+    if (mutateVarsInEqn.size > 0) {
+      for (let i = 0; i < eqn.inputs.length; i++) {
+        const atom = eqn.inputs[i];
+        if (!(atom instanceof Var)) continue;
+        const effect = eqn.inputEffects[i];
+        if (effect === MemoryEffect.Borrow && mutateVarsInEqn.has(atom)) {
+          errors.push(
+            `Mutate exclusivity violation: var %${atom.id} is both ` +
+              `Mutate and Borrow in "${eqn.primitive}"`,
+          );
+        }
+      }
+    }
+
+    // Track Alloc outputs
+    for (let i = 0; i < eqn.outBinders.length; i++) {
+      const effect = eqn.outputEffects[i];
+      if (effect === MemoryEffect.Alloc) {
+        allocatedVars.add(eqn.outBinders[i]);
+      }
+    }
+  }
+
+  // Rule 3: All Alloc vars must be consumed or returned
+  for (const v of allocatedVars) {
+    if (!consumed.has(v) && !outputVars.has(v)) {
+      // Check if the var is used at all (referenced by any later equation or output)
+      const isUsed =
+        jaxpr.eqns.some((e) =>
+          e.inputs.some((a) => a instanceof Var && a === v),
+        ) || outputVars.has(v);
+      if (isUsed) {
+        errors.push(
+          `Alloc var %${v.id} (${v.aval}) is used but never Consumed ` +
+            `or returned as output`,
+        );
+      }
+      // Dead (unused) Alloc vars are acceptable — they represent dead code
+    }
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
 /**
  * Function callback with an associated dispose() method.
  *
