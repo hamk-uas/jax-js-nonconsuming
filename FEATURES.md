@@ -503,9 +503,8 @@ in pairs of real and imaginary parts.
 
 Similarly, the `linalg` module has some very important operations for linear algebra and matrices.
 Most of these will be tricky to implement as routines with backend-specific lowering. We have
-Cholesky but are missing other building blocks like:
+Cholesky, LU (with partial pivoting), and triangular solve. Still missing:
 
-- LU decomposition (solver)
 - Householder iteration (QR, SVD, eigenvalues)
 
 | API                | Support | Notes                                   |
