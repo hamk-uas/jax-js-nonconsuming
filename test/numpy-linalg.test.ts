@@ -74,7 +74,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       using aInv = np.linalg.inv(a);
       using identity = np.matmul(a, aInv);
       using expected = np.eye(2);
-      // Newton refinement in solve() adds a tiny O(ε_mach) correction; loosen atol.
+      // f32 rounding through LU -> A @ A^{-1} is identity to ~1e-7; loosen atol.
       expect(identity).toBeAllclose(expected, { atol: 1e-6 });
     });
 

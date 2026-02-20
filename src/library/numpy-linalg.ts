@@ -213,8 +213,8 @@ export function slogdet(a: ArrayLike): [Array, Array] {
  * This solves a (batched) linear system of equations `a @ x = b` for `x` given
  * `a` and `b`. If `a` is singular, this will return `nan` or `inf` values.
  *
- * Gradients use the implicit function theorem (A @ x = b) rather than
- * differentiating through the LU decomposition, matching JAX's approach.
+ * Gradient flows through the LU decomposition via the TriangularSolve JVP rule
+ * (which correctly masks dA with triu()). Both ∂L/∂A and ∂L/∂b are supported.
  *
  * @param a - Coefficient matrix of shape `(..., N, N)`.
  * @param b - Values of shape `(N,)` or `(..., N, M)`.
@@ -259,15 +259,12 @@ export function solve(a: ArrayLike, b: ArrayLike): Array {
       d.push(b);
     }
 
-    // Factor A with gradient stopped on the LU *outputs* (not on 'a' itself).
-    // Stopping on 'a' would consume it under grad: stopGradient(a) creates a
-    // fully-known PETracer that PE disposal cascades through, freeing 'a'.
-    // Instead, stop on lu/perm outputs: gradient through the (broken) LU JVP
-    // rule is blocked, while 'a' remains alive for the Newton refinement step.
-    // In eager mode, stopGradient returns the same object, so lu === luRaw etc.
-    const [luRaw, pivotsRaw, permRaw] = lax.linalg.lu(a);
-    d.push(luRaw, pivotsRaw, permRaw);
-    const lu = lax.stopGradient(luRaw);
+    // Factor A. Gradient flows freely through the LU JVP (TriSolve triu mask fixed).
+    // Stop gradient only on permRaw — permutation is integer-valued, no gradient.
+    // Do NOT stop gradient on 'a' itself — stopGradient(a) creates a fully-known
+    // PETracer that PE disposal cascades through, which would free 'a' early.
+    const [lu, pivotsRaw, permRaw] = lax.linalg.lu(a);
+    d.push(lu, pivotsRaw, permRaw);
     const permutation = lax.stopGradient(permRaw);
 
     // Build permutation matrix P (derived from stopGradient'd factorization).
@@ -280,22 +277,9 @@ export function solve(a: ArrayLike, b: ArrayLike): Array {
     const P = eq.astype(b.dtype);
     d.push(P);
 
-    // Solve x_raw = A^{-1} b using the LU factorization.
-    // Only b's gradient flows through (lu/P are behind stopGradient).
-    const xRaw = luSolveWithP(lu, P, b, d);
-    d.push(xRaw);
-
-    // Re-attach A gradient via one-step iterative refinement.
-    // residual = A @ x_raw - b  (uses differentiable 'a', gradient flows through A)
-    // correction ≈ 0 numerically, but provides correct ∂L/∂A = -(A^{-T} g) x^T.
-    const axRaw = np.matmul(a, xRaw);
-    d.push(axRaw);
-    const residual = axRaw.sub(b);
-    d.push(residual);
-    const correction = luSolveWithP(lu, P, residual, d);
-    d.push(correction);
-
-    let x = xRaw.sub(correction);
+    // Solve x = A^{-1} b via the LU factorization.
+    // Gradient flows through both b (TriSolve transpose rule) and A (TriSolve JVP).
+    let x = luSolveWithP(lu, P, b, d);
     if (bIs1d) {
       d.push(x);
       x = np.squeeze(x, -1);

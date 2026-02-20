@@ -3796,39 +3796,46 @@ After the fix, direct LU→triSolve gradients match the Newton refinement to mac
 
 ---
 
-## Current Design: stopGradient + Newton Refinement
+## Current Design: Direct LU→TriSolve Gradient Path
 
-The current `solve` implementation uses stopGradient on LU outputs + Newton refinement as a defense-
-in-depth measure. With the TriSolve JVP fix in place, this is no longer strictly necessary but
-remains as a safety net until the direct path is fully validated.
+With the TriSolve JVP `triu(dA)` mask fix in place, `solve` differentiates directly through
+`lu → triangularSolve` — no Newton refinement or `stopGradient` workarounds needed.
 
-**Key ownership subtlety:** We stop gradient on the LU _outputs_ (not on `a` itself).
-`stopGradient(a)` would create a fully-known PETracer wrapping `a` under partial evaluation for
-`grad`. When `disposePeIntermediates` runs, this PETracer cascades and frees `a`, violating the
-non-consuming model. Stopping on the LU outputs avoids this — the cascade frees the fresh LU arrays
-(correct), not `a`.
+**Key ownership constraint:** Stop gradient only on `permRaw` (integer-valued, no gradient). Do NOT
+stop gradient on `a` itself or on `luRaw` — `stopGradient(a)` would create a fully-known PETracer
+that PE disposal cascades through, freeing `a` early.
 
 ```ts
-// 1. Factor A — stop gradient on LU outputs, not on 'a'
-const [luRaw, _, permRaw] = lax.linalg.lu(a);
-const lu = lax.stopGradient(luRaw); // blocks LU JVP; lu===luRaw in eager
-const perm = lax.stopGradient(permRaw);
+// Factor A. Gradient flows through LU JVP (TriSolve triu mask ensures correctness).
+// Stop gradient only on permRaw — permutation is integer-valued, no gradient.
+const [lu, pivotsRaw, permRaw] = lax.linalg.lu(a);
+const permutation = lax.stopGradient(permRaw);
 
-// 2. Solve x_raw = A^{-1} b (only b's gradient flows through)
-const xRaw = luSolveWithP(lu, P, b, d);
-
-// 3. Re-attach A gradient via Newton refinement
-const residual = np.matmul(a, xRaw).sub(b); // uses differentiable 'a'
-const correction = luSolveWithP(lu, P, residual, d); // stopped-gradient LU
-const x = xRaw.sub(correction);
+// Solve directly — both ∂L/∂b and ∂L/∂A flow through correctly.
+const x = luSolveWithP(lu, P, b, d);
 ```
 
-**Mathematical verification:**
+**Why this works:**
 
-- **Forward:** `residual = A · A⁻¹b - b = 0`, so `correction ≈ 0` and `x = x_raw` ✓
-- **∂L/∂b:** chain rule gives `∂x/∂b = A⁻¹` ✓
-- **∂L/∂A:** The `matmul(a, xRaw)` term creates the graph edge: `∂L/∂A = -(A⁻ᵀ g) xᵀ` — the standard
-  formula ✓
+- **∂L/∂b:** TriangularSolve transpose rule gives `ctB = A^{-T} ct` — correct.
+- **∂L/∂A:** TriangularSolve JVP (now with `triu(dA)` mask) gives `dx = A^{-1} (db - triu(dA) X)` —
+  the mask prevents gradient leaking from below-diagonal entries. Verified to match the analytical
+  formula $-A^{-T} g x^T$ to machine precision.
+
+**Comparison with JAX:**
+
+JAX uses `custom_linear_solve` — a dedicated primitive that encodes the implicit function theorem.
+The gradient never flows through LU. This is heavier: new primitive + 4 transform rules. By fixing
+the TriSolve JVP, jax-js achieves the same correctness with zero extra infrastructure.
+
+| Aspect               | JAX (`custom_linear_solve`)       | jax-js (direct LU→triSolve)          |
+| -------------------- | --------------------------------- | ------------------------------------ |
+| Forward cost         | 2 triangular solves               | 2 triangular solves (same)           |
+| Backward cost        | 2 triSolves + 1 matmul            | Auto-transposed (comparable)         |
+| Implementation cost  | New primitive + 4 transform rules | Zero new infrastructure              |
+| Gradient correctness | Exact (hand-written)              | Exact (automatic from fixed JVP)     |
+| Composability        | Manual rule for each transform    | Free (`jit`, `grad`, `vmap` compose) |
+| Maintenance          | Custom primitive to maintain      | Nothing extra — standard AD pipeline |
 
 ### Why `inv` is just `solve(A, I)`
 
@@ -3859,8 +3866,8 @@ function luSolveWithP(lu, P, b, d) {
 }
 ```
 
-Used twice in `solve`: once for the primary solve, once for the correction. Intermediates are pushed
-to the caller's `d[]` disposal tracker.
+Used once in `solve` for the primary solve. Intermediates are pushed to the caller's `d[]` disposal
+tracker.
 
 ---
 
@@ -3875,58 +3882,13 @@ to the caller's `d[]` disposal tracker.
 
 ---
 
-## TODO: Remove Newton Refinement (Direct LU→TriSolve Gradient Path)
+## ~~TODO~~ DONE: Newton Refinement Removed (Direct LU→TriSolve Path)
 
-### Context
+Direct LU→triSolve gradient path is now the only implementation. Newton refinement and
+`stopGradient(luRaw)` have been removed. See
+[Current Design](#current-design-direct-lu-trisolve-gradient-path).
 
-The TriangularSolve JVP fix (`triu(da)` mask) makes the direct LU→triSolve gradient path correct.
-Newton refinement is no longer needed for correctness — it was a workaround for the now-fixed bug.
-Removing it would halve the forward and backward operation count for `solve` and `inv`.
-
-### What "going beyond JAX" means here
-
-JAX uses `custom_linear_solve` — a dedicated primitive that encodes the implicit function theorem
-directly in its JVP and transpose rules. The gradient never flows through LU at all. This is a
-heavyweight primitive requiring custom JVP, transpose, vmap, and PE rules.
-
-With the TriSolve JVP fix, jax-js can differentiate directly through `lu → triangularSolve` — no
-special solve primitive needed. The AD system handles it automatically. This is arguably a **simpler
-and more general** approach than JAX's:
-
-| Aspect               | JAX (`custom_linear_solve`)       | jax-js (direct LU→triSolve)          |
-| -------------------- | --------------------------------- | ------------------------------------ |
-| Forward cost         | 2 triangular solves               | 2 triangular solves (same)           |
-| Backward cost        | 2 triSolves + 1 matmul            | Auto-transposed (comparable)         |
-| Implementation cost  | New primitive + 4 transform rules | Zero new infrastructure              |
-| Gradient correctness | Exact (hand-written)              | Exact (automatic from fixed JVP)     |
-| Composability        | Manual rule for each transform    | Free (`jit`, `grad`, `vmap` compose) |
-| Maintenance          | Custom primitive to maintain      | Nothing extra — standard AD pipeline |
-
-### Steps to remove Newton refinement
-
-1. **Remove `stopGradient` on `luRaw`** in `numpy-linalg.ts` `solve` — let gradient flow through the
-   LU JVP and into the triangular solves normally
-2. **Keep `stopGradient` on `permRaw`** — permutation is integer (no meaningful gradient)
-3. **Remove the Newton refinement steps** — the `matmul(a, xRaw).sub(b)` / `luSolveWithP` correction
-4. **Add direct-path grad tests** — compare `grad(solve)` against analytical formula, FD, and the
-   old Newton results at multiple sizes (2×2, 3×3, 5×5, batched)
-5. **Test `unitDiagonal` mask** — verify `triu(da, 1)` correctly zeros diagonal tangent for L-solve
-6. **Test transform compositions** — `jit(grad(solve))`, `grad(grad(solve))` (Hessian), `vmap(grad)`
-7. **Performance benchmark** — measure speedup from removing 2× redundant solves
-
-### Risks and considerations
-
-- **Permutation discontinuity:** LU with partial pivoting has a discrete pivot choice. The gradient
-  is correct on either side of the pivot boundary, but FD across the boundary gives wrong results.
-  This is inherent to LU, not a bug — matches JAX behavior.
-- **`stopGradient` on `a` ownership:** Must NOT be introduced — causes use-after-free under PE
-  disposal cascade. The fix avoids this entirely by not needing stopGradient on the LU output.
-- **Mixed `lower=true/false` triSolve on packed LU:** The `triu(da)` mask at the primitive level
-  correctly handles the flipping in `core.triangularSolve` — lower=true flips the matrix so that the
-  relevant triangle in the original becomes the upper triangle in the flipped version. Verified
-  empirically for both L-solve and U-solve paths.
-- **`unitDiagonal=true` mask (`triu(da, 1)`):** When the diagonal is forced to 1, perturbations of
-  diagonal elements have zero effect. The `triu(da, 1)` mask correctly zeros these.
+**What was removed and why it's no longer needed:**
 
 ### Primitive convention reference
 
