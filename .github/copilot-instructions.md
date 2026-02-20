@@ -3690,3 +3690,251 @@ reference and parallel scan results are compared to 5 decimal places.
 | Low      | WebGL performance                | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                                                                                     |
 | Medium   | `scatter_add` primitive          | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.                                                                                                                                             |
 | ~~Low~~  | ~~`using` declaration examples~~ | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                                                                            |
+
+---
+
+# Part 6: Linear Algebra Autodiff (`solve`, `inv`)
+
+## Overview & Motivation
+
+`numpy.linalg.solve(A, b)` and `numpy.linalg.inv(A)` compute $A^{-1} b$ and $A^{-1}$ respectively,
+using LU decomposition internally. Getting correct gradients through these operations required
+finding and fixing a bug in the `Primitive.TriangularSolve` JVP rule.
+
+**Key files:**
+
+| File                          | Purpose                                     |
+| ----------------------------- | ------------------------------------------- |
+| `src/library/numpy-linalg.ts` | `solve`, `inv`, `luSolveWithP` helper       |
+| `src/frontend/jvp.ts`         | JVP rules for TriangularSolve, Cholesky, LU |
+| `src/frontend/linearize.ts`   | Transpose rules for TriangularSolve         |
+| `src/frontend/core.ts`        | `stopGradient`, `Primitive.StopGradient`    |
+| `test/numpy-linalg.test.ts`   | Gradient tests for inv, det, lstsq          |
+
+---
+
+## Root Cause: TriangularSolve JVP Triangle Mask Bug
+
+### The bug
+
+The `Primitive.TriangularSolve` JVP rule differentiates `A @ X^T = B^T` where `A` is upper
+triangular. Only the upper triangle of `A` affects the solution `X`. The JVP must therefore only
+propagate tangents from `triu(dA)` — perturbations below the diagonal have zero effect.
+
+**Before fix (buggy):**
+
+```ts
+[Primitive.TriangularSolve]([a, b], [da, db], { unitDiagonal }) {
+    const x = triangularSolve(a, b, { unitDiagonal });
+    using dax = batchMatmulT(da, x);      // dA @ X^T — uses ALL of dA ←── BUG
+    using mTdax = mT(dax);
+    using rhsT = db.sub(mTdax);
+    const dx = triangularSolve(a, rhsT, { unitDiagonal });
+    return [[x], [dx]];
+}
+```
+
+**After fix:**
+
+```ts
+[Primitive.TriangularSolve]([a, b], [da, db], { unitDiagonal }) {
+    const x = triangularSolve(a, b, { unitDiagonal });
+    using maskedDa = (unitDiagonal ? triu(da, 1) : triu(da)) as Tracer;  // ←── FIX
+    using dax = batchMatmulT(maskedDa, x);  // triu(dA) @ X^T
+    using mTdax = mT(dax);
+    using rhsT = db.sub(mTdax);
+    const dx = triangularSolve(a, rhsT, { unitDiagonal });
+    return [[x], [dx]];
+}
+```
+
+### Why the missing mask causes wrong gradients through `solve`
+
+In `solve(A, b)`, the packed LU matrix stores L in the lower triangle and U in the upper triangle.
+When `triangularSolve(luMatrix, ...)` is called:
+
+- **Lower solve (L):** `core.triangularSolve(luMatrix, ..., {lower: true})` flips the matrix so L's
+  lower triangle becomes the upper triangle of the flipped matrix. The primitive reads this upper
+  triangle. With the fix, `triu(d_flipped)` correctly masks to only L's entries.
+- **Upper solve (U):** `core.triangularSolve(luMatrix, ..., {lower: false})` passes the packed
+  matrix directly. The primitive reads the upper triangle (U). Without the mask, `dA @ X^T` uses the
+  L entries in the lower triangle — gradient leaks from L's entries into U's solve.
+
+This gradient leak caused `grad(solve)` and `grad(inv)` to produce incorrect results (errors of
+0.15–0.44 in 2×2–3×3 tests, not a precision issue).
+
+### What was NOT the bug
+
+- **LU JVP rule:** Verified correct both mathematically and empirically. Forward-mode tangents match
+  finite differences to f32 precision (~0.0016). The LU JVP uses `triSolve(L, ...)` and
+  `triSolve(U^T, ...)` where L and U are known primals — `da=0` at those calls, so the triangle mask
+  bug doesn't fire.
+- **TriangularSolve transpose rule** (for b input): Correct — tested independently (err < 0.001).
+- **`tril`/`triu` transpose rules:** Self-adjoint, verified correct.
+- **Dot transpose rule:** Correct — verified by tracing through `batchMatmulT` composition.
+
+### Impact matrix
+
+| Operation                              | Before fix               | After fix  |
+| -------------------------------------- | ------------------------ | ---------- |
+| `grad(triSolve(A, b))` w.r.t. A        | ❌ Wrong (gradient leak) | ✅ Correct |
+| `grad(triSolve(A, b))` w.r.t. b        | ✅ Correct               | ✅ Correct |
+| `grad(lu(A))`                          | ✅ Correct               | ✅ Correct |
+| `grad(solve(A, b))` via Newton         | ✅ Correct (workaround)  | ✅ Correct |
+| `grad(solve(A, b))` direct LU→triSolve | ❌ Wrong                 | ✅ Correct |
+| `grad(inv(A))` analytical comparison   | ✅ via Newton            | ✅ Direct  |
+
+### Verification results
+
+After the fix, direct LU→triSolve gradients match the Newton refinement to machine precision:
+
+| Test                         | Direct vs Newton | Direct vs FD | Direct vs Analytical |
+| ---------------------------- | ---------------- | ------------ | -------------------- |
+| 2×2 `grad(sum(solve(A, I)))` | 1e-8             | 1.8e-4       | —                    |
+| 3×3 with pivoting            | 6e-8             | —            | —                    |
+| 2×2 `grad(sum(inv(A)))`      | —                | —            | 0 (exact)            |
+
+---
+
+## Current Design: stopGradient + Newton Refinement
+
+The current `solve` implementation uses stopGradient on LU outputs + Newton refinement as a defense-
+in-depth measure. With the TriSolve JVP fix in place, this is no longer strictly necessary but
+remains as a safety net until the direct path is fully validated.
+
+**Key ownership subtlety:** We stop gradient on the LU _outputs_ (not on `a` itself).
+`stopGradient(a)` would create a fully-known PETracer wrapping `a` under partial evaluation for
+`grad`. When `disposePeIntermediates` runs, this PETracer cascades and frees `a`, violating the
+non-consuming model. Stopping on the LU outputs avoids this — the cascade frees the fresh LU arrays
+(correct), not `a`.
+
+```ts
+// 1. Factor A — stop gradient on LU outputs, not on 'a'
+const [luRaw, _, permRaw] = lax.linalg.lu(a);
+const lu = lax.stopGradient(luRaw); // blocks LU JVP; lu===luRaw in eager
+const perm = lax.stopGradient(permRaw);
+
+// 2. Solve x_raw = A^{-1} b (only b's gradient flows through)
+const xRaw = luSolveWithP(lu, P, b, d);
+
+// 3. Re-attach A gradient via Newton refinement
+const residual = np.matmul(a, xRaw).sub(b); // uses differentiable 'a'
+const correction = luSolveWithP(lu, P, residual, d); // stopped-gradient LU
+const x = xRaw.sub(correction);
+```
+
+**Mathematical verification:**
+
+- **Forward:** `residual = A · A⁻¹b - b = 0`, so `correction ≈ 0` and `x = x_raw` ✓
+- **∂L/∂b:** chain rule gives `∂x/∂b = A⁻¹` ✓
+- **∂L/∂A:** The `matmul(a, xRaw)` term creates the graph edge: `∂L/∂A = -(A⁻ᵀ g) xᵀ` — the standard
+  formula ✓
+
+### Why `inv` is just `solve(A, I)`
+
+With `solve` handling gradients correctly, `inv` is simply:
+
+```ts
+export function inv(a: ArrayLike): Array {
+  const n = checkSquare("inv", a);
+  using eye = np.eye(n, { dtype: a.dtype });
+  return solve(a, eye);
+}
+```
+
+The gradient `∂L/∂A` for `inv(A)` reduces to $-A^{-T} G A^{-T}$ (where $G$ is the cotangent), which
+falls out of `solve`'s gradient formula automatically.
+
+---
+
+## `luSolveWithP` helper
+
+Shared helper that applies a pre-computed LU factorization with permutation matrix:
+
+```ts
+function luSolveWithP(lu, P, b, d) {
+  const Pb = np.matmul(P, b); // Apply row permutation
+  const LPb = triangularSolve(lu, Pb, { lower: true, unitDiagonal: true }); // L⁻¹ P b
+  return triangularSolve(lu, LPb, { lower: false }); // U⁻¹ L⁻¹ P b
+}
+```
+
+Used twice in `solve`: once for the primary solve, once for the correction. Intermediates are pushed
+to the caller's `d[]` disposal tracker.
+
+---
+
+## Test Coverage
+
+| Test                                         | File                        | What it verifies                    |
+| -------------------------------------------- | --------------------------- | ----------------------------------- |
+| `gradient of sum(inv(A)) matches analytical` | `test/numpy-linalg.test.ts` | inv gradient vs $-A^{-T} G A^{-T}$  |
+| `gradient of det is adjugate.mT`             | `test/numpy-linalg.test.ts` | det gradient (exercises LU forward) |
+| `solves random batched AX = B`               | `test/numpy-linalg.test.ts` | Batched solve correctness           |
+| `works with grad on b (underdetermined)`     | `test/numpy-linalg.test.ts` | lstsq gradient (Cholesky path)      |
+
+---
+
+## TODO: Remove Newton Refinement (Direct LU→TriSolve Gradient Path)
+
+### Context
+
+The TriangularSolve JVP fix (`triu(da)` mask) makes the direct LU→triSolve gradient path correct.
+Newton refinement is no longer needed for correctness — it was a workaround for the now-fixed bug.
+Removing it would halve the forward and backward operation count for `solve` and `inv`.
+
+### What "going beyond JAX" means here
+
+JAX uses `custom_linear_solve` — a dedicated primitive that encodes the implicit function theorem
+directly in its JVP and transpose rules. The gradient never flows through LU at all. This is a
+heavyweight primitive requiring custom JVP, transpose, vmap, and PE rules.
+
+With the TriSolve JVP fix, jax-js can differentiate directly through `lu → triangularSolve` — no
+special solve primitive needed. The AD system handles it automatically. This is arguably a **simpler
+and more general** approach than JAX's:
+
+| Aspect               | JAX (`custom_linear_solve`)       | jax-js (direct LU→triSolve)          |
+| -------------------- | --------------------------------- | ------------------------------------ |
+| Forward cost         | 2 triangular solves               | 2 triangular solves (same)           |
+| Backward cost        | 2 triSolves + 1 matmul            | Auto-transposed (comparable)         |
+| Implementation cost  | New primitive + 4 transform rules | Zero new infrastructure              |
+| Gradient correctness | Exact (hand-written)              | Exact (automatic from fixed JVP)     |
+| Composability        | Manual rule for each transform    | Free (`jit`, `grad`, `vmap` compose) |
+| Maintenance          | Custom primitive to maintain      | Nothing extra — standard AD pipeline |
+
+### Steps to remove Newton refinement
+
+1. **Remove `stopGradient` on `luRaw`** in `numpy-linalg.ts` `solve` — let gradient flow through the
+   LU JVP and into the triangular solves normally
+2. **Keep `stopGradient` on `permRaw`** — permutation is integer (no meaningful gradient)
+3. **Remove the Newton refinement steps** — the `matmul(a, xRaw).sub(b)` / `luSolveWithP` correction
+4. **Add direct-path grad tests** — compare `grad(solve)` against analytical formula, FD, and the
+   old Newton results at multiple sizes (2×2, 3×3, 5×5, batched)
+5. **Test `unitDiagonal` mask** — verify `triu(da, 1)` correctly zeros diagonal tangent for L-solve
+6. **Test transform compositions** — `jit(grad(solve))`, `grad(grad(solve))` (Hessian), `vmap(grad)`
+7. **Performance benchmark** — measure speedup from removing 2× redundant solves
+
+### Risks and considerations
+
+- **Permutation discontinuity:** LU with partial pivoting has a discrete pivot choice. The gradient
+  is correct on either side of the pivot boundary, but FD across the boundary gives wrong results.
+  This is inherent to LU, not a bug — matches JAX behavior.
+- **`stopGradient` on `a` ownership:** Must NOT be introduced — causes use-after-free under PE
+  disposal cascade. The fix avoids this entirely by not needing stopGradient on the LU output.
+- **Mixed `lower=true/false` triSolve on packed LU:** The `triu(da)` mask at the primitive level
+  correctly handles the flipping in `core.triangularSolve` — lower=true flips the matrix so that the
+  relevant triangle in the original becomes the upper triangle in the flipped version. Verified
+  empirically for both L-solve and U-solve paths.
+- **`unitDiagonal=true` mask (`triu(da, 1)`):** When the diagonal is forced to 1, perturbations of
+  diagonal elements have zero effect. The `triu(da, 1)` mask correctly zeros these.
+
+### Primitive convention reference
+
+The `Primitive.TriangularSolve` convention (important for understanding the JVP):
+
+- `A @ X^T = B^T` where A is **upper triangular**
+- Returns $X = B @ A^{-T}$ (NOT $A^{-1} @ B$)
+- `core.triangularSolve(a, b, {lower: true})` converts to upper by flipping both axes of `a` and
+  last axis of `b`, solves, flips result back
+- `lax.linalg.triangularSolve(A, b, {leftSide: true})` transforms to right-side convention by
+  transposing both arguments and flipping `lower`

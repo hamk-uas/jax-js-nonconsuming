@@ -4,6 +4,27 @@ import * as np from "./numpy";
 import { Array, ArrayLike, fudgeArray } from "../frontend/array";
 import { generalBroadcast } from "../utils";
 
+/**
+ * Apply a pre-computed LU factorization to solve A x = b.
+ *
+ * @param lu - Combined L/U matrix from `lax.linalg.lu(A)`.
+ * @param P  - Permutation matrix derived from the LU permutation vector.
+ * @param b  - Right-hand side to solve.
+ * @param d  - Disposal tracker for intermediate arrays.
+ * @returns Solution x; caller must push to `d` if not the final return.
+ */
+function luSolveWithP(lu: Array, P: Array, b: Array, d: Array[]): Array {
+  const Pb = np.matmul(P, b);
+  d.push(Pb);
+  const LPb = triangularSolve(lu, Pb, {
+    leftSide: true,
+    lower: true,
+    unitDiagonal: true,
+  });
+  d.push(LPb);
+  return triangularSolve(lu, LPb, { leftSide: true, lower: false });
+}
+
 function checkSquare(name: string, a: Array) {
   if (a.ndim < 2 || a.shape[a.ndim - 1] !== a.shape[a.ndim - 2]) {
     throw new Error(
@@ -192,6 +213,9 @@ export function slogdet(a: ArrayLike): [Array, Array] {
  * This solves a (batched) linear system of equations `a @ x = b` for `x` given
  * `a` and `b`. If `a` is singular, this will return `nan` or `inf` values.
  *
+ * Gradients use the implicit function theorem (A @ x = b) rather than
+ * differentiating through the LU decomposition, matching JAX's approach.
+ *
  * @param a - Coefficient matrix of shape `(..., N, N)`.
  * @param b - Values of shape `(N,)` or `(..., N, M)`.
  * @returns Solution `x` of shape `(..., N)` or `(..., N, M)`.
@@ -218,16 +242,35 @@ export function solve(a: ArrayLike, b: ArrayLike): Array {
       a.shape.slice(0, -2),
       b.shape.slice(0, -2),
     );
-    a = np.broadcastTo(a, [...batchDims, n, n]);
-    d.push(a);
-    b = np.broadcastTo(b, [...batchDims, n, m]);
-    d.push(b);
+    const aTargetShape = [...batchDims, n, n];
+    if (
+      a.shape.length !== aTargetShape.length ||
+      a.shape.some((dim, i) => dim !== aTargetShape[i])
+    ) {
+      a = np.broadcastTo(a, aTargetShape);
+      d.push(a);
+    }
+    const bTargetShape = [...batchDims, n, m];
+    if (
+      b.shape.length !== bTargetShape.length ||
+      b.shape.some((dim, i) => dim !== bTargetShape[i])
+    ) {
+      b = np.broadcastTo(b, bTargetShape);
+      d.push(b);
+    }
 
-    // Compute the LU decomposition with partial pivoting.
-    const [lu, pivots, permutation] = lax.linalg.lu(a);
-    d.push(lu, pivots, permutation);
+    // Factor A with gradient stopped on the LU *outputs* (not on 'a' itself).
+    // Stopping on 'a' would consume it under grad: stopGradient(a) creates a
+    // fully-known PETracer that PE disposal cascades through, freeing 'a'.
+    // Instead, stop on lu/perm outputs: gradient through the (broken) LU JVP
+    // rule is blocked, while 'a' remains alive for the Newton refinement step.
+    // In eager mode, stopGradient returns the same object, so lu === luRaw etc.
+    const [luRaw, pivotsRaw, permRaw] = lax.linalg.lu(a);
+    d.push(luRaw, pivotsRaw, permRaw);
+    const lu = lax.stopGradient(luRaw);
+    const permutation = lax.stopGradient(permRaw);
 
-    // L @ U @ x = P @ b
+    // Build permutation matrix P (derived from stopGradient'd factorization).
     const arangeN = np.arange(n);
     d.push(arangeN);
     const permR = permutation.reshape([...permutation.shape, 1]);
@@ -236,15 +279,23 @@ export function solve(a: ArrayLike, b: ArrayLike): Array {
     d.push(eq);
     const P = eq.astype(b.dtype);
     d.push(P);
-    const Pb = np.matmul(P, b);
-    d.push(Pb);
-    const LPb = triangularSolve(lu, Pb, {
-      leftSide: true,
-      lower: true,
-      unitDiagonal: true,
-    });
-    d.push(LPb);
-    let x = triangularSolve(lu, LPb, { leftSide: true, lower: false });
+
+    // Solve x_raw = A^{-1} b using the LU factorization.
+    // Only b's gradient flows through (lu/P are behind stopGradient).
+    const xRaw = luSolveWithP(lu, P, b, d);
+    d.push(xRaw);
+
+    // Re-attach A gradient via one-step iterative refinement.
+    // residual = A @ x_raw - b  (uses differentiable 'a', gradient flows through A)
+    // correction ≈ 0 numerically, but provides correct ∂L/∂A = -(A^{-T} g) x^T.
+    const axRaw = np.matmul(a, xRaw);
+    d.push(axRaw);
+    const residual = axRaw.sub(b);
+    d.push(residual);
+    const correction = luSolveWithP(lu, P, residual, d);
+    d.push(correction);
+
+    let x = xRaw.sub(correction);
     if (bIs1d) {
       d.push(x);
       x = np.squeeze(x, -1);

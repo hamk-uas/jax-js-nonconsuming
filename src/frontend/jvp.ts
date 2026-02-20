@@ -407,13 +407,20 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     ];
   },
   [Primitive.TriangularSolve]([a, b], [da, db], { unitDiagonal }) {
-    // A @ X.T = B.T  =>  dA @ X.T + A @ dX.T = dB.T
-    // So: A @ dX.T = dB.T - dA @ X.T
-    // Therefore: dX.T = A^-1 @ (dB.T - dA @ X.T)
+    // The primitive solves A @ X.T = B.T, where A is upper triangular.
+    // Only the upper triangle of A affects X, so we mask dA accordingly.
+    // JVP: dA @ X.T + A @ dX.T = dB.T
+    //   => A @ dX.T = dB.T - triu(dA) @ X.T
+    //   => dX.T = A^-1 @ (dB.T - triu(dA) @ X.T)
     const x = triangularSolve(a, b, { unitDiagonal }); // (A^-1 @ B.T).T
-    using dax = batchMatmulT(da, x); // dA @ X.T
+    // Mask dA to the triangle actually read by the solver.
+    // unitDiagonal means the diagonal is forced to 1 (not read from A).
+    using maskedDa = (
+      unitDiagonal ? triu(da as any, 1) : triu(da as any)
+    ) as Tracer;
+    using dax = batchMatmulT(maskedDa, x); // triu(dA) @ X.T
     using mTdax = mT(dax);
-    using rhsT = db.sub(mTdax); // (dB.T - dA @ X.T).T
+    using rhsT = db.sub(mTdax); // (dB.T - triu(dA) @ X.T).T
     const dx = triangularSolve(a, rhsT, { unitDiagonal });
     return [[x], [dx]];
   },

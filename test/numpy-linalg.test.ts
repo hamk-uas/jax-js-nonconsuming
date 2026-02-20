@@ -74,7 +74,8 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       using aInv = np.linalg.inv(a);
       using identity = np.matmul(a, aInv);
       using expected = np.eye(2);
-      expect(identity).toBeAllclose(expected);
+      // Newton refinement in solve() adds a tiny O(ε_mach) correction; loosen atol.
+      expect(identity).toBeAllclose(expected, { atol: 1e-6 });
     });
 
     test("computes inverse of batched matrices", () => {
@@ -89,6 +90,27 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       expect(identity).toBeAllclose(expected, {
         atol: 1e-4,
       });
+    });
+
+    test("gradient of sum(inv(A)) matches analytical formula", () => {
+      using a = np.array([
+        [2.0, 0.3],
+        [0.1, 1.7],
+      ]);
+
+      const f = (x: np.Array) => {
+        return np.linalg.inv(x).sum();
+      };
+      using da = grad(f)(a);
+
+      using aInv = np.linalg.inv(a);
+      using aInvT = np.matrixTranspose(aInv);
+      using ones = np.ones([2, 2]);
+      using left = np.matmul(aInvT, ones);
+      using leftRight = np.matmul(left, aInvT);
+      using expected = leftRight.mul(-1);
+
+      expect(da).toBeAllclose(expected, { rtol: 1e-4, atol: 1e-4 });
     });
   });
 
