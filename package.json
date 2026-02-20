@@ -57,6 +57,9 @@
   "module": "dist/index.js",
   "license": "MIT",
   "scripts": {
+    "mistakes:log": "npx tsx scripts/log-mistake.ts",
+    "mistakes:report": "npx tsx scripts/mistakes-report.ts",
+    "preflight": "npx tsx scripts/preflight.ts",
     "build": "tsdown",
     "build:watch": "TSDOWN_WATCH_MODE=1 tsdown",
     "check": "tsc",
