@@ -975,6 +975,10 @@ WASM.
 - Deno tests MUST import from `../../dist/index.js` to share backend instances across test modules.
 - Mixed `src/` vs `dist/` imports create separate module graphs with separate backend instances,
   causing leak detection failures.
+- **The main `test/*.test.ts` Vitest suite also imports from `dist/`**, not `src/`. The package
+  `"main"` field resolves `@hamk-uas/jax-js-nonconsuming` to `dist/index.js`, so source edits are
+  invisible to those tests until after `pnpm build`. Only files under `src/` that use relative
+  imports (e.g. `src/alu.test.ts`) see in-flight source changes directly.
 
 **Buffer cleanup**
 
@@ -2451,6 +2455,10 @@ contributors should be aware of:
 - Deno tests MUST import from `../../dist/index.js` to share backend instances across test modules.
 - Mixed `src/` vs `dist/` imports create separate module graphs with separate backend instances,
   causing leak detection failures.
+- **The main `test/*.test.ts` Vitest suite also imports from `dist/`**, not `src/`. The package
+  `"main"` field resolves `@hamk-uas/jax-js-nonconsuming` to `dist/index.js`, so source edits are
+  invisible to those tests until after `pnpm build`. Only files under `src/` that use relative
+  imports (e.g. `src/alu.test.ts`) see in-flight source changes directly.
 
 **Buffer cleanup**
 
