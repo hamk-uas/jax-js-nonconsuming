@@ -1,6 +1,13 @@
 import { DType } from "./alu";
 import { defaultDevice, Device, devices, getBackend, init } from "./backend";
 import { Array, ArrayLike } from "./frontend/array";
+import { aotLinearize } from "./frontend/artifacts";
+import type {
+  AotLinearizeResult,
+  PrimalArtifact,
+  PullbackArtifact,
+  ResidualPack,
+} from "./frontend/artifacts";
 import {
   checkLeaks,
   type LeakReport,
@@ -24,6 +31,8 @@ import type { ScanPath } from "./utils";
 import "./polyfills";
 
 export {
+  aotLinearize,
+  type AotLinearizeResult,
   init,
   Array,
   checkLeaks,
@@ -41,7 +50,10 @@ export {
   nn,
   numpy,
   type OwnedFunction,
+  type PrimalArtifact,
+  type PullbackArtifact,
   random,
+  type ResidualPack,
   setDebug,
   scipySpecial,
   type ScanPath,

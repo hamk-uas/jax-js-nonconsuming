@@ -16,6 +16,78 @@ Session protocol (do this EVERY session, even after context summarization) 🚦
 - **Why this section is here**: context summarization erases session memory. This file is the _only_
   thing guaranteed to survive. If you skip this protocol, you lose the self-tuning system entirely.
 
+Autonomous instruction maintenance loop (self-tuning) 🔁
+
+- Goal: reduce repeated friction across tasks by updating this file when patterns recur.
+- **Budget**: allocate ~5% of each task's effort to self-tuning work. This includes logging
+  mistakes/successes, checking `mistakes:report`, improving preflight policies, pruning stale rules,
+  and evolving tooling. Do this throughout the task — not only at the end — so improvements compound
+  across tasks. If a task is trivial (< 2 min), skip self-tuning; if a task is large (> 30 min), the
+  5% budget is worth spending.
+- Treat updates as **high-signal only**: avoid one-off noise and personal style churn.
+
+When to update this file
+
+- Update `copilot-instructions.md` only when at least one of these is true:
+  1. Same mistake happened **2+ times** across separate tasks.
+  2. A repeated slowdown cost **10+ minutes** and a short rule/check would have prevented it.
+  3. A project behavior changed (API, script, workflow, benchmark path) and old guidance is now
+     wrong.
+
+How to log mistakes (lightweight telemetry)
+
+- Maintain `tmp/copilot-mistakes.json` as an append/update ledger (gitignored, local only).
+- Preferred command: `pnpm run mistakes:log -- --key <id>` (increments existing count by 1).
+- For new keys, include metadata once:
+  `pnpm run mistakes:log -- --key <id> --category <cat> --symptom "..." --prevention "..."`.
+- Prioritize rules with `pnpm run mistakes:report` (ranks entries by count, category weight, and
+  recency; highlights promotion candidates).
+- Schema per key:
+  - `count`: number of occurrences
+  - `lastSeen`: ISO timestamp
+  - `category`: one of `state-drift | wrong-assumption | missed-check | tooling | docs-stale | perf`
+  - `symptom`: short observable failure mode
+  - `prevention`: one-line rule/check that would have prevented it
+- Example keys: `timing-registry-orphan`, `forgot-check-timings`, `assumed-linear-task-state`.
+
+Promotion policy (ledger → instructions)
+
+- Promote a new rule into this file only if:
+  - `count >= 2`, and
+  - the prevention rule is short, testable, and project-specific.
+- When promoting, add only:
+  1. The minimal rule/check,
+  2. Where to apply it (file/script scope),
+  3. A concrete command if applicable.
+- Keep this file concise: prefer editing existing bullets over adding new sections when possible.
+
+Parallel-task safety (must-follow)
+
+- Do not assume linear task history.
+- Before acting on prior notes/summaries, verify on-disk truth via targeted reads and/or `git diff`.
+- If task notes and repo state disagree, trust repo state and update notes.
+
+Quarterly cleanup rule for this file
+
+- If a rule has not been relevant for ~90 days (or is superseded), remove or merge it.
+- Collapse duplicate guidance to keep onboarding fast.
+
+Fast loop at task end (30-60 seconds)
+
+1. Ask: "What slowed me down most?"
+2. If preventable, update `tmp/copilot-mistakes.json` (`count += 1`).
+3. If promotion criteria met, patch this file in the smallest possible edit.
+4. Prefer adding a validation command to scripts/CI over adding prose-only warnings.
+5. Update `tmp/copilot-task-notes.md`: record decisions made, confusion traps hit, any in-progress
+   work. Keep it concise — this is for your future self after context summarization.
+6. Before handoff, run `pnpm run preflight` (or `pnpm run preflight -- --strict`) so high-value
+   checks are selected from context automatically.
+
+Contact & follow-ups
+
+- If anything in the instructions is unclear, ask which _behavior_ or _test_ to preserve — provide
+  the failing `tests/out/*.json` and the test name.
+
 ---
 
 These notes help AI coding agents be immediately productive. The document has two parts:

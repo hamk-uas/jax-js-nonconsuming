@@ -106,7 +106,18 @@ class PartialVal {
   }
 }
 
-function partialEvalFlat(
+/**
+ * Phase 1 of partial evaluation: trace `f` under a PartialEvalTrace and
+ * produce a forward jaxpr together with PE intermediates for ownership disposal.
+ *
+ * This is the core of partial evaluation. The returned intermediates must be
+ * disposed by the caller via `ResidualCollector.dispose()` (or a future
+ * `ResidualCollector`) to balance rc=1 from creation.
+ *
+ * Extracted from `partialEvalFlat` in M1.1 to enable composition with
+ * `buildBackwardJaxpr` and future artifact types.
+ */
+function buildForwardJaxpr(
   f: (...args: any[]) => any,
   pvalsIn: PartialVal[],
 ): {
@@ -194,6 +205,19 @@ function partialEvalFlat(
     literalIntermediates,
   };
 }
+
+/** Thin wrapper for backward compatibility. Delegates to `buildForwardJaxpr`. */
+function _partialEvalFlat(
+  f: (...args: any[]) => any,
+  pvalsIn: PartialVal[],
+): {
+  jaxpr: ClosedJaxpr;
+  pvalsOut: PartialVal[];
+  peIntermediates: Tracer[];
+  literalIntermediates: Tracer[];
+} {
+  return buildForwardJaxpr(f, pvalsIn);
+}
 /**
  * Unwrap tracer wrappers (BatchTracer, etc.) to find the underlying concrete
  * Array. Chases the `.val` chain until it reaches a non-wrapper value.
@@ -210,53 +234,71 @@ function unwrapToConcreteArray(t: Tracer): Tracer {
 }
 
 /**
- * Dispose PE intermediates that aren't outputs or externally captured.
- * During PE, all-known evaluations create concrete arrays. Output values
- * (in protectedVals) are returned to the caller. ClosedJaxpr consts have
- * independent ownership via .ref in partialEvalGraphToJaxpr. Everything
- * else (pure intermediates AND computed consts) needs one dispose here
- * to balance the rc=1 from creation.
+ * Collects PE intermediates from a forward partial-evaluation pass and
+ * provides a `dispose(protectedVals)` method for deterministic cleanup.
+ *
+ * This class encapsulates the `disposePeIntermediates` logic: it owns the
+ * list of PE intermediates and literal intermediates, and disposes those
+ * that are NOT in the protected set (outputs, aux captures, low-rc consts).
+ *
+ * Precursor to `ResidualPack` in the AOT linearization artifact model.
+ * Extracted in M1.3.
  */
-function disposePeIntermediates(
-  peIntermediates: Tracer[],
-  _literalIntermediates: Tracer[],
-  protectedVals: Set<Tracer>,
-): void {
-  if (insideAbstractTrace()) return;
-  // Build a protection set that includes both the wrapper tracers and their
-  // underlying concrete arrays. PE-created arrays (peIntermediates) are raw
-  // Arrays, but protectedVals may contain BatchTracers wrapping those arrays.
-  // Without unwrapping, identity checks fail through the wrapper layer.
-  //
-  // CRITICAL: Multiple wrappers can share the same underlying concrete array
-  // (e.g., Reduce with axis=[] returns the input as-is, so both the
-  // intermediate and the output wrap the same raw Array). We must protect
-  // the concrete array from disposal via ANY wrapper, not just the one
-  // in protectedVals.
-  const allProtected = new Set<Tracer>(protectedVals);
-  for (const v of protectedVals) {
-    const concrete = unwrapToConcreteArray(v);
-    if (concrete !== v) allProtected.add(concrete);
+class ResidualCollector {
+  readonly peIntermediates: Tracer[];
+  readonly literalIntermediates: Tracer[];
+
+  constructor(peIntermediates: Tracer[], literalIntermediates: Tracer[]) {
+    this.peIntermediates = peIntermediates;
+    this.literalIntermediates = literalIntermediates;
   }
-  const targets = peIntermediates;
-  const disposed = new Set<Tracer>();
-  for (const t of targets) {
-    if (allProtected.has(t)) continue;
-    if (disposed.has(t)) continue;
-    // Before disposing a wrapper, check if its underlying concrete array
-    // is protected. If so, skip this disposal entirely — cascading would
-    // free the protected array.
-    const concrete = unwrapToConcreteArray(t);
-    if (concrete !== t && allProtected.has(concrete)) continue;
-    disposed.add(t);
-    // Mark the unwrapped concrete array as disposed too, so the raw Array
-    // entry in peIntermediates (from _peArrayCreationTracker) won't
-    // double-free it.
-    if (concrete !== t) disposed.add(concrete);
-    try {
-      t.dispose();
-    } catch {
-      // Already disposed.
+
+  /**
+   * Dispose PE intermediates that aren't protected (outputs, aux, low-rc consts).
+   *
+   * During PE, all-known evaluations create concrete arrays. Output values
+   * (in protectedVals) are returned to the caller. ClosedJaxpr consts have
+   * independent ownership via .ref in partialEvalGraphToJaxpr. Everything
+   * else (pure intermediates AND computed consts) needs one dispose here
+   * to balance the rc=1 from creation.
+   */
+  dispose(protectedVals: Set<Tracer>): void {
+    if (insideAbstractTrace()) return;
+    // Build a protection set that includes both the wrapper tracers and their
+    // underlying concrete arrays. PE-created arrays (peIntermediates) are raw
+    // Arrays, but protectedVals may contain BatchTracers wrapping those arrays.
+    // Without unwrapping, identity checks fail through the wrapper layer.
+    //
+    // CRITICAL: Multiple wrappers can share the same underlying concrete array
+    // (e.g., Reduce with axis=[] returns the input as-is, so both the
+    // intermediate and the output wrap the same raw Array). We must protect
+    // the concrete array from disposal via ANY wrapper, not just the one
+    // in protectedVals.
+    const allProtected = new Set<Tracer>(protectedVals);
+    for (const v of protectedVals) {
+      const concrete = unwrapToConcreteArray(v);
+      if (concrete !== v) allProtected.add(concrete);
+    }
+    const targets = this.peIntermediates;
+    const disposed = new Set<Tracer>();
+    for (const t of targets) {
+      if (allProtected.has(t)) continue;
+      if (disposed.has(t)) continue;
+      // Before disposing a wrapper, check if its underlying concrete array
+      // is protected. If so, skip this disposal entirely — cascading would
+      // free the protected array.
+      const concrete = unwrapToConcreteArray(t);
+      if (concrete !== t && allProtected.has(concrete)) continue;
+      disposed.add(t);
+      // Mark the unwrapped concrete array as disposed too, so the raw Array
+      // entry in peIntermediates (from _peArrayCreationTracker) won't
+      // double-free it.
+      if (concrete !== t) disposed.add(concrete);
+      try {
+        t.dispose();
+      } catch {
+        // Already disposed.
+      }
     }
   }
 }
@@ -276,22 +318,27 @@ function collectConcreteArrays(value: any): Tracer[] {
   return result;
 }
 
+/** Result of linearizeFlatUtil: forward jaxpr + primals + disposal collector. */
+export interface ForwardResult {
+  primalsOut: Tracer[];
+  jaxpr: ClosedJaxpr;
+  collector: ResidualCollector;
+}
+
 /**
  * Helper function with shared Jaxpr logic between linearize and vjp.
  *
  * Internally, vjp() looks very similar to linearize() but returns a function
  * evaluating the "transposed" linearized Jaxpr, pulling back cotangents instead
  * of pushing forward tangents.
+ *
+ * Uses `buildForwardJaxpr` (M1.1) and returns a `ResidualCollector` (M1.3)
+ * instead of raw intermediate arrays.
  */
-function linearizeFlatUtil(
+export function linearizeFlatUtil(
   f: (...args: any[]) => any,
   primalsIn: Tracer[],
-): {
-  primalsOut: Tracer[];
-  jaxpr: ClosedJaxpr;
-  peIntermediates: Tracer[];
-  literalIntermediates: Tracer[];
-} {
+): ForwardResult {
   const pvalsIn = [
     ...primalsIn.map(PartialVal.known),
     ...primalsIn.map((t) => PartialVal.unknown(t.aval)),
@@ -303,13 +350,17 @@ function linearizeFlatUtil(
     return [...primalsOut, ...tangentsOut];
   };
   const { jaxpr, pvalsOut, peIntermediates, literalIntermediates } =
-    partialEvalFlat(fJvp, pvalsIn);
+    buildForwardJaxpr(fJvp, pvalsIn);
   const primalPvals = pvalsOut.slice(0, pvalsOut.length / 2);
   if (!primalPvals.every((pval) => pval.isKnown)) {
     throw new Error("Not all primal values are known after partial evaluation");
   }
   const primalsOut = primalPvals.map((pval) => pval.val!);
-  return { primalsOut, jaxpr, peIntermediates, literalIntermediates };
+  const collector = new ResidualCollector(
+    peIntermediates,
+    literalIntermediates,
+  );
+  return { primalsOut, jaxpr, collector };
 }
 
 function linearizeFlat(
@@ -317,12 +368,11 @@ function linearizeFlat(
   primalsIn: Tracer[],
   auxStore?: { value: any },
 ): [Tracer[], (...args: Tracer[]) => Tracer[], () => void] {
-  const { primalsOut, jaxpr, peIntermediates, literalIntermediates } =
-    linearizeFlatUtil(f, primalsIn);
+  const { primalsOut, jaxpr, collector } = linearizeFlatUtil(f, primalsIn);
   // Protect primalsOut + concrete arrays underlying aux captures
   const protectedVals = new Set<Tracer>(primalsOut);
   // Protect jaxpr consts whose creation ref was already consumed by user disposal.
-  // Normal consts have rc>=2 (creation + instantiateConst); disposePeIntermediates
+  // Normal consts have rc>=2 (creation + instantiateConst); ResidualCollector.dispose
   // safely takes the creation ref. But if user code inside the traced function
   // disposed a const (e.g. initVal.dispose() in a grad body), rc=1 and disposal
   // would kill ClosedJaxpr's ownership.
@@ -334,7 +384,7 @@ function linearizeFlat(
       protectedVals.add(arr);
     }
   }
-  disposePeIntermediates(peIntermediates, literalIntermediates, protectedVals);
+  collector.dispose(protectedVals);
   const fLin = (...tangents: Tracer[]) =>
     evalJaxpr(jaxpr.jaxpr, [...jaxpr.consts.map((c) => c.ref), ...tangents]);
   const dispose = () => jaxpr.dispose();
@@ -487,7 +537,7 @@ class PartialEvalTrace extends Trace {
 
   pure(val: TracerValue): Tracer {
     const arr = pureArray(val);
-    // Track literal-created Arrays so disposePeIntermediates can clean them up.
+    // Track literal-created Arrays so ResidualCollector can clean them up.
     // pureArray() returns existing Tracers as-is, so non-Tracer inputs (numbers,
     // TypedArrays) produce genuinely new allocations that need disposal.
     // Without this, literals used as args in JVP rules (0.0, 1.0, etc.) leak
@@ -2195,13 +2245,58 @@ function transposeJaxpr(jaxpr: Jaxpr, undefPrimals: boolean[]): ClosedJaxpr {
   return newJaxpr;
 }
 
+/**
+ * Phase 2 of partial evaluation: transpose a forward jaxpr to produce a
+ * backward jaxpr suitable for VJP/grad.
+ *
+ * This is a thin wrapper around `transposeJaxpr` that constructs the
+ * `undefPrimals` mask from the forward jaxpr's input count and the number
+ * of primals. In the forward jaxpr, the inputs are `[...consts, ...primals, ...tangents]`.
+ * The `undefPrimals` mask marks which inputs should be treated as
+ * unknowns in the transpose (i.e., the tangent slots → true, primal slots → false).
+ *
+ * Extracted from `vjpFlat` in M1.2 to enable composition with
+ * `buildForwardJaxpr` and future artifact types.
+ */
+export function buildBackwardJaxpr(forwardJaxpr: ClosedJaxpr): ClosedJaxpr {
+  // The forward jaxpr's inBinders are [...constVars, ...tangentVars].
+  // constVars correspond to the residuals from partial evaluation (known
+  // in the backward pass). tangentVars correspond to the JVP tangent
+  // inputs (unknown — we want gradients w.r.t. them).
+  const numConsts = forwardJaxpr.consts.length;
+  const undefPrimals = forwardJaxpr.jaxpr.inBinders.map(
+    (_, i) => i >= numConsts,
+  );
+
+  // Build a fresh backward jaxpr. We bypass transposeJaxprCache because
+  // the returned ClosedJaxpr will be owned (and disposed) by the caller
+  // (PullbackArtifact). Caching would create stale-entry hazards.
+  const jaxpr = forwardJaxpr.jaxpr;
+  const { inTypes, outTypes } = typecheckJaxpr(jaxpr);
+  const forwardInTypes = inTypes.filter((_, i) => !undefPrimals[i]);
+
+  const { jaxpr: newJaxpr } = makeJaxpr(
+    (forwardIn: Tracer[], cotangents: Tracer[]) => {
+      const args: (Tracer | UndefPrimal)[] = [];
+      let forwardInIdx = 0;
+      for (let i = 0; i < undefPrimals.length; i++) {
+        if (undefPrimals[i]) args.push(new UndefPrimal(inTypes[i]));
+        else args.push(forwardIn[forwardInIdx++]);
+      }
+      return evalJaxprTransposed(jaxpr, args, cotangents);
+    },
+    { validateRefs: false },
+  )(forwardInTypes, outTypes);
+  typecheckJaxpr(newJaxpr.jaxpr);
+  return newJaxpr;
+}
+
 function vjpFlat(
   f: (...x: Tracer[]) => Tracer[],
   primalsIn: Tracer[],
   auxStore?: { value: any },
 ): [Tracer[], (...cotangents: Tracer[]) => Tracer[], () => void] {
-  const { primalsOut, jaxpr, peIntermediates, literalIntermediates } =
-    linearizeFlatUtil(f, primalsIn);
+  const { primalsOut, jaxpr, collector } = linearizeFlatUtil(f, primalsIn);
   // Protect primalsOut + concrete arrays underlying aux captures
   const protectedVals = new Set<Tracer>(primalsOut);
   // Protect jaxpr consts whose creation ref was already consumed by user disposal.
@@ -2214,7 +2309,7 @@ function vjpFlat(
       protectedVals.add(arr);
     }
   }
-  disposePeIntermediates(peIntermediates, literalIntermediates, protectedVals);
+  collector.dispose(protectedVals);
 
   // Flush primals' pending backend dispatches. PE tracing created concrete
   // forward-pass arrays with lazy PendingExecute chains. Submitting them

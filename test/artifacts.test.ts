@@ -2,10 +2,11 @@
  * @file Tests for AOT linearization artifacts.
  *
  * M0.3: Placeholder tests that import types and verify they exist.
- * Later milestones (M2.x) will add real correctness and leak tests.
+ * M2: Real correctness, reuse, and leak tests.
  */
 import { describe, expect, it } from "vitest";
 
+import { init, numpy as np } from "../src";
 import { aotLinearize } from "../src/frontend/artifacts";
 import type {
   AotLinearizeResult,
@@ -14,15 +15,11 @@ import type {
   ResidualPack,
 } from "../src/frontend/artifacts";
 
+await init("wasm");
+
 describe("artifact type stubs", () => {
   it("aotLinearize is a function", () => {
     expect(typeof aotLinearize).toBe("function");
-  });
-
-  it("aotLinearize throws not-yet-implemented", () => {
-    expect(() => aotLinearize(() => [], [])).toThrow(
-      "aotLinearize: not yet implemented",
-    );
   });
 
   it("artifact interfaces are importable", () => {
@@ -35,5 +32,186 @@ describe("artifact type stubs", () => {
     expect(_p).toBeNull();
     expect(_pb).toBeNull();
     expect(_r).toBeNull();
+  });
+});
+
+describe("ResidualPack", () => {
+  it("arrays returns arrays before disposal", () => {
+    const f = (x: any) => [np.sin(x)];
+    using x = np.array([1.0]);
+    const { primal, pullback } = aotLinearize(f, [x]);
+    const { primalsOut, residuals } = primal.run([x]);
+
+    expect(residuals.consumed).toBe(false);
+    expect(residuals.arrays.length).toBeGreaterThan(0);
+
+    residuals[Symbol.dispose]();
+    primalsOut.forEach((p: any) => p.dispose());
+    primal[Symbol.dispose]();
+    pullback[Symbol.dispose]();
+  });
+
+  it("arrays after dispose throws ReferenceError", () => {
+    const f = (x: any) => [np.sin(x)];
+    using x = np.array([1.0]);
+    const { primal, pullback } = aotLinearize(f, [x]);
+    const { primalsOut, residuals } = primal.run([x]);
+
+    residuals[Symbol.dispose]();
+    expect(residuals.consumed).toBe(true);
+    expect(() => residuals.arrays).toThrow(ReferenceError);
+
+    primalsOut.forEach((p: any) => p.dispose());
+    primal[Symbol.dispose]();
+    pullback[Symbol.dispose]();
+  });
+});
+
+describe("PullbackArtifact", () => {
+  it("run produces correct gradients for sin", async () => {
+    const f = (x: any) => [np.sin(x)];
+    using x = np.array([1.0]);
+    const { primal, pullback } = aotLinearize(f, [x]);
+    const { primalsOut, residuals } = primal.run([x]);
+
+    // sin(1.0) ≈ 0.8415
+    const sinVal = await (primalsOut[0] as any).data();
+    expect(sinVal[0]).toBeCloseTo(Math.sin(1.0), 4);
+
+    // grad(sin)(1.0) = cos(1.0) ≈ 0.5403
+    using ct = np.array([1.0]);
+    const grads = pullback.run(residuals, [ct]);
+    expect(grads.length).toBe(1);
+    const gradVal = await (grads[0] as any).data();
+    expect(gradVal[0]).toBeCloseTo(Math.cos(1.0), 4);
+
+    grads.forEach((g: any) => g.dispose());
+    residuals[Symbol.dispose]();
+    primalsOut.forEach((p: any) => p.dispose());
+    primal[Symbol.dispose]();
+    pullback[Symbol.dispose]();
+  });
+
+  it("run can be called multiple times (reusability)", async () => {
+    const f = (x: any) => [np.sin(x)];
+    using x = np.array([1.0]);
+    const { primal, pullback } = aotLinearize(f, [x]);
+    const { primalsOut, residuals } = primal.run([x]);
+
+    // First call with ct=1
+    using ct1 = np.array([1.0]);
+    const grads1 = pullback.run(residuals, [ct1]);
+    const g1 = await (grads1[0] as any).data();
+    grads1.forEach((g: any) => g.dispose());
+
+    // Second call with ct=2
+    using ct2 = np.array([2.0]);
+    const grads2 = pullback.run(residuals, [ct2]);
+    const g2 = await (grads2[0] as any).data();
+    grads2.forEach((g: any) => g.dispose());
+
+    expect(g1[0]).toBeCloseTo(Math.cos(1.0), 4);
+    expect(g2[0]).toBeCloseTo(2 * Math.cos(1.0), 4);
+
+    residuals[Symbol.dispose]();
+    primalsOut.forEach((p: any) => p.dispose());
+    primal[Symbol.dispose]();
+    pullback[Symbol.dispose]();
+  });
+
+  it("after dispose throws ReferenceError", () => {
+    const f = (x: any) => [np.sin(x)];
+    using x = np.array([1.0]);
+    const { primal, pullback } = aotLinearize(f, [x]);
+    const { primalsOut, residuals } = primal.run([x]);
+
+    pullback[Symbol.dispose]();
+    using ct = np.array([1.0]);
+    expect(() => pullback.run(residuals, [ct])).toThrow(ReferenceError);
+
+    residuals[Symbol.dispose]();
+    primalsOut.forEach((p: any) => p.dispose());
+    primal[Symbol.dispose]();
+  });
+});
+
+describe("PrimalArtifact", () => {
+  it("run produces correct primal outputs", async () => {
+    const f = (x: any) => [x.mul(x)];
+    using x = np.array([3.0]);
+    const { primal, pullback } = aotLinearize(f, [x]);
+    const { primalsOut, residuals } = primal.run([x]);
+
+    const val = await (primalsOut[0] as any).data();
+    expect(val[0]).toBeCloseTo(9.0, 4);
+
+    residuals[Symbol.dispose]();
+    primalsOut.forEach((p: any) => p.dispose());
+    primal[Symbol.dispose]();
+    pullback[Symbol.dispose]();
+  });
+
+  it("after dispose throws ReferenceError", () => {
+    const f = (x: any) => [np.sin(x)];
+    using x = np.array([1.0]);
+    const { primal, pullback } = aotLinearize(f, [x]);
+
+    primal[Symbol.dispose]();
+    expect(() => primal.run([x])).toThrow(ReferenceError);
+    expect(() => primal.forwardJaxpr).toThrow(ReferenceError);
+
+    pullback[Symbol.dispose]();
+  });
+});
+
+describe("aotLinearize integration", () => {
+  it("produces correct grad for polynomial x^3", async () => {
+    const f = (x: any) => {
+      using x2 = x.mul(x) as any;
+      return [x2.mul(x)];
+    };
+    using x = np.array([2.0]);
+    const { primal, pullback } = aotLinearize(f, [x]);
+    const { primalsOut, residuals } = primal.run([x]);
+
+    // f(2) = 8
+    const val = await (primalsOut[0] as any).data();
+    expect(val[0]).toBeCloseTo(8.0, 4);
+
+    // f'(x) = 3x^2, f'(2) = 12
+    using ct = np.array([1.0]);
+    const grads = pullback.run(residuals, [ct]);
+    const gradVal = await (grads[0] as any).data();
+    expect(gradVal[0]).toBeCloseTo(12.0, 4);
+
+    grads.forEach((g: any) => g.dispose());
+    residuals[Symbol.dispose]();
+    primalsOut.forEach((p: any) => p.dispose());
+    primal[Symbol.dispose]();
+    pullback[Symbol.dispose]();
+  });
+
+  it("residual from primal feeds into pullback correctly", async () => {
+    // exp(x) — simple function where residuals are the forward-pass values
+    const f = (x: any) => [np.exp(x)];
+    using x = np.array([1.0]);
+    const { primal, pullback } = aotLinearize(f, [x]);
+    const { primalsOut, residuals } = primal.run([x]);
+
+    // exp(1) ≈ 2.7183
+    const val = await (primalsOut[0] as any).data();
+    expect(val[0]).toBeCloseTo(Math.exp(1.0), 3);
+
+    // grad(exp)(1) = exp(1) ≈ 2.7183
+    using ct = np.array([1.0]);
+    const grads = pullback.run(residuals, [ct]);
+    const gradVal = await (grads[0] as any).data();
+    expect(gradVal[0]).toBeCloseTo(Math.exp(1.0), 3);
+
+    grads.forEach((g: any) => g.dispose());
+    residuals[Symbol.dispose]();
+    primalsOut.forEach((p: any) => p.dispose());
+    primal[Symbol.dispose]();
+    pullback[Symbol.dispose]();
   });
 });
