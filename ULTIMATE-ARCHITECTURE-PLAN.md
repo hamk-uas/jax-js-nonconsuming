@@ -25,9 +25,12 @@ performance on the table due to four architectural bottlenecks:
    time.
 4. **Single-Threaded Wasm:** The Wasm backend currently runs on a single CPU thread, ignoring modern
    multi-core browser capabilities.
+5. **JIT Compilation Overhead for Variable-Length Data:** Currently, array dimensions are baked into
+   the JIT compilation. If a time series length changes, the entire program must be retraced and
+   recompiled, causing severe latency spikes in dynamic workloads like trend analysis.
 
-This plan resolves all four bottlenecks, culminating in a "Mega-Module" Wasm compiler and a
-highly-fused WebGPU pipeline.
+This plan resolves all five bottlenecks, culminating in a "Mega-Module" Wasm compiler, polymorphic
+shapes, and a highly-fused WebGPU pipeline.
 
 ---
 
@@ -103,17 +106,43 @@ successfully emits single WGSL/Wasm kernels that write to multiple output buffer
 
 ---
 
-### M3 — Wasm Multithreading Foundation (5–7 days)
+### M3 — Polymorphic Shapes (Dynamic Dimensions) (4–6 days)
+
+Eliminate JIT recompilation for variable-length data by allowing users to specify which axes are
+dynamic (symbolic) rather than constant-size.
+
+#### M3.1 — Symbolic Shape IR & Tracing
+
+**What:** Update `ShapeTracker` and `Jaxpr` to support symbolic dimensions (e.g., `["T", 64]`).
+
+- Add an opt-in API to `jit`: `jit(f, { dynamic_axes: { 0: "time" } })`.
+- Update `effectDrivenAllocate` to emit `malloc` steps with symbolic size formulas instead of static
+  byte counts. **Exit criteria:** Jaxpr tracing successfully propagates symbolic dimensions through
+  standard operations without throwing shape mismatch errors.
+
+#### M3.2 — Parameterized Backend Codegen
+
+**What:** Update Wasm and WebGPU codegen to accept dynamic dimensions as runtime arguments.
+
+- **Wasm:** Pass symbols as Wasm function parameters. Disable loop unrolling for dynamic axes.
+- **WebGPU:** Pass symbols via a dedicated Uniform buffer. Compute `dispatchWorkgroups` dynamically
+  in JS before submission. **Exit criteria:** A JIT-compiled function can be called with `[100, 64]`
+  and `[150, 64]` inputs without triggering a recompilation, producing correct results on both
+  backends.
+
+---
+
+### M4 — Wasm Multithreading Foundation (5–7 days)
 
 Saturate the CPU by parallelizing the Wasm backend.
 
-#### M3.1 — `SharedArrayBuffer` Memory Pool
+#### M4.1 — `SharedArrayBuffer` Memory Pool
 
 **What:** Upgrade `WasmAllocator` to use `WebAssembly.Memory({ shared: true })` when
 `crossOriginIsolated` is true. **Exit criteria:** The Wasm backend functions correctly
 (sequentially) using shared memory.
 
-#### M3.2 — `WasmWorkerPool`
+#### M4.2 — `WasmWorkerPool`
 
 **What:** Implement a pool of Web Workers initialized at backend startup.
 
@@ -121,7 +150,7 @@ Saturate the CPU by parallelizing the Wasm backend.
 - Implement a lightweight synchronization primitive using `Atomics.wait` and `Atomics.notify`.
   **Exit criteria:** Worker pool initializes cleanly and can execute basic tasks.
 
-#### M3.3 — Parallel `wasmblr` Loops
+#### M4.3 — Parallel `wasmblr` Loops
 
 **What:** Add `parallelForLoop` to `wasmblr-hl.ts`.
 
@@ -131,22 +160,22 @@ Saturate the CPU by parallelizing the Wasm backend.
 
 ---
 
-### M4 — Whole-Program Wasm Compilation (The "Mega-Module") (6–8 days)
+### M5 — Whole-Program Wasm Compilation (The "Mega-Module") (6–8 days)
 
 Eliminate the JS ↔ Wasm boundary entirely for JIT programs.
 
-#### M4.1 — `JitProgram` to Wasm Translator
+#### M5.1 — `JitProgram` to Wasm Translator
 
 **What:** Instead of executing `JitStep`s in a JS loop, write a compiler pass that translates the
 entire `JitProgram` into a single `wasmblr` module.
 
-- `malloc` and `recycle` steps become simple pointer arithmetic (integer additions) inside the Wasm
-  module's local state.
+- `malloc` and `recycle` steps become dynamic pointer arithmetic inside the Wasm module's local
+  state, evaluating the polymorphic shape formulas (from M3) at runtime.
 - `execute` steps (Kernels and Routines) are inlined as Wasm function calls within the module.
   **Exit criteria:** A JIT program with 50 operations compiles to 1 Wasm module and executes with 1
   JS call.
 
-#### M4.2 — Mega-Module Multithreading
+#### M5.2 — Mega-Module Multithreading
 
 **What:** Ensure the Mega-Module correctly dispatches parallelizable loops to the `WasmWorkerPool`
 without returning to JS. **Exit criteria:** Complex neural network forward passes execute entirely
@@ -154,11 +183,11 @@ in native Wasm, utilizing all CPU cores, with zero JS overhead.
 
 ---
 
-### M5 — First-Class `associativeScan` (4–6 days)
+### M6 — First-Class `associativeScan` (4–6 days)
 
 Fix the O(N) WebGPU bottleneck and O(log N) Wasm overhead for parallel prefix scans.
 
-#### M5.1 — `Primitive.AssociativeScan`
+#### M6.1 — `Primitive.AssociativeScan`
 
 **What:** Promote `associativeScan` from a high-level unrolled function to a core `Primitive`.
 
@@ -166,7 +195,7 @@ Fix the O(N) WebGPU bottleneck and O(log N) Wasm overhead for parallel prefix sc
   than exploding into massive Jaxprs). **Exit criteria:** `grad(associativeScan)` produces a
   compact, O(1) depth Jaxpr.
 
-#### M5.2 — Native `associativeScan` Compilers
+#### M6.2 — Native `associativeScan` Compilers
 
 **What:**
 
@@ -179,26 +208,27 @@ Fix the O(N) WebGPU bottleneck and O(log N) Wasm overhead for parallel prefix sc
 
 ---
 
-### M6 — Cleanup, Benchmarking & Documentation (2–3 days)
+### M7 — Cleanup, Benchmarking & Documentation (2–3 days)
 
-#### M6.1 — Benchmark Suite
+#### M7.1 — Benchmark Suite
 
-**What:** Create a comprehensive benchmark suite comparing M0 baselines to M5.
+**What:** Create a comprehensive benchmark suite comparing M0 baselines to M6.
 
 - Focus on: Embedding layer backward pass (`scatter_add`), `matmul+relu` fusion, and Wasm
   Mega-Module latency. **Exit criteria:** Benchmark report generated and saved to
   `docs/ULTIMATE-BENCHMARKS.md`.
 
-#### M6.2 — Documentation
+#### M7.2 — Documentation
 
 **What:** Update `copilot-instructions.md` to document:
 
 - How to write Epilogue-fused Routines.
 - The Wasm Mega-Module architecture and Worker Pool.
-- The `scatter_add` primitive and WebGPU CAS loops. **Exit criteria:** Documentation reflects the
-  new architecture.
+- The `scatter_add` primitive and WebGPU CAS loops.
+- Polymorphic shapes and dynamic dimensions. **Exit criteria:** Documentation reflects the new
+  architecture.
 
-#### M6.3 — Final Regression Run
+#### M7.3 — Final Regression Run
 
 **What:** Full CI-equivalent check. **Exit criteria:** All checks pass. Zero regressions from M0
 baseline.
@@ -214,15 +244,17 @@ M0.1 (baseline) ──→ M0.2 (feature detection)
   │
   ├─→ M2.1 (Multi-output) ──→ M2.2 (Epilogue Fusion)
   │
-  ├─→ M3.1 (SharedArrayBuffer) ──→ M3.2 (Worker Pool) ──→ M3.3 (Parallel Wasm)
+  ├─→ M3.1 (Symbolic Shape IR) ──→ M3.2 (Parameterized Codegen)
+  │                                      │
+  ├─→ M4.1 (SharedArrayBuffer) ──→ M4.2 (Worker Pool) ──→ M4.3 (Parallel Wasm)
   │                                                              │
   │                                                              ↓
-  └─→ M4.1 (Mega-Module Compiler) ─────────────────────────→ M4.2 (Mega-Module + Threads)
+  └─→ M5.1 (Mega-Module Compiler) ─────────────────────────→ M5.2 (Mega-Module + Threads)
                                                                  │
-  M5.1 (assocScan Primitive) ──→ M5.2 (Native assocScan) ────────┤
+  M6.1 (assocScan Primitive) ──→ M6.2 (Native assocScan) ────────┤
                                                                  │
                                                                  ↓
-                                                          M6.1 - M6.3 (Cleanup)
+                                                          M7.1 - M7.3 (Cleanup)
 ```
 
 ## Risk Register
@@ -233,6 +265,7 @@ M0.1 (baseline) ──→ M0.2 (feature detection)
 | WebGPU CAS loop for `f32` is too slow                   | `scatter_add` bottlenecks training | Optimize CAS loop; rely on `shader-f32-atomic-add` where available; batch updates if possible.                     |
 | Mega-Module compilation time is too high                | JIT latency spikes                 | Cache Mega-Modules aggressively; use `wasmblr`'s fast generation; defer heavy optimizations to background threads. |
 | Epilogue fusion register pressure                       | WebGPU/Wasm register spilling      | Limit epilogue complexity; fallback to standard VRAM round-trip if epilogue exceeds heuristic cost.                |
+| Polymorphic shapes break routine unrolling              | Wasm routines slow down            | Keep static sizes as the default; only use dynamic loops for explicitly marked dynamic axes.                       |
 
 ## Estimated Timeline
 
@@ -241,16 +274,17 @@ M0.1 (baseline) ──→ M0.2 (feature detection)
 | M0        | 1–2 days | 1–2 days   |
 | M1        | 4–6 days | 5–8 days   |
 | M2        | 5–7 days | 10–15 days |
-| M3        | 5–7 days | 15–22 days |
-| M4        | 6–8 days | 21–30 days |
-| M5        | 4–6 days | 25–36 days |
-| M6        | 2–3 days | 27–39 days |
+| M3        | 4–6 days | 14–21 days |
+| M4        | 5–7 days | 19–28 days |
+| M5        | 6–8 days | 25–36 days |
+| M6        | 4–6 days | 29–42 days |
+| M7        | 2–3 days | 31–45 days |
 
-Total: **4–6 weeks** of focused implementation by a tireless agent.
+Total: **5–7 weeks** of focused implementation by a tireless agent.
 
 ## Commit Strategy
 
-- One commit per task (M0.1, M0.2, ..., M6.3).
+- One commit per task (M0.1, M0.2, ..., M7.3).
 - Commit message format: `ultimate M{n}.{m}: {short description}`
 - Every commit must pass `pnpm vitest run`.
-- Branch off `main` at start. Merge back after M6.3 passes full CI.
+- Branch off `main` at start. Merge back after M7.3 passes full CI.
