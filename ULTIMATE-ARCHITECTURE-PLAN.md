@@ -56,12 +56,32 @@ by this plan.
 
 ---
 
-### M1 — The Missing Primitive: `scatter_add` & Atomics (4–6 days)
+### M1 — Technical Debt & Architecture Unification (2–3 days)
+
+Before building the Mega-Module, we must resolve the remaining architectural debt from the AOT
+Linearization and Effect-Typed IR phases.
+
+#### M1.1 — Unify `vjpFlat` and `aotLinearize`
+
+**What:** Currently, `vjpFlat` uses a call-time-transpose fallback for scan-containing jaxprs,
+bypassing `aotLinearize`. Unify these into a single artifact-based ownership codepath for backward
+pass construction. **Exit criteria:** `vjpFlat` uses the same artifact-driven lifecycle as
+`aotLinearize`, eliminating the dual-codepath maintenance burden.
+
+#### M1.2 — Resolve `scan-executor.ts` P0 Hack
+
+**What:** Remove the `HACK: P0 hack — slot swap` in the scan executor. **Exit criteria:** Scan
+execution uses a clean, deterministic memory model that can be safely compiled into the Wasm
+Mega-Module.
+
+---
+
+### M2 — The Missing Primitive: `scatter_add` & Atomics (4–6 days)
 
 Leverage the `Mutate` effect to implement safe, in-place atomic additions, unlocking embedding
 gradients.
 
-#### M1.1 — `Primitive.ScatterAdd` & AD Rules
+#### M2.1 — `Primitive.ScatterAdd` & AD Rules
 
 **What:** Define `Primitive.ScatterAdd`.
 
@@ -70,7 +90,7 @@ gradients.
   backward pass) and `scatter_add` itself. **Exit criteria:** Jaxpr tracing for `scatter_add` passes
   the static Borrow Checker.
 
-#### M1.2 — WebGPU Atomics (The CAS Loop)
+#### M2.2 — WebGPU Atomics (The CAS Loop)
 
 **What:** Implement `scatter_add` in WGSL.
 
@@ -79,24 +99,24 @@ gradients.
   `bitcast<u32>` to safely accumulate `f32` values across thousands of threads. **Exit criteria:**
   `scatter_add` produces correct results on WebGPU, even with highly duplicated indices.
 
-#### M1.3 — Wasm `scatter_add`
+#### M2.3 — Wasm `scatter_add`
 
 **What:** Implement the sequential Wasm version of `scatter_add` using `wasmblr`. **Exit criteria:**
 Wasm backend passes all `scatter_add` tests.
 
 ---
 
-### M2 — Multi-Output Kernels & Epilogue Fusion (5–7 days)
+### M3 — Multi-Output Kernels & Epilogue Fusion (5–7 days)
 
 Eliminate VRAM round-trips by blurring the line between Kernels and Routines.
 
-#### M2.1 — Multi-Output `Kernel` Support
+#### M3.1 — Multi-Output `Kernel` Support
 
 **What:** Upgrade the `Kernel` class and `splitGraphDataflow` to support fusing operations that
 produce multiple outputs (e.g., complex AD backward passes). **Exit criteria:** The JIT compiler
 successfully emits single WGSL/Wasm kernels that write to multiple output buffers simultaneously.
 
-#### M2.2 — Routine Epilogue Fusion
+#### M3.2 — Routine Epilogue Fusion
 
 **What:** Modify the `Routine` interface to accept an optional `epilogue: Jaxpr`.
 
@@ -106,12 +126,12 @@ successfully emits single WGSL/Wasm kernels that write to multiple output buffer
 
 ---
 
-### M3 — Polymorphic Shapes (Dynamic Dimensions) (4–6 days)
+### M4 — Polymorphic Shapes (Dynamic Dimensions) (4–6 days)
 
 Eliminate JIT recompilation for variable-length data by allowing users to specify which axes are
 dynamic (symbolic) rather than constant-size.
 
-#### M3.1 — Symbolic Shape IR & Tracing
+#### M4.1 — Symbolic Shape IR & Tracing
 
 **What:** Update `ShapeTracker` and `Jaxpr` to support symbolic dimensions (e.g., `["T", 64]`).
 
@@ -120,7 +140,7 @@ dynamic (symbolic) rather than constant-size.
   byte counts. **Exit criteria:** Jaxpr tracing successfully propagates symbolic dimensions through
   standard operations without throwing shape mismatch errors.
 
-#### M3.2 — Parameterized Backend Codegen
+#### M4.2 — Parameterized Backend Codegen
 
 **What:** Update Wasm and WebGPU codegen to accept dynamic dimensions as runtime arguments.
 
@@ -132,17 +152,17 @@ dynamic (symbolic) rather than constant-size.
 
 ---
 
-### M4 — Wasm Multithreading Foundation (5–7 days)
+### M5 — Wasm Multithreading Foundation (5–7 days)
 
 Saturate the CPU by parallelizing the Wasm backend.
 
-#### M4.1 — `SharedArrayBuffer` Memory Pool
+#### M5.1 — `SharedArrayBuffer` Memory Pool
 
 **What:** Upgrade `WasmAllocator` to use `WebAssembly.Memory({ shared: true })` when
 `crossOriginIsolated` is true. **Exit criteria:** The Wasm backend functions correctly
 (sequentially) using shared memory.
 
-#### M4.2 — `WasmWorkerPool`
+#### M5.2 — `WasmWorkerPool`
 
 **What:** Implement a pool of Web Workers initialized at backend startup.
 
@@ -150,7 +170,7 @@ Saturate the CPU by parallelizing the Wasm backend.
 - Implement a lightweight synchronization primitive using `Atomics.wait` and `Atomics.notify`.
   **Exit criteria:** Worker pool initializes cleanly and can execute basic tasks.
 
-#### M4.3 — Parallel `wasmblr` Loops
+#### M5.3 — Parallel `wasmblr` Loops
 
 **What:** Add `parallelForLoop` to `wasmblr-hl.ts`.
 
@@ -160,22 +180,22 @@ Saturate the CPU by parallelizing the Wasm backend.
 
 ---
 
-### M5 — Whole-Program Wasm Compilation (The "Mega-Module") (6–8 days)
+### M6 — Whole-Program Wasm Compilation (The "Mega-Module") (6–8 days)
 
 Eliminate the JS ↔ Wasm boundary entirely for JIT programs.
 
-#### M5.1 — `JitProgram` to Wasm Translator
+#### M6.1 — `JitProgram` to Wasm Translator
 
 **What:** Instead of executing `JitStep`s in a JS loop, write a compiler pass that translates the
 entire `JitProgram` into a single `wasmblr` module.
 
 - `malloc` and `recycle` steps become dynamic pointer arithmetic inside the Wasm module's local
-  state, evaluating the polymorphic shape formulas (from M3) at runtime.
+  state, evaluating the polymorphic shape formulas (from M4) at runtime.
 - `execute` steps (Kernels and Routines) are inlined as Wasm function calls within the module.
   **Exit criteria:** A JIT program with 50 operations compiles to 1 Wasm module and executes with 1
   JS call.
 
-#### M5.2 — Mega-Module Multithreading
+#### M6.2 — Mega-Module Multithreading
 
 **What:** Ensure the Mega-Module correctly dispatches parallelizable loops to the `WasmWorkerPool`
 without returning to JS. **Exit criteria:** Complex neural network forward passes execute entirely
@@ -183,11 +203,11 @@ in native Wasm, utilizing all CPU cores, with zero JS overhead.
 
 ---
 
-### M6 — First-Class `associativeScan` (4–6 days)
+### M7 — First-Class `associativeScan` (4–6 days)
 
 Fix the O(N) WebGPU bottleneck and O(log N) Wasm overhead for parallel prefix scans.
 
-#### M6.1 — `Primitive.AssociativeScan`
+#### M7.1 — `Primitive.AssociativeScan`
 
 **What:** Promote `associativeScan` from a high-level unrolled function to a core `Primitive`.
 
@@ -195,7 +215,7 @@ Fix the O(N) WebGPU bottleneck and O(log N) Wasm overhead for parallel prefix sc
   than exploding into massive Jaxprs). **Exit criteria:** `grad(associativeScan)` produces a
   compact, O(1) depth Jaxpr.
 
-#### M6.2 — Native `associativeScan` Compilers
+#### M7.2 — Native `associativeScan` Compilers
 
 **What:**
 
@@ -208,17 +228,17 @@ Fix the O(N) WebGPU bottleneck and O(log N) Wasm overhead for parallel prefix sc
 
 ---
 
-### M7 — Cleanup, Benchmarking & Documentation (2–3 days)
+### M8 — Cleanup, Benchmarking & Documentation (2–3 days)
 
-#### M7.1 — Benchmark Suite
+#### M8.1 — Benchmark Suite
 
-**What:** Create a comprehensive benchmark suite comparing M0 baselines to M6.
+**What:** Create a comprehensive benchmark suite comparing M0 baselines to M7.
 
 - Focus on: Embedding layer backward pass (`scatter_add`), `matmul+relu` fusion, and Wasm
   Mega-Module latency. **Exit criteria:** Benchmark report generated and saved to
   `docs/ULTIMATE-BENCHMARKS.md`.
 
-#### M7.2 — Documentation
+#### M8.2 — Documentation
 
 **What:** Update `copilot-instructions.md` to document:
 
@@ -228,7 +248,7 @@ Fix the O(N) WebGPU bottleneck and O(log N) Wasm overhead for parallel prefix sc
 - Polymorphic shapes and dynamic dimensions. **Exit criteria:** Documentation reflects the new
   architecture.
 
-#### M7.3 — Final Regression Run
+#### M8.3 — Final Regression Run
 
 **What:** Full CI-equivalent check. **Exit criteria:** All checks pass. Zero regressions from M0
 baseline.
@@ -240,21 +260,23 @@ baseline.
 ```
 M0.1 (baseline) ──→ M0.2 (feature detection)
   │
-  ├─→ M1.1 (scatter_add IR) ──→ M1.2 (WebGPU CAS) ──→ M1.3 (Wasm scatter)
+  ├─→ M1.1 (Unify vjpFlat) ──→ M1.2 (scan-executor hack)
   │
-  ├─→ M2.1 (Multi-output) ──→ M2.2 (Epilogue Fusion)
+  ├─→ M2.1 (scatter_add IR) ──→ M2.2 (WebGPU CAS) ──→ M2.3 (Wasm scatter)
   │
-  ├─→ M3.1 (Symbolic Shape IR) ──→ M3.2 (Parameterized Codegen)
+  ├─→ M3.1 (Multi-output) ──→ M3.2 (Epilogue Fusion)
+  │
+  ├─→ M4.1 (Symbolic Shape IR) ──→ M4.2 (Parameterized Codegen)
   │                                      │
-  ├─→ M4.1 (SharedArrayBuffer) ──→ M4.2 (Worker Pool) ──→ M4.3 (Parallel Wasm)
+  ├─→ M5.1 (SharedArrayBuffer) ──→ M5.2 (Worker Pool) ──→ M5.3 (Parallel Wasm)
   │                                                              │
   │                                                              ↓
-  └─→ M5.1 (Mega-Module Compiler) ─────────────────────────→ M5.2 (Mega-Module + Threads)
+  └─→ M6.1 (Mega-Module Compiler) ─────────────────────────→ M6.2 (Mega-Module + Threads)
                                                                  │
-  M6.1 (assocScan Primitive) ──→ M6.2 (Native assocScan) ────────┤
+  M7.1 (assocScan Primitive) ──→ M7.2 (Native assocScan) ────────┤
                                                                  │
                                                                  ↓
-                                                          M7.1 - M7.3 (Cleanup)
+                                                          M8.1 - M8.3 (Cleanup)
 ```
 
 ## Risk Register
@@ -272,19 +294,20 @@ M0.1 (baseline) ──→ M0.2 (feature detection)
 | Milestone | Effort   | Cumulative |
 | --------- | -------- | ---------- |
 | M0        | 1–2 days | 1–2 days   |
-| M1        | 4–6 days | 5–8 days   |
-| M2        | 5–7 days | 10–15 days |
-| M3        | 4–6 days | 14–21 days |
-| M4        | 5–7 days | 19–28 days |
-| M5        | 6–8 days | 25–36 days |
-| M6        | 4–6 days | 29–42 days |
-| M7        | 2–3 days | 31–45 days |
+| M1        | 2–3 days | 3–5 days   |
+| M2        | 4–6 days | 7–11 days  |
+| M3        | 5–7 days | 12–18 days |
+| M4        | 4–6 days | 16–24 days |
+| M5        | 5–7 days | 21–31 days |
+| M6        | 6–8 days | 27–39 days |
+| M7        | 4–6 days | 31–45 days |
+| M8        | 2–3 days | 33–48 days |
 
 Total: **5–7 weeks** of focused implementation by a tireless agent.
 
 ## Commit Strategy
 
-- One commit per task (M0.1, M0.2, ..., M7.3).
+- One commit per task (M0.1, M0.2, ..., M8.3).
 - Commit message format: `ultimate M{n}.{m}: {short description}`
 - Every commit must pass `pnpm vitest run`.
-- Branch off `main` at start. Merge back after M7.3 passes full CI.
+- Branch off `main` at start. Merge back after M8.3 passes full CI.
