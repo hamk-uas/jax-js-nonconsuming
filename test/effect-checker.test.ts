@@ -349,8 +349,58 @@ describe("effect-checker", () => {
       expect([...data]).toEqual([22, 37]);
     });
 
-    test.skip("placeholder: zero-copy DUS on WebGPU", () => {
-      // Will be implemented in M3.2
+    test("zero-copy DUS produces correct results", async () => {
+      // JIT-compiled DynamicUpdateSlice: write a slice into a larger array
+      using f = jit((dst: Array, src: Array) => {
+        return lax.dynamicUpdateSlice(dst, src, 1);
+      });
+      using dst = np.array([10, 20, 30, 40, 50]);
+      using src = np.array([99, 88]);
+      using result = f(dst, src) as Array;
+      const data = await result.data();
+      // dst[1:3] = [99, 88] → [10, 99, 88, 40, 50]
+      expect([...data]).toEqual([10, 99, 88, 40, 50]);
+    });
+
+    test("zero-copy DUS does not leak buffers", async () => {
+      const backend = getBackend() as any;
+      const before = backend.slotCount();
+
+      {
+        using f = jit((dst: Array, src: Array) => {
+          return lax.dynamicUpdateSlice(dst, src, 2);
+        });
+        using dst = np.array([1, 2, 3, 4]);
+        using src = np.array([77, 88]);
+        using result = f(dst, src) as Array;
+        await result.data();
+      }
+
+      const after = backend.slotCount();
+      expect(after).toBe(before);
+    });
+
+    test("DUS at offset 0 copies entire src", async () => {
+      using f = jit((dst: Array, src: Array) => {
+        return lax.dynamicUpdateSlice(dst, src, 0);
+      });
+      using dst = np.array([10, 20, 30]);
+      using src = np.array([1, 2, 3]);
+      using result = f(dst, src) as Array;
+      const data = await result.data();
+      expect([...data]).toEqual([1, 2, 3]);
+    });
+
+    test("DUS with 2D arrays axis=0", async () => {
+      using f = jit((dst: Array, src: Array) => {
+        return lax.dynamicUpdateSlice(dst, src, 1);
+      });
+      using dst = np.zeros([3, 2]);
+      using src = np.ones([1, 2]);
+      using result = f(dst, src) as Array;
+      const data = await result.data();
+      // Row 0: [0,0], Row 1: [1,1], Row 2: [0,0]
+      expect([...data]).toEqual([0, 0, 1, 1, 0, 0]);
     });
   });
 });

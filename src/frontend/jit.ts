@@ -81,6 +81,15 @@ export type JitStep =
       xs: JitId[];
       xsAvals: ShapedArray[];
       outputs: JitId[];
+    }
+  | {
+      type: "dus";
+      dst: JitId; // the destination buffer (mutated via Mutate effect)
+      src: JitId; // the source slice to copy
+      output: JitId; // the result (same slot as dst if recycled, else separate)
+      offsetBytes: number; // byte offset into dst where src is written
+      sliceBytes: number; // byte size of the src slice
+      dstSizeBytes: number; // total byte size of dst (= output size)
     };
 
 /**
@@ -185,6 +194,10 @@ export class JitProgram {
             `scan [${step.plan.path}] length=${step.length} numCarry=${step.numCarry} ` +
               `numConsts=${step.numConsts} numX=${step.numX} numY=${step.numY}` +
               (step.reverse ? " reverse" : ""),
+          );
+        case "dus":
+          return PPrint.pp(
+            `%${step.output} = dus %${step.dst}[${step.offsetBytes}] <- %${step.src} (${step.sliceBytes} bytes)`,
           );
       }
     });
@@ -306,6 +319,39 @@ export class JitProgram {
           }
           break;
         }
+        case "dus": {
+          // Flush pending ops — DUS needs materialized inputs
+          for (const p of pending) {
+            p.prepareSync();
+            p.submit();
+          }
+          pending.length = 0;
+
+          const dstSlot = scope.get(step.dst)!;
+          const srcSlot = scope.get(step.src)!;
+          const outSlot = scope.get(step.output)!;
+
+          // Zero-copy: if effectDrivenAllocate recycled dst → output,
+          // skip the full copy (they share the same buffer).
+          if (dstSlot !== outSlot) {
+            this.backend.copyBufferToBuffer!(
+              dstSlot,
+              0,
+              outSlot,
+              0,
+              step.dstSizeBytes,
+            );
+          }
+          // Copy src slice into output at the byte offset
+          this.backend.copyBufferToBuffer!(
+            srcSlot,
+            0,
+            outSlot,
+            step.offsetBytes,
+            step.sliceBytes,
+          );
+          break;
+        }
         default:
           step satisfies never;
       }
@@ -331,6 +377,8 @@ function stepUsesId(step: JitStep, id: JitId): boolean {
         step.initCarry.includes(id) ||
         step.xs.includes(id)
       );
+    case "dus":
+      return step.dst === id || step.src === id || step.output === id;
     default:
       return false;
   }
@@ -725,14 +773,68 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       continue;
     }
 
-    // DynamicUpdateSlice is used by the scan executor directly (copySliceToBuffer).
-    // Standalone JIT compilation is not supported — DUS should only appear
-    // inside scan bodies.
+    // DynamicUpdateSlice: compile to a zero-copy DUS step.
+    // The Mutate effect on dst allows effectDrivenAllocate to recycle
+    // dst → output, avoiding the full buffer copy.
     if (eqn.primitive === Primitive.DynamicUpdateSlice) {
-      throw new Error(
-        "DynamicUpdateSlice JIT compilation is not supported. " +
-          "DUS should only appear inside scan bodies, which handle it directly.",
-      );
+      const params = eqn.params as PrimitiveParams<
+        typeof Primitive.DynamicUpdateSlice
+      >;
+      const { offset, axis } = params;
+
+      if (axis !== 0) {
+        throw new Error(
+          "DynamicUpdateSlice JIT: only axis=0 is currently supported",
+        );
+      }
+
+      // Resolve input JitIds
+      const dstInput = eqn.inputs[0];
+      const srcInput = eqn.inputs[1];
+      let dstId: JitId;
+      let srcId: JitId;
+
+      if (dstInput instanceof Var) {
+        const jv = ctx.get(dstInput)!;
+        if (jv.type !== "imm") {
+          throw new Error("jit: DUS dst input is not imm");
+        }
+        dstId = jv.arg;
+      } else {
+        dstId = builder.pushLit(dstInput as Lit);
+      }
+
+      if (srcInput instanceof Var) {
+        const jv = ctx.get(srcInput)!;
+        if (jv.type !== "imm") {
+          throw new Error("jit: DUS src input is not imm");
+        }
+        srcId = jv.arg;
+      } else {
+        srcId = builder.pushLit(srcInput as Lit);
+      }
+
+      const outVar = eqn.outBinders[0];
+      const elemBytes = byteWidth(outVar.aval.dtype);
+      const innerSize = outVar.aval.shape.slice(1).reduce((a, b) => a * b, 1);
+      const offsetBytes = offset * innerSize * elemBytes;
+      const sliceBytes = srcInput.aval.size * elemBytes;
+      const dstSizeBytes = outVar.aval.size * elemBytes;
+
+      // Allocate output buffer (same size as dst — recycling may reclaim dst)
+      const outId = builder.pushBuffer(dstSizeBytes);
+      ctx.set(outVar, { type: "imm", arg: outId });
+
+      builder.steps.push({
+        type: "dus",
+        dst: dstId,
+        src: srcId,
+        output: outId,
+        offsetBytes,
+        sliceBytes,
+        dstSizeBytes,
+      });
+      continue;
     }
 
     // If this is a routine, construct and dispatch the routine.
