@@ -6,11 +6,13 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   resolve: {
     alias: {
-      // Resolve workspace sub-packages to their TypeScript sources so that
-      // tests work without a prior `pnpm build` step.  The root
-      // @hamk-uas/jax-js-nonconsuming package is NOT aliased here because tests in
-      // src/ use relative imports — aliasing it would create duplicate module
-      // instances and break leak detection.
+      // Resolve ALL workspace packages to their TypeScript sources so that
+      // tests work without a prior `pnpm build` step.  The root package
+      // alias is essential: without it, test/*.test.ts imports resolve to
+      // dist/index.js while src/*.test.ts uses relative imports, creating
+      // two module graphs where `instanceof Tracer` fails and leak
+      // detection sees mismatched singletons.
+      "@hamk-uas/jax-js-nonconsuming": path.resolve(__dirname, "src/index.ts"),
       "@hamk-uas/jax-js-nonconsuming-optax": path.resolve(
         __dirname,
         "packages/optax/src/index.ts",

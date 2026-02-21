@@ -167,13 +167,10 @@ describe("scatter_add", () => {
   });
 
   test("jit(grad(take)) with duplicates", () => {
+    using indices = np.array([0, 1, 0], { dtype: DType.Int32 });
     using f = jit(
       grad((x: Array) => {
-        using taken = np.take(
-          x,
-          np.array([0, 1, 0], { dtype: DType.Int32 }),
-          0,
-        );
+        using taken = np.take(x, indices, 0);
         return np.sum(taken);
       }),
     );

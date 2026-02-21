@@ -1,14 +1,13 @@
-import { beforeAll, describe, expect, it } from "vitest";
-
 import {
+  defaultDevice,
   Device,
-  devicePut,
   grad,
   init,
   jit,
   lax,
   numpy as np,
-} from "../src/index";
+} from "@hamk-uas/jax-js-nonconsuming";
+import { beforeAll, describe, expect, it } from "vitest";
 
 describe("lax.scan backend coverage", () => {
   let devices: Device[] = [];
@@ -25,11 +24,12 @@ describe("lax.scan backend coverage", () => {
   // Simpler: Just one test that iterates.
 
   it("executes tests on all devices", async () => {
-    for (const device of devices) {
-      console.log(`Running sub-tests for ${device}`);
+    const originalDefault = defaultDevice();
 
-      // Manual invocation logic to reuse the code above?
-      // I will inline simple logic here.
+    for (const device of devices) {
+      // Set default device so internal operations (e.g., zeros in makeJaxpr)
+      // create arrays on the same device as the scan inputs.
+      defaultDevice(device);
 
       // 1. Basic
       {
@@ -37,8 +37,8 @@ describe("lax.scan backend coverage", () => {
           const newC = np.add(c, x);
           return [newC, newC];
         };
-        using initVal = await devicePut(np.zeros([1]), device);
-        using xs = await devicePut(np.ones([10, 1]), device);
+        using initVal = np.zeros([1]);
+        using xs = np.ones([10, 1]);
         const [final, ys] = lax.scan(step, initVal, xs);
         const finalData = await final.data();
         expect(finalData[0]).toBe(10);
@@ -76,8 +76,8 @@ describe("lax.scan backend coverage", () => {
           return lax.scan(step, init, xs);
         });
 
-        using initVal = await devicePut(np.zeros([1]), device);
-        using xs = await devicePut(np.ones([5, 1]), device);
+        using initVal = np.zeros([1]);
+        using xs = np.ones([5, 1]);
         // eslint-disable-next-line @typescript-eslint/await-thenable
         const [final, ys] = await run(initVal, xs);
 
@@ -89,23 +89,26 @@ describe("lax.scan backend coverage", () => {
 
       // 4. Grad scan
       {
+        using initVal = np.zeros([1]);
         const loss = (xs: np.Array) => {
           const step = (c: np.Array, x: np.Array): [np.Array, np.Array] => {
             return [np.add(c, x), c];
           };
-          using initVal = np.zeros([1]);
           const [final, _] = lax.scan(step, initVal, xs);
-          return np.sum(final);
+          using __ = _;
+          return final.sum();
         };
 
-        const xs = await devicePut(np.ones([5, 1]), device);
-        const calcGrad = grad(loss);
-        // eslint-disable-next-line @typescript-eslint/await-thenable
-        const dxs = await calcGrad(xs);
+        using xs = np.ones([5, 1]);
+        const dxs = grad(loss)(xs);
 
         const dxsData = await dxs.data();
         expect(dxsData[0]).toBe(1);
+        dxs.dispose();
       }
     }
+
+    // Restore original default device
+    defaultDevice(originalDefault);
   });
 });
