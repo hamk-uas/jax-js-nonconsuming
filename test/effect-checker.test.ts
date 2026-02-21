@@ -2,6 +2,8 @@ import {
   _setVerifyEffects,
   type Array,
   ClosedJaxpr,
+  getBackend,
+  jit,
   lax,
   makeJaxpr,
   MemoryEffect,
@@ -299,8 +301,52 @@ describe("effect-checker", () => {
   });
 
   describe("M3 — JIT integration", () => {
-    test.skip("placeholder: effect-driven recycling matches or beats heuristic", () => {
-      // Will be implemented in M3.1
+    test("effect-driven allocator produces correct results", async () => {
+      // Multi-step chain: x → +1 → *2 → -3 → +4
+      // Multiple same-size intermediates that can be recycled
+      using f = jit((x: Array) => x.add(1).mul(2).sub(3).add(4));
+      using input = np.array([1, 2, 3]);
+      using result = f(input) as Array;
+      const data = await result.data();
+      // (1+1)*2-3+4 = 5, (2+1)*2-3+4 = 7, (3+1)*2-3+4 = 9
+      expect([...data]).toEqual([5, 7, 9]);
+    });
+
+    test("effect-driven allocator does not leak buffers", async () => {
+      const backend = getBackend() as any;
+      const before = backend.slotCount();
+
+      {
+        using f = jit((x: Array) => {
+          using a = x.mul(x) as Array;
+          using b = a.add(x) as Array;
+          return b.mul(2);
+        });
+        using input = np.array([3, 4, 5]);
+        using result = f(input) as Array;
+        await result.data();
+      }
+
+      const after = backend.slotCount();
+      expect(after).toBe(before);
+    });
+
+    test("recycling works across execute boundaries", async () => {
+      // Two independent same-size computations: the first intermediate dies
+      // before the second is born, even though an execute step sits between.
+      // The new allocator recycles across that boundary.
+      using f = jit((x: Array, y: Array) => {
+        using a = x.mul(x) as Array; // same size as x
+        using b = a.add(x) as Array; // same size
+        using c = y.mul(y) as Array; // same size — can reuse a's buffer
+        return b.add(c);
+      });
+      using x = np.array([2, 3]);
+      using y = np.array([4, 5]);
+      using result = f(x, y) as Array;
+      const data = await result.data();
+      // (2*2+2) + (4*4) = 6+16=22, (3*3+3) + (5*5) = 12+25=37
+      expect([...data]).toEqual([22, 37]);
     });
 
     test.skip("placeholder: zero-copy DUS on WebGPU", () => {

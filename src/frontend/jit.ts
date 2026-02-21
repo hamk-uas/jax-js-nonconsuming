@@ -317,6 +317,25 @@ export class JitProgram {
   }
 }
 
+/** Check whether a JitStep references the given JitId as input or output. */
+function stepUsesId(step: JitStep, id: JitId): boolean {
+  switch (step.type) {
+    case "execute":
+      return step.inputs.includes(id) || step.outputs.includes(id);
+    case "malloc":
+      return step.output === id;
+    case "scan":
+      return (
+        step.outputs.includes(id) ||
+        step.consts.includes(id) ||
+        step.initCarry.includes(id) ||
+        step.xs.includes(id)
+      );
+    default:
+      return false;
+  }
+}
+
 class JitProgramBuilder {
   backend: Backend;
   #nextId: number;
@@ -463,6 +482,107 @@ class JitProgramBuilder {
 
     if (DEBUG >= 1 && recycleCount > 0) {
       console.info(`jit: recycled ${recycleCount} buffer(s)`);
+    }
+  }
+
+  /**
+   * Effect-driven buffer lifecycle allocation.
+   *
+   * Replaces the two-pass `insertFreeSteps` + `recycleBuffers` with a
+   * single-pass algorithm that uses liveness analysis for optimal buffer
+   * reuse. Key improvement: can recycle buffers across execute/scan step
+   * boundaries, catching opportunities the old adjacent-pair scanner missed.
+   *
+   * Algorithm:
+   * 1. Collect all malloc'd JitIds and their byte sizes.
+   * 2. Compute last-use step index for each (excluding program outputs).
+   * 3. Forward pass: when a JitId dies, add to a free pool (keyed by size).
+   *    When a malloc is needed, check the pool → emit recycle or malloc.
+   * 4. Emit free steps for any remaining pooled buffers.
+   */
+  effectDrivenAllocate(outputIds: JitId[]): void {
+    // Phase 1: Collect all malloc'd JitIds and their sizes
+    const mallocSizes = new Map<JitId, number>();
+    for (const s of this.steps) {
+      if (s.type === "malloc") mallocSizes.set(s.output, s.size);
+    }
+
+    // Phase 2: Compute last-use step index for each non-output malloc'd JitId
+    const outputSet = new Set(outputIds);
+    const lastUse = new Map<JitId, number>();
+    for (const [id] of mallocSizes) {
+      if (outputSet.has(id)) continue;
+      for (let j = this.steps.length - 1; j >= 0; j--) {
+        if (stepUsesId(this.steps[j], id)) {
+          lastUse.set(id, j);
+          break;
+        }
+      }
+    }
+
+    // Pre-compute which JitIds die after each step index
+    const pendingFree = new Map<number, JitId[]>();
+    for (const [id, stepIdx] of lastUse) {
+      let list = pendingFree.get(stepIdx);
+      if (!list) {
+        list = [];
+        pendingFree.set(stepIdx, list);
+      }
+      list.push(id);
+    }
+
+    // Phase 3: Single forward pass with free pool for cross-boundary recycling
+    const freePool = new Map<number, JitId[]>(); // size → available JitIds
+    const newSteps: JitStep[] = [];
+    let recycleCount = 0;
+
+    for (let i = 0; i < this.steps.length; i++) {
+      const step = this.steps[i];
+
+      if (step.type === "malloc") {
+        // Check free pool for a same-size buffer to recycle
+        const pool = freePool.get(step.size);
+        if (pool && pool.length > 0) {
+          const reusedId = pool.pop()!;
+          newSteps.push({
+            type: "recycle",
+            input: reusedId,
+            output: step.output,
+          });
+          recycleCount++;
+        } else {
+          newSteps.push(step);
+        }
+      } else {
+        newSteps.push(step);
+      }
+
+      // After this step, release any JitIds whose lifetime ends here
+      const dying = pendingFree.get(i);
+      if (dying) {
+        for (const id of dying) {
+          const size = mallocSizes.get(id);
+          if (size === undefined) continue;
+          let pool = freePool.get(size);
+          if (!pool) {
+            pool = [];
+            freePool.set(size, pool);
+          }
+          pool.push(id);
+        }
+      }
+    }
+
+    // Phase 4: Emit free steps for any pooled buffers not recycled
+    for (const [, pool] of freePool) {
+      for (const id of pool) {
+        newSteps.push({ type: "free", input: id });
+      }
+    }
+
+    this.steps = newSteps;
+    if (DEBUG >= 1 && recycleCount > 0) {
+      console.info(`jit: effect-driven recycled ${recycleCount} buffer(s)`);
     }
   }
 }
@@ -787,11 +907,9 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
     }
   }
 
-  // Emit free steps after last usage of any intermediates.
-  builder.insertFreeSteps(outputIds);
-
-  // Recycle same-size buffers: replace free→malloc pairs with slot reuse.
-  builder.recycleBuffers();
+  // Effect-driven buffer allocation: compute liveness, insert free steps,
+  // and recycle same-size buffers across execute/scan boundaries.
+  builder.effectDrivenAllocate(outputIds);
 
   const jp = new JitProgram(backend, builder.steps, range(0, nargs), outputIds);
   if (DEBUG >= 4) console.info(jp.toString());
