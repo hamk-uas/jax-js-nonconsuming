@@ -112,7 +112,12 @@ export class CpuBackend implements Backend {
     return new Executable(routine, undefined);
   }
 
-  dispatch(exe: Executable<void>, inputs: Slot[], outputs: Slot[], _dynamicParams?: number[]): void {
+  dispatch(
+    exe: Executable<void>,
+    inputs: Slot[],
+    outputs: Slot[],
+    _dynamicParams?: number[],
+  ): void {
     if (exe.source instanceof Routine) {
       return runCpuRoutine(
         exe.source,

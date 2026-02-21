@@ -52,7 +52,7 @@ suite("tree.makeDisposable", () => {
   });
 
   test("works with using keyword", () => {
-    const before = (getBackend() as any).slotCount();
+    const before = getBackend().slotCount();
     {
       using result = tree.makeDisposable({
         x: np.array([1, 2, 3]),
@@ -61,7 +61,7 @@ suite("tree.makeDisposable", () => {
       expect(result.x.js()).toEqual([1, 2, 3]);
       expect(result.y.js()).toEqual([4, 5, 6]);
     }
-    const after = (getBackend() as any).slotCount();
+    const after = getBackend().slotCount();
     expect(after).toBe(before);
   });
 

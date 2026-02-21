@@ -23,7 +23,7 @@
  */
 
 import { accessorGlobal, AluExp, AluOp, AluVar, DType, Kernel } from "./alu";
-import { ShapeTracker, unravelAlu, type SizeExpr } from "./shape";
+import { ShapeTracker, type SizeExpr, unravelAlu } from "./shape";
 import { DEBUG, deepEqual, lexCompare, prod, range, sorted } from "./utils";
 
 export interface TuneResult {

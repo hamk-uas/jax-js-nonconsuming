@@ -81,7 +81,8 @@ const strict: Linter.Config = {
  * in eager mode and inside `jit()` bodies.
  *
  * Use this for user code when you want explicit eager/JIT semantic invariance
- * gates in CI.
+ * gates in CI.  Does not include `no-array-chain` because chains affect only
+ * performance (eager peak memory), not correctness.
  */
 const invariance: Linter.Config = {
   plugins: { "jax-js": plugin },
@@ -91,7 +92,6 @@ const invariance: Linter.Config = {
     "jax-js/no-dispose-then-reassign-param": "error",
     "jax-js/no-make-disposable-alias": "error",
     "jax-js/no-unnecessary-ref": "error",
-    "jax-js/no-array-chain": "error",
     "jax-js/require-scan-result-dispose": "error",
   },
 };

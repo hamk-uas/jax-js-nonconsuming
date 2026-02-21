@@ -328,7 +328,7 @@ export const checkLeaks = {
     _startSlots.clear();
     for (const d of devices) {
       try {
-        _startSlots.set(d, (getBackend(d) as any).slotCount());
+        _startSlots.set(d, getBackend(d).slotCount());
       } catch {
         /* not initialized */
       }
@@ -391,7 +391,7 @@ export const checkLeaks = {
     for (const d of devices) {
       try {
         const baseline = _startSlots.get(d) ?? 0;
-        leaked += (getBackend(d) as any).slotCount() - baseline;
+        leaked += getBackend(d).slotCount() - baseline;
       } catch {
         /* backend not initialized or gone */
       }

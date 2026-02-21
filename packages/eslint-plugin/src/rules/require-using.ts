@@ -109,6 +109,25 @@ const ARRAY_FACTORIES = new Set([
   "sinh",
 ]);
 
+/**
+ * Functions on the `lax` namespace that return arrays.
+ * `lax.scan` is excluded — handled by `require-scan-result-dispose`.
+ */
+const LAX_FACTORIES = new Set([
+  "associativeScan",
+  "dot",
+  "conv",
+  "convGeneralDilated",
+  "convWithGeneralPadding",
+  "convTranspose",
+  "reduceWindow",
+  "erf",
+  "erfc",
+  "stopGradient",
+  "dynamicUpdateSlice",
+  "topK",
+]);
+
 const ARRAY_METHODS = new Set([
   "add",
   "sub",
@@ -169,6 +188,14 @@ function isArrayProducingCall(node: any): boolean {
       callee.object.type === "Identifier" &&
       callee.object.name === "np" &&
       ARRAY_FACTORIES.has(property)
+    ) {
+      return true;
+    }
+
+    if (
+      callee.object.type === "Identifier" &&
+      callee.object.name === "lax" &&
+      LAX_FACTORIES.has(property)
     ) {
       return true;
     }

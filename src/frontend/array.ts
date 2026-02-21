@@ -141,7 +141,12 @@ export class PendingExecute {
     if (this.#rc <= 0) throw new Error("internal: PendingExecute used rc<=0");
     if (!this.prepared) throw new Error("internal: Not prepared yet");
     this.submitted = true;
-    this.backend.dispatch(this.prepared, this.inputs, this.outputs, this.dynamicParams);
+    this.backend.dispatch(
+      this.prepared,
+      this.inputs,
+      this.outputs,
+      this.dynamicParams,
+    );
     for (const slot of this.inputs) this.backend.decRef(slot);
     for (const slot of this.outputs) this.backend.decRef(slot);
   }

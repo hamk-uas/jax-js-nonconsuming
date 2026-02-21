@@ -10,10 +10,9 @@ suite("M4.2: Parameterized Backend Codegen", () => {
   test("[100,64] and [150,64] share the same JitProgram", () => {
     // The exit criteria: a JIT function handles different batch sizes
     // without recompilation, producing correct results.
-    using f = jit(
-      (x: np.Array) => x.mul(np.array(2.0)).add(np.array(1.0)),
-      { dynamic_axes: { 0: "T" } },
-    );
+    using f = jit((x: np.Array) => x.mul(np.array(2.0)).add(np.array(1.0)), {
+      dynamic_axes: { 0: "T" },
+    });
 
     // First call: [100, 64]
     using x1 = np.ones([100, 64]);
@@ -40,7 +39,8 @@ suite("M4.2: Parameterized Backend Codegen", () => {
     // Chain of operations where intermediates have the same symbolic size.
     // Buffer recycling should work (recycle steps emitted in JitProgram).
     using f = jit(
-      (x: np.Array) => x.add(np.array(1.0)).mul(np.array(2.0)).sub(np.array(0.5)),
+      (x: np.Array) =>
+        x.add(np.array(1.0)).mul(np.array(2.0)).sub(np.array(0.5)),
       { dynamic_axes: { 0: "T" } },
     );
 

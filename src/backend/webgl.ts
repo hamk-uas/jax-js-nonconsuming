@@ -127,6 +127,10 @@ export class WebGLBackend implements Backend {
     return slot;
   }
 
+  slotCount(): number {
+    return this.#buffers.size;
+  }
+
   incRef(slot: Slot): void {
     const buffer = this.#buffers.get(slot);
     if (!buffer) throw new SlotError(slot);

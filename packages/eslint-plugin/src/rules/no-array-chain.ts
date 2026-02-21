@@ -59,10 +59,10 @@ function isTransformCallee(callee: any): boolean {
   // Direct call: jit(fn), grad(fn), etc.
   if (callee?.type === "Identifier" && TRACING_TRANSFORMS.has(callee.name))
     return true;
-  // Method call: lax.scan(fn, ...)
+  // Method call: lax.scan(fn, ...), lax.associativeScan(fn, ...)
   if (callee?.type === "MemberExpression") {
     const method = getMemberName(callee.property);
-    if (method === "scan") return true;
+    if (method === "scan" || method === "associativeScan") return true;
   }
   return false;
 }

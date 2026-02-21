@@ -174,6 +174,9 @@ export interface Backend {
   /** Hardware and environment capabilities. */
   readonly capabilities: BackendCapabilities;
 
+  /** Number of live backend slots (allocated buffers with refcount > 0). */
+  slotCount(): number;
+
   /** Allocate a new slot with reference count 1. */
   malloc(size: number, initialData?: Uint8Array): Slot;
 
@@ -228,7 +231,12 @@ export interface Backend {
    * parameterized kernels (symbolic dims). For WASM, appended as extra i32
    * function args. For WebGPU, written to a uniform buffer.
    */
-  dispatch(exe: Executable, inputs: Slot[], outputs: Slot[], dynamicParams?: number[]): void;
+  dispatch(
+    exe: Executable,
+    inputs: Slot[],
+    outputs: Slot[],
+    dynamicParams?: number[],
+  ): void;
 
   /**
    * Optional: prepare the backend's buffer pool for an upcoming JitProgram

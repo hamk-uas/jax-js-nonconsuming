@@ -13,15 +13,15 @@ import { Backend, Slot } from "../backend";
 import { PPrint } from "../pprint";
 import { Routine } from "../routine";
 import {
+  hasSymbolicDims,
+  isSymbolicSize,
   Pair,
+  resolveShape,
+  resolveSizeExpr,
   ShapeTracker,
-  unravelAlu,
   type SizeExpr,
   sizeExprKey,
-  resolveSizeExpr,
-  isSymbolicSize,
-  hasSymbolicDims,
-  resolveShape,
+  unravelAlu,
 } from "../shape";
 import {
   DEBUG,
@@ -283,10 +283,7 @@ export class JitProgram {
             step.source.isSymbolic &&
             dimBindings
           ) {
-            const resolvedSize = resolveSizeExpr(
-              step.source.size,
-              dimBindings,
-            );
+            const resolvedSize = resolveSizeExpr(step.source.size, dimBindings);
             dynamicParams = [resolvedSize];
           }
           pending.push(
@@ -713,53 +710,113 @@ export function jitCompile(
   _currentDimBindings = dimBindings;
 
   try {
-  if (DEBUG >= 1) {
-    console.info("=========== JIT Compile ===========\n" + jaxpr.toString());
-  }
-
-  jaxpr = jaxpr.flatten().simplify();
-  const nargs = jaxpr.inBinders.length;
-  const builder = new JitProgramBuilder(backend, nargs);
-
-  const blackNodes = splitGraphDataflow(backend, jaxpr);
-
-  /** Set concreteSizeHint on a kernel if dimBindings are available. */
-  const setConcreteHint = (kernel: Kernel, size: SizeExpr): void => {
-    if (_currentDimBindings && isSymbolicSize(size)) {
-      kernel.concreteSizeHint = resolveSizeExpr(
-        size,
-        _currentDimBindings,
-      ) as number;
+    if (DEBUG >= 1) {
+      console.info("=========== JIT Compile ===========\n" + jaxpr.toString());
     }
-  };
 
-  // Initialize jaxpr inBinders.
-  const ctx = new Map<Var, JitValue>();
-  for (let i = 0; i < nargs; i++) {
-    const v = jaxpr.inBinders[i];
-    ctx.set(v, { type: "imm", arg: i }); // JitId i = input #i
-  }
+    jaxpr = jaxpr.flatten().simplify();
+    const nargs = jaxpr.inBinders.length;
+    const builder = new JitProgramBuilder(backend, nargs);
 
-  // ---- Pending kernel batching ----
-  // Defer black-node kernel dispatch to batch same-size non-reduction kernels
-  // into multi-output Kernel steps, reducing dispatch overhead.
-  interface PendingKernelEntry {
-    outVar: Var;
-    exp: AluExp;
-    reduction: Reduction | undefined;
-    inputArgs: JitId[];
-    size: SizeExpr;
-  }
-  const pendingKernels: PendingKernelEntry[] = [];
+    const blackNodes = splitGraphDataflow(backend, jaxpr);
 
-  /** Flush all pending kernels into JitSteps. Groups same-size non-reduction
-   *  kernels with identical inputArgs into multi-output Kernel steps. */
-  const flushPendingKernels = (): void => {
-    if (pendingKernels.length === 0) return;
+    /** Set concreteSizeHint on a kernel if dimBindings are available. */
+    const setConcreteHint = (kernel: Kernel, size: SizeExpr): void => {
+      if (_currentDimBindings && isSymbolicSize(size)) {
+        kernel.concreteSizeHint = resolveSizeExpr(
+          size,
+          _currentDimBindings,
+        ) as number;
+      }
+    };
 
-    // If backend doesn't support multi-output, emit all as solo
-    if (!backend.capabilities.multiOutputKernel) {
+    // Initialize jaxpr inBinders.
+    const ctx = new Map<Var, JitValue>();
+    for (let i = 0; i < nargs; i++) {
+      const v = jaxpr.inBinders[i];
+      ctx.set(v, { type: "imm", arg: i }); // JitId i = input #i
+    }
+
+    // ---- Pending kernel batching ----
+    // Defer black-node kernel dispatch to batch same-size non-reduction kernels
+    // into multi-output Kernel steps, reducing dispatch overhead.
+    interface PendingKernelEntry {
+      outVar: Var;
+      exp: AluExp;
+      reduction: Reduction | undefined;
+      inputArgs: JitId[];
+      size: SizeExpr;
+    }
+    const pendingKernels: PendingKernelEntry[] = [];
+
+    /** Flush all pending kernels into JitSteps. Groups same-size non-reduction
+     *  kernels with identical inputArgs into multi-output Kernel steps. */
+    const flushPendingKernels = (): void => {
+      if (pendingKernels.length === 0) return;
+
+      // If backend doesn't support multi-output, emit all as solo
+      if (!backend.capabilities.multiOutputKernel) {
+        for (const entry of pendingKernels) {
+          const kernel = Kernel.single(
+            entry.inputArgs.length,
+            entry.size,
+            entry.exp,
+            entry.reduction,
+          );
+          setConcreteHint(kernel, entry.size);
+          const outId = builder.pushKernel(kernel, entry.inputArgs);
+          ctx.set(entry.outVar, { type: "imm", arg: outId });
+        }
+        pendingKernels.length = 0;
+        return;
+      }
+
+      // Group by size + inputArgs identity (sorted JitIds as key).
+      // Only non-reduction kernels with matching size AND inputArgs can merge.
+      const groups = new Map<string, PendingKernelEntry[]>();
+      const soloEntries: PendingKernelEntry[] = [];
+
       for (const entry of pendingKernels) {
+        if (entry.reduction) {
+          // Kernels with reductions always emit solo
+          soloEntries.push(entry);
+        } else {
+          const key = `${sizeExprKey(entry.size)}:${entry.inputArgs.join(",")}`;
+          const group = groups.get(key);
+          if (group) group.push(entry);
+          else groups.set(key, [entry]);
+        }
+      }
+
+      // Emit multi-output kernels for groups with > 1 entries
+      for (const [, group] of groups) {
+        if (group.length === 1) {
+          soloEntries.push(group[0]);
+        } else {
+          // Check maxArgs: nargs + numOutputs <= backend limit
+          const maxArgs = backend.maxArgs;
+          if (group[0].inputArgs.length + group.length > maxArgs) {
+            // Too many buffers — fall back to individual kernels
+            for (const e of group) soloEntries.push(e);
+          } else {
+            const nargs = group[0].inputArgs.length;
+            const size = group[0].size;
+            const outputDescs = group.map((e) => ({
+              exp: e.exp,
+              reduction: e.reduction,
+            }));
+            const kernel = Kernel.multi(nargs, size, outputDescs);
+            setConcreteHint(kernel, size);
+            const outIds = builder.pushMultiKernel(kernel, group[0].inputArgs);
+            for (let j = 0; j < group.length; j++) {
+              ctx.set(group[j].outVar, { type: "imm", arg: outIds[j] });
+            }
+          }
+        }
+      }
+
+      // Emit solo kernels
+      for (const entry of soloEntries) {
         const kernel = Kernel.single(
           entry.inputArgs.length,
           entry.size,
@@ -770,492 +827,447 @@ export function jitCompile(
         const outId = builder.pushKernel(kernel, entry.inputArgs);
         ctx.set(entry.outVar, { type: "imm", arg: outId });
       }
+
       pendingKernels.length = 0;
-      return;
-    }
-
-    // Group by size + inputArgs identity (sorted JitIds as key).
-    // Only non-reduction kernels with matching size AND inputArgs can merge.
-    const groups = new Map<string, PendingKernelEntry[]>();
-    const soloEntries: PendingKernelEntry[] = [];
-
-    for (const entry of pendingKernels) {
-      if (entry.reduction) {
-        // Kernels with reductions always emit solo
-        soloEntries.push(entry);
-      } else {
-        const key = `${sizeExprKey(entry.size)}:${entry.inputArgs.join(",")}`;
-        const group = groups.get(key);
-        if (group) group.push(entry);
-        else groups.set(key, [entry]);
-      }
-    }
-
-    // Emit multi-output kernels for groups with > 1 entries
-    for (const [, group] of groups) {
-      if (group.length === 1) {
-        soloEntries.push(group[0]);
-      } else {
-        // Check maxArgs: nargs + numOutputs <= backend limit
-        const maxArgs = backend.maxArgs;
-        if (group[0].inputArgs.length + group.length > maxArgs) {
-          // Too many buffers — fall back to individual kernels
-          for (const e of group) soloEntries.push(e);
-        } else {
-          const nargs = group[0].inputArgs.length;
-          const size = group[0].size;
-          const outputDescs = group.map((e) => ({
-            exp: e.exp,
-            reduction: e.reduction,
-          }));
-          const kernel = Kernel.multi(nargs, size, outputDescs);
-          setConcreteHint(kernel, size);
-          const outIds = builder.pushMultiKernel(kernel, group[0].inputArgs);
-          for (let j = 0; j < group.length; j++) {
-            ctx.set(group[j].outVar, { type: "imm", arg: outIds[j] });
-          }
-        }
-      }
-    }
-
-    // Emit solo kernels
-    for (const entry of soloEntries) {
-      const kernel = Kernel.single(
-        entry.inputArgs.length,
-        entry.size,
-        entry.exp,
-        entry.reduction,
-      );
-      setConcreteHint(kernel, entry.size);
-      const outId = builder.pushKernel(kernel, entry.inputArgs);
-      ctx.set(entry.outVar, { type: "imm", arg: outId });
-    }
-
-    pendingKernels.length = 0;
-  };
-
-  // Now run each primitive through a set of rules, mirroring implRules.
-  for (let i = 0; i < jaxpr.eqns.length; i++) {
-    const eqn = jaxpr.eqns[i];
-
-    // Handle Primitive.Scan specially — it compiles the body jaxpr and
-    // emits a single "scan" JitStep with a ScanPlan.
-    if (eqn.primitive === Primitive.Scan) {
-      flushPendingKernels();
-      const params = eqn.params as PrimitiveParams<typeof Primitive.Scan>;
-      const {
-        jaxpr: bodyJaxpr,
-        numCarry,
-        numConsts,
-        length,
-        reverse,
-        acceptPath,
-      } = params;
-      const numX = bodyJaxpr.inBinders.length - numConsts - numCarry;
-      const numY = bodyJaxpr.outs.length - numCarry;
-
-      // Resolve input JitIds (all must be "imm" — black nodes)
-      const allInputIds: JitId[] = [];
-      for (const input of eqn.inputs) {
-        if (input instanceof Var) {
-          const jv = ctx.get(input)!;
-          if (jv.type !== "imm") {
-            throw new Error("jit: scan primitive input is not imm");
-          }
-          allInputIds.push(jv.arg);
-        } else if (input instanceof Lit) {
-          allInputIds.push(builder.pushLit(input));
-        }
-      }
-
-      const constsIds = allInputIds.slice(0, numConsts);
-      const initCarryIds = allInputIds.slice(numConsts, numConsts + numCarry);
-      const xsIds = allInputIds.slice(numConsts + numCarry);
-
-      // xs avals (actual shapes from the jaxpr, include leading length dim)
-      const xsAvals: ShapedArray[] = [];
-      const xsInputs = eqn.inputs.slice(numConsts + numCarry);
-      for (const input of xsInputs) {
-        xsAvals.push(input.aval);
-      }
-
-      // Allocate output buffers: [carry_out..., stacked_ys...]
-      const outputIds: JitId[] = [];
-      for (const outVar of eqn.outBinders) {
-        const outId = builder.pushBuffer(
-          outVar.aval.size * byteWidth(outVar.aval.dtype),
-        );
-        outputIds.push(outId);
-        ctx.set(outVar, { type: "imm", arg: outId });
-      }
-
-      // Compile body jaxpr
-      const bodyProgram = jitCompile(backend, bodyJaxpr);
-
-      // Determine scan plan
-      const scanPlan = planScan(
-        backend,
-        bodyProgram,
-        bodyJaxpr,
-        length,
-        numCarry,
-        numConsts,
-        numX,
-        numY,
-        reverse,
-        acceptPath as ScanPath | ScanPath[] | undefined,
-      );
-
-      // Compute per-slice xsAvals (without leading length dimension)
-      const xsSliceAvals = xsAvals.map(
-        (a) => new ShapedArray(a.shape.slice(1), a.dtype, a.weakType),
-      );
-
-      builder.steps.push({
-        type: "scan",
-        plan: scanPlan,
-        bodyProgram,
-        bodyJaxpr,
-        length,
-        numCarry,
-        numConsts,
-        numX,
-        numY,
-        reverse,
-        consts: constsIds,
-        initCarry: initCarryIds,
-        xs: xsIds,
-        xsAvals: xsSliceAvals,
-        outputs: outputIds,
-      });
-      continue;
-    }
-
-    // DynamicUpdateSlice: compile to a zero-copy DUS step.
-    // The Mutate effect on dst allows effectDrivenAllocate to recycle
-    // dst → output, avoiding the full buffer copy.
-    if (eqn.primitive === Primitive.DynamicUpdateSlice) {
-      flushPendingKernels();
-      const params = eqn.params as PrimitiveParams<
-        typeof Primitive.DynamicUpdateSlice
-      >;
-      const { offset, axis } = params;
-
-      if (axis !== 0) {
-        throw new Error(
-          "DynamicUpdateSlice JIT: only axis=0 is currently supported",
-        );
-      }
-
-      // Resolve input JitIds
-      const dstInput = eqn.inputs[0];
-      const srcInput = eqn.inputs[1];
-      let dstId: JitId;
-      let srcId: JitId;
-
-      if (dstInput instanceof Var) {
-        const jv = ctx.get(dstInput)!;
-        if (jv.type !== "imm") {
-          throw new Error("jit: DUS dst input is not imm");
-        }
-        dstId = jv.arg;
-      } else {
-        dstId = builder.pushLit(dstInput as Lit);
-      }
-
-      if (srcInput instanceof Var) {
-        const jv = ctx.get(srcInput)!;
-        if (jv.type !== "imm") {
-          throw new Error("jit: DUS src input is not imm");
-        }
-        srcId = jv.arg;
-      } else {
-        srcId = builder.pushLit(srcInput as Lit);
-      }
-
-      const outVar = eqn.outBinders[0];
-      const elemBytes = byteWidth(outVar.aval.dtype);
-      const innerSize = (outVar.aval.shape as number[])
-        .slice(1)
-        .reduce((a, b) => a * b, 1);
-      const offsetBytes = offset * innerSize * elemBytes;
-      const sliceBytes = srcInput.aval.size * elemBytes;
-      const dstSizeBytes = outVar.aval.size * elemBytes;
-
-      // Allocate output buffer (same size as dst — recycling may reclaim dst)
-      const outId = builder.pushBuffer(dstSizeBytes);
-      ctx.set(outVar, { type: "imm", arg: outId });
-
-      builder.steps.push({
-        type: "dus",
-        dst: dstId,
-        src: srcId,
-        output: outId,
-        offsetBytes,
-        sliceBytes,
-        dstSizeBytes,
-      });
-      continue;
-    }
-
-    // ScatterAdd: compile to a scatter_add JitStep.
-    // The Mutate effect on target allows effectDrivenAllocate to recycle
-    // target → output, avoiding a full buffer copy when sizes match.
-    if (eqn.primitive === Primitive.ScatterAdd) {
-      flushPendingKernels();
-      const params = eqn.params as PrimitiveParams<typeof Primitive.ScatterAdd>;
-      const { axis } = params;
-
-      // Resolve input JitIds: target, indices, updates
-      const resolveInput = (input: Var | Lit): JitId => {
-        if (input instanceof Var) {
-          const jv = ctx.get(input)!;
-          if (jv.type !== "imm") {
-            throw new Error("jit: ScatterAdd input is not imm");
-          }
-          return jv.arg;
-        }
-        return builder.pushLit(input as Lit);
-      };
-
-      const targetId = resolveInput(eqn.inputs[0]);
-      const indicesId = resolveInput(eqn.inputs[1]);
-      const updatesId = resolveInput(eqn.inputs[2]);
-
-      const outVar = eqn.outBinders[0];
-      const targetShape = eqn.inputs[0].aval.shape as number[];
-      const updatesLen = eqn.inputs[2].aval.shape[axis] as number;
-      const dtype = outVar.aval.dtype;
-      const outSizeBytes = outVar.aval.size * byteWidth(dtype);
-
-      // Allocate output buffer (same size as target — recycling may reclaim target)
-      const outId = builder.pushBuffer(outSizeBytes);
-      ctx.set(outVar, { type: "imm", arg: outId });
-
-      builder.steps.push({
-        type: "scatter_add",
-        target: targetId,
-        indices: indicesId,
-        updates: updatesId,
-        output: outId,
-        axis,
-        targetShape,
-        updatesLen,
-        dtype,
-      });
-      continue;
-    }
-
-    // If this is a routine, construct and dispatch the routine.
-    if (routinePrimitives.has(eqn.primitive)) {
-      flushPendingKernels();
-      // The rest of the code collaborates to make sure that all inputs to a
-      // routine are "imm" (black node, dispatched) and so is itself.
-      const routine = new Routine(
-        routinePrimitives.get(eqn.primitive)!,
-        {
-          inputShapes: eqn.inputs.map((x) => x.aval.shape as number[]),
-          inputDtypes: eqn.inputs.map((x) => x.aval.dtype),
-          outputShapes: eqn.outBinders.map((x) => x.aval.shape as number[]),
-          outputDtypes: eqn.outBinders.map((x) => x.aval.dtype),
-        },
-        eqn.params as any,
-      );
-      const inputs: JitId[] = [];
-      for (const input of eqn.inputs) {
-        if (input instanceof Var) {
-          const jv = ctx.get(input)!;
-          if (jv.type !== "imm") {
-            throw new Error(
-              `jit: routine primitive ${eqn.primitive} input is not imm`,
-            );
-          }
-          inputs.push(jv.arg);
-        } else if (input instanceof Lit) {
-          inputs.push(builder.pushLit(input));
-        }
-      }
-      const outputs: JitId[] = [];
-      for (const outVar of eqn.outBinders) {
-        const outId = builder.pushBuffer(
-          outVar.aval.size * byteWidth(outVar.aval.dtype),
-        );
-        outputs.push(outId);
-        ctx.set(outVar, { type: "imm", arg: outId });
-      }
-      builder.pushRoutine(routine, inputs, outputs);
-      continue;
-    }
-
-    // If any input references a pending kernel's output, flush first so the
-    // output is materialized and available in ctx.
-    if (pendingKernels.length > 0) {
-      for (const input of eqn.inputs) {
-        if (
-          input instanceof Var &&
-          !ctx.has(input) &&
-          pendingKernels.some((pk) => pk.outVar === input)
-        ) {
-          flushPendingKernels();
-          break;
-        }
-      }
-    }
-
-    // Transform each input into an AluExp to start, and normalize any arguments
-    // as needed.
-    const inputExps: AluExp[] = []; // len(inputs)
-    const inputAvals: ShapedArray[] = []; // len(inputs)
-    const inputArgs: JitId[] = [];
-
-    let inputReduction: (JitValue & { type: "red" }) | null = null;
-
-    // May need to reindex gids to match order, returns array of new gids.
-    const addArgs = (args: JitId[]): number[] => {
-      const newGids: number[] = [];
-      for (const jitId of args) {
-        let newGid = inputArgs.indexOf(jitId);
-        if (newGid === -1) {
-          newGid = inputArgs.length;
-          inputArgs.push(jitId);
-        }
-        newGids.push(newGid);
-      }
-      return newGids;
     };
 
-    for (const input of eqn.inputs) {
-      if (input instanceof Var) {
-        const jv = ctx.get(input)!;
-        if (jv.type === "exp") {
-          const newGids = addArgs(jv.args);
-          inputExps.push(jv.exp.reindexGids(newGids));
-        } else if (jv.type === "imm") {
-          const [gid] = addArgs([jv.arg]);
-          // For symbolic shapes, resolve to concrete using dimBindings for
-          // ShapeTracker operations. The kernel.size stays symbolic (SizeExpr)
-          // and is resolved at execution time via dynamicParams.
-          const shape =
-            hasSymbolicDims(input.aval.shape) && _currentDimBindings
-              ? (resolveShape(input.aval.shape, _currentDimBindings) as number[])
-              : (input.aval.shape as number[]);
-          const st = ShapeTracker.fromShape(shape);
-          const indices = unravelAlu(st.shape, AluVar.gidx);
-          inputExps.push(AluExp.globalView(input.aval.dtype, gid, st, indices));
-        } else if (jv.type === "red") {
-          // Special case: We are consuming a 'red' JitValue, so we must be in the
-          // fused epilogue of a reduction.
-          if (inputReduction)
-            throw new Error("jit: unexpected, multiple red inputs");
-          const newGids = addArgs(jv.args);
-          inputExps.push(jv.reduction.epilogue.reindexGids(newGids));
-          inputReduction = jv;
-        } else {
-          jv satisfies never; // static check
+    // Now run each primitive through a set of rules, mirroring implRules.
+    for (let i = 0; i < jaxpr.eqns.length; i++) {
+      const eqn = jaxpr.eqns[i];
+
+      // Handle Primitive.Scan specially — it compiles the body jaxpr and
+      // emits a single "scan" JitStep with a ScanPlan.
+      if (eqn.primitive === Primitive.Scan) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<typeof Primitive.Scan>;
+        const {
+          jaxpr: bodyJaxpr,
+          numCarry,
+          numConsts,
+          length,
+          reverse,
+          acceptPath,
+        } = params;
+        const numX = bodyJaxpr.inBinders.length - numConsts - numCarry;
+        const numY = bodyJaxpr.outs.length - numCarry;
+
+        // Resolve input JitIds (all must be "imm" — black nodes)
+        const allInputIds: JitId[] = [];
+        for (const input of eqn.inputs) {
+          if (input instanceof Var) {
+            const jv = ctx.get(input)!;
+            if (jv.type !== "imm") {
+              throw new Error("jit: scan primitive input is not imm");
+            }
+            allInputIds.push(jv.arg);
+          } else if (input instanceof Lit) {
+            allInputIds.push(builder.pushLit(input));
+          }
         }
-        inputAvals.push(input.aval);
-      } else if (input instanceof Lit) {
-        inputExps.push(AluExp.const(input.dtype, input.value));
-        inputAvals.push(input.aval);
+
+        const constsIds = allInputIds.slice(0, numConsts);
+        const initCarryIds = allInputIds.slice(numConsts, numConsts + numCarry);
+        const xsIds = allInputIds.slice(numConsts + numCarry);
+
+        // xs avals (actual shapes from the jaxpr, include leading length dim)
+        const xsAvals: ShapedArray[] = [];
+        const xsInputs = eqn.inputs.slice(numConsts + numCarry);
+        for (const input of xsInputs) {
+          xsAvals.push(input.aval);
+        }
+
+        // Allocate output buffers: [carry_out..., stacked_ys...]
+        const outputIds: JitId[] = [];
+        for (const outVar of eqn.outBinders) {
+          const outId = builder.pushBuffer(
+            outVar.aval.size * byteWidth(outVar.aval.dtype),
+          );
+          outputIds.push(outId);
+          ctx.set(outVar, { type: "imm", arg: outId });
+        }
+
+        // Compile body jaxpr
+        const bodyProgram = jitCompile(backend, bodyJaxpr);
+
+        // Determine scan plan
+        const scanPlan = planScan(
+          backend,
+          bodyProgram,
+          bodyJaxpr,
+          length,
+          numCarry,
+          numConsts,
+          numX,
+          numY,
+          reverse,
+          acceptPath as ScanPath | ScanPath[] | undefined,
+        );
+
+        // Compute per-slice xsAvals (without leading length dimension)
+        const xsSliceAvals = xsAvals.map(
+          (a) => new ShapedArray(a.shape.slice(1), a.dtype, a.weakType),
+        );
+
+        builder.steps.push({
+          type: "scan",
+          plan: scanPlan,
+          bodyProgram,
+          bodyJaxpr,
+          length,
+          numCarry,
+          numConsts,
+          numX,
+          numY,
+          reverse,
+          consts: constsIds,
+          initCarry: initCarryIds,
+          xs: xsIds,
+          xsAvals: xsSliceAvals,
+          outputs: outputIds,
+        });
+        continue;
+      }
+
+      // DynamicUpdateSlice: compile to a zero-copy DUS step.
+      // The Mutate effect on dst allows effectDrivenAllocate to recycle
+      // dst → output, avoiding the full buffer copy.
+      if (eqn.primitive === Primitive.DynamicUpdateSlice) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<
+          typeof Primitive.DynamicUpdateSlice
+        >;
+        const { offset, axis } = params;
+
+        if (axis !== 0) {
+          throw new Error(
+            "DynamicUpdateSlice JIT: only axis=0 is currently supported",
+          );
+        }
+
+        // Resolve input JitIds
+        const dstInput = eqn.inputs[0];
+        const srcInput = eqn.inputs[1];
+        let dstId: JitId;
+        let srcId: JitId;
+
+        if (dstInput instanceof Var) {
+          const jv = ctx.get(dstInput)!;
+          if (jv.type !== "imm") {
+            throw new Error("jit: DUS dst input is not imm");
+          }
+          dstId = jv.arg;
+        } else {
+          dstId = builder.pushLit(dstInput as Lit);
+        }
+
+        if (srcInput instanceof Var) {
+          const jv = ctx.get(srcInput)!;
+          if (jv.type !== "imm") {
+            throw new Error("jit: DUS src input is not imm");
+          }
+          srcId = jv.arg;
+        } else {
+          srcId = builder.pushLit(srcInput as Lit);
+        }
+
+        const outVar = eqn.outBinders[0];
+        const elemBytes = byteWidth(outVar.aval.dtype);
+        const innerSize = (outVar.aval.shape as number[])
+          .slice(1)
+          .reduce((a, b) => a * b, 1);
+        const offsetBytes = offset * innerSize * elemBytes;
+        const sliceBytes = srcInput.aval.size * elemBytes;
+        const dstSizeBytes = outVar.aval.size * elemBytes;
+
+        // Allocate output buffer (same size as dst — recycling may reclaim dst)
+        const outId = builder.pushBuffer(dstSizeBytes);
+        ctx.set(outVar, { type: "imm", arg: outId });
+
+        builder.steps.push({
+          type: "dus",
+          dst: dstId,
+          src: srcId,
+          output: outId,
+          offsetBytes,
+          sliceBytes,
+          dstSizeBytes,
+        });
+        continue;
+      }
+
+      // ScatterAdd: compile to a scatter_add JitStep.
+      // The Mutate effect on target allows effectDrivenAllocate to recycle
+      // target → output, avoiding a full buffer copy when sizes match.
+      if (eqn.primitive === Primitive.ScatterAdd) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<
+          typeof Primitive.ScatterAdd
+        >;
+        const { axis } = params;
+
+        // Resolve input JitIds: target, indices, updates
+        const resolveInput = (input: Var | Lit): JitId => {
+          if (input instanceof Var) {
+            const jv = ctx.get(input)!;
+            if (jv.type !== "imm") {
+              throw new Error("jit: ScatterAdd input is not imm");
+            }
+            return jv.arg;
+          }
+          return builder.pushLit(input as Lit);
+        };
+
+        const targetId = resolveInput(eqn.inputs[0]);
+        const indicesId = resolveInput(eqn.inputs[1]);
+        const updatesId = resolveInput(eqn.inputs[2]);
+
+        const outVar = eqn.outBinders[0];
+        const targetShape = eqn.inputs[0].aval.shape as number[];
+        const updatesLen = eqn.inputs[2].aval.shape[axis] as number;
+        const dtype = outVar.aval.dtype;
+        const outSizeBytes = outVar.aval.size * byteWidth(dtype);
+
+        // Allocate output buffer (same size as target — recycling may reclaim target)
+        const outId = builder.pushBuffer(outSizeBytes);
+        ctx.set(outVar, { type: "imm", arg: outId });
+
+        builder.steps.push({
+          type: "scatter_add",
+          target: targetId,
+          indices: indicesId,
+          updates: updatesId,
+          output: outId,
+          axis,
+          targetShape,
+          updatesLen,
+          dtype,
+        });
+        continue;
+      }
+
+      // If this is a routine, construct and dispatch the routine.
+      if (routinePrimitives.has(eqn.primitive)) {
+        flushPendingKernels();
+        // The rest of the code collaborates to make sure that all inputs to a
+        // routine are "imm" (black node, dispatched) and so is itself.
+        const routine = new Routine(
+          routinePrimitives.get(eqn.primitive)!,
+          {
+            inputShapes: eqn.inputs.map((x) => x.aval.shape as number[]),
+            inputDtypes: eqn.inputs.map((x) => x.aval.dtype),
+            outputShapes: eqn.outBinders.map((x) => x.aval.shape as number[]),
+            outputDtypes: eqn.outBinders.map((x) => x.aval.dtype),
+          },
+          eqn.params as any,
+        );
+        const inputs: JitId[] = [];
+        for (const input of eqn.inputs) {
+          if (input instanceof Var) {
+            const jv = ctx.get(input)!;
+            if (jv.type !== "imm") {
+              throw new Error(
+                `jit: routine primitive ${eqn.primitive} input is not imm`,
+              );
+            }
+            inputs.push(jv.arg);
+          } else if (input instanceof Lit) {
+            inputs.push(builder.pushLit(input));
+          }
+        }
+        const outputs: JitId[] = [];
+        for (const outVar of eqn.outBinders) {
+          const outId = builder.pushBuffer(
+            outVar.aval.size * byteWidth(outVar.aval.dtype),
+          );
+          outputs.push(outId);
+          ctx.set(outVar, { type: "imm", arg: outId });
+        }
+        builder.pushRoutine(routine, inputs, outputs);
+        continue;
+      }
+
+      // If any input references a pending kernel's output, flush first so the
+      // output is materialized and available in ctx.
+      if (pendingKernels.length > 0) {
+        for (const input of eqn.inputs) {
+          if (
+            input instanceof Var &&
+            !ctx.has(input) &&
+            pendingKernels.some((pk) => pk.outVar === input)
+          ) {
+            flushPendingKernels();
+            break;
+          }
+        }
+      }
+
+      // Transform each input into an AluExp to start, and normalize any arguments
+      // as needed.
+      const inputExps: AluExp[] = []; // len(inputs)
+      const inputAvals: ShapedArray[] = []; // len(inputs)
+      const inputArgs: JitId[] = [];
+
+      let inputReduction: (JitValue & { type: "red" }) | null = null;
+
+      // May need to reindex gids to match order, returns array of new gids.
+      const addArgs = (args: JitId[]): number[] => {
+        const newGids: number[] = [];
+        for (const jitId of args) {
+          let newGid = inputArgs.indexOf(jitId);
+          if (newGid === -1) {
+            newGid = inputArgs.length;
+            inputArgs.push(jitId);
+          }
+          newGids.push(newGid);
+        }
+        return newGids;
+      };
+
+      for (const input of eqn.inputs) {
+        if (input instanceof Var) {
+          const jv = ctx.get(input)!;
+          if (jv.type === "exp") {
+            const newGids = addArgs(jv.args);
+            inputExps.push(jv.exp.reindexGids(newGids));
+          } else if (jv.type === "imm") {
+            const [gid] = addArgs([jv.arg]);
+            // For symbolic shapes, resolve to concrete using dimBindings for
+            // ShapeTracker operations. The kernel.size stays symbolic (SizeExpr)
+            // and is resolved at execution time via dynamicParams.
+            const shape =
+              hasSymbolicDims(input.aval.shape) && _currentDimBindings
+                ? (resolveShape(
+                    input.aval.shape,
+                    _currentDimBindings,
+                  ) as number[])
+                : (input.aval.shape as number[]);
+            const st = ShapeTracker.fromShape(shape);
+            const indices = unravelAlu(st.shape, AluVar.gidx);
+            inputExps.push(
+              AluExp.globalView(input.aval.dtype, gid, st, indices),
+            );
+          } else if (jv.type === "red") {
+            // Special case: We are consuming a 'red' JitValue, so we must be in the
+            // fused epilogue of a reduction.
+            if (inputReduction)
+              throw new Error("jit: unexpected, multiple red inputs");
+            const newGids = addArgs(jv.args);
+            inputExps.push(jv.reduction.epilogue.reindexGids(newGids));
+            inputReduction = jv;
+          } else {
+            jv satisfies never; // static check
+          }
+          inputAvals.push(input.aval);
+        } else if (input instanceof Lit) {
+          inputExps.push(AluExp.const(input.dtype, input.value));
+          inputAvals.push(input.aval);
+        } else {
+          throw new TypeError(`Unexpected input in Jaxpr: ${input}`);
+        }
+      }
+
+      // Produce a new expression and/or reduction for the operation based on the
+      // jit() implementation of the primitive.
+      const rule = jitRules[eqn.primitive];
+      if (!rule)
+        throw new TypeError(
+          `JIT not implemented for primitive ${eqn.primitive}`,
+        );
+
+      let exp: AluExp[];
+      let reduction: Reduction | undefined;
+
+      if (inputReduction) {
+        // Special case: we are in the fused epilogue of a reduction.
+        const jv = inputReduction;
+        const newEpilogue = rule(inputExps, inputAvals, eqn.params as any)
+          .exp[0];
+        exp = [jv.exp.reindexGids(addArgs(jv.args))];
+        reduction = new Reduction(
+          jv.reduction.dtype,
+          jv.reduction.op,
+          jv.reduction.size,
+          newEpilogue,
+        );
       } else {
-        throw new TypeError(`Unexpected input in Jaxpr: ${input}`);
+        const ruleOutput = rule(inputExps, inputAvals, eqn.params as any);
+        exp = ruleOutput.exp;
+        reduction = ruleOutput.reduction;
+      }
+
+      // Then dispatch the kernel, if it is a "black" node as determined from
+      // dataflow analysis above. Defer to pending kernel batching for potential
+      // multi-output fusion.
+      for (let i = 0; i < eqn.outBinders.length; i++) {
+        const outVar = eqn.outBinders[i];
+        if (blackNodes.has(outVar)) {
+          const size = outVar.aval.sizeExpr;
+          pendingKernels.push({
+            outVar,
+            exp: exp[i],
+            reduction,
+            inputArgs: [...inputArgs],
+            size,
+          });
+        } else if (reduction) {
+          // Reduction but not black, means it will have an epilogue.
+          ctx.set(outVar, {
+            type: "red",
+            exp: exp[i],
+            reduction,
+            args: inputArgs,
+          });
+        } else {
+          // Otherwise, fuse the kernel into the next expression.
+          ctx.set(outVar, { type: "exp", exp: exp[i], args: inputArgs });
+        }
       }
     }
 
-    // Produce a new expression and/or reduction for the operation based on the
-    // jit() implementation of the primitive.
-    const rule = jitRules[eqn.primitive];
-    if (!rule)
-      throw new TypeError(`JIT not implemented for primitive ${eqn.primitive}`);
+    // Flush any remaining pending kernels before output collection.
+    flushPendingKernels();
 
-    let exp: AluExp[];
-    let reduction: Reduction | undefined;
-
-    if (inputReduction) {
-      // Special case: we are in the fused epilogue of a reduction.
-      const jv = inputReduction;
-      const newEpilogue = rule(inputExps, inputAvals, eqn.params as any).exp[0];
-      exp = [jv.exp.reindexGids(addArgs(jv.args))];
-      reduction = new Reduction(
-        jv.reduction.dtype,
-        jv.reduction.op,
-        jv.reduction.size,
-        newEpilogue,
-      );
-    } else {
-      const ruleOutput = rule(inputExps, inputAvals, eqn.params as any);
-      exp = ruleOutput.exp;
-      reduction = ruleOutput.reduction;
-    }
-
-    // Then dispatch the kernel, if it is a "black" node as determined from
-    // dataflow analysis above. Defer to pending kernel batching for potential
-    // multi-output fusion.
-    for (let i = 0; i < eqn.outBinders.length; i++) {
-      const outVar = eqn.outBinders[i];
-      if (blackNodes.has(outVar)) {
-        const size = outVar.aval.sizeExpr;
-        pendingKernels.push({
-          outVar,
-          exp: exp[i],
-          reduction,
-          inputArgs: [...inputArgs],
-          size,
-        });
-      } else if (reduction) {
-        // Reduction but not black, means it will have an epilogue.
-        ctx.set(outVar, {
-          type: "red",
-          exp: exp[i],
-          reduction,
-          args: inputArgs,
-        });
+    // Finally, loop through the outputs.
+    const outputIds: JitId[] = [];
+    for (const out of jaxpr.outs) {
+      if (out instanceof Var) {
+        const jitValue = ctx.get(out)!;
+        if (jitValue.type !== "imm")
+          throw new Error("internal: Expected imm, since outs are black nodes");
+        outputIds.push(jitValue.arg);
+      } else if (out instanceof Lit) {
+        outputIds.push(builder.pushLit(out));
       } else {
-        // Otherwise, fuse the kernel into the next expression.
-        ctx.set(outVar, { type: "exp", exp: exp[i], args: inputArgs });
+        out satisfies never; // static check
       }
     }
-  }
 
-  // Flush any remaining pending kernels before output collection.
-  flushPendingKernels();
-
-  // Finally, loop through the outputs.
-  const outputIds: JitId[] = [];
-  for (const out of jaxpr.outs) {
-    if (out instanceof Var) {
-      const jitValue = ctx.get(out)!;
-      if (jitValue.type !== "imm")
-        throw new Error("internal: Expected imm, since outs are black nodes");
-      outputIds.push(jitValue.arg);
-    } else if (out instanceof Lit) {
-      outputIds.push(builder.pushLit(out));
-    } else {
-      out satisfies never; // static check
+    // Each output should have its own backend reference. If an output slot is
+    // returned twice, or if an input is returned directly, insert "incref" steps
+    // to balance the books.
+    const outputNeedsRef = new Set<JitId>(range(nargs)); // inputs
+    for (const outputId of outputIds) {
+      if (outputNeedsRef.has(outputId)) {
+        builder.pushIncref(outputId);
+      } else {
+        // If this output is seen again, increment its ref at that point.
+        outputNeedsRef.add(outputId);
+      }
     }
-  }
 
-  // Each output should have its own backend reference. If an output slot is
-  // returned twice, or if an input is returned directly, insert "incref" steps
-  // to balance the books.
-  const outputNeedsRef = new Set<JitId>(range(nargs)); // inputs
-  for (const outputId of outputIds) {
-    if (outputNeedsRef.has(outputId)) {
-      builder.pushIncref(outputId);
-    } else {
-      // If this output is seen again, increment its ref at that point.
-      outputNeedsRef.add(outputId);
-    }
-  }
+    // Effect-driven buffer allocation: compute liveness, insert free steps,
+    // and recycle same-size buffers across execute/scan boundaries.
+    builder.effectDrivenAllocate(outputIds);
 
-  // Effect-driven buffer allocation: compute liveness, insert free steps,
-  // and recycle same-size buffers across execute/scan boundaries.
-  builder.effectDrivenAllocate(outputIds);
-
-  const jp = new JitProgram(backend, builder.steps, range(0, nargs), outputIds);
-  if (DEBUG >= 4) console.info(jp.toString());
-  jitCompileCache.set(cacheKey, jp);
-  return jp;
+    const jp = new JitProgram(
+      backend,
+      builder.steps,
+      range(0, nargs),
+      outputIds,
+    );
+    if (DEBUG >= 4) console.info(jp.toString());
+    jitCompileCache.set(cacheKey, jp);
+    return jp;
   } finally {
     _currentDimBindings = undefined;
   }

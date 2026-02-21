@@ -278,6 +278,21 @@ export class WebGPUBackend implements Backend {
     return this.#gpuAllocatedBytes;
   }
 
+  /** Buffer pool diagnostic: pooled buffer count, pooled bytes, and byte budget. */
+  poolStats(): {
+    pooledBuffers: number;
+    pooledBytes: number;
+    budgetBytes: number;
+  } {
+    let pooledBuffers = 0;
+    for (const list of this.#bufferPool.values()) pooledBuffers += list.length;
+    return {
+      pooledBuffers,
+      pooledBytes: this.#poolCurrentBytes,
+      budgetBytes: this.#poolBudgetBytes,
+    };
+  }
+
   malloc(size: number, initialData?: Uint8Array<ArrayBuffer>): Slot {
     let buffer: GPUBuffer;
     // All GPUBuffer must be a multiple of 4 bytes in length, to support copy
@@ -471,7 +486,13 @@ export class WebGPUBackend implements Backend {
   ): void {
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot).buffer);
     const outputBuffers = outputs.map((slot) => this.#getBuffer(slot).buffer);
-    pipelineSubmit(this.device, exe.data, inputBuffers, outputBuffers, dynamicParams);
+    pipelineSubmit(
+      this.device,
+      exe.data,
+      inputBuffers,
+      outputBuffers,
+      dynamicParams,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -1325,10 +1346,7 @@ function pipelineSourceMulti(device: GPUDevice, kernel: Kernel): ShaderInfo {
   } else {
     const tc = threadCount as number;
     if (gridY === 1) {
-      emit(
-        `if (id.x >= ${tc}) { return; }`,
-        "let gidx: i32 = i32(id.x);",
-      );
+      emit(`if (id.x >= ${tc}) { return; }`, "let gidx: i32 = i32(id.x);");
     } else {
       const sizeX = gridX * workgroupSize;
       emit(
@@ -2053,7 +2071,10 @@ function nativeScanMultiShaderSource(
   const xsElemStrides = xsStrides.map((s) => s / elemSize);
 
   // Find the maximum kernel size across all steps
-  const maxKernelSize = Math.max(...steps.map((s) => s.kernel.size as number), 1);
+  const maxKernelSize = Math.max(
+    ...steps.map((s) => s.kernel.size as number),
+    1,
+  );
 
   const { emit, pushIndent, popIndent, getCode } = createShaderEmitter();
 

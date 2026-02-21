@@ -19,6 +19,7 @@ import {
   jit,
   lax,
   numpy as np,
+  tree,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, test } from "vitest";
 
@@ -201,16 +202,13 @@ describe("lax.associativeScan — pytree (affine composition)", () => {
     //   result[2] = f2 ∘ result[1]               => 5(6x+7)+2 = 30x+37 => a=30, b=37
     using as = np.array([2.0, 3.0, 5.0]);
     using bs = np.array([1.0, 4.0, 2.0]);
-    const result = lax.associativeScan(composeAffine, { a: as, b: bs });
+    using result = tree.makeDisposable(
+      lax.associativeScan(composeAffine, { a: as, b: bs }),
+    );
     const ra = (result as { a: np.Array; b: np.Array }).a;
     const rb = (result as { a: np.Array; b: np.Array }).b;
-    try {
-      expect(ra).toBeAllclose([2, 6, 30]);
-      expect(rb).toBeAllclose([1, 7, 37]);
-    } finally {
-      ra.dispose();
-      rb.dispose();
-    }
+    expect(ra).toBeAllclose([2, 6, 30]);
+    expect(rb).toBeAllclose([1, 7, 37]);
   });
 });
 
@@ -386,10 +384,12 @@ describe("parallel Kalman filter via associativeScan", () => {
       return { a: newA, b: newB };
     };
 
-    const scanResult = lax.associativeScan(composeAffine, {
-      a: aArr,
-      b: bArr,
-    });
+    using scanResult = tree.makeDisposable(
+      lax.associativeScan(composeAffine, {
+        a: aArr,
+        b: bArr,
+      }),
+    );
     const rA = (scanResult as { a: np.Array; b: np.Array }).a;
     const rB = (scanResult as { a: np.Array; b: np.Array }).b;
 
@@ -401,9 +401,6 @@ describe("parallel Kalman filter via associativeScan", () => {
     );
     // Use the synchronous data from rB directly (x_0 = 0 so it's just rB).
     const rBData = Array.from(rB.dataSync());
-
-    rA.dispose();
-    rB.dispose();
 
     // Compare with sequential reference
     for (let t = 0; t < N; t++) {

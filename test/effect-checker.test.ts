@@ -313,7 +313,7 @@ describe("effect-checker", () => {
     });
 
     test("effect-driven allocator does not leak buffers", async () => {
-      const backend = getBackend() as any;
+      const backend = getBackend();
       const before = backend.slotCount();
 
       {
@@ -363,7 +363,7 @@ describe("effect-checker", () => {
     });
 
     test("zero-copy DUS does not leak buffers", async () => {
-      const backend = getBackend() as any;
+      const backend = getBackend();
       const before = backend.slotCount();
 
       {

@@ -14,6 +14,6 @@ test("plugin exports invariance config", () => {
   assert.equal(rules["jax-js/no-dispose-then-reassign-param"], "error");
   assert.equal(rules["jax-js/no-make-disposable-alias"], "error");
   assert.equal(rules["jax-js/no-unnecessary-ref"], "error");
-  assert.equal(rules["jax-js/no-array-chain"], "error");
+  assert.equal(rules["jax-js/no-array-chain"], undefined);
   assert.equal(rules["jax-js/require-scan-result-dispose"], "error");
 });

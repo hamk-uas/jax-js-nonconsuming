@@ -4,13 +4,13 @@ import { AluGroup, AluOp, DType, isFloatDtype, promoteTypes } from "../alu";
 import { Routines } from "../routine";
 import {
   type Dim,
-  type SizeExpr,
   dimCompatible,
   dimEquals,
   dimProduct,
   hasSymbolicDims,
   isSymbolicDim,
   type Pair,
+  type SizeExpr,
 } from "../shape";
 import {
   JsTreeDef,

@@ -3,7 +3,6 @@ import { PPrint } from "../pprint";
 import {
   concreteDim,
   type Dim,
-  dimCompatible,
   dimEquals,
   type Pair,
   resolveShape,

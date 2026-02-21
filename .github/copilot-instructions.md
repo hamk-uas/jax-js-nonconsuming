@@ -4049,3 +4049,229 @@ The `Primitive.TriangularSolve` convention (important for understanding the JVP)
   last axis of `b`, solves, flips result back
 - `lax.linalg.triangularSolve(A, b, {leftSide: true})` transforms to right-side convention by
   transposing both arguments and flipping `lower`
+
+---
+
+# Part 7: Polymorphic Shapes (M4 — Dynamic Dimensions)
+
+## Overview
+
+Polymorphic shapes enable a single JIT-compiled `JitProgram` to be reused across different input
+sizes on a specified axis (e.g., sequence length `T`). Without this, each new input shape triggers a
+full re-trace + re-compile. With polymorphic shapes, the program is traced once with symbolic
+dimensions and compiled to code parameterized by those dimensions.
+
+**Key design decision: concrete compilation + symbolic caching.** The program is compiled for a
+_concrete_ instantiation of the symbolic dimensions (using the first call's actual sizes), but the
+compiled artifact is cached under a _symbolic_ key. Subsequent calls with different sizes on the
+dynamic axis hit the cache if they share the same symbolic structure — they just pass different
+concrete dimension values at execution time.
+
+## Key Types (`src/dim.ts`)
+
+| Type           | Purpose                                                                                                                  |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `SymDim`       | A named symbolic dimension variable (e.g., `SymDim("T")`). Propagated through shape inference during tracing.            |
+| `Dim`          | `number \| SymDim` — a dimension is either concrete or symbolic.                                                         |
+| `SymbolicSize` | A symbolic size expression: `factor × prod(syms)`. E.g., `SymbolicSize(4, ["T"])` = `T × 4`. Resolves with dim bindings. |
+| `SizeExpr`     | `number \| SymbolicSize` — used for `Kernel.size`, `KernelOutput.bytes`, `JitStep.malloc.size`.                          |
+
+Key utility functions: `isSymbolicDim()`, `hasSymbolicDims()`, `concreteDim()`, `concreteShape()`,
+`dimEquals()`, `dimCompatible()`, `resolveShape()`, `isSymbolicSize()`, `resolveSizeExpr()`,
+`sizeExprKey()`, `dimProduct()`, `sizeExprMul()`.
+
+## How It Works
+
+### Tracing (`makeJaxpr` with `dynamic_axes`)
+
+```ts
+const jaxpr = makeJaxpr(f, [ShapedArray([3, SymDim("T")], DType.Float32)], {
+  dynamic_axes: { T: 0 }, // axis 1 is symbolic
+});
+```
+
+During tracing, `SymDim("T")` propagates through all shape operations. Operations that depend on the
+symbolic dimension get `SymbolicSize` kernel sizes instead of concrete numbers.
+
+### Compilation (`_currentDimBindings` in `jit.ts`)
+
+`_currentDimBindings` is a module-level variable set during `jitCompile()`:
+
+1. **Set on entry**: `_currentDimBindings = dimBindings` — maps symbolic names to concrete values
+   for the current call (e.g., `{ T: 128 }`).
+2. **Used during compilation**: `resolveShape()` converts symbolic `Dim[]` to concrete `number[]`
+   for `ShapeTracker` operations (strides, offsets, unravel indices). `setConcreteHint()` resolves
+   `SizeExpr` to a concrete `concreteSizeHint` on each `Kernel` for expression simplification
+   (modulo elimination).
+3. **Cleared in finally**: Prevents stale state from leaking across compilations.
+
+### Execution (`dynamicParams`)
+
+At execution time, resolved symbolic dimensions are passed to the compiled code:
+
+- **WASM**: As extra `i32` function parameters (planned; currently uses concrete compilation)
+- **WebGPU**: Via uniform buffer containing resolved dimension values (planned; `isSymbolicSize`
+  guards exist in codegen)
+
+### Cache Key Strategy
+
+The JIT cache uses `sizeExprKey()` for symbolic sizes — e.g., `"T*4"` instead of `"512"`. This means
+a program compiled for `T=128` is reused when called with `T=256` (same symbolic structure,
+different concrete value). The `Kernel.concreteSizeHint` is re-resolved from `_currentDimBindings`
+on each compilation, but the cache key matches on the symbolic expression.
+
+## Key Files
+
+| File                              | Purpose                                                     |
+| --------------------------------- | ----------------------------------------------------------- |
+| `src/dim.ts`                      | `SymDim`, `Dim`, `SymbolicSize`, `SizeExpr` types + helpers |
+| `src/frontend/jit.ts`             | `_currentDimBindings`, `setConcreteHint`                    |
+| `src/frontend/jaxpr.ts`           | `dynamic_axes` option in `makeJaxpr()`                      |
+| `test/polymorphic-shapes.test.ts` | Test coverage for symbolic shape tracing + compilation      |
+
+## Current Limitations
+
+- `Reduction.size` is still `number`, not `SizeExpr` — reductions on symbolic axes need work
+- Full buffer pool integration with symbolic `PoolHints` not yet implemented
+- WebGPU uniform dim buffer (`struct Dims { T: u32 }`) not yet implemented
+- WASM codegen extra `i32` parameters for symbolic dims not yet implemented
+- Dynamic grid size computation from resolved symbolic dims at execution time not yet implemented
+
+---
+
+# Part 8: ULTIMATE-ARCHITECTURE-PLAN Progress
+
+## Plan Location
+
+`ULTIMATE-ARCHITECTURE-PLAN.md` in the repo root. Contains detailed specifications for milestones
+M0–M8 with dependency graph, code sketches, and test plans.
+
+## Milestone Status
+
+| Milestone | Title                         | Status             | Notes                                                     |
+| --------- | ----------------------------- | ------------------ | --------------------------------------------------------- |
+| M0.1      | Record baseline tests         | Not done           | No `tmp/m0-*` baseline files created yet                  |
+| M0.2      | Hardware feature detection    | **DONE**           | `BackendCapabilities` interface in `src/backend.ts`       |
+| M1.1      | `ScanBackwardArtifact` type   | Partially done     | `ScanPullbackArtifact` exists in `scan-backward.ts`       |
+| M1.2      | Unify `vjpFlat` transposition | **DONE**           | `jaxprNeedsCallTimeTranspose` fully removed               |
+| M2.1      | `scatter_add` IR & AD rules   | **DONE**           | `Primitive.ScatterAdd` with JVP + transpose rules         |
+| M2.2      | WebGPU CAS loop shader        | **DONE**           | `dispatchScatterAdd()` in `webgpu.ts`                     |
+| M2.3      | WASM sequential scatter       | **DONE**           | `dispatchScatterAdd()` in `wasm.ts`                       |
+| M3.1      | Multi-output `Kernel`         | **DONE\***         | `KernelOutput[]`, `Kernel.single()`, multi-output codegen |
+| M3.2      | Epilogue fusion chain walk    | Not done           | No extended epilogue fusion in `splitGraphDataflow`       |
+| M4.1      | `SymDim` & shape propagation  | **DONE**           | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`          |
+| M4.2      | Parameterized backend codegen | **DONE** (partial) | `SizeExpr`, `_currentDimBindings`, symbolic cache keys    |
+| M5.1–5.3  | WASM multithreading           | Not done           | No `SharedArrayBuffer`/workers infrastructure             |
+| M6.1      | Mega-Module                   | Not done           | Depends on M4.2 completion + M5                           |
+| M6.2      | Mega-module multithreading    | Not done           | Depends on M5 + M6.1                                      |
+| M7.1      | `Primitive.AssociativeScan`   | Not done           | Still unrolls; no dedicated primitive                     |
+| M7.2–7.3  | Compiled/threaded Kogge-Stone | Not done           | Depends on M7.1 + M5/M6.2                                 |
+| M8        | Cleanup & benchmarking        | Not done           | Depends on all others                                     |
+
+\* M3.1 is structurally complete (multi-output `Kernel`, codegen on both backends, tests) but
+backward-compat shims (`get exp()`, etc.) that the plan says should be removed within M3.1 still
+exist.
+
+## Dependency Graph (Simplified)
+
+```
+M0.2 ✅ ──┬──→ M1 (scan backward AOT) ~partial
+          ├──→ M2 (scatter_add) ✅
+          ├──→ M3.1 (multi-output kernel) ✅* ──→ M3.2 (epilogue fusion) ❌
+          ├──→ M4.1 ✅ ──→ M4.2 ~done ──→ M6.1 ❌
+          └──→ M5 ❌ ──→ M6.2 ❌
+                         M7.1 ❌ ──→ M7.2 ❌ ──→ M7.3 ❌ (needs M5+M6.2)
+                                                    ↓
+                                              M8 (cleanup) ❌
+```
+
+## Next Available Milestones
+
+Per the dependency graph, the following milestones can be worked on next:
+
+1. **M0.1** — Record baseline test numbers (independent, quick)
+2. **M3.2** — Epilogue fusion (depends on M3.1 ✅)
+3. **M5** — WASM multithreading foundation (independent)
+4. **M7.1** — `Primitive.AssociativeScan` (independent)
+5. **M1.1** completion — Finish `ScanBackwardArtifact` (M0 dependency met)
+
+---
+
+# Part 9: Session Continuity Notes for AI Agents
+
+## Before Starting Work
+
+1. **Build first**: Run `pnpm build` before running tests — Vitest imports from `dist/`, not `src/`.
+2. **Check branch**: `git branch` to confirm you're on the right branch (currently
+   `docs/ultimate-architecture-plan`).
+3. **Read the plan**: `ULTIMATE-ARCHITECTURE-PLAN.md` contains detailed specifications for each
+   milestone including code sketches, test plans, and acceptance criteria.
+4. **Check git log**: `git log --oneline -10` to see recent commits and understand context.
+
+## Key Implementation Patterns
+
+### Adding new primitives
+
+Follow the checklist in Part 1 → "Adding a new primitive" and "Adding a new routine". Key: add to
+`Primitive` enum, impl rules, JVP rules, transpose rules, export from `index.ts`.
+
+### JIT compilation flow
+
+`makeJaxpr` → `jaxpr.flatten().simplify()` → `splitGraphDataflow()` → `jitCompile()` →
+`JitProgram.execute()`. The `splitGraphDataflow` P2 pass is the most subtle — see the
+`isNonKernelBlack` distinction in common pitfalls.
+
+### Ownership debugging
+
+If a `UseAfterFreeError` appears, check: artifact disposal timing, `transposeJaxprCache`
+(cache-owned, don't dispose), `getOrMakeConstTracer` `.ref` balance, `evalJaxprTransposed`
+`argPrimals` set.
+
+### Test workflow
+
+```bash
+pnpm build                    # Required before tests
+pnpm vitest run               # Full test suite (imports from dist/)
+pnpm run test:eslint-plugin   # ESLint plugin tests
+pnpm lint                     # Lint check
+pnpm check                    # TypeScript type check
+```
+
+## What Gets Lost at Summarization Boundaries
+
+These details are frequently lost when conversation context is summarized:
+
+1. **The M-numbering discrepancy**: Early git commits are labeled M0–M4 but refer to foundational
+   work, NOT the ULTIMATE-ARCHITECTURE-PLAN milestones. The plan's milestones are a separate
+   numbering system. Always check `ULTIMATE-ARCHITECTURE-PLAN.md` for the canonical milestone
+   definitions.
+
+2. **Test imports from `dist/`**: Source edits in `src/` are invisible to Vitest tests until
+   `pnpm build` runs. This causes confusion when an edit "doesn't work" in tests.
+
+3. **eslint.config.ts structure**: The invariance config applies to `test/**`, strict applies
+   nowhere by default, internalTransforms rules run via a separate `lint:ownership:internal` script.
+
+4. **`_currentDimBindings` is module-level state**: Set/cleared in `jitCompile()` via try/finally.
+   Any new compilation code that reads symbolic dimensions must go through this.
+
+5. **Multi-output kernel compat shims**: `Kernel.exp`, `Kernel.reduction`, `Kernel.dtype` getters
+   still exist as backward-compat shims delegating to `outputs[0]`. The plan says remove them but
+   they're still used in many places.
+
+6. **The `no-array-chain` rule is NOT in the `invariance` config** — only in `strict`. The
+   `invariance` config focuses on ownership correctness (eager/JIT equivalence), not performance
+   patterns.
+
+## Architecture Decisions Log
+
+Decisions made during development that future agents should understand:
+
+| Decision                              | Rationale                                                                               |
+| ------------------------------------- | --------------------------------------------------------------------------------------- |
+| Non-consuming ownership model         | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting  |
+| Concrete compilation + symbolic cache | Simpler than full symbolic IR; ShapeTracker needs concrete strides                      |
+| `effectDrivenAllocate` over two-pass  | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect |
+| Direct LU→triSolve gradient path      | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                  |
+| `transposeJaxprCache` is cache-owned  | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`        |
+| `invariance` ≠ `strict` ESLint config | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory    |

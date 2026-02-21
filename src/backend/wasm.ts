@@ -1396,7 +1396,8 @@ function emitKernelBody(opts: {
    */
   sizeLocal?: number;
 }): void {
-  const { cg, kernel, gidx, emitOutputAddr, emitExp, emitStore, sizeLocal } = opts;
+  const { cg, kernel, gidx, emitOutputAddr, emitExp, emitStore, sizeLocal } =
+    opts;
   const tune = tuneNullopt(kernel);
   const re = kernel.reduction;
   const storeAlign = Math.log2(byteWidth(kernel.dtype));

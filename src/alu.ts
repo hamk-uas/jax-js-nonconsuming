@@ -1,6 +1,6 @@
+import { isSymbolicSize, type SizeExpr, sizeExprMul } from "./dim";
 import { PPrint } from "./pprint";
 import { ShapeTracker } from "./shape";
-import { type SizeExpr, isSymbolicSize, sizeExprMul } from "./dim";
 import { clamp, FpHash, FpHashable, gcd, strip1 } from "./utils";
 
 /** A numerical data type for array contents. */
@@ -520,7 +520,10 @@ export class AluExp implements FpHashable {
         ret = [this.arg, this.arg];
         break;
       case AluOp.Special:
-        ret = typeof this.arg[1] === "number" ? [0, this.arg[1] - 1] : [-Infinity, Infinity];
+        ret =
+          typeof this.arg[1] === "number"
+            ? [0, this.arg[1] - 1]
+            : [-Infinity, Infinity];
         break;
 
       default:
