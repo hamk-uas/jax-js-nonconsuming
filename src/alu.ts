@@ -1441,59 +1441,166 @@ export const AluVar = {
 };
 
 /**
+ * A single output of a kernel. Contains the expression to evaluate and an
+ * optional reduction. Multi-output kernels hold one KernelOutput per output.
+ */
+export interface KernelOutput {
+  /** Expression to be evaluated for this output. */
+  readonly exp: AluExp;
+  /** Optional reduction to be performed for this output. */
+  readonly reduction?: Reduction;
+  /** The dtype of this output. */
+  readonly dtype: DType;
+  /** The number of bytes in the output array. */
+  readonly bytes: number;
+}
+
+/**
  * Description of a kernel to be compiled.
  *
  * Each of these can be processed by a backend into some lower-level
  * representation. It consists of one or more fused operations, optionally
- * indexing into a buffer.
+ * indexing into a buffer. A kernel may produce one or more outputs that share
+ * the same input arguments and loop bounds.
  */
 export class Kernel implements FpHashable {
-  constructor(
+  /** The outputs produced by this kernel. */
+  readonly outputs: KernelOutput[];
+
+  // ---- backward-compatible accessors (delegate to outputs[0]) ----
+
+  /** Expression for the first (or only) output. */
+  get exp(): AluExp {
+    return this.outputs[0].exp;
+  }
+
+  /** Reduction for the first (or only) output. */
+  get reduction(): Reduction | undefined {
+    return this.outputs[0].reduction;
+  }
+
+  /** Dtype of the first (or only) output. */
+  get dtype(): DType {
+    return this.outputs[0].dtype;
+  }
+
+  /** Bytes of the first (or only) output. */
+  get bytes(): number {
+    return this.outputs[0].bytes;
+  }
+
+  // ---- multi-output accessors ----
+
+  /** Number of outputs. */
+  get numOutputs(): number {
+    return this.outputs.length;
+  }
+
+  /** Whether this kernel has more than one output. */
+  get isMultiOutput(): boolean {
+    return this.outputs.length > 1;
+  }
+
+  /** Whether any output has a reduction. */
+  get hasReduction(): boolean {
+    return this.outputs.some((o) => o.reduction !== undefined);
+  }
+
+  /** Dtype of a specific output. */
+  dtypeAt(i: number): DType {
+    return this.outputs[i].dtype;
+  }
+
+  /** Total bytes across all outputs. */
+  get totalBytes(): number {
+    let total = 0;
+    for (const o of this.outputs) total += o.bytes;
+    return total;
+  }
+
+  /** Bytes per output as an array. */
+  get bytesPerOutput(): number[] {
+    return this.outputs.map((o) => o.bytes);
+  }
+
+  private constructor(
     /** Number of global arguments / arrays. */
     readonly nargs: number,
     /** Size of the result array in element count. */
     readonly size: number,
-    /** Expression to be evaluated. */
-    readonly exp: AluExp,
-    /** Optional reduction to be performed. */
-    readonly reduction?: Reduction,
+    outputs: KernelOutput[],
   ) {
-    this.exp = exp.simplify();
+    this.outputs = outputs;
+  }
+
+  /** Create a single-output kernel (replaces `new Kernel(...)`). */
+  static single(
+    nargs: number,
+    size: number,
+    exp: AluExp,
+    reduction?: Reduction,
+  ): Kernel {
+    exp = exp.simplify();
+    const dtype = reduction ? reduction.epilogue.dtype : exp.dtype;
+    const bytes = size * byteWidth(dtype);
+    return new Kernel(nargs, size, [{ exp, reduction, dtype, bytes }]);
+  }
+
+  /** Create a multi-output kernel. None of the outputs may have reductions. */
+  static multi(
+    nargs: number,
+    size: number,
+    outputDescs: { exp: AluExp; reduction?: Reduction }[],
+  ): Kernel {
+    if (outputDescs.length === 0) {
+      throw new Error("Kernel.multi requires at least one output");
+    }
+    const outputs: KernelOutput[] = outputDescs.map(
+      ({ exp: rawExp, reduction }) => {
+        const exp = rawExp.simplify();
+        const dtype = reduction ? reduction.epilogue.dtype : exp.dtype;
+        const bytes = size * byteWidth(dtype);
+        return { exp, reduction, dtype, bytes };
+      },
+    );
+    return new Kernel(nargs, size, outputs);
   }
 
   hash(state: FpHash): void {
-    state
-      .update(this.nargs)
-      .update(this.size)
-      .update(this.exp)
-      .update(this.reduction);
+    state.update(this.nargs).update(this.size);
+    for (const o of this.outputs) {
+      state.update(o.exp).update(o.reduction);
+    }
   }
 
   pprint(): PPrint {
-    let details = PPrint.pp(`exp = ${this.exp}`);
-    details = details.concat(PPrint.pp(`size = ${this.size}`));
-    if (this.reduction) {
-      details = details.concat(PPrint.pp(`reduction = ${this.reduction}`));
+    if (this.outputs.length === 1) {
+      let details = PPrint.pp(`exp = ${this.outputs[0].exp}`);
+      details = details.concat(PPrint.pp(`size = ${this.size}`));
+      if (this.outputs[0].reduction) {
+        details = details.concat(
+          PPrint.pp(`reduction = ${this.outputs[0].reduction}`),
+        );
+      }
+      return PPrint.pp("{ ").stack(details).stack(PPrint.pp(" }"));
+    }
+    // Multi-output
+    let details = PPrint.pp(`size = ${this.size}`);
+    details = details.concat(PPrint.pp(`numOutputs = ${this.outputs.length}`));
+    for (let i = 0; i < this.outputs.length; i++) {
+      const o = this.outputs[i];
+      details = details.concat(PPrint.pp(`output[${i}] exp = ${o.exp}`));
+      if (o.reduction) {
+        details = details.concat(
+          PPrint.pp(`output[${i}] reduction = ${o.reduction}`),
+        );
+      }
     }
     return PPrint.pp("{ ").stack(details).stack(PPrint.pp(" }"));
   }
 
   toString(): string {
     return this.pprint().toString();
-  }
-
-  /** The dtype of the values output by this kernel. */
-  get dtype(): DType {
-    if (this.reduction) {
-      return this.reduction.epilogue.dtype;
-    } else {
-      return this.exp.dtype;
-    }
-  }
-
-  /** The number of bytes in the output array when evaluating this kernel. */
-  get bytes(): number {
-    return this.size * byteWidth(this.dtype);
   }
 }
 

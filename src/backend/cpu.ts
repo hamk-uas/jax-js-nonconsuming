@@ -11,6 +11,7 @@ export class CpuBackend implements Backend {
   readonly capabilities: BackendCapabilities = {
     atomicF32Add: false,
     sharedMemory: false,
+    multiOutputKernel: true,
   };
 
   #buffers: Map<Slot, { ref: number; buffer: Uint8Array<ArrayBuffer> }>;
@@ -121,25 +122,37 @@ export class CpuBackend implements Backend {
     }
 
     const kernel = exe.source as Kernel;
-    const { exp, epilogue } = tuneNullopt(kernel);
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot));
     const outputBuffers = outputs.map((slot) => this.#getBuffer(slot));
 
-    const usedArgs = new Map(
-      [
-        ...exp.collect((exp) => exp.op === AluOp.GlobalIndex),
-        ...(epilogue
-          ? epilogue.collect((exp) => exp.op === AluOp.GlobalIndex)
-          : []),
-      ].map((exp) => [exp.arg[0] as number, exp.dtype]),
-    );
+    // Tune each output independently
+    const tunes = kernel.outputs.map((o) => {
+      const tmp = Kernel.single(kernel.nargs, kernel.size, o.exp, o.reduction);
+      return tuneNullopt(tmp);
+    });
+
+    // Collect used args across all outputs
+    const usedArgs = new Map<number, DType>();
+    for (const tune of tunes) {
+      for (const exp of tune.exp.collect(
+        (exp) => exp.op === AluOp.GlobalIndex,
+      )) {
+        usedArgs.set(exp.arg[0] as number, exp.dtype);
+      }
+      if (tune.epilogue) {
+        for (const exp of tune.epilogue.collect(
+          (exp) => exp.op === AluOp.GlobalIndex,
+        )) {
+          usedArgs.set(exp.arg[0] as number, exp.dtype);
+        }
+      }
+    }
 
     const inputArrays = inputBuffers.map((buf, i) => {
       const dtype = usedArgs.get(i);
       if (!dtype) return null!; // This arg is unused, so we just blank it out.
       return dtypedArray(dtype, buf);
     });
-    const outputArray = dtypedArray(kernel.dtype, outputBuffers[0]);
 
     const globals = (gid: number, bufidx: number) => {
       if (gid < 0 || gid >= inputArrays.length)
@@ -148,29 +161,37 @@ export class CpuBackend implements Backend {
         throw new Error("bufidx out of bounds: " + bufidx);
       return inputArrays[gid][bufidx];
     };
-    if (!kernel.reduction) {
-      for (let i = 0; i < kernel.size; i++) {
-        outputArray[i] = exp.evaluate({ gidx: i }, globals);
-      }
-    } else {
-      const useKahan =
-        kernel.reduction.dtype === DType.Float64 &&
-        kernel.reduction.op === AluOp.Add;
-      for (let i = 0; i < kernel.size; i++) {
-        let acc = kernel.reduction.identity;
-        let comp = 0; // Kahan compensation
-        for (let j = 0; j < kernel.reduction.size; j++) {
-          const item = exp.evaluate({ gidx: i, ridx: j }, globals);
-          if (useKahan) {
-            const y = item - comp;
-            const t = acc + y;
-            comp = t - acc - y;
-            acc = t;
-          } else {
-            acc = kernel.reduction.evaluate(acc, item);
-          }
+
+    // Evaluate each output
+    for (let oi = 0; oi < kernel.numOutputs; oi++) {
+      const tune = tunes[oi];
+      const out = kernel.outputs[oi];
+      const outputArray = dtypedArray(out.dtype, outputBuffers[oi]);
+
+      if (!out.reduction) {
+        for (let i = 0; i < kernel.size; i++) {
+          outputArray[i] = tune.exp.evaluate({ gidx: i }, globals);
         }
-        outputArray[i] = epilogue!.evaluate({ acc, gidx: i }, globals);
+      } else {
+        const useKahan =
+          out.reduction.dtype === DType.Float64 &&
+          out.reduction.op === AluOp.Add;
+        for (let i = 0; i < kernel.size; i++) {
+          let acc = out.reduction.identity;
+          let comp = 0; // Kahan compensation
+          for (let j = 0; j < out.reduction.size; j++) {
+            const item = tune.exp.evaluate({ gidx: i, ridx: j }, globals);
+            if (useKahan) {
+              const y = item - comp;
+              const t = acc + y;
+              comp = t - acc - y;
+              acc = t;
+            } else {
+              acc = out.reduction.evaluate(acc, item);
+            }
+          }
+          outputArray[i] = tune.epilogue!.evaluate({ acc, gidx: i }, globals);
+        }
       }
     }
   }

@@ -271,7 +271,7 @@ function tryPrepareWasmNativeScan(
             source.reduction.epilogue.reindexGids(reindexMap),
           )
         : undefined;
-      const reindexedKernel = new Kernel(
+      const reindexedKernel = Kernel.single(
         numInputs + internalSizes.length,
         source.size,
         reindexedExp,
@@ -620,7 +620,7 @@ function tryPrepareWebGPUNativeScan(
             source.reduction.epilogue.reindexGids(reindexMap),
           )
         : undefined;
-      const reindexedKernel = new Kernel(
+      const reindexedKernel = Kernel.single(
         numInputs,
         source.size,
         reindexedExp,

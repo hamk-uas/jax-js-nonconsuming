@@ -121,6 +121,7 @@ export class WasmBackend implements Backend {
       typeof globalThis.crossOriginIsolated === "boolean"
         ? globalThis.crossOriginIsolated
         : false,
+    multiOutputKernel: true,
   };
 
   #memory: WebAssembly.Memory;
@@ -758,6 +759,10 @@ function importWasmHelperFuncs(
 }
 
 function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
+  if (kernel.isMultiOutput) {
+    return codegenWasmMulti(kernel);
+  }
+
   const tune = tuneNullopt(kernel);
 
   if (DEBUG >= 3) {
@@ -795,6 +800,136 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
         translateExp(cg, funcs, exp, vars);
       },
     });
+  });
+  cg.export(kernelFunc, "kernel");
+
+  return cg.finish();
+}
+
+/**
+ * Codegen for multi-output kernels. Generates a single gidx loop that
+ * evaluates and stores each output expression sequentially per element.
+ * Function signature: (input0, ..., inputN-1, output0, ..., outputM-1).
+ */
+function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
+  const numOutputs = kernel.numOutputs;
+  const tunes = kernel.outputs.map((o) => {
+    // Build a temporary single-output kernel for tuning
+    const tmpKernel = Kernel.single(
+      kernel.nargs,
+      kernel.size,
+      o.exp,
+      o.reduction,
+    );
+    return tuneNullopt(tmpKernel);
+  });
+
+  const cg = new CodeGenerator();
+  cg.memory.import("env", "memory");
+
+  // Collect all distinct ops across all output expressions
+  let allOps: Map<AluOp, Set<DType>> = new Map();
+  for (const tune of tunes) {
+    allOps = mapSetUnion(allOps, tune.exp.distinctOps());
+    if (tune.epilogue)
+      allOps = mapSetUnion(allOps, tune.epilogue.distinctOps());
+  }
+  const funcs = importWasmHelperFuncs(cg, allOps);
+
+  // Function params: nargs inputs + numOutputs outputs, all i32 pointers
+  const nParams = kernel.nargs + numOutputs;
+  const kernelFunc = cg.function(rep(nParams, cg.i32), [], () => {
+    const gidx = cg.local.declare(cg.i32);
+
+    // gidx loop
+    cg.i32.const(0);
+    cg.local.set(gidx);
+    cg.loop(cg.void);
+    {
+      cg.block(cg.void);
+      cg.local.get(gidx);
+      cg.i32.const(kernel.size);
+      cg.i32.ge_u();
+      cg.br_if(0);
+
+      // For each output: compute expression, store result
+      for (let oi = 0; oi < numOutputs; oi++) {
+        const tune = tunes[oi];
+        const out = kernel.outputs[oi];
+        const outParamIdx = kernel.nargs + oi;
+        const storeAlign = Math.log2(byteWidth(out.dtype));
+
+        // Push output address: outParam + gidx * elemSize
+        cg.local.get(outParamIdx);
+        cg.local.get(gidx);
+        cg.i32.const(byteWidth(out.dtype));
+        cg.i32.mul();
+        cg.i32.add();
+
+        if (out.reduction) {
+          // Reduction: accumulator + inner ridx loop
+          const re = out.reduction;
+          const acc = cg.local.declare(dty(cg, null, out.exp.dtype));
+          dty(cg, null, out.exp.dtype).const(re.identity);
+          cg.local.set(acc);
+
+          const useKahan = re.dtype === DType.Float64 && re.op === AluOp.Add;
+          let kahanComp: number | undefined;
+          if (useKahan) {
+            kahanComp = cg.local.declare(cg.f64);
+            cg.f64.const(0);
+            cg.local.set(kahanComp);
+          }
+
+          const ridx = cg.local.declare(cg.i32);
+          cg.i32.const(0);
+          cg.local.set(ridx);
+
+          cg.loop(cg.void);
+          {
+            cg.block(cg.void);
+            cg.local.get(ridx);
+            cg.i32.const(re.size);
+            cg.i32.ge_u();
+            cg.br_if(0);
+
+            const vars: Record<string, number> = { gidx, ridx };
+            translateExp(cg, funcs, tune.exp, vars);
+            codegenReductionAccumulate(cg, re, acc, kahanComp);
+
+            cg.local.get(ridx);
+            cg.i32.const(1);
+            cg.i32.add();
+            cg.local.set(ridx);
+
+            cg.br(1);
+            cg.end();
+          }
+          cg.end();
+
+          // Emit epilogue
+          const epilogueVars: Record<string, number> = { gidx, acc };
+          translateExp(cg, funcs, tune.epilogue!, epilogueVars);
+        } else {
+          // No reduction: just translate the expression
+          const vars: Record<string, number> = { gidx };
+          translateExp(cg, funcs, tune.exp, vars);
+        }
+
+        // Store result
+        dty(cg, null, out.dtype).store(storeAlign);
+      }
+
+      // gidx++
+      cg.local.get(gidx);
+      cg.i32.const(1);
+      cg.i32.add();
+      cg.local.set(gidx);
+
+      cg.br(1);
+      cg.end();
+    }
+    cg.end();
   });
   cg.export(kernelFunc, "kernel");
 

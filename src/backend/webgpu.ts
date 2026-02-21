@@ -246,6 +246,7 @@ export class WebGPUBackend implements Backend {
         "shader-f32-atomic-add" as GPUFeatureName,
       ),
       sharedMemory: false,
+      multiOutputKernel: true,
     };
     this.pipelines = new ShaderPipelineCache(device);
     this.syncReader = new SyncReader(device);
@@ -1211,12 +1212,253 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 /**
+ * Compiles a multi-output kernel into a single WebGPU shader.
+ * Multi-output kernels are always non-reduction (enforced by jitCompile batching).
+ * Generates one result binding per output and one store per output per gidx.
+ */
+function pipelineSourceMulti(device: GPUDevice, kernel: Kernel): ShaderInfo {
+  const { nargs } = kernel;
+  const numOutputs = kernel.numOutputs;
+  const args = Array.from({ length: nargs }, (_, i) => `in${i}`);
+
+  // Tune each output individually (all non-reduction → tuneNullopt)
+  const tunes = kernel.outputs.map((o) => {
+    const tmp = Kernel.single(nargs, kernel.size, o.exp, o.reduction);
+    return tuneNullopt(tmp);
+  });
+
+  // All outputs share the same threadCount (same size, no reductions)
+  const threadCount = tunes[0].threadCount;
+
+  const shader: string[] = [];
+  let indent = "";
+  const pushIndent = Symbol("pushIndent");
+  const popIndent = Symbol("popIndent");
+  const emit = (...lines: (string | symbol)[]) => {
+    for (const line of lines) {
+      if (line === pushIndent) indent += "  ";
+      else if (line === popIndent) indent = indent.slice(0, -2);
+      else shader.push(line ? indent + (line as string) : line);
+    }
+  };
+
+  // Check for f16 across all outputs
+  if (tunes.some((t) => t.exp.some((exp) => exp.dtype === DType.Float16))) {
+    if (!device.features.has("shader-f16"))
+      throw new Error("WebGPU device does not support shader-f16 feature");
+    emit("enable f16;");
+  }
+
+  emit(headerWgsl);
+
+  // Collect all distinct ops across all output expressions
+  let allOps: Map<AluOp, Set<DType>> = new Map();
+  for (const tune of tunes) {
+    allOps = mapSetUnion(allOps, tune.exp.distinctOps());
+  }
+  if (allOps.has(AluOp.Threefry2x32)) emit(threefrySrc);
+  if (allOps.has(AluOp.Erf) || allOps.has(AluOp.Erfc)) emit(erfSrc);
+  emit("");
+
+  // Find used args across all outputs
+  const usedArgs: (DType | null)[] = Array.from({ length: nargs }, () => null);
+  for (const tune of tunes) {
+    tune.exp.fold((exp) => {
+      if (exp.op === AluOp.GlobalIndex) usedArgs[exp.arg[0]] = exp.dtype;
+    });
+  }
+
+  // Input bindings
+  for (let i = 0; i < nargs; i++) {
+    const ty = dtypeToWgsl(usedArgs[i] ?? DType.Float32, true);
+    emit(
+      `@group(0) @binding(${i}) var<storage, read> ${args[i]} : array<${ty}>;`,
+    );
+  }
+
+  // Output bindings (one per output)
+  for (let oi = 0; oi < numOutputs; oi++) {
+    const resultTy = dtypeToWgsl(kernel.outputs[oi].dtype, true);
+    emit(
+      `@group(0) @binding(${nargs + oi}) var<storage, read_write> result${oi} : array<${resultTy}>;`,
+    );
+  }
+
+  const workgroupSize = findPow2(threadCount, 256);
+  const gridSize = Math.ceil(threadCount / workgroupSize);
+  const [gridX, gridY] = calculateGrid(gridSize);
+
+  emit(
+    "",
+    `@compute @workgroup_size(${workgroupSize})`,
+    "fn main(@builtin(global_invocation_id) id : vec3<u32>) {",
+    pushIndent,
+  );
+  if (gridY === 1) {
+    emit(
+      `if (id.x >= ${threadCount}) { return; }`,
+      "let gidx: i32 = i32(id.x);",
+    );
+  } else {
+    const sizeX = gridX * workgroupSize;
+    emit(
+      `if (${sizeX} * id.y + id.x >= ${threadCount}) { return; }`,
+      `let gidx: i32 = i32(${sizeX} * id.y + id.x);`,
+    );
+  }
+
+  // CSE infrastructure (shared across all outputs for subexpression sharing)
+  let gensymCount = 0;
+  const gensym = () => `alu${gensymCount++}`;
+  const isGensym = (text: string) => text.match(/^alu[0-9]+$/);
+
+  // Phony assignments for unused args
+  if (args.length > 0) {
+    emit(args.map((arg) => `_ = &${arg};`).join(" "));
+  }
+
+  // Count references across ALL output expressions for correct CSE
+  const references = new Map<AluExp, number>();
+  const seen = new Set<AluExp>();
+  const countReferences = (exp: AluExp) => {
+    references.set(exp, (references.get(exp) ?? 0) + 1);
+    if (!seen.has(exp)) {
+      seen.add(exp);
+      for (const src of exp.src) countReferences(src);
+    }
+  };
+  for (const tune of tunes) {
+    countReferences(tune.exp);
+  }
+
+  // AluExp → WGSL translator with CSE
+  const expContext = new Map<AluExp, string>();
+  const gen = (exp: AluExp): string => {
+    if (expContext.has(exp)) return expContext.get(exp)!;
+    const { op, src, dtype, arg } = exp;
+
+    let source = "";
+    if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
+      const a = gen(src[0]);
+      const b = gen(src[1]);
+      if (op === AluOp.Add) {
+        if (dtype === DType.Bool) source = `(${a} || ${b})`;
+        else source = `(${a} + ${b})`;
+      } else if (op === AluOp.Sub) source = `(${a} - ${b})`;
+      else if (op === AluOp.Mul) {
+        if (dtype === DType.Bool) source = `(${a} && ${b})`;
+        else source = `(${a} * ${b})`;
+      } else if (op === AluOp.Idiv)
+        source = isFloatDtype(dtype) ? `trunc(${a} / ${b})` : `(${a} / ${b})`;
+      else if (op === AluOp.Mod) source = `(${a} % ${b})`;
+      else if (op === AluOp.Min) {
+        if (dtype === DType.Bool) source = `(${a} && ${b})`;
+        else source = `min(${strip1(a)}, ${strip1(b)})`;
+      } else if (op === AluOp.Max) {
+        if (dtype === DType.Bool) source = `(${a} || ${b})`;
+        else source = `max(${strip1(a)}, ${strip1(b)})`;
+      } else if (op === AluOp.Cmplt) source = `(${a} < ${b})`;
+      else if (op === AluOp.Cmpne) {
+        if (isFloatDtype(src[0].dtype)) {
+          const x = isGensym(a) ? a : gensym();
+          if (x !== a) emit(`let ${x} = ${a};`);
+          source = `(${x} != ${b} || min(${x}, ${dtypeToWgsl(src[0].dtype)}(inf())) != ${x})`;
+        } else {
+          source = `(${a} != ${b})`;
+        }
+      }
+    } else if (AluGroup.Unary.has(op)) {
+      if (op === AluOp.Reciprocal && src[0].op === AluOp.Sqrt) {
+        const a = gen(src[0].src[0]);
+        source = `inverseSqrt(${a})`;
+      } else {
+        const a = gen(src[0]);
+        if (op === AluOp.Sin) source = `sin(${strip1(a)})`;
+        else if (op === AluOp.Cos) source = `cos(${strip1(a)})`;
+        else if (op === AluOp.Asin) source = `asin(${strip1(a)})`;
+        else if (op === AluOp.Atan) source = `atan(${strip1(a)})`;
+        else if (op === AluOp.Exp) source = `exp(${strip1(a)})`;
+        else if (op === AluOp.Log) source = `log(${strip1(a)})`;
+        else if (op === AluOp.Erf || op === AluOp.Erfc) {
+          const funcName = op === AluOp.Erf ? "erf" : "erfc";
+          if (dtype !== DType.Float32) {
+            source = `${dtypeToWgsl(dtype)}(${funcName}(f32(${strip1(a)})))`;
+          } else {
+            source = `${funcName}(${strip1(a)})`;
+          }
+        } else if (op === AluOp.Sqrt) source = `sqrt(${strip1(a)})`;
+        else if (op === AluOp.Reciprocal) source = `(1.0 / ${a})`;
+        else if (op === AluOp.Floor) source = `floor(${strip1(a)})`;
+        else if (op === AluOp.Ceil) source = `ceil(${strip1(a)})`;
+        else if (op === AluOp.Cast)
+          source = `${dtypeToWgsl(dtype)}(${strip1(a)})`;
+        else if (op === AluOp.Bitcast)
+          source = `bitcast<${dtypeToWgsl(dtype)}>(${strip1(a)})`;
+      }
+    } else if (op === AluOp.Where) {
+      source = `select(${strip1(gen(src[2]))}, ${strip1(gen(src[1]))}, ${strip1(gen(src[0]))})`;
+    } else if (op === AluOp.Threefry2x32) {
+      const x = gensym();
+      const [k0, k1, c0, c1] = src.map((x) => strip1(gen(x)));
+      emit(`let ${x} = threefry2x32(vec2(${k0}, ${k1}), vec2(${c0}, ${c1}));`);
+      if (arg === "xor") source = `(${x}.x ^ ${x}.y)`;
+      else if (arg === 0) source = `${x}.x`;
+      else if (arg === 1) source = `${x}.y`;
+      else throw new UnsupportedOpError(op, dtype, "webgpu", arg);
+    } else if (op === AluOp.Const) {
+      return constToWgsl(dtype, arg);
+    } else if (op === AluOp.Special) {
+      return arg[0] as string;
+    } else if (op === AluOp.Variable) {
+      return arg as string;
+    } else if (op === AluOp.GlobalIndex) {
+      source = `${args[arg[0]]}[${strip1(gen(src[0]))}]`;
+      if (dtype === DType.Bool) source = `(${source} != 0)`;
+    }
+
+    if (!source) throw new UnsupportedOpError(op, dtype, "webgpu", arg);
+    const typeName = dtypeToWgsl(dtype);
+    if ((references.get(exp) ?? 0) > 1) {
+      const name = gensym();
+      expContext.set(exp, name);
+      emit(`let ${name}: ${typeName} = ${strip1(source)};`);
+      return name;
+    } else {
+      expContext.set(exp, source);
+      return source;
+    }
+  };
+
+  // Generate stores for each output
+  for (let oi = 0; oi < numOutputs; oi++) {
+    const resultTy = dtypeToWgsl(kernel.outputs[oi].dtype, true);
+    let rhs = strip1(gen(tunes[oi].exp));
+    if (resultTy !== dtypeToWgsl(tunes[oi].exp.dtype))
+      rhs = `${resultTy}(${rhs})`;
+    emit(`result${oi}[gidx] = ${rhs};`);
+  }
+
+  emit(popIndent, "}");
+  return {
+    code: shader.join("\n"),
+    numInputs: nargs,
+    numOutputs: numOutputs,
+    hasUniform: false,
+    passes: [{ grid: [gridX, gridY] }],
+  };
+}
+
+/**
  * Compiles an expression into WebGPU shader source code.
  *
  * Returns the shader source and the number of workgroups to dispatch along x
  * and y axes, to run the kernel.
  */
 function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
+  if (kernel.isMultiOutput) {
+    return pipelineSourceMulti(device, kernel);
+  }
+
   const tune = tuneWebgpu(kernel);
   if (DEBUG >= 3) {
     console.info(`kernel.exp: ${kernel.exp}\ntune.exp: ${tune.exp}`);

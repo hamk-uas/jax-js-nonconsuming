@@ -408,7 +408,7 @@ export class Array extends Tracer {
       exp = accessorGlobal(this.#dtype, gid, this.#st, src);
     }
 
-    const kernel = new Kernel(inputs.length, prod(finalShape), exp);
+    const kernel = Kernel.single(inputs.length, prod(finalShape), exp);
     const output = this.#backend.malloc(kernel.bytes);
     const pending = [...this.#pending, ...indices.flatMap((ar) => ar.#pending)];
     for (const exe of pending) exe.updateRc(+1);
@@ -469,7 +469,7 @@ export class Array extends Tracer {
     const exp = new AluExp(op, dtypeOutput, [
       AluExp.globalView(this.#dtype, 0, this.#st, indices),
     ]);
-    const kernel = new Kernel(1, this.#st.size, exp);
+    const kernel = Kernel.single(1, this.#st.size, exp);
     const output = this.#backend.malloc(kernel.bytes);
     const pending = [...this.#pending];
     for (const exe of pending) exe.updateRc(+1);
@@ -626,7 +626,7 @@ export class Array extends Tracer {
       const [axisSize] = newShape.splice(-1, 1); // Remove the contracted axis.
       re = new Reduction(exp.dtype, AluOp.Add, axisSize);
     }
-    const kernel = new Kernel(inputs.length, prod(newShape), exp, re);
+    const kernel = Kernel.single(inputs.length, prod(newShape), exp, re);
     const output = backend.malloc(kernel.bytes);
     const pending = new Set([...arrays.flatMap((ar) => ar.#pending)]);
     for (const exe of pending) exe.updateRc(+1);
@@ -668,7 +668,7 @@ export class Array extends Tracer {
       exp = accessorGlobal(this.#dtype, 0, this.#st, indices);
     }
 
-    const kernel = new Kernel(inputs.length, newSize, exp, reduction);
+    const kernel = Kernel.single(inputs.length, newSize, exp, reduction);
     const output = this.#backend.malloc(kernel.bytes);
     const pending = [...this.#pending];
     for (const exe of pending) exe.updateRc(+1);
@@ -737,7 +737,7 @@ export class Array extends Tracer {
     const indices = unravelAlu(this.#st.shape, AluVar.gidx);
     if (this.#source instanceof AluExp) {
       const exp = accessorAluExp(this.#source, this.#st, indices);
-      const kernel = new Kernel(0, this.#st.size, exp);
+      const kernel = Kernel.single(0, this.#st.size, exp);
       const output = this.#backend.malloc(kernel.bytes);
       const pendingItem = new PendingExecute(
         this.#backend,
@@ -752,7 +752,7 @@ export class Array extends Tracer {
       // Only realize if the ShapeTracker is non-contiguous.
       if (this.#st.contiguous) return;
       const exp = accessorGlobal(this.#dtype, 0, this.#st, indices);
-      const kernel = new Kernel(1, this.#st.size, exp);
+      const kernel = Kernel.single(1, this.#st.size, exp);
       const output = this.#backend.malloc(kernel.bytes);
       const pendingItem = new PendingExecute(
         this.#backend,

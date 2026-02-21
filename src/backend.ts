@@ -22,6 +22,8 @@ export interface BackendCapabilities {
   readonly atomicF32Add: boolean;
   /** Wasm: true if crossOriginIsolated (SharedArrayBuffer available). */
   readonly sharedMemory: boolean;
+  /** Whether the backend supports multi-output kernel dispatch. */
+  readonly multiOutputKernel: boolean;
 }
 export const devices: Device[] = ["cpu", "wasm", "webgpu", "webgl"];
 

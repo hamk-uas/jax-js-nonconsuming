@@ -455,7 +455,7 @@ class JitProgramBuilder {
   }
 
   pushLit(lit: Lit): JitId {
-    const kernel = new Kernel(
+    const kernel = Kernel.single(
       0,
       lit.aval.size,
       AluExp.const(lit.dtype, lit.value),
@@ -482,6 +482,24 @@ class JitProgramBuilder {
       outputs: [id],
     });
     return id;
+  }
+
+  /**
+   * Push a multi-output kernel. Allocates one buffer per output and emits a
+   * single execute step. Returns array of JitIds, one per kernel output.
+   */
+  pushMultiKernel(kernel: Kernel, inputs: JitId[]): JitId[] {
+    const ids: JitId[] = [];
+    for (const o of kernel.outputs) {
+      ids.push(this.pushBuffer(o.bytes));
+    }
+    this.steps.push({
+      type: "execute",
+      source: kernel,
+      inputs,
+      outputs: ids,
+    });
+    return ids;
   }
 
   pushRoutine(routine: Routine, inputs: JitId[], outputs: JitId[]): void {
@@ -652,6 +670,97 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
     ctx.set(v, { type: "imm", arg: i }); // JitId i = input #i
   }
 
+  // ---- Pending kernel batching ----
+  // Defer black-node kernel dispatch to batch same-size non-reduction kernels
+  // into multi-output Kernel steps, reducing dispatch overhead.
+  interface PendingKernelEntry {
+    outVar: Var;
+    exp: AluExp;
+    reduction: Reduction | undefined;
+    inputArgs: JitId[];
+    size: number;
+  }
+  const pendingKernels: PendingKernelEntry[] = [];
+
+  /** Flush all pending kernels into JitSteps. Groups same-size non-reduction
+   *  kernels with identical inputArgs into multi-output Kernel steps. */
+  const flushPendingKernels = (): void => {
+    if (pendingKernels.length === 0) return;
+
+    // If backend doesn't support multi-output, emit all as solo
+    if (!backend.capabilities.multiOutputKernel) {
+      for (const entry of pendingKernels) {
+        const kernel = Kernel.single(
+          entry.inputArgs.length,
+          entry.size,
+          entry.exp,
+          entry.reduction,
+        );
+        const outId = builder.pushKernel(kernel, entry.inputArgs);
+        ctx.set(entry.outVar, { type: "imm", arg: outId });
+      }
+      pendingKernels.length = 0;
+      return;
+    }
+
+    // Group by size + inputArgs identity (sorted JitIds as key).
+    // Only non-reduction kernels with matching size AND inputArgs can merge.
+    const groups = new Map<string, PendingKernelEntry[]>();
+    const soloEntries: PendingKernelEntry[] = [];
+
+    for (const entry of pendingKernels) {
+      if (entry.reduction) {
+        // Kernels with reductions always emit solo
+        soloEntries.push(entry);
+      } else {
+        const key = `${entry.size}:${entry.inputArgs.join(",")}`;
+        const group = groups.get(key);
+        if (group) group.push(entry);
+        else groups.set(key, [entry]);
+      }
+    }
+
+    // Emit multi-output kernels for groups with > 1 entries
+    for (const [, group] of groups) {
+      if (group.length === 1) {
+        soloEntries.push(group[0]);
+      } else {
+        // Check maxArgs: nargs + numOutputs <= backend limit
+        const maxArgs = backend.maxArgs;
+        if (group[0].inputArgs.length + group.length > maxArgs) {
+          // Too many buffers — fall back to individual kernels
+          for (const e of group) soloEntries.push(e);
+        } else {
+          const nargs = group[0].inputArgs.length;
+          const size = group[0].size;
+          const outputDescs = group.map((e) => ({
+            exp: e.exp,
+            reduction: e.reduction,
+          }));
+          const kernel = Kernel.multi(nargs, size, outputDescs);
+          const outIds = builder.pushMultiKernel(kernel, group[0].inputArgs);
+          for (let j = 0; j < group.length; j++) {
+            ctx.set(group[j].outVar, { type: "imm", arg: outIds[j] });
+          }
+        }
+      }
+    }
+
+    // Emit solo kernels
+    for (const entry of soloEntries) {
+      const kernel = Kernel.single(
+        entry.inputArgs.length,
+        entry.size,
+        entry.exp,
+        entry.reduction,
+      );
+      const outId = builder.pushKernel(kernel, entry.inputArgs);
+      ctx.set(entry.outVar, { type: "imm", arg: outId });
+    }
+
+    pendingKernels.length = 0;
+  };
+
   // Now run each primitive through a set of rules, mirroring implRules.
   for (let i = 0; i < jaxpr.eqns.length; i++) {
     const eqn = jaxpr.eqns[i];
@@ -659,6 +768,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
     // Handle Primitive.Scan specially — it compiles the body jaxpr and
     // emits a single "scan" JitStep with a ScanPlan.
     if (eqn.primitive === Primitive.Scan) {
+      flushPendingKernels();
       const params = eqn.params as PrimitiveParams<typeof Primitive.Scan>;
       const {
         jaxpr: bodyJaxpr,
@@ -752,6 +862,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
     // The Mutate effect on dst allows effectDrivenAllocate to recycle
     // dst → output, avoiding the full buffer copy.
     if (eqn.primitive === Primitive.DynamicUpdateSlice) {
+      flushPendingKernels();
       const params = eqn.params as PrimitiveParams<
         typeof Primitive.DynamicUpdateSlice
       >;
@@ -816,6 +927,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
     // The Mutate effect on target allows effectDrivenAllocate to recycle
     // target → output, avoiding a full buffer copy when sizes match.
     if (eqn.primitive === Primitive.ScatterAdd) {
+      flushPendingKernels();
       const params = eqn.params as PrimitiveParams<typeof Primitive.ScatterAdd>;
       const { axis } = params;
 
@@ -861,6 +973,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
 
     // If this is a routine, construct and dispatch the routine.
     if (routinePrimitives.has(eqn.primitive)) {
+      flushPendingKernels();
       // The rest of the code collaborates to make sure that all inputs to a
       // routine are "imm" (black node, dispatched) and so is itself.
       const routine = new Routine(
@@ -897,6 +1010,21 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       }
       builder.pushRoutine(routine, inputs, outputs);
       continue;
+    }
+
+    // If any input references a pending kernel's output, flush first so the
+    // output is materialized and available in ctx.
+    if (pendingKernels.length > 0) {
+      for (const input of eqn.inputs) {
+        if (
+          input instanceof Var &&
+          !ctx.has(input) &&
+          pendingKernels.some((pk) => pk.outVar === input)
+        ) {
+          flushPendingKernels();
+          break;
+        }
+      }
     }
 
     // Transform each input into an AluExp to start, and normalize any arguments
@@ -979,15 +1107,19 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
     }
 
     // Then dispatch the kernel, if it is a "black" node as determined from
-    // dataflow analysis above.
+    // dataflow analysis above. Defer to pending kernel batching for potential
+    // multi-output fusion.
     for (let i = 0; i < eqn.outBinders.length; i++) {
       const outVar = eqn.outBinders[i];
       if (blackNodes.has(outVar)) {
-        const nargs = inputArgs.length;
         const size = outVar.aval.size;
-        const kernel = new Kernel(nargs, size, exp[i], reduction);
-        const outId = builder.pushKernel(kernel, inputArgs);
-        ctx.set(outVar, { type: "imm", arg: outId });
+        pendingKernels.push({
+          outVar,
+          exp: exp[i],
+          reduction,
+          inputArgs: [...inputArgs],
+          size,
+        });
       } else if (reduction) {
         // Reduction but not black, means it will have an epilogue.
         ctx.set(outVar, {
@@ -1002,6 +1134,9 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       }
     }
   }
+
+  // Flush any remaining pending kernels before output collection.
+  flushPendingKernels();
 
   // Finally, loop through the outputs.
   const outputIds: JitId[] = [];

@@ -60,6 +60,7 @@ export class WebGLBackend implements Backend {
   readonly capabilities: BackendCapabilities = {
     atomicF32Add: false,
     sharedMemory: false,
+    multiOutputKernel: false,
   };
 
   readonly gl: WebGL2RenderingContext;
