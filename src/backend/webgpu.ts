@@ -9,6 +9,7 @@ import {
 } from "../alu";
 import {
   Backend,
+  type BackendCapabilities,
   Device,
   Executable,
   Slot,
@@ -184,6 +185,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 export class WebGPUBackend implements Backend {
   readonly type: Device = "webgpu";
   readonly maxArgs: number;
+  readonly capabilities: BackendCapabilities;
 
   readonly pipelines: ShaderPipelineCache;
   readonly syncReader: SyncReader;
@@ -239,6 +241,12 @@ export class WebGPUBackend implements Backend {
       );
     }
     this.maxArgs = this.device.limits.maxStorageBuffersPerShaderStage - 1;
+    this.capabilities = {
+      atomicF32Add: device.features.has(
+        "shader-f32-atomic-add" as GPUFeatureName,
+      ),
+      sharedMemory: false,
+    };
     this.pipelines = new ShaderPipelineCache(device);
     this.syncReader = new SyncReader(device);
     this.buffers = new Map();

@@ -15,6 +15,14 @@ import { WasmBackend } from "./backend/wasm";
 import { Routine, Routines } from "./routine";
 
 export type Device = "cpu" | "wasm" | "webgpu" | "webgl";
+
+/** Hardware and environment capabilities exposed by each backend. */
+export interface BackendCapabilities {
+  /** WebGPU: true if shader-f32-atomic-add extension is available. */
+  readonly atomicF32Add: boolean;
+  /** Wasm: true if crossOriginIsolated (SharedArrayBuffer available). */
+  readonly sharedMemory: boolean;
+}
 export const devices: Device[] = ["cpu", "wasm", "webgpu", "webgl"];
 
 const initializedBackends = new Map<Device, Backend>();
@@ -160,6 +168,9 @@ export interface Backend {
 
   /** Maximum number of arguments per dispatched kernel. */
   readonly maxArgs: number;
+
+  /** Hardware and environment capabilities. */
+  readonly capabilities: BackendCapabilities;
 
   /** Allocate a new slot with reference count 1. */
   malloc(size: number, initialData?: Uint8Array): Slot;

@@ -1,5 +1,6 @@
 import { AluOp, DType, dtypedArray, Kernel } from "../alu";
 import { Backend, Device, Executable, Slot, SlotError } from "../backend";
+import type { BackendCapabilities } from "../backend";
 import { Routine, runCpuRoutine } from "../routine";
 import { tuneNullopt } from "../tuner";
 
@@ -7,6 +8,10 @@ import { tuneNullopt } from "../tuner";
 export class CpuBackend implements Backend {
   readonly type: Device = "cpu";
   readonly maxArgs = Infinity;
+  readonly capabilities: BackendCapabilities = {
+    atomicF32Add: false,
+    sharedMemory: false,
+  };
 
   #buffers: Map<Slot, { ref: number; buffer: Uint8Array<ArrayBuffer> }>;
   #nextSlot: number;

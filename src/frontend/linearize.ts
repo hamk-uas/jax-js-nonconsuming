@@ -2021,16 +2021,6 @@ export function buildBackwardJaxpr(forwardJaxpr: ClosedJaxpr): ClosedJaxpr {
   return newJaxpr;
 }
 
-/**
- * Check whether a Jaxpr contains any equation that `buildBackwardJaxpr`
- * cannot trace (currently: `Primitive.Scan`, whose transpose rule creates
- * sub-jaxprs and does concrete forward recomputation incompatible with
- * makeJaxpr tracing — see M4 in AOT-LINEARIZATION-PLAN.md).
- */
-function jaxprNeedsCallTimeTranspose(jaxpr: Jaxpr): boolean {
-  return jaxpr.eqns.some((eqn) => eqn.primitive === Primitive.Scan);
-}
-
 function vjpFlat(
   f: (...x: Tracer[]) => Tracer[],
   primalsIn: Tracer[],
@@ -2067,57 +2057,22 @@ function vjpFlat(
     }
   }
 
-  // Phase 3: Choose transposition strategy.
+  // Phase 3: Call-time transposition.
   //
-  // Scan's transpose rule creates sub-jaxprs and does concrete forward
-  // recomputation — incompatible with `buildBackwardJaxpr`'s makeJaxpr
-  // tracing (M4 will add a dedicated scan backward artifact). For now,
-  // fall back to call-time transposition for scan-containing jaxprs.
-  if (jaxprNeedsCallTimeTranspose(forwardJaxpr.jaxpr)) {
-    // Call-time transposition: evalJaxprTransposed runs with concrete arrays
-    // when fVjp is invoked (the old, proven pattern).
-    const fVjp = (...cotangents: Tracer[]) => {
-      const transposeInputs = [
-        ...forwardJaxpr.consts,
-        ...primalsIn.map((t) => new UndefPrimal(t.aval)),
-      ];
-      return evalJaxprTransposed(
-        forwardJaxpr.jaxpr,
-        transposeInputs,
-        cotangents,
-      );
-    };
-    const dispose = () => forwardJaxpr.dispose();
-    return [primalsOut, fVjp, dispose];
-  }
-
-  // AOT transposition: build backward jaxpr eagerly.
-  const backwardJaxpr = buildBackwardJaxpr(forwardJaxpr);
-  const primal = {
-    forwardJaxpr,
-    run(_primalsIn: Tracer[]) {
-      const residualArrays = forwardJaxpr.consts.map((c) => c.ref);
-      return { primalsOut, residuals: residualArrays };
-    },
-  };
-
-  // Pullback closure: evaluate backward jaxpr with residuals + cotangents.
-  const residuals = primal.run(primalsIn);
+  // evalJaxprTransposed runs with concrete arrays when fVjp is invoked.
+  // For scan-containing jaxprs, the scan transpose rule creates
+  // ScanPullbackArtifact and runs the checkpoint-based backward pass.
+  // For non-scan jaxprs, evalJaxprTransposed applies per-equation
+  // transpose rules directly. In both cases, evalJaxprTransposed
+  // preserves caller-owned args and cotangents (no .ref needed).
   const fVjp = (...cotangents: Tracer[]) => {
-    return evalJaxpr(backwardJaxpr.jaxpr, [
-      ...backwardJaxpr.consts.map((c) => c.ref),
-      ...residuals.residuals.map((a) => a.ref),
-      ...cotangents.map((c) => c.ref),
-    ]);
+    const transposeInputs = [
+      ...forwardJaxpr.consts,
+      ...primalsIn.map((t) => new UndefPrimal(t.aval)),
+    ];
+    return evalJaxprTransposed(forwardJaxpr.jaxpr, transposeInputs, cotangents);
   };
-
-  // Dispose all owned resources.
-  const dispose = () => {
-    for (const r of residuals.residuals) r.dispose();
-    forwardJaxpr.dispose();
-    backwardJaxpr.dispose();
-  };
-
+  const dispose = () => forwardJaxpr.dispose();
   return [primalsOut, fVjp, dispose];
 }
 

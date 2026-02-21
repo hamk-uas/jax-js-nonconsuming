@@ -9,6 +9,7 @@ import {
 } from "../alu";
 import {
   Backend,
+  type BackendCapabilities,
   Device,
   Executable,
   Slot,
@@ -114,6 +115,13 @@ const moduleCache = new Map<string, WebAssembly.Module>();
 export class WasmBackend implements Backend {
   readonly type: Device = "wasm";
   readonly maxArgs = 64; // Arbitrary choice
+  readonly capabilities: BackendCapabilities = {
+    atomicF32Add: false,
+    sharedMemory:
+      typeof globalThis.crossOriginIsolated === "boolean"
+        ? globalThis.crossOriginIsolated
+        : false,
+  };
 
   #memory: WebAssembly.Memory;
   #nextSlot: number;

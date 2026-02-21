@@ -1,5 +1,6 @@
 import { DType } from "./alu";
 import { defaultDevice, Device, devices, getBackend, init } from "./backend";
+import type { BackendCapabilities } from "./backend";
 import { Array, ArrayLike } from "./frontend/array";
 import { aotLinearize } from "./frontend/artifacts";
 import type {
@@ -43,6 +44,7 @@ export {
   aotLinearize,
   type AotLinearizeOptions,
   type AotLinearizeResult,
+  type BackendCapabilities,
   init,
   Array,
   checkLeaks,

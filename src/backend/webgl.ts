@@ -1,6 +1,7 @@
 import { AluExp, AluGroup, AluOp, DType, isFloatDtype, Kernel } from "../alu";
 import {
   Backend,
+  type BackendCapabilities,
   Device,
   Executable,
   Slot,
@@ -56,6 +57,10 @@ interface WebGLSlot {
 export class WebGLBackend implements Backend {
   readonly type: Device = "webgl";
   readonly maxArgs = 8; // See: https://web3dsurvey.com/webgl/parameters/MAX_TEXTURE_IMAGE_UNITS
+  readonly capabilities: BackendCapabilities = {
+    atomicF32Add: false,
+    sharedMemory: false,
+  };
 
   readonly gl: WebGL2RenderingContext;
   readonly #fbo: WebGLFramebuffer;
