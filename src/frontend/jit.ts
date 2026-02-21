@@ -441,96 +441,12 @@ class JitProgramBuilder {
     });
   }
 
-  insertFreeSteps(outputIds: JitId[]): void {
-    // Only free malloc'd ids that are not used in the output.
-    //
-    // Intermediates are allowed to be freed independently, since they are
-    // guaranteed to be unused elsewhere after the JitProgram is executed.
-    // Meanwhile, inputs and consts are owned / freed elsewhere.
-    const ids = this.steps
-      .filter((s) => s.type === "malloc")
-      .map((s) => s.output);
-    for (const id of ids) {
-      // Find the last usage of this id.
-      if (outputIds.includes(id)) continue;
-      const lastUsage = this.steps.findLastIndex(
-        (s) =>
-          (s.type === "execute" &&
-            (s.outputs.includes(id) || s.inputs.includes(id))) ||
-          (s.type === "malloc" && s.output === id) ||
-          (s.type === "scan" &&
-            (s.outputs.includes(id) ||
-              s.consts.includes(id) ||
-              s.initCarry.includes(id) ||
-              s.xs.includes(id))),
-      )!;
-      this.steps.splice(lastUsage + 1, 0, {
-        type: "free",
-        input: id,
-      });
-    }
-  }
-
   pushFree(id: JitId): void {
     // Should be paired with the output of pushKernel() when last used.
     this.steps.push({
       type: "free",
       input: id,
     });
-  }
-
-  /**
-   * Replace consecutive free→malloc pairs of the same byte size with a single
-   * "recycle" step, reusing the same backend Slot without any alloc/free calls.
-   *
-   * This is safe because:
-   * 1. The free'd buffer's last consumer has already been scheduled
-   * 2. The malloc'd buffer hasn't been written yet (execute comes after)
-   * 3. Sizes match exactly, so no memory waste and no peak-memory increase
-   */
-  recycleBuffers(): void {
-    // Build size map: JitId → byte size for all malloc steps.
-    const mallocSizes = new Map<JitId, number>();
-    for (const s of this.steps) {
-      if (s.type === "malloc") mallocSizes.set(s.output, s.size);
-    }
-
-    let recycleCount = 0;
-
-    // Walk steps looking for free(a) immediately followed by malloc(b) where
-    // size(a) === size(b). We allow incref/free steps in between since they
-    // don't interact with the recycled buffer.
-    for (let i = 0; i < this.steps.length - 1; i++) {
-      const step = this.steps[i];
-      if (step.type !== "free") continue;
-      const freeSize = mallocSizes.get(step.input);
-      if (freeSize === undefined || freeSize === 0) continue;
-
-      // Scan forward for the next malloc of the same size, skipping only
-      // non-interfering steps (incref, free of other ids).
-      for (let j = i + 1; j < this.steps.length; j++) {
-        const next = this.steps[j];
-        if (next.type === "malloc" && next.size === freeSize) {
-          // Replace free + malloc with a recycle step.
-          this.steps.splice(i, 1, {
-            type: "recycle",
-            input: step.input,
-            output: next.output,
-          });
-          // Remove the malloc step (now at j since we replaced i).
-          this.steps.splice(j, 1);
-          recycleCount++;
-          break;
-        }
-        // Only skip past non-interfering steps.
-        if (next.type === "incref" || next.type === "free") continue;
-        break; // execute, scan, or other — stop looking
-      }
-    }
-
-    if (DEBUG >= 1 && recycleCount > 0) {
-      console.info(`jit: recycled ${recycleCount} buffer(s)`);
-    }
   }
 
   /**
