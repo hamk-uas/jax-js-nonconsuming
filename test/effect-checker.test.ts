@@ -1,4 +1,5 @@
 import {
+  _setVerifyEffects,
   type Array,
   ClosedJaxpr,
   lax,
@@ -160,6 +161,76 @@ describe("effect-checker", () => {
       const result = verifyJaxprEffects(closedJaxpr.jaxpr);
       expect(result.ok).toBe(true);
       closedJaxpr.dispose();
+    });
+
+    test("verifyJaxprEffects accepts intermediates (non-consuming model)", () => {
+      // Intermediates that are borrowed by later equations are valid
+      const { jaxpr: closedJaxpr } = makeJaxpr((a: Array, b: Array) => {
+        const c = np.multiply(a, b); // intermediate
+        return np.add(c, a); // uses intermediate + original
+      })(np.zeros([4]), np.zeros([4]));
+      const result = verifyJaxprEffects(closedJaxpr.jaxpr);
+      expect(result.ok).toBe(true);
+      expect(result.errors).toHaveLength(0);
+      closedJaxpr.dispose();
+    });
+  });
+
+  describe("M2.2 — validator integration in makeJaxpr", () => {
+    test("makeJaxpr succeeds with verification enabled for elementwise ops", () => {
+      _setVerifyEffects(true);
+      try {
+        const { jaxpr: closedJaxpr } = makeJaxpr((a: Array, b: Array) =>
+          np.add(a, b),
+        )(np.zeros([4]), np.zeros([4]));
+        // If we get here, verification passed
+        expect(closedJaxpr).toBeInstanceOf(ClosedJaxpr);
+        closedJaxpr.dispose();
+      } finally {
+        _setVerifyEffects(false);
+      }
+    });
+
+    test("makeJaxpr succeeds with verification enabled for chained ops", () => {
+      _setVerifyEffects(true);
+      try {
+        const { jaxpr: closedJaxpr } = makeJaxpr((a: Array, b: Array) => {
+          const c = np.multiply(a, b);
+          const d = np.add(c, a);
+          return np.subtract(d, b);
+        })(np.zeros([3]), np.zeros([3]));
+        expect(closedJaxpr).toBeInstanceOf(ClosedJaxpr);
+        closedJaxpr.dispose();
+      } finally {
+        _setVerifyEffects(false);
+      }
+    });
+
+    test("makeJaxpr succeeds with verification enabled for DUS", () => {
+      _setVerifyEffects(true);
+      try {
+        const { jaxpr: closedJaxpr } = makeJaxpr((dst: Array, src: Array) =>
+          lax.dynamicUpdateSlice(dst, src, 0),
+        )(np.zeros([6]), np.zeros([3]));
+        expect(closedJaxpr).toBeInstanceOf(ClosedJaxpr);
+        closedJaxpr.dispose();
+      } finally {
+        _setVerifyEffects(false);
+      }
+    });
+
+    test("makeJaxpr succeeds with verification enabled for reductions", () => {
+      _setVerifyEffects(true);
+      try {
+        const { jaxpr: closedJaxpr } = makeJaxpr((a: Array) => {
+          const b = np.multiply(a, a);
+          return np.sum(b);
+        })(np.zeros([8]));
+        expect(closedJaxpr).toBeInstanceOf(ClosedJaxpr);
+        closedJaxpr.dispose();
+      } finally {
+        _setVerifyEffects(false);
+      }
     });
   });
 

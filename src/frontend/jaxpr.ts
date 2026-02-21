@@ -171,25 +171,36 @@ export function verifyJaxprEffects(jaxpr: Jaxpr): EffectVerificationResult {
     }
   }
 
-  // Rule 3: All Alloc vars must be consumed or returned
+  // Rule 3: All Alloc vars must be consumed, returned, or referenced.
+  // In the non-consuming model, intermediates are Borrowed (not Consumed)
+  // by subsequent equations — this is valid. Only dead allocations (never
+  // referenced by any equation and not returned) are flagged.
   for (const v of allocatedVars) {
-    if (!consumed.has(v) && !outputVars.has(v)) {
-      // Check if the var is used at all (referenced by any later equation or output)
-      const isUsed =
-        jaxpr.eqns.some((e) =>
-          e.inputs.some((a) => a instanceof Var && a === v),
-        ) || outputVars.has(v);
-      if (isUsed) {
-        errors.push(
-          `Alloc var %${v.id} (${v.aval}) is used but never Consumed ` +
-            `or returned as output`,
-        );
-      }
-      // Dead (unused) Alloc vars are acceptable — they represent dead code
+    if (consumed.has(v) || outputVars.has(v)) continue;
+    const isReferenced = jaxpr.eqns.some((e) =>
+      e.inputs.some((a) => a instanceof Var && a === v),
+    );
+    if (!isReferenced) {
+      errors.push(
+        `Dead allocation: var %${v.id} (${v.aval}) is allocated but ` +
+          `never referenced, consumed, or returned`,
+      );
     }
   }
 
   return { ok: errors.length === 0, errors };
+}
+
+/** Whether to run effect verification at the end of makeJaxpr. */
+let _verifyEffectsEnabled = false;
+
+/**
+ * Enable or disable automatic effect verification in `makeJaxpr`.
+ * When enabled, `verifyJaxprEffects` runs after every `makeJaxpr` call
+ * and throws on violations. Gated behind this flag for performance.
+ */
+export function _setVerifyEffects(enabled: boolean): void {
+  _verifyEffectsEnabled = enabled;
 }
 
 /**
@@ -1382,10 +1393,20 @@ export function makeJaxpr(
     if (outTree.value === undefined) {
       throw new Error("outTree was not set in makeJaxpr");
     }
-    return {
-      jaxpr: jaxpr.mapJaxpr((j) => j.simplify()),
-      treedef: outTree.value,
-    };
+    const simplified = jaxpr.mapJaxpr((j) => j.simplify());
+
+    // When effect verification is enabled, validate the simplified Jaxpr.
+    if (_verifyEffectsEnabled) {
+      const result = verifyJaxprEffects(simplified.jaxpr);
+      if (!result.ok) {
+        simplified.dispose();
+        throw new Error(
+          `Effect verification failed:\n${result.errors.join("\n")}`,
+        );
+      }
+    }
+
+    return { jaxpr: simplified, treedef: outTree.value };
   };
 }
 

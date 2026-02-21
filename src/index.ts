@@ -16,6 +16,7 @@ import {
 } from "./frontend/check-leaks";
 import * as jaxprModule from "./frontend/jaxpr";
 import {
+  _setVerifyEffects,
   ClosedJaxpr,
   type EffectVerificationResult,
   Jaxpr,
@@ -65,6 +66,7 @@ export {
   type PullbackArtifact,
   random,
   type ResidualPack,
+  _setVerifyEffects,
   setDebug,
   scipySpecial,
   type ScanPath,
