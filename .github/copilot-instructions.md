@@ -115,8 +115,9 @@ When deciding what to work on, prefer work in this order:
 2. **API breadth** — approximate NumPy/JAX API compatibility (see `FEATURES.md` for the status
    table). The goal is that common JAX/NumPy patterns can be ported with minimal changes.
 3. **Performance** — there is significant headroom, especially in:
-   - WASM backend (SIMD is used for Cholesky f32; extending to matmul/elementwise kernels and adding
-     multi-threading via SharedArrayBuffer are open opportunities).
+   - WASM backend (SIMD is used for Cholesky f32; extending to matmul/elementwise kernels. M5 added
+     `WasmWorkerPool` for parallel kernel dispatch via `SharedArrayBuffer` + Web Workers — active
+     when `crossOriginIsolated`, dispatches kernels with ≥ 4096 elements across cores).
    - Transformer inference (currently ~1/3 of raw matmul GFLOP/s).
    - Conv2d and other operations that haven't been tuned yet.
 4. **Demos and applications** — fluid simulations, neural networks, audio processing, embedding
@@ -448,15 +449,16 @@ A **Slot** is jax-js's internal handle to a backend memory allocation (WASM poin
 
 ### Backend memory comparison
 
-| Aspect          | Wasm (`src/backend/wasm.ts`)                | WebGPU (`src/backend/webgpu.ts`)                      |
-| --------------- | ------------------------------------------- | ----------------------------------------------------- |
-| Allocation      | `WasmAllocator` over `WebAssembly.Memory`   | `device.createBuffer()` with `GPUBufferUsage.STORAGE` |
-| Slot tracking   | `Map<Slot, {ptr, size, ref}>`               | `Map<Slot, {buffer, size, ref}>`                      |
-| Buffer copy     | `Uint8Array.copyWithin` (aligned/unaligned) | `copyBufferToBuffer` (aligned) or WGSL copy shader    |
-| Sync read       | Direct memory view                          | `SyncReader` with staging buffer + `mapAsync`         |
-| Dispatch        | Instantiate Wasm module, call exported fn   | `commandEncoder.dispatchWorkgroups()`, queue submit   |
-| Zero on alloc   | **Yes** — `.fill(0)` on free-list reuse     | **Fresh only** — `createBuffer` zeros; pool does not  |
-| Zero on recycle | N/A (JIT recycle = slot rename)             | N/A (JIT recycle = slot rename)                       |
+| Aspect          | Wasm (`src/backend/wasm.ts`)                                | WebGPU (`src/backend/webgpu.ts`)                      |
+| --------------- | ----------------------------------------------------------- | ----------------------------------------------------- |
+| Allocation      | `WasmAllocator` over `WebAssembly.Memory`                   | `device.createBuffer()` with `GPUBufferUsage.STORAGE` |
+| Slot tracking   | `Map<Slot, {ptr, size, ref}>`                               | `Map<Slot, {buffer, size, ref}>`                      |
+| Buffer copy     | `Uint8Array.copyWithin` (aligned/unaligned)                 | `copyBufferToBuffer` (aligned) or WGSL copy shader    |
+| Sync read       | Direct memory view                                          | `SyncReader` with staging buffer + `mapAsync`         |
+| Dispatch        | Instantiate Wasm module, call `kernel(start, end, ...ptrs)` | `commandEncoder.dispatchWorkgroups()`, queue submit   |
+| Parallel        | `WasmWorkerPool` (SharedArrayBuffer + Atomics, M5)          | Workgroup parallelism (hardware-managed)              |
+| Zero on alloc   | **Yes** — `.fill(0)` on free-list reuse                     | **Fresh only** — `createBuffer` zeros; pool does not  |
+| Zero on recycle | N/A (JIT recycle = slot rename)                             | N/A (JIT recycle = slot rename)                       |
 
 ### Float64 support & numerical precision
 
@@ -780,13 +782,14 @@ Understanding this structure is essential for adding scan codegen paths.
 
 **WASM Backend:**
 
-| Function                        | Role                                                |
-| ------------------------------- | --------------------------------------------------- |
-| `translateExpCore()`            | Shared core handling all `AluOp` cases              |
-| `TranslateExpContext` interface | Callbacks for `getVariable` and `handleGlobalIndex` |
-| `translateExp()`                | Wrapper with bounds-check GlobalIndex               |
-| `emitKernelBody()`              | Shared gidx loop + reduction + store for one kernel |
-| `codegenWasm()`                 | Single entry point for kernel codegen               |
+| Function                        | Role                                                             |
+| ------------------------------- | ---------------------------------------------------------------- |
+| `translateExpCore()`            | Shared core handling all `AluOp` cases                           |
+| `TranslateExpContext` interface | Callbacks for `getVariable` and `handleGlobalIndex`              |
+| `translateExp()`                | Wrapper with bounds-check GlobalIndex; `paramOffset` for M5      |
+| `emitKernelBody()`              | Shared gidx loop + reduction + store; `startLocal`/`endLocal` M5 |
+| `codegenWasm()`                 | Kernel codegen: `(start, end, ...ptrs)` signature (M5)           |
+| `codegenWasmMulti()`            | Multi-output kernel codegen: `(start, end, ...ptrs)` (M5)        |
 
 **`AluOp.Where` — cost-based branching (WASM only):**
 
@@ -949,12 +952,12 @@ WASM.
 
 ### WASM feature opportunities (assessed Feb 2026)
 
-| Priority | Feature            | Browser risk       | Impact      | Notes                                                                                |
-| -------- | ------------------ | ------------------ | ----------- | ------------------------------------------------------------------------------------ |
-| Medium   | i64 in wasmblr     | None (MVP)         | Medium-High | Unlocks proper f64 builtins (exp/log/sin/erf) and simplifies Threefry PRNG           |
-| Medium   | Relaxed SIMD (FMA) | Safari unsupported | High        | `f32x4.relaxed_madd` for 2× dot-product throughput; needs runtime feature detection  |
-| Low      | Threads / atomics  | Needs COOP/COEP    | Very High   | SharedArrayBuffer + Workers for parallel matmul/routines; major architectural change |
-| Low      | Sign extension ops | None               | Low         | `i32.extend8_s` etc.; marginal for float-focused workloads                           |
+| Priority | Feature             | Browser risk        | Impact        | Notes                                                                                                 |
+| -------- | ------------------- | ------------------- | ------------- | ----------------------------------------------------------------------------------------------------- |
+| Medium   | i64 in wasmblr      | None (MVP)          | Medium-High   | Unlocks proper f64 builtins (exp/log/sin/erf) and simplifies Threefry PRNG                            |
+| Medium   | Relaxed SIMD (FMA)  | Safari unsupported  | High          | `f32x4.relaxed_madd` for 2× dot-product throughput; needs runtime feature detection                   |
+| ~~Low~~  | ~~Threads/atomics~~ | ~~Needs COOP/COEP~~ | ~~Very High~~ | ✅ **M5 DONE** — `WasmWorkerPool` with `SharedArrayBuffer` + Atomics; `(start, end)` kernel signature |
+| Low      | Sign extension ops  | None                | Low           | `i32.extend8_s` etc.; marginal for float-focused workloads                                            |
 
 ## Deno WebGPU test guidelines
 
@@ -2157,12 +2160,14 @@ Routines are compiled at runtime using wasmblr — no separate build step requir
 
 **Key files:**
 
-| File                                   | Purpose                                |
-| -------------------------------------- | -------------------------------------- |
-| `src/backend/wasm/wasmblr.ts`          | Low-level WASM bytecode assembler      |
-| `src/backend/wasm/wasmblr-hl.ts`       | High-level helper layer (WasmHl class) |
-| `src/backend/wasm/routines/*.ts`       | Size-specialized routine codegen       |
-| `src/backend/wasm/routine-provider.ts` | 64-entry LRU module cache (by size)    |
+| File                                   | Purpose                                      |
+| -------------------------------------- | -------------------------------------------- |
+| `src/backend/wasm/wasmblr.ts`          | Low-level WASM bytecode assembler            |
+| `src/backend/wasm/wasmblr-hl.ts`       | High-level helper layer (WasmHl class)       |
+| `src/backend/wasm/routines/*.ts`       | Size-specialized routine codegen             |
+| `src/backend/wasm/routine-provider.ts` | 64-entry LRU module cache (by size)          |
+| `src/backend/wasm/worker-pool.ts`      | `WasmWorkerPool` for parallel dispatch (M5)  |
+| `src/backend/wasm/allocator.ts`        | Free-list allocator for `WebAssembly.Memory` |
 
 ### Adding a new routine (checklist)
 
@@ -2307,15 +2312,16 @@ Expression translation and shader generation share common code between regular k
 
 **WASM Backend:**
 
-| Function                               | Role                                                |
-| -------------------------------------- | --------------------------------------------------- |
-| `translateExpCore()`                   | Shared core handling all `AluOp` cases              |
-| `TranslateExpContext` interface        | Callbacks for `getVariable` and `handleGlobalIndex` |
-| `translateExp()`                       | Wrapper with bounds-check GlobalIndex               |
-| `emitKernelBody()`                     | Shared gidx loop + reduction + store for one kernel |
-| `translateExpWithGeneralScanContext()` | Wrapper with const/carry/xs/internal classification |
-| `codegenWasm()`                        | Single entry point for kernel codegen               |
-| `codegenNativeScanGeneral()`           | Full scan loop codegen with direct-write analysis   |
+| Function                               | Role                                                             |
+| -------------------------------------- | ---------------------------------------------------------------- |
+| `translateExpCore()`                   | Shared core handling all `AluOp` cases                           |
+| `TranslateExpContext` interface        | Callbacks for `getVariable` and `handleGlobalIndex`              |
+| `translateExp()`                       | Wrapper with bounds-check GlobalIndex; `paramOffset` for M5      |
+| `emitKernelBody()`                     | Shared gidx loop + reduction + store; `startLocal`/`endLocal` M5 |
+| `translateExpWithGeneralScanContext()` | Wrapper with const/carry/xs/internal classification              |
+| `codegenWasm()`                        | Kernel codegen: `(start, end, ...ptrs)` signature (M5)           |
+| `codegenWasmMulti()`                   | Multi-output kernel codegen: `(start, end, ...ptrs)` (M5)        |
+| `codegenNativeScanGeneral()`           | Full scan loop codegen with direct-write analysis                |
 
 **WebGPU Backend:**
 
@@ -2342,8 +2348,11 @@ scan bodies (multiple independent single-output kernel steps) are handled by
 ### Shared kernel body: `emitKernelBody()`
 
 The inner per-element loop (gidx iteration, reduction accumulator, store) is shared between
-`codegenWasm()` and `codegenNativeScanGeneral()` via `emitKernelBody()`. Callers inject
-backend-specific behavior through three callbacks:
+`codegenWasm()` and `codegenNativeScanGeneral()` via `emitKernelBody()`. The function accepts
+optional `startLocal`/`endLocal` params (M5) — when provided, the gidx loop runs
+`[local.get(startLocal), local.get(endLocal))` instead of `[0, kernel.size)`. This enables
+work-splitting for `WasmWorkerPool`. Scan's call does NOT pass these — it always runs the full
+range. Callers inject backend-specific behavior through three callbacks:
 
 | Callback         | `codegenWasm` provides             | `codegenNativeScanGeneral` provides                    |
 | ---------------- | ---------------------------------- | ------------------------------------------------------ |
@@ -2470,12 +2479,12 @@ contributors should be aware of:
 
 ### WASM feature opportunities (assessed Feb 2026)
 
-| Priority | Feature            | Browser risk       | Impact      | Notes                                                                                |
-| -------- | ------------------ | ------------------ | ----------- | ------------------------------------------------------------------------------------ |
-| Medium   | i64 in wasmblr     | None (MVP)         | Medium-High | Unlocks proper f64 builtins (exp/log/sin/erf) and simplifies Threefry PRNG           |
-| Medium   | Relaxed SIMD (FMA) | Safari unsupported | High        | `f32x4.relaxed_madd` for 2× dot-product throughput; needs runtime feature detection  |
-| Low      | Threads / atomics  | Needs COOP/COEP    | Very High   | SharedArrayBuffer + Workers for parallel matmul/routines; major architectural change |
-| Low      | Sign extension ops | None               | Low         | `i32.extend8_s` etc.; marginal for float-focused workloads                           |
+| Priority | Feature             | Browser risk        | Impact        | Notes                                                                                                 |
+| -------- | ------------------- | ------------------- | ------------- | ----------------------------------------------------------------------------------------------------- |
+| Medium   | i64 in wasmblr      | None (MVP)          | Medium-High   | Unlocks proper f64 builtins (exp/log/sin/erf) and simplifies Threefry PRNG                            |
+| Medium   | Relaxed SIMD (FMA)  | Safari unsupported  | High          | `f32x4.relaxed_madd` for 2× dot-product throughput; needs runtime feature detection                   |
+| ~~Low~~  | ~~Threads/atomics~~ | ~~Needs COOP/COEP~~ | ~~Very High~~ | ✅ **M5 DONE** — `WasmWorkerPool` with `SharedArrayBuffer` + Atomics; `(start, end)` kernel signature |
+| Low      | Sign extension ops  | None                | Low           | `i32.extend8_s` etc.; marginal for float-focused workloads                                            |
 
 ---
 
@@ -2491,6 +2500,7 @@ contributors should be aware of:
 | `test/deno/webgpu.test.ts`      | Headless WebGPU tests via Deno                 |
 | `test/deno/pool-memory.test.ts` | Pool peak memory guarantee (Deno WebGPU)       |
 | `test/deno/scan.bench.ts`       | Deno WebGPU scan benchmarks                    |
+| `test/wasm-parallel.test.ts`    | WASM parallel dispatch + kernel signature (M5) |
 
 ### Deno WebGPU test guidelines
 
@@ -3608,7 +3618,8 @@ loop plus ping-pong buffers — could be compiled into a single WASM module anal
    runs the N elements sequentially inside WASM, but all round orchestration stays in native code.
 2. **Element-level parallelism (long-term):** Run each round's N elements in parallel across WASM
    workers via `SharedArrayBuffer`. Requires `Cross-Origin-Isolation` HTTP headers and a redesigned
-   dispatch model — currently Low priority (see WASM feature opportunities table in Part 1).
+   dispatch model — **M5 provides the foundation** (SharedArrayBuffer + WasmWorkerPool + range
+   kernel signature). Extending to per-round parallelism is the next step.
 
 ### Ownership model
 
@@ -3834,7 +3845,7 @@ reference and parallel scan results are compared to 5 decimal places.
 | -------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Medium   | `Primitive.AssociativeScan`      | Register as a primitive with body sub-jaxpr, JVP/transpose/vmap/PE rules. JVP unrolls Kogge-Stone with doubled inputs (same O(log N) depth). Enables backend specialization and clean IR. See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.1.                                                                                                                                                               |
 | Medium   | WASM compiled-loop for assocScan | Compile the full Kogge-Stone ladder into a single WASM module (analogous to scan's `codegenNativeScanGeneral`), reducing ceil(log₂ N) JS→WASM crossings to one. Depends on M7.1 (primitive) so the JIT compiler can recognize the operation. WebGPU: ceil(log₂ N) dispatches is already the hardware-imposed floor (no cross-workgroup global barrier). See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.2. |
-| Low      | Multithreaded Kogge-Stone (WASM) | Parallelize inner loop across workers via `SharedArrayBuffer` + orchestrator-worker pattern (depends on M5/M6.2). Expect ~3–4× speedup with 4 workers for large N. See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.3.                                                                                                                                                                                      |
+| Low      | Multithreaded Kogge-Stone (WASM) | Parallelize inner loop across workers via `SharedArrayBuffer` + orchestrator-worker pattern (depends on M5✅/M6.2). Expect ~3–4× speedup with 4 workers for large N. See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.3.                                                                                                                                                                                    |
 | Low      | N=0 test                         | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                                                                                                                              |
 | Low      | WebGL performance                | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                                                                                                                                             |
 | Medium   | `scatter_add` primitive          | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices. See `ULTIMATE-ARCHITECTURE-PLAN.md` M2 for full AD math, `MemoryEffect.Mutate` registration, WebGPU CAS-loop shader, and wasmblr codegen.                                                           |
@@ -4161,11 +4172,13 @@ M0–M8 with dependency graph, code sketches, and test plans.
 | M3.2      | Epilogue fusion chain walk    | **DONE**           | Already implemented; verified via `stepCounts()` tests    |
 | M4.1      | `SymDim` & shape propagation  | **DONE**           | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`          |
 | M4.2      | Parameterized backend codegen | **DONE** (partial) | `SizeExpr`, `_currentDimBindings`, symbolic cache keys    |
-| M5.1–5.3  | WASM multithreading           | Not done           | No `SharedArrayBuffer`/workers infrastructure             |
-| M6.1      | Mega-Module                   | Not done           | Depends on M4.2 completion + M5                           |
-| M6.2      | Mega-module multithreading    | Not done           | Depends on M5 + M6.1                                      |
+| M5.1      | SharedArrayBuffer memory pool | **DONE**           | Shared memory when `crossOriginIsolated`                  |
+| M5.2      | WasmWorkerPool                | **DONE**           | Atomics-based sync dispatch via Web Workers               |
+| M5.3      | Kernel signature + dispatch   | **DONE**           | `(start, end, ...ptrs)` + parallel dispatch wiring        |
+| M6.1      | Mega-Module                   | Not done           | Depends on M4.2 completion + M5 ✅                        |
+| M6.2      | Mega-module multithreading    | Not done           | Depends on M5 ✅ + M6.1                                   |
 | M7.1      | `Primitive.AssociativeScan`   | Not done           | Still unrolls; no dedicated primitive                     |
-| M7.2–7.3  | Compiled/threaded Kogge-Stone | Not done           | Depends on M7.1 + M5/M6.2                                 |
+| M7.2–7.3  | Compiled/threaded Kogge-Stone | Not done           | Depends on M7.1 + M5✅/M6.2                               |
 | M8        | Cleanup & benchmarking        | Not done           | Depends on all others                                     |
 
 ## Dependency Graph (Simplified)
@@ -4175,8 +4188,8 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
         ├──→ M2 (scatter_add) ✅
         ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
         ├──→ M4.1 ✅ ──→ M4.2 ~done ──→ M6.1 ❌
-        └──→ M5 ❌ ──→ M6.2 ❌
-                       M7.1 ❌ ──→ M7.2 ❌ ──→ M7.3 ❌ (needs M5+M6.2)
+        └──→ M5 ✅ ──→ M6.2 ❌ (needs M6.1)
+                       M7.1 ❌ ──→ M7.2 ❌ ──→ M7.3 ❌ (needs M5✅+M6.2)
                                                   ↓
                                             M8 (cleanup) ❌
 ```
@@ -4185,7 +4198,7 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
 
 Per the dependency graph, the following milestones can be worked on next:
 
-1. **M5** — WASM multithreading foundation (independent, major)
+1. **M6.1** — Mega-Module (depends on M4.2 completion + M5 ✅)
 2. **M7.1** — `Primitive.AssociativeScan` (independent)
 3. **M4.2** completion — Finish parameterized backend codegen (M4.1 done)
 
@@ -4261,11 +4274,12 @@ These details are frequently lost when conversation context is summarized:
 
 Decisions made during development that future agents should understand:
 
-| Decision                              | Rationale                                                                               |
-| ------------------------------------- | --------------------------------------------------------------------------------------- |
-| Non-consuming ownership model         | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting  |
-| Concrete compilation + symbolic cache | Simpler than full symbolic IR; ShapeTracker needs concrete strides                      |
-| `effectDrivenAllocate` over two-pass  | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect |
-| Direct LU→triSolve gradient path      | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                  |
-| `transposeJaxprCache` is cache-owned  | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`        |
-| `invariance` ≠ `strict` ESLint config | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory    |
+| Decision                               | Rationale                                                                                  |
+| -------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Non-consuming ownership model          | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting     |
+| Concrete compilation + symbolic cache  | Simpler than full symbolic IR; ShapeTracker needs concrete strides                         |
+| `effectDrivenAllocate` over two-pass   | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect    |
+| Direct LU→triSolve gradient path       | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                     |
+| `transposeJaxprCache` is cache-owned   | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`           |
+| `invariance` ≠ `strict` ESLint config  | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory       |
+| WASM `(start, end, ...ptrs)` signature | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen |
