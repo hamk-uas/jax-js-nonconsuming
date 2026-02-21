@@ -455,7 +455,7 @@ export function scan<
 
     const yFlatEmpty = yOutAtoms.map((atom) => {
       const aval = atom.aval;
-      return zeros([0, ...aval.shape], { dtype: aval.dtype });
+      return zeros([0, ...(aval.shape as number[])], { dtype: aval.dtype });
     });
 
     // Reconstruct pytrees

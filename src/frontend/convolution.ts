@@ -79,10 +79,10 @@ export function checkConvShape(
     throw new Error(`conv() input channels: ${lhsShape[1]} != ${rhsShape[1]}`);
 
   const outShape = [
-    ...generalBroadcast(
+    ...(generalBroadcast(
       lhsShape.slice(0, vmapDims),
       rhsShape.slice(0, vmapDims),
-    ), // vmap dimensions (broadcast)
+    ) as number[]), // vmap dimensions (broadcast)
     lhsShape[vmapDims], // Batch size
     rhsShape[vmapDims], // out_channels
   ];

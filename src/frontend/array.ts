@@ -692,9 +692,9 @@ export class Array extends Tracer {
       const routine = new Routine(
         routinePrimitives.get(prim)!,
         {
-          inputShapes: avals.map((a) => a.shape),
+          inputShapes: avals.map((a) => a.shape as number[]),
           inputDtypes: avals.map((a) => a.dtype),
-          outputShapes: avalsOut.map((a) => a.shape),
+          outputShapes: avalsOut.map((a) => a.shape as number[]),
           outputDtypes: avalsOut.map((a) => a.dtype),
         },
         params,
@@ -713,7 +713,7 @@ export class Array extends Tracer {
         (output, i) =>
           new Array({
             source: output,
-            st: ShapeTracker.fromShape(avalsOut[i].shape),
+            st: ShapeTracker.fromShape(avalsOut[i].shape as number[]),
             dtype: avalsOut[i].dtype,
             weakType: avalsOut[i].weakType,
             backend,
@@ -781,7 +781,9 @@ export class Array extends Tracer {
     if (arrays.length === 0)
       throw new Error("Need at least one array to broadcast");
     if (arrays.length === 1) return arrays;
-    const newShape = arrays.map((a) => a.shape).reduce(generalBroadcast);
+    const newShape = arrays
+      .map((a) => a.shape)
+      .reduce((a, b) => generalBroadcast(a, b) as number[]);
     return arrays.map((ar) => {
       if (deepEqual(ar.shape, newShape)) return ar;
       return ar.#reshape(
@@ -1214,7 +1216,7 @@ export class Array extends Tracer {
         return outputs.map((source, i) => {
           return new Array({
             source,
-            st: ShapeTracker.fromShape(jaxpr.outs[i].aval.shape),
+            st: ShapeTracker.fromShape(jaxpr.outs[i].aval.shape as number[]),
             dtype: jaxpr.outs[i].aval.dtype,
             weakType: jaxpr.outs[i].aval.weakType,
             backend,
@@ -1458,7 +1460,8 @@ export class Array extends Tracer {
         // Carry output slots
         for (let ci = 0; ci < numCarry; ci++) {
           const aval = bodyOutAvals[ci];
-          const sizeBytes = prod(aval.shape) * byteWidth(aval.dtype);
+          const sizeBytes =
+            prod(aval.shape as number[]) * byteWidth(aval.dtype);
           outputSlots.push(backend.malloc(sizeBytes > 0 ? sizeBytes : 1));
         }
 
@@ -1466,7 +1469,7 @@ export class Array extends Tracer {
         for (let yi = 0; yi < numY; yi++) {
           const aval = bodyOutAvals[numCarry + yi];
           const totalSizeBytes =
-            length * prod(aval.shape) * byteWidth(aval.dtype);
+            length * prod(aval.shape as number[]) * byteWidth(aval.dtype);
           outputSlots.push(
             backend.malloc(totalSizeBytes > 0 ? totalSizeBytes : 1),
           );
@@ -1513,7 +1516,7 @@ export class Array extends Tracer {
           outputs.push(
             new Array({
               source: result.outputs[ci],
-              st: ShapeTracker.fromShape(aval.shape),
+              st: ShapeTracker.fromShape(aval.shape as number[]),
               dtype: aval.dtype,
               weakType: aval.weakType,
               backend,
@@ -1529,7 +1532,7 @@ export class Array extends Tracer {
           outputs.push(
             new Array({
               source: result.outputs[numCarry + yi],
-              st: ShapeTracker.fromShape([length, ...aval.shape]),
+              st: ShapeTracker.fromShape([length, ...(aval.shape as number[])]),
               dtype: aval.dtype,
               weakType: aval.weakType,
               backend,
@@ -1802,7 +1805,7 @@ export function fullInternal(
 ) {
   return new Array({
     source: AluExp.const(aval.dtype, fillValue),
-    st: ShapeTracker.fromShape(aval.shape),
+    st: ShapeTracker.fromShape(aval.shape as number[]),
     dtype: aval.dtype,
     weakType: aval.weakType,
     backend: getBackend(device),

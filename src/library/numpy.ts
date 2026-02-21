@@ -1,6 +1,7 @@
 // Port of the `jax.numpy` module, typically imported as `np`.
 
 import { AluOp, DType, isFloatDtype, promoteTypes } from "../alu";
+import type { Dim } from "../dim";
 import {
   arange,
   Array,
@@ -852,7 +853,7 @@ export function broadcastTo(a: ArrayLike, shape: number[]) {
 /** Broadcast input shapes to a common output shape. */
 export function broadcastShapes(...shapes: number[][]): number[] {
   if (shapes.length === 0) return [];
-  return shapes.reduce(generalBroadcast);
+  return (shapes as Dim[][]).reduce(generalBroadcast) as number[];
 }
 
 /** Broadcast arrays to a common shape. */

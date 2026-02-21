@@ -1,5 +1,7 @@
 /** @file Generic programming utilities with no dependencies on library code. */
 
+import { type Dim, dimEquals, isSymbolicDim } from "./dim";
+
 export let DEBUG: number = 0;
 
 /**
@@ -311,18 +313,18 @@ export function findPow2(hint: number, max: number): number {
  *
  * <https://numpy.org/doc/stable/user/basics.broadcasting.html#general-broadcasting-rules>
  */
-export function generalBroadcast(a: number[], b: number[]): number[] {
-  const out: number[] = [];
+export function generalBroadcast(a: Dim[], b: Dim[]): Dim[] {
+  const out: Dim[] = [];
   let i = a.length - 1;
   let j = b.length - 1;
   for (; i >= 0 && j >= 0; i--, j--) {
     const x = a[i];
     const y = b[j];
-    if (x === y) {
+    if (dimEquals(x, y)) {
       out.push(x);
-    } else if (x === 1) {
+    } else if (!isSymbolicDim(x) && x === 1) {
       out.push(y);
-    } else if (y === 1) {
+    } else if (!isSymbolicDim(y) && y === 1) {
       out.push(x);
     } else {
       throw new TypeError(`Incompatible array broadcast shapes: ${a} vs ${b}`);

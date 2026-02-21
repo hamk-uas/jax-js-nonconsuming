@@ -31,6 +31,18 @@ import {
   zip,
 } from "./utils";
 
+// Re-export symbolic dimension types from dim.ts (dependency-free module).
+export {
+  type Dim,
+  SymDim,
+  concreteDim,
+  concreteShape,
+  dimEquals,
+  hasSymbolicDims,
+  isSymbolicDim,
+  resolveShape,
+} from "./dim";
+
 /** @inline */
 export type Pair = [number, number];
 

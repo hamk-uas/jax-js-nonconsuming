@@ -2,7 +2,13 @@
 
 import { AluGroup, AluOp, DType, isFloatDtype, promoteTypes } from "../alu";
 import { Routines } from "../routine";
-import { type Pair } from "../shape";
+import {
+  type Dim,
+  dimEquals,
+  hasSymbolicDims,
+  isSymbolicDim,
+  type Pair,
+} from "../shape";
 import {
   JsTreeDef,
   flatten as treeFlatten,
@@ -771,8 +777,12 @@ export abstract class Trace {
 
 /** Internal representation of an array value. */
 export interface AbstractValue {
-  /** Shape of the array. Must be a static tuple of non-negative dimensions. */
-  shape: number[];
+  /**
+   * Shape of the array. Dimensions are concrete numbers in most contexts.
+   * During polymorphic tracing (jit with dynamic_axes), some dimensions may
+   * be SymDim instances representing unknown sizes.
+   */
+  shape: Dim[];
 
   /** Concrete data type of array elements. */
   dtype: DType;
@@ -883,7 +893,7 @@ export abstract class Tracer {
 
   /** The shape of the array. */
   get shape(): number[] {
-    return this.aval.shape;
+    return this.aval.shape as number[];
   }
   /** The total number of elements in the array. */
   get size(): number {
@@ -1395,7 +1405,7 @@ export function getShape(x: TracerValue): number[] {
 // the only `AbstractValue` is a `ShapedArray` instance.
 export class ShapedArray implements AbstractValue {
   constructor(
-    readonly shape: number[],
+    readonly shape: Dim[],
     readonly dtype: DType,
     readonly weakType: boolean,
   ) {}
@@ -1409,7 +1419,16 @@ export class ShapedArray implements AbstractValue {
   }
 
   get size() {
-    return prod(this.shape);
+    // Size is only defined for fully concrete shapes.
+    let p = 1;
+    for (const d of this.shape) {
+      if (isSymbolicDim(d))
+        throw new Error(
+          `Cannot compute size of symbolic shape [${this.shape}]`,
+        );
+      p *= d;
+    }
+    return p;
   }
 
   scalar() {
@@ -1420,13 +1439,19 @@ export class ShapedArray implements AbstractValue {
     return `${this.dtype}[${this.shape.join(",")}]`;
   }
 
+  /** Check for abstract equality (shapes and dtype match). */
   equals(other: ShapedArray) {
     return (
       this === other ||
       (this.constructor === other.constructor &&
         this.ndim === other.ndim &&
-        this.shape.every((d, i) => d === other.shape[i]))
+        this.shape.every((d, i) => dimEquals(d, other.shape[i])))
     );
+  }
+
+  /** True when all dimensions are concrete numbers. */
+  get isConcrete() {
+    return !hasSymbolicDims(this.shape);
   }
 }
 

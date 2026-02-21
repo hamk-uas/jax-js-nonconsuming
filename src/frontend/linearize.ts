@@ -798,7 +798,9 @@ class PartialEvalTrace extends Trace {
       if (t.pval.isKnown) {
         return (t.pval.val as Tracer).ref;
       } else {
-        const z = zeros(t.pval.aval.shape, { dtype: t.pval.aval.dtype });
+        const z = zeros(t.pval.aval.shape as number[], {
+          dtype: t.pval.aval.dtype,
+        });
         synthesizedZeroInputs.push(z);
         return z;
       }
@@ -1179,7 +1181,7 @@ function evalJaxprTransposed(
       ctStore.delete(v);
       return ct;
     } else {
-      const z = zeros(v.aval.shape, { dtype: v.aval.dtype });
+      const z = zeros(v.aval.shape as number[], { dtype: v.aval.dtype });
       // Mark as anonymous so getOrMakeConstTracer (when inside a makeJaxpr
       // trace like transposeJaxpr) skips .ref — the ClosedJaxpr becomes
       // the sole owner and dispose() fully frees the backing Slot.
@@ -1393,7 +1395,7 @@ function unbroadcast(x: Tracer, target: UndefPrimal): Tracer {
   let result = x.sum(reductionDims);
   if (!deepEqual(result.shape, shape)) {
     const sumResult = result;
-    result = broadcast(sumResult, shape, unsqueeze); // keep dims selectively
+    result = broadcast(sumResult, shape as number[], unsqueeze); // keep dims selectively
     sumResult.dispose();
   }
   return result;
@@ -1452,7 +1454,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
   [Primitive.Reduce]([ct], [x], { op, axis }) {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Reduce);
     if (op === AluOp.Add) {
-      return [broadcast(ct, x.aval.shape, axis)];
+      return [broadcast(ct, x.aval.shape as number[], axis)];
     } else {
       // Forward-mode jvp of product does not involve any products.
       // The same applies to min/max as non-additive reductions.
@@ -1462,7 +1464,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
   [Primitive.Pool]([ct], [x], { window, strides }) {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Pool);
     return bind(Primitive.PoolTranspose, [ct], {
-      inShape: x.aval.shape,
+      inShape: x.aval.shape as number[],
       window,
       strides,
     });
@@ -1475,7 +1477,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
   [Primitive.Dot]([ct], [x, y]) {
     if (x instanceof UndefPrimal === y instanceof UndefPrimal)
       throw new NonlinearError(Primitive.Dot);
-    const axisSize = generalBroadcast(x.aval.shape, y.aval.shape).slice(-1)[0];
+    const axisSize = generalBroadcast(x.aval.shape, y.aval.shape).slice(
+      -1,
+    )[0] as number;
     const ctBroad = broadcast(ct, ct.shape.concat(axisSize), [-1]); // Undo the contraction.
     if (x instanceof UndefPrimal) {
       const prod = mul(ctBroad, y as Tracer);
@@ -1522,7 +1526,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
           // Instead, we set it to make the output shape (before strides) match
           // with dilatedLhs, currently it's less than dilatedLhs.
           const dilatedLhs =
-            (lhs.aval.shape[i + v + 2] - 1) * params.lhsDilation[i] + 1;
+            ((lhs.aval.shape[i + v + 2] as number) - 1) *
+              params.lhsDilation[i] +
+            1;
           const padAfter =
             dilatedLhs + dilatedKernel - 1 - dilatedCt - padBefore;
           return [padBefore, padAfter];
@@ -1541,9 +1547,13 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         // Reference: _conv_general_vjp_rhs_padding()
         padding: params.padding.map<[number, number]>(([pl, _pr], i) => {
           const dilatedLhs =
-            (lhs.aval.shape[i + v + 2] - 1) * params.lhsDilation[i] + 1;
+            ((lhs.aval.shape[i + v + 2] as number) - 1) *
+              params.lhsDilation[i] +
+            1;
           const dilatedKernel =
-            (rhs.aval.shape[i + v + 2] - 1) * params.rhsDilation[i] + 1;
+            ((rhs.aval.shape[i + v + 2] as number) - 1) *
+              params.rhsDilation[i] +
+            1;
           const dilatedCt = (ct.shape[i + v + 2] - 1) * params.strides[i] + 1;
           const padFromLhs = dilatedCt - dilatedLhs;
           const padFromRhs = dilatedKernel - pl - 1;
@@ -1593,7 +1603,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     if (inputs.every((x) => !(x instanceof UndefPrimal)))
       throw new NonlinearError(Primitive.Concatenate);
 
-    const sizes = inputs.map((x) => x.aval.shape[axis]);
+    const sizes = inputs.map((x) => x.aval.shape[axis] as number);
     const splits = split(ct, axis, sizes);
 
     // Fast path: all inputs are tangent variables.
@@ -1620,7 +1630,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     // Transpose of gather is scatter_add: accumulate cotangent back to
     // source positions.  Handles both permutation and duplicate indices.
     const idx = indices[0] as Tracer;
-    using z = zeros(x.aval.shape, { dtype: ct.dtype }) as Tracer;
+    using z = zeros(x.aval.shape as number[], { dtype: ct.dtype }) as Tracer;
     const result = scatterAdd(z, idx, ct, axis[0]);
     return [result, null];
   },
@@ -1649,7 +1659,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
   [Primitive.Reshape]([ct], [x], _) {
     if (!(x instanceof UndefPrimal))
       throw new NonlinearError(Primitive.Reshape);
-    return [reshape(ct, x.aval.shape)];
+    return [reshape(ct, x.aval.shape as number[])];
   },
   [Primitive.Flip]([ct], [x], { axis }) {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Flip);
@@ -1658,14 +1668,14 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
   [Primitive.Shrink]([ct], [x], { slice }) {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Shrink);
     const width = slice.map(
-      ([s, e], i) => [s, x.aval.shape[i] - e] as [number, number],
+      ([s, e], i) => [s, (x.aval.shape[i] as number) - e] as [number, number],
     );
     return [pad(ct, width)];
   },
   [Primitive.Pad]([ct], [x], { width }) {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Pad);
     const slice = width.map(
-      ([s, _e], i) => [s, s + x.aval.shape[i]] as [number, number],
+      ([s, _e], i) => [s, s + (x.aval.shape[i] as number)] as [number, number],
     );
     return [shrink(ct, slice)];
   },
@@ -1802,7 +1812,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         for (let i = 0; i < jaxpr.inBinders.length; i++) {
           if (bodyUndefPrimals[i]) {
             const aval = jaxpr.inBinders[i].aval;
-            fullInputs.push(zeros(aval.shape, { dtype: aval.dtype }));
+            fullInputs.push(
+              zeros(aval.shape as number[], { dtype: aval.dtype }),
+            );
           } else {
             fullInputs.push(primalInputs[primalIdx++].ref);
           }

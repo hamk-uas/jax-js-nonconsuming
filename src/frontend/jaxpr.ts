@@ -1,6 +1,14 @@
 import { byteWidth, DType, isFloatDtype } from "../alu";
 import { PPrint } from "../pprint";
-import { type Pair } from "../shape";
+import {
+  concreteDim,
+  type Dim,
+  dimEquals,
+  hasSymbolicDims,
+  type Pair,
+  resolveShape,
+  SymDim,
+} from "../shape";
 import {
   JsTreeDef,
   MapJsTree,
@@ -429,7 +437,16 @@ export class Jaxpr implements FpHashable {
     const vi = (v: Var) => {
       if (varIds.has(v)) return varIds.get(v)!;
       const id = varIds.size + 1; // Start from 1, why not?
-      varIds.set(v, FpHash.hash(id, v.aval.dtype, ...v.aval.shape));
+      varIds.set(
+        v,
+        FpHash.hash(
+          id,
+          v.aval.dtype,
+          ...v.aval.shape.map((d) =>
+            typeof d === "number" ? d : d.toString(),
+          ),
+        ),
+      );
       return id;
     };
     hasher.update(this.inBinders.length);
@@ -639,6 +656,43 @@ export class Jaxpr implements FpHashable {
     // Replace the output variables if needed.
     const newOuts = this.outs.map(varMapF);
     return new Jaxpr(this.inBinders, newEqns, newOuts);
+  }
+
+  /**
+   * Resolve symbolic dimensions to concrete values.
+   * Returns a new Jaxpr with all SymDim instances replaced by numbers.
+   */
+  resolveDims(bindings: ReadonlyMap<string, number>): Jaxpr {
+    const resolveAval = (aval: ShapedArray): ShapedArray =>
+      new ShapedArray(
+        resolveShape(aval.shape, bindings),
+        aval.dtype,
+        aval.weakType,
+      );
+
+    const varMap = new Map<Var, Var>();
+    const resolveVar = (v: Var): Var => {
+      let resolved = varMap.get(v);
+      if (!resolved) {
+        resolved = new Var(resolveAval(v.aval), v.effect);
+        varMap.set(v, resolved);
+      }
+      return resolved;
+    };
+    const resolveAtom = (a: Atom): Atom =>
+      a instanceof Var ? resolveVar(a) : a;
+
+    const newIn = this.inBinders.map(resolveVar);
+    const newEqns = this.eqns.map((eqn) =>
+      new JaxprEqn(
+        eqn.primitive,
+        eqn.inputs.map(resolveAtom),
+        eqn.params,
+        eqn.outBinders.map(resolveVar),
+      ).copyEffectsFrom(eqn),
+    );
+    const newOuts = this.outs.map(resolveAtom);
+    return new Jaxpr(newIn, newEqns, newOuts);
   }
 }
 
@@ -1076,7 +1130,7 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     return [new ShapedArray(newShape, x.dtype, x.weakType)];
   },
   [Primitive.Pool]([x], { window, strides }) {
-    const shape = checkPoolShape(x.shape, window, strides);
+    const shape = checkPoolShape(x.shape as number[], window, strides);
     return [new ShapedArray(shape, x.dtype, x.weakType)];
   },
   [Primitive.PoolTranspose]([x], { inShape, window, strides }) {
@@ -1097,7 +1151,11 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
   },
   [Primitive.Conv]([lhs, rhs], params) {
     const { dtype, weakType } = promoteAvals(lhs.scalar(), rhs.scalar());
-    const shape = checkConvShape(lhs.shape, rhs.shape, params);
+    const shape = checkConvShape(
+      lhs.shape as number[],
+      rhs.shape as number[],
+      params,
+    );
     return [new ShapedArray(shape, dtype, weakType)];
   },
   [Primitive.Compare]: compareAbstractEval,
@@ -1114,20 +1172,23 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     for (const x of xs) {
       if (
         x.ndim !== xs[0].ndim ||
-        !x.shape.every((s, i) => i === axis || s === xs[0].shape[i])
+        !x.shape.every((s, i) => i === axis || dimEquals(s, xs[0].shape[i]))
       )
         throw new TypeError(
           `Concatenate: inputs ${xs[0]} and ${x} must match shapes except on axis ${axis}`,
         );
     }
-    const shape = xs[0].shape.slice();
-    shape[axis] = xs.reduce((sum, x) => sum + x.shape[axis], 0);
+    const shape: Dim[] = xs[0].shape.slice();
+    shape[axis] = xs.reduce(
+      (sum, x) => sum + concreteDim(x.shape[axis], "Concatenate"),
+      0,
+    );
     const { dtype, weakType } = xs.map((x) => x.scalar()).reduce(promoteAvals);
     return [new ShapedArray(shape, dtype, weakType)];
   },
   [Primitive.Split]([x], { axis, sizes }) {
     const totalSize = sizes.reduce((a, b) => a + b, 0);
-    if (x.shape[axis] !== totalSize) {
+    if (!dimEquals(x.shape[axis], totalSize)) {
       throw new TypeError(
         `Split: sizes ${sizes} do not sum to dimension ${x.shape[axis]} on axis ${axis}`,
       );
@@ -1175,7 +1236,7 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     const axisSet = new Set(axis);
     if (axisSet.size !== axis.length)
       throw new TypeError("Gather axes are not unique");
-    const gatherShape = indices.reduce<number[]>(
+    const gatherShape = indices.reduce<Dim[]>(
       (shape, a) => generalBroadcast(shape, a.shape),
       [],
     );
@@ -1202,11 +1263,13 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     return [ShapedArray.fromAval(x)];
   },
   [Primitive.Shrink]([x], { slice }) {
-    const newShape = slice.map((s) => s[1] - s[0]);
+    const newShape: Dim[] = slice.map((s) => s[1] - s[0]);
     return [new ShapedArray(newShape, x.dtype, x.weakType)];
   },
   [Primitive.Pad]([x], { width }) {
-    const newShape = x.shape.map((dim, i) => dim + width[i][0] + width[i][1]);
+    const newShape = x.shape.map(
+      (dim, i) => concreteDim(dim, "Pad") + width[i][0] + width[i][1],
+    );
     return [new ShapedArray(newShape, x.dtype, x.weakType)];
   },
   [Primitive.DynamicUpdateSlice]([dst, src], { offset, axis }) {
@@ -1218,17 +1281,20 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     if (dstShape.length === srcShape.length) {
       for (let i = 0; i < dstShape.length; i++) {
         if (i === axis) continue;
-        if (dstShape[i] !== srcShape[i])
+        if (!dimEquals(dstShape[i], srcShape[i]))
           throw new TypeError("dynamicUpdateSlice: shape mismatch");
       }
-      if (offset + srcShape[axis] > dstShape[axis])
+      if (
+        offset + concreteDim(srcShape[axis], "DUS") >
+        concreteDim(dstShape[axis], "DUS")
+      )
         throw new TypeError("dynamicUpdateSlice: out of bounds");
     } else if (axis === 0 && dstShape.length === srcShape.length + 1) {
       for (let i = 0; i < srcShape.length; i++) {
-        if (dstShape[i + 1] !== srcShape[i])
+        if (!dimEquals(dstShape[i + 1], srcShape[i]))
           throw new TypeError("dynamicUpdateSlice: stacked shape mismatch");
       }
-      if (offset + 1 > dstShape[0])
+      if (offset + 1 > concreteDim(dstShape[0], "DUS"))
         throw new TypeError("dynamicUpdateSlice: stacked out of bounds");
     } else {
       throw new TypeError("dynamicUpdateSlice: unsupported shapes");
@@ -1273,8 +1339,8 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     if (
       !deepEqual(a.shape.slice(0, -2), b.shape.slice(0, -2)) ||
       a.dtype !== b.dtype ||
-      m !== n ||
-      n !== q
+      !dimEquals(m, n) ||
+      !dimEquals(n, q)
     )
       throw new TypeError(`triangular_solve: mismatch ${a} vs ${b}`);
     return [new ShapedArray(b.shape, b.dtype, a.weakType && b.weakType)];
@@ -1282,7 +1348,7 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
   [Primitive.Cholesky]([a]) {
     if (a.ndim < 2)
       throw new TypeError(`cholesky: requires at least 2D input, got ${a}`);
-    if (a.shape[a.ndim - 2] !== a.shape[a.ndim - 1])
+    if (!dimEquals(a.shape[a.ndim - 2], a.shape[a.ndim - 1]))
       throw new TypeError(`cholesky: must be square, got ${a}`);
     return [ShapedArray.fromAval(a)];
   },
@@ -1290,7 +1356,7 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     if (a.ndim < 2)
       throw new TypeError(`lu: requires at least 2D input, got ${a}`);
     const batch = a.shape.slice(0, -2);
-    const [m, n] = a.shape.slice(-2);
+    const [m, n] = a.shape.slice(-2) as number[];
     return [
       ShapedArray.fromAval(a),
       new ShapedArray([...batch, Math.min(m, n)], DType.Int32, false),
@@ -1367,6 +1433,15 @@ function joinIdx(n: number, a: any[], b: any[], argnums: Set<number>): any[] {
 export type JitOpts = {
   staticArgnums?: number[];
   validateRefs?: boolean;
+  /**
+   * Map from argument axis index to symbolic dimension name.
+   * When set, the specified axes are traced symbolically (as `SymDim`),
+   * allowing a single traced Jaxpr to be reused for different sizes
+   * on those axes without re-tracing.
+   *
+   * Example: `{ 0: "T" }` traces axis 0 as symbolic dimension "T".
+   */
+  dynamic_axes?: Record<number, string>;
 };
 
 export function makeJaxpr(
@@ -1442,21 +1517,54 @@ export function jit<F extends (...args: any[]) => any>(
   const cache = new Map<string, ReturnType<ReturnType<typeof makeJaxpr>>>();
   const staticArgnums = new Set(opts?.staticArgnums ?? []);
 
+  const dynamicAxes = opts?.dynamic_axes;
+
   const result = ((...args) => {
     const [staticArgs, dynamicArgs] = splitIdx(args, staticArgnums);
 
     const [argsFlat, inTree] = treeFlatten(dynamicArgs);
     const avalsInFlat = argsFlat.map((x) => ShapedArray.fromAval(getAval(x)));
-    const avalsIn = treeUnflatten(inTree, avalsInFlat) as any[];
 
+    // When dynamic_axes is set, replace specified axes with SymDim instances
+    // so that the traced Jaxpr is polymorphic over those dimensions.
+    let avalsForCache: ShapedArray[];
+    if (dynamicAxes) {
+      avalsForCache = avalsInFlat.map((aval) => {
+        const newShape: Dim[] = aval.shape.map((d, i) =>
+          i in dynamicAxes ? new SymDim(dynamicAxes[i]) : d,
+        );
+        return new ShapedArray(newShape, aval.dtype, aval.weakType);
+      });
+    } else {
+      avalsForCache = avalsInFlat;
+    }
+
+    const avalsIn = treeUnflatten(inTree, avalsForCache) as any[];
     const jaxprArgs = joinIdx(args.length, staticArgs, avalsIn, staticArgnums);
     const { jaxpr, treedef: outTree } = runWithCache(cache, jaxprArgs, () => {
       return makeJaxpr(f, opts)(...jaxprArgs);
     });
 
+    // Build dimension bindings from concrete input shapes if the Jaxpr
+    // was traced with symbolic dims.
+    let resolvedJaxpr = jaxpr.jaxpr;
+    if (
+      dynamicAxes &&
+      hasSymbolicDims(jaxpr.jaxpr.inBinders[0]?.aval.shape ?? [])
+    ) {
+      const bindings = new Map<string, number>();
+      for (const [axisStr, dimName] of Object.entries(dynamicAxes)) {
+        const axis = Number(axisStr);
+        // Use the first arg's concrete shape to resolve the binding.
+        const concreteVal = (avalsInFlat[0]?.shape[axis] ?? 0) as number;
+        bindings.set(dimName, concreteVal);
+      }
+      resolvedJaxpr = jaxpr.jaxpr.resolveDims(bindings);
+    }
+
     const outs = bind(Primitive.Jit, [...jaxpr.consts, ...argsFlat], {
       name: f.name || "closure",
-      jaxpr: jaxpr.jaxpr,
+      jaxpr: resolvedJaxpr,
       numConsts: jaxpr.consts.length,
     });
     return treeUnflatten(outTree, outs);

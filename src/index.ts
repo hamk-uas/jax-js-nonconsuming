@@ -1,6 +1,7 @@
 import { DType } from "./alu";
 import { defaultDevice, Device, devices, getBackend, init } from "./backend";
 import type { BackendCapabilities } from "./backend";
+import { type Dim, hasSymbolicDims, isSymbolicDim, SymDim } from "./dim";
 import { Array, ArrayLike } from "./frontend/array";
 import { aotLinearize } from "./frontend/artifacts";
 import type {
@@ -45,6 +46,7 @@ export {
   type AotLinearizeOptions,
   type AotLinearizeResult,
   type BackendCapabilities,
+  type Dim,
   init,
   Array,
   checkLeaks,
@@ -55,6 +57,8 @@ export {
   DType,
   type EffectVerificationResult,
   getBackend,
+  hasSymbolicDims,
+  isSymbolicDim,
   Jaxpr,
   type JsTree,
   type JsTreeDef,
@@ -73,6 +77,7 @@ export {
   scipySpecial,
   type ScanPath,
   type SnapshotEntry,
+  SymDim,
   tree,
   verifyJaxprEffects,
 };

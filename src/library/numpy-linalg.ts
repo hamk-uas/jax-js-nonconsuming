@@ -241,7 +241,7 @@ export function solve(a: ArrayLike, b: ArrayLike): Array {
     const batchDims = generalBroadcast(
       a.shape.slice(0, -2),
       b.shape.slice(0, -2),
-    );
+    ) as number[];
     const aTargetShape = [...batchDims, n, n];
     if (
       a.shape.length !== aTargetShape.length ||
@@ -250,7 +250,7 @@ export function solve(a: ArrayLike, b: ArrayLike): Array {
       a = np.broadcastTo(a, aTargetShape);
       d.push(a);
     }
-    const bTargetShape = [...batchDims, n, m];
+    const bTargetShape = [...batchDims, n, m as number];
     if (
       b.shape.length !== bTargetShape.length ||
       b.shape.some((dim, i) => dim !== bTargetShape[i])

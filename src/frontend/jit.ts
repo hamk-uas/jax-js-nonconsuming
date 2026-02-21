@@ -902,7 +902,9 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
 
       const outVar = eqn.outBinders[0];
       const elemBytes = byteWidth(outVar.aval.dtype);
-      const innerSize = outVar.aval.shape.slice(1).reduce((a, b) => a * b, 1);
+      const innerSize = (outVar.aval.shape as number[])
+        .slice(1)
+        .reduce((a, b) => a * b, 1);
       const offsetBytes = offset * innerSize * elemBytes;
       const sliceBytes = srcInput.aval.size * elemBytes;
       const dstSizeBytes = outVar.aval.size * elemBytes;
@@ -948,8 +950,8 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       const updatesId = resolveInput(eqn.inputs[2]);
 
       const outVar = eqn.outBinders[0];
-      const targetShape = eqn.inputs[0].aval.shape;
-      const updatesLen = eqn.inputs[2].aval.shape[axis];
+      const targetShape = eqn.inputs[0].aval.shape as number[];
+      const updatesLen = eqn.inputs[2].aval.shape[axis] as number;
       const dtype = outVar.aval.dtype;
       const outSizeBytes = outVar.aval.size * byteWidth(dtype);
 
@@ -979,9 +981,9 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       const routine = new Routine(
         routinePrimitives.get(eqn.primitive)!,
         {
-          inputShapes: eqn.inputs.map((x) => x.aval.shape),
+          inputShapes: eqn.inputs.map((x) => x.aval.shape as number[]),
           inputDtypes: eqn.inputs.map((x) => x.aval.dtype),
-          outputShapes: eqn.outBinders.map((x) => x.aval.shape),
+          outputShapes: eqn.outBinders.map((x) => x.aval.shape as number[]),
           outputDtypes: eqn.outBinders.map((x) => x.aval.dtype),
         },
         eqn.params as any,
@@ -1057,7 +1059,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
           inputExps.push(jv.exp.reindexGids(newGids));
         } else if (jv.type === "imm") {
           const [gid] = addArgs([jv.arg]);
-          const st = ShapeTracker.fromShape(input.aval.shape); // "imm" is realized
+          const st = ShapeTracker.fromShape(input.aval.shape as number[]); // "imm" is realized
           const indices = unravelAlu(st.shape, AluVar.gidx);
           inputExps.push(AluExp.globalView(input.aval.dtype, gid, st, indices));
         } else if (jv.type === "red") {
@@ -1239,7 +1241,7 @@ function broadcastedJit<P extends Primitive>(
       exp = reshapeViews(exp, (st) => {
         if (!deepEqual(st.shape, newShape))
           return st.broadcast(
-            newShape,
+            newShape as number[],
             range(newShape.length - st.shape.length),
           );
       });
@@ -1308,10 +1310,10 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
       if (axis.includes(i)) shiftedAxes.push(i);
       else {
         keptAxes.push(i);
-        newShape.push(as.shape[i]);
+        newShape.push(as.shape[i] as number);
       }
     }
-    const reductionSize = prod(shiftedAxes.map((ax) => as.shape[ax]));
+    const reductionSize = prod(shiftedAxes.map((ax) => as.shape[ax] as number));
     newShape.push(reductionSize);
 
     const perm = keptAxes.concat(shiftedAxes);
@@ -1324,7 +1326,7 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   ),
   [Primitive.PoolTranspose]([a], [as], { inShape, window, strides }) {
     let stX = poolTranspose(
-      ShapeTracker.fromShape(as.shape),
+      ShapeTracker.fromShape(as.shape as number[]),
       inShape,
       window,
       strides,
@@ -1350,8 +1352,8 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   },
   [Primitive.Conv]([a, b], [as, bs], params) {
     const [stX, stY] = prepareConv(
-      ShapeTracker.fromShape(as.shape),
-      ShapeTracker.fromShape(bs.shape),
+      ShapeTracker.fromShape(as.shape as number[]),
+      ShapeTracker.fromShape(bs.shape as number[]),
       params,
     );
     a = reshapeViews(a, (st) => st.compose(stX));
@@ -1367,7 +1369,7 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   ),
   [Primitive.Concatenate](exps, avals, { axis }) {
     const ndim = avals[0].ndim;
-    const sizes = avals.map((x) => x.shape[axis]);
+    const sizes = avals.map((x) => x.shape[axis] as number);
     const finalSize = sizes.reduce((a, b) => a + b, 0);
     const { dtype: dtypeOut } = avals
       .map((x) => x.scalar())
@@ -1377,11 +1379,11 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     let cum = 0;
     const src: AluExp[] = [];
     for (let i = 0; i < exps.length; i++) {
-      const padding = makePadAxis(cum, finalSize - cum - sizes[i]);
+      const padding = makePadAxis(cum, finalSize - cum - (sizes[i] as number));
       src.push(
         reshapeViews(AluExp.cast(dtypeOut, exps[i]), (st) => st.pad(padding)),
       );
-      cum += sizes[i];
+      cum += sizes[i] as number;
     }
     return { exp: [src.reduce(AluExp.add)] };
   },
@@ -1390,7 +1392,7 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     let start = 0;
     for (const size of sizes) {
       const slice = range(as.ndim).map<Pair>((d) =>
-        d === axis ? [start, start + size] : [0, as.shape[d]],
+        d === axis ? [start, start + size] : [0, as.shape[d] as number],
       );
       exp.push(reshapeViews(a, (st) => st.shrink(slice)));
       start += size;
@@ -1424,8 +1426,8 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     // First, broadcast each integer array in `indices`.
     const indexShape = indicesShapes
       .map((c) => c.shape)
-      .reduce(generalBroadcast);
-    const finalShape = xs.shape.filter((_, i) => !axisSet.has(i));
+      .reduce(generalBroadcast) as number[];
+    const finalShape = (xs.shape as number[]).filter((_, i) => !axisSet.has(i));
     finalShape.splice(outDim, 0, ...indexShape);
 
     // Make variables for expression indices for gathered axes, and non-axis.
@@ -1458,7 +1460,9 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
 
     // Finally, index into "x" by replacing its gidx with a flat accessor into
     // the gathered indices.
-    const [index, valid] = ShapeTracker.fromShape(xs.shape).toAluExp(src);
+    const [index, valid] = ShapeTracker.fromShape(
+      xs.shape as number[],
+    ).toAluExp(src);
     if (!valid.resolve())
       throw new Error("internal: expected full validity mask in Gather");
     return { exp: [x.substitute({ gidx: index })] };
