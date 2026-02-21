@@ -234,6 +234,70 @@ describe("effect-checker", () => {
     });
   });
 
+  describe("M2.3 — zero violations across operations", () => {
+    test("broad operation coverage: no effect violations", () => {
+      _setVerifyEffects(true);
+      try {
+        // Multi-op chain (exp, sin, cos)
+        const { jaxpr: j1 } = makeJaxpr((a: Array) =>
+          np.exp(np.sin(np.cos(a))),
+        )(np.zeros([4]));
+        j1.dispose();
+
+        // Deep chain with reduction
+        const { jaxpr: j2 } = makeJaxpr((a: Array, b: Array) => {
+          const c = np.multiply(a, b);
+          const d = np.add(c, a);
+          const e = np.subtract(d, b);
+          return np.sum(e);
+        })(np.zeros([4]), np.zeros([4]));
+        j2.dispose();
+
+        // Matmul
+        const { jaxpr: j3 } = makeJaxpr((a: Array, b: Array) =>
+          np.matmul(a, b),
+        )(np.zeros([3, 4]), np.zeros([4, 5]));
+        j3.dispose();
+
+        // Transpose
+        const { jaxpr: j4 } = makeJaxpr((a: Array) => np.transpose(a))(
+          np.zeros([3, 4]),
+        );
+        j4.dispose();
+
+        // Where / conditional
+        const { jaxpr: j5 } = makeJaxpr((a: Array, b: Array) =>
+          np.where(np.greater(a, b), a, b),
+        )(np.zeros([4]), np.zeros([4]));
+        j5.dispose();
+
+        // Flip
+        const { jaxpr: j6 } = makeJaxpr((a: Array) => np.flip(a))(
+          np.zeros([4]),
+        );
+        j6.dispose();
+
+        // Concatenate
+        const { jaxpr: j7 } = makeJaxpr((a: Array, b: Array) =>
+          np.concatenate([a, b], 0),
+        )(np.zeros([3]), np.zeros([4]));
+        j7.dispose();
+
+        // Softmax-like pattern
+        const { jaxpr: j8 } = makeJaxpr((a: Array) => {
+          const maxA = np.max(a);
+          const shifted = np.subtract(a, maxA);
+          const e = np.exp(shifted);
+          const s = np.sum(e);
+          return np.divide(e, s);
+        })(np.zeros([4]));
+        j8.dispose();
+      } finally {
+        _setVerifyEffects(false);
+      }
+    });
+  });
+
   describe("M3 — JIT integration", () => {
     test.skip("placeholder: effect-driven recycling matches or beats heuristic", () => {
       // Will be implemented in M3.1
