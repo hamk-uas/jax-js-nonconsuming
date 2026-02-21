@@ -772,7 +772,7 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   const tune = tuneNullopt(kernel);
 
   if (DEBUG >= 3) {
-    console.info(`kernel.exp: ${kernel.exp}\ntune.exp: ${tune.exp}`);
+    console.info(`kernel.exp: ${kernel.outputs[0].exp}\ntune.exp: ${tune.exp}`);
   }
 
   const cg = new CodeGenerator();
@@ -801,7 +801,7 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
       emitOutputAddr: () => {
         cg.local.get(kernel.nargs); // output buffer is last argument
         cg.local.get(gidx);
-        cg.i32.const(byteWidth(kernel.dtype));
+        cg.i32.const(byteWidth(kernel.outputs[0].dtype));
         cg.i32.mul();
         cg.i32.add();
       },
@@ -1399,8 +1399,8 @@ function emitKernelBody(opts: {
   const { cg, kernel, gidx, emitOutputAddr, emitExp, emitStore, sizeLocal } =
     opts;
   const tune = tuneNullopt(kernel);
-  const re = kernel.reduction;
-  const storeAlign = Math.log2(byteWidth(kernel.dtype));
+  const re = kernel.outputs[0].reduction;
+  const storeAlign = Math.log2(byteWidth(kernel.outputs[0].dtype));
 
   cg.i32.const(0);
   cg.local.set(gidx);
@@ -1422,8 +1422,8 @@ function emitKernelBody(opts: {
 
     if (re) {
       // Reduction: accumulator + inner ridx loop.
-      const acc = cg.local.declare(dty(cg, null, kernel.exp.dtype));
-      dty(cg, null, kernel.exp.dtype).const(re.identity);
+      const acc = cg.local.declare(dty(cg, null, kernel.outputs[0].exp.dtype));
+      dty(cg, null, kernel.outputs[0].exp.dtype).const(re.identity);
       cg.local.set(acc);
 
       // Kahan compensation local for Float64 Add reductions.
@@ -1469,7 +1469,7 @@ function emitKernelBody(opts: {
     if (emitStore) {
       emitStore();
     } else {
-      dty(cg, null, kernel.dtype).store(storeAlign);
+      dty(cg, null, kernel.outputs[0].dtype).store(storeAlign);
     }
 
     // gidx++
@@ -1649,9 +1649,12 @@ function codegenNativeScanGeneral(
     const reads = new Set<number>();
     if (step.source instanceof Kernel) {
       // Single-output kernel: check exp and epilogue
-      for (const c of collectCarryReads(step.source.exp)) reads.add(c);
-      if (step.source.reduction?.epilogue) {
-        for (const c of collectCarryReads(step.source.reduction.epilogue))
+      for (const c of collectCarryReads(step.source.outputs[0].exp))
+        reads.add(c);
+      if (step.source.outputs[0].reduction?.epilogue) {
+        for (const c of collectCarryReads(
+          step.source.outputs[0].reduction.epilogue,
+        ))
           reads.add(c);
       }
     }
@@ -1691,7 +1694,7 @@ function codegenNativeScanGeneral(
   for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
     const step = steps[stepIdx];
     if (step.source instanceof Kernel) {
-      if (step.source.reduction) continue; // no reduction allowed for direct-write
+      if (step.source.outputs[0].reduction) continue; // no reduction allowed for direct-write
 
       const indices = [step.outputInternalIdx];
 
@@ -1853,7 +1856,7 @@ function codegenNativeScanGeneral(
           // Single-output Kernel step — delegate to shared emitKernelBody.
           const kernel = step.source;
           const dw = directWriteMap.get(internalIdx);
-          const bw = byteWidth(kernel.dtype);
+          const bw = byteWidth(kernel.outputs[0].dtype);
           const needsDualStore = dw && dw.yIdx !== undefined;
 
           emitKernelBody({
@@ -1881,9 +1884,11 @@ function codegenNativeScanGeneral(
             emitStore: needsDualStore
               ? () => {
                   const storeAlign = Math.log2(bw);
-                  const tmpVal = cg.local.declare(dty(cg, null, kernel.dtype));
+                  const tmpVal = cg.local.declare(
+                    dty(cg, null, kernel.outputs[0].dtype),
+                  );
                   cg.local.tee(tmpVal);
-                  dty(cg, null, kernel.dtype).store(storeAlign);
+                  dty(cg, null, kernel.outputs[0].dtype).store(storeAlign);
                   // Store to ysStacked
                   cg.local.get(ysStackedBase + dw!.yIdx!);
                   cg.local.get(dataIdx);
@@ -1895,7 +1900,7 @@ function codegenNativeScanGeneral(
                   cg.i32.mul();
                   cg.i32.add();
                   cg.local.get(tmpVal);
-                  dty(cg, null, kernel.dtype).store(storeAlign);
+                  dty(cg, null, kernel.outputs[0].dtype).store(storeAlign);
                 }
               : undefined,
           });

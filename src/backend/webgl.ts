@@ -360,11 +360,14 @@ export class WebGLBackend implements Backend {
 function generateShader(kernel: Kernel): ShaderInfo {
   const tune = tuneNullopt(kernel);
   if (DEBUG >= 3) {
-    console.info(`webgl kernel.exp: ${kernel.exp}\ntune.exp: ${tune.exp}`);
+    console.info(
+      `webgl kernel.exp: ${kernel.outputs[0].exp}\ntune.exp: ${tune.exp}`,
+    );
   }
 
-  const { nargs, reduction: re } = kernel;
-  const outputDtype = kernel.dtype;
+  const { nargs } = kernel;
+  const re = kernel.outputs[0].reduction;
+  const outputDtype = kernel.outputs[0].dtype;
 
   // Calculate output texture dimensions (4 elements per texel)
   const numTexels = Math.ceil((kernel.size as number) / 4) || 1;

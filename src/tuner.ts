@@ -30,7 +30,7 @@ export interface TuneResult {
   /** New expression with GlobalView ops and gidx/ridx lowered. */
   exp: AluExp;
 
-  /** New reduction epilogue expression, present when `kernel.reduction` is present. */
+  /** New reduction epilogue expression, present when the kernel output has a reduction. */
   epilogue?: AluExp;
 
   /** Expression for indexing the result array, including upcast. */
@@ -191,20 +191,21 @@ class TuneDims {
 
 /** Tuning step that does not apply any optimization. */
 export function tuneNullopt(kernel: Kernel): TuneResult {
-  let exp = kernel.exp;
+  const o = kernel.outputs[0];
+  let exp = o.exp;
   const vars: Record<string, AluExp> = {};
   // For symbolic kernels with a concrete hint, use the hint for gidx range.
   // This gives gidx a bounded range [0, concreteSize-1] so the simplifier
   // can eliminate modulo ops, producing size-independent expressions.
   const gidxSize = kernel.concreteSizeHint ?? kernel.size;
   vars.gidx = AluExp.special(DType.Int32, "gidx", gidxSize);
-  if (kernel.reduction) {
-    vars.ridx = AluExp.special(DType.Int32, "ridx", kernel.reduction.size);
-    if (exp.dtype !== kernel.reduction.dtype)
-      exp = AluExp.cast(kernel.reduction.dtype, exp);
+  if (o.reduction) {
+    vars.ridx = AluExp.special(DType.Int32, "ridx", o.reduction.size);
+    if (exp.dtype !== o.reduction.dtype)
+      exp = AluExp.cast(o.reduction.dtype, exp);
   }
   let resultExp = exp.substitute(vars).rewriteGlobalViews().simplify();
-  let resultEpilogue = kernel.reduction?.epilogue
+  let resultEpilogue = o.reduction?.epilogue
     .substitute({ gidx: vars.gidx })
     .rewriteGlobalViews()
     .simplify();
@@ -229,7 +230,7 @@ export function tuneNullopt(kernel: Kernel): TuneResult {
     outputIdxExp: vars.gidx,
     threadCount: kernel.size,
     size: {
-      reduce: kernel.reduction ? kernel.reduction.size : 0,
+      reduce: o.reduction ? o.reduction.size : 0,
     },
   };
 }
@@ -248,12 +249,12 @@ function unlimitGlobalIndexLen(exp: AluExp): AluExp {
 
 /** Tuning for WebGPU kernels. */
 export function tuneWebgpu(kernel: Kernel): TuneResult {
-  const reduction = kernel.reduction;
+  const reduction = kernel.outputs[0].reduction;
   if (!reduction) return tuneNullopt(kernel);
   // Symbolic kernels can't use upcast/unroll optimizations (unknown size).
   if (kernel.isSymbolic) return tuneNullopt(kernel);
 
-  const exp = AluExp.cast(reduction.dtype, kernel.exp);
+  const exp = AluExp.cast(reduction.dtype, kernel.outputs[0].exp);
   const globalIndexes = exp.collect((exp) => exp.op === AluOp.GlobalIndex);
   if (globalIndexes.length > 0) {
     if (DEBUG >= 4)

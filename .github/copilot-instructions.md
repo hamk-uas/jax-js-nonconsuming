@@ -2461,12 +2461,12 @@ contributors should be aware of:
 
 ### Future work
 
-| Priority | Feature                        | Notes                                                                                                                                                                                              |
-| -------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| High     | Multi-output kernel            | Unify `Kernel` to multi-output + `splitGraphDataflow` fusion post-pass. See `ULTIMATE-ARCHITECTURE-PLAN.md` M3.1 for merged type design, `singleKernel()` factory, codegen sketches, and test plan |
-| Medium   | Missing test categories        | ~30 additional tests: WASM routine scan, path-documentation, advanced vmap/grad compositions                                                                                                       |
-| Medium   | Mixed-dtype WebGPU scan shader | Per-binding dtype in `nativeScanMultiShaderSource`                                                                                                                                                 |
-| Medium   | WebGL copy for scan stacking   | Enable direct-write stacked Ys on WebGL fallback                                                                                                                                                   |
+| Priority | Feature                        | Notes                                                                                                                                                                |
+| -------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~High~~ | ~~Multi-output kernel~~        | ✅ DONE — `Kernel` unified to multi-output. `Kernel.single()` factory, multi-output codegen, backward-compat shims removed. See `ULTIMATE-ARCHITECTURE-PLAN.md` M3.1 |
+| Medium   | Missing test categories        | ~30 additional tests: WASM routine scan, path-documentation, advanced vmap/grad compositions                                                                         |
+| Medium   | Mixed-dtype WebGPU scan shader | Per-binding dtype in `nativeScanMultiShaderSource`                                                                                                                   |
+| Medium   | WebGL copy for scan stacking   | Enable direct-write stacked Ys on WebGL fallback                                                                                                                     |
 
 ### WASM feature opportunities (assessed Feb 2026)
 
@@ -4157,7 +4157,7 @@ M0–M8 with dependency graph, code sketches, and test plans.
 | M2.1      | `scatter_add` IR & AD rules   | **DONE**           | `Primitive.ScatterAdd` with JVP + transpose rules         |
 | M2.2      | WebGPU CAS loop shader        | **DONE**           | `dispatchScatterAdd()` in `webgpu.ts`                     |
 | M2.3      | WASM sequential scatter       | **DONE**           | `dispatchScatterAdd()` in `wasm.ts`                       |
-| M3.1      | Multi-output `Kernel`         | **DONE\***         | `KernelOutput[]`, `Kernel.single()`, multi-output codegen |
+| M3.1      | Multi-output `Kernel`         | **DONE**           | `KernelOutput[]`, `Kernel.single()`, multi-output codegen |
 | M3.2      | Epilogue fusion chain walk    | Not done           | No extended epilogue fusion in `splitGraphDataflow`       |
 | M4.1      | `SymDim` & shape propagation  | **DONE**           | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`          |
 | M4.2      | Parameterized backend codegen | **DONE** (partial) | `SizeExpr`, `_currentDimBindings`, symbolic cache keys    |
@@ -4168,16 +4168,12 @@ M0–M8 with dependency graph, code sketches, and test plans.
 | M7.2–7.3  | Compiled/threaded Kogge-Stone | Not done           | Depends on M7.1 + M5/M6.2                                 |
 | M8        | Cleanup & benchmarking        | Not done           | Depends on all others                                     |
 
-\* M3.1 is structurally complete (multi-output `Kernel`, codegen on both backends, tests) but
-backward-compat shims (`get exp()`, etc.) that the plan says should be removed within M3.1 still
-exist.
-
 ## Dependency Graph (Simplified)
 
 ```
 M0.2 ✅ ──┬──→ M1 (scan backward AOT) ~partial
           ├──→ M2 (scatter_add) ✅
-          ├──→ M3.1 (multi-output kernel) ✅* ──→ M3.2 (epilogue fusion) ❌
+          ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ❌
           ├──→ M4.1 ✅ ──→ M4.2 ~done ──→ M6.1 ❌
           └──→ M5 ❌ ──→ M6.2 ❌
                          M7.1 ❌ ──→ M7.2 ❌ ──→ M7.3 ❌ (needs M5+M6.2)
@@ -4255,9 +4251,9 @@ These details are frequently lost when conversation context is summarized:
 4. **`_currentDimBindings` is module-level state**: Set/cleared in `jitCompile()` via try/finally.
    Any new compilation code that reads symbolic dimensions must go through this.
 
-5. **Multi-output kernel compat shims**: `Kernel.exp`, `Kernel.reduction`, `Kernel.dtype` getters
-   still exist as backward-compat shims delegating to `outputs[0]`. The plan says remove them but
-   they're still used in many places.
+5. **Multi-output kernel access pattern**: `Kernel` has no single-output shims. All call sites
+   access `kernel.outputs[0].exp`, `kernel.outputs[0].reduction`, `kernel.outputs[0].dtype`,
+   `kernel.outputs[0].bytes` explicitly. Multi-output paths iterate `kernel.outputs`.
 
 6. **The `no-array-chain` rule is NOT in the `invariance` config** — only in `strict`. The
    `invariance` config focuses on ownership correctness (eager/JIT equivalence), not performance

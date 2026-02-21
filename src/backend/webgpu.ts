@@ -233,6 +233,13 @@ export class WebGPUBackend implements Backend {
    */
   #gpuAllocatedBytes: number = 0;
 
+  /**
+   * High-water mark: the maximum value `#gpuAllocatedBytes` ever reached.
+   * Useful for verifying that optimizations (fusion, recycling, pooling)
+   * reduce peak GPU memory. Reset via `resetPeakGpuAllocatedBytes()`.
+   */
+  #gpuPeakBytes: number = 0;
+
   constructor(readonly device: GPUDevice) {
     if (DEBUG >= 3 && device.adapterInfo) {
       console.info(
@@ -276,6 +283,19 @@ export class WebGPUBackend implements Backend {
   /** Total GPU bytes held by jax-js: live buffer bytes + pooled buffer bytes. */
   gpuAllocatedBytes(): number {
     return this.#gpuAllocatedBytes;
+  }
+
+  /**
+   * High-water mark: the maximum `gpuAllocatedBytes()` ever reached.
+   * Useful for verifying that fusion, recycling, and pooling reduce peak memory.
+   */
+  peakGpuAllocatedBytes(): number {
+    return this.#gpuPeakBytes;
+  }
+
+  /** Reset the peak memory watermark to the current allocation level. */
+  resetPeakGpuAllocatedBytes(): void {
+    this.#gpuPeakBytes = this.#gpuAllocatedBytes;
   }
 
   /** Buffer pool diagnostic: pooled buffer count, pooled bytes, and byte budget. */
@@ -1229,6 +1249,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     });
     if (!read) {
       this.#gpuAllocatedBytes += size;
+      if (this.#gpuAllocatedBytes > this.#gpuPeakBytes) {
+        this.#gpuPeakBytes = this.#gpuAllocatedBytes;
+      }
     }
     return buffer;
   }
@@ -1512,10 +1535,11 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
 
   const tune = tuneWebgpu(kernel);
   if (DEBUG >= 3) {
-    console.info(`kernel.exp: ${kernel.exp}\ntune.exp: ${tune.exp}`);
+    console.info(`kernel.exp: ${kernel.outputs[0].exp}\ntune.exp: ${tune.exp}`);
   }
 
-  const { nargs, reduction: re } = kernel;
+  const { nargs } = kernel;
+  const re = kernel.outputs[0].reduction;
   const args = Array.from({ length: nargs }, (_, i) => `in${i}`);
 
   // binding(0..n-1): input buffers
@@ -1575,7 +1599,7 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     );
   }
 
-  const resultTy = dtypeToWgsl(kernel.dtype, true);
+  const resultTy = dtypeToWgsl(kernel.outputs[0].dtype, true);
   emit(
     `@group(0) @binding(${nargs}) var<storage, read_write> result : array<${resultTy}>;`,
   );
@@ -2063,7 +2087,7 @@ function nativeScanMultiShaderSource(
   } = params;
 
   // Determine dtype from first kernel step
-  const dtype = steps[0]?.kernel.dtype ?? DType.Float32;
+  const dtype = steps[0]?.kernel.outputs[0].dtype ?? DType.Float32;
   const resultTy = dtypeToWgsl(dtype, true);
   const elemSize = byteWidth(dtype);
 
@@ -2184,7 +2208,7 @@ function nativeScanMultiShaderSource(
     emit(`if (gidx < ${kernelSize}) {`);
     emit(pushIndent);
 
-    const re = kernel.reduction;
+    const re = kernel.outputs[0].reduction;
     if (re) {
       // Reduction kernel: inner ridx loop + epilogue
       const accTy = dtypeToWgsl(re.dtype, true);

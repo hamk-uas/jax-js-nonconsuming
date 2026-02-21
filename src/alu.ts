@@ -1471,28 +1471,6 @@ export class Kernel implements FpHashable {
   /** The outputs produced by this kernel. */
   readonly outputs: KernelOutput[];
 
-  // ---- backward-compatible accessors (delegate to outputs[0]) ----
-
-  /** Expression for the first (or only) output. */
-  get exp(): AluExp {
-    return this.outputs[0].exp;
-  }
-
-  /** Reduction for the first (or only) output. */
-  get reduction(): Reduction | undefined {
-    return this.outputs[0].reduction;
-  }
-
-  /** Dtype of the first (or only) output. */
-  get dtype(): DType {
-    return this.outputs[0].dtype;
-  }
-
-  /** Bytes of the first (or only) output. */
-  get bytes(): SizeExpr {
-    return this.outputs[0].bytes;
-  }
-
   // ---- multi-output accessors ----
 
   /** Number of outputs. */
@@ -1664,8 +1642,8 @@ export class Reduction implements FpHashable {
     this.epilogue = epilogue.simplify();
 
     // If reducing in low-precision float with sum, do it in float32 instead.
-    // The tuning step will reconcile the mismatch between `kernel.exp` and
-    // `kernel.reduction.dtype` by inserting a cast.
+    // The tuning step will reconcile the mismatch between the expression dtype
+    // and reduction dtype by inserting a cast.
     if (this.dtype === DType.Float16 && this.op === AluOp.Add) {
       this.epilogue = this.epilogue.substitute({
         acc: AluExp.cast(this.dtype, AluVar.acc(DType.Float32)),

@@ -14,7 +14,7 @@ import requireWrapperDisposeSymmetry from "./rules/require-wrapper-dispose-symme
 const plugin: ESLint.Plugin = {
   meta: {
     name: "@hamk-uas/eslint-plugin-jax-js",
-    version: "0.1.0",
+    version: "0.1.2",
   },
   rules: {
     "require-using": requireUsing,

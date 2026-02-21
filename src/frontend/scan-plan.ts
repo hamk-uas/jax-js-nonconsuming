@@ -2,7 +2,7 @@
  * @file Scan plan construction — determines the execution strategy for a scan.
  */
 
-import { AluOp, byteWidth, Kernel, Reduction } from "../alu";
+import { AluExp, AluOp, byteWidth, Kernel, Reduction } from "../alu";
 import type { Backend, Executable } from "../backend";
 import {
   getScanRoutineInfo,
@@ -177,7 +177,9 @@ function tryPrepareWasmNativeScan(
     if (source instanceof Kernel) {
       const internalIdx = internalSizes.length;
       slotToInternal.set(step.outputs[0], internalIdx);
-      internalSizes.push((source.size as number) * byteWidth(source.dtype));
+      internalSizes.push(
+        (source.size as number) * byteWidth(source.outputs[0].dtype),
+      );
     } else if (source instanceof Routine) {
       // Routine: may have multiple outputs
       for (let outIdx = 0; outIdx < step.outputs.length; outIdx++) {
@@ -262,13 +264,13 @@ function tryPrepareWasmNativeScan(
     if (source instanceof Kernel) {
       // Reindex kernel expressions to use our inputSlots mapping
       const reindexMap = inputSlots;
-      const reindexedExp = source.exp.reindexGids(reindexMap);
-      const reindexedReduction = source.reduction
+      const reindexedExp = source.outputs[0].exp.reindexGids(reindexMap);
+      const reindexedReduction = source.outputs[0].reduction
         ? new Reduction(
-            source.reduction.dtype,
-            source.reduction.op,
-            source.reduction.size,
-            source.reduction.epilogue.reindexGids(reindexMap),
+            source.outputs[0].reduction.dtype,
+            source.outputs[0].reduction.op,
+            source.outputs[0].reduction.size,
+            source.outputs[0].reduction.epilogue.reindexGids(reindexMap),
           )
         : undefined;
       const reindexedKernel = Kernel.single(
@@ -573,9 +575,9 @@ function tryPrepareWebGPUNativeScan(
       const laterStep = orderedSteps[j].step;
       const laterSource = laterStep.source as Kernel;
       const laterReindexMap = laterStep.inputs;
-      const laterExp = laterSource.exp.reindexGids(laterReindexMap);
+      const laterExp = laterSource.outputs[0].exp.reindexGids(laterReindexMap);
       const readsWrittenCarry = laterExp.some(
-        (e) =>
+        (e: AluExp) =>
           (e.op === AluOp.GlobalIndex || e.op === AluOp.GlobalView) &&
           e.arg[0] === writtenCarryGid,
       );
@@ -587,11 +589,13 @@ function tryPrepareWebGPUNativeScan(
         return null;
       }
       // Also check reduction epilogue if present
-      if (laterSource.reduction) {
+      if (laterSource.outputs[0].reduction) {
         const laterReductionExp =
-          laterSource.reduction.epilogue.reindexGids(laterReindexMap);
+          laterSource.outputs[0].reduction.epilogue.reindexGids(
+            laterReindexMap,
+          );
         const readsInReduction = laterReductionExp.some(
-          (e) =>
+          (e: AluExp) =>
             (e.op === AluOp.GlobalIndex || e.op === AluOp.GlobalView) &&
             e.arg[0] === writtenCarryGid,
         );
@@ -611,13 +615,13 @@ function tryPrepareWebGPUNativeScan(
       const source = step.source as Kernel;
       // Reindex kernel expression gids from local args to scan buffer layout
       const reindexMap = step.inputs;
-      const reindexedExp = source.exp.reindexGids(reindexMap);
-      const reindexedReduction = source.reduction
+      const reindexedExp = source.outputs[0].exp.reindexGids(reindexMap);
+      const reindexedReduction = source.outputs[0].reduction
         ? new Reduction(
-            source.reduction.dtype,
-            source.reduction.op,
-            source.reduction.size,
-            source.reduction.epilogue.reindexGids(reindexMap),
+            source.outputs[0].reduction.dtype,
+            source.outputs[0].reduction.op,
+            source.outputs[0].reduction.size,
+            source.outputs[0].reduction.epilogue.reindexGids(reindexMap),
           )
         : undefined;
       const reindexedKernel = Kernel.single(

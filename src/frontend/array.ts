@@ -415,7 +415,7 @@ export class Array extends Tracer {
     }
 
     const kernel = Kernel.single(inputs.length, prod(finalShape), exp);
-    const output = this.#backend.malloc(kernel.bytes as number);
+    const output = this.#backend.malloc(kernel.outputs[0].bytes as number);
     const pending = [...this.#pending, ...indices.flatMap((ar) => ar.#pending)];
     for (const exe of pending) exe.updateRc(+1);
     pending.push(new PendingExecute(this.#backend, kernel, inputs, [output]));
@@ -476,7 +476,7 @@ export class Array extends Tracer {
       AluExp.globalView(this.#dtype, 0, this.#st, indices),
     ]);
     const kernel = Kernel.single(1, this.#st.size, exp);
-    const output = this.#backend.malloc(kernel.bytes as number);
+    const output = this.#backend.malloc(kernel.outputs[0].bytes as number);
     const pending = [...this.#pending];
     for (const exe of pending) exe.updateRc(+1);
     pending.push(
@@ -633,7 +633,7 @@ export class Array extends Tracer {
       re = new Reduction(exp.dtype, AluOp.Add, axisSize);
     }
     const kernel = Kernel.single(inputs.length, prod(newShape), exp, re);
-    const output = backend.malloc(kernel.bytes as number);
+    const output = backend.malloc(kernel.outputs[0].bytes as number);
     const pending = new Set([...arrays.flatMap((ar) => ar.#pending)]);
     for (const exe of pending) exe.updateRc(+1);
     pending.add(new PendingExecute(backend, kernel, inputs, [output]));
@@ -648,7 +648,7 @@ export class Array extends Tracer {
     return new Array({
       source: output,
       st: ShapeTracker.fromShape(newShape),
-      dtype: kernel.dtype,
+      dtype: kernel.outputs[0].dtype,
       weakType,
       backend,
       committed,
@@ -675,7 +675,7 @@ export class Array extends Tracer {
     }
 
     const kernel = Kernel.single(inputs.length, newSize, exp, reduction);
-    const output = this.#backend.malloc(kernel.bytes as number);
+    const output = this.#backend.malloc(kernel.outputs[0].bytes as number);
     const pending = [...this.#pending];
     for (const exe of pending) exe.updateRc(+1);
     pending.push(new PendingExecute(this.#backend, kernel, inputs, [output]));
@@ -744,7 +744,7 @@ export class Array extends Tracer {
     if (this.#source instanceof AluExp) {
       const exp = accessorAluExp(this.#source, this.#st, indices);
       const kernel = Kernel.single(0, this.#st.size, exp);
-      const output = this.#backend.malloc(kernel.bytes as number);
+      const output = this.#backend.malloc(kernel.outputs[0].bytes as number);
       const pendingItem = new PendingExecute(
         this.#backend,
         kernel,
@@ -759,7 +759,7 @@ export class Array extends Tracer {
       if (this.#st.contiguous) return;
       const exp = accessorGlobal(this.#dtype, 0, this.#st, indices);
       const kernel = Kernel.single(1, this.#st.size, exp);
-      const output = this.#backend.malloc(kernel.bytes as number);
+      const output = this.#backend.malloc(kernel.outputs[0].bytes as number);
       const pendingItem = new PendingExecute(
         this.#backend,
         kernel,

@@ -113,6 +113,18 @@ export type JitStep =
       dtype: DType;
     };
 
+/** Per-type step counts from {@link JitProgram.stepCounts}. */
+export interface JitStepCounts {
+  execute: number;
+  malloc: number;
+  free: number;
+  recycle: number;
+  incref: number;
+  scan: number;
+  dus: number;
+  scatter_add: number;
+}
+
 /**
  * Pool hints computed at JIT compile time. Tells the backend which buffer
  * sizes the program will allocate and how many bytes are live at peak, so the
@@ -240,6 +252,32 @@ export class JitProgram {
 
   toString(): string {
     return this.pprint().toString();
+  }
+
+  /**
+   * Count steps by type. Useful for verifying fusion reduces dispatch count.
+   *
+   * @example
+   * ```ts
+   * const counts = program.stepCounts();
+   * expect(counts.execute).toBe(1); // verify single dispatch after fusion
+   * ```
+   */
+  stepCounts(): JitStepCounts {
+    const counts: JitStepCounts = {
+      execute: 0,
+      malloc: 0,
+      free: 0,
+      recycle: 0,
+      incref: 0,
+      scan: 0,
+      dus: 0,
+      scatter_add: 0,
+    };
+    for (const step of this.steps) {
+      counts[step.type]++;
+    }
+    return counts;
   }
 
   /**
@@ -513,7 +551,7 @@ class JitProgramBuilder {
   }
 
   pushKernel(kernel: Kernel, inputs: JitId[]): JitId {
-    const id = this.pushBuffer(kernel.bytes);
+    const id = this.pushBuffer(kernel.outputs[0].bytes);
     this.steps.push({
       type: "execute",
       source: kernel,

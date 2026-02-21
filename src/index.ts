@@ -26,6 +26,7 @@ import {
   OwnedFunction,
   verifyJaxprEffects,
 } from "./frontend/jaxpr";
+import type { JitStepCounts } from "./frontend/jit";
 import * as jvpModule from "./frontend/jvp";
 import * as linearizeModule from "./frontend/linearize";
 import * as vmapModule from "./frontend/vmap";
@@ -62,6 +63,7 @@ export {
   Jaxpr,
   type JsTree,
   type JsTreeDef,
+  type JitStepCounts,
   lax,
   type LeakReport,
   MemoryEffect,
