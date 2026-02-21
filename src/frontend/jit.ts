@@ -1577,13 +1577,34 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
           case Primitive.Idiv:
           case Primitive.Mod:
           case Primitive.Min:
-          case Primitive.Max: {
+          case Primitive.Max:
+          case Primitive.Compare: {
             const otherInput = nextEqn.inputs.find((v) => v !== outVar)!;
             if (
               otherInput instanceof Lit ||
               deepEqual(
                 generalBroadcast(otherInput.aval.shape, outVar.aval.shape),
                 outVar.aval.shape,
+              )
+            ) {
+              head = usages[0];
+              continue;
+            }
+            break;
+          }
+
+          // Ternary Where: fusable if all non-chain inputs are literals or
+          // same-shape arrays (no broadcasting that enlarges the result).
+          case Primitive.Where: {
+            const otherInputs = nextEqn.inputs.filter((v) => v !== outVar);
+            if (
+              otherInputs.every(
+                (inp) =>
+                  inp instanceof Lit ||
+                  deepEqual(
+                    generalBroadcast(inp.aval.shape, outVar.aval.shape),
+                    outVar.aval.shape,
+                  ),
               )
             ) {
               head = usages[0];
