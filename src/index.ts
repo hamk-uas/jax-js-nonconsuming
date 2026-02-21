@@ -27,6 +27,7 @@ import {
   verifyJaxprEffects,
 } from "./frontend/jaxpr";
 import type { JitStepCounts } from "./frontend/jit";
+import { jitCompile, JitProgram } from "./frontend/jit";
 import * as jvpModule from "./frontend/jvp";
 import * as linearizeModule from "./frontend/linearize";
 import * as vmapModule from "./frontend/vmap";
@@ -61,6 +62,8 @@ export {
   hasSymbolicDims,
   isSymbolicDim,
   Jaxpr,
+  jitCompile,
+  JitProgram,
   type JsTree,
   type JsTreeDef,
   type JitStepCounts,

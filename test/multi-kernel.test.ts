@@ -7,9 +7,12 @@
  */
 import {
   defaultDevice,
+  getBackend,
   grad,
   init,
   jit,
+  jitCompile,
+  makeJaxpr,
   nn,
   numpy as np,
 } from "@hamk-uas/jax-js-nonconsuming";
@@ -279,6 +282,97 @@ describe("reduction epilogue fusion (WASM)", () => {
     expect(b.js()).toBe(7); // 6+1
     a.dispose();
     b.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dispatch count verification via stepCounts()
+// Verifies that epilogue fusion reduces dispatch count to 1 (M3.2 exit criteria)
+// ---------------------------------------------------------------------------
+describe("epilogue fusion dispatch counts (WASM)", () => {
+  let prev: ReturnType<typeof defaultDevice>;
+  beforeAll(() => {
+    prev = defaultDevice("wasm");
+  });
+  afterAll(() => defaultDevice(prev));
+
+  it("matmul + bias + relu compiles to single dispatch", () => {
+    using A = np.zeros([2, 3]);
+    using B = np.zeros([3, 2]);
+    using bias = np.zeros([2]);
+    const { jaxpr: cj } = makeJaxpr(
+      (A: np.Array, B: np.Array, bias: np.Array) => {
+        using c = np.matmul(A, B) as np.Array;
+        using d = c.add(bias) as np.Array;
+        return nn.relu(d);
+      },
+    )(A, B, bias);
+    const program = jitCompile(getBackend(), cj.jaxpr);
+    const counts = program.stepCounts();
+    expect(counts.execute).toBe(1); // Single fused dispatch
+    cj.dispose();
+  });
+
+  it("sum().mul(2).add(1) compiles to single dispatch", () => {
+    using x = np.zeros([4]);
+    const { jaxpr: cj } = makeJaxpr((x: np.Array) => {
+      using s = x.sum() as np.Array;
+      using m = s.mul(2) as np.Array;
+      return m.add(1);
+    })(x);
+    const program = jitCompile(getBackend(), cj.jaxpr);
+    expect(program.stepCounts().execute).toBe(1);
+    cj.dispose();
+  });
+
+  it("dot + neg compiles to single dispatch", () => {
+    using a = np.zeros([3]);
+    using b = np.zeros([3]);
+    const { jaxpr: cj } = makeJaxpr((a: np.Array, b: np.Array) => {
+      using d = np.dot(a, b) as np.Array;
+      return np.negative(d);
+    })(a, b);
+    const program = jitCompile(getBackend(), cj.jaxpr);
+    expect(program.stepCounts().execute).toBe(1);
+    cj.dispose();
+  });
+
+  it("matmul + scale compiles to single dispatch", () => {
+    using A = np.zeros([1, 2]);
+    using B = np.zeros([2, 1]);
+    const { jaxpr: cj } = makeJaxpr((A: np.Array, B: np.Array) => {
+      using c = np.matmul(A, B) as np.Array;
+      return c.mul(0.5);
+    })(A, B);
+    const program = jitCompile(getBackend(), cj.jaxpr);
+    expect(program.stepCounts().execute).toBe(1);
+    cj.dispose();
+  });
+
+  it("sum + exp compiles to single dispatch", () => {
+    using x = np.zeros([4]);
+    const { jaxpr: cj } = makeJaxpr((x: np.Array) => {
+      using s = x.sum() as np.Array;
+      return np.exp(s);
+    })(x);
+    const program = jitCompile(getBackend(), cj.jaxpr);
+    expect(program.stepCounts().execute).toBe(1);
+    cj.dispose();
+  });
+
+  it("divergent consumers produce multiple dispatches (no fusion)", () => {
+    using x = np.zeros([3]);
+    const { jaxpr: cj } = makeJaxpr((x: np.Array) => {
+      using s = x.sum() as np.Array;
+      using a = s.mul(2) as np.Array;
+      using b = s.add(1) as np.Array;
+      return [a, b] as [np.Array, np.Array];
+    })(x);
+    const program = jitCompile(getBackend(), cj.jaxpr);
+    // sum is used by both mul and add (divergent), so sum is a black node
+    // producing 1 reduction dispatch + elementwise dispatches
+    expect(program.stepCounts().execute).toBeGreaterThanOrEqual(2);
+    cj.dispose();
   });
 });
 

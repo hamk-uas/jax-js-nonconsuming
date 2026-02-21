@@ -4158,7 +4158,7 @@ M0–M8 with dependency graph, code sketches, and test plans.
 | M2.2      | WebGPU CAS loop shader        | **DONE**           | `dispatchScatterAdd()` in `webgpu.ts`                     |
 | M2.3      | WASM sequential scatter       | **DONE**           | `dispatchScatterAdd()` in `wasm.ts`                       |
 | M3.1      | Multi-output `Kernel`         | **DONE**           | `KernelOutput[]`, `Kernel.single()`, multi-output codegen |
-| M3.2      | Epilogue fusion chain walk    | Not done           | No extended epilogue fusion in `splitGraphDataflow`       |
+| M3.2      | Epilogue fusion chain walk    | **DONE**           | Already implemented; verified via `stepCounts()` tests    |
 | M4.1      | `SymDim` & shape propagation  | **DONE**           | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`          |
 | M4.2      | Parameterized backend codegen | **DONE** (partial) | `SizeExpr`, `_currentDimBindings`, symbolic cache keys    |
 | M5.1–5.3  | WASM multithreading           | Not done           | No `SharedArrayBuffer`/workers infrastructure             |
@@ -4173,7 +4173,7 @@ M0–M8 with dependency graph, code sketches, and test plans.
 ```
 M0.2 ✅ ──┬──→ M1 (scan backward AOT) ~partial
           ├──→ M2 (scatter_add) ✅
-          ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ❌
+          ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
           ├──→ M4.1 ✅ ──→ M4.2 ~done ──→ M6.1 ❌
           └──→ M5 ❌ ──→ M6.2 ❌
                          M7.1 ❌ ──→ M7.2 ❌ ──→ M7.3 ❌ (needs M5+M6.2)
@@ -4186,10 +4186,9 @@ M0.2 ✅ ──┬──→ M1 (scan backward AOT) ~partial
 Per the dependency graph, the following milestones can be worked on next:
 
 1. **M0.1** — Record baseline test numbers (independent, quick)
-2. **M3.2** — Epilogue fusion (depends on M3.1 ✅)
-3. **M5** — WASM multithreading foundation (independent)
-4. **M7.1** — `Primitive.AssociativeScan` (independent)
-5. **M1.1** completion — Finish `ScanBackwardArtifact` (M0 dependency met)
+2. **M5** — WASM multithreading foundation (independent)
+3. **M7.1** — `Primitive.AssociativeScan` (independent)
+4. **M1.1** completion — Finish `ScanBackwardArtifact` (M0 dependency met)
 
 ---
 
