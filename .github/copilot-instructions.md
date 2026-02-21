@@ -4150,9 +4150,9 @@ M0–M8 with dependency graph, code sketches, and test plans.
 
 | Milestone | Title                         | Status             | Notes                                                     |
 | --------- | ----------------------------- | ------------------ | --------------------------------------------------------- |
-| M0.1      | Record baseline tests         | Not done           | No `tmp/m0-*` baseline files created yet                  |
+| M0.1      | Record baseline tests         | **DONE**           | `tmp/m0-*` baseline files captured                        |
 | M0.2      | Hardware feature detection    | **DONE**           | `BackendCapabilities` interface in `src/backend.ts`       |
-| M1.1      | `ScanBackwardArtifact` type   | Partially done     | `ScanPullbackArtifact` exists in `scan-backward.ts`       |
+| M1.1      | `ScanBackwardArtifact` type   | **DONE**           | `ScanPullbackArtifact.run()` encapsulates backward pass   |
 | M1.2      | Unify `vjpFlat` transposition | **DONE**           | `jaxprNeedsCallTimeTranspose` fully removed               |
 | M2.1      | `scatter_add` IR & AD rules   | **DONE**           | `Primitive.ScatterAdd` with JVP + transpose rules         |
 | M2.2      | WebGPU CAS loop shader        | **DONE**           | `dispatchScatterAdd()` in `webgpu.ts`                     |
@@ -4171,24 +4171,23 @@ M0–M8 with dependency graph, code sketches, and test plans.
 ## Dependency Graph (Simplified)
 
 ```
-M0.2 ✅ ──┬──→ M1 (scan backward AOT) ~partial
-          ├──→ M2 (scatter_add) ✅
-          ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
-          ├──→ M4.1 ✅ ──→ M4.2 ~done ──→ M6.1 ❌
-          └──→ M5 ❌ ──→ M6.2 ❌
-                         M7.1 ❌ ──→ M7.2 ❌ ──→ M7.3 ❌ (needs M5+M6.2)
-                                                    ↓
-                                              M8 (cleanup) ❌
+M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
+        ├──→ M2 (scatter_add) ✅
+        ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
+        ├──→ M4.1 ✅ ──→ M4.2 ~done ──→ M6.1 ❌
+        └──→ M5 ❌ ──→ M6.2 ❌
+                       M7.1 ❌ ──→ M7.2 ❌ ──→ M7.3 ❌ (needs M5+M6.2)
+                                                  ↓
+                                            M8 (cleanup) ❌
 ```
 
 ## Next Available Milestones
 
 Per the dependency graph, the following milestones can be worked on next:
 
-1. **M0.1** — Record baseline test numbers (independent, quick)
-2. **M5** — WASM multithreading foundation (independent)
-3. **M7.1** — `Primitive.AssociativeScan` (independent)
-4. **M1.1** completion — Finish `ScanBackwardArtifact` (M0 dependency met)
+1. **M5** — WASM multithreading foundation (independent, major)
+2. **M7.1** — `Primitive.AssociativeScan` (independent)
+3. **M4.2** completion — Finish parameterized backend codegen (M4.1 done)
 
 ---
 
