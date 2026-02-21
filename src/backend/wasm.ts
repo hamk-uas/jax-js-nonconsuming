@@ -39,6 +39,7 @@ import {
   getTriangularSolveModule,
 } from "./wasm/routine-provider";
 import { CodeGenerator } from "./wasm/wasmblr";
+import { WasmWorkerPool } from "./wasm/worker-pool";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -111,6 +112,40 @@ export interface NativeScanGeneralParams {
 
 const moduleCache = new Map<string, WebAssembly.Module>();
 
+// ---------------------------------------------------------------------------
+// Shared memory support (M5.1)
+// ---------------------------------------------------------------------------
+
+/** Maximum pages for shared WebAssembly.Memory (256 MiB = 4096 × 64 KiB). */
+const MAX_SHARED_PAGES = 4096;
+
+/**
+ * Minimum number of elements in a kernel before parallel dispatch is used.
+ * Below this threshold, the overhead of worker coordination exceeds the
+ * benefit of parallelism.
+ */
+const PARALLEL_THRESHOLD = 4096;
+
+/**
+ * Module-level flag: whether the WASM backend uses shared memory.
+ * Set by WasmBackend constructor. Used by codegen paths to declare
+ * memory imports as shared (required by the WebAssembly threads proposal
+ * when the provided memory is a SharedArrayBuffer).
+ */
+let _useSharedMemory = false;
+
+/**
+ * Configure the standard memory import for a codegen unit.
+ * If shared memory is active, declares the import as shared with max pages
+ * so that the module can be instantiated with a SharedArrayBuffer-backed memory.
+ */
+function configureMemoryImport(cg: CodeGenerator): void {
+  const mem = cg.memory.import("env", "memory");
+  if (_useSharedMemory) {
+    mem.shared(true).pages(0, MAX_SHARED_PAGES);
+  }
+}
+
 /** Backend that compiles into WebAssembly bytecode for immediate execution. */
 export class WasmBackend implements Backend {
   readonly type: Device = "wasm";
@@ -130,13 +165,38 @@ export class WasmBackend implements Backend {
   #buffers: Map<Slot, WasmBuffer>;
   /** Cache WebAssembly instances keyed by module for reuse in dispatch. */
   #instanceCache: WeakMap<WebAssembly.Module, WebAssembly.Instance>;
+  /** Worker pool for parallel kernel dispatch (only when shared memory). */
+  #workerPool: WasmWorkerPool | null = null;
 
   constructor() {
-    this.#memory = new WebAssembly.Memory({ initial: 0 });
+    const shared = this.capabilities.sharedMemory;
+    _useSharedMemory = shared;
+    this.#memory = shared
+      ? new WebAssembly.Memory({
+          initial: 0,
+          maximum: MAX_SHARED_PAGES,
+          shared: true,
+        })
+      : new WebAssembly.Memory({ initial: 0 });
     this.#allocator = new WasmAllocator(this.#memory);
     this.#nextSlot = 1;
     this.#buffers = new Map();
     this.#instanceCache = new WeakMap();
+
+    // Create worker pool when SharedArrayBuffer is available and Workers exist
+    if (shared && typeof Worker !== "undefined") {
+      try {
+        this.#workerPool = new WasmWorkerPool(this.#memory);
+      } catch {
+        // Worker creation can fail (e.g., CSP restrictions); fall back silently
+        this.#workerPool = null;
+      }
+    }
+  }
+
+  /** The worker pool, if available. Exposed for testing. */
+  get workerPool(): WasmWorkerPool | null {
+    return this.#workerPool;
   }
 
   slotCount(): number {
@@ -215,7 +275,12 @@ export class WasmBackend implements Backend {
   }
 
   async prepareKernel(kernel: Kernel): Promise<Executable<WasmProgram>> {
-    return this.prepareKernelSync(kernel);
+    const exe = this.prepareKernelSync(kernel);
+    // Pre-register module on workers for parallel dispatch
+    if (this.#workerPool && exe.data?.module) {
+      await this.#workerPool.registerModule(exe.data.module);
+    }
+    return exe;
   }
 
   prepareKernelSync(kernel: Kernel): Executable<WasmProgram> {
@@ -290,15 +355,25 @@ export class WasmBackend implements Backend {
       });
       this.#instanceCache.set(exe.data.module, instance);
     }
-    const func = instance.exports.kernel as (...args: number[]) => void;
     const ptrs = [...inputs, ...outputs].map(
       (slot) => this.#buffers.get(slot)!.ptr,
     );
-    // For symbolic kernels, append resolved total element count(s).
-    if (dynamicParams) {
-      func(...ptrs, ...dynamicParams);
+    // Kernel signature: (start, end, ...ptrs).
+    // For symbolic kernels, dynamicParams[0] is the resolved total size.
+    const totalSize = dynamicParams?.[0] ?? (exe.source.size as number);
+
+    // Parallel dispatch: use workers when pool is available, module is registered,
+    // and array is large enough for the overhead to pay off.
+    if (
+      this.#workerPool &&
+      totalSize >= PARALLEL_THRESHOLD &&
+      this.#workerPool.isModuleReady(exe.data.module)
+    ) {
+      const moduleId = this.#workerPool.getModuleId(exe.data.module)!;
+      this.#workerPool.dispatchSync(moduleId, instance, totalSize, ptrs);
     } else {
-      func(...ptrs);
+      const func = instance.exports.kernel as (...args: number[]) => void;
+      func(0, totalSize, ...ptrs);
     }
   }
 
@@ -764,6 +839,14 @@ function importWasmHelperFuncs(
   return funcs;
 }
 
+/**
+ * Number of range parameters prepended to the kernel function signature.
+ * All kernels use (start: i32, end: i32, ...ptrs) -> () so that parallel
+ * dispatch (M5.3) can pass a sub-range to each worker. Single-threaded
+ * dispatch calls kernel(0, totalSize, ...ptrs).
+ */
+const RANGE_PARAMS = 2;
+
 function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   if (kernel.isMultiOutput) {
     return codegenWasmMulti(kernel);
@@ -776,7 +859,7 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   }
 
   const cg = new CodeGenerator();
-  cg.memory.import("env", "memory");
+  configureMemoryImport(cg);
 
   const distinctOps = mapSetUnion(
     tune.exp.distinctOps(),
@@ -784,10 +867,10 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   );
   const funcs = importWasmHelperFuncs(cg, distinctOps);
 
-  // For symbolic kernels, add an extra i32 param for the resolved total element count.
-  // Signature: (ptr0, ..., ptrOut, total_size?) -> ()
-  const nParams = kernel.nargs + 1 + (kernel.isSymbolic ? 1 : 0);
-  const sizeParamIdx = kernel.isSymbolic ? kernel.nargs + 1 : -1;
+  // Signature: (start, end, ptr0, ..., ptrOut) -> ()
+  // start and end are the element range for parallel dispatch (M5.3).
+  // Single-threaded: kernel(0, totalSize, ...ptrs)
+  const nParams = RANGE_PARAMS + kernel.nargs + 1;
 
   const kernelFunc = cg.function(rep(nParams, cg.i32), [], () => {
     const gidx = cg.local.declare(cg.i32);
@@ -797,9 +880,10 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
       funcs,
       kernel,
       gidx,
-      sizeLocal: kernel.isSymbolic ? sizeParamIdx : undefined,
+      startLocal: 0,
+      endLocal: 1,
       emitOutputAddr: () => {
-        cg.local.get(kernel.nargs); // output buffer is last argument
+        cg.local.get(RANGE_PARAMS + kernel.nargs); // output buffer param (shifted)
         cg.local.get(gidx);
         cg.i32.const(byteWidth(kernel.outputs[0].dtype));
         cg.i32.mul();
@@ -809,7 +893,7 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
         const vars: Record<string, number> = { gidx };
         if (ridx !== undefined) vars.ridx = ridx;
         if (acc !== undefined) vars.acc = acc;
-        translateExp(cg, funcs, exp, vars);
+        translateExp(cg, funcs, exp, vars, RANGE_PARAMS);
       },
     });
   });
@@ -837,7 +921,7 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
   });
 
   const cg = new CodeGenerator();
-  cg.memory.import("env", "memory");
+  configureMemoryImport(cg);
 
   // Collect all distinct ops across all output expressions
   let allOps: Map<AluOp, Set<DType>> = new Map();
@@ -848,25 +932,21 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
   }
   const funcs = importWasmHelperFuncs(cg, allOps);
 
-  // Function params: nargs inputs + numOutputs outputs + optional total_size, all i32
-  const nParams = kernel.nargs + numOutputs + (kernel.isSymbolic ? 1 : 0);
-  const sizeParamIdx = kernel.isSymbolic ? kernel.nargs + numOutputs : -1;
+  // Function params: start, end, nargs inputs + numOutputs outputs, all i32
+  // Signature: (start, end, ptr0, ..., ptrN-1, out0, ..., outM-1) -> ()
+  const nParams = RANGE_PARAMS + kernel.nargs + numOutputs;
 
   const kernelFunc = cg.function(rep(nParams, cg.i32), [], () => {
     const gidx = cg.local.declare(cg.i32);
 
-    // gidx loop
-    cg.i32.const(0);
+    // gidx loop: start from param 0 (start), loop until param 1 (end)
+    cg.local.get(0); // start
     cg.local.set(gidx);
     cg.loop(cg.void);
     {
       cg.block(cg.void);
       cg.local.get(gidx);
-      if (kernel.isSymbolic) {
-        cg.local.get(sizeParamIdx);
-      } else {
-        cg.i32.const(kernel.size as number);
-      }
+      cg.local.get(1); // end
       cg.i32.ge_u();
       cg.br_if(0);
 
@@ -874,7 +954,7 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
       for (let oi = 0; oi < numOutputs; oi++) {
         const tune = tunes[oi];
         const out = kernel.outputs[oi];
-        const outParamIdx = kernel.nargs + oi;
+        const outParamIdx = RANGE_PARAMS + kernel.nargs + oi;
         const storeAlign = Math.log2(byteWidth(out.dtype));
 
         // Push output address: outParam + gidx * elemSize
@@ -912,7 +992,7 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
             cg.br_if(0);
 
             const vars: Record<string, number> = { gidx, ridx };
-            translateExp(cg, funcs, tune.exp, vars);
+            translateExp(cg, funcs, tune.exp, vars, RANGE_PARAMS);
             codegenReductionAccumulate(cg, re, acc, kahanComp);
 
             cg.local.get(ridx);
@@ -927,11 +1007,11 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
 
           // Emit epilogue
           const epilogueVars: Record<string, number> = { gidx, acc };
-          translateExp(cg, funcs, tune.epilogue!, epilogueVars);
+          translateExp(cg, funcs, tune.epilogue!, epilogueVars, RANGE_PARAMS);
         } else {
           // No reduction: just translate the expression
           const vars: Record<string, number> = { gidx };
-          translateExp(cg, funcs, tune.exp, vars);
+          translateExp(cg, funcs, tune.exp, vars, RANGE_PARAMS);
         }
 
         // Store result
@@ -1256,6 +1336,12 @@ function translateExp(
   funcs: Record<string, number>,
   exp: AluExp,
   ctx: Record<string, number>,
+  /**
+   * Offset to add to GlobalIndex buffer indices when looking up function
+   * params. Accounts for the (start, end) prefix in kernel signatures.
+   * Default 0 (scan context — no prefix).
+   */
+  paramOffset = 0,
 ) {
   translateExpCore(cg, funcs, exp, {
     getVariable: (name) => ctx[name],
@@ -1275,7 +1361,7 @@ function translateExp(
 
       cg.i32.const(byteWidth(dtype));
       cg.i32.mul();
-      cg.local.get(gid); // base offset of array
+      cg.local.get(gid + paramOffset); // base offset of array (shifted by RANGE_PARAMS for kernels)
       cg.i32.add();
       dty(cg, AluOp.GlobalIndex, dtype).load(Math.log2(byteWidth(dtype)));
     },
@@ -1389,28 +1475,46 @@ function emitKernelBody(opts: {
   /** Custom store logic. If omitted, a simple typed store is emitted. */
   emitStore?: () => void;
   /**
-   * Optional WASM local holding the resolved total element count.
-   * When provided, uses `local.get(sizeLocal)` instead of
-   * `i32.const(kernel.size)` for the gidx loop bound — enabling
-   * parameterized kernels whose size is determined at dispatch time.
+   * Optional WASM local holding the loop start index.
+   * When provided, gidx is initialised from `local.get(startLocal)` instead
+   * of `i32.const(0)` — enabling parallel dispatch (M5.3).
    */
-  sizeLocal?: number;
+  startLocal?: number;
+  /**
+   * Optional WASM local holding the loop end (exclusive) element count.
+   * When provided, uses `local.get(endLocal)` instead of
+   * `i32.const(kernel.size)` for the gidx loop bound — enabling
+   * parameterized / parallel kernels whose range is determined at dispatch.
+   */
+  endLocal?: number;
 }): void {
-  const { cg, kernel, gidx, emitOutputAddr, emitExp, emitStore, sizeLocal } =
-    opts;
+  const {
+    cg,
+    kernel,
+    gidx,
+    emitOutputAddr,
+    emitExp,
+    emitStore,
+    startLocal,
+    endLocal,
+  } = opts;
   const tune = tuneNullopt(kernel);
   const re = kernel.outputs[0].reduction;
   const storeAlign = Math.log2(byteWidth(kernel.outputs[0].dtype));
 
-  cg.i32.const(0);
+  if (startLocal !== undefined) {
+    cg.local.get(startLocal);
+  } else {
+    cg.i32.const(0);
+  }
   cg.local.set(gidx);
   cg.loop(cg.void);
   {
-    // if (gidx >= size) break;
+    // if (gidx >= end) break;
     cg.block(cg.void);
     cg.local.get(gidx);
-    if (sizeLocal !== undefined) {
-      cg.local.get(sizeLocal);
+    if (endLocal !== undefined) {
+      cg.local.get(endLocal);
     } else {
       cg.i32.const(kernel.size as number);
     }
@@ -1736,7 +1840,7 @@ function codegenNativeScanGeneral(
 
   // ---- Code generation ----
   const cg = new CodeGenerator();
-  cg.memory.import("env", "memory");
+  configureMemoryImport(cg);
 
   // Import routine functions from the "routines" module
   const routineFuncIndices: number[] = [];
