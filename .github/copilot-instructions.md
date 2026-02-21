@@ -1037,7 +1037,10 @@ The JIT system lives in `src/frontend/jit.ts` and `src/frontend/jaxpr.ts`.
      P2 dep-count check.
 4. **Kernel fusion** – Consecutive elementwise ops merge into a single `Kernel`
 5. **Compilation** – `jitCompile(backend, jaxpr)` emits a `JitProgram` (list of `JitStep`s)
-6. **Execution** – `JitProgram.execute(slots)` runs steps, managing memory lifetime
+6. **Buffer lifecycle** – `effectDrivenAllocate()` runs a single-pass liveness analysis with a
+   free-pool, replacing adjacent `free→malloc` pairs of the same size with zero-cost `recycle`
+   steps. Supersedes the earlier `insertFreeSteps()` + `recycleBuffers()` two-pass approach.
+7. **Execution** – `JitProgram.execute(slots)` runs steps, managing memory lifetime
 
 **Key types:**
 
@@ -1056,7 +1059,9 @@ The JIT system lives in `src/frontend/jit.ts` and `src/frontend/jaxpr.ts`.
 | `malloc`  | Allocate a buffer                                                       |
 | `incref`  | Increment refcount on a slot                                            |
 | `free`    | Decrement refcount on a slot                                            |
+| `recycle` | Reuse a freed buffer for a new allocation (zero backend cost)           |
 | `scan`    | Scan loop (fallback, compiled-loop, or preencoded-routine via ScanPlan) |
+| `dus`     | Zero-copy DynamicUpdateSlice (copies src into dst at byte offset)       |
 
 **Kernel class:**
 
@@ -1073,8 +1078,58 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
 2. Add tracing rule in `implRules` / `jvpRules` / `transposeRules`
 3. If fusable elementwise, add ALU lowering in `jit.ts`
 4. If needs dedicated kernel, register in `routinePrimitives` and implement in `src/backend/*`
-5. If copy-like (e.g., `DynamicUpdateSlice`), it is handled specially in `jitCompile()` (throws; DUS
-   only appears inside scan bodies) and is classified as a black node in `splitGraphDataflow()`
+5. If copy-like (e.g., `DynamicUpdateSlice`), it emits a dedicated `dus` JitStep in `jitCompile()`
+   and is classified as a non-kernel black node in `splitGraphDataflow()`. DUS carries a `Mutate`
+   effect on its first input (dst), enabling `effectDrivenAllocate` to recycle the dst buffer
+   directly into the output slot (zero-copy when sizes match).
+
+## Effect system (memory effects)
+
+The Jaxpr IR carries per-equation **memory effect annotations** that model how each primitive
+interacts with buffer ownership. This enables the JIT compiler's `effectDrivenAllocate` pass to make
+sound buffer recycling decisions — including zero-copy DUS — without heuristic liveness analysis.
+
+**`MemoryEffect` enum (`src/frontend/jaxpr.ts`):**
+
+| Effect    | Meaning                                                                |
+| --------- | ---------------------------------------------------------------------- |
+| `Alloc`   | Creates a new buffer (output of a primitive)                           |
+| `Borrow`  | Reads a buffer without taking ownership (default for all inputs)       |
+| `Consume` | Takes ownership; buffer cannot be used again                           |
+| `Mutate`  | In-place modification (requires exclusive ownership of the input slot) |
+
+**`primitiveInputEffects` table:** Per-primitive overrides for input effects. Returns an array of
+effects for the primitive's inputs, or `undefined` for the default (all `Borrow`). Currently only
+`DynamicUpdateSlice` has an override — its first input (dst) is `Mutate`.
+
+**`verifyJaxprEffects()` — static borrow checker:** Walks the Jaxpr and enforces:
+
+1. **No use after consume** — once a Var is `Consume`d, any subsequent `Borrow`/`Mutate` is an
+   error.
+2. **Mutate exclusivity** — a Var cannot appear as both `Mutate` and `Borrow` in the same equation's
+   inputs.
+3. **Dead allocation detection** — an `Alloc`'d Var that is never referenced, consumed, or returned
+   is flagged as dead code.
+
+Enable verification with `_setVerifyEffects(true)` — runs automatically at the end of every
+`makeJaxpr()` call. Gated behind a flag for performance (disabled in production, enabled in tests
+via `test/effect-checker.test.ts`).
+
+**How effects drive buffer recycling:**
+
+The `effectDrivenAllocate()` method in `JitProgramBuilder` uses effect annotations to identify
+recycling opportunities. For DUS specifically, the `Mutate` effect on the dst input tells the
+allocator that dst's buffer is exclusively owned and can be reused as the output slot — enabling
+zero-copy `copyBufferToBuffer` within the same allocation. Without the effect annotation, the
+allocator would conservatively allocate a new buffer for the output.
+
+**Key files:**
+
+| File                          | Purpose                                                |
+| ----------------------------- | ------------------------------------------------------ |
+| `src/frontend/jaxpr.ts`       | `MemoryEffect` enum, `primitiveInputEffects`, verifier |
+| `src/frontend/jit.ts`         | `effectDrivenAllocate()`, DUS JitStep emission         |
+| `test/effect-checker.test.ts` | 23 tests: effect annotations, verifier, DUS zero-copy  |
 
 ## Common pitfalls
 
@@ -3440,6 +3495,7 @@ statically at edit time, complementing the runtime `checkLeaks` diagnostic.
 | ~~High~~   | ~~unreachable Const PETracer leak~~       | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                           |
 | ~~High~~   | ~~user-disposed const over-disposal~~     | ✅ Fixed via `refCount <= 1` protection in `linearizeFlat`/`vjpFlat`                                                                                                                            |
 | ~~High~~   | ~~AOT linearization artifacts~~           | ✅ Implemented: `PrimalArtifact`, `PullbackArtifact`, `ScanPullbackArtifact` in `artifacts.ts` / `scan-backward.ts`                                                                             |
+| ~~High~~   | ~~Effect-typed IR + DUS zero-copy~~       | ✅ `MemoryEffect` enum, `verifyJaxprEffects` borrow checker, `effectDrivenAllocate` (replaced `insertFreeSteps` + `recycleBuffers`), DUS JitStep with zero-copy optimization                    |
 | Medium     | Anonymous constant leak fix               | Partially addressed by `markAnonymous` flag in `transposeJaxpr`/`buildBackwardJaxpr`; full fix would distinguish user-held vs anonymous consts in scan tracing                                  |
 | ~~Medium~~ | ~~ESLint plugin for non-consuming model~~ | ✅ Implemented as `@jax-js/eslint-plugin` v0.1.0 — `require-using`, `no-use-after-dispose`, `no-dispose-then-reassign-param`, `no-unnecessary-ref`, `no-array-chain`                            |
 | Low        | Chain→temporaries RFC (design-only)       | Keep implementation deferred. Scope RFC to assignment/return chains only, preserve evaluation order + exceptions, and require measured eager-memory wins / lint-pressure before implementation. |
