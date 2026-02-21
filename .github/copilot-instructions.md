@@ -1921,8 +1921,9 @@ When a kernel step is eligible for direct-write:
 For multi-output kernels, each output is analyzed independently — some may use direct-write while
 others fall back to internal buffers.
 
-> Note: Multi-output kernel fusion (`Kernel.multi()`) is planned but not yet implemented. Currently
-> each output is a separate single-output kernel step.
+> Note: Multi-output kernel fusion is planned but not yet implemented. See
+> `ULTIMATE-ARCHITECTURE-PLAN.md` M3.1 for the unified multi-output `Kernel` design. Currently each
+> output is a separate single-output kernel step.
 
 Eligibility conditions (all must be met):
 
@@ -2460,12 +2461,12 @@ contributors should be aware of:
 
 ### Future work
 
-| Priority | Feature                        | Notes                                                                                                                            |
-| -------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| High     | Multi-output kernel            | `KernelOutput`, `Kernel.multi()`, `codegenWasmMultiPath` — bodies producing multiple outputs can't fuse into one kernel dispatch |
-| Medium   | Missing test categories        | ~30 additional tests: WASM routine scan, path-documentation, advanced vmap/grad compositions                                     |
-| Medium   | Mixed-dtype WebGPU scan shader | Per-binding dtype in `nativeScanMultiShaderSource`                                                                               |
-| Medium   | WebGL copy for scan stacking   | Enable direct-write stacked Ys on WebGL fallback                                                                                 |
+| Priority | Feature                        | Notes                                                                                                                                                                                              |
+| -------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| High     | Multi-output kernel            | Unify `Kernel` to multi-output + `splitGraphDataflow` fusion post-pass. See `ULTIMATE-ARCHITECTURE-PLAN.md` M3.1 for merged type design, `singleKernel()` factory, codegen sketches, and test plan |
+| Medium   | Missing test categories        | ~30 additional tests: WASM routine scan, path-documentation, advanced vmap/grad compositions                                                                                                       |
+| Medium   | Mixed-dtype WebGPU scan shader | Per-binding dtype in `nativeScanMultiShaderSource`                                                                                                                                                 |
+| Medium   | WebGL copy for scan stacking   | Enable direct-write stacked Ys on WebGL fallback                                                                                                                                                   |
 
 ### WASM feature opportunities (assessed Feb 2026)
 
@@ -3648,13 +3649,20 @@ A reverse scan is implemented by:
 This is equivalent to JAX's approach and produces the inclusive right-to-left prefix:
 `result[i] = fn(elems[i], fn(elems[i+1], ... fn(elems[N-2], elems[N-1])...))`
 
-### Autodiff architecture (trace-through, no dedicated primitive)
+### Autodiff architecture (trace-through today, Primitive planned)
 
 Unlike `lax.scan` (which registers `Primitive.Scan` with dedicated JVP, transpose, PE, and vmap
-rules), `associativeScan` has **no dedicated primitive**. This matches Python JAX's design — JAX's
-`associative_scan` is also not a primitive.
+rules), `associativeScan` currently has **no dedicated primitive** — it unrolls Kogge-Stone rounds
+directly into the traced Jaxpr. This matches Python JAX's current design.
 
-**How it works:** When `grad(f)` or `valueAndGrad(f)` traces through `associativeScan`, the
+**Future direction:** `associativeScan` should eventually become a `Primitive.AssociativeScan` with
+a body sub-jaxpr (see `ULTIMATE-ARCHITECTURE-PLAN.md` M7.1). This enables: (1) clean IR — one
+equation instead of O(log N), (2) backend specialization — WASM compiled Kogge-Stone (M7.2) and
+multithreaded inner loops (M7.3), (3) consistency with `Primitive.Scan`. AD compatibility is
+preserved: the JVP rule unrolls the Kogge-Stone ladder with doubled (primal+tangent) inputs,
+producing the same O(log N)-depth graph that AD handles naturally.
+
+**How it works today:** When `grad(f)` or `valueAndGrad(f)` traces through `associativeScan`, the
 `insideAbstractTrace()` check returns `true`, so `associativeScanCore()` executes directly. This
 unrolls `ceil(log₂ N)` Kogge-Stone rounds into the traced Jaxpr. Each round composes standard
 operations (`core.shrink`, `core.concatenate`, user `fn`), all of which already have JVP and
@@ -3673,14 +3681,15 @@ transpose rules. The AD system automatically differentiates through the unrolled
 
 This is ~6 equations/round for add and ~20 for matmul compose — constant overhead per round.
 
-**Why no primitive is needed (unlike `lax.scan`):**
+**Why no primitive is needed for AD (unlike `lax.scan`):**
 
 - `lax.scan` is inherently sequential (O(N) depth). Without a primitive, AD would trace N
   iterations, producing an O(N) Jaxpr with O(N) intermediate residuals. The primitive + √N
   checkpointing trades 2× compute for O(√N) memory.
 - `associativeScan` already has O(log N) depth. The unrolled graph has O(body_ops × log N)
   equations. AD through this graph naturally produces O(log N) depth gradient computation. There is
-  no sequential bottleneck to optimize away — a primitive would add complexity without benefit.
+  no sequential bottleneck to optimize away — the primitive is motivated by IR cleanliness and
+  backend specialization, not AD necessity.
 
 **Measured `grad` runtime (Feb 2026):**
 
@@ -3821,13 +3830,15 @@ reference and parallel scan results are compared to 5 decimal places.
 
 ## Future Work
 
-| Priority | Feature                          | Notes                                                                                                                                                                                                                                                                                                                                     |
-| -------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Medium   | WASM compiled-loop for assocScan | Compile the full Kogge-Stone ladder into a single WASM module (analogous to scan's `codegenNativeScanGeneral`), reducing ceil(log₂ N) JS→WASM crossings to one. WebGPU: a single-dispatch compiled-loop is architecturally impossible (no cross-workgroup global barrier); ceil(log₂ N) dispatches is already the hardware-imposed floor. |
-| Low      | N=0 test                         | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                                                                      |
-| Low      | WebGL performance                | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                                                                                     |
-| Medium   | `scatter_add` primitive          | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices.                                                                                                                                             |
-| ~~Low~~  | ~~`using` declaration examples~~ | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                                                                            |
+| Priority | Feature                          | Notes                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Medium   | `Primitive.AssociativeScan`      | Register as a primitive with body sub-jaxpr, JVP/transpose/vmap/PE rules. JVP unrolls Kogge-Stone with doubled inputs (same O(log N) depth). Enables backend specialization and clean IR. See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.1.                                                                                                                                                               |
+| Medium   | WASM compiled-loop for assocScan | Compile the full Kogge-Stone ladder into a single WASM module (analogous to scan's `codegenNativeScanGeneral`), reducing ceil(log₂ N) JS→WASM crossings to one. Depends on M7.1 (primitive) so the JIT compiler can recognize the operation. WebGPU: ceil(log₂ N) dispatches is already the hardware-imposed floor (no cross-workgroup global barrier). See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.2. |
+| Low      | Multithreaded Kogge-Stone (WASM) | Parallelize inner loop across workers via `SharedArrayBuffer` + orchestrator-worker pattern (depends on M5/M6.2). Expect ~3–4× speedup with 4 workers for large N. See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.3.                                                                                                                                                                                      |
+| Low      | N=0 test                         | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                                                                                                                              |
+| Low      | WebGL performance                | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                                                                                                                                             |
+| Medium   | `scatter_add` primitive          | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices. See `ULTIMATE-ARCHITECTURE-PLAN.md` M2 for full AD math, `MemoryEffect.Mutate` registration, WebGPU CAS-loop shader, and wasmblr codegen.                                                           |
+| ~~Low~~  | ~~`using` declaration examples~~ | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                                                                                                                                    |
 
 ---
 

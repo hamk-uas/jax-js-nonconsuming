@@ -1,6 +1,6 @@
 # The Ultimate Architecture: Fusion, Atomics, and Mega-Modules
 
-**Branch:** `ultimate-architecture-plan` **Scope:** Transform `jax-js-nonconsuming` into a
+**Branch:** `ultimate-architecture` **Scope:** Transform `jax-js-nonconsuming` into a
 fully-optimized, hardware-saturating compute engine. This plan eliminates the JS ↔ Native dispatch
 boundary, minimizes VRAM bandwidth via aggressive fusion, introduces WebGPU atomics for
 `scatter_add`, and parallelizes the Wasm backend via `SharedArrayBuffer`. **Execution model:**
@@ -10,27 +10,30 @@ Single autonomous, tireless coding agent.
 
 ## Motivation
 
-With AOT Linearization (Option B) and Effect-Typed IR (Option A) complete, the library is
-memory-safe, deterministic, and structurally sound. However, it currently leaves massive hardware
-performance on the table due to four architectural bottlenecks:
+With AOT Linearization and Effect-Typed IR complete, the library is memory-safe, deterministic, and
+structurally sound. However, it currently leaves massive hardware performance on the table due to
+five architectural bottlenecks:
 
-1. **The Functional Blocker (`scatter_add`):** Gradients for `take`/`gather` with duplicate indices
-   overwrite each other. Without `scatter_add` (which requires hardware atomics), embedding layers
-   and Graph Neural Networks are mathematically impossible to train.
-2. **The VRAM Bandwidth Bottleneck (Opaque Routines):** Routines like `matmul` cannot fuse with
-   subsequent elementwise operations (e.g., `relu`). This forces the GPU to write the intermediate
-   matrix to VRAM and immediately read it back, starving the compute units.
-3. **The JS ↔ Native Boundary (Wasm Overhead):** A JIT program with 50 fused kernels crosses the JS
-   ↔ Wasm boundary 50 times. For small/medium arrays, this dispatch overhead dominates execution
-   time.
-4. **Single-Threaded Wasm:** The Wasm backend currently runs on a single CPU thread, ignoring modern
-   multi-core browser capabilities.
-5. **JIT Compilation Overhead for Variable-Length Data:** Currently, array dimensions are baked into
-   the JIT compilation. If a time series length changes, the entire program must be retraced and
-   recompiled, causing severe latency spikes in dynamic workloads like trend analysis.
-
-This plan resolves all five bottlenecks, culminating in a "Mega-Module" Wasm compiler, polymorphic
-shapes, and a highly-fused WebGPU pipeline.
+1. **The Functional Blocker (`scatter_add`):** The Gather transpose rule
+   (`src/frontend/linearize.ts` L1617–1647) only handles the permutation case (single 1-D index,
+   same axis size in/out) via `argsort`-based inverse. For duplicate indices — required by embedding
+   lookups, GNNs, and any `np.take` with repeated indices — it throws
+   `"requires a scatter_add primitive"`. Without `scatter_add`, these models are mathematically
+   impossible to train.
+2. **The VRAM Bandwidth Bottleneck (single-output Kernels):** `Kernel` (`src/alu.ts` L1450) is
+   single-output: `constructor(nargs, size, exp, reduction?)`. AD backward passes that produce
+   `dA + dB` emit two separate kernel dispatches, forcing intermediate VRAM round-trips. Matmul
+   (`Primitive.Dot`) compiles to a Mul→Reduce kernel — fusing a subsequent `relu` or `bias add`
+   _into the same shader_ is possible via the existing `tune.epilogue` mechanism but not yet
+   exploited by `splitGraphDataflow`.
+3. **The JS ↔ Native Boundary (Wasm Overhead):** A `JitProgram` with 50 steps
+   (`src/frontend/jit.ts` L155) is executed by a JS `for` loop over `JitStep`s. Each `"execute"`
+   step crosses the JS↔Wasm boundary. For small/medium arrays, dispatch overhead dominates.
+4. **Single-Threaded Wasm:** `WasmAllocator` (`src/backend/wasm/allocator.ts`) uses a standard
+   `WebAssembly.Memory`. All kernel dispatches run on the main thread.
+5. **JIT Recompilation for Variable-Length Data:** Array dimensions are baked into `Kernel.size`,
+   `ShapeTracker.views[].shape`, and `effectDrivenAllocate()`'s byte-size computations. Changing a
+   time series length forces a full retrace and recompile.
 
 ---
 
@@ -38,193 +41,1128 @@ shapes, and a highly-fused WebGPU pipeline.
 
 ### M0 — Baseline Snapshot & Feature Detection (1–2 days)
 
-Establish baselines and implement hardware feature detection for the advanced capabilities required
-by this plan.
-
 #### M0.1 — Record Baseline Test Results
 
 **What:** Run the full test suite and Deno tests, record pass/fail counts and benchmark timings.
+
+**Commands:**
+
+```bash
+pnpm build
+pnpm vitest run 2>&1 | tee tmp/m0-vitest-baseline.txt; echo $? > tmp/m0-vitest-exit.txt
+pnpm run test:deno 2>&1 | tee tmp/m0-deno-baseline.txt; echo $? > tmp/m0-deno-exit.txt
+deno bench --no-check --unstable-webgpu --allow-read --allow-env \
+  test/deno/recycle.bench.ts 2>&1 | tee tmp/m0-bench-baseline.txt
+```
+
 **Exit criteria:** Baseline files exist in `tmp/` with full logs, exit codes, and benchmark results.
 
 #### M0.2 — Hardware Feature Detection
 
-**What:** Implement robust feature detection for:
+**What:** Add two capabilities to the `Backend` interface (`src/backend.ts`):
 
-1. `crossOriginIsolated` (required for `SharedArrayBuffer` and Wasm threads).
-2. WebGPU `shader-f32-atomic-add` extension (to determine if we need a software CAS loop for `f32`
-   atomics). **Exit criteria:** `backend.ts` exposes these capabilities cleanly to the JIT compiler.
+```typescript
+// Add to Backend interface:
+readonly capabilities: BackendCapabilities;
+
+// New type:
+export interface BackendCapabilities {
+  /** WebGPU: true if shader-f32-atomic-add extension is available. */
+  atomicF32Add: boolean;
+  /** Wasm: true if crossOriginIsolated (SharedArrayBuffer available). */
+  sharedMemory: boolean;
+}
+```
+
+**Files touched:**
+
+- `src/backend.ts` — add `BackendCapabilities` type, add to `Backend` interface
+- `src/backend/webgpu.ts` — detect `shader-f32-atomic-add` at adapter request time (check
+  `adapter.features.has("shader-f32-atomic-add")`)
+- `src/backend/wasm.ts` — detect `globalThis.crossOriginIsolated`
+- `src/backend/cpu.ts` — `{ atomicF32Add: false, sharedMemory: false }`
+
+**Exit criteria:** `backend.capabilities` exposes both flags on all backends. All tests pass.
 
 ---
 
-### M1 — Technical Debt & Architecture Unification (2–3 days)
+### M1 — Scan Backward AOT Artifact (3–4 days)
 
-Before building the Mega-Module, we must resolve the remaining architectural debt from the AOT
-Linearization and Effect-Typed IR phases.
+The `vjpFlat` function (`src/frontend/linearize.ts` L2034) has two codepaths for backward pass
+construction: an AOT path via `buildBackwardJaxpr` for non-scan jaxprs, and a call-time-transpose
+fallback for scan-containing jaxprs. The call-time fallback exists because scan's transpose rule
+(`src/frontend/linearize.ts` L1710–1900) performs **concrete forward recomputation** from
+checkpoints and creates sub-jaxprs — operations that `makeJaxpr` tracing (used by
+`buildBackwardJaxpr`) cannot capture.
 
-#### M1.1 — Unify `vjpFlat` and `aotLinearize`
+This milestone creates a dedicated `ScanBackwardArtifact` that encapsulates the scan backward pass
+as an AOT artifact, eliminating the dual-codepath maintenance burden without changing the underlying
+scan transpose algorithm.
 
-**What:** Currently, `vjpFlat` uses a call-time-transpose fallback for scan-containing jaxprs,
-bypassing `aotLinearize`. Unify these into a single artifact-based ownership codepath for backward
-pass construction. **Exit criteria:** `vjpFlat` uses the same artifact-driven lifecycle as
-`aotLinearize`, eliminating the dual-codepath maintenance burden.
+#### M1.1 — `ScanBackwardArtifact` type
 
-#### M1.2 — Resolve `scan-executor.ts` P0 Hack
+**What:** Extend `src/frontend/scan-backward.ts` to make `ScanPullbackArtifact` a full AOT artifact:
 
-**What:** Remove the `HACK: P0 hack — slot swap` in the scan executor. **Exit criteria:** Scan
-execution uses a clean, deterministic memory model that can be safely compiled into the Wasm
-Mega-Module.
+```typescript
+// Extend existing ScanPullbackArtifact:
+export interface ScanBackwardArtifact extends Disposable {
+  /** The scan transpose rule, pre-bound with residuals and checkpoint config. */
+  run(cotangents: Tracer[]): Tracer[];
+}
+```
+
+The `run()` method wraps the existing scan transpose rule's concrete forward recomputation +
+per-segment backward transposition. It does NOT trace into a Jaxpr — it runs with concrete arrays at
+call time, exactly as the current fallback does. The artifact owns its residual arrays and
+checkpoint carries.
+
+**Files touched:**
+
+- `src/frontend/scan-backward.ts` — extend `ScanPullbackArtifact` with `run()` method
+- `src/frontend/linearize.ts` — factor the scan-specific backward closure in `vjpFlat` into
+  `ScanPullbackArtifact.run()`
+
+**Exit criteria:** `ScanPullbackArtifact` encapsulates the backward pass. `vjpFlat` delegates to it.
+
+#### M1.2 — Unify `vjpFlat` transposition strategy
+
+**What:** Replace `jaxprNeedsCallTimeTranspose` with a unified strategy:
+
+```typescript
+function vjpFlat(f, primalsIn, auxStore?) {
+  // Phase 1–2: unchanged (linearizeFlatUtil + PE cleanup)
+  // Phase 3: always AOT-transpose for non-scan eqns
+  const backwardJaxpr = buildBackwardJaxpr(forwardJaxpr);
+  // Phase 4: check for scan artifacts in the forward jaxpr
+  const scanArtifacts = collectScanArtifacts(forwardJaxpr);
+  // fVjp calls backwardJaxpr.eval() + scanArtifact.run() for scan portions
+}
+```
+
+The key insight: `buildBackwardJaxpr` already handles everything _except_ `Primitive.Scan`. For scan
+equations, it emits a placeholder that the `ScanBackwardArtifact.run()` fills in at call time. The
+scan backward pass remains **concrete call-time execution** — its runtime loops, checkpoint logic,
+and sub-jaxpr construction cannot be captured into a Jaxpr by `makeJaxpr` tracing. Only the non-scan
+portion of the backward pass gets AOT-compiled. In the current codebase, `grad()` calls
+`fVjp(ones_like)` with concrete cotangents (not tracers), so the scan backward pass already runs
+with concrete arrays — this milestone formalizes that pattern as the artifact API.
+
+**Files touched:**
+
+- `src/frontend/linearize.ts` — remove `jaxprNeedsCallTimeTranspose`, unify `vjpFlat`
+- `src/frontend/scan-backward.ts` — `collectScanArtifacts` helper
+
+**Test commands:**
+
+```bash
+pnpm build
+pnpm vitest run test/lax-scan.test.ts        # scan grad tests
+pnpm vitest run test/transform-compositions.test.ts
+pnpm vitest run test/leak-diagnostic.test.ts
+pnpm vitest run                               # full regression
+```
+
+**Exit criteria:** `vjpFlat` has a single codepath. `jaxprNeedsCallTimeTranspose` removed. All scan
+grad/transform composition tests pass.
+
+**Migration verification:**
+
+```bash
+grep -rn 'jaxprNeedsCallTimeTranspose' src/   # must return zero matches
+pnpm check                                     # no type errors from stale references
+```
 
 ---
 
-### M2 — The Missing Primitive: `scatter_add` & Atomics (4–6 days)
+### M2 — The Missing Primitive: `scatter_add` (4–6 days)
 
-Leverage the `Mutate` effect to implement safe, in-place atomic additions, unlocking embedding
-gradients.
+Implement the `scatter_add` primitive using the existing `MemoryEffect.Mutate` infrastructure
+(proven by DUS).
 
-#### M2.1 — `Primitive.ScatterAdd` & AD Rules
+#### M2.1 — `Primitive.ScatterAdd` IR & AD Rules
 
-**What:** Define `Primitive.ScatterAdd`.
+**What:** Add `scatter_add(target, indices, updates, axis)` to the IR.
 
-- **Effects:** Target buffer is `Mutate`, indices and updates are `Borrow`.
-- **AD:** Implement the JVP and Transpose rules for `take` (which will now emit `scatter_add` in the
-  backward pass) and `scatter_add` itself. **Exit criteria:** Jaxpr tracing for `scatter_add` passes
-  the static Borrow Checker.
+**Primitive definition** (`src/frontend/core.ts`):
 
-#### M2.2 — WebGPU Atomics (The CAS Loop)
+```typescript
+// Add to Primitive enum:
+ScatterAdd = "scatter_add",
 
-**What:** Implement `scatter_add` in WGSL.
+// Add to PrimitiveParams:
+[Primitive.ScatterAdd]: { axis: number };
 
-- If `shader-f32-atomic-add` is available, use it.
-- Otherwise, implement a Compare-And-Swap (CAS) loop using `atomicCompareExchangeWeak` and
-  `bitcast<u32>` to safely accumulate `f32` values across thousands of threads. **Exit criteria:**
-  `scatter_add` produces correct results on WebGPU, even with highly duplicated indices.
+// Add binding function:
+export function scatterAdd(
+  target: Tracer, indices: Tracer, updates: Tracer,
+  axis: number,
+): Tracer {
+  return bind1(Primitive.ScatterAdd, [target, indices, updates], { axis });
+}
+```
+
+**Memory effects** (`src/frontend/jaxpr.ts`):
+
+```typescript
+// Add to primitiveInputEffects:
+[Primitive.ScatterAdd]: (n: number) => {
+  // target is Mutate (in-place accumulation), indices + updates are Borrow
+  const effects = globalThis.Array.from({ length: n }, () => MemoryEffect.Borrow);
+  effects[0] = MemoryEffect.Mutate;
+  return effects;
+},
+```
+
+**AD rules** — the mathematical relationship between `gather` and `scatter_add`:
+
+| Operation                | Forward: $y = f(x)$                   | JVP: $\dot{y} = f'(x) \cdot \dot{x}$                    | Transpose: $\bar{x} = f'^T \cdot \bar{y}$                                            |
+| ------------------------ | ------------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `gather(x, idx)`         | $y_j = x_{idx_j}$                     | $\dot{y}_j = \dot{x}_{idx_j}$                           | $\bar{x}_i = \sum_{j: idx_j = i} \bar{y}_j$ ← **this is `scatter_add`**              |
+| `scatter_add(t, idx, u)` | $y_i = t_i + \sum_{j: idx_j = i} u_j$ | $\dot{y}_i = \dot{t}_i + \sum_{j: idx_j = i} \dot{u}_j$ | $\bar{t} = \bar{y}$ (identity), $\bar{u}_j = \bar{y}_{idx_j}$ ← **this is `gather`** |
+
+**JVP rule** (`src/frontend/jvp.ts`):
+
+```typescript
+[Primitive.ScatterAdd]([target, indices, updates], [dTarget, _dIndices, dUpdates], { axis }) {
+  const primal = scatterAdd(target, indices, updates, axis);
+  const tangent = scatterAdd(dTarget, indices, dUpdates, axis);
+  return [[primal], [tangent]];
+},
+```
+
+**Transpose rules** (`src/frontend/linearize.ts`):
+
+```typescript
+// Replace the Gather transpose rule (L1617–1647):
+[Primitive.Gather]([ct], [x, ...indices], { axis, outDim }) {
+  if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Gather);
+  if (indices.some((i) => i instanceof UndefPrimal))
+    throw new NonlinearError(Primitive.Gather);
+  // General case: scatter_add the cotangent back to source positions.
+  // target = zeros_like(x), scatter_add(target, indices, ct, axis)
+  const idx = indices[0] as Tracer;
+  const zeros = np.zeros(x.aval.shape, { dtype: ct.dtype });
+  const result = scatterAdd(zeros, idx, ct, axis[0]);
+  zeros.dispose();
+  return [result, null];
+},
+
+// ScatterAdd transpose:
+[Primitive.ScatterAdd]([ct], [target, indices, updates], { axis }) {
+  // d/d(target) = ct (identity — scatter_add is additive in target)
+  const ctTarget = !(target instanceof UndefPrimal) ? null : ct;
+  // d/d(updates) = gather(ct, indices) — reverse the scatter
+  const ctUpdates = !(updates instanceof UndefPrimal)
+    ? null
+    : gather(ct, [indices], [axis], axis);
+  return [
+    ctTarget ?? ct,
+    null,
+    ctUpdates ?? np.zeros(updates.aval.shape, { dtype: ct.dtype }),
+  ];
+},
+```
+
+**Abstract eval** (`src/frontend/jaxpr.ts`): Output shape = target shape, output dtype = target
+dtype.
+
+**Files touched:**
+
+- `src/frontend/core.ts` — `Primitive.ScatterAdd`, `PrimitiveParams`, `scatterAdd()`
+- `src/frontend/jaxpr.ts` — abstract eval rule, `primitiveInputEffects` entry
+- `src/frontend/jvp.ts` — JVP rule
+- `src/frontend/linearize.ts` — Gather transpose (replace), ScatterAdd transpose (new)
+- `src/frontend/array.ts` — eager impl rule
+- `src/frontend/vmap.ts` — batching rule
+- `src/index.ts` — export `scatterAdd` if public
+
+**Test file:** `test/scatter-add.test.ts`
+
+| Test name                            | What it verifies                                        |
+| ------------------------------------ | ------------------------------------------------------- |
+| `scatter_add basic 1-D`              | Correct accumulation with unique indices                |
+| `scatter_add with duplicate indices` | Values at same index are summed                         |
+| `scatter_add 2-D axis=0`             | Batched scatter along first axis                        |
+| `scatter_add 2-D axis=1`             | Scatter along second axis                               |
+| `scatter_add preserves target`       | Non-consuming: target is not modified                   |
+| `grad(take) with duplicates`         | End-to-end: `grad(sum(take(x, [0,1,0])))` gives `[2,1]` |
+| `grad(scatter_add) wrt updates`      | Cotangent gathered back correctly                       |
+| `grad(scatter_add) wrt target`       | Identity cotangent                                      |
+| `jit(scatter_add)`                   | JIT compilation with Mutate effect                      |
+| `scatter_add passes effect checker`  | `verifyJaxprEffects` validates Mutate on target         |
+
+**Exit criteria:** All tests pass. `grad(np.take(x, [0,1,0]))` returns correct gradients with
+duplicate indices. Effect checker validates ScatterAdd's Mutate annotation.
+
+**Migration verification:** The old Gather transpose rule (argsort-based permutation path,
+L1617–1647) is **deleted entirely** — `scatter_add` handles both unique and duplicate indices. The
+old code is not preserved as a fallback.
+
+```bash
+grep -rn 'requires a scatter_add primitive' src/   # must return zero matches
+grep -rn 'argsort.*inverse.*permutation' src/frontend/linearize.ts  # must return zero matches
+```
+
+#### M2.2 — WebGPU Atomics (CAS Loop)
+
+**What:** Implement `scatter_add` dispatch in the WebGPU backend.
+
+**The problem:** Multiple GPU threads may write to the same output index simultaneously. WGSL
+provides `atomicAdd` for `i32`/`u32`, but not for `f32`. The solution is a Compare-And-Swap (CAS)
+loop on the bitcast representation.
+
+**JIT compilation** (`src/frontend/jit.ts`): `ScatterAdd` is a **non-kernel black node** (like Scan,
+DUS) — it gets its own `JitStep` type:
+
+```typescript
+// Add to JitStep union:
+| { type: "scatter_add"; target: JitId; indices: JitId; updates: JitId;
+    output: JitId; axis: number; exe: Executable }
+```
+
+`splitGraphDataflow` classifies `Primitive.ScatterAdd` as a non-kernel black (exempt from P2
+maxArgs, has its own step type).
+
+**WGSL shader** (`src/backend/webgpu.ts`):
+
+```wgsl
+// For i32/u32 (native atomicAdd):
+@group(0) @binding(0) var<storage, read_write> target : array<atomic<i32>>;
+@group(0) @binding(1) var<storage, read> indices : array<i32>;
+@group(0) @binding(2) var<storage, read> updates : array<i32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&updates)) { return; }
+    let idx = indices[i];
+    atomicAdd(&target[idx], updates[i]);
+}
+
+// For f32 (CAS loop — always safe, even without shader-f32-atomic-add):
+@group(0) @binding(0) var<storage, read_write> target : array<atomic<u32>>;
+@group(0) @binding(1) var<storage, read> indices : array<i32>;
+@group(0) @binding(2) var<storage, read> updates : array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&updates)) { return; }
+    let idx = indices[i];
+    let val = updates[i];
+    // CAS loop: atomically add val to target[idx]
+    var old_bits = atomicLoad(&target[idx]);
+    loop {
+        let old_val = bitcast<f32>(old_bits);
+        let new_val = old_val + val;
+        let new_bits = bitcast<u32>(new_val);
+        let result = atomicCompareExchangeWeak(&target[idx], old_bits, new_bits);
+        if (result.exchanged) { break; }
+        old_bits = result.old_value;
+    }
+}
+```
+
+When `backend.capabilities.atomicF32Add` is true, use the native
+`atomicAdd(&target[idx], bitcast<u32>(val))` path instead of CAS.
+
+**Files touched:**
+
+- `src/frontend/jit.ts` — `scatter_add` JitStep type, blackNode classification, execution case
+- `src/backend/webgpu.ts` — `prepareScatterAdd()` shader generation, `dispatchScatterAdd()`
+- `src/backend/webgpu/codegen.ts` — grid calculation for scatter dispatches
+
+**Exit criteria:** `scatter_add` produces correct results on WebGPU with highly duplicated indices
+(e.g., 10000 updates to 100 positions).
 
 #### M2.3 — Wasm `scatter_add`
 
-**What:** Implement the sequential Wasm version of `scatter_add` using `wasmblr`. **Exit criteria:**
-Wasm backend passes all `scatter_add` tests.
+**What:** Implement sequential `scatter_add` in the Wasm backend. Since Wasm is single-threaded, no
+atomics are needed — a simple loop suffices.
+
+**wasmblr implementation** (`src/backend/wasm/routines/scatter-add.ts`):
+
+```typescript
+export function buildScatterAddModule(
+  dtype: "f32" | "f64" | "i32",
+  updateSize: number,
+): Uint8Array<ArrayBuffer> {
+  const cg = new CodeGenerator();
+  const hl = new WasmHl(cg);
+  cg.memory.import("env", "memory");
+
+  // scatter_add(targetPtr, indicesPtr, updatesPtr)
+  const func = cg.function([cg.i32, cg.i32, cg.i32], [], () => {
+    const i = cg.local.declare(cg.i32);
+    hl.forLoop(i, 0, updateSize, () => {
+      // idx = indices[i]
+      const idx = cg.local.declare(cg.i32);
+      hl.load("i32", 1 /* indicesPtr */, hl.getExpr(i));
+      cg.local.set(idx);
+      // target[idx] += updates[i]
+      hl.store(dtype, 0 /* targetPtr */, hl.getExpr(idx), () => {
+        hl.load(dtype, 0, hl.getExpr(idx)); // target[idx]
+        hl.load(dtype, 2 /* updatesPtr */, hl.getExpr(i)); // updates[i]
+        hl.binOp(dtype, "add");
+      });
+    });
+  });
+  cg.export(func, "scatter_add");
+  return cg.finish();
+}
+```
+
+**Files touched:**
+
+- `src/backend/wasm/routines/scatter-add.ts` — new file
+- `src/backend/wasm/routines/index.ts` — export
+- `src/backend/wasm/routine-provider.ts` — add to `routineBuilders` map
+- `src/backend/wasm.ts` — dispatch case
+
+**Exit criteria:** Wasm backend passes all `scatter_add` tests.
 
 ---
 
 ### M3 — Multi-Output Kernels & Epilogue Fusion (5–7 days)
 
-Eliminate VRAM round-trips by blurring the line between Kernels and Routines.
+#### M3.1 — Multi-Output `Kernel` Support (and merge with `Kernel`)
 
-#### M3.1 — Multi-Output `Kernel` Support
+**What:** Extend `Kernel` to support multiple outputs, then retire the single-output class —
+`Kernel` is just a degenerate `MultiKernel`. The two types should be unified rather than carried
+forward in parallel.
 
-**What:** Upgrade the `Kernel` class and `splitGraphDataflow` to support fusing operations that
-produce multiple outputs (e.g., complex AD backward passes). **Exit criteria:** The JIT compiler
-successfully emits single WGSL/Wasm kernels that write to multiple output buffers simultaneously.
+**Current state:** `Kernel` (`src/alu.ts` L1450) is single-output:
+`constructor(nargs, size, exp, reduction?)`. `splitGraphDataflow` (`src/frontend/jit.ts` L1260)
+materializes every output as a separate black node.
 
-#### M3.2 — Routine Epilogue Fusion
+**Migration plan — replace, don't extend:**
 
-**What:** Modify the `Routine` interface to accept an optional `epilogue: Jaxpr`.
+1. Introduce `MultiKernelOutput` and the new multi-output `Kernel` class (renaming the old class
+   away is fine since it's an internal type):
 
-- Update `matmul` and `cholesky` WGSL/Wasm generators to evaluate the epilogue Jaxpr _in registers_
-  before writing the final value to VRAM. **Exit criteria:** `jit(x => relu(matmul(A, B) + bias))`
-  compiles into a **single** WebGPU dispatch and a **single** Wasm call.
+```typescript
+export interface KernelOutput {
+  readonly exp: AluExp;
+  readonly reduction?: Reduction;
+  readonly dtype: DType;
+  readonly bytes: number;
+}
+
+// Replaces the old single-output Kernel entirely:
+export class Kernel implements FpHashable {
+  constructor(
+    readonly nargs: number,
+    readonly size: number,
+    readonly outputs: KernelOutput[],     // 1..N outputs
+  ) {}
+
+  /** Convenience: true when this is effectively single-output. */
+  get isSingleOutput(): boolean { return this.outputs.length === 1; }
+
+  /** Compatibility shim for callsites that still use kernel.exp / kernel.reduction. */
+  get exp(): AluExp { return this.outputs[0].exp; }
+  get reduction(): Reduction | undefined { return this.outputs[0].reduction; }
+  get dtype(): DType { return this.outputs[0].dtype; }
+}
+
+/** Factory for the common single-output case, used throughout the existing codebase. */
+export function singleKernel(nargs: number, size: number, exp: AluExp, reduction?: Reduction): Kernel {
+  return new Kernel(nargs, size, [{ exp: exp.simplify(), reduction, dtype: ..., bytes: ... }]);
+}
+```
+
+2. Replace all `new Kernel(nargs, size, exp, reduction)` call sites with `singleKernel(...)`.
+3. Remove the compatibility shims (`get exp()`, `get reduction()`, `get dtype()`) once all call
+   sites are migrated. This MUST happen within M3.1 — not deferred to a later milestone.
+
+**`splitGraphDataflow` changes** (`src/frontend/jit.ts`):
+
+Add a post-pass after P2: for each group of black-node equations that share the same set of
+transitive inputs and have the same `size`, check if they can be fused into a multi-output `Kernel`.
+Two kernels are fusible if:
+
+1. Same `nargs` and same `size` (same loop bounds)
+2. No data dependency between them (neither reads the other's output)
+3. Combined buffer count ≤ `backend.maxArgs`
+
+**JitStep changes** — `outputs` becomes a list (was a single JitId):
+
+```typescript
+// Update execute step to support multiple outputs:
+| { type: "execute"; inputs: JitId[]; outputs: JitId[];
+    source: Kernel | Routine }
+```
+
+**WASM codegen** (`src/backend/wasm.ts`): The existing `codegenWasm()` path already handles
+`Kernel`. With `outputs.length === 1` the code path is identical to before; with
+`outputs.length > 1`, the gidx loop emits multiple store instructions:
+
+```typescript
+// For each output: compute exp, store to outputN[gidx]
+for (let oi = 0; oi < kernel.outputs.length; oi++) {
+  // Push output address: outputN + gidx * byteWidth
+  // Evaluate expression
+  // Store
+}
+```
+
+**WebGPU codegen** (`src/backend/webgpu.ts`):
+
+```wgsl
+// Multiple output bindings:
+@group(0) @binding(0) var<storage, read> in0 : array<f32>;
+// ...
+@group(0) @binding(N) var<storage, read_write> out0 : array<f32>;
+@group(0) @binding(N+1) var<storage, read_write> out1 : array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let gidx = gid.x;
+    if (gidx >= size) { return; }
+    // Shared expression evaluation (CSE across outputs)
+    let shared_val = in0[gidx] * in1[gidx];
+    out0[gidx] = shared_val + bias[gidx];
+    out1[gidx] = max(shared_val, 0.0);
+}
+```
+
+**Files touched:**
+
+- `src/alu.ts` — replace `Kernel` with multi-output version, add `KernelOutput`, `singleKernel()`
+- `src/frontend/jit.ts` — migrate `new Kernel(...)` → `singleKernel(...)`, multi-output fusion pass
+  in `splitGraphDataflow`, `execute` step outputs as list, `effectDrivenAllocate` multi-output
+- `src/backend/wasm.ts` — `codegenWasm()` handles `outputs` array; single-output path unchanged
+- `src/backend/webgpu.ts` — multi-output `pipelineSource()`
+- All other files that construct `new Kernel(...)` — migrate to `singleKernel()`
+
+**Test file:** `test/multi-kernel.test.ts`
+
+| Test name                                      | What it verifies                            |
+| ---------------------------------------------- | ------------------------------------------- |
+| `singleKernel constructs correct Kernel`       | Factory shim, `outputs.length === 1`        |
+| `two same-size outputs fuse into one dispatch` | JIT pprint shows single execute step        |
+| `correctness with shared subexpressions`       | Both outputs correct                        |
+| `different-size outputs remain separate`       | No incorrect fusion                         |
+| `grad backward pass fuses`                     | AD backward bodies produce fewer dispatches |
+| `multi-output with reduction`                  | One output has reduce, one doesn't          |
+| `respects maxArgs limit`                       | Falls back to separate when too many inputs |
+
+**Exit criteria:** `Kernel` class is unified (multi-output). `singleKernel()` factory used
+everywhere the old `new Kernel(nargs, size, exp)` appeared. Compatibility shims removed.
+Multi-output kernels compile and execute correctly on both backends. AD backward passes with
+multiple same-size outputs show fewer dispatches.
+
+**Migration verification:**
+
+```bash
+grep -rn 'new Kernel(' src/              # must return zero matches (all migrated to singleKernel)
+grep -rn 'get exp()' src/alu.ts          # must return zero matches (shims removed)
+pnpm check                                # no type errors from stale Kernel constructor usage
+```
+
+#### M3.2 — Reduction Epilogue Fusion
+
+**What:** Extend `splitGraphDataflow`'s existing reduction epilogue logic (L1290–1340) to fuse more
+aggressively. Currently, a reduction (Dot/Reduce/Conv) can only fuse with a single downstream
+unary/binary op. Extend to fuse with chains of elementwise ops.
+
+**Current behavior** (`src/frontend/jit.ts` L1290–1340): The reduction epilogue fusion checks if the
+downstream equation is a simple unary/binary op and fuses it into the `Reduction.epilogue` field.
+
+**Extended behavior:** Walk downstream from a reduction output through a chain of elementwise ops
+(add, mul, relu, etc.) until hitting a black node or fork. Compose all ops into a single
+`Reduction.epilogue` expression.
+
+**Example:**
+
+```typescript
+// Before: 3 dispatches
+const c = np.matmul(A, B); // Dot → Kernel(Mul+Reduce)
+const d = c.add(bias); // Add → Kernel
+const e = nn.relu(d); // Max(0, x) → Kernel
+
+// After: 1 dispatch
+// Dot with epilogue: relu(acc + bias[gidx])
+```
+
+**Constraints:**
+
+- Epilogue ops must be elementwise (no reductions, no shape changes)
+- Epilogue expression must not read from other reduction outputs (no cross-dependency)
+- Total binding count (inputs + outputs) must stay within `backend.maxArgs`
+- Pure unary epilogues (relu, neg, exp) add **zero** new buffer bindings — they reuse the reduction
+  output slot. Binary epilogues with a new external input (e.g., bias add) add one binding each. The
+  existing `splitGraphDataflow` P2 pass (`jit.ts` L1440–1530) already enforces `maxArgs` via
+  backtracking — it counts transitive dependencies and marks excess inputs as black nodes. No new
+  `maxArgs` handling is needed; the P2 pass extends naturally to longer epilogue chains.
+
+**Files touched:**
+
+- `src/frontend/jit.ts` — extend epilogue fusion walk in `splitGraphDataflow`
+- No backend changes needed — epilogue is already an `AluExp` that both backends evaluate
+
+**Test file:** add to `test/multi-kernel.test.ts`
+
+| Test name                                          | What it verifies                        |
+| -------------------------------------------------- | --------------------------------------- |
+| `matmul + bias + relu fuses to 1 dispatch`         | JIT pprint: single kernel with epilogue |
+| `matmul + bias fuses (existing behavior extended)` | Chain of 2 ops                          |
+| `matmul + divergent consumers stays separate`      | Fork prevents fusion                    |
+
+**Exit criteria:** `jit(x => relu(matmul(A, B).add(bias)))` compiles to a single dispatch on both
+backends.
 
 ---
 
-### M4 — Polymorphic Shapes (Dynamic Dimensions) (4–6 days)
+### M4 — Polymorphic Shapes (Dynamic Dimensions) (5–7 days)
 
-Eliminate JIT recompilation for variable-length data by allowing users to specify which axes are
-dynamic (symbolic) rather than constant-size.
+Allow users to mark axes as dynamic so that JIT programs can handle variable-length inputs without
+recompilation.
 
-#### M4.1 — Symbolic Shape IR & Tracing
+#### M4.1 — Symbolic Dimension Type & Shape Propagation
 
-**What:** Update `ShapeTracker` and `Jaxpr` to support symbolic dimensions (e.g., `["T", 64]`).
+**What:** Introduce a `SymDim` type for symbolic dimensions, extending the shape system.
 
-- Add an opt-in API to `jit`: `jit(f, { dynamic_axes: { 0: "time" } })`.
-- Update `effectDrivenAllocate` to emit `malloc` steps with symbolic size formulas instead of static
-  byte counts. **Exit criteria:** Jaxpr tracing successfully propagates symbolic dimensions through
-  standard operations without throwing shape mismatch errors.
+**New types** (`src/shape.ts`):
+
+```typescript
+/** A dimension is either a concrete number or a symbolic variable. */
+export type Dim = number | SymDim;
+
+export class SymDim {
+  constructor(readonly name: string) {}
+  toString(): string {
+    return this.name;
+  }
+}
+
+// ShapeTracker.shape becomes Dim[] instead of number[]:
+export class ShapeTracker {
+  get shape(): Dim[] { ... }
+  get size(): Dim | number { ... } // product of dims, symbolic if any dim is symbolic
+}
+```
+
+**Tracing with symbolic dims:** When `jit(f, { dynamic_axes: { 0: "T" } })` is called:
+
+1. The tracer creates `ShapedArray` instances with symbolic dims: `[SymDim("T"), 64]`
+2. Shape propagation rules compute output shapes symbolically:
+   - `reshape([T, 64], [-1])` → `[T * 64]` (symbolic product)
+   - `broadcast([T, 1], [T, 64])` → `[T, 64]`
+   - `reduce([T, 64], axis=1)` → `[T]`
+3. `Kernel.size` becomes `Dim | number` — symbolic when any input has a symbolic dim
+
+**Shape guard at call time:** When the JIT function is called with concrete inputs, the symbolic
+dims are resolved and checked against cached compilations.
+
+**Operations that CANNOT support symbolic dims** (initially):
+
+| Operation                       | Why                                        | Fallback   |
+| ------------------------------- | ------------------------------------------ | ---------- |
+| `reshape` with computed dim     | `-1` inference needs concrete size         | Specialize |
+| `concatenate`                   | Output size depends on all input sizes     | Specialize |
+| `pad`                           | Padding amounts are typically compile-time | Specialize |
+| Routines (sort, cholesky, etc.) | Size-specialized wasmblr modules           | Specialize |
+
+**Files touched:**
+
+- `src/shape.ts` — `Dim`, `SymDim` types, update `View` and `ShapeTracker` to use `Dim[]`
+- `src/frontend/core.ts` — shape propagation rules for symbolic dims
+- `src/frontend/jaxpr.ts` — `ShapedArray` uses `Dim[]` for shape
+- `src/alu.ts` — `Kernel.size` becomes `Dim | number`
+- `src/frontend/jit.ts` — `jit()` accepts `dynamic_axes` option, shape guard logic
+
+**Test file:** `test/polymorphic-shapes.test.ts`
+
+| Test name                                | What it verifies                     |
+| ---------------------------------------- | ------------------------------------ |
+| `same JIT program for different lengths` | No recompilation                     |
+| `simple elementwise with dynamic axis`   | `x.add(1)` works for varying T       |
+| `reduce along static axis`               | `x.sum(axis=1)` with dynamic axis 0  |
+| `matmul with dynamic batch dim`          | `[T,M] @ [M,N]` → `[T,N]`            |
+| `unsupported op forces specialization`   | `reshape` with `-1` triggers retrace |
+
+**Exit criteria:** A JIT function traced with `dynamic_axes: {0: "T"}` handles inputs of different
+leading dimensions without recompilation.
 
 #### M4.2 — Parameterized Backend Codegen
 
-**What:** Update Wasm and WebGPU codegen to accept dynamic dimensions as runtime arguments.
+**What:** Update codegen to accept symbolic dimensions as runtime parameters.
 
-- **Wasm:** Pass symbols as Wasm function parameters. Disable loop unrolling for dynamic axes.
-- **WebGPU:** Pass symbols via a dedicated Uniform buffer. Compute `dispatchWorkgroups` dynamically
-  in JS before submission. **Exit criteria:** A JIT-compiled function can be called with `[100, 64]`
-  and `[150, 64]` inputs without triggering a recompilation, producing correct results on both
-  backends.
+**Wasm:**
+
+```typescript
+// Current kernel signature: (ptr0, ptr1, ..., ptrOut) -> ()
+// New with symbolic dims: (ptr0, ptr1, ..., ptrOut, T_dim) -> ()
+// T_dim replaces all compile-time size references
+```
+
+- `codegenWasm()`: When `kernel.size` is symbolic, add an extra `i32` parameter for each symbolic
+  dim. Replace `cg.i32.const(kernel.size)` with `cg.local.get(symDimLocal)`.
+- Disable loop unrolling (`forLoopUnrolled`) for symbolic-dim loops.
+
+**WebGPU:**
+
+```wgsl
+// Pass symbolic dims via a uniform buffer:
+struct Dims { T: u32 }
+@group(0) @binding(N) var<uniform> dims : Dims;
+
+// Grid size computed dynamically in JS:
+const gridSize = concreteT; // resolved at call time
+encoder.dispatchWorkgroups(calculateGrid(gridSize));
+```
+
+- `pipelineSource()`: Add uniform buffer binding for symbolic dims. Replace hardcoded sizes with
+  `dims.T`.
+- `JitProgram.execute()`: Resolve symbolic dims from input shapes, write to uniform buffer, compute
+  grid dynamically.
+
+**Interaction with buffer recycling and pool (`effectDrivenAllocate`, `computePoolHints`):**
+
+The JIT compiler's memory management operates on byte sizes. With symbolic dims, these become
+symbolic expressions. Both `effectDrivenAllocate()` and `computePoolHints()` need adaptation:
+
+- **`effectDrivenAllocate()`:** Currently keys the free pool on concrete `number` byte sizes. With
+  symbolic dims, two malloc steps with sizes like `T * 256` and `T * 256` are structurally identical
+  and CAN be recycled. Strategy: key the free pool by a canonical symbolic expression string (e.g.,
+  `"T*256"`) instead of a number. Only structurally identical expressions match. Different
+  expressions (`T * 256` vs `T * 128`) provably differ without knowing `T`.
+
+- **`computePoolHints()`:** Currently computes literal `peakBytes: number` and
+  `mallocSizes: Set<number>`. With symbolic dims, these become symbolic expressions. Strategy:
+  `PoolHints` type becomes `{ peakBytes: number | SymExpr, mallocSizes: Set<number | SymExpr> }`.
+  `JitProgram.execute()` resolves all symbolic expressions against the actual input shapes at call
+  time, producing concrete numbers for `configurePool()`. The peak-memory guarantee is preserved.
+
+- **Mega-Module (M6):** Compute byte sizes from symbolic dim parameters at runtime within Wasm. The
+  `malloc` calls inside the module become `call $bump_alloc(local.get(T) * 256)` etc. This is
+  straightforward arithmetic, not a general expression evaluator.
+
+**Files touched:**
+
+- `src/backend/wasm.ts` — `codegenWasm()` symbolic-dim parameter
+- `src/backend/webgpu.ts` — `pipelineSource()` uniform dim buffer
+- `src/frontend/jit.ts` — `JitProgram.execute()` symbolic dim resolution, `effectDrivenAllocate()`
+  symbolic byte sizes, `computePoolHints()` symbolic `PoolHints`
+
+**Exit criteria:** A JIT-compiled function handles `[100, 64]` and `[150, 64]` inputs without
+recompilation, producing correct results on both backends. Buffer recycling works for same-symbolic-
+size intermediates.
 
 ---
 
 ### M5 — Wasm Multithreading Foundation (5–7 days)
 
-Saturate the CPU by parallelizing the Wasm backend.
-
 #### M5.1 — `SharedArrayBuffer` Memory Pool
 
-**What:** Upgrade `WasmAllocator` to use `WebAssembly.Memory({ shared: true })` when
-`crossOriginIsolated` is true. **Exit criteria:** The Wasm backend functions correctly
-(sequentially) using shared memory.
+**What:** Upgrade `WasmAllocator` to optionally use `WebAssembly.Memory({ shared: true, ... })`.
+
+**Key constraint:** `shared: true` requires `maximum` pages to be specified upfront. Strategy: start
+with 256 MB maximum (4096 pages), grow as needed within that cap.
+
+**Files touched:**
+
+- `src/backend/wasm/allocator.ts` — constructor accepts `shared: boolean`, uses
+  `new WebAssembly.Memory({ initial, maximum, shared })` when `crossOriginIsolated`
+- `src/backend/wasm.ts` — pass `shared: backend.capabilities.sharedMemory` to allocator
+
+**Exit criteria:** All existing tests pass with shared memory enabled (sequential execution). No
+behavior change — just the memory type changes.
 
 #### M5.2 — `WasmWorkerPool`
 
-**What:** Implement a pool of Web Workers initialized at backend startup.
+**What:** Create a pool of Web Workers that share the same `WebAssembly.Memory`.
 
-- Workers instantiate the same Wasm modules and share the same memory.
-- Implement a lightweight synchronization primitive using `Atomics.wait` and `Atomics.notify`.
-  **Exit criteria:** Worker pool initializes cleanly and can execute basic tasks.
+```typescript
+// src/backend/wasm/worker-pool.ts
+export class WasmWorkerPool {
+  readonly workers: Worker[];
+  readonly numWorkers: number; // navigator.hardwareConcurrency - 1
+
+  constructor(memory: WebAssembly.Memory) { ... }
+
+  /** Dispatch a parallel loop: each worker runs [start, end) slice. */
+  dispatchParallel(
+    moduleBytes: Uint8Array,
+    funcName: string,
+    totalSize: number,
+    args: number[], // shared memory pointers
+  ): Promise<void>;
+
+  destroy(): void;
+}
+```
+
+Workers are initialized with a lightweight message handler:
+
+```typescript
+// src/backend/wasm/worker-entry.ts (inlined as Blob URL)
+self.onmessage = async (e) => {
+  const { moduleBytes, memory, funcName, start, end, args } = e.data;
+  const module = await WebAssembly.instantiate(moduleBytes, { env: { memory } });
+  module.instance.exports[funcName](start, end, ...args);
+  self.postMessage({ done: true });
+};
+```
+
+Synchronization uses `postMessage`/`Promise.all` for the JS→Worker dispatch in `dispatchParallel`,
+which is async and works on the main thread. For intra-module synchronization (M6.2), see the
+orchestrator-worker pattern below — `Atomics.wait`/`Atomics.notify` can only be used from worker
+threads, not the main browser thread.
+
+**Files touched:**
+
+- `src/backend/wasm/worker-pool.ts` — new file
+- `src/backend/wasm/worker-entry.ts` — new file (Worker script)
+- `src/backend/wasm.ts` — initialize pool at backend startup when `crossOriginIsolated`
+
+**Exit criteria:** Worker pool initializes, dispatches a basic elementwise add across workers,
+produces correct results.
 
 #### M5.3 — Parallel `wasmblr` Loops
 
-**What:** Add `parallelForLoop` to `wasmblr-hl.ts`.
+**What:** Add `parallelForLoop` to `WasmHl` and wire it into kernel codegen.
 
-- The main thread divides the loop range by the number of workers, writes the ranges to a shared
-  control block, and wakes the workers. **Exit criteria:** Large elementwise operations and
-  reductions show near-linear speedup on multi-core CPUs.
+```typescript
+// src/backend/wasm/wasmblr-hl.ts
+class WasmHl {
+  /** Generate loop body that accepts (start, end) parameters for parallel dispatch. */
+  parallelForLoop(
+    i: number, // loop variable local
+    body: () => void,
+  ): void {
+    // Function signature: (start: i32, end: i32, ...args) -> ()
+    // Loop: for (i = start; i < end; i++) { body(); }
+  }
+}
+```
+
+**Integration with kernel dispatch:** When `WasmWorkerPool` is available and array size > threshold
+(e.g., 4096 elements), `WasmBackend.dispatch()` splits the gidx range across workers:
+
+```typescript
+dispatch(exe, inputs, outputs) {
+  if (this.workerPool && exe.source instanceof Kernel && exe.source.size > 4096) {
+    this.workerPool.dispatchParallel(exe.module, "kernel", exe.source.size, [...ptrs]);
+  } else {
+    // Single-threaded: call kernel(0, size, ...ptrs)
+    exe.instance.exports.kernel(0, exe.source.size, ...ptrs);
+  }
+}
+```
+
+**Files touched:**
+
+- `src/backend/wasm/wasmblr-hl.ts` — `parallelForLoop`
+- `src/backend/wasm.ts` — parallel dispatch in `dispatch()`, threshold logic
+- `src/backend/wasm.ts` — `codegenWasm()` generates `(start, end, ...ptrs)` signature
+
+**Test file:** `test/wasm-parallel.test.ts`
+
+| Test name                                       | What it verifies                               |
+| ----------------------------------------------- | ---------------------------------------------- |
+| `parallel add produces correct results`         | Large array add matches sequential             |
+| `parallel reduce`                               | Correctness with per-worker partial reductions |
+| `small arrays stay single-threaded`             | Size < threshold uses main thread              |
+| `graceful fallback without crossOriginIsolated` | No workers created, sequential OK              |
+
+**Exit criteria:** Large elementwise operations show near-linear speedup on multi-core CPUs. All
+existing tests pass.
+
+**Migration verification:** All WASM kernels use the new `(start, end, ...ptrs)` signature. The old
+`(ptrs...) -> ()` format is retired — single-threaded dispatch passes `(0, size, ...ptrs)`.
+
+```bash
+# Verify no codegen path still emits the old signature:
+grep -rn 'kernel(.*ptrs)' src/backend/wasm.ts  # all calls must include start, end arguments
+pnpm check
+```
 
 ---
 
 ### M6 — Whole-Program Wasm Compilation (The "Mega-Module") (6–8 days)
 
-Eliminate the JS ↔ Wasm boundary entirely for JIT programs.
+Compile an entire `JitProgram` into a single wasmblr module, eliminating JS↔Wasm boundary
+crossings.
 
 #### M6.1 — `JitProgram` to Wasm Translator
 
-**What:** Instead of executing `JitStep`s in a JS loop, write a compiler pass that translates the
-entire `JitProgram` into a single `wasmblr` module.
+**What:** Add `compileToWasmModule(program: JitProgram): WasmMegaModule` that translates the full
+step list into a single Wasm function.
 
-- `malloc` and `recycle` steps become dynamic pointer arithmetic inside the Wasm module's local
-  state, evaluating the polymorphic shape formulas (from M4) at runtime.
-- `execute` steps (Kernels and Routines) are inlined as Wasm function calls within the module.
-  **Exit criteria:** A JIT program with 50 operations compiles to 1 Wasm module and executes with 1
-  JS call.
+**Architecture:**
+
+```typescript
+// src/backend/wasm/mega-module.ts
+export interface WasmMegaModule {
+  readonly module: WebAssembly.Module;
+  readonly instance: WebAssembly.Instance;
+  /** Execute: pass input slot pointers, get output slot pointers. */
+  execute(inputPtrs: number[], symDims?: Record<string, number>): number[];
+}
+```
+
+**Step-by-step translation:**
+
+| JitStep            | Wasm translation                                                                  |
+| ------------------ | --------------------------------------------------------------------------------- |
+| `malloc(id, size)` | `local.set(id, call $bump_alloc(size))` — calls imported `WasmAllocator.malloc`   |
+| `free(id)`         | `call $free(local.get(id))` — calls imported `WasmAllocator.free`                 |
+| `recycle(a → b)`   | `local.set(b, local.get(a))` — zero-cost local rename                             |
+| `execute(kernel)`  | Inline the kernel's gidx loop body directly (no function call overhead)           |
+| `execute(routine)` | `call $routine_N(...)` — call imported pre-compiled routine                       |
+| `incref(id)`       | `call $incref(local.get(id))` — calls imported `Backend.incRef`                   |
+| `scan(...)`        | Inline the scan loop (for compiled-loop) or `call $scan_dispatch(...)` (fallback) |
+| `dus(...)`         | `call $memory_copy(dst, src, offset, len)` — bulk memory op                       |
+
+**Memory management within the module:**
+
+- Wasm locals (`local.declare(cg.i32)`) hold slot pointers for each `JitId`
+- `malloc`/`free` are imported from the `WasmAllocator`
+- `recycle` is a zero-cost local-to-local copy (no import call)
+- Kernel bodies are inlined — the gidx loop runs directly in the mega-module
+- Routines are imported as separate Wasm functions (already compiled by `routine-provider.ts`)
+
+**Key constraint — polymorphic sizes:** When M4 is active, `malloc` sizes may be symbolic. The
+mega-module function signature includes symbolic dim parameters:
+
+```typescript
+// mega_execute(input0_ptr, input1_ptr, ..., symDim_T) -> (output0_ptr, output1_ptr, ...)
+// All sizes computed from symDim_T at runtime within the Wasm module
+```
+
+**Files touched:**
+
+- `src/backend/wasm/mega-module.ts` — new file: `compileToWasmModule()`
+- `src/frontend/jit.ts` — add `compiledMegaModule?: WasmMegaModule` cache on `JitProgram`
+- `src/backend/wasm.ts` — integration: when `JitProgram` has Wasm backend, compile and cache
+
+**Test file:** `test/mega-module.test.ts`
+
+| Test name                                    | What it verifies                           |
+| -------------------------------------------- | ------------------------------------------ |
+| `5-step chain compiles to 1 Wasm call`       | Benchmark: 1 JS→Wasm crossing              |
+| `correctness matches step-by-step execution` | Same results as current JitProgram.execute |
+| `malloc/free/recycle inside mega-module`     | Internal memory management works           |
+| `routine calls via imports`                  | Cholesky/sort inside mega-module           |
+| `scan inside mega-module`                    | Compiled-loop scan embedded                |
+| `mega-module with symbolic dims`             | Variable-length inputs (depends on M4)     |
+
+**Exit criteria:** A JitProgram with 50 operations compiles to 1 Wasm module and executes with 1 JS
+call. Correctness matches step-by-step execution on all test cases.
 
 #### M6.2 — Mega-Module Multithreading
 
-**What:** Ensure the Mega-Module correctly dispatches parallelizable loops to the `WasmWorkerPool`
-without returning to JS. **Exit criteria:** Complex neural network forward passes execute entirely
-in native Wasm, utilizing all CPU cores, with zero JS overhead.
+**What:** Wire the `WasmWorkerPool` (M5) into the mega-module. Parallelizable loops (large
+elementwise kernels) dispatch to workers without returning to JS.
+
+**Key constraint — `Atomics.wait` on the main thread:** Browsers forbid `Atomics.wait` (and the Wasm
+equivalent `memory.atomic.wait32`) on the main thread to prevent UI freezing. The mega-module cannot
+call `Atomics.wait` to wait for workers if it runs on the main thread. Node.js and Deno do not have
+this restriction.
+
+**Approach — orchestrator worker:** The mega-module itself runs inside a dedicated orchestrator
+worker. The main thread sends input slot pointers to the orchestrator via `postMessage` (zero-copy
+via `SharedArrayBuffer`). The orchestrator worker runs the mega-module synchronously — it CAN call
+`Atomics.wait` since it's not the main thread. Inside the module, large kernels fan out to the
+`WasmWorkerPool` via `Atomics.notify` → `Atomics.wait`:
+
+```
+Main thread                    Orchestrator Worker           Compute Workers
+    │                               │                            │
+    ├─ postMessage(inputPtrs) ─────→│                            │
+    │                               ├─ mega_execute(...)         │
+    │                               │   ├─ inline kernel A       │
+    │                               │   ├─ parallel kernel B:    │
+    │                               │   │   Atomics.notify ─────→│ run chunk
+    │                               │   │   Atomics.wait ←───────│ done
+    │                               │   ├─ inline kernel C       │
+    │                               │   └─ return outputs        │
+    │←── postMessage(outputPtrs) ───┤                            │
+```
+
+From the `JitProgram.execute()` API perspective, this is async (`Promise<number[]>`). The existing
+sync `execute()` can remain for non-threaded backends; threaded execution returns a promise that
+resolves when the orchestrator posts back.
+
+**Files touched:**
+
+- `src/backend/wasm/mega-module.ts` — parallel dispatch within mega-module
+- `src/backend/wasm/worker-pool.ts` — shared control block protocol, orchestrator worker
+- `src/backend/wasm/orchestrator-entry.ts` — new file (orchestrator worker script)
+
+**Exit criteria:** Complex JIT programs execute entirely in Wasm, utilizing all CPU cores. Works in
+both browsers (via orchestrator worker) and Node.js/Deno (direct main-thread execution).
 
 ---
 
-### M7 — First-Class `associativeScan` (4–6 days)
+### M7 — Native `associativeScan` Compilers (4–6 days)
 
-Fix the O(N) WebGPU bottleneck and O(log N) Wasm overhead for parallel prefix scans.
+**Design decision — Primitive vs trace-through:**
 
-#### M7.1 — `Primitive.AssociativeScan`
+Currently `associativeScan` is NOT a primitive — it unrolls the Kogge-Stone ladder into standard
+operations during tracing. This works for AD (O(log N) depth is preserved) and is sufficient for
+WebGPU (ceil(log₂ N) dispatches is the hardware-imposed floor).
 
-**What:** Promote `associativeScan` from a high-level unrolled function to a core `Primitive`.
+However, `associativeScan` should **eventually become a Primitive** (`Primitive.AssociativeScan`)
+with a body sub-jaxpr, for three reasons:
 
-- Implement JVP and Transpose rules (which will emit transposed `associativeScan` primitives rather
-  than exploding into massive Jaxprs). **Exit criteria:** `grad(associativeScan)` produces a
-  compact, O(1) depth Jaxpr.
+1. **Clean IR representation** — one Jaxpr equation with a body sub-jaxpr vs O(body_ops × log N)
+   unrolled equations. This matches how `Primitive.Scan` represents `lax.scan`.
+2. **Backend specialization** — the JIT compiler can recognize the primitive and route to
+   `codegenNativeAssociativeScan()` automatically. Without a primitive, the optimization lives at
+   the library level (a pre-JIT check in `lax.associativeScan`).
+3. **Consistency** — both `scan` and `associativeScan` are higher-order control flow operations.
+   Having one as a primitive but not the other creates an asymmetry.
 
-#### M7.2 — Native `associativeScan` Compilers
+**AD compatibility:** Making it a primitive does NOT break autodiff. The JVP rule doubles the body
+(primal+tangent inputs) and runs a single scan with the doubled body. For transposition, the
+simplest approach is to unroll during tracing: when `insideAbstractTrace()` is true, the primitive's
+impl rule calls the Kogge-Stone algorithm directly, producing the same unrolled graph that AD
+handles today. This means `grad(associativeScan)` produces identical results whether or not it's a
+primitive.
 
-**What:**
+**Scope for M7:** M7.1 introduces `Primitive.AssociativeScan` with the unroll-during-trace AD
+strategy. M7.2 adds the WASM compiled Kogge-Stone backend. M7.3 adds multithreaded inner loops.
 
-- **WebGPU:** Write a dedicated multi-dispatch orchestrator that executes the Kogge-Stone doubling
-  loop without JS-side Jaxpr unrolling.
-- **Wasm:** Write `codegenNativeAssociativeScan` that compiles the entire Kogge-Stone ladder
-  (including ping-pong buffer swaps) into a single Wasm loop. **Exit criteria:** `associativeScan`
-  performance matches or exceeds `lax.scan` on Wasm, and `grad(scan)` over linalg bodies can be
-  cleanly reformulated by users to avoid WebGPU O(N) bottlenecks.
+#### M7.1 — `Primitive.AssociativeScan` & Transform Rules
+
+**What:** Register `associativeScan` as a primitive with body sub-jaxpr.
+
+**Primitive definition** (`src/frontend/core.ts`):
+
+```typescript
+// Add to Primitive enum:
+AssociativeScan = "associative_scan",
+
+// Add to PrimitiveParams:
+[Primitive.AssociativeScan]: {
+  jaxpr: ClosedJaxpr;  // body: (a: T, b: T) => T
+  numLeaves: number;    // number of pytree leaves
+  axis: number;
+  reverse: boolean;
+};
+```
+
+**Transform rules:**
+
+| Transform | Strategy                                                                          |
+| --------- | --------------------------------------------------------------------------------- |
+| JVP       | Double the body (primal+tangent), run single associativeScan with 2× leaves       |
+| Transpose | Unroll: call `associativeScanCore()` inside `makeJaxpr` trace (produces O(log N)) |
+| Vmap      | Move batch dim, run batched associativeScan (same as current impl)                |
+| PE        | Forward to impl (unroll at trace time)                                            |
+
+**Key insight — unroll-during-trace for AD:** When the primitive is encountered during
+`evalJaxprTransposed` or PE tracing, its impl rule calls the existing `associativeScanCore()` which
+unrolls the Kogge-Stone rounds into standard ops. The traced graph captures these ops normally. This
+means no new transpose rule is needed — the unrolled ops have their own transpose rules.
+
+**Files touched:**
+
+- `src/frontend/core.ts` — `Primitive.AssociativeScan`, params type
+- `src/frontend/jaxpr.ts` — abstract eval rule
+- `src/frontend/array.ts` — eager impl rule (calls `associativeScanCore`)
+- `src/frontend/jvp.ts` — JVP rule (double the body)
+- `src/frontend/vmap.ts` — batching rule
+- `src/library/lax-associative-scan.ts` — emit primitive instead of calling core directly
+- `src/frontend/jit.ts` — `associative_scan` JitStep type, blackNode classification
+
+**Exit criteria:** All existing `test/lax-associative-scan.test.ts` tests pass. `makeJaxpr` shows a
+single `associative_scan` equation. `grad(associativeScan)` produces correct results.
+
+**Migration verification:** The public `lax.associativeScan()` entry point always emits
+`Primitive.AssociativeScan` — the old direct call to `associativeScanCore()` is removed from the
+public path. `associativeScanCore()` is retained ONLY as the primitive's impl rule body (for eager
+execution and for unrolling during abstract tracing).
+
+```bash
+# lax-associative-scan.ts should emit the primitive, not call core directly:
+grep -n 'associativeScanCore' src/library/lax-associative-scan.ts
+# Expected: zero matches in the public function body; core is imported only by array.ts impl rule
+pnpm check
+```
+
+#### M7.2 — WASM Compiled Kogge-Stone
+
+**What:** Add `codegenNativeAssociativeScan()` to `src/backend/wasm.ts` that compiles the full
+Kogge-Stone ladder — stride-doubling loop, ping-pong buffers, per-round `fn` application — into one
+Wasm module.
+
+**Algorithm inside the Wasm module:**
+
+The compiled module runs single-threaded within one Wasm invocation. The primary win is eliminating
+ceil(log₂ N) JS→Wasm crossings.
+
+```
+allocate ping/pong buffers (2 × N × elemSize)
+copy input to ping buffer
+for stride = 1, 2, 4, ..., while stride < N:
+    for i = stride..N:  // parallelizable per-element loop
+        pong[i] = fn(ping[i - stride], ping[i])
+    for i = 0..stride:
+        pong[i] = ping[i]  // prefix: unchanged
+    swap ping <-> pong
+copy result from ping to output
+free scratch buffers
+```
+
+**Integration:** The JIT compiler recognizes `Primitive.AssociativeScan` and emits an
+`associative_scan` JitStep. The WASM backend's `planAssociativeScan()` checks if the body jaxpr is
+eligible for compilation (elementwise kernels only, no routines) and returns a compiled
+`Executable`. On WebGPU, returns `null` (the unrolled JIT path is already optimal — ceil(log₂ N)
+dispatches is the hardware-imposed floor).
+
+**Files touched:**
+
+- `src/backend/wasm.ts` — `codegenNativeAssociativeScan()`, `planAssociativeScan()`
+- `src/backend.ts` — add optional `planAssociativeScan` to `Backend` interface
+- `src/frontend/jit.ts` — `associative_scan` JitStep execution delegates to backend plan
+
+**Test additions in** `test/lax-associative-scan.test.ts`:
+
+| Test name                             | What it verifies                                  |
+| ------------------------------------- | ------------------------------------------------- |
+| `WASM compiled path matches unrolled` | Correctness for cumsum, cumprod                   |
+| `WASM compiled path N=65536`          | Performance: single WASM call vs ceil(log₂ 65536) |
+| `pytree body on WASM compiled path`   | Flattened pytree through single module            |
+
+**Exit criteria:** `associativeScan` on WASM runs in a single JS→WASM call. Performance matches or
+exceeds `lax.scan`'s compiled-loop for associative bodies.
+
+#### M7.3 — Multithreaded Kogge-Stone (depends on M5/M6.2)
+
+**What:** Parallelize the inner per-element loop across workers using the M6.2 orchestrator-worker
+pattern.
+
+**Feasibility:** The Kogge-Stone algorithm has natural parallelism — within each round, all elements
+`i >= stride` compute `pong[i] = fn(ping[i-stride], ping[i])` independently. Workers share ping/pong
+buffers via `SharedArrayBuffer`. The synchronization pattern is one barrier per round (O(log N)
+total):
+
+```
+Orchestrator Worker:
+    for stride = 1, 2, 4, ..., while stride < N:
+        // Fan out inner loop to compute workers
+        write (start=stride, end=N, pingPtr, pongPtr) to control block
+        Atomics.notify(workers)
+        Atomics.wait(completion_counter)  // OK — not main thread
+        // Copy prefix
+        for i = 0..stride: pong[i] = ping[i]
+        swap ping <-> pong
+```
+
+**Speedup estimate:** With P workers: O(N log N / P + log N × barrier_cost). For N=65536 with 4
+workers, expect ~3–4× speedup on the inner loop. The barrier cost (16 `Atomics.wait` calls) is
+negligible versus the per-element computation.
+
+**Files touched:**
+
+- `src/backend/wasm.ts` — `codegenNativeAssociativeScan()` generates parallel inner loop
+- `src/backend/wasm/mega-module.ts` — reuse orchestrator dispatch for assocScan
+
+**Exit criteria:** Multithreaded `associativeScan` shows near-linear speedup on 4+ core CPUs.
 
 ---
 
@@ -232,82 +1170,168 @@ Fix the O(N) WebGPU bottleneck and O(log N) Wasm overhead for parallel prefix sc
 
 #### M8.1 — Benchmark Suite
 
-**What:** Create a comprehensive benchmark suite comparing M0 baselines to M7.
+**What:** Create benchmark scripts comparing M0 baselines.
 
-- Focus on: Embedding layer backward pass (`scatter_add`), `matmul+relu` fusion, and Wasm
-  Mega-Module latency. **Exit criteria:** Benchmark report generated and saved to
-  `docs/ULTIMATE-BENCHMARKS.md`.
+**Benchmark categories:**
 
-#### M8.2 — Documentation
+| Benchmark                                  | What it measures               | Expected improvement    |
+| ------------------------------------------ | ------------------------------ | ----------------------- |
+| `scatter_add` 10K updates to 100 positions | WebGPU/WASM scatter throughput | ∞ (was impossible)      |
+| `matmul + relu` fusion                     | JIT dispatch count             | 3→1 dispatches          |
+| 5-step chain (size 4096)                   | Mega-module vs step-by-step    | 5→1 JS↔Wasm crossings  |
+| Large elementwise (size 1M)                | Parallel vs single-thread WASM | ~4× on 4-core           |
+| Variable-length JIT (100,150,200)          | Recompilation avoided          | 3→1 compilations        |
+| `associativeScan` N=65536 WASM             | Compiled vs unrolled           | 16→1 JS↔Wasm crossings |
 
-**What:** Update `copilot-instructions.md` to document:
+**Files:** `bench/scatter-add.bench.ts`, `bench/mega-module.bench.ts`,
+`bench/parallel-wasm.bench.ts`
 
-- How to write Epilogue-fused Routines.
-- The Wasm Mega-Module architecture and Worker Pool.
-- The `scatter_add` primitive and WebGPU CAS loops.
-- Polymorphic shapes and dynamic dimensions. **Exit criteria:** Documentation reflects the new
-  architecture.
+**Exit criteria:** Benchmark results saved to `docs/ULTIMATE-BENCHMARKS.md`.
+
+#### M8.2 — Dead Code Audit & Documentation
+
+**Dead code audit:** Systematic grep for old patterns that should no longer exist:
+
+```bash
+# M1 remnants:
+grep -rn 'jaxprNeedsCallTimeTranspose' src/
+
+# M2 remnants:
+grep -rn 'requires a scatter_add primitive' src/
+
+# M3 remnants:
+grep -rn 'new Kernel(' src/
+grep -rn 'get exp()\|get reduction()\|get dtype()' src/alu.ts
+
+# M7 remnants:
+grep -n 'associativeScanCore' src/library/lax-associative-scan.ts
+
+# All must return zero matches.
+```
+
+Also check for:
+
+- Unused imports left behind by refactored modules
+- Dead branches (`if (false)`, commented-out old paths)
+- TODO/FIXME comments referencing completed milestones
+
+**Documentation:** Update `copilot-instructions.md` to document:
+
+- `scatter_add` primitive, CAS loop, `MemoryEffect.Mutate` pattern
+- Multi-output kernel fusion and epilogue fusion in `splitGraphDataflow`
+- Wasm Mega-Module architecture
+- Worker pool and parallel dispatch
+- Polymorphic shapes API and limitations
+- Native `associativeScan` on WASM
+
+**Files touched:** `.github/copilot-instructions.md` — new sections in relevant parts.
+
+**Exit criteria:** Dead code audit returns zero matches. Documentation reflects the new
+architecture.
 
 #### M8.3 — Final Regression Run
 
-**What:** Full CI-equivalent check. **Exit criteria:** All checks pass. Zero regressions from M0
-baseline.
+**What:** Full CI-equivalent check.
+
+**Commands:**
+
+```bash
+pnpm build && pnpm check
+pnpm vitest run
+pnpm run test:deno
+pnpm run lint && pnpm run format:check
+```
+
+**Exit criteria:** All checks pass. Zero regressions from M0 baseline.
 
 ---
 
 ## Dependency Graph
 
 ```
-M0.1 (baseline) ──→ M0.2 (feature detection)
+M0.1 (baseline) ──→ M0.2 (capabilities)
   │
-  ├─→ M1.1 (Unify vjpFlat) ──→ M1.2 (scan-executor hack)
+  ├─→ M1.1 (ScanBackwardArtifact) ──→ M1.2 (unify vjpFlat)
   │
-  ├─→ M2.1 (scatter_add IR) ──→ M2.2 (WebGPU CAS) ──→ M2.3 (Wasm scatter)
+  ├─→ M2.1 (scatter_add IR+AD) ──→ M2.2 (WebGPU CAS) ──→ M2.3 (Wasm scatter)
   │
-  ├─→ M3.1 (Multi-output) ──→ M3.2 (Epilogue Fusion)
+  ├─→ M3.1 (unified Kernel, multi-output) ──→ M3.2 (epilogue fusion)
   │
-  ├─→ M4.1 (Symbolic Shape IR) ──→ M4.2 (Parameterized Codegen)
-  │                                      │
-  ├─→ M5.1 (SharedArrayBuffer) ──→ M5.2 (Worker Pool) ──→ M5.3 (Parallel Wasm)
+  ├─→ M4.1 (SymDim + shape propagation) ──→ M4.2 (parameterized codegen)
+  │                                               │
+  ├─→ M5.1 (SharedArrayBuffer) ──→ M5.2 (WorkerPool) ──→ M5.3 (parallel loops)
   │                                                              │
   │                                                              ↓
-  └─→ M6.1 (Mega-Module Compiler) ─────────────────────────→ M6.2 (Mega-Module + Threads)
+  └─→ M6.1 (Mega-Module compiler) ────────────────────────→ M6.2 (Mega + threads)
+       (depends on M4.2 for symbolic dims)                       │
                                                                  │
-  M7.1 (assocScan Primitive) ──→ M7.2 (Native assocScan) ────────┤
-                                                                 │
-                                                                 ↓
-                                                          M8.1 - M8.3 (Cleanup)
+  M7.1 (Primitive.AssociativeScan) ──→ M7.2 (WASM compiled) ────┤
+                                             │                   │
+                                             ├─ M7.3 (threaded) ┘
+                                             │  (depends on M5+M6.2)
+                                             │
+                                             ↓
+                                      M8.1 – M8.3 (cleanup)
 ```
+
+**Independent tracks** (can be parallelized if multiple agents available):
+
+- Track A: M1 → M2 (AD infrastructure)
+- Track B: M3 (kernel fusion)
+- Track C: M4 (polymorphic shapes)
+- Track D: M5 → M6 (WASM performance)
+- Track E: M7.1 → M7.2 (associativeScan primitive + compiled); M7.3 depends on Track D
 
 ## Risk Register
 
-| Risk                                                    | Impact                             | Mitigation                                                                                                         |
-| ------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `crossOriginIsolated` not available in user environment | Wasm falls back to single-thread   | Graceful degradation: `WasmAllocator` falls back to standard `ArrayBuffer`; Mega-Module executes sequentially.     |
-| WebGPU CAS loop for `f32` is too slow                   | `scatter_add` bottlenecks training | Optimize CAS loop; rely on `shader-f32-atomic-add` where available; batch updates if possible.                     |
-| Mega-Module compilation time is too high                | JIT latency spikes                 | Cache Mega-Modules aggressively; use `wasmblr`'s fast generation; defer heavy optimizations to background threads. |
-| Epilogue fusion register pressure                       | WebGPU/Wasm register spilling      | Limit epilogue complexity; fallback to standard VRAM round-trip if epilogue exceeds heuristic cost.                |
-| Polymorphic shapes break routine unrolling              | Wasm routines slow down            | Keep static sizes as the default; only use dynamic loops for explicitly marked dynamic axes.                       |
+| Risk                                       | Impact                                     | Mitigation                                                                                      |
+| ------------------------------------------ | ------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| `crossOriginIsolated` unavailable          | Wasm single-thread fallback                | Graceful degradation: `WasmAllocator` uses standard `ArrayBuffer`; Mega-Module runs sequential  |
+| `Atomics.wait` blocked on main thread      | Mega-module can't sync with workers inline | Orchestrator-worker pattern (M6.2): run mega-module in a worker; Node.js/Deno can use direct    |
+| WebGPU CAS loop contention too high        | `scatter_add` slow with many duplicates    | Sort indices first to reduce contention; segment-based scatter; rely on `shader-f32-atomic-add` |
+| Mega-Module compilation latency            | JIT first-call spike                       | Cache by jaxpr hash; `wasmblr` generates fast (~1 KB modules); lazy compilation                 |
+| Polymorphic shapes break View composition  | `ShapeTracker.reshape` needs concrete dims | Specialize on first concrete call; expand support incrementally                                 |
+| Polymorphic shapes break buffer recycling  | `effectDrivenAllocate` needs concrete size | Key free pool by symbolic expression string; resolve at call time (M4.2)                        |
+| Epilogue fusion register pressure (WebGPU) | GPU register spilling                      | Limit epilogue chain depth (e.g., ≤5 ops); fall back to separate kernel                         |
+| Multi-output kernel binding limit          | `maxArgs` exceeded                         | `splitGraphDataflow` P2 pass already prevents this; extend to unified multi-output `Kernel`     |
+| Parallel Wasm worker startup latency       | Cold-start overhead                        | Pre-initialize workers at backend startup; amortize over subsequent calls                       |
 
 ## Estimated Timeline
 
 | Milestone | Effort   | Cumulative |
 | --------- | -------- | ---------- |
 | M0        | 1–2 days | 1–2 days   |
-| M1        | 2–3 days | 3–5 days   |
-| M2        | 4–6 days | 7–11 days  |
-| M3        | 5–7 days | 12–18 days |
-| M4        | 4–6 days | 16–24 days |
-| M5        | 5–7 days | 21–31 days |
-| M6        | 6–8 days | 27–39 days |
-| M7        | 4–6 days | 31–45 days |
-| M8        | 2–3 days | 33–48 days |
+| M1        | 3–4 days | 4–6 days   |
+| M2        | 4–6 days | 8–12 days  |
+| M3        | 5–7 days | 13–19 days |
+| M4        | 5–7 days | 18–26 days |
+| M5        | 5–7 days | 23–33 days |
+| M6        | 6–8 days | 29–41 days |
+| M7        | 4–6 days | 33–47 days |
+| M8        | 2–3 days | 35–50 days |
 
-Total: **5–7 weeks** of focused implementation by a tireless agent.
+Total: **5–7 weeks** of focused implementation.
 
 ## Commit Strategy
 
-- One commit per task (M0.1, M0.2, ..., M8.3).
+- One commit per sub-task (M0.1, M0.2, ..., M8.3).
 - Commit message format: `ultimate M{n}.{m}: {short description}`
 - Every commit must pass `pnpm vitest run`.
 - Branch off `main` at start. Merge back after M8.3 passes full CI.
+
+### Migration Hygiene
+
+Every milestone that replaces an old pattern MUST verify full migration before its final commit:
+
+1. **Grep-verify removal:** After deleting old code, grep the codebase for old identifiers, error
+   messages, and patterns. The milestone's exit criteria are not met until grep returns zero
+   matches. Each milestone above includes a `Migration verification` block with the specific grep
+   commands.
+2. **No lingering shims:** Compatibility shims (deprecated accessors, dual codepaths, fallback
+   branches) are temporary _intra-milestone_ scaffolding. They MUST be removed within the same
+   milestone that introduces them — never deferred to "a follow-up" or "later."
+3. **Type-check catches stragglers:** After removing an old type or changing a type signature,
+   `pnpm check` (tsc) surfaces all unupdated callers. Run it before the milestone's final commit.
+4. **Old code is deleted, not commented out:** Do not leave `// OLD: ...` blocks or `if (false)`
+   branches. If the old path is genuinely needed as a fallback (e.g., non-threaded execution in M6),
+   it is documented as an intentional dual path, not leftover code.
