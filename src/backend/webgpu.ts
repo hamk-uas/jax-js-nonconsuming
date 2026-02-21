@@ -17,6 +17,7 @@ import {
   UnsupportedOpError,
 } from "../backend";
 import { Routine } from "../routine";
+import { isSymbolicSize } from "../shape";
 import { tuneNullopt, tuneWebgpu } from "../tuner";
 import {
   DEBUG,
@@ -466,10 +467,11 @@ export class WebGPUBackend implements Backend {
     exe: Executable<ShaderDispatch[]>,
     inputs: Slot[],
     outputs: Slot[],
+    dynamicParams?: number[],
   ): void {
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot).buffer);
     const outputBuffers = outputs.map((slot) => this.#getBuffer(slot).buffer);
-    pipelineSubmit(this.device, exe.data, inputBuffers, outputBuffers);
+    pipelineSubmit(this.device, exe.data, inputBuffers, outputBuffers, dynamicParams);
   }
 
   // ---------------------------------------------------------------------------
@@ -1284,9 +1286,27 @@ function pipelineSourceMulti(device: GPUDevice, kernel: Kernel): ShaderInfo {
     );
   }
 
-  const workgroupSize = findPow2(threadCount, 256);
-  const gridSize = Math.ceil(threadCount / workgroupSize);
-  const [gridX, gridY] = calculateGrid(gridSize);
+  const symbolic = isSymbolicSize(threadCount);
+
+  let workgroupSize: number;
+  let gridX: number;
+  let gridY: number;
+
+  if (symbolic) {
+    workgroupSize = 256;
+    gridX = 1;
+    gridY = 1;
+    emit(
+      "",
+      "struct Dims { total_size: u32 }",
+      "@group(1) @binding(0) var<uniform> dims: Dims;",
+    );
+  } else {
+    const tc = threadCount as number;
+    workgroupSize = findPow2(tc, 256);
+    const gridSize = Math.ceil(tc / workgroupSize);
+    [gridX, gridY] = calculateGrid(gridSize);
+  }
 
   emit(
     "",
@@ -1294,17 +1314,28 @@ function pipelineSourceMulti(device: GPUDevice, kernel: Kernel): ShaderInfo {
     "fn main(@builtin(global_invocation_id) id : vec3<u32>) {",
     pushIndent,
   );
-  if (gridY === 1) {
+
+  if (symbolic) {
+    const sizeX = gridOffsetY * workgroupSize;
     emit(
-      `if (id.x >= ${threadCount}) { return; }`,
-      "let gidx: i32 = i32(id.x);",
+      `let linear_idx: u32 = ${sizeX}u * id.y + id.x;`,
+      "if (linear_idx >= dims.total_size) { return; }",
+      "let gidx: i32 = i32(linear_idx);",
     );
   } else {
-    const sizeX = gridX * workgroupSize;
-    emit(
-      `if (${sizeX} * id.y + id.x >= ${threadCount}) { return; }`,
-      `let gidx: i32 = i32(${sizeX} * id.y + id.x);`,
-    );
+    const tc = threadCount as number;
+    if (gridY === 1) {
+      emit(
+        `if (id.x >= ${tc}) { return; }`,
+        "let gidx: i32 = i32(id.x);",
+      );
+    } else {
+      const sizeX = gridX * workgroupSize;
+      emit(
+        `if (${sizeX} * id.y + id.x >= ${tc}) { return; }`,
+        `let gidx: i32 = i32(${sizeX} * id.y + id.x);`,
+      );
+    }
   }
 
   // CSE infrastructure (shared across all outputs for subexpression sharing)
@@ -1443,8 +1474,10 @@ function pipelineSourceMulti(device: GPUDevice, kernel: Kernel): ShaderInfo {
     code: shader.join("\n"),
     numInputs: nargs,
     numOutputs: numOutputs,
-    hasUniform: false,
+    hasUniform: symbolic,
     passes: [{ grid: [gridX, gridY] }],
+    isSymbolic: symbolic || undefined,
+    workgroupSize: symbolic ? workgroupSize : undefined,
   };
 }
 
@@ -1529,12 +1562,31 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     `@group(0) @binding(${nargs}) var<storage, read_write> result : array<${resultTy}>;`,
   );
 
-  const workgroupSize = findPow2(tune.threadCount, 256);
+  const symbolic = isSymbolicSize(tune.threadCount);
 
-  // Determine grid size, may need to be 3D due to limits on X.
-  // maxComputeWorkgroupsPerDimension ~ 65535, so we use 16384 when exceeded.
-  const gridSize = Math.ceil(tune.threadCount / workgroupSize);
-  const [gridX, gridY] = calculateGrid(gridSize);
+  // For symbolic kernels, use a uniform buffer to pass the total element count
+  // at dispatch time. For concrete kernels, bake the count into the shader.
+  let workgroupSize: number;
+  let gridX: number;
+  let gridY: number;
+
+  if (symbolic) {
+    workgroupSize = 256;
+    // Grid and guard are resolved at dispatch time from dynamicParams.
+    // Use placeholder grid [1,1] — overridden by pipelineSubmit.
+    gridX = 1;
+    gridY = 1;
+    emit(
+      "",
+      "struct Dims { total_size: u32 }",
+      "@group(1) @binding(0) var<uniform> dims: Dims;",
+    );
+  } else {
+    const threadCount = tune.threadCount as number;
+    workgroupSize = findPow2(threadCount, 256);
+    const gridSize = Math.ceil(threadCount / workgroupSize);
+    [gridX, gridY] = calculateGrid(gridSize);
+  }
 
   emit(
     "",
@@ -1542,17 +1594,29 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     "fn main(@builtin(global_invocation_id) id : vec3<u32>) {",
     pushIndent,
   );
-  if (gridY === 1) {
+
+  if (symbolic) {
+    // For symbolic: always use 2D formula (works for 1D when id.y=0).
+    const sizeX = gridOffsetY * workgroupSize;
     emit(
-      `if (id.x >= ${tune.threadCount}) { return; }`,
-      "let gidx: i32 = i32(id.x);",
+      `let linear_idx: u32 = ${sizeX}u * id.y + id.x;`,
+      "if (linear_idx >= dims.total_size) { return; }",
+      "let gidx: i32 = i32(linear_idx);",
     );
   } else {
-    const sizeX = gridX * workgroupSize;
-    emit(
-      `if (${sizeX} * id.y + id.x >= ${tune.threadCount}) { return; }`,
-      `let gidx: i32 = i32(${sizeX} * id.y + id.x);`,
-    );
+    const threadCount = tune.threadCount as number;
+    if (gridY === 1) {
+      emit(
+        `if (id.x >= ${threadCount}) { return; }`,
+        "let gidx: i32 = i32(id.x);",
+      );
+    } else {
+      const sizeX = gridX * workgroupSize;
+      emit(
+        `if (${sizeX} * id.y + id.x >= ${threadCount}) { return; }`,
+        `let gidx: i32 = i32(${sizeX} * id.y + id.x);`,
+      );
+    }
   }
 
   // Generate code for each AluExp operation.
@@ -1790,8 +1854,10 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     code: shader.join("\n"),
     numInputs: nargs,
     numOutputs: 1,
-    hasUniform: false,
+    hasUniform: symbolic,
     passes: [{ grid: [gridX, gridY] }],
+    isSymbolic: symbolic || undefined,
+    workgroupSize: symbolic ? workgroupSize : undefined,
   };
 }
 
@@ -1987,7 +2053,7 @@ function nativeScanMultiShaderSource(
   const xsElemStrides = xsStrides.map((s) => s / elemSize);
 
   // Find the maximum kernel size across all steps
-  const maxKernelSize = Math.max(...steps.map((s) => s.kernel.size), 1);
+  const maxKernelSize = Math.max(...steps.map((s) => s.kernel.size as number), 1);
 
   const { emit, pushIndent, popIndent, getCode } = createShaderEmitter();
 
@@ -2179,6 +2245,7 @@ function pipelineSubmit(
   pipelines: ShaderDispatch[],
   inputs: GPUBuffer[],
   outputs: GPUBuffer[],
+  dynamicParams?: number[],
 ) {
   const commandEncoder = device.createCommandEncoder();
   for (const { pipeline, ...shader } of pipelines) {
@@ -2211,8 +2278,37 @@ function pipelineSubmit(
 
     let uniformBindGroup: GPUBindGroup | null = null;
     let uniformAlignment = 0;
-    if (shader.hasUniform) {
-      // This shader requires uniforms, create a shared buffer with uniform
+
+    // Symbolic shaders: compute grid dynamically from dynamicParams and
+    // create a uniform buffer containing the resolved total element count.
+    let symbolicGrid: [number, number] | null = null;
+    if (shader.isSymbolic && dynamicParams && dynamicParams.length > 0) {
+      const totalSize = dynamicParams[0];
+      const wgSize = shader.workgroupSize!;
+      const gridSize = Math.ceil(totalSize / wgSize);
+      symbolicGrid = calculateGrid(gridSize);
+
+      // Create uniform buffer with total_size as u32
+      const uniformData = new Uint8Array(4);
+      new DataView(uniformData.buffer).setUint32(0, totalSize, true);
+      const minAlign = device.limits.minUniformBufferOffsetAlignment;
+      const alignment = Math.ceil(4 / minAlign) * minAlign;
+      const uniformBuffer = device.createBuffer({
+        size: alignment,
+        usage: GPUBufferUsage.UNIFORM,
+        mappedAtCreation: true,
+      });
+      new Uint8Array(uniformBuffer.getMappedRange()).set(uniformData);
+      uniformBuffer.unmap();
+      uniformAlignment = alignment;
+      uniformBindGroup = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(1),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer, size: alignment } },
+        ],
+      });
+    } else if (shader.hasUniform) {
+      // Non-symbolic shader with uniforms: create a shared buffer with uniform
       // values for each pass of the shader (use dynamic offsets).
       const uniforms = filteredPasses.map(({ uniform }) => uniform!);
       const [uniformBuffer, alignment] = combineUniforms(device, uniforms);
@@ -2226,7 +2322,7 @@ function pipelineSubmit(
     }
 
     for (let i = 0; i < filteredPasses.length; i++) {
-      const { grid } = filteredPasses[i];
+      const grid = symbolicGrid ?? filteredPasses[i].grid;
       const passEncoder = commandEncoder.beginComputePass();
       passEncoder.setPipeline(pipeline);
       passEncoder.setBindGroup(0, bindGroup);

@@ -112,7 +112,7 @@ export class CpuBackend implements Backend {
     return new Executable(routine, undefined);
   }
 
-  dispatch(exe: Executable<void>, inputs: Slot[], outputs: Slot[]): void {
+  dispatch(exe: Executable<void>, inputs: Slot[], outputs: Slot[], _dynamicParams?: number[]): void {
     if (exe.source instanceof Routine) {
       return runCpuRoutine(
         exe.source,
@@ -169,14 +169,14 @@ export class CpuBackend implements Backend {
       const outputArray = dtypedArray(out.dtype, outputBuffers[oi]);
 
       if (!out.reduction) {
-        for (let i = 0; i < kernel.size; i++) {
+        for (let i = 0; i < (kernel.size as number); i++) {
           outputArray[i] = tune.exp.evaluate({ gidx: i }, globals);
         }
       } else {
         const useKahan =
           out.reduction.dtype === DType.Float64 &&
           out.reduction.op === AluOp.Add;
-        for (let i = 0; i < kernel.size; i++) {
+        for (let i = 0; i < (kernel.size as number); i++) {
           let acc = out.reduction.identity;
           let comp = 0; // Kahan compensation
           for (let j = 0; j < out.reduction.size; j++) {

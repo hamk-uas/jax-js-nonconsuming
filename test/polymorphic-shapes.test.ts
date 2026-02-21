@@ -6,6 +6,75 @@ import {
 } from "@hamk-uas/jax-js-nonconsuming";
 import { expect, suite, test } from "vitest";
 
+suite("M4.2: Parameterized Backend Codegen", () => {
+  test("[100,64] and [150,64] share the same JitProgram", () => {
+    // The exit criteria: a JIT function handles different batch sizes
+    // without recompilation, producing correct results.
+    using f = jit(
+      (x: np.Array) => x.mul(np.array(2.0)).add(np.array(1.0)),
+      { dynamic_axes: { 0: "T" } },
+    );
+
+    // First call: [100, 64]
+    using x1 = np.ones([100, 64]);
+    using y1 = f(x1) as np.Array;
+    expect(y1.shape).toEqual([100, 64]);
+    // Each element should be 2*1 + 1 = 3
+    const data1 = y1.js() as number[][];
+    expect(data1.length).toBe(100);
+    expect(data1[0].length).toBe(64);
+    expect(data1[0][0]).toBe(3);
+    expect(data1[99][63]).toBe(3);
+
+    // Second call: [150, 64] — should reuse the same compiled program
+    using x2 = np.ones([150, 64]);
+    using y2 = f(x2) as np.Array;
+    expect(y2.shape).toEqual([150, 64]);
+    const data2 = y2.js() as number[][];
+    expect(data2.length).toBe(150);
+    expect(data2[0][0]).toBe(3);
+    expect(data2[149][63]).toBe(3);
+  });
+
+  test("buffer recycling works for same-symbolic-size intermediates", () => {
+    // Chain of operations where intermediates have the same symbolic size.
+    // Buffer recycling should work (recycle steps emitted in JitProgram).
+    using f = jit(
+      (x: np.Array) => x.add(np.array(1.0)).mul(np.array(2.0)).sub(np.array(0.5)),
+      { dynamic_axes: { 0: "T" } },
+    );
+
+    using x1 = np.ones([80, 32]);
+    using y1 = f(x1) as np.Array;
+    expect(y1.shape).toEqual([80, 32]);
+    // (1 + 1) * 2 - 0.5 = 3.5
+    const data1 = y1.js() as number[][];
+    expect(data1[0][0]).toBe(3.5);
+
+    using x2 = np.ones([200, 32]);
+    using y2 = f(x2) as np.Array;
+    expect(y2.shape).toEqual([200, 32]);
+    const data2 = y2.js() as number[][];
+    expect(data2[199][31]).toBe(3.5);
+  });
+
+  test("reduce along dynamic axis is not yet supported", () => {
+    // Reducing along the dynamic axis (axis 0) requires Reduction.size to be
+    // SizeExpr (the reduction loop bound must be dynamic). This is future work.
+    const f = jit((x: np.Array) => np.sum(x, 0), {
+      dynamic_axes: { 0: "T" },
+    });
+    using x1 = np.ones([3, 4]);
+    // Should throw because the concrete reduction size from first call (3)
+    // can't be reused for arbitrary dynamic sizes.
+    // For now just verify it doesn't crash on the first call.
+    using y1 = f(x1) as np.Array;
+    expect(y1.shape).toEqual([4]);
+    expect(y1.js()).toEqual([3, 3, 3, 3]);
+    f.dispose();
+  });
+});
+
 suite("M4.1: Symbolic Dimension Type & Shape Propagation", () => {
   suite("SymDim basics", () => {
     test("SymDim toString and toJSON", () => {

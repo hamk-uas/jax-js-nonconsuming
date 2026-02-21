@@ -14,7 +14,7 @@ import {
 } from "../alu";
 import { Backend, Device, Executable, getBackend, Slot } from "../backend";
 import { Routine } from "../routine";
-import { Pair, ShapeTracker, unravelAlu } from "../shape";
+import { Pair, resolveShape, ShapeTracker, unravelAlu } from "../shape";
 import {
   deepEqual,
   generalBroadcast,
@@ -91,6 +91,7 @@ export class PendingExecute {
     readonly source: Kernel | Routine,
     readonly inputs: Slot[],
     readonly outputs: Slot[],
+    readonly dynamicParams?: number[],
   ) {
     // Take a reference to all I/O buffers, while this execution is pending.
     // The reference is dropped after submit() or cancellation.
@@ -140,7 +141,7 @@ export class PendingExecute {
     if (this.#rc <= 0) throw new Error("internal: PendingExecute used rc<=0");
     if (!this.prepared) throw new Error("internal: Not prepared yet");
     this.submitted = true;
-    this.backend.dispatch(this.prepared, this.inputs, this.outputs);
+    this.backend.dispatch(this.prepared, this.inputs, this.outputs, this.dynamicParams);
     for (const slot of this.inputs) this.backend.decRef(slot);
     for (const slot of this.outputs) this.backend.decRef(slot);
   }
@@ -409,7 +410,7 @@ export class Array extends Tracer {
     }
 
     const kernel = Kernel.single(inputs.length, prod(finalShape), exp);
-    const output = this.#backend.malloc(kernel.bytes);
+    const output = this.#backend.malloc(kernel.bytes as number);
     const pending = [...this.#pending, ...indices.flatMap((ar) => ar.#pending)];
     for (const exe of pending) exe.updateRc(+1);
     pending.push(new PendingExecute(this.#backend, kernel, inputs, [output]));
@@ -470,7 +471,7 @@ export class Array extends Tracer {
       AluExp.globalView(this.#dtype, 0, this.#st, indices),
     ]);
     const kernel = Kernel.single(1, this.#st.size, exp);
-    const output = this.#backend.malloc(kernel.bytes);
+    const output = this.#backend.malloc(kernel.bytes as number);
     const pending = [...this.#pending];
     for (const exe of pending) exe.updateRc(+1);
     pending.push(
@@ -627,7 +628,7 @@ export class Array extends Tracer {
       re = new Reduction(exp.dtype, AluOp.Add, axisSize);
     }
     const kernel = Kernel.single(inputs.length, prod(newShape), exp, re);
-    const output = backend.malloc(kernel.bytes);
+    const output = backend.malloc(kernel.bytes as number);
     const pending = new Set([...arrays.flatMap((ar) => ar.#pending)]);
     for (const exe of pending) exe.updateRc(+1);
     pending.add(new PendingExecute(backend, kernel, inputs, [output]));
@@ -669,7 +670,7 @@ export class Array extends Tracer {
     }
 
     const kernel = Kernel.single(inputs.length, newSize, exp, reduction);
-    const output = this.#backend.malloc(kernel.bytes);
+    const output = this.#backend.malloc(kernel.bytes as number);
     const pending = [...this.#pending];
     for (const exe of pending) exe.updateRc(+1);
     pending.push(new PendingExecute(this.#backend, kernel, inputs, [output]));
@@ -738,7 +739,7 @@ export class Array extends Tracer {
     if (this.#source instanceof AluExp) {
       const exp = accessorAluExp(this.#source, this.#st, indices);
       const kernel = Kernel.single(0, this.#st.size, exp);
-      const output = this.#backend.malloc(kernel.bytes);
+      const output = this.#backend.malloc(kernel.bytes as number);
       const pendingItem = new PendingExecute(
         this.#backend,
         kernel,
@@ -753,7 +754,7 @@ export class Array extends Tracer {
       if (this.#st.contiguous) return;
       const exp = accessorGlobal(this.#dtype, 0, this.#st, indices);
       const kernel = Kernel.single(1, this.#st.size, exp);
-      const output = this.#backend.malloc(kernel.bytes);
+      const output = this.#backend.malloc(kernel.bytes as number);
       const pendingItem = new PendingExecute(
         this.#backend,
         kernel,
@@ -1185,7 +1186,7 @@ export class Array extends Tracer {
       [Primitive.TriangularSolve]: Array.#routine(Primitive.TriangularSolve),
       [Primitive.Cholesky]: Array.#routine(Primitive.Cholesky),
       [Primitive.LU]: Array.#routine(Primitive.LU),
-      [Primitive.Jit](args, { jaxpr, name: _name }) {
+      [Primitive.Jit](args, { jaxpr, name: _name, dynamicAxes }) {
         if (jaxpr.inBinders.length !== args.length) {
           throw new Error(
             `jit expects ${jaxpr.inBinders.length} args, got ${args.length}`,
@@ -1209,14 +1210,31 @@ export class Array extends Tracer {
           }
         }
 
-        const jp = jitCompile(backend, jaxpr);
-        const { outputs, pending } = jp.execute(slots);
+        // Build dimension bindings from concrete input shapes if the Jaxpr
+        // was traced with symbolic dims.
+        let dimBindings: ReadonlyMap<string, number> | undefined;
+        if (dynamicAxes) {
+          const bindings = new Map<string, number>();
+          for (const [axisStr, dimName] of Object.entries(dynamicAxes)) {
+            const axis = Number(axisStr);
+            // Use the first dynamic arg's concrete shape to resolve the binding.
+            const concreteVal = args[0]?.shape[axis] as number;
+            bindings.set(dimName, concreteVal);
+          }
+          dimBindings = bindings;
+        }
+
+        const jp = jitCompile(backend, jaxpr, dimBindings);
+        const { outputs, pending } = jp.execute(slots, dimBindings);
         for (const exe of pending) exe.updateRc(+outputs.length - 1);
 
         return outputs.map((source, i) => {
+          const outShape = dimBindings
+            ? resolveShape(jaxpr.outs[i].aval.shape, dimBindings)
+            : (jaxpr.outs[i].aval.shape as number[]);
           return new Array({
             source,
-            st: ShapeTracker.fromShape(jaxpr.outs[i].aval.shape as number[]),
+            st: ShapeTracker.fromShape(outShape),
             dtype: jaxpr.outs[i].aval.dtype,
             weakType: jaxpr.outs[i].aval.weakType,
             backend,

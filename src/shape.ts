@@ -34,13 +34,21 @@ import {
 // Re-export symbolic dimension types from dim.ts (dependency-free module).
 export {
   type Dim,
+  type SizeExpr,
   SymDim,
+  SymbolicSize,
   concreteDim,
   concreteShape,
+  dimCompatible,
   dimEquals,
+  dimProduct,
   hasSymbolicDims,
   isSymbolicDim,
+  isSymbolicSize,
   resolveShape,
+  resolveSizeExpr,
+  sizeExprKey,
+  sizeExprMul,
 } from "./dim";
 
 /** @inline */

@@ -12,7 +12,17 @@ import {
 import { Backend, Slot } from "../backend";
 import { PPrint } from "../pprint";
 import { Routine } from "../routine";
-import { Pair, ShapeTracker, unravelAlu } from "../shape";
+import {
+  Pair,
+  ShapeTracker,
+  unravelAlu,
+  type SizeExpr,
+  sizeExprKey,
+  resolveSizeExpr,
+  isSymbolicSize,
+  hasSymbolicDims,
+  resolveShape,
+} from "../shape";
 import {
   DEBUG,
   deepEqual,
@@ -49,7 +59,7 @@ export type JitStep =
     }
   | {
       type: "malloc";
-      size: number;
+      size: SizeExpr;
       output: JitId;
     }
   | {
@@ -124,6 +134,8 @@ function computePoolHints(steps: JitStep[]): PoolHints {
   const sizeOf = new Map<JitId, number>();
   for (const s of steps) {
     if (s.type === "malloc") {
+      // Skip symbolic sizes — can't compute concrete pool hints for them.
+      if (typeof s.size !== "number") continue;
       const padded = Math.ceil(s.size / 4) * 4;
       sizeOf.set(s.output, padded);
       mallocSizes.add(padded);
@@ -230,8 +242,15 @@ export class JitProgram {
     return this.pprint().toString();
   }
 
-  /** Execute the JitProgram with the given inputs. */
-  execute(inputs: Slot[]): { outputs: Slot[]; pending: PendingExecute[] } {
+  /**
+   * Execute the JitProgram with the given inputs.
+   * @param dimBindings Optional map of symbolic dimension names to concrete
+   *   values. Required when the program contains symbolic sizes.
+   */
+  execute(
+    inputs: Slot[],
+    dimBindings?: ReadonlyMap<string, number>,
+  ): { outputs: Slot[]; pending: PendingExecute[] } {
     // Tell the backend which buffer sizes we'll need and our peak memory,
     // so it can evict stale pool entries and cap retained bytes.
     this.backend.configurePool?.(this.poolHints);
@@ -257,13 +276,36 @@ export class JitProgram {
           ) {
             throw new Error(`internal: JitProgram scope undefined`);
           }
+          // Compute dynamicParams for symbolic kernels
+          let dynamicParams: number[] | undefined;
+          if (
+            step.source instanceof Kernel &&
+            step.source.isSymbolic &&
+            dimBindings
+          ) {
+            const resolvedSize = resolveSizeExpr(
+              step.source.size,
+              dimBindings,
+            );
+            dynamicParams = [resolvedSize];
+          }
           pending.push(
-            new PendingExecute(this.backend, step.source, inputs, outputs),
+            new PendingExecute(
+              this.backend,
+              step.source,
+              inputs,
+              outputs,
+              dynamicParams,
+            ),
           );
           break;
         }
         case "malloc": {
-          const slot = this.backend.malloc(step.size);
+          const concreteSize =
+            typeof step.size === "number"
+              ? step.size
+              : resolveSizeExpr(step.size, dimBindings!);
+          const slot = this.backend.malloc(concreteSize);
           scope.set(step.output, slot);
           break;
         }
@@ -463,7 +505,7 @@ class JitProgramBuilder {
     return this.pushKernel(kernel, []);
   }
 
-  pushBuffer(size: number): JitId {
+  pushBuffer(size: SizeExpr): JitId {
     const id = this.#nextId++;
     this.steps.push({
       type: "malloc",
@@ -543,7 +585,7 @@ class JitProgramBuilder {
    */
   effectDrivenAllocate(outputIds: JitId[]): void {
     // Phase 1: Collect all malloc'd JitIds and their sizes
-    const mallocSizes = new Map<JitId, number>();
+    const mallocSizes = new Map<JitId, SizeExpr>();
     for (const s of this.steps) {
       if (s.type === "malloc") mallocSizes.set(s.output, s.size);
     }
@@ -573,7 +615,7 @@ class JitProgramBuilder {
     }
 
     // Phase 3: Single forward pass with free pool for cross-boundary recycling
-    const freePool = new Map<number, JitId[]>(); // size → available JitIds
+    const freePool = new Map<string | number, JitId[]>(); // sizeExprKey → available JitIds
     const newSteps: JitStep[] = [];
     let recycleCount = 0;
 
@@ -582,7 +624,8 @@ class JitProgramBuilder {
 
       if (step.type === "malloc") {
         // Check free pool for a same-size buffer to recycle
-        const pool = freePool.get(step.size);
+        const key = sizeExprKey(step.size);
+        const pool = freePool.get(key);
         if (pool && pool.length > 0) {
           const reusedId = pool.pop()!;
           newSteps.push({
@@ -604,10 +647,11 @@ class JitProgramBuilder {
         for (const id of dying) {
           const size = mallocSizes.get(id);
           if (size === undefined) continue;
-          let pool = freePool.get(size);
+          const key = sizeExprKey(size);
+          let pool = freePool.get(key);
           if (!pool) {
             pool = [];
-            freePool.set(size, pool);
+            freePool.set(key, pool);
           }
           pool.push(id);
         }
@@ -647,12 +691,28 @@ export function _clearJitCompileCache(): void {
 // Register with jaxpr.ts so checkLeaks.stop() can flush this cache.
 _registerJitCacheDisposer(_clearJitCompileCache);
 
-export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
+/**
+ * Module-level dim bindings for jitRules to use when resolving symbolic shapes
+ * to concrete values for ShapeTracker operations. Set by jitCompile().
+ * @internal
+ */
+let _currentDimBindings: ReadonlyMap<string, number> | undefined;
+
+export function jitCompile(
+  backend: Backend,
+  jaxpr: Jaxpr,
+  dimBindings?: ReadonlyMap<string, number>,
+): JitProgram {
   const cacheKey = backend.type + "," + FpHash.hash(jaxpr);
 
   const cached = jitCompileCache.get(cacheKey);
   if (cached) return cached;
 
+  // Set module-level dim bindings for jitRules to resolve symbolic shapes
+  // to concrete values in ShapeTracker operations.
+  _currentDimBindings = dimBindings;
+
+  try {
   if (DEBUG >= 1) {
     console.info("=========== JIT Compile ===========\n" + jaxpr.toString());
   }
@@ -662,6 +722,16 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
   const builder = new JitProgramBuilder(backend, nargs);
 
   const blackNodes = splitGraphDataflow(backend, jaxpr);
+
+  /** Set concreteSizeHint on a kernel if dimBindings are available. */
+  const setConcreteHint = (kernel: Kernel, size: SizeExpr): void => {
+    if (_currentDimBindings && isSymbolicSize(size)) {
+      kernel.concreteSizeHint = resolveSizeExpr(
+        size,
+        _currentDimBindings,
+      ) as number;
+    }
+  };
 
   // Initialize jaxpr inBinders.
   const ctx = new Map<Var, JitValue>();
@@ -678,7 +748,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
     exp: AluExp;
     reduction: Reduction | undefined;
     inputArgs: JitId[];
-    size: number;
+    size: SizeExpr;
   }
   const pendingKernels: PendingKernelEntry[] = [];
 
@@ -696,6 +766,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
           entry.exp,
           entry.reduction,
         );
+        setConcreteHint(kernel, entry.size);
         const outId = builder.pushKernel(kernel, entry.inputArgs);
         ctx.set(entry.outVar, { type: "imm", arg: outId });
       }
@@ -713,7 +784,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         // Kernels with reductions always emit solo
         soloEntries.push(entry);
       } else {
-        const key = `${entry.size}:${entry.inputArgs.join(",")}`;
+        const key = `${sizeExprKey(entry.size)}:${entry.inputArgs.join(",")}`;
         const group = groups.get(key);
         if (group) group.push(entry);
         else groups.set(key, [entry]);
@@ -738,6 +809,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
             reduction: e.reduction,
           }));
           const kernel = Kernel.multi(nargs, size, outputDescs);
+          setConcreteHint(kernel, size);
           const outIds = builder.pushMultiKernel(kernel, group[0].inputArgs);
           for (let j = 0; j < group.length; j++) {
             ctx.set(group[j].outVar, { type: "imm", arg: outIds[j] });
@@ -754,6 +826,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         entry.exp,
         entry.reduction,
       );
+      setConcreteHint(kernel, entry.size);
       const outId = builder.pushKernel(kernel, entry.inputArgs);
       ctx.set(entry.outVar, { type: "imm", arg: outId });
     }
@@ -1059,7 +1132,14 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
           inputExps.push(jv.exp.reindexGids(newGids));
         } else if (jv.type === "imm") {
           const [gid] = addArgs([jv.arg]);
-          const st = ShapeTracker.fromShape(input.aval.shape as number[]); // "imm" is realized
+          // For symbolic shapes, resolve to concrete using dimBindings for
+          // ShapeTracker operations. The kernel.size stays symbolic (SizeExpr)
+          // and is resolved at execution time via dynamicParams.
+          const shape =
+            hasSymbolicDims(input.aval.shape) && _currentDimBindings
+              ? (resolveShape(input.aval.shape, _currentDimBindings) as number[])
+              : (input.aval.shape as number[]);
+          const st = ShapeTracker.fromShape(shape);
           const indices = unravelAlu(st.shape, AluVar.gidx);
           inputExps.push(AluExp.globalView(input.aval.dtype, gid, st, indices));
         } else if (jv.type === "red") {
@@ -1114,7 +1194,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
     for (let i = 0; i < eqn.outBinders.length; i++) {
       const outVar = eqn.outBinders[i];
       if (blackNodes.has(outVar)) {
-        const size = outVar.aval.size;
+        const size = outVar.aval.sizeExpr;
         pendingKernels.push({
           outVar,
           exp: exp[i],
@@ -1176,6 +1256,9 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
   if (DEBUG >= 4) console.info(jp.toString());
   jitCompileCache.set(cacheKey, jp);
   return jp;
+  } finally {
+    _currentDimBindings = undefined;
+  }
 }
 
 /**
@@ -1237,12 +1320,18 @@ function broadcastedJit<P extends Primitive>(
     //
     // Only GlobalView is affected. GlobalIndex is not used here, and neither is
     // AluVar.idx, since those are realized before jit().
+    // For symbolic shapes, resolve to concrete using dimBindings for
+    // ShapeTracker broadcast operations.
+    const concreteNewShape =
+      _currentDimBindings && hasSymbolicDims(newShape)
+        ? (resolveShape(newShape, _currentDimBindings) as number[])
+        : (newShape as number[]);
     exps = exps.map((exp, i) => {
       exp = reshapeViews(exp, (st) => {
-        if (!deepEqual(st.shape, newShape))
+        if (!deepEqual(st.shape, concreteNewShape))
           return st.broadcast(
-            newShape as number[],
-            range(newShape.length - st.shape.length),
+            concreteNewShape,
+            range(concreteNewShape.length - st.shape.length),
           );
       });
       if (exp.dtype !== newDtype && !skipCastIdx.includes(i)) {
@@ -1303,17 +1392,22 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   [Primitive.Erfc]: unopJit(AluExp.erfc),
   [Primitive.Sqrt]: unopJit(AluExp.sqrt),
   [Primitive.Reduce]([a], [as], { op, axis }) {
+    // Resolve symbolic shapes to concrete for ShapeTracker operations.
+    const shape =
+      _currentDimBindings && hasSymbolicDims(as.shape)
+        ? (resolveShape(as.shape, _currentDimBindings) as number[])
+        : (as.shape as number[]);
     const keptAxes: number[] = [];
     const shiftedAxes: number[] = [];
     const newShape: number[] = [];
-    for (let i = 0; i < as.shape.length; i++) {
+    for (let i = 0; i < shape.length; i++) {
       if (axis.includes(i)) shiftedAxes.push(i);
       else {
         keptAxes.push(i);
-        newShape.push(as.shape[i] as number);
+        newShape.push(shape[i]);
       }
     }
-    const reductionSize = prod(shiftedAxes.map((ax) => as.shape[ax] as number));
+    const reductionSize = prod(shiftedAxes.map((ax) => shape[ax]));
     newShape.push(reductionSize);
 
     const perm = keptAxes.concat(shiftedAxes);

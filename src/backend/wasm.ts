@@ -241,6 +241,7 @@ export class WasmBackend implements Backend {
     exe: Executable<WasmProgram>,
     inputs: Slot[],
     outputs: Slot[],
+    dynamicParams?: number[],
   ): void {
     if (exe.source instanceof Routine) {
       const routine = exe.source;
@@ -293,7 +294,12 @@ export class WasmBackend implements Backend {
     const ptrs = [...inputs, ...outputs].map(
       (slot) => this.#buffers.get(slot)!.ptr,
     );
-    func(...ptrs);
+    // For symbolic kernels, append resolved total element count(s).
+    if (dynamicParams) {
+      func(...ptrs, ...dynamicParams);
+    } else {
+      func(...ptrs);
+    }
   }
 
   /** Get or create a WASM instance for a size-specialized routine module. */
@@ -778,7 +784,12 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   );
   const funcs = importWasmHelperFuncs(cg, distinctOps);
 
-  const kernelFunc = cg.function(rep(kernel.nargs + 1, cg.i32), [], () => {
+  // For symbolic kernels, add an extra i32 param for the resolved total element count.
+  // Signature: (ptr0, ..., ptrOut, total_size?) -> ()
+  const nParams = kernel.nargs + 1 + (kernel.isSymbolic ? 1 : 0);
+  const sizeParamIdx = kernel.isSymbolic ? kernel.nargs + 1 : -1;
+
+  const kernelFunc = cg.function(rep(nParams, cg.i32), [], () => {
     const gidx = cg.local.declare(cg.i32);
 
     emitKernelBody({
@@ -786,6 +797,7 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
       funcs,
       kernel,
       gidx,
+      sizeLocal: kernel.isSymbolic ? sizeParamIdx : undefined,
       emitOutputAddr: () => {
         cg.local.get(kernel.nargs); // output buffer is last argument
         cg.local.get(gidx);
@@ -836,8 +848,10 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
   }
   const funcs = importWasmHelperFuncs(cg, allOps);
 
-  // Function params: nargs inputs + numOutputs outputs, all i32 pointers
-  const nParams = kernel.nargs + numOutputs;
+  // Function params: nargs inputs + numOutputs outputs + optional total_size, all i32
+  const nParams = kernel.nargs + numOutputs + (kernel.isSymbolic ? 1 : 0);
+  const sizeParamIdx = kernel.isSymbolic ? kernel.nargs + numOutputs : -1;
+
   const kernelFunc = cg.function(rep(nParams, cg.i32), [], () => {
     const gidx = cg.local.declare(cg.i32);
 
@@ -848,7 +862,11 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
     {
       cg.block(cg.void);
       cg.local.get(gidx);
-      cg.i32.const(kernel.size);
+      if (kernel.isSymbolic) {
+        cg.local.get(sizeParamIdx);
+      } else {
+        cg.i32.const(kernel.size as number);
+      }
       cg.i32.ge_u();
       cg.br_if(0);
 
@@ -1370,8 +1388,15 @@ function emitKernelBody(opts: {
   emitExp: (exp: AluExp, extra: { ridx?: number; acc?: number }) => void;
   /** Custom store logic. If omitted, a simple typed store is emitted. */
   emitStore?: () => void;
+  /**
+   * Optional WASM local holding the resolved total element count.
+   * When provided, uses `local.get(sizeLocal)` instead of
+   * `i32.const(kernel.size)` for the gidx loop bound — enabling
+   * parameterized kernels whose size is determined at dispatch time.
+   */
+  sizeLocal?: number;
 }): void {
-  const { cg, kernel, gidx, emitOutputAddr, emitExp, emitStore } = opts;
+  const { cg, kernel, gidx, emitOutputAddr, emitExp, emitStore, sizeLocal } = opts;
   const tune = tuneNullopt(kernel);
   const re = kernel.reduction;
   const storeAlign = Math.log2(byteWidth(kernel.dtype));
@@ -1383,7 +1408,11 @@ function emitKernelBody(opts: {
     // if (gidx >= size) break;
     cg.block(cg.void);
     cg.local.get(gidx);
-    cg.i32.const(kernel.size);
+    if (sizeLocal !== undefined) {
+      cg.local.get(sizeLocal);
+    } else {
+      cg.i32.const(kernel.size as number);
+    }
     cg.i32.ge_u();
     cg.br_if(0);
 

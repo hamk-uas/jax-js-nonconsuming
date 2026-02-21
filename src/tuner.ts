@@ -23,7 +23,7 @@
  */
 
 import { accessorGlobal, AluExp, AluOp, AluVar, DType, Kernel } from "./alu";
-import { ShapeTracker, unravelAlu } from "./shape";
+import { ShapeTracker, unravelAlu, type SizeExpr } from "./shape";
 import { DEBUG, deepEqual, lexCompare, prod, range, sorted } from "./utils";
 
 export interface TuneResult {
@@ -37,7 +37,7 @@ export interface TuneResult {
   outputIdxExp: AluExp;
 
   /** How many total threads to dispatch in the grid. */
-  threadCount: number;
+  threadCount: SizeExpr;
 
   /** Sizes of various dimensions of the kernel. */
   size: {
@@ -193,18 +193,39 @@ class TuneDims {
 export function tuneNullopt(kernel: Kernel): TuneResult {
   let exp = kernel.exp;
   const vars: Record<string, AluExp> = {};
-  vars.gidx = AluExp.special(DType.Int32, "gidx", kernel.size);
+  // For symbolic kernels with a concrete hint, use the hint for gidx range.
+  // This gives gidx a bounded range [0, concreteSize-1] so the simplifier
+  // can eliminate modulo ops, producing size-independent expressions.
+  const gidxSize = kernel.concreteSizeHint ?? kernel.size;
+  vars.gidx = AluExp.special(DType.Int32, "gidx", gidxSize);
   if (kernel.reduction) {
     vars.ridx = AluExp.special(DType.Int32, "ridx", kernel.reduction.size);
     if (exp.dtype !== kernel.reduction.dtype)
       exp = AluExp.cast(kernel.reduction.dtype, exp);
   }
+  let resultExp = exp.substitute(vars).rewriteGlobalViews().simplify();
+  let resultEpilogue = kernel.reduction?.epilogue
+    .substitute({ gidx: vars.gidx })
+    .rewriteGlobalViews()
+    .simplify();
+
+  // For symbolic kernels, replace GlobalIndex len with INT32_MAX.
+  // When compiled with the first call's concrete dims, the simplifier
+  // eliminates modulus ops (e.g., gidx % 6400 → gidx when range is bounded).
+  // But the GlobalIndex len retains the first call's concrete total, which
+  // would cause an incorrect WASM bounds clamp for larger sizes. Setting
+  // len to INT32_MAX makes the per-element bounds check a no-op; the actual
+  // bound comes from the shader/loop guard (gidx < dynamicParams[0]).
+  if (kernel.isSymbolic) {
+    resultExp = unlimitGlobalIndexLen(resultExp);
+    if (resultEpilogue) {
+      resultEpilogue = unlimitGlobalIndexLen(resultEpilogue);
+    }
+  }
+
   return {
-    exp: exp.substitute(vars).rewriteGlobalViews().simplify(),
-    epilogue: kernel.reduction?.epilogue
-      .substitute({ gidx: vars.gidx })
-      .rewriteGlobalViews()
-      .simplify(),
+    exp: resultExp,
+    epilogue: resultEpilogue,
     outputIdxExp: vars.gidx,
     threadCount: kernel.size,
     size: {
@@ -213,10 +234,24 @@ export function tuneNullopt(kernel: Kernel): TuneResult {
   };
 }
 
+/** Replace all GlobalIndex len values with INT32_MAX (0x7FFFFFFF). */
+function unlimitGlobalIndexLen(exp: AluExp): AluExp {
+  return exp.rewrite((node) => {
+    if (node.op === AluOp.GlobalIndex) {
+      const [gid, len] = node.arg as [number, number];
+      if (len !== 0x7fffffff) {
+        return AluExp.globalIndex(node.dtype, gid, 0x7fffffff, node.src[0]);
+      }
+    }
+  });
+}
+
 /** Tuning for WebGPU kernels. */
 export function tuneWebgpu(kernel: Kernel): TuneResult {
   const reduction = kernel.reduction;
   if (!reduction) return tuneNullopt(kernel);
+  // Symbolic kernels can't use upcast/unroll optimizations (unknown size).
+  if (kernel.isSymbolic) return tuneNullopt(kernel);
 
   const exp = AluExp.cast(reduction.dtype, kernel.exp);
   const globalIndexes = exp.collect((exp) => exp.op === AluOp.GlobalIndex);
@@ -424,7 +459,7 @@ export function tuneWebgpu(kernel: Kernel): TuneResult {
     exp: newExp.simplify(),
     epilogue: newEpilogue.simplify(),
     outputIdxExp: outputIdxExp.simplify(),
-    threadCount: (kernel.size / size.upcast) * size.groups,
+    threadCount: ((kernel.size as number) / size.upcast) * size.groups,
     size,
   };
 }

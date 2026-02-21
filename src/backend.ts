@@ -223,8 +223,12 @@ export interface Backend {
    * The operation may not run immediately, but operations are guaranteed to run
    * in the dispatch order. Also, `read()` will wait for all pending operations
    * on that slot to finish.
+   *
+   * @param dynamicParams - Optional resolved runtime parameters for
+   * parameterized kernels (symbolic dims). For WASM, appended as extra i32
+   * function args. For WebGPU, written to a uniform buffer.
    */
-  dispatch(exe: Executable, inputs: Slot[], outputs: Slot[]): void;
+  dispatch(exe: Executable, inputs: Slot[], outputs: Slot[], dynamicParams?: number[]): void;
 
   /**
    * Optional: prepare the backend's buffer pool for an upcoming JitProgram

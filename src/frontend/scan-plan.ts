@@ -177,7 +177,7 @@ function tryPrepareWasmNativeScan(
     if (source instanceof Kernel) {
       const internalIdx = internalSizes.length;
       slotToInternal.set(step.outputs[0], internalIdx);
-      internalSizes.push(source.size * byteWidth(source.dtype));
+      internalSizes.push((source.size as number) * byteWidth(source.dtype));
     } else if (source instanceof Routine) {
       // Routine: may have multiple outputs
       for (let outIdx = 0; outIdx < step.outputs.length; outIdx++) {
@@ -631,7 +631,7 @@ function tryPrepareWebGPUNativeScan(
         kernel: reindexedKernel,
         inputs: reindexMap.slice(),
         outputCarryIdx: carryIdx,
-        outputSize: source.size,
+        outputSize: source.size as number,
       };
     },
   );

@@ -286,6 +286,7 @@ export class WebGLBackend implements Backend {
     exe: Executable<ShaderDispatch>,
     inputs: Slot[],
     outputs: Slot[],
+    _dynamicParams?: number[],
   ): void {
     const gl = this.gl;
     if (gl.isContextLost())
@@ -362,7 +363,7 @@ function generateShader(kernel: Kernel): ShaderInfo {
   const outputDtype = kernel.dtype;
 
   // Calculate output texture dimensions (4 elements per texel)
-  const numTexels = Math.ceil(kernel.size / 4) || 1;
+  const numTexels = Math.ceil((kernel.size as number) / 4) || 1;
   const outputSize = computeTextureDimensions(numTexels);
 
   // Collect input dtypes from GlobalIndex operations and detect builtins needed

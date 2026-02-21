@@ -1,5 +1,6 @@
 import { PPrint } from "./pprint";
 import { ShapeTracker } from "./shape";
+import { type SizeExpr, isSymbolicSize, sizeExprMul } from "./dim";
 import { clamp, FpHash, FpHashable, gcd, strip1 } from "./utils";
 
 /** A numerical data type for array contents. */
@@ -257,7 +258,7 @@ export class AluExp implements FpHashable {
     }
     return new AluExp(AluOp.Const, dtype, [], value);
   }
-  static special(dtype: DType, name: string, n: number): AluExp {
+  static special(dtype: DType, name: string, n: number | SizeExpr): AluExp {
     return new AluExp(AluOp.Special, dtype, [], [name, n]);
   }
   static variable(dtype: DType, name: string): AluExp {
@@ -519,7 +520,7 @@ export class AluExp implements FpHashable {
         ret = [this.arg, this.arg];
         break;
       case AluOp.Special:
-        ret = [0, this.arg[1] - 1];
+        ret = typeof this.arg[1] === "number" ? [0, this.arg[1] - 1] : [-Infinity, Infinity];
         break;
 
       default:
@@ -1451,8 +1452,8 @@ export interface KernelOutput {
   readonly reduction?: Reduction;
   /** The dtype of this output. */
   readonly dtype: DType;
-  /** The number of bytes in the output array. */
-  readonly bytes: number;
+  /** The number of bytes in the output array (may be symbolic). */
+  readonly bytes: SizeExpr;
 }
 
 /**
@@ -1485,7 +1486,7 @@ export class Kernel implements FpHashable {
   }
 
   /** Bytes of the first (or only) output. */
-  get bytes(): number {
+  get bytes(): SizeExpr {
     return this.outputs[0].bytes;
   }
 
@@ -1511,45 +1512,62 @@ export class Kernel implements FpHashable {
     return this.outputs[i].dtype;
   }
 
-  /** Total bytes across all outputs. */
+  /** Total bytes across all outputs (concrete only). */
   get totalBytes(): number {
     let total = 0;
-    for (const o of this.outputs) total += o.bytes;
+    for (const o of this.outputs) {
+      if (isSymbolicSize(o.bytes))
+        throw new Error("Cannot compute totalBytes for symbolic kernel");
+      total += o.bytes;
+    }
     return total;
   }
 
   /** Bytes per output as an array. */
-  get bytesPerOutput(): number[] {
+  get bytesPerOutput(): SizeExpr[] {
     return this.outputs.map((o) => o.bytes);
   }
 
   private constructor(
     /** Number of global arguments / arrays. */
     readonly nargs: number,
-    /** Size of the result array in element count. */
-    readonly size: number,
+    /** Size of the result array in element count (may be symbolic). */
+    readonly size: SizeExpr,
     outputs: KernelOutput[],
   ) {
     this.outputs = outputs;
   }
 
+  /** Whether this kernel has symbolic (non-concrete) size. */
+  get isSymbolic(): boolean {
+    return isSymbolicSize(this.size);
+  }
+
+  /**
+   * Concrete size hint for the simplifier (set during jitCompile when
+   * dimBindings are available). When set, tuneNullopt uses this instead
+   * of the symbolic `size` for the gidx Special range, enabling modulo
+   * elimination so the compiled expression is size-independent.
+   */
+  concreteSizeHint?: number;
+
   /** Create a single-output kernel (replaces `new Kernel(...)`). */
   static single(
     nargs: number,
-    size: number,
+    size: SizeExpr,
     exp: AluExp,
     reduction?: Reduction,
   ): Kernel {
     exp = exp.simplify();
     const dtype = reduction ? reduction.epilogue.dtype : exp.dtype;
-    const bytes = size * byteWidth(dtype);
+    const bytes = sizeExprMul(size, byteWidth(dtype));
     return new Kernel(nargs, size, [{ exp, reduction, dtype, bytes }]);
   }
 
   /** Create a multi-output kernel. None of the outputs may have reductions. */
   static multi(
     nargs: number,
-    size: number,
+    size: SizeExpr,
     outputDescs: { exp: AluExp; reduction?: Reduction }[],
   ): Kernel {
     if (outputDescs.length === 0) {
@@ -1559,7 +1577,7 @@ export class Kernel implements FpHashable {
       ({ exp: rawExp, reduction }) => {
         const exp = rawExp.simplify();
         const dtype = reduction ? reduction.epilogue.dtype : exp.dtype;
-        const bytes = size * byteWidth(dtype);
+        const bytes = sizeExprMul(size, byteWidth(dtype));
         return { exp, reduction, dtype, bytes };
       },
     );
@@ -1567,7 +1585,14 @@ export class Kernel implements FpHashable {
   }
 
   hash(state: FpHash): void {
-    state.update(this.nargs).update(this.size);
+    state.update(this.nargs);
+    // Hash symbolic sizes by their canonical key so different concrete T values
+    // produce the same hash.
+    if (isSymbolicSize(this.size)) {
+      state.update(this.size.key());
+    } else {
+      state.update(this.size);
+    }
     for (const o of this.outputs) {
       state.update(o.exp).update(o.reduction);
     }

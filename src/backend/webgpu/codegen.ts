@@ -11,6 +11,13 @@ export interface ShaderInfo {
     grid: [number, number]; // Grid size (number of workgroups) in x and y.
     uniform?: Uint8Array<ArrayBuffer>; // Optional uniform value.
   }[];
+  /**
+   * When true, the shader is parameterized by a runtime total_size value.
+   * The grid and guard check are computed from `dynamicParams[0]` at dispatch.
+   */
+  isSymbolic?: boolean;
+  /** Workgroup size for dynamic grid computation (only set when isSymbolic). */
+  workgroupSize?: number;
 }
 
 export const headerWgsl = String.raw`

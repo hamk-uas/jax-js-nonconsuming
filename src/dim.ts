@@ -77,6 +77,19 @@ export function dimEquals(a: Dim, b: Dim): boolean {
 }
 
 /**
+ * Check if dimension `a` is compatible with pattern `b`.
+ * A concrete dim is compatible with a symbolic dim (any value satisfies it).
+ * Otherwise behaves like dimEquals.
+ */
+export function dimCompatible(a: Dim, b: Dim): boolean {
+  if (dimEquals(a, b)) return true;
+  // Concrete value satisfies a symbolic pattern
+  if (typeof a === "number" && b instanceof SymDim) return true;
+  if (a instanceof SymDim && typeof b === "number") return true;
+  return false;
+}
+
+/**
  * Resolve a shape by substituting symbolic dimensions with concrete values.
  */
 export function resolveShape(
@@ -93,4 +106,98 @@ export function resolveShape(
     }
     return val;
   });
+}
+
+// ---------------------------------------------------------------------------
+// SizeExpr — symbolic size expressions for parameterized codegen (M4.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * A symbolic size: `factor × prod(syms)`.
+ * Used when Kernel.size or malloc byte count depends on symbolic dims.
+ */
+export class SymbolicSize {
+  constructor(
+    readonly factor: number,
+    readonly syms: readonly string[],
+  ) {}
+
+  resolve(bindings: ReadonlyMap<string, number>): number {
+    let n = this.factor;
+    for (const s of this.syms) {
+      const v = bindings.get(s);
+      if (v === undefined)
+        throw new Error(`Unresolved symbolic dim '${s}' in SizeExpr`);
+      n *= v;
+    }
+    return n;
+  }
+
+  /** Canonical string key for pool/recycling matching. */
+  key(): string {
+    return `${[...this.syms].sort().join("*")}*${this.factor}`;
+  }
+
+  toString(): string {
+    return this.syms.length > 0
+      ? `${this.syms.join("×")}×${this.factor}`
+      : String(this.factor);
+  }
+
+  /** Multiply this symbolic size by a concrete factor. */
+  mul(n: number): SymbolicSize {
+    return new SymbolicSize(this.factor * n, this.syms);
+  }
+}
+
+/**
+ * A size expression: either a concrete number or a symbolic product.
+ * `Kernel.size`, `KernelOutput.bytes`, and `JitStep.malloc.size` use this type.
+ */
+export type SizeExpr = number | SymbolicSize;
+
+/** Check if a size expression is symbolic. */
+export function isSymbolicSize(expr: SizeExpr): expr is SymbolicSize {
+  return expr instanceof SymbolicSize;
+}
+
+/** Resolve a SizeExpr to a concrete number. */
+export function resolveSizeExpr(
+  expr: SizeExpr,
+  bindings: ReadonlyMap<string, number>,
+): number {
+  return typeof expr === "number" ? expr : expr.resolve(bindings);
+}
+
+/**
+ * Return a canonical key for a SizeExpr, suitable for pool/recycling matching.
+ * Concrete numbers return themselves; symbolic sizes return a canonical string.
+ */
+export function sizeExprKey(expr: SizeExpr): string | number {
+  return typeof expr === "number" ? expr : expr.key();
+}
+
+/**
+ * Compute `prod(shape) × multiplier` as a SizeExpr.
+ * If any dimension is symbolic, returns a SymbolicSize; otherwise a number.
+ */
+export function dimProduct(
+  shape: readonly Dim[],
+  multiplier: number = 1,
+): SizeExpr {
+  const syms: string[] = [];
+  let factor = multiplier;
+  for (const d of shape) {
+    if (isSymbolicDim(d)) syms.push(d.name);
+    else factor *= d;
+  }
+  return syms.length === 0 ? factor : new SymbolicSize(factor, syms);
+}
+
+/**
+ * Multiply a SizeExpr by a concrete number.
+ */
+export function sizeExprMul(expr: SizeExpr, n: number): SizeExpr {
+  if (typeof expr === "number") return expr * n;
+  return expr.mul(n);
 }

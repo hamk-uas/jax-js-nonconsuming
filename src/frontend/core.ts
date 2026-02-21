@@ -4,7 +4,10 @@ import { AluGroup, AluOp, DType, isFloatDtype, promoteTypes } from "../alu";
 import { Routines } from "../routine";
 import {
   type Dim,
+  type SizeExpr,
+  dimCompatible,
   dimEquals,
+  dimProduct,
   hasSymbolicDims,
   isSymbolicDim,
   type Pair,
@@ -136,7 +139,12 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   // Scatter-add: target[indices[i]] += updates[i] along axis
   [Primitive.ScatterAdd]: { axis: number };
   [Primitive.TriangularSolve]: { unitDiagonal: boolean };
-  [Primitive.Jit]: { name: string; jaxpr: Jaxpr; numConsts: number };
+  [Primitive.Jit]: {
+    name: string;
+    jaxpr: Jaxpr;
+    numConsts: number;
+    dynamicAxes?: Record<number, string>;
+  };
   [Primitive.Scan]: {
     jaxpr: Jaxpr;
     numCarry: number;
@@ -1431,6 +1439,15 @@ export class ShapedArray implements AbstractValue {
     return p;
   }
 
+  /**
+   * Compute element count as a SizeExpr. Supports symbolic dimensions.
+   * Returns a concrete number when all dims are concrete, or a SymbolicSize
+   * otherwise.
+   */
+  get sizeExpr(): SizeExpr {
+    return dimProduct(this.shape);
+  }
+
   scalar() {
     return new ShapedArray([], this.dtype, this.weakType);
   }
@@ -1446,6 +1463,19 @@ export class ShapedArray implements AbstractValue {
       (this.constructor === other.constructor &&
         this.ndim === other.ndim &&
         this.shape.every((d, i) => dimEquals(d, other.shape[i])))
+    );
+  }
+
+  /**
+   * Check if this ShapedArray is compatible with `other`, allowing
+   * concrete dims to match symbolic dims.
+   */
+  compatible(other: ShapedArray) {
+    return (
+      this === other ||
+      (this.constructor === other.constructor &&
+        this.ndim === other.ndim &&
+        this.shape.every((d, i) => dimCompatible(d, other.shape[i])))
     );
   }
 

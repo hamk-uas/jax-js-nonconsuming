@@ -3,8 +3,8 @@ import { PPrint } from "../pprint";
 import {
   concreteDim,
   type Dim,
+  dimCompatible,
   dimEquals,
-  hasSymbolicDims,
   type Pair,
   resolveShape,
   SymDim,
@@ -347,9 +347,9 @@ export class JaxprEqn {
     );
     let rhs = PPrint.pp(this.primitive);
     // pprint params
-    const paramsList = Object.entries(this.params).map(([k, v]) =>
-      PPrint.pp(`${k}=${v}`),
-    );
+    const paramsList = Object.entries(this.params)
+      .filter(([, v]) => v !== undefined)
+      .map(([k, v]) => PPrint.pp(`${k}=${v}`));
     if (paramsList.length > 0) {
       rhs = rhs
         .stack(PPrint.pp(" [ "))
@@ -1371,7 +1371,8 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
       );
     }
     for (let i = 0; i < inTypes.length; i++) {
-      if (!args[i].equals(inTypes[i])) {
+      // Use compatible() to allow concrete args to match symbolic inTypes
+      if (!args[i].compatible(inTypes[i])) {
         throw new TypeError(
           `jit argument ${i} has type ${args[i]}, expected ${inTypes[i]}`,
         );
@@ -1545,27 +1546,11 @@ export function jit<F extends (...args: any[]) => any>(
       return makeJaxpr(f, opts)(...jaxprArgs);
     });
 
-    // Build dimension bindings from concrete input shapes if the Jaxpr
-    // was traced with symbolic dims.
-    let resolvedJaxpr = jaxpr.jaxpr;
-    if (
-      dynamicAxes &&
-      hasSymbolicDims(jaxpr.jaxpr.inBinders[0]?.aval.shape ?? [])
-    ) {
-      const bindings = new Map<string, number>();
-      for (const [axisStr, dimName] of Object.entries(dynamicAxes)) {
-        const axis = Number(axisStr);
-        // Use the first arg's concrete shape to resolve the binding.
-        const concreteVal = (avalsInFlat[0]?.shape[axis] ?? 0) as number;
-        bindings.set(dimName, concreteVal);
-      }
-      resolvedJaxpr = jaxpr.jaxpr.resolveDims(bindings);
-    }
-
     const outs = bind(Primitive.Jit, [...jaxpr.consts, ...argsFlat], {
       name: f.name || "closure",
-      jaxpr: resolvedJaxpr,
+      jaxpr: jaxpr.jaxpr,
       numConsts: jaxpr.consts.length,
+      dynamicAxes,
     });
     return treeUnflatten(outTree, outs);
   }) as OwnedFunction<F>;
