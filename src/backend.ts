@@ -234,6 +234,24 @@ export interface Backend {
     readonly peakBytes: number;
     readonly mallocSizes: ReadonlySet<number>;
   }): void;
+
+  /**
+   * Optional: dispatch a scatter-add operation.
+   * Accumulates `updates` into `target` (already copied to output) at
+   * positions given by `indices` along `axis`.
+   *
+   * For duplicate indices, values are summed (order-independent).
+   * The output slot must already contain a copy of the target data.
+   */
+  dispatchScatterAdd?(
+    output: Slot,
+    indices: Slot,
+    updates: Slot,
+    axis: number,
+    targetShape: number[],
+    updatesLen: number,
+    dtype: DType,
+  ): void;
 }
 
 export class Executable<T = any> {

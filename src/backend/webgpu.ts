@@ -1040,6 +1040,153 @@ export class WebGPUBackend implements Backend {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // ScatterAdd dispatch (M2: scatter_add primitive)
+  // ---------------------------------------------------------------------------
+  #scatterAddPipelineCache = new Map<string, GPUComputePipeline>();
+
+  dispatchScatterAdd(
+    output: Slot,
+    indices: Slot,
+    updates: Slot,
+    axis: number,
+    targetShape: number[],
+    updatesLen: number,
+    dtype: DType,
+  ): void {
+    if (dtype === DType.Float64) {
+      throw new Error("ScatterAdd: Float64 not supported on WebGPU");
+    }
+
+    // Compute strides for the scatter axis
+    const ndim = targetShape.length;
+    const innerSize =
+      ndim > 0 ? targetShape.slice(axis + 1).reduce((a, b) => a * b, 1) : 1;
+    const outerSize =
+      ndim > 0 ? targetShape.slice(0, axis).reduce((a, b) => a * b, 1) : 1;
+    const axisSize = ndim > 0 ? targetShape[axis] : 1;
+
+    // Total number of update elements
+    const totalUpdates = updatesLen * outerSize * innerSize;
+    const [gridX, gridY] = calculateGrid(Math.ceil(totalUpdates / 64));
+
+    const cacheKey = `scatter_add_${dtype}_${ndim}_${axis}_${outerSize}_${innerSize}_${axisSize}_${updatesLen}`;
+    let pipeline = this.#scatterAddPipelineCache.get(cacheKey);
+
+    if (!pipeline) {
+      const wgslType = dtypeToWgsl(dtype);
+      const isFloat = dtype === DType.Float32 || dtype === DType.Float16;
+      const atomicType = isFloat ? "u32" : wgslType === "i32" ? "i32" : "u32";
+
+      // Build shader
+      let code = `
+@group(0) @binding(0) var<storage, read_write> output: array<atomic<${atomicType}>>;
+@group(0) @binding(1) var<storage, read> indices: array<i32>;
+@group(0) @binding(2) var<storage, read> updates: array<${wgslType}>;
+
+const INNER: u32 = ${innerSize}u;
+const OUTER: u32 = ${outerSize}u;
+const AXIS_SIZE: u32 = ${axisSize}u;
+const UPDATES_LEN: u32 = ${updatesLen}u;
+const TOTAL: u32 = ${totalUpdates}u;
+const TARGET_INNER_STRIDE: u32 = ${axisSize * innerSize}u;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let flat = gid.x + gid.y * ${gridX}u;
+  if (flat >= TOTAL) { return; }
+
+  // Decompose flat index into (outer, updateIdx, inner)
+  let inner = flat % INNER;
+  let tmp = flat / INNER;
+  let updateIdx = tmp % UPDATES_LEN;
+  let outer = tmp / UPDATES_LEN;
+
+  // Look up target axis index
+  let targetAxisIdx = u32(indices[updateIdx]);
+  if (targetAxisIdx >= AXIS_SIZE) { return; }
+
+  // Compute flat output index
+  let outFlat = outer * TARGET_INNER_STRIDE + targetAxisIdx * INNER + inner;
+
+  let val = updates[flat];
+`;
+
+      if (isFloat) {
+        // CAS loop for f32 atomics (bitcast through u32)
+        code += `
+  // CAS loop: atomically add f32 via bitcast<u32>
+  var old_bits = atomicLoad(&output[outFlat]);
+  loop {
+    let old_val = bitcast<${wgslType}>(old_bits);
+    let new_val = old_val + val;
+    let new_bits = bitcast<u32>(new_val);
+    let result = atomicCompareExchangeWeak(&output[outFlat], old_bits, new_bits);
+    if (result.exchanged) { break; }
+    old_bits = result.old_value;
+  }
+`;
+      } else {
+        // Native atomicAdd for integer types
+        code += `
+  atomicAdd(&output[outFlat], ${atomicType === "u32" ? "bitcast<u32>(val)" : "val"});
+`;
+      }
+
+      code += `}\n`;
+
+      const shaderModule = this.device.createShaderModule({ code });
+      const layout = this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.device.createBindGroupLayout({
+            entries: [
+              {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "storage" },
+              },
+              {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "read-only-storage" },
+              },
+              {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "read-only-storage" },
+              },
+            ],
+          }),
+        ],
+      });
+      pipeline = this.device.createComputePipeline({
+        layout,
+        compute: { module: shaderModule, entryPoint: "main" },
+      });
+      this.#scatterAddPipelineCache.set(cacheKey, pipeline);
+    }
+
+    const outBuf = this.#getBuffer(output).buffer;
+    const idxBuf = this.#getBuffer(indices).buffer;
+    const updBuf = this.#getBuffer(updates).buffer;
+
+    const commandEncoder = this.device.createCommandEncoder();
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: outBuf } },
+        { binding: 1, resource: { buffer: idxBuf } },
+        { binding: 2, resource: { buffer: updBuf } },
+      ],
+    });
+    const pass = commandEncoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(gridX, gridY);
+    pass.end();
+    this.device.queue.submit([commandEncoder.finish()]);
+  }
+
   #createBuffer(
     size: number,
     { mapped = false, read = false } = {},

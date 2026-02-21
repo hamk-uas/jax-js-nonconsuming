@@ -518,6 +518,113 @@ export class WasmBackend implements Backend {
     return buffer.ptr;
   }
 
+  // ---------------------------------------------------------------------------
+  // ScatterAdd dispatch (M2: scatter_add primitive)
+  // ---------------------------------------------------------------------------
+
+  dispatchScatterAdd(
+    output: Slot,
+    indices: Slot,
+    updates: Slot,
+    axis: number,
+    targetShape: number[],
+    updatesLen: number,
+    dtype: DType,
+  ): void {
+    const outBuf = this.#getBuffer(output);
+    const idxBuf = this.#getBuffer(indices);
+    const updBuf = this.#getBuffer(updates);
+
+    const ndim = targetShape.length;
+    const innerSize =
+      ndim > 0 ? targetShape.slice(axis + 1).reduce((a, b) => a * b, 1) : 1;
+    const outerSize =
+      ndim > 0 ? targetShape.slice(0, axis).reduce((a, b) => a * b, 1) : 1;
+    const axisSize = ndim > 0 ? targetShape[axis] : 1;
+    const targetInnerStride = axisSize * innerSize;
+
+    // Create typed views for the output and updates
+    const idxView = new Int32Array(
+      idxBuf.buffer,
+      idxBuf.byteOffset,
+      updatesLen,
+    );
+
+    // Sequential scatter-add loop
+    if (dtype === DType.Float32) {
+      const out = new Float32Array(
+        outBuf.buffer,
+        outBuf.byteOffset,
+        outBuf.byteLength / 4,
+      );
+      const upd = new Float32Array(
+        updBuf.buffer,
+        updBuf.byteOffset,
+        updBuf.byteLength / 4,
+      );
+      for (let o = 0; o < outerSize; o++) {
+        for (let j = 0; j < updatesLen; j++) {
+          const targetAxisIdx = idxView[j];
+          if (targetAxisIdx < 0 || targetAxisIdx >= axisSize) continue;
+          for (let k = 0; k < innerSize; k++) {
+            const outIdx =
+              o * targetInnerStride + targetAxisIdx * innerSize + k;
+            const updIdx = o * updatesLen * innerSize + j * innerSize + k;
+            out[outIdx] += upd[updIdx];
+          }
+        }
+      }
+    } else if (dtype === DType.Float64) {
+      const out = new Float64Array(
+        outBuf.buffer,
+        outBuf.byteOffset,
+        outBuf.byteLength / 8,
+      );
+      const upd = new Float64Array(
+        updBuf.buffer,
+        updBuf.byteOffset,
+        updBuf.byteLength / 8,
+      );
+      for (let o = 0; o < outerSize; o++) {
+        for (let j = 0; j < updatesLen; j++) {
+          const targetAxisIdx = idxView[j];
+          if (targetAxisIdx < 0 || targetAxisIdx >= axisSize) continue;
+          for (let k = 0; k < innerSize; k++) {
+            const outIdx =
+              o * targetInnerStride + targetAxisIdx * innerSize + k;
+            const updIdx = o * updatesLen * innerSize + j * innerSize + k;
+            out[outIdx] += upd[updIdx];
+          }
+        }
+      }
+    } else if (dtype === DType.Int32) {
+      const out = new Int32Array(
+        outBuf.buffer,
+        outBuf.byteOffset,
+        outBuf.byteLength / 4,
+      );
+      const upd = new Int32Array(
+        updBuf.buffer,
+        updBuf.byteOffset,
+        updBuf.byteLength / 4,
+      );
+      for (let o = 0; o < outerSize; o++) {
+        for (let j = 0; j < updatesLen; j++) {
+          const targetAxisIdx = idxView[j];
+          if (targetAxisIdx < 0 || targetAxisIdx >= axisSize) continue;
+          for (let k = 0; k < innerSize; k++) {
+            const outIdx =
+              o * targetInnerStride + targetAxisIdx * innerSize + k;
+            const updIdx = o * updatesLen * innerSize + j * innerSize + k;
+            out[outIdx] += upd[updIdx];
+          }
+        }
+      }
+    } else {
+      throw new Error(`ScatterAdd: unsupported dtype ${dtype}`);
+    }
+  }
+
   /**
    * Prepare a native scan WASM module from the given params.
    * Returns an Executable whose data is a WasmProgram.

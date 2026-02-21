@@ -1344,6 +1344,36 @@ export class Array extends Tracer {
           "dynamicUpdateSlice: unsupported dst/src shapes for update",
         );
       },
+      [Primitive.ScatterAdd]([target, indices, updates], { axis }) {
+        // Eager scatter_add: target[indices[i]] += updates[i] along axis.
+        // Returns a new array — target is NOT consumed.
+        const targetShape = target.shape;
+        const indicesData = indices.dataSync() as Int32Array;
+        const updatesData = updates.dataSync();
+        const resultData = target.dataSync();
+        const n = indicesData.length;
+        const innerBefore = prod(targetShape.slice(axis + 1));
+        const outerBefore = prod(targetShape.slice(0, axis));
+        // For each update position, walk the outer × inner grid.
+        for (let out = 0; out < outerBefore; out++) {
+          for (let j = 0; j < n; j++) {
+            const idx = indicesData[j];
+            for (let inner = 0; inner < innerBefore; inner++) {
+              const targetOfs =
+                (out * targetShape[axis] + idx) * innerBefore + inner;
+              const updateOfs = (out * n + j) * innerBefore + inner;
+              (resultData as any)[targetOfs] += (updatesData as any)[updateOfs];
+            }
+          }
+        }
+        return [
+          array(resultData, {
+            shape: targetShape,
+            dtype: target.dtype,
+            device: target.device,
+          }),
+        ];
+      },
       [Primitive.Scan](
         args,
         { jaxpr, numCarry, numConsts, length, reverse, acceptPath },

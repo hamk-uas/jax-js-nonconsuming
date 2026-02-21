@@ -90,6 +90,17 @@ export type JitStep =
       offsetBytes: number; // byte offset into dst where src is written
       sliceBytes: number; // byte size of the src slice
       dstSizeBytes: number; // total byte size of dst (= output size)
+    }
+  | {
+      type: "scatter_add";
+      target: JitId;
+      indices: JitId;
+      updates: JitId;
+      output: JitId;
+      axis: number;
+      targetShape: number[];
+      updatesLen: number; // number of updates along the scatter axis
+      dtype: DType;
     };
 
 /**
@@ -198,6 +209,10 @@ export class JitProgram {
         case "dus":
           return PPrint.pp(
             `%${step.output} = dus %${step.dst}[${step.offsetBytes}] <- %${step.src} (${step.sliceBytes} bytes)`,
+          );
+        case "scatter_add":
+          return PPrint.pp(
+            `%${step.output} = scatter_add %${step.target} %${step.indices} %${step.updates} axis=${step.axis}`,
           );
       }
     });
@@ -352,6 +367,43 @@ export class JitProgram {
           );
           break;
         }
+        case "scatter_add": {
+          // Flush pending ops — scatter_add needs materialized inputs
+          for (const p of pending) {
+            p.prepareSync();
+            p.submit();
+          }
+          pending.length = 0;
+
+          const targetSlot = scope.get(step.target)!;
+          const indicesSlot = scope.get(step.indices)!;
+          const updatesSlot = scope.get(step.updates)!;
+          const outSlot = scope.get(step.output)!;
+
+          // Copy target to output if not already recycled
+          const targetBytes = prod(step.targetShape) * byteWidth(step.dtype);
+          if (targetSlot !== outSlot) {
+            this.backend.copyBufferToBuffer!(
+              targetSlot,
+              0,
+              outSlot,
+              0,
+              targetBytes,
+            );
+          }
+
+          // Dispatch scatter_add kernel on the backend
+          this.backend.dispatchScatterAdd!(
+            outSlot,
+            indicesSlot,
+            updatesSlot,
+            step.axis,
+            step.targetShape,
+            step.updatesLen,
+            step.dtype,
+          );
+          break;
+        }
         default:
           step satisfies never;
       }
@@ -379,6 +431,13 @@ function stepUsesId(step: JitStep, id: JitId): boolean {
       );
     case "dus":
       return step.dst === id || step.src === id || step.output === id;
+    case "scatter_add":
+      return (
+        step.target === id ||
+        step.indices === id ||
+        step.updates === id ||
+        step.output === id
+      );
     default:
       return false;
   }
@@ -749,6 +808,53 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         offsetBytes,
         sliceBytes,
         dstSizeBytes,
+      });
+      continue;
+    }
+
+    // ScatterAdd: compile to a scatter_add JitStep.
+    // The Mutate effect on target allows effectDrivenAllocate to recycle
+    // target → output, avoiding a full buffer copy when sizes match.
+    if (eqn.primitive === Primitive.ScatterAdd) {
+      const params = eqn.params as PrimitiveParams<typeof Primitive.ScatterAdd>;
+      const { axis } = params;
+
+      // Resolve input JitIds: target, indices, updates
+      const resolveInput = (input: Var | Lit): JitId => {
+        if (input instanceof Var) {
+          const jv = ctx.get(input)!;
+          if (jv.type !== "imm") {
+            throw new Error("jit: ScatterAdd input is not imm");
+          }
+          return jv.arg;
+        }
+        return builder.pushLit(input as Lit);
+      };
+
+      const targetId = resolveInput(eqn.inputs[0]);
+      const indicesId = resolveInput(eqn.inputs[1]);
+      const updatesId = resolveInput(eqn.inputs[2]);
+
+      const outVar = eqn.outBinders[0];
+      const targetShape = eqn.inputs[0].aval.shape;
+      const updatesLen = eqn.inputs[2].aval.shape[axis];
+      const dtype = outVar.aval.dtype;
+      const outSizeBytes = outVar.aval.size * byteWidth(dtype);
+
+      // Allocate output buffer (same size as target — recycling may reclaim target)
+      const outId = builder.pushBuffer(outSizeBytes);
+      ctx.set(outVar, { type: "imm", arg: outId });
+
+      builder.steps.push({
+        type: "scatter_add",
+        target: targetId,
+        indices: indicesId,
+        updates: updatesId,
+        output: outId,
+        axis,
+        targetShape,
+        updatesLen,
+        dtype,
       });
       continue;
     }
@@ -1254,6 +1360,9 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
       "internal: Scan is handled specially in jitCompile, not via jitRules",
     );
   },
+  [Primitive.ScatterAdd]() {
+    throw new Error("internal: ScatterAdd is handled specially in jitCompile");
+  },
 };
 
 /** Determines how to split the Jaxpr into kernels via dataflow analysis. */
@@ -1397,6 +1506,7 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     // be black nodes with materialized inputs.
     Primitive.Scan,
     Primitive.DynamicUpdateSlice,
+    Primitive.ScatterAdd,
   ];
   for (let i = jaxpr.eqns.length - 1; i >= 0; i--) {
     const eqn = jaxpr.eqns[i];

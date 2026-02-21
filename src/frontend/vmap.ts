@@ -499,6 +499,9 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.DynamicUpdateSlice]() {
     throw new Error("DynamicUpdateSlice vmap: not yet implemented");
   },
+  [Primitive.ScatterAdd]() {
+    throw new Error("ScatterAdd vmap: not yet implemented");
+  },
   [Primitive.Scan](
     axisSize,
     args,

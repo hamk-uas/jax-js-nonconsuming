@@ -35,7 +35,6 @@ import {
   _setPACT,
   AbstractValue,
   add,
-  argsort,
   bind,
   broadcast,
   concatenate,
@@ -56,6 +55,7 @@ import {
   PrimitiveParams,
   reduce,
   reshape,
+  scatterAdd,
   ShapedArray,
   shrink,
   split,
@@ -1613,32 +1613,28 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Split);
     return [concatenate(cts, axis)];
   },
-  [Primitive.Gather]([ct], [x, ...indices], { axis, outDim }) {
+  [Primitive.Gather]([ct], [x, ...indices], { axis, outDim: _outDim }) {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Gather);
     if (indices.some((i) => i instanceof UndefPrimal))
       throw new NonlinearError(Primitive.Gather);
-    // Permutation-case transpose: when a single 1-D index gathers along one
-    // axis and the output has the same size as the input, the index is a
-    // permutation.  Its transpose is gather(ct, inverse_perm). This covers
-    // the sort/argsort JVP path.  The general case (duplicate indices,
-    // multi-axis) requires a scatter_add primitive — see future work.
-    if (
-      indices.length === 1 &&
-      axis.length === 1 &&
-      ct.shape[axis[0]] === x.aval.shape[axis[0]]
-    ) {
-      const idx = indices[0] as Tracer;
-      // argsort of the permutation gives the inverse permutation.
-      const [sortedVals, invIdx] = argsort(idx);
-      const result = gather(ct, [invIdx], axis, outDim);
-      sortedVals.dispose();
-      invIdx.dispose();
-      return [result, null];
-    }
-    throw new Error(
-      "Gather transpose rule is only implemented for permutation gathers. " +
-        "General case (duplicate indices) requires a scatter_add primitive.",
-    );
+    // Transpose of gather is scatter_add: accumulate cotangent back to
+    // source positions.  Handles both permutation and duplicate indices.
+    const idx = indices[0] as Tracer;
+    using z = zeros(x.aval.shape, { dtype: ct.dtype }) as Tracer;
+    const result = scatterAdd(z, idx, ct, axis[0]);
+    return [result, null];
+  },
+  [Primitive.ScatterAdd]([ct], [target, indices, updates], { axis }) {
+    // Transpose of scatter_add(target, indices, updates, axis):
+    //   d/d(target)  = ct  (scatter_add is additive in target → identity)
+    //   d/d(indices) = null (integer, non-differentiable)
+    //   d/d(updates) = gather(ct, indices, axis) — reverse the scatter
+    const ctTarget = target instanceof UndefPrimal ? ct : null;
+    const ctUpdates =
+      updates instanceof UndefPrimal
+        ? (gather(ct, [indices as Tracer], [axis], axis) as Tracer)
+        : null;
+    return [ctTarget, null, ctUpdates];
   },
   [Primitive.Transpose]([ct], [x], { perm }) {
     if (!(x instanceof UndefPrimal))

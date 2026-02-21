@@ -56,6 +56,7 @@ import {
   PrimitiveParams,
   reciprocal,
   reduce,
+  scatterAdd,
   sin,
   sqrt,
   Trace,
@@ -380,6 +381,18 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
       [gather(x, indices, axis, outDim)],
       [gather(dx, indicesRef, axis, outDim)],
     ];
+  },
+  [Primitive.ScatterAdd](
+    [target, indices, updates],
+    [dTarget, _dIndices, dUpdates],
+    { axis },
+  ) {
+    // d(scatter_add(target, indices, updates, axis))
+    //   = scatter_add(dTarget, indices, dUpdates, axis)
+    // Indices are not differentiable.
+    const primal = scatterAdd(target, indices, updates, axis);
+    const tangent = scatterAdd(dTarget, indices, dUpdates, axis);
+    return [[primal], [tangent]];
   },
   [Primitive.Transpose]: linearTangentsJvp(Primitive.Transpose),
   [Primitive.Broadcast]: linearTangentsJvp(Primitive.Broadcast),

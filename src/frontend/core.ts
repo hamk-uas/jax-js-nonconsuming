@@ -86,6 +86,8 @@ export enum Primitive {
   Pad = "pad",
   // Update a contiguous slice along an axis: dst[axis=offset:offset+len] = src
   DynamicUpdateSlice = "dynamic_update_slice",
+  // Atomic scatter-add: target[indices[i]] += updates[i]
+  ScatterAdd = "scatter_add",
 
   // Routines (custom lowering)
   Sort = "sort", // sort(x, axis=-1), unstable
@@ -125,6 +127,8 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.Pad]: { width: Pair[] };
   // Update a contiguous slice along a single axis: dst[axis=offset:offset+src.shape[axis]] = src
   [Primitive.DynamicUpdateSlice]: { offset: number; axis: number };
+  // Scatter-add: target[indices[i]] += updates[i] along axis
+  [Primitive.ScatterAdd]: { axis: number };
   [Primitive.TriangularSolve]: { unitDiagonal: boolean };
   [Primitive.Jit]: { name: string; jaxpr: Jaxpr; numConsts: number };
   [Primitive.Scan]: {
@@ -550,6 +554,24 @@ export function dynamicUpdateSlice(
     );
   }
   return bind1(Primitive.DynamicUpdateSlice, [dst, src], { offset, axis });
+}
+
+/**
+ * Scatter-add: `target[indices[i]] += updates[i]` along the given axis.
+ *
+ * Returns a new array equal to target but with updates[j] added at
+ * position indices[j] along `axis`. Multiple indices mapping to the
+ * same position are summed (order-independent). The original target is
+ * NOT consumed.
+ */
+export function scatterAdd(
+  target: TracerValue,
+  indices: TracerValue,
+  updates: TracerValue,
+  axis: number,
+) {
+  axis = checkAxis(axis, ndim(target));
+  return bind1(Primitive.ScatterAdd, [target, indices, updates], { axis });
 }
 
 export function triangularSolve(

@@ -78,6 +78,15 @@ const primitiveInputEffects: Partial<
     effects[0] = MemoryEffect.Mutate;
     return effects;
   },
+  // ScatterAdd mutates its first input (target) in place; indices + updates are Borrow.
+  [Primitive.ScatterAdd]: (n: number) => {
+    const effects = globalThis.Array.from(
+      { length: n },
+      () => MemoryEffect.Borrow,
+    );
+    effects[0] = MemoryEffect.Mutate;
+    return effects;
+  },
 };
 
 /** Result of verifying memory effects on a Jaxpr. */
@@ -1225,6 +1234,20 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
       throw new TypeError("dynamicUpdateSlice: unsupported shapes");
     }
     return [new ShapedArray(dst.shape, dst.dtype, dst.weakType)];
+  },
+  [Primitive.ScatterAdd]([target, indices, updates], { axis: _axis }) {
+    if (!(target instanceof ShapedArray))
+      throw new TypeError("scatter_add: target must be a shaped array");
+    if (!(indices instanceof ShapedArray))
+      throw new TypeError("scatter_add: indices must be a shaped array");
+    if (!(updates instanceof ShapedArray))
+      throw new TypeError("scatter_add: updates must be a shaped array");
+    if (indices.dtype !== DType.Int32 && indices.dtype !== DType.Uint32)
+      throw new TypeError(
+        `scatter_add: indices must be Int32 or Uint32, got ${indices.dtype}`,
+      );
+    // Output shape = target shape, output dtype = target dtype.
+    return [new ShapedArray(target.shape, target.dtype, target.weakType)];
   },
   [Primitive.Sort]([x]) {
     if (x.ndim === 0) throw new TypeError("sort: requires at least 1D input");
