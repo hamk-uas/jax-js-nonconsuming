@@ -1232,6 +1232,12 @@ allocator would conservatively allocate a new buffer for the output.
   Previously the P2 pass skipped ALL all-black-output equations, allowing kernel endpoints to
   accumulate arbitrarily many fused inputs — causing `Too many buffers (N) for WebGPU pipeline` in
   `jit(grad(assocScan))` with 3-tuple pytrees. Fixed in commit `3d6e450`.
+- **Mega-module silent corruption with non-concrete values**: `canCompileToMegaModule` must reject
+  any step with symbolic sizes (malloc or reduction). If a non-number value (e.g., `SymbolicSize`)
+  leaks through to `cg.i32.const()`, it silently encodes as 0 via NaN coercion in `encodeSigned()`,
+  producing correct shapes but identity-value results (0 for sum, -Infinity for max). A runtime
+  guard in `i32.const()` now catches this with an actionable error message. When adding new symbolic
+  size paths, check `canCompileToMegaModule` — see the MIGRATION NOTE there.
 - **`no-unnecessary-ref` autofix vs internal tracer `.ref` propagation**: The
   `jax-js/no-unnecessary-ref` eslint rule has autofix (`--fix` removes `.ref`). This is safe for
   user code but **unsafe for internal tracer plumbing** where `.ref` must propagate to inner values

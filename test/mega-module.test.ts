@@ -140,4 +140,51 @@ describe("mega-module (M6.1)", () => {
       expect(result.js()).toEqual([2, 4, 6]);
     });
   });
+
+  describe("symbolic size fallback", () => {
+    // Symbolic sizes (from polymorphic shapes / dynamic axes) must NOT be
+    // compiled into the mega-module. If canCompileToMegaModule fails to
+    // reject them, i32.const receives a SymbolicSize object → NaN → 0,
+    // making reduction loops run 0 iterations and producing identity values
+    // (0 for sum, -Infinity for max). The wasmblr guard in i32.const()
+    // catches this with an actionable error; these tests verify the
+    // step-by-step fallback produces correct results.
+    //
+    // To support symbolic sizes in the mega-module in the future, see
+    // the MIGRATION NOTE in canCompileToMegaModule (mega-module.ts).
+
+    it("reduction with reused jit and different sizes falls back correctly", () => {
+      // jit with static argnums caches by shape — but dynamic axis T means
+      // the reduction size is symbolic. The mega-module must reject this
+      // and the step-by-step path must produce correct values.
+      using f = jit((x: np.Array) => x.sum(0));
+
+      using x3 = np.ones([3, 4]);
+      using r3 = f(x3);
+      expect(r3.js()).toEqual([3, 3, 3, 3]);
+
+      using x5 = np.ones([5, 4]);
+      using r5 = f(x5);
+      expect(r5.js()).toEqual([5, 5, 5, 5]);
+    });
+
+    it("chained ops + reduction with varying shapes", () => {
+      using f = jit((x: np.Array) => x.mul(2).sum(0));
+
+      using x1 = np.array([
+        [1, 2],
+        [3, 4],
+      ]);
+      using r1 = f(x1);
+      expect(r1.js()).toEqual([8, 12]);
+
+      using x2 = np.array([
+        [10, 20],
+        [30, 40],
+        [50, 60],
+      ]);
+      using r2 = f(x2);
+      expect(r2.js()).toEqual([180, 240]);
+    });
+  });
 });

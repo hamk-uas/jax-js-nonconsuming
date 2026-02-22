@@ -75,6 +75,12 @@ export function canCompileToMegaModule(steps: JitStep[]): boolean {
         // Symbolic reduction sizes require runtime resolution via dynamicParams —
         // the mega-module inlines reduction loops with i32.const bounds, which
         // can't represent symbolic sizes. Reject and fall through to step-by-step.
+        //
+        // MIGRATION NOTE: To support symbolic reductions in mega-module, you would
+        // need to: (1) accept a reduceSize i32 param in mega_execute's signature,
+        // (2) use local.get instead of i32.const in emitReductionBody's loop bound,
+        // (3) plumb dynamicParams through executeMegaModule. This mirrors the
+        // approach used by codegenWasm() for regular kernels (see reduceSizeLocal).
         if (step.source instanceof Kernel && step.source.hasSymbolicReduction)
           return false;
         break;

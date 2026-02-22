@@ -684,6 +684,12 @@ class I32 implements Type {
   }
 
   const(i: number) {
+    assert(
+      typeof i === "number" && !Number.isNaN(i),
+      `i32.const: expected a finite number, got ${typeof i === "object" ? ((i as object).constructor?.name ?? i) : i}. ` +
+        `If this is a SymbolicSize, the caller must resolve it to a concrete number first ` +
+        `(or canCompileToMegaModule should have rejected this program).`,
+    );
     this.cg._emit(0x41);
     this.cg._emit(encodeSigned(i));
     this.cg._push(this);
@@ -751,6 +757,10 @@ class F32 implements Type {
   }
 
   const(f: number) {
+    assert(
+      typeof f === "number",
+      `f32.const: expected a number, got ${typeof f}`,
+    );
     this.cg._emit(0x43);
     const buffer = new ArrayBuffer(4);
     new DataView(buffer).setFloat32(0, f, true);
@@ -803,6 +813,10 @@ class F64 implements Type {
   }
 
   const(f: number) {
+    assert(
+      typeof f === "number",
+      `f64.const: expected a number, got ${typeof f}`,
+    );
     this.cg._emit(0x44);
     const buffer = new ArrayBuffer(8);
     new DataView(buffer).setFloat64(0, f, true);

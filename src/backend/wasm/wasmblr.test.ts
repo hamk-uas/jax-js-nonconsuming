@@ -190,4 +190,18 @@ suite("CodeGenerator", () => {
     expect(callImported(2, 3)).toBe(6); // 2 + 3 + 1
     expect(callImported(5.5, 4.5)).toBe(11); // 5.5 + 4.5 + 1
   });
+
+  test("i32.const rejects non-number values", () => {
+    const cg = new CodeGenerator();
+    // Object that would silently coerce to NaN → 0 without the guard
+    const fakeSymbolic = { factor: 4, syms: ["T"] };
+    expect(() => cg.i32.const(fakeSymbolic as unknown as number)).toThrow(
+      /i32\.const.*SymbolicSize|i32\.const.*expected.*finite number/,
+    );
+  });
+
+  test("i32.const rejects NaN", () => {
+    const cg = new CodeGenerator();
+    expect(() => cg.i32.const(NaN)).toThrow(/i32\.const/);
+  });
 });
