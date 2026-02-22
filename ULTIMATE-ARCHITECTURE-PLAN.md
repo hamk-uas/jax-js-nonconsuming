@@ -1355,7 +1355,7 @@ type AssocScanPlan =
 `jit({ dynamic_axes })` wrapping `associativeScan` handles different input lengths without
 recompilation. Performance matches or exceeds `lax.scan`'s compiled-loop for associative bodies.
 
-#### M7.3 — Multithreaded Kogge-Stone (depends on M5/M6.2c)
+#### M7.3 — Multithreaded Kogge-Stone (depends on M5/M6.2c) ✅ DONE
 
 **What:** Parallelize the inner per-element loop across workers using the M6.2c orchestrator-worker
 
