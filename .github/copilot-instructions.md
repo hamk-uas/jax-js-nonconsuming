@@ -278,14 +278,14 @@ import { setDebug } from "@hamk-uas/jax-js-nonconsuming";
 setDebug(1); // Enable debug logging BEFORE any jit compilation
 ```
 
-| Level | Output                                           |
-| ----- | ------------------------------------------------ |
-| 0     | No debug output (default)                        |
-| 1     | JIT compile logs, scan path selection            |
-| 2     | Shader code (WGSL/WebAssembly), detailed tracing |
-| 3     | Expressions and metadata                         |
-| 4     | JIT programs, tuning details                     |
-| 5     | Most verbose operation traces                    |
+| Level | Output                                                                   |
+| ----- | ------------------------------------------------------------------------ |
+| 0     | No debug output (default)                                                |
+| 1     | JIT compile logs, scan path selection, mega-module summary               |
+| 2     | Shader code (WGSL/WebAssembly), detailed tracing, mega-module per-kernel |
+| 3     | Expressions and metadata                                                 |
+| 4     | JIT programs, tuning details, mega-module WASM hex dump                  |
+| 5     | Most verbose operation traces                                            |
 
 ### WebGPU testing on headless servers
 
@@ -1096,7 +1096,8 @@ dispatches. This is the M6.1 milestone.
 
 **Key exports:**
 
-- `WasmMegaModule` — interface: `{ module, numInputs, numOutputs, outputSizes }`
+- `WasmMegaModule` — interface: `{ module, numInputs, numOutputs, outputSizes, kernelExports }`
+- `ExtractedKernelInfo` — per-kernel metadata: `{ name, size, isReduction, nInputs, nOutputs }`
 - `canCompileToMegaModule(steps)` — returns `false` for `incref`, `scan`, `dus`, `scatter_add`,
   `assoc_scan`, Routine steps, or symbolic `malloc` sizes
 - `compileToMegaModule(steps, inputIds, outputIds)` — returns compiled module or `null`
@@ -1113,12 +1114,27 @@ buffer allocations.
 
 **Step translation:**
 
-| JitStep   | WASM translation                                          |
-| --------- | --------------------------------------------------------- |
-| `malloc`  | `local.set(id, call $alloc(size))` — imported alloc       |
-| `free`    | `call $free(local.get(id))` — imported free               |
-| `recycle` | `local.set(new, local.get(old))` — zero-cost local rename |
-| `execute` | Inline kernel gidx loop body (no function call overhead)  |
+| JitStep   | WASM translation                                                            |
+| --------- | --------------------------------------------------------------------------- |
+| `malloc`  | `local.set(id, call $alloc(size))` — imported alloc                         |
+| `free`    | `call $free(local.get(id))` — imported free                                 |
+| `recycle` | `local.set(new, local.get(old))` — zero-cost local rename                   |
+| `execute` | `call $kernel_N(0, size, ...ptrs)` — extracted function (M6.2a)             |
+| `execute` | Inlined reduction loop (reductions stay in `mega_execute`, not extractable) |
+
+**Extracted kernel functions (M6.2a):**
+
+Non-reduction kernels are compiled as separate WASM functions with signature
+`(start: i32, end: i32, ...bufPtrs: i32[]) → void` and exported from the module (e.g., `kernel_0`,
+`kernel_1`). `mega_execute` calls them via direct `call $kernel_N(0, size, ...)`. V8 inlines these
+at runtime, so serial performance is unchanged. Reduction kernels remain inlined in `mega_execute`
+because they have accumulator dependencies that prevent parallel decomposition.
+
+**Debug logging:**
+
+`setDebug(1)` prints a one-line summary after compilation (step count, kernel count, extracted vs
+inlined, WASM byte size). `setDebug(2)` adds per-kernel detail lines (name, size, reduction status,
+input/output counts). `setDebug(4)` dumps the full WASM binary as hex for `wasm-dis` inspection.
 
 **What it catches vs. what it rejects:**
 
@@ -2394,16 +2410,16 @@ contributors should be aware of:
 
 ### Test files
 
-| File                            | Purpose                                         |
-| ------------------------------- | ----------------------------------------------- |
-| `test/lax-scan.test.ts`         | Main scan test suite (~1880 lines)              |
-| `test/scan-backends.test.ts`    | Backend coverage & `copyBufferToBuffer` checks  |
-| `test/scan-bench.test.ts`       | Scan benchmark tests                            |
-| `test/deno/webgpu.test.ts`      | Headless WebGPU tests via Deno                  |
-| `test/deno/pool-memory.test.ts` | Pool peak memory guarantee (Deno WebGPU)        |
-| `test/deno/scan.bench.ts`       | Deno WebGPU scan benchmarks                     |
-| `test/wasm-parallel.test.ts`    | WASM parallel dispatch + kernel signature (M5)  |
-| `test/mega-module.test.ts`      | Mega-module correctness + leak detection (M6.1) |
+| File                            | Purpose                                                                    |
+| ------------------------------- | -------------------------------------------------------------------------- |
+| `test/lax-scan.test.ts`         | Main scan test suite (~1880 lines)                                         |
+| `test/scan-backends.test.ts`    | Backend coverage & `copyBufferToBuffer` checks                             |
+| `test/scan-bench.test.ts`       | Scan benchmark tests                                                       |
+| `test/deno/webgpu.test.ts`      | Headless WebGPU tests via Deno                                             |
+| `test/deno/pool-memory.test.ts` | Pool peak memory guarantee (Deno WebGPU)                                   |
+| `test/deno/scan.bench.ts`       | Deno WebGPU scan benchmarks                                                |
+| `test/wasm-parallel.test.ts`    | WASM parallel dispatch + kernel signature (M5)                             |
+| `test/mega-module.test.ts`      | Mega-module correctness + leak detection (M6.1), extracted kernels (M6.2a) |
 
 ### Deno WebGPU & leak detection
 
