@@ -33,6 +33,20 @@ import {
 } from "../wasm";
 import { CodeGenerator } from "./wasmblr";
 
+/** Info about an extracted kernel function (M6.2a). */
+export interface ExtractedKernelInfo {
+  /** Export name (e.g., "kernel_0"). */
+  readonly name: string;
+  /** Number of elements this kernel processes. */
+  readonly size: number;
+  /** Whether this kernel has a reduction (kept inlined, not extracted). */
+  readonly isReduction: boolean;
+  /** Number of input buffer params (after start, end). */
+  readonly nInputs: number;
+  /** Number of output buffer params. */
+  readonly nOutputs: number;
+}
+
 /** Result of compiling a JitProgram into a mega-module. */
 export interface WasmMegaModule {
   /** The compiled WebAssembly module. */
@@ -48,6 +62,13 @@ export interface WasmMegaModule {
    * Empty if all steps were compiled.
    */
   readonly unsupportedSteps: string[];
+  /**
+   * Info about extracted kernel functions (M6.2a).
+   * Non-reduction kernels are extracted into separate WASM functions with
+   * (start, end, ...bufs) signatures, callable independently by workers.
+   * Reduction kernels remain inlined in mega_execute.
+   */
+  readonly kernelExports: ExtractedKernelInfo[];
 }
 
 /**
@@ -207,6 +228,55 @@ export function compileToMegaModule(
   // Import math helper functions (reuse shared helper from wasm.ts)
   const funcs = importWasmHelperFuncs(cg, allOps);
 
+  // --- M6.2a: Extract non-reduction kernels into separate WASM functions ---
+  // Each extracted function has signature: (start: i32, end: i32, ...bufs: i32[]) => void
+  // mega_execute calls them via direct `call` with (0, size, ...bufLocals).
+  // V8's TurboFan inlines these back in the serial path (zero overhead).
+  // The exports enable M6.2b/c to call them from workers with sub-ranges.
+  const extractedForStep = new Map<
+    number,
+    { funcRef: number; exportName: string; nInputs: number; nOutputs: number }
+  >();
+  const kernelExports: ExtractedKernelInfo[] = [];
+  let kernelCounter = 0;
+
+  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+    const step = steps[stepIdx];
+    if (step.type === "execute" && step.source instanceof Kernel) {
+      const kernel = step.source;
+      const isReduction = kernel.hasReduction;
+      const kernelSize = kernel.size as number;
+      const exportName = `kernel_${kernelCounter}`;
+
+      if (!isReduction) {
+        // Extract into a separate WASM function
+        const funcRef = emitExtractedKernelFunc(
+          cg,
+          funcs,
+          kernel,
+          step.inputs.length,
+          step.outputs.length,
+        );
+        cg.export(funcRef, exportName);
+        extractedForStep.set(stepIdx, {
+          funcRef,
+          exportName,
+          nInputs: step.inputs.length,
+          nOutputs: step.outputs.length,
+        });
+      }
+
+      kernelExports.push({
+        name: exportName,
+        size: kernelSize,
+        isReduction,
+        nInputs: step.inputs.length,
+        nOutputs: step.outputs.length,
+      });
+      kernelCounter++;
+    }
+  }
+
   // Build function: mega_execute(input0..inputN, resultBufPtr) -> void
   const numInputParams = inputIds.length;
   const totalParams = numInputParams + 1; // +1 for resultBufPtr
@@ -267,13 +337,29 @@ export function compileToMegaModule(
 
         case "execute": {
           if (step.source instanceof Kernel) {
-            emitInlinedKernel(
-              cg,
-              funcs,
-              step.source,
-              step.inputs.map((id) => jitIdLocals.get(id)!),
-              step.outputs.map((id) => jitIdLocals.get(id)!),
-            );
+            const extracted = extractedForStep.get(stepIdx);
+            if (extracted) {
+              // M6.2a: call extracted kernel function with (0, size, ...bufs)
+              const kernelSize = step.source.size as number;
+              cg.i32.const(0); // start
+              cg.i32.const(kernelSize); // end
+              for (const id of step.inputs) {
+                cg.local.get(jitIdLocals.get(id)!);
+              }
+              for (const id of step.outputs) {
+                cg.local.get(jitIdLocals.get(id)!);
+              }
+              cg.call(extracted.funcRef);
+            } else {
+              // Reduction kernel: keep inlined in mega_execute
+              emitInlinedKernel(
+                cg,
+                funcs,
+                step.source,
+                step.inputs.map((id) => jitIdLocals.get(id)!),
+                step.outputs.map((id) => jitIdLocals.get(id)!),
+              );
+            }
           }
           break;
         }
@@ -305,15 +391,212 @@ export function compileToMegaModule(
     numOutputs: outputIds.length,
     outputSizes,
     unsupportedSteps: [],
+    kernelExports,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Inline kernel emission
+// Extracted kernel functions (M6.2a)
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit a separate WASM function for a non-reduction kernel.
+ *
+ * Signature: (start: i32, end: i32, inBuf0: i32, ..., outBuf0: i32, ...) => void
+ *
+ * The gidx loop runs [start, end) instead of [0, size). Buffer pointers
+ * are function parameters, not mega_execute locals. This makes the function
+ * independently callable by workers with sub-ranges for M6.2c.
+ *
+ * V8's TurboFan inlines direct `call` to these functions when called from
+ * mega_execute, so serial performance is unchanged.
+ */
+function emitExtractedKernelFunc(
+  cg: CodeGenerator,
+  funcs: Record<string, number>,
+  kernel: Kernel,
+  nInputs: number,
+  nOutputs: number,
+): number {
+  // Params: (start, end, inBuf0..inBufN, outBuf0..outBufM)
+  const nBufParams = nInputs + nOutputs;
+  const paramTypes = rep(2 + nBufParams, cg.i32); // start, end, ...bufs
+
+  return cg.function(paramTypes, [], () => {
+    // Param indices:
+    // 0 = start, 1 = end
+    // 2..2+nInputs-1 = input buffer pointers
+    // 2+nInputs..2+nInputs+nOutputs-1 = output buffer pointers
+    const startParam = 0;
+    const endParam = 1;
+    const inputLocals = Array.from({ length: nInputs }, (_, i) => 2 + i);
+    const outputLocals = Array.from(
+      { length: nOutputs },
+      (_, i) => 2 + nInputs + i,
+    );
+
+    if (kernel.isMultiOutput) {
+      emitExtractedMultiOutputBody(
+        cg,
+        funcs,
+        kernel,
+        inputLocals,
+        outputLocals,
+        startParam,
+        endParam,
+      );
+    } else {
+      emitExtractedSingleOutputBody(
+        cg,
+        funcs,
+        kernel,
+        inputLocals,
+        outputLocals[0],
+        startParam,
+        endParam,
+      );
+    }
+  });
+}
+
+/**
+ * Emit the body of an extracted single-output kernel function.
+ * gidx loop runs [startParam, endParam).
+ */
+function emitExtractedSingleOutputBody(
+  cg: CodeGenerator,
+  funcs: Record<string, number>,
+  kernel: Kernel,
+  inputLocals: number[],
+  outputLocal: number,
+  startParam: number,
+  endParam: number,
+): void {
+  const tune = tuneNullopt(kernel);
+  const out = kernel.outputs[0];
+  const storeAlign = Math.log2(byteWidth(out.dtype));
+
+  const gidx = cg.local.declare(cg.i32);
+
+  // gidx = start
+  cg.local.get(startParam);
+  cg.local.set(gidx);
+
+  // loop
+  cg.loop(cg.void);
+  {
+    // if (gidx >= end) break
+    cg.block(cg.void);
+    cg.local.get(gidx);
+    cg.local.get(endParam);
+    cg.i32.ge_u();
+    cg.br_if(0);
+
+    // Output address: outputLocal + gidx * byteWidth
+    cg.local.get(outputLocal);
+    cg.local.get(gidx);
+    cg.i32.const(byteWidth(out.dtype));
+    cg.i32.mul();
+    cg.i32.add();
+
+    // Translate expression
+    translateExpMega(cg, funcs, tune.exp, gidx, inputLocals);
+
+    // Store result
+    dty(cg, null, out.dtype).store(storeAlign);
+
+    // gidx++
+    cg.local.get(gidx);
+    cg.i32.const(1);
+    cg.i32.add();
+    cg.local.set(gidx);
+
+    cg.br(1);
+    cg.end();
+  }
+  cg.end();
+}
+
+/**
+ * Emit the body of an extracted multi-output kernel function.
+ * gidx loop runs [startParam, endParam).
+ */
+function emitExtractedMultiOutputBody(
+  cg: CodeGenerator,
+  funcs: Record<string, number>,
+  kernel: Kernel,
+  inputLocals: number[],
+  outputLocals: number[],
+  startParam: number,
+  endParam: number,
+): void {
+  const numOutputs = kernel.numOutputs;
+  const tunes = kernel.outputs.map((o) => {
+    const tmpKernel = Kernel.single(
+      kernel.nargs,
+      kernel.size,
+      o.exp,
+      o.reduction,
+    );
+    return tuneNullopt(tmpKernel);
+  });
+
+  const gidx = cg.local.declare(cg.i32);
+
+  // gidx = start
+  cg.local.get(startParam);
+  cg.local.set(gidx);
+
+  // loop
+  cg.loop(cg.void);
+  {
+    // if (gidx >= end) break
+    cg.block(cg.void);
+    cg.local.get(gidx);
+    cg.local.get(endParam);
+    cg.i32.ge_u();
+    cg.br_if(0);
+
+    // For each output: compute + store
+    for (let oi = 0; oi < numOutputs; oi++) {
+      const tune = tunes[oi];
+      const out = kernel.outputs[oi];
+      const storeAlign = Math.log2(byteWidth(out.dtype));
+
+      // Output address: outputLocals[oi] + gidx * byteWidth
+      cg.local.get(outputLocals[oi]);
+      cg.local.get(gidx);
+      cg.i32.const(byteWidth(out.dtype));
+      cg.i32.mul();
+      cg.i32.add();
+
+      translateExpMega(cg, funcs, tune.exp, gidx, inputLocals);
+
+      dty(cg, null, out.dtype).store(storeAlign);
+    }
+
+    // gidx++
+    cg.local.get(gidx);
+    cg.i32.const(1);
+    cg.i32.add();
+    cg.local.set(gidx);
+
+    cg.br(1);
+    cg.end();
+  }
+  cg.end();
+}
+
+// ---------------------------------------------------------------------------
+// Inline kernel emission (reduction kernels only after M6.2a)
 // ---------------------------------------------------------------------------
 
 /**
  * Emit an inlined kernel body within the mega-module.
+ *
+ * After M6.2a, this is only used for reduction kernels (which must run
+ * single-threaded due to accumulator dependencies). Non-reduction kernels
+ * are extracted into separate functions by emitExtractedKernelFunc.
  *
  * This reuses the gidx loop structure but references JitId locals
  * instead of function parameters for input/output buffers.
