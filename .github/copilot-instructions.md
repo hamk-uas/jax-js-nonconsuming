@@ -1413,6 +1413,11 @@ allocator would conservatively allocate a new buffer for the output.
   Previously the P2 pass skipped ALL all-black-output equations, allowing kernel endpoints to
   accumulate arbitrarily many fused inputs — causing `Too many buffers (N) for WebGPU pipeline` in
   `jit(grad(assocScan))` with 3-tuple pytrees. Fixed in commit `3d6e450`.
+- **WebGPU NaN comparison (`AluOp.Cmpne`) requires bitcast, not `min()` heuristic**: WGSL NaN
+  propagation is unspecified — `min(NaN, inf)` may return NaN or inf depending on driver. The
+  `AluOp.Cmpne` codegen (used by `np.isnan` via `x != x`) uses `bitcast<u32>` to inspect IEEE 754
+  bits directly: f32 NaN = exponent all-1s (`0x7F800000`) && mantissa non-zero; f16 NaN = `0x7C00`
+  && `0x03FF` non-zero. Fixed in commit `c912f52`. Do NOT revert to `min(x, inf) != x`.
 - **Mega-module silent corruption with non-concrete values**: `canCompileToMegaModule` must reject
   any step with symbolic sizes (malloc or reduction). If a non-number value (e.g., `SymbolicSize`)
   leaks through to `cg.i32.const()`, it silently encodes as 0 via NaN coercion in `encodeSigned()`,
