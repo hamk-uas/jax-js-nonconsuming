@@ -1,5 +1,10 @@
-import { checkLeaks, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
-import { afterEach, beforeEach, expect } from "vitest";
+import {
+  checkLeaks,
+  devices,
+  getBackend,
+  numpy as np,
+} from "@hamk-uas/jax-js-nonconsuming";
+import { afterAll, afterEach, beforeEach, expect } from "vitest";
 
 beforeEach(() => {
   checkLeaks.start();
@@ -8,6 +13,22 @@ beforeEach(() => {
 afterEach(() => {
   const result = checkLeaks.stop();
   expect(result.leaked, result.summary).toBe(0);
+});
+
+// Tear down background workers so vitest/Playwright can exit cleanly.
+// Without this, WasmWorkerPool and OrchestratorWorker threads keep the
+// browser tab alive indefinitely after all tests complete.
+afterAll(() => {
+  for (const dev of devices) {
+    try {
+      const b = getBackend(dev) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+      if (typeof b.destroyWorkers === "function") {
+        b.destroyWorkers();
+      }
+    } catch {
+      // Backend may not be initialized; ignore.
+    }
+  }
 });
 
 expect.extend({

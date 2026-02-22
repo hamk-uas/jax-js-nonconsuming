@@ -5,6 +5,7 @@
  * Uses merge sort on indices for stability.
  */
 
+import { configureMemoryImport } from "../shared-memory-config";
 import { CodeGenerator } from "../wasmblr";
 import { WasmHl } from "../wasmblr-hl";
 
@@ -363,7 +364,7 @@ export function buildArgsortModuleSized(
 ): Uint8Array<ArrayBuffer> {
   const cg = new CodeGenerator();
   const hl = new WasmHl(cg);
-  cg.memory.import("env", "memory");
+  configureMemoryImport(cg);
 
   const mergeFunc = genMergeIdx(cg, hl, dtype);
   const argsortFunc = genArgsortSized(cg, hl, n, dtype, mergeFunc);

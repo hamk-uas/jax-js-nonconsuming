@@ -5,6 +5,7 @@
  * Uses bottom-up merge sort which is O(n log n) and stable.
  */
 
+import { configureMemoryImport } from "../shared-memory-config";
 import { CodeGenerator } from "../wasmblr";
 import { WasmHl } from "../wasmblr-hl";
 
@@ -305,7 +306,7 @@ export function buildSortModuleSized(
 ): Uint8Array<ArrayBuffer> {
   const cg = new CodeGenerator();
   const hl = new WasmHl(cg);
-  cg.memory.import("env", "memory");
+  configureMemoryImport(cg);
 
   const mergeFunc = genMerge(cg, hl, dtype);
   const sortFunc = genSortSized(cg, hl, n, dtype, mergeFunc);

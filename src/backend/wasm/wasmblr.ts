@@ -431,11 +431,11 @@ export class CodeGenerator {
         concat(importSectionBytes, encodeString(this.memory.aString));
         concat(importSectionBytes, encodeString(this.memory.bString));
         importSectionBytes.push(0x02); // memory flag
-        if (this.memory.min && this.memory.max) {
+        if (this.memory.max > 0) {
           if (this.memory.isShared) {
-            importSectionBytes.push(0x03);
+            importSectionBytes.push(0x03); // shared + bounded
           } else {
-            importSectionBytes.push(0x01);
+            importSectionBytes.push(0x01); // bounded
           }
           concat(importSectionBytes, encodeUnsigned(this.memory.min));
           concat(importSectionBytes, encodeUnsigned(this.memory.max));
@@ -466,11 +466,11 @@ export class CodeGenerator {
     const memorySectionBytes: number[] = [];
     if (!this.memory.isImport && (this.memory.min || this.memory.max)) {
       memorySectionBytes.push(0x01); // always one memory
-      if (this.memory.min && this.memory.max) {
+      if (this.memory.max > 0) {
         if (this.memory.isShared) {
-          memorySectionBytes.push(0x03);
+          memorySectionBytes.push(0x03); // shared + bounded
         } else {
-          memorySectionBytes.push(0x01);
+          memorySectionBytes.push(0x01); // bounded
         }
         concat(memorySectionBytes, encodeUnsigned(this.memory.min));
         concat(memorySectionBytes, encodeUnsigned(this.memory.max));

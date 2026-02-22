@@ -5,6 +5,7 @@
  * Uses SIMD for the inner dot product loop when dimension >= 4.
  */
 
+import { configureMemoryImport } from "../shared-memory-config";
 import { CodeGenerator } from "../wasmblr";
 import { WasmHl } from "../wasmblr-hl";
 
@@ -254,7 +255,7 @@ function genCholeskyBatchedSized(
  */
 export function buildCholeskySimdModule(n: number): Uint8Array<ArrayBuffer> {
   const cg = new CodeGenerator();
-  cg.memory.import("env", "memory");
+  configureMemoryImport(cg);
 
   const singleFunc = genCholeskySimd(cg, n);
   const batchedFunc = genCholeskyBatchedSized(cg, n, singleFunc);

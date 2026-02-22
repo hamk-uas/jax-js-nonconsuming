@@ -5,6 +5,7 @@
  * Size specialization bakes in n, batchRows, unitDiagonal, and lower at compile time.
  */
 
+import { configureMemoryImport } from "../shared-memory-config";
 import { CodeGenerator } from "../wasmblr";
 import { WasmHl } from "../wasmblr-hl";
 
@@ -236,7 +237,7 @@ export function buildTriangularSolveModuleSized(
 ): Uint8Array<ArrayBuffer> {
   const cg = new CodeGenerator();
   const hl = new WasmHl(cg);
-  cg.memory.import("env", "memory");
+  configureMemoryImport(cg);
 
   const solveFunc = lower
     ? genSolveLowerSized(cg, hl, n, dtype, unitDiagonal)

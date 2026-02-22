@@ -117,7 +117,8 @@ When deciding what to work on, prefer work in this order:
 3. **Performance** — there is significant headroom, especially in:
    - WASM backend (SIMD is used for Cholesky f32; extending to matmul/elementwise kernels. M5 added
      `WasmWorkerPool` for parallel kernel dispatch via `SharedArrayBuffer` + Web Workers — active
-     when `crossOriginIsolated`, dispatches kernels with ≥ 4096 elements across cores).
+     when `SharedArrayBuffer` is constructable, dispatches kernels with ≥ 4096 elements across
+     cores. M6.2b added `OrchestratorWorker` for off-main-thread mega-module execution).
    - Transformer inference (currently ~1/3 of raw matmul GFLOP/s).
    - Conv2d and other operations that haven't been tuned yet.
 4. **Demos and applications** — fluid simulations, neural networks, audio processing, embedding
@@ -1171,12 +1172,83 @@ field). Programs that can't be compiled fall through to the regular step-by-step
 
 **Key files:**
 
-| File                              | Purpose                                                                    |
-| --------------------------------- | -------------------------------------------------------------------------- |
-| `src/backend/wasm/mega-module.ts` | Compiler: `compileToMegaModule()`                                          |
-| `src/backend/wasm.ts`             | `executeMegaModule()` method on WasmBackend                                |
-| `src/frontend/jit.ts`             | `_megaModule` cache + fast path in execute                                 |
-| `test/mega-module.test.ts`        | Mega-module correctness + leak detection (M6.1), extracted kernels (M6.2a) |
+| File                              | Purpose                                                                                                |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `src/backend/wasm/mega-module.ts` | Compiler: `compileToMegaModule()`                                                                      |
+| `src/backend/wasm.ts`             | `executeMegaModule()` method on WasmBackend                                                            |
+| `src/frontend/jit.ts`             | `_megaModule` cache + fast path in execute                                                             |
+| `test/mega-module.test.ts`        | Mega-module correctness + leak detection (M6.1), extracted kernels (M6.2a), orchestrator tests (M6.2b) |
+| `test/deno/orchestrator.test.ts`  | Deno-only orchestrator + worker pool tests (12 tests, requires native SAB)                             |
+
+## Orchestrator Worker (M6.2b — Off-Main-Thread Mega-Module)
+
+The orchestrator worker (`src/backend/wasm/orchestrator.ts`) moves mega-module execution off the
+main thread via a dedicated Web Worker. This eliminates main-thread blocking during WASM execution
+and is a prerequisite for M6.2c (parallel kernel dispatch within the worker).
+
+**Architecture:**
+
+```
+Main thread                          Worker thread
+─────────────────────────────────────────────────────────
+jit(f)(x)
+  → executeMegaModule(module, inputs)
+    → orchestrator.dispatch(moduleId, ptrs, resultBuf)
+      ── postMessage({type:"dispatch"}) ──→
+                                        instantiate module
+                                        call mega_execute()
+                                        ←── postMessage({type:"done"}) ──
+    ← resolve Promise with output slots
+```
+
+The worker shares the same `WebAssembly.Memory` (via `SharedArrayBuffer`) as the main thread, so
+input/output data is zero-copy — only metadata (module bytes, pointer offsets, result buffer
+address) crosses the postMessage boundary.
+
+**Key design decisions:**
+
+- **Module registration + caching:** Compiled WASM module bytes are sent to the worker once via
+  `registerModule()`, which returns a numeric `moduleId`. Subsequent `dispatch()` calls reference
+  the cached module by ID, avoiding repeated module transfer.
+- **Lazy creation:** `WasmBackend.#orchestrator` uses three-state tracking (`undefined` = not
+  attempted, `null` = unavailable, instance = created). The `#getOrchestrator()` private method
+  creates it on first mega-module execution, only when `SharedArrayBuffer` is constructable.
+- **Module Workers:** Both `orchestrator.ts` and `worker-pool.ts` use
+  `new Worker(url, { type: "module" })` (not classic workers). Deno requires module workers for blob
+  URL workers; Chromium supports both.
+- **SAB detection:** Uses constructability test
+  `try { new SharedArrayBuffer(1).byteLength === 1 } catch { false }` instead of
+  `crossOriginIsolated`. This works in Deno (native SAB support) and browsers (with COOP/COEP
+  headers).
+- **PostMessage-based wake:** The worker uses pure `postMessage`/`onmessage` protocol (no
+  `Atomics.wait` on the main thread). The main thread creates a `Promise` per dispatch and resolves
+  it when the worker posts `{type: "done"}`.
+
+**SharedArrayBuffer testing limitation:**
+
+Vitest's browser mode uses iframes to isolate tests. Setting COOP+COEP headers (required for
+`crossOriginIsolated=true` in browsers) breaks the iframe communication — tests hang indefinitely.
+This is a fundamental Vitest limitation, not a jax-js bug. Consequently:
+
+- **Vitest tests** (`test/mega-module.test.ts`): 8 orchestrator tests use
+  `describe.skipIf(!globalThis.crossOriginIsolated)` — always skipped in Vitest.
+- **Deno tests** (`test/deno/orchestrator.test.ts`): 12 tests exercise the full orchestrator +
+  worker pool. Deno has native `SharedArrayBuffer` support without COOP/COEP headers.
+
+**Worker cleanup:** `WasmBackend.destroyWorkers()` terminates both the orchestrator worker and the
+worker pool. Called in `test/setup.ts` `afterAll` hook to prevent worker threads from keeping the
+process alive after tests complete.
+
+**Key files:**
+
+| File                                       | Purpose                                                    |
+| ------------------------------------------ | ---------------------------------------------------------- |
+| `src/backend/wasm/orchestrator.ts`         | OrchestratorWorker: module registration + dispatch         |
+| `src/backend/wasm/worker-pool.ts`          | WasmWorkerPool: parallel kernel dispatch                   |
+| `src/backend/wasm/shared-memory-config.ts` | Shared config: `MAX_SHARED_PAGES`, `configureMemoryImport` |
+| `src/backend/wasm.ts`                      | Lazy `#getOrchestrator()`, `#getWorkerPool()`, SAB detect  |
+| `test/deno/orchestrator.test.ts`           | 12 Deno tests for orchestrator + worker pool               |
+| `test/mega-module.test.ts`                 | 8 orchestrator tests (skipped in Vitest, covered by Deno)  |
 
 ## Effect system (memory effects)
 
@@ -1273,6 +1345,10 @@ allocator would conservatively allocate a new buffer for the output.
 - **Deno WebGPU tests** (`test/deno/`): When running all Deno test files together in a single
   `deno test` invocation, GPU state pollution between files causes memory leak detection failures.
   The `test:deno` script runs each file as a separate `deno test` command (chained with `&&`).
+- **Deno associative-scan-perf test** (`test/deno/associative-scan-perf.test.ts`): The speedup
+  threshold (≥3× vs sequential scan) is hardware-dependent and fails on some machines (measured
+  ~1.3–1.4× on Intel Core Ultra 5 125H integrated GPU). This is a performance regression test, not a
+  correctness issue.
 
 ## Known framework bugs (`KNOWN_BUG` tests)
 
@@ -2410,16 +2486,17 @@ contributors should be aware of:
 
 ### Test files
 
-| File                            | Purpose                                                                    |
-| ------------------------------- | -------------------------------------------------------------------------- |
-| `test/lax-scan.test.ts`         | Main scan test suite (~1880 lines)                                         |
-| `test/scan-backends.test.ts`    | Backend coverage & `copyBufferToBuffer` checks                             |
-| `test/scan-bench.test.ts`       | Scan benchmark tests                                                       |
-| `test/deno/webgpu.test.ts`      | Headless WebGPU tests via Deno                                             |
-| `test/deno/pool-memory.test.ts` | Pool peak memory guarantee (Deno WebGPU)                                   |
-| `test/deno/scan.bench.ts`       | Deno WebGPU scan benchmarks                                                |
-| `test/wasm-parallel.test.ts`    | WASM parallel dispatch + kernel signature (M5)                             |
-| `test/mega-module.test.ts`      | Mega-module correctness + leak detection (M6.1), extracted kernels (M6.2a) |
+| File                             | Purpose                                                                                  |
+| -------------------------------- | ---------------------------------------------------------------------------------------- |
+| `test/lax-scan.test.ts`          | Main scan test suite (~1880 lines)                                                       |
+| `test/scan-backends.test.ts`     | Backend coverage & `copyBufferToBuffer` checks                                           |
+| `test/scan-bench.test.ts`        | Scan benchmark tests                                                                     |
+| `test/deno/webgpu.test.ts`       | Headless WebGPU tests via Deno                                                           |
+| `test/deno/pool-memory.test.ts`  | Pool peak memory guarantee (Deno WebGPU)                                                 |
+| `test/deno/scan.bench.ts`        | Deno WebGPU scan benchmarks                                                              |
+| `test/wasm-parallel.test.ts`     | WASM parallel dispatch + kernel signature (M5)                                           |
+| `test/mega-module.test.ts`       | Mega-module correctness + leak detection (M6.1), extracted kernels (M6.2a), orch (M6.2b) |
+| `test/deno/orchestrator.test.ts` | Orchestrator + worker pool tests (Deno-only, 12 tests)                                   |
 
 ### Deno WebGPU & leak detection
 
@@ -4063,12 +4140,12 @@ M0–M8 with dependency graph, code sketches, and test plans.
 | M3.2      | Epilogue fusion chain walk    | **DONE**        | Already implemented; verified via `stepCounts()` tests                  |
 | M4.1      | `SymDim` & shape propagation  | **DONE**        | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`                        |
 | M4.2      | Parameterized backend codegen | **DONE**        | Symbolic reduction sizes, `dynamicParams` layout, mega-module rejection |
-| M5.1      | SharedArrayBuffer memory pool | **DONE**        | Shared memory when `crossOriginIsolated`                                |
+| M5.1      | SharedArrayBuffer memory pool | **DONE**        | Shared memory when SAB constructable (Deno native, browser COOP/COEP)   |
 | M5.2      | WasmWorkerPool                | **DONE**        | Atomics-based sync dispatch via Web Workers                             |
 | M5.3      | Kernel signature + dispatch   | **DONE**        | `(start, end, ...ptrs)` + parallel dispatch wiring                      |
 | M6.1      | Mega-Module                   | **DONE**        | `compileToMegaModule()`, single WASM call, 16 tests                     |
 | M6.2a     | Extract kernel functions      | **DONE**        | Extracted WASM functions per kernel, 10 tests                           |
-| M6.2b     | Orchestrator worker           | Not done        | Mega-module runs off main thread, enables Atomics.wait                  |
+| M6.2b     | Orchestrator worker           | **DONE**        | Off-main-thread mega-module via Web Worker, 12 Deno tests               |
 | M6.2c     | Parallel kernel dispatch      | Not done        | Large kernels fan out to compute workers via dispatchSync               |
 | M7.1      | `Primitive.AssociativeScan`   | **DONE**        | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests                   |
 | M7.2      | WASM compiled Kogge-Stone     | **DONE**        | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests                |
@@ -4082,7 +4159,7 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
         ├──→ M2 (scatter_add) ✅
         ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
         ├──→ M4.1 ✅ ──→ M4.2 ✅ ──→ M6.1 ✅
-        └──→ M5 ✅ ──→ M6.2a ✅ ──→ M6.2b ❌ ──→ M6.2c ❌
+        └──→ M5 ✅ ──→ M6.2a ✅ ──→ M6.2b ✅ ──→ M6.2c ❌
                        M7.1 ✅ ──→ M7.2 ✅ ──→ M7.3 ❌ (needs M5✅+M6.2c)
                                                   ↓
                                             M8 (cleanup) ❌
@@ -4092,9 +4169,8 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
 
 Per the dependency graph, the following milestones can be worked on next:
 
-1. **M6.2b** — Orchestrator worker (depends on M6.2a ✅)
-2. **M6.2c** — Parallel kernel dispatch (depends on M6.2b + M5 ✅)
-3. **M7.3** — Multithreaded Kogge-Stone (depends on M7.2 ✅ + M6.2c)
+1. **M6.2c** — Parallel kernel dispatch (depends on M6.2b ✅ + M5 ✅)
+2. **M7.3** — Multithreaded Kogge-Stone (depends on M7.2 ✅ + M6.2c)
 
 ---
 
@@ -4171,16 +4247,19 @@ These details are frequently lost when conversation context is summarized:
 
 Decisions made during development that future agents should understand:
 
-| Decision                               | Rationale                                                                                                                                                                      |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Non-consuming ownership model          | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting                                                                                         |
-| Concrete compilation + symbolic cache  | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                                                                                             |
-| `effectDrivenAllocate` over two-pass   | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect                                                                                        |
-| Direct LU→triSolve gradient path       | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                                                                                         |
-| `transposeJaxprCache` is cache-owned   | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`                                                                                               |
-| `invariance` ≠ `strict` ESLint config  | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                                                                           |
-| WASM `(start, end, ...ptrs)` signature | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                                                                                     |
-| WASM compiled Kogge-Stone (assocScan)  | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan`                                                        |
-| Mega-module rejects pass-through       | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes                                                         |
-| `scatterAdd` not in public API         | Not exported from `src/index.ts`; bench/test import from `src/frontend/core` directly. Add to public API when stable                                                           |
-| M6.2 extracted-functions design        | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension. |
+| Decision                                        | Rationale                                                                                                                                                                      |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Non-consuming ownership model                   | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting                                                                                         |
+| Concrete compilation + symbolic cache           | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                                                                                             |
+| `effectDrivenAllocate` over two-pass            | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect                                                                                        |
+| Direct LU→triSolve gradient path                | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                                                                                         |
+| `transposeJaxprCache` is cache-owned            | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`                                                                                               |
+| `invariance` ≠ `strict` ESLint config           | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                                                                           |
+| WASM `(start, end, ...ptrs)` signature          | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                                                                                     |
+| WASM compiled Kogge-Stone (assocScan)           | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan`                                                        |
+| Mega-module rejects pass-through                | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes                                                         |
+| `scatterAdd` not in public API                  | Not exported from `src/index.ts`; bench/test import from `src/frontend/core` directly. Add to public API when stable                                                           |
+| M6.2 extracted-functions design                 | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension. |
+| Module Workers (`type: "module"`)               | Deno doesn't support classic blob-URL workers; module workers work in both Deno and Chromium. Applied to both `worker-pool.ts` and `orchestrator.ts`.                          |
+| SAB constructability over `crossOriginIsolated` | `try { new SharedArrayBuffer(1) }` works in Deno (native SAB) and browsers (with COOP/COEP); `crossOriginIsolated` is browser-only and false in Deno.                          |
+| Vitest SAB tests skipped, Deno covers           | COOP+COEP headers break Vitest's iframe runner. Orchestrator/worker pool features tested exclusively via Deno. 8 Vitest tests skip, 12 Deno tests cover.                       |

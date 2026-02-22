@@ -33,6 +33,7 @@ import {
   wasm_threefry2x32,
 } from "./wasm/builtins";
 import type { WasmMegaModule } from "./wasm/mega-module";
+import { OrchestratorWorker } from "./wasm/orchestrator";
 import {
   getArgsortModule,
   getCholeskyModule,
@@ -40,8 +41,15 @@ import {
   getSortModule,
   getTriangularSolveModule,
 } from "./wasm/routine-provider";
+import {
+  configureMemoryImport,
+  MAX_SHARED_PAGES,
+  setUseSharedMemory,
+} from "./wasm/shared-memory-config";
 import { CodeGenerator } from "./wasm/wasmblr";
 import { WasmWorkerPool } from "./wasm/worker-pool";
+
+export { configureMemoryImport } from "./wasm/shared-memory-config";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -118,9 +126,6 @@ const moduleCache = new Map<string, WebAssembly.Module>();
 // Shared memory support (M5.1)
 // ---------------------------------------------------------------------------
 
-/** Maximum pages for shared WebAssembly.Memory (256 MiB = 4096 × 64 KiB). */
-const MAX_SHARED_PAGES = 4096;
-
 /**
  * Minimum number of elements in a kernel before parallel dispatch is used.
  * Below this threshold, the overhead of worker coordination exceeds the
@@ -128,36 +133,25 @@ const MAX_SHARED_PAGES = 4096;
  */
 const PARALLEL_THRESHOLD = 4096;
 
-/**
- * Module-level flag: whether the WASM backend uses shared memory.
- * Set by WasmBackend constructor. Used by codegen paths to declare
- * memory imports as shared (required by the WebAssembly threads proposal
- * when the provided memory is a SharedArrayBuffer).
- */
-let _useSharedMemory = false;
-
-/**
- * Configure the standard memory import for a codegen unit.
- * If shared memory is active, declares the import as shared with max pages
- * so that the module can be instantiated with a SharedArrayBuffer-backed memory.
- */
-export function configureMemoryImport(cg: CodeGenerator): void {
-  const mem = cg.memory.import("env", "memory");
-  if (_useSharedMemory) {
-    mem.shared(true).pages(0, MAX_SHARED_PAGES);
-  }
-}
-
 /** Backend that compiles into WebAssembly bytecode for immediate execution. */
 export class WasmBackend implements Backend {
   readonly type: Device = "wasm";
   readonly maxArgs = 64; // Arbitrary choice
   readonly capabilities: BackendCapabilities = {
     atomicF32Add: false,
-    sharedMemory:
-      typeof globalThis.crossOriginIsolated === "boolean"
-        ? globalThis.crossOriginIsolated
-        : false,
+    // SharedArrayBuffer is available when either:
+    //   (a) crossOriginIsolated is true (COOP + COEP headers), or
+    //   (b) the browser enables it unconditionally (e.g., Chromium
+    //       --enable-features=SharedArrayBuffer; Deno; Node.js)
+    // We test constructability rather than relying on crossOriginIsolated
+    // so that the Chromium flag and non-browser runtimes work too.
+    sharedMemory: (() => {
+      try {
+        return new SharedArrayBuffer(1).byteLength === 1;
+      } catch {
+        return false;
+      }
+    })(),
     multiOutputKernel: true,
   };
 
@@ -167,12 +161,23 @@ export class WasmBackend implements Backend {
   #buffers: Map<Slot, WasmBuffer>;
   /** Cache WebAssembly instances keyed by module for reuse in dispatch. */
   #instanceCache: WeakMap<WebAssembly.Module, WebAssembly.Instance>;
-  /** Worker pool for parallel kernel dispatch (only when shared memory). */
-  #workerPool: WasmWorkerPool | null = null;
+  /**
+   * Worker pool for parallel kernel dispatch (only when shared memory).
+   * Created lazily on first parallel dispatch to avoid spawning Workers
+   * when they are never needed (most tests use arrays < PARALLEL_THRESHOLD).
+   * `undefined` = not yet attempted, `null` = attempted but failed/unsupported.
+   */
+  #workerPool: WasmWorkerPool | null | undefined = undefined;
+  /**
+   * Orchestrator worker for off-main-thread mega-module execution (M6.2b).
+   * Created lazily on first mega-module dispatch.
+   * `undefined` = not yet attempted, `null` = attempted but failed/unsupported.
+   */
+  #orchestrator: OrchestratorWorker | null | undefined = undefined;
 
   constructor() {
     const shared = this.capabilities.sharedMemory;
-    _useSharedMemory = shared;
+    setUseSharedMemory(shared);
     this.#memory = shared
       ? new WebAssembly.Memory({
           initial: 0,
@@ -184,21 +189,70 @@ export class WasmBackend implements Backend {
     this.#nextSlot = 1;
     this.#buffers = new Map();
     this.#instanceCache = new WeakMap();
+    // Workers/orchestrator are created lazily — see #getWorkerPool(), #getOrchestrator().
+  }
 
-    // Create worker pool when SharedArrayBuffer is available and Workers exist
-    if (shared && typeof Worker !== "undefined") {
-      try {
-        this.#workerPool = new WasmWorkerPool(this.#memory);
-      } catch {
-        // Worker creation can fail (e.g., CSP restrictions); fall back silently
-        this.#workerPool = null;
-      }
+  /**
+   * Lazily create or return the WasmWorkerPool.
+   * Returns null when SharedArrayBuffer or Workers are unavailable.
+   */
+  #getWorkerPool(): WasmWorkerPool | null {
+    if (this.#workerPool !== undefined) return this.#workerPool;
+    if (!this.capabilities.sharedMemory || typeof Worker === "undefined") {
+      this.#workerPool = null;
+      return null;
     }
+    try {
+      this.#workerPool = new WasmWorkerPool(this.#memory);
+    } catch {
+      // Worker creation can fail (e.g., CSP restrictions); fall back silently
+      this.#workerPool = null;
+    }
+    return this.#workerPool;
+  }
+
+  /**
+   * Lazily create or return the OrchestratorWorker.
+   * Returns null when SharedArrayBuffer or Workers are unavailable.
+   */
+  #getOrchestrator(): OrchestratorWorker | null {
+    if (this.#orchestrator !== undefined) return this.#orchestrator;
+    if (!this.capabilities.sharedMemory || typeof Worker === "undefined") {
+      this.#orchestrator = null;
+      return null;
+    }
+    try {
+      this.#orchestrator = new OrchestratorWorker(this.#memory);
+    } catch {
+      this.#orchestrator = null;
+    }
+    return this.#orchestrator;
   }
 
   /** The worker pool, if available. Exposed for testing. */
   get workerPool(): WasmWorkerPool | null {
-    return this.#workerPool;
+    return this.#workerPool ?? null;
+  }
+
+  /** The orchestrator worker, if available. Exposed for testing. */
+  get orchestrator(): OrchestratorWorker | null {
+    return this.#orchestrator ?? null;
+  }
+
+  /**
+   * Tear down background workers (worker pool + orchestrator).
+   * Called during test teardown to allow vitest/Playwright to exit cleanly.
+   * In production, browser tab close terminates workers automatically.
+   */
+  destroyWorkers(): void {
+    if (this.#workerPool) {
+      this.#workerPool.destroy();
+      this.#workerPool = null;
+    }
+    if (this.#orchestrator) {
+      this.#orchestrator.destroy();
+      this.#orchestrator = null;
+    }
   }
 
   slotCount(): number {
@@ -279,8 +333,9 @@ export class WasmBackend implements Backend {
   async prepareKernel(kernel: Kernel): Promise<Executable<WasmProgram>> {
     const exe = this.prepareKernelSync(kernel);
     // Pre-register module on workers for parallel dispatch
-    if (this.#workerPool && exe.data?.module) {
-      await this.#workerPool.registerModule(exe.data.module);
+    const pool = this.#getWorkerPool();
+    if (pool && exe.data?.module) {
+      await pool.registerModule(exe.data.module);
     }
     return exe;
   }
@@ -369,13 +424,14 @@ export class WasmBackend implements Backend {
 
     // Parallel dispatch: use workers when pool is available, module is registered,
     // and array is large enough for the overhead to pay off.
+    const pool = this.#workerPool ?? null; // use pool if already created (don't force-create here)
     if (
-      this.#workerPool &&
+      pool &&
       totalSize >= PARALLEL_THRESHOLD &&
-      this.#workerPool.isModuleReady(exe.data.module)
+      pool.isModuleReady(exe.data.module)
     ) {
-      const moduleId = this.#workerPool.getModuleId(exe.data.module)!;
-      this.#workerPool.dispatchSync(moduleId, instance, totalSize, [
+      const moduleId = pool.getModuleId(exe.data.module)!;
+      pool.dispatchSync(moduleId, instance, totalSize, [
         ...ptrs,
         ...extraArgs,
       ]);
@@ -919,22 +975,43 @@ export class WasmBackend implements Backend {
     const resultBufSize = megaModule.numOutputs * 4;
     const resultBufPtr = this.#allocator.malloc(resultBufSize);
 
-    // Get or create cached instance (with alloc/free imports)
-    let instance = this.#instanceCache.get(megaModule.module);
-    if (!instance) {
-      instance = new WebAssembly.Instance(megaModule.module, {
-        env: {
-          memory: this.#memory,
-          alloc: (size: number) => this.#allocator.malloc(size),
-          free: (ptr: number) => this.#allocator.free(ptr),
-        },
-      });
-      this.#instanceCache.set(megaModule.module, instance);
-    }
+    const orch = this.#getOrchestrator();
+    if (orch && inputPtrs.length <= 64) {
+      // --- Orchestrator path (M6.2b): off-main-thread execution ---
+      // Register the module if not already known to the orchestrator.
+      const moduleId = orch.registerModuleSync(
+        megaModule.module,
+      );
+      // Dispatch to orchestrator. The main thread spin-waits here,
+      // servicing alloc/free proxy requests via the control buffer.
+      orch.dispatch(
+        moduleId,
+        inputPtrs,
+        resultBufPtr,
+        (size: number) => this.#allocator.malloc(size),
+        (ptr: number) => this.#allocator.free(ptr),
+      );
+    } else {
+      // --- Direct execution path (fallback / no orchestrator) ---
+      // Get or create cached instance (with alloc/free imports)
+      let instance = this.#instanceCache.get(megaModule.module);
+      if (!instance) {
+        instance = new WebAssembly.Instance(megaModule.module, {
+          env: {
+            memory: this.#memory,
+            alloc: (size: number) => this.#allocator.malloc(size),
+            free: (ptr: number) => this.#allocator.free(ptr),
+          },
+        });
+        this.#instanceCache.set(megaModule.module, instance);
+      }
 
-    // Call mega_execute(input0_ptr, ..., inputN_ptr, resultBufPtr)
-    const func = instance.exports.mega_execute as (...args: number[]) => void;
-    func(...inputPtrs, resultBufPtr);
+      // Call mega_execute(input0_ptr, ..., inputN_ptr, resultBufPtr)
+      const func = instance.exports.mega_execute as (
+        ...args: number[]
+      ) => void;
+      func(...inputPtrs, resultBufPtr);
+    }
 
     // Read output pointers from result buffer and create Slots.
     // All outputs are new allocations (pass-through outputs are rejected

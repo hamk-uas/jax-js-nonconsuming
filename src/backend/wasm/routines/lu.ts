@@ -5,6 +5,7 @@
  * where L is lower-triangular with unit diagonal, U is upper-triangular.
  */
 
+import { configureMemoryImport } from "../shared-memory-config";
 import { CodeGenerator } from "../wasmblr";
 import { WasmHl } from "../wasmblr-hl";
 
@@ -347,7 +348,7 @@ export function buildLUModuleSized(
 ): Uint8Array<ArrayBuffer> {
   const cg = new CodeGenerator();
   const hl = new WasmHl(cg);
-  cg.memory.import("env", "memory");
+  configureMemoryImport(cg);
 
   const luFunc = genLUSized(cg, hl, m, n, dtype);
   const luBatchedFunc = genLUBatchedSized(cg, hl, m, n, dtype, luFunc);

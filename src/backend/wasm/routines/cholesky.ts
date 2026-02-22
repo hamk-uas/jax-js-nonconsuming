@@ -8,6 +8,7 @@
  * - Eliminate runtime size parameter overhead
  */
 
+import { configureMemoryImport } from "../shared-memory-config";
 import { CodeGenerator } from "../wasmblr";
 import { WasmHl } from "../wasmblr-hl";
 
@@ -210,7 +211,7 @@ export function buildCholeskyModuleSized(
   dtype: "f32" | "f64",
 ): Uint8Array<ArrayBuffer> {
   const cg = new CodeGenerator();
-  cg.memory.import("env", "memory");
+  configureMemoryImport(cg);
 
   const singleFunc = genCholeskySized(cg, n, dtype);
   const batchedFunc = genCholeskyBatchedSized(cg, n, dtype, singleFunc);

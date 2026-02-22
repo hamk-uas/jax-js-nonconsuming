@@ -55,7 +55,15 @@ function instantiateMega(mm: WasmMegaModule): {
   memory: WebAssembly.Memory;
   f32: Float32Array;
 } {
-  const memory = new WebAssembly.Memory({ initial: 1 });
+  // When cross-origin-isolated the mega-module binary imports a shared
+  // memory with a maximum.  Match that here so instantiation succeeds.
+  const shared =
+    typeof globalThis.crossOriginIsolated === "boolean"
+      ? globalThis.crossOriginIsolated
+      : false;
+  const memory = shared
+    ? new WebAssembly.Memory({ initial: 1, maximum: 4096, shared: true })
+    : new WebAssembly.Memory({ initial: 1 });
   const instance = new WebAssembly.Instance(mm.module, {
     env: {
       memory,
@@ -450,3 +458,83 @@ describe("extracted kernel functions (M6.2a)", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// M6.2b: Orchestrator worker (off-main-thread mega-module execution)
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!globalThis.crossOriginIsolated)(
+  "orchestrator worker (M6.2b)",
+  () => {
+    beforeAll(async () => {
+      await init("wasm");
+    });
+
+    it("backend has orchestrator when crossOriginIsolated", () => {
+      const backend = getBackend() as any;
+      expect(backend.orchestrator).not.toBeNull();
+    });
+
+    it("simple add produces correct result via orchestrator", () => {
+      using f = jit((x: np.Array) => x.add(1));
+      using x = np.array([10, 20, 30, 40]);
+      using result = f(x);
+      expect(result.js()).toEqual([11, 21, 31, 41]);
+    });
+
+    it("chained ops dispatched through orchestrator", () => {
+      using f = jit((x: np.Array) => x.add(1).mul(2).sub(3));
+      using x = np.array([1, 2, 3, 4]);
+      using result = f(x);
+      expect(result.js()).toEqual([1, 3, 5, 7]);
+    });
+
+    it("two-input operation through orchestrator", () => {
+      using f = jit((a: np.Array, b: np.Array) => a.add(b));
+      using a = np.array([1, 2, 3]);
+      using b = np.array([10, 20, 30]);
+      using result = f(a, b);
+      expect(result.js()).toEqual([11, 22, 33]);
+    });
+
+    it("mega-module with internal alloc/free proxied correctly", () => {
+      // Multi-step chain where recycling can't eliminate all alloc/free:
+      // f(x) = ((x + 1) * 2 - 3) / 4 + 5
+      using f = jit((x: np.Array) => x.add(1).mul(2).sub(3).div(4).add(5));
+      using x = np.array([3, 7, 11, 15]);
+      using result = f(x);
+      // (3+1)*2=8, 8-3=5, 5/4=1.25, 1.25+5=6.25
+      // (7+1)*2=16, 16-3=13, 13/4=3.25, 3.25+5=8.25
+      // (11+1)*2=24, 24-3=21, 21/4=5.25, 5.25+5=10.25
+      // (15+1)*2=32, 32-3=29, 29/4=7.25, 7.25+5=12.25
+      expect(result.js()).toEqual([6.25, 8.25, 10.25, 12.25]);
+    });
+
+    it("repeated dispatches use cached module registration", () => {
+      using f = jit((x: np.Array) => x.mul(3));
+      using x1 = np.array([1, 2, 3]);
+      using r1 = f(x1);
+      expect(r1.js()).toEqual([3, 6, 9]);
+
+      // Second call reuses the same registered module
+      using x2 = np.array([10, 20, 30]);
+      using r2 = f(x2);
+      expect(r2.js()).toEqual([30, 60, 90]);
+    });
+
+    it("grad through orchestrator-dispatched mega-module", () => {
+      using f = jit((x: np.Array) => x.mul(x).sum());
+      using x = np.array([1, 2, 3]);
+      using g = grad(f)(x);
+      // d/dx (x^2).sum() = 2x
+      expect(g.js()).toEqual([2, 4, 6]);
+    });
+
+    it("reduction kernel through orchestrator", () => {
+      using f = jit((x: np.Array) => x.sum());
+      using x = np.array([1, 2, 3, 4]);
+      using result = f(x);
+      expect(result.js()).toBe(10);
+    });
+  },
+);

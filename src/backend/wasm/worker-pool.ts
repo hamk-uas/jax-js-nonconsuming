@@ -2,21 +2,30 @@
  * Worker pool for parallel WASM kernel dispatch.
  *
  * Workers share a `WebAssembly.Memory` (backed by `SharedArrayBuffer`).
- * Coordination uses a shared Int32Array control buffer with per-worker state
- * managed via `Atomics.wait` (workers) and `Atomics.load` spin-wait (main thread).
+ * Coordination uses a shared Int32Array control buffer for work params
+ * and completion signaling, combined with `postMessage` for wake-up.
  *
  * Protocol (per worker):
- *   READY (0) — worker is blocked on `Atomics.wait`, idle.
- *   WORK  (1) — main thread wrote work params; worker wakes, executes, resets to READY.
+ *   1. Main thread writes work params to control buffer via Atomics.store
+ *   2. Main thread sends postMessage({ type: "wake" }) to worker
+ *   3. Worker's onmessage fires, reads params, executes kernel
+ *   4. Worker writes STATE_READY to control buffer, calls Atomics.notify
+ *   5. Main thread spin-waits on Atomics.load for STATE_READY
  *
- * Main thread spin-waits via `Atomics.load` (no `Atomics.wait` — blocked on browser main thread).
+ * This avoids Atomics.wait (blocks worker thread) and Atomics.waitAsync
+ * (creates promises that prevent browser page cleanup on exit).
+ * Workers sit in the natural browser event loop between dispatches,
+ * allowing onmessage events (register, destroy) to fire normally.
+ *
+ * Main thread spin-waits via `Atomics.load` (no `Atomics.wait` — blocked on
+ * browser main thread).
  */
 
 // ---------------------------------------------------------------------------
 // Control buffer layout constants
 // ---------------------------------------------------------------------------
 
-/** Worker is idle, waiting for work. */
+/** Worker is idle, waiting for postMessage wake-up. */
 const STATE_READY = 0;
 /** Work params written, worker should process. */
 const STATE_WORK = 1;
@@ -48,6 +57,7 @@ function buildWorkerCode(): string {
 var memory = null;
 var control = null;
 var workerIdx = -1;
+var workBase = -1;
 var instances = Object.create(null); // moduleId -> WebAssembly.Instance
 
 self.onmessage = function (e) {
@@ -57,7 +67,34 @@ self.onmessage = function (e) {
     workerIdx = msg.workerIdx;
   } else if (msg.type === "control") {
     control = new Int32Array(msg.buffer);
-    workLoop();
+    workBase = workerIdx * ${WORKER_STRIDE};
+  } else if (msg.type === "wake") {
+    // Main thread wrote work params — execute kernel
+    if (workBase < 0) return;
+    var state = Atomics.load(control, workBase + ${CTRL_STATE});
+    if (state !== ${STATE_WORK}) return; // spurious or already processed
+
+    var moduleId = Atomics.load(control, workBase + ${CTRL_MODULE_ID});
+    var start = Atomics.load(control, workBase + ${CTRL_START});
+    var end = Atomics.load(control, workBase + ${CTRL_END});
+    var numArgs = Atomics.load(control, workBase + ${CTRL_NUM_ARGS});
+
+    var args = new Array(numArgs);
+    for (var a = 0; a < numArgs; a++) {
+      args[a] = Atomics.load(control, workBase + ${CTRL_ARGS} + a);
+    }
+
+    var instance = instances[moduleId];
+    if (instance) {
+      instance.exports.kernel(start, end, args[0], args[1], args[2], args[3],
+        args[4], args[5], args[6], args[7], args[8], args[9],
+        args[10], args[11], args[12], args[13], args[14], args[15],
+        args[16], args[17], args[18], args[19]);
+    }
+
+    // Signal completion: set READY and notify main thread.
+    Atomics.store(control, workBase + ${CTRL_STATE}, ${STATE_READY});
+    Atomics.notify(control, workBase + ${CTRL_STATE});
   } else if (msg.type === "register") {
     try {
       var inst = new WebAssembly.Instance(msg.module, { env: { memory: memory } });
@@ -70,41 +107,6 @@ self.onmessage = function (e) {
     self.close();
   }
 };
-
-function workLoop() {
-  var STRIDE = ${WORKER_STRIDE};
-  var base = workerIdx * STRIDE;
-
-  while (true) {
-    // Block until state changes from READY.
-    Atomics.wait(control, base + ${CTRL_STATE}, ${STATE_READY});
-
-    var state = Atomics.load(control, base + ${CTRL_STATE});
-    if (state !== ${STATE_WORK}) continue; // spurious wakeup
-
-    var moduleId = Atomics.load(control, base + ${CTRL_MODULE_ID});
-    var start = Atomics.load(control, base + ${CTRL_START});
-    var end = Atomics.load(control, base + ${CTRL_END});
-    var numArgs = Atomics.load(control, base + ${CTRL_NUM_ARGS});
-
-    var args = new Array(numArgs);
-    for (var a = 0; a < numArgs; a++) {
-      args[a] = Atomics.load(control, base + ${CTRL_ARGS} + a);
-    }
-
-    var instance = instances[moduleId];
-    if (instance) {
-      instance.exports.kernel(start, end, args[0], args[1], args[2], args[3],
-        args[4], args[5], args[6], args[7], args[8], args[9],
-        args[10], args[11], args[12], args[13], args[14], args[15],
-        args[16], args[17], args[18], args[19]);
-    }
-
-    // Signal completion: set READY and notify main thread.
-    Atomics.store(control, base + ${CTRL_STATE}, ${STATE_READY});
-    Atomics.notify(control, base + ${CTRL_STATE});
-  }
-}
 `;
 }
 
@@ -145,7 +147,7 @@ export class WasmWorkerPool {
 
     this.#workers = [];
     for (let i = 0; i < n; i++) {
-      const w = new Worker(url);
+      const w = new Worker(url, { type: "module" });
       // Init: send shared memory
       w.postMessage({ type: "init", memory, workerIdx: i });
       // Send control buffer so worker can start its work loop
@@ -236,7 +238,7 @@ export class WasmWorkerPool {
     const nChunks = n + 1; // workers + main thread
     const chunkSize = Math.ceil(totalSize / nChunks);
 
-    // Write work params for each worker
+    // Write work params for each worker, then wake via postMessage
     for (let i = 0; i < n; i++) {
       const start = (i + 1) * chunkSize;
       const end = Math.min(start + chunkSize, totalSize);
@@ -250,9 +252,10 @@ export class WasmWorkerPool {
       for (let a = 0; a < args.length; a++) {
         Atomics.store(this.#control, base + CTRL_ARGS + a, args[a]);
       }
-      // Signal work (must be last — triggers Atomics.wait return in worker)
+      // Signal work (must be last — worker reads STATE_WORK on wake)
       Atomics.store(this.#control, base + CTRL_STATE, STATE_WORK);
-      Atomics.notify(this.#control, base + CTRL_STATE);
+      // Wake worker via postMessage (no Atomics.waitAsync/notify needed)
+      this.#workers[i].postMessage({ type: "wake" });
     }
 
     // Main thread processes chunk [0, chunkSize)
