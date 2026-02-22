@@ -4304,10 +4304,12 @@ M0–M8 with dependency graph, code sketches, and test plans.
 | M5.2      | WasmWorkerPool                | **DONE**        | Atomics-based sync dispatch via Web Workers                             |
 | M5.3      | Kernel signature + dispatch   | **DONE**        | `(start, end, ...ptrs)` + parallel dispatch wiring                      |
 | M6.1      | Mega-Module                   | **DONE**        | `compileToMegaModule()`, single WASM call, 14 tests                     |
-| M6.2      | Mega-module multithreading    | Not done        | Depends on M5 ✅ + M6.1 ✅                                              |
+| M6.2a     | Extract kernel functions      | Not done        | Refactor monolithic mega → extracted WASM functions per kernel          |
+| M6.2b     | Orchestrator worker           | Not done        | Mega-module runs off main thread, enables Atomics.wait                  |
+| M6.2c     | Parallel kernel dispatch      | Not done        | Large kernels fan out to compute workers via dispatchSync               |
 | M7.1      | `Primitive.AssociativeScan`   | **DONE**        | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests                   |
 | M7.2      | WASM compiled Kogge-Stone     | **DONE**        | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests                |
-| M7.3      | Multithreaded Kogge-Stone     | Not done        | Depends on M5✅ + M6.2                                                  |
+| M7.3      | Multithreaded Kogge-Stone     | Not done        | Depends on M5✅ + M6.2c                                                 |
 | M8        | Cleanup & benchmarking        | **In Progress** | M8.1 benchmarks ✅, M8.2 dead code audit ✅, M8.3 docs WIP              |
 
 ## Dependency Graph (Simplified)
@@ -4317,8 +4319,8 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
         ├──→ M2 (scatter_add) ✅
         ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
         ├──→ M4.1 ✅ ──→ M4.2 ✅ ──→ M6.1 ✅
-        └──→ M5 ✅ ──→ M6.2 ❌ (needs M6.1✅)
-                       M7.1 ✅ ──→ M7.2 ✅ ──→ M7.3 ❌ (needs M5✅+M6.2)
+        └──→ M5 ✅ ──→ M6.2a ❌ ──→ M6.2b ❌ ──→ M6.2c ❌
+                       M7.1 ✅ ──→ M7.2 ✅ ──→ M7.3 ❌ (needs M5✅+M6.2c)
                                                   ↓
                                             M8 (cleanup) ❌
 ```
@@ -4327,9 +4329,10 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
 
 Per the dependency graph, the following milestones can be worked on next:
 
-1. **M6.2** — Mega-Module multithreading (depends on M5 ✅ + M6.1 ✅)
-2. **M7.3** — Multithreaded Kogge-Stone (depends on M7.2 ✅ + M6.2)
-3. ~~**M4.2** completion~~ — ✅ **DONE** — Symbolic reduction sizes across all backends
+1. **M6.2a** — Extract kernel functions from monolithic mega-module (depends on M6.1 ✅)
+2. **M6.2b** — Orchestrator worker (depends on M6.2a)
+3. **M6.2c** — Parallel kernel dispatch (depends on M6.2b + M5 ✅)
+4. **M7.3** — Multithreaded Kogge-Stone (depends on M7.2 ✅ + M6.2c)
 
 ---
 
@@ -4406,15 +4409,16 @@ These details are frequently lost when conversation context is summarized:
 
 Decisions made during development that future agents should understand:
 
-| Decision                               | Rationale                                                                                                               |
-| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Non-consuming ownership model          | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting                                  |
-| Concrete compilation + symbolic cache  | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                                      |
-| `effectDrivenAllocate` over two-pass   | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect                                 |
-| Direct LU→triSolve gradient path       | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                                  |
-| `transposeJaxprCache` is cache-owned   | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`                                        |
-| `invariance` ≠ `strict` ESLint config  | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                    |
-| WASM `(start, end, ...ptrs)` signature | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                              |
-| WASM compiled Kogge-Stone (assocScan)  | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan` |
-| Mega-module rejects pass-through       | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes  |
-| `scatterAdd` not in public API         | Not exported from `src/index.ts`; bench/test import from `src/frontend/core` directly. Add to public API when stable    |
+| Decision                               | Rationale                                                                                                                                                                      |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Non-consuming ownership model          | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting                                                                                         |
+| Concrete compilation + symbolic cache  | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                                                                                             |
+| `effectDrivenAllocate` over two-pass   | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect                                                                                        |
+| Direct LU→triSolve gradient path       | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                                                                                         |
+| `transposeJaxprCache` is cache-owned   | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`                                                                                               |
+| `invariance` ≠ `strict` ESLint config  | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                                                                           |
+| WASM `(start, end, ...ptrs)` signature | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                                                                                     |
+| WASM compiled Kogge-Stone (assocScan)  | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan`                                                        |
+| Mega-module rejects pass-through       | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes                                                         |
+| `scatterAdd` not in public API         | Not exported from `src/index.ts`; bench/test import from `src/frontend/core` directly. Add to public API when stable                                                           |
+| M6.2 extracted-functions design        | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension. |

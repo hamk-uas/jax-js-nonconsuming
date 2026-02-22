@@ -937,43 +937,197 @@ call. Correctness matches step-by-step execution on all test cases.
 **What:** Wire the `WasmWorkerPool` (M5) into the mega-module. Parallelizable loops (large
 elementwise kernels) dispatch to workers without returning to JS.
 
+**Design rationale — V8 WASM function inlining:**
+
+V8's TurboFan compiler inlines WASM function calls aggressively (Chrome M137+, June 2025). Key
+findings from the [V8 blog](https://v8.dev/blog/wasm-speculative-optimizations):
+
+- V8 inlines **all WASM call types**: direct `call`, `call_ref`, `call_indirect`, plus tail-call
+  variants. Direct `call` inlining has been reliable for even longer.
+- Small functions are "almost always inlined" — heuristics heavily favor small callees.
+- There is an **inlining budget** — too many inlining sites or large functions exhaust it. In the
+  Matrix4Benchmark case, inlining 16 `call_indirect` sites crowded out more beneficial direct call
+  inlining.
+- Microbenchmark speedup: 675ms → 90ms (7.5×); real workloads: 1–8%.
+
+**Core insight:** Extracting kernel bodies into separate WASM functions is **performance-neutral for
+the serial path** (V8 inlines them back into `mega_execute`) and **enabling for the parallel path**
+(each kernel becomes independently callable with `(start, end)` range parameters). This resolves the
+design tension between the mega-module's zero-crossing benefit and per-kernel parallelism.
+
+**Inlining budget risk assessment:** Typical mega-modules have 3–7 kernel steps (well under the
+16-step budget exhaustion seen in Matrix4Benchmark). Direct `call` is cheaper than `call_indirect`.
+For programs with many steps, V8 may stop inlining some late kernels — but those would still be
+correct, just slightly slower (non-inlined call overhead is ~few ns).
+
+**Approach comparison:**
+
+| Approach                                 | Serial perf                  | Parallel capable | Alloc/free handling    | Complexity |
+| ---------------------------------------- | ---------------------------- | ---------------- | ---------------------- | ---------- |
+| Current (monolithic `mega_execute`)      | Best (compile-time inlined)  | No               | Inside WASM            | Low        |
+| **Extracted functions (per-kernel)** ✅  | Same (V8 inlines at runtime) | Yes              | Orchestrator sequences | Medium     |
+| Full orchestrator JS (no `mega_execute`) | Worse (JS↔WASM per step)    | Yes              | JS-side                | Low        |
+
+The extracted-functions approach wins because it preserves the mega-module's zero-crossing benefit
+for serial execution while enabling per-kernel parallelism.
+
+##### M6.2a — Extract Kernel Functions (refactoring, no behavior change)
+
+**What:** Refactor `compileToMegaModule()` to emit each kernel body as a separate WASM function with
+`(start, end, ...bufs)` signature, instead of inlining kernel loops directly into `mega_execute`.
+`mega_execute` calls each kernel function via direct `call` with `(0, totalSize, ...)`.
+
+**Current architecture (monolithic):**
+
+```
+mega_execute(input0..N, resultBufPtr):
+  alloc(size)
+  [inlined gidx loop for kernel 0, range [0, size)]  ← monolithic
+  free(...)
+  alloc(size)
+  [inlined gidx loop for kernel 1, range [0, size)]  ← monolithic
+  write outputs to resultBuf
+```
+
+**Refactored architecture (extracted functions):**
+
+```
+$kernel_0(start, end, buf0, buf1, out):   ← separate WASM function
+  for gidx = start..end: out[gidx] = ...
+
+$kernel_1(start, end, buf0, out):         ← separate WASM function
+  for gidx = start..end: out[gidx] = ...
+
+$mega_execute(input0..N, resultBufPtr):
+  alloc(size)
+  call $kernel_0(0, size, ...)             ← V8 inlines this at runtime
+  free(...)
+  call $kernel_1(0, size, ...)             ← V8 inlines this at runtime
+  write outputs to resultBuf
+```
+
+**Implementation details:**
+
+1. `emitInlinedKernel()` and `emitInlinedMultiOutputKernel()` are refactored to emit a separate WASM
+   function with signature `(start: i32, end: i32, ...bufPtrs: i32[]) => void`. The gidx loop runs
+   `[start, end)` instead of `[0, kernelSize)`.
+2. `mega_execute` calls each kernel function via `call $kernel_N(0, size, ...bufPtrs)`.
+3. Each kernel function is exported from the WASM module (e.g., `kernel_0`, `kernel_1`, ...) for
+   future use by compute workers.
+4. Reduction kernels are NOT extracted — they must run single-threaded (accumulator dependencies).
+   They remain inlined in `mega_execute`.
+5. The `WasmMegaModule` interface gains a `kernelExports: string[]` field listing exported kernel
+   function names and their sizes (for the orchestrator to decide parallel vs serial per kernel).
+
+**Key detail — alloc/free isolation:** The extracted kernel functions do NOT import `alloc`/`free`.
+They only process elements in `[start, end)` using buffer pointers passed as arguments. All
+allocation/deallocation remains in `mega_execute`. This means workers can instantiate the module
+with stub alloc/free imports: `{ env: { memory, alloc: () => { throw }, free: () => {} } }`.
+
+**Files touched:**
+
+- `src/backend/wasm/mega-module.ts` — refactor `emitInlinedKernel` / `emitInlinedMultiOutputKernel`
+  to emit separate WASM functions; `mega_execute` calls them via direct `call`
+
+**Test additions in** `test/mega-module.test.ts`:
+
+| Test name                                             | What it verifies                                        |
+| ----------------------------------------------------- | ------------------------------------------------------- |
+| `extracted kernel functions produce same results`     | Correctness matches monolithic mega-module              |
+| `reduction kernels remain inlined`                    | Reductions still work (not extracted)                   |
+| `kernel exports are available on the WASM module`     | Exported functions callable independently               |
+| `extracted kernel with (start, end) produces correct` | Calling exported kernel with sub-range gives same slice |
+
+**Exit criteria:** All existing `test/mega-module.test.ts` tests pass with zero regression. New
+tests verify extracted kernel functions are independently callable with `(start, end)` ranges.
+Performance benchmarks show ≤5% regression vs monolithic (V8 inlining absorbs the call overhead).
+
+**Migration verification:**
+
+```bash
+# Kernel loops should no longer be inlined directly in mega_execute:
+# emitInlinedKernel should emit a function definition, not inline code
+pnpm check
+pnpm vitest run test/mega-module.test.ts
+```
+
+##### M6.2b — Orchestrator Worker
+
+**What:** Create an orchestrator worker that runs `mega_execute` off the main thread, enabling
+`Atomics.wait` usage and future parallel dispatch.
+
 **Key constraint — `Atomics.wait` on the main thread:** Browsers forbid `Atomics.wait` (and the Wasm
 equivalent `memory.atomic.wait32`) on the main thread to prevent UI freezing. The mega-module cannot
 call `Atomics.wait` to wait for workers if it runs on the main thread. Node.js and Deno do not have
 this restriction.
 
-**Approach — orchestrator worker:** The mega-module itself runs inside a dedicated orchestrator
-worker. The main thread sends input slot pointers to the orchestrator via `postMessage` (zero-copy
-via `SharedArrayBuffer`). The orchestrator worker runs the mega-module synchronously — it CAN call
-`Atomics.wait` since it's not the main thread. Inside the module, large kernels fan out to the
-`WasmWorkerPool` via `Atomics.notify` → `Atomics.wait`:
+**Approach:** The orchestrator is a dedicated Web Worker that receives input pointers via
+`postMessage` (zero-copy via `SharedArrayBuffer`), runs `mega_execute` synchronously, and posts back
+output pointers. The main thread awaits the response.
+
+```
+Main thread                    Orchestrator Worker
+    │                               │
+    ├─ postMessage(inputPtrs) ─────→│
+    │                               ├─ mega_execute(...)
+    │                               │   ├─ call $kernel_0(0, size, ...)
+    │                               │   ├─ call $kernel_1(0, size, ...)
+    │                               │   └─ return outputs
+    │←── postMessage(outputPtrs) ───┤
+```
+
+From the `JitProgram.execute()` API perspective, this adds an async path. The existing sync
+`execute()` remains for non-threaded backends and small programs; the orchestrator path is used when
+`crossOriginIsolated` is available and program complexity warrants it.
+
+**Files touched:**
+
+- `src/backend/wasm/orchestrator-entry.ts` — new file (orchestrator worker script)
+- `src/backend/wasm/mega-module.ts` — orchestrator dispatch option
+- `src/backend/wasm.ts` — integration: orchestrator lifecycle management
+
+**Exit criteria:** `mega_execute` runs off the main thread in browser environments.
+
+##### M6.2c — Parallel Kernel Dispatch
+
+**What:** The orchestrator dispatches large kernel functions to compute workers via
+`WasmWorkerPool.dispatchSync` (using `Atomics.wait` — OK since orchestrator is not main thread).
 
 ```
 Main thread                    Orchestrator Worker           Compute Workers
     │                               │                            │
     ├─ postMessage(inputPtrs) ─────→│                            │
     │                               ├─ mega_execute(...)         │
-    │                               │   ├─ inline kernel A       │
-    │                               │   ├─ parallel kernel B:    │
-    │                               │   │   Atomics.notify ─────→│ run chunk
+    │                               │   ├─ call $kernel_0(...)   │ small → serial
+    │                               │   ├─ dispatch $kernel_1:   │
+    │                               │   │   Atomics.notify ─────→│ run chunk [s, e)
     │                               │   │   Atomics.wait ←───────│ done
-    │                               │   ├─ inline kernel C       │
+    │                               │   ├─ call $kernel_2(...)   │ small → serial
     │                               │   └─ return outputs        │
     │←── postMessage(outputPtrs) ───┤                            │
 ```
 
-From the `JitProgram.execute()` API perspective, this is async (`Promise<number[]>`). The existing
-sync `execute()` can remain for non-threaded backends; threaded execution returns a promise that
-resolves when the orchestrator posts back.
+Per-kernel decision: small kernel (< `PARALLEL_THRESHOLD`) → call directly from `mega_execute` (V8
+inlines); large kernel (≥ `PARALLEL_THRESHOLD`) → fan out to workers via `dispatchSync`.
+
+**Worker module instantiation:** Workers instantiate the mega-module with stub alloc/free imports
+since kernel functions never call alloc/free:
+
+```typescript
+{ env: { memory, alloc: () => { throw new Error("kernel called alloc"); }, free: () => {} } }
+```
+
+Workers only call the exported `$kernel_X` functions, never `mega_execute`.
 
 **Files touched:**
 
-- `src/backend/wasm/mega-module.ts` — parallel dispatch within mega-module
-- `src/backend/wasm/worker-pool.ts` — shared control block protocol, orchestrator worker
-- `src/backend/wasm/orchestrator-entry.ts` — new file (orchestrator worker script)
+- `src/backend/wasm/mega-module.ts` — per-kernel parallel/serial decision
+- `src/backend/wasm/worker-pool.ts` — orchestrator integration, mega-module kernel dispatch
+- `src/backend/wasm/orchestrator-entry.ts` — parallel dispatch logic
 
 **Exit criteria:** Complex JIT programs execute entirely in Wasm, utilizing all CPU cores. Works in
-both browsers (via orchestrator worker) and Node.js/Deno (direct main-thread execution).
+both browsers (via orchestrator worker) and Node.js/Deno (direct main-thread execution). Large
+kernels show near-linear speedup with worker count.
 
 ---
 
@@ -1201,10 +1355,11 @@ type AssocScanPlan =
 `jit({ dynamic_axes })` wrapping `associativeScan` handles different input lengths without
 recompilation. Performance matches or exceeds `lax.scan`'s compiled-loop for associative bodies.
 
-#### M7.3 — Multithreaded Kogge-Stone (depends on M5/M6.2)
+#### M7.3 — Multithreaded Kogge-Stone (depends on M5/M6.2c)
 
-**What:** Parallelize the inner per-element loop across workers using the M6.2 orchestrator-worker
-pattern.
+**What:** Parallelize the inner per-element loop across workers using the M6.2c orchestrator-worker
+
+- parallel dispatch pattern.
 
 **Feasibility:** The Kogge-Stone algorithm has natural parallelism — within each round, all elements
 `i >= stride` compute `pong[i] = fn(ping[i-stride], ping[i])` independently. Workers share ping/pong
@@ -1332,13 +1487,15 @@ M0.1 (baseline) ──→ M0.2 (capabilities)
   ├─→ M5.1 (SharedArrayBuffer) ──→ M5.2 (WorkerPool) ──→ M5.3 (parallel loops)
   │                                                              │
   │                                                              ↓
-  └─→ M6.1 (Mega-Module compiler) ────────────────────────→ M6.2 (Mega + threads)
-       (depends on M4.2 for symbolic dims)                       │
-                                                                 │
-  M7.1 (Primitive.AssociativeScan) ──→ M7.2 (WASM compiled) ────┤
-                                             │                   │
-                                             ├─ M7.3 (threaded) ┘
-                                             │  (depends on M5+M6.2)
+  └─→ M6.1 (Mega-Module compiler) ──→ M6.2a (extract kernels) ──→ M6.2b (orchestrator)
+       (depends on M4.2 for symbolic dims)                             │
+                                                                       ↓
+                                                                 M6.2c (parallel dispatch)
+                                                                       │
+  M7.1 (Primitive.AssociativeScan) ──→ M7.2 (WASM compiled) ──────────┤
+                                             │                         │
+                                             ├─ M7.3 (threaded) ──────┘
+                                             │  (depends on M5+M6.2c)
                                              │
                                              ↓
                                       M8.1 – M8.3 (cleanup)
