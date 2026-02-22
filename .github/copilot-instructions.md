@@ -1245,8 +1245,8 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 - Demos: `website/src/routes/repl/`, `website/src/routes/mobileclip/`
 - Deno WebGPU tests: `test/deno/webgpu.test.ts` — headless hardware GPU testing
 - Scan tests: `test/lax-scan.test.ts` — comprehensive scan suite (~1880 lines)
-- Associative scan tests: `test/lax-associative-scan.test.ts` — 17 tests covering correctness,
-  reverse, non-zero axis, pytrees, autodiff, parallel Kalman filter
+- Associative scan tests: `test/lax-associative-scan.test.ts` — 27 tests covering correctness,
+  reverse, non-zero axis, pytrees, autodiff, parallel Kalman filter, WASM compiled-loop
 
 ---
 
@@ -3556,13 +3556,15 @@ result[i] = fn(result[i-1], elems[i])   for i ≥ 1
 | `src/frontend/jaxpr.ts`               | Abstract eval rule                                     |
 | `src/frontend/array.ts`               | Eager `Primitive.AssociativeScan` impl                 |
 | `src/frontend/jit.ts`                 | JIT step for `Primitive.AssociativeScan`               |
+| `src/frontend/scan-plan.ts`           | `AssocScanPlan` type, `planAssociativeScan()` planning |
+| `src/backend/wasm.ts`                 | `codegenNativeAssociativeScan()` compiled-loop codegen |
 | `src/frontend/jvp.ts`                 | JVP rule (forward-mode AD with doubled inputs)         |
 | `src/frontend/linearize.ts`           | PE rule + transpose rule for `grad`                    |
 | `src/frontend/vmap.ts`                | Vmap rule (batches independent scans along batch axis) |
 
 **Export path:** `lax.associativeScan` (re-exported from `src/library/lax.ts`)
 
-**Test file:** `test/lax-associative-scan.test.ts` — 19 tests
+**Test file:** `test/lax-associative-scan.test.ts` — 27 tests
 
 ---
 
@@ -3606,9 +3608,11 @@ If body tracing fails (e.g., einsum with batch-dimension-dependent subscripts), 
 direct `associativeScanCore` which unrolls into the current trace.
 
 The Kogge-Stone rounds use high-level array primitives internally: `core.shrink` (O(1) ShapeTracker
-slice views), `core.flip`, `core.concatenate`, and `moveaxis`. There is no dedicated backend kernel
-(no compiled-loop / custom WASM module / custom WebGPU shader yet), but the primitive enables future
-backend specialization (M7.2, M7.3).
+slice views), `core.flip`, `core.concatenate`, and `moveaxis`. On **WASM**, M7.2 added a dedicated
+compiled-loop (`codegenNativeAssociativeScan()`) that compiles the entire Kogge-Stone ladder into a
+single WASM module with N as a runtime i32 parameter. On **WebGPU**, the JS-driven ceil(log₂ N)
+dispatch path is already the hardware-imposed floor — no further backend specialization is needed.
+M7.3 (multithreaded WASM) remains future work.
 
 On **WebGPU**, the resulting ceil(log₂ N) dispatches is the **hardware-imposed floor**: the JIT
 graph forces each round's `fn` output to be materialized before `Concatenate` (which requires clean
@@ -3618,9 +3622,10 @@ no cross-workgroup global barrier, making a single-dispatch compiled-loop archit
 impossible. The current implementation is already optimal for WebGPU. If `fn` contains reductions
 (e.g., matmul or `sum()`), those add extra dispatches per round.
 
-On **WASM**, a true compiled-loop is achievable: the entire Kogge-Stone ladder — stride-doubling
-loop plus ping-pong buffers — could be compiled into a single WASM module analogous to scan's
-`codegenNativeScanGeneral`, reducing ceil(log₂ N) JS→WASM crossings to one. It remains future work.
+On **WASM**, M7.2 compiled the entire Kogge-Stone ladder into a single WASM module via
+`codegenNativeAssociativeScan()`. N is a runtime i32 parameter enabling polymorphic length.
+Ping-pong buffers are allocated by the caller at dispatch time. This eliminates all ceil(log₂ N)
+JS→WASM boundary crossings.
 
 | Backend    | What each Kogge-Stone round does                                                                                                                                                                                                                                               | Performance vs `lax.scan`                                                                                                                                                                   |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -3707,8 +3712,9 @@ Previously (trace-through mode), the Jaxpr grew as O(body_ops × log N) equation
 **Why the primitive helps AD (compared to trace-through):**
 
 - **Clean IR:** One equation instead of O(log N) unrolled rounds.
-- **Backend specialization:** The JIT compiler can recognize `Primitive.AssociativeScan` and
-  potentially emit specialized WASM/WebGPU code (M7.2, M7.3).
+- **Backend specialization:** The JIT compiler recognizes `Primitive.AssociativeScan` and emits
+  specialized WASM code (M7.2 compiled-loop). WebGPU uses JS-driven dispatch (already optimal). M7.3
+  (multithreaded WASM) is future work.
 - **Consistent with `Primitive.Scan`:** Same pattern of body sub-jaxpr + transform rules.
 - **Transpose rule:** The backward pass is a reverse sequential scan, not an unrolled graph.
 
@@ -3802,7 +3808,7 @@ const composeLeak = (p, q) => ({
 | Output                       | `[finalCarry, stackedYs]`                | Full prefix result (same shape as input)                                                                                                          |
 | Complexity                   | O(N) sequential depth                    | O(N log N) total work, O(log N) depth                                                                                                             |
 | WebGPU dispatch rounds       | N (fallback) or 1 (compiled-loop)        | ceil(log₂ N) JS-driven dispatches — already the hardware-imposed floor (no cross-workgroup global barrier on WebGPU; more if `fn` has reductions) |
-| WASM/CPU dispatch rounds     | 1 compiled WASM invocation (entire loop) | ceil(log₂ N) JS→WASM round-trips + concat allocs per round                                                                                        |
+| WASM/CPU dispatch rounds     | 1 compiled WASM invocation (entire loop) | 1 compiled WASM invocation (entire Kogge-Stone ladder, M7.2); CPU: ceil(log₂ N) JS round-trips                                                    |
 | Reverse option               | ✅                                       | ✅                                                                                                                                                |
 | Pytrees                      | ✅                                       | ✅                                                                                                                                                |
 | `xs=null` / `Y=null`         | ✅                                       | N/A                                                                                                                                               |
@@ -4289,12 +4295,13 @@ These details are frequently lost when conversation context is summarized:
 
 Decisions made during development that future agents should understand:
 
-| Decision                               | Rationale                                                                                  |
-| -------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Non-consuming ownership model          | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting     |
-| Concrete compilation + symbolic cache  | Simpler than full symbolic IR; ShapeTracker needs concrete strides                         |
-| `effectDrivenAllocate` over two-pass   | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect    |
-| Direct LU→triSolve gradient path       | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                     |
-| `transposeJaxprCache` is cache-owned   | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`           |
-| `invariance` ≠ `strict` ESLint config  | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory       |
-| WASM `(start, end, ...ptrs)` signature | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen |
+| Decision                               | Rationale                                                                                                               |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Non-consuming ownership model          | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting                                  |
+| Concrete compilation + symbolic cache  | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                                      |
+| `effectDrivenAllocate` over two-pass   | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect                                 |
+| Direct LU→triSolve gradient path       | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                                  |
+| `transposeJaxprCache` is cache-owned   | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`                                        |
+| `invariance` ≠ `strict` ESLint config  | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                    |
+| WASM `(start, end, ...ptrs)` signature | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                              |
+| WASM compiled Kogge-Stone (assocScan)  | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan` |
