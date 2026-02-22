@@ -3242,7 +3242,9 @@ Current semantics in the in-repo implementation:
   `BinaryExpression` contexts (e.g., `buffer.ref++`, `buffer.ref === 0`) to avoid false positives on
   backend buffer tracking objects. For files with many intentional `.ref` calls, a file-level
   `// jax-js-lint: allow-ref` directive (in leading comments) suppresses all warnings. Per-line
-  `// jax-js-lint: allow-ref` comments are used for isolated sites.
+  `// jax-js-lint: allow-ref` comments are used for isolated sites — both on the preceding line and
+  as **inline trailing comments** on the same line (e.g., `x.ref; // jax-js-lint: allow-ref`). The
+  `hasAllowComment` function detects both styles via raw source-text scanning.
 - `jax-js/no-array-chain` deduplicates: only the outermost qualifying chain is reported, avoiding
   noisy depth-N + depth-(N-1) + ... reports for a single expression.
 - `jax-js/no-dispose-then-reassign-param` scans function bodies for adjacent
@@ -3545,11 +3547,22 @@ result[i] = fn(result[i-1], elems[i])   for i ≥ 1
 - `reverse?: boolean` — If `true`, scan right-to-left:
   `result[i] = fn(elems[i], fn(... fn(elems[i+1], elems[N-1]))...)` (default `false`).
 
-**Key file:** `src/library/lax-associative-scan.ts`
+**Key files:**
+
+| File                                  | Purpose                                                |
+| ------------------------------------- | ------------------------------------------------------ |
+| `src/library/lax-associative-scan.ts` | Public API, Kogge-Stone core, primitive-based JIT path |
+| `src/frontend/core.ts`                | `Primitive.AssociativeScan` enum + params type         |
+| `src/frontend/jaxpr.ts`               | Abstract eval rule                                     |
+| `src/frontend/array.ts`               | Eager `Primitive.AssociativeScan` impl                 |
+| `src/frontend/jit.ts`                 | JIT step for `Primitive.AssociativeScan`               |
+| `src/frontend/jvp.ts`                 | JVP rule (forward-mode AD with doubled inputs)         |
+| `src/frontend/linearize.ts`           | PE rule + transpose rule for `grad`                    |
+| `src/frontend/vmap.ts`                | Vmap rule (batches independent scans along batch axis) |
 
 **Export path:** `lax.associativeScan` (re-exported from `src/library/lax.ts`)
 
-**Test file:** `test/lax-associative-scan.test.ts` — 15 tests
+**Test file:** `test/lax-associative-scan.test.ts` — 19 tests
 
 ---
 
@@ -3586,11 +3599,16 @@ barrier between rounds, which WebGPU cannot provide within a single dispatch.
 
 ### Backend behaviour
 
-`associativeScan` is implemented in terms of high-level array primitives: `core.shrink` (O(1)
-ShapeTracker slice views), `core.flip`, `core.concatenate`, and `moveaxis`. There is still **no
-dedicated backend primitive** (no scan-style compiled-loop / custom WASM module / custom WebGPU
-shader), but eager execution routes through a cached whole-call `jit` wrapper (outside abstract
-tracing), so round orchestration is not executed as op-by-op eager dispatches.
+`associativeScan` is registered as `Primitive.AssociativeScan` with a body sub-jaxpr. When called
+outside abstract tracing (eager mode or inside `jit`), it traces the body function once via
+`makeJaxpr`, then dispatches the Kogge-Stone ladder using `evalJaxpr` per round with batched inputs.
+If body tracing fails (e.g., einsum with batch-dimension-dependent subscripts), it falls back to
+direct `associativeScanCore` which unrolls into the current trace.
+
+The Kogge-Stone rounds use high-level array primitives internally: `core.shrink` (O(1) ShapeTracker
+slice views), `core.flip`, `core.concatenate`, and `moveaxis`. There is no dedicated backend kernel
+(no compiled-loop / custom WASM module / custom WebGPU shader yet), but the primitive enables future
+backend specialization (M7.2, M7.3).
 
 On **WebGPU**, the resulting ceil(log₂ N) dispatches is the **hardware-imposed floor**: the JIT
 graph forces each round's `fn` output to be materialized before `Concatenate` (which requires clean
@@ -3660,47 +3678,39 @@ A reverse scan is implemented by:
 This is equivalent to JAX's approach and produces the inclusive right-to-left prefix:
 `result[i] = fn(elems[i], fn(elems[i+1], ... fn(elems[N-2], elems[N-1])...))`
 
-### Autodiff architecture (trace-through today, Primitive planned)
+### Autodiff architecture (`Primitive.AssociativeScan`)
 
-Unlike `lax.scan` (which registers `Primitive.Scan` with dedicated JVP, transpose, PE, and vmap
-rules), `associativeScan` currently has **no dedicated primitive** — it unrolls Kogge-Stone rounds
-directly into the traced Jaxpr. This matches Python JAX's current design.
+`associativeScan` is registered as `Primitive.AssociativeScan` with dedicated transform rules:
 
-**Future direction:** `associativeScan` should eventually become a `Primitive.AssociativeScan` with
-a body sub-jaxpr (see `ULTIMATE-ARCHITECTURE-PLAN.md` M7.1). This enables: (1) clean IR — one
-equation instead of O(log N), (2) backend specialization — WASM compiled Kogge-Stone (M7.2) and
-multithreaded inner loops (M7.3), (3) consistency with `Primitive.Scan`. AD compatibility is
-preserved: the JVP rule unrolls the Kogge-Stone ladder with doubled (primal+tangent) inputs,
-producing the same O(log N)-depth graph that AD handles naturally.
+| Transform     | Rule location          | Strategy                                                                              |
+| ------------- | ---------------------- | ------------------------------------------------------------------------------------- |
+| **JVP**       | `src/frontend/jvp.ts`  | Doubles inputs (primal+tangent), runs Kogge-Stone with JVP'd body via `jvpJaxprCache` |
+| **PE**        | `linearize.ts`         | Partial eval rule: all-unknown → opaque equation; builds transposed body for grad     |
+| **Transpose** | `linearize.ts`         | Reverse sequential scan of N-1 iterations using transposed body jaxpr                 |
+| **Vmap**      | `src/frontend/vmap.ts` | Maps independent scans along batch axis with axis permutation                         |
 
-**How it works today:** When `grad(f)` or `valueAndGrad(f)` traces through `associativeScan`, the
-`insideAbstractTrace()` check returns `true`, so `associativeScanCore()` executes directly. This
-unrolls `ceil(log₂ N)` Kogge-Stone rounds into the traced Jaxpr. Each round composes standard
-operations (`core.shrink`, `core.concatenate`, user `fn`), all of which already have JVP and
-transpose rules. The AD system automatically differentiates through the unrolled loop.
+**How autodiff works:** When `grad(f)` traces through `associativeScan`, the PE rule keeps the
+primitive opaque in the residual jaxpr. The transpose rule runs a reverse sequential scan of N-1
+iterations, applying the transposed body to propagate cotangents backward. The JVP rule uses
+`jvpJaxprCache` to cache the differentiated body jaxpr, then runs the Kogge-Stone ladder with
+doubled (primal+tangent) leaves — preserving O(log N) depth.
 
-**Jaxpr size — O(log N):** The unrolled Jaxpr grows linearly in `ceil(log₂ N)`, NOT exponentially:
+**Body tracing fallback:** If `makeJaxpr` fails to trace the body (e.g., einsum with
+batch-dimension-dependent subscripts like `"nij,njk->nik"`), the function falls back to
+`associativeScanCore` which unrolls Kogge-Stone rounds directly into the current trace. AD still
+works through the unrolled operations.
 
-| N   | Equations (add body) | Equations (matmul compose) | Rounds |
-| --- | -------------------- | -------------------------- | ------ |
-| 4   | 13                   | 36                         | 2      |
-| 8   | 19                   | 57                         | 3      |
-| 16  | 25                   | 78                         | 4      |
-| 32  | 31                   | 99                         | 5      |
-| 64  | 37                   | —                          | 6      |
-| 128 | 43                   | —                          | 7      |
+**Jaxpr IR size:** With the primitive, the Jaxpr contains a single `AssociativeScan` equation
+referencing the body sub-jaxpr — O(1) regardless of N. The body jaxpr itself is O(body_ops).
+Previously (trace-through mode), the Jaxpr grew as O(body_ops × log N) equations.
 
-This is ~6 equations/round for add and ~20 for matmul compose — constant overhead per round.
+**Why the primitive helps AD (compared to trace-through):**
 
-**Why no primitive is needed for AD (unlike `lax.scan`):**
-
-- `lax.scan` is inherently sequential (O(N) depth). Without a primitive, AD would trace N
-  iterations, producing an O(N) Jaxpr with O(N) intermediate residuals. The primitive + √N
-  checkpointing trades 2× compute for O(√N) memory.
-- `associativeScan` already has O(log N) depth. The unrolled graph has O(body_ops × log N)
-  equations. AD through this graph naturally produces O(log N) depth gradient computation. There is
-  no sequential bottleneck to optimize away — the primitive is motivated by IR cleanliness and
-  backend specialization, not AD necessity.
+- **Clean IR:** One equation instead of O(log N) unrolled rounds.
+- **Backend specialization:** The JIT compiler can recognize `Primitive.AssociativeScan` and
+  potentially emit specialized WASM/WebGPU code (M7.2, M7.3).
+- **Consistent with `Primitive.Scan`:** Same pattern of body sub-jaxpr + transform rules.
+- **Transpose rule:** The backward pass is a reverse sequential scan, not an unrolled graph.
 
 **Measured `grad` runtime (Feb 2026):**
 
@@ -3797,7 +3807,7 @@ const composeLeak = (p, q) => ({
 | Pytrees                      | ✅                                       | ✅                                                                                                                                                |
 | `xs=null` / `Y=null`         | ✅                                       | N/A                                                                                                                                               |
 | Carry state threading        | ✅                                       | N/A (output IS the prefix)                                                                                                                        |
-| Autodiff                     | ✅ (dedicated JVP/transpose rules)       | ✅ (trace-through, O(log N) depth preserved — see [Autodiff architecture](#autodiff-architecture-trace-through-no-dedicated-primitive))           |
+| Autodiff                     | ✅ (dedicated JVP/transpose rules)       | ✅ (dedicated JVP/PE/transpose/vmap rules via `Primitive.AssociativeScan`)                                                                        |
 
 **When to use which:**
 
@@ -3820,7 +3830,7 @@ const composeLeak = (p, q) => ({
 
 ## Test Coverage
 
-`test/lax-associative-scan.test.ts` — 15 tests:
+`test/lax-associative-scan.test.ts` — 19 tests:
 
 | Category                    | Tests | Notes                                                                                                                                                                                             | File                                      |
 | --------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
@@ -3828,8 +3838,10 @@ const composeLeak = (p, q) => ({
 | Reverse                     | 2     | reverse cumsum, reverse cummax                                                                                                                                                                    | `test/lax-associative-scan.test.ts`       |
 | Non-zero axis               | 2     | axis=1 and axis=0 on 2-D arrays                                                                                                                                                                   | `test/lax-associative-scan.test.ts`       |
 | Pytree (affine composition) | 1     | Composition of arity-2 pytree with internal intermediate disposal                                                                                                                                 | `test/lax-associative-scan.test.ts`       |
-| Autodiff                    | 2     | `grad` through scan, `grad(jit(scan))`                                                                                                                                                            | `test/lax-associative-scan.test.ts`       |
+| Autodiff                    | 4     | `grad`, `grad(jit)`, `jit(grad)` with 2-tuple, `jit(grad)` with 3-tuple compose                                                                                                                   | `test/lax-associative-scan.test.ts`       |
 | Parallel Kalman filter      | 2     | Sequential vs parallel correctness (8 obs), differentiable wrt obs                                                                                                                                | `test/lax-associative-scan.test.ts`       |
+| Vmap                        | 1     | `vmap(associativeScan)` batches independent scans                                                                                                                                                 | `test/lax-associative-scan.test.ts`       |
+| Einsum fallback             | 1     | Body tracing fallback for einsum with batch-dependent subscripts                                                                                                                                  | `test/lax-associative-scan.test.ts`       |
 | Deno WebGPU perf            | 1     | N=65536 prefix product: assocScan (16 JS-driven rounds, ceil(log₂ 65536)) must be ≥3× faster than scan (65536 sequential in-shader iterations on 1 GPU thread); measured ~5–8× on tested hardware | `test/deno/associative-scan-perf.test.ts` |
 
 **Kalman filter test:** Scalar constant-coefficient Kalman filter expressed as a prefix scan of
@@ -3841,15 +3853,15 @@ reference and parallel scan results are compared to 5 decimal places.
 
 ## Future Work
 
-| Priority | Feature                          | Notes                                                                                                                                                                                                                                                                                                                                                                                             |
-| -------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Medium   | `Primitive.AssociativeScan`      | Register as a primitive with body sub-jaxpr, JVP/transpose/vmap/PE rules. JVP unrolls Kogge-Stone with doubled inputs (same O(log N) depth). Enables backend specialization and clean IR. See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.1.                                                                                                                                                               |
-| Medium   | WASM compiled-loop for assocScan | Compile the full Kogge-Stone ladder into a single WASM module (analogous to scan's `codegenNativeScanGeneral`), reducing ceil(log₂ N) JS→WASM crossings to one. Depends on M7.1 (primitive) so the JIT compiler can recognize the operation. WebGPU: ceil(log₂ N) dispatches is already the hardware-imposed floor (no cross-workgroup global barrier). See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.2. |
-| Low      | Multithreaded Kogge-Stone (WASM) | Parallelize inner loop across workers via `SharedArrayBuffer` + orchestrator-worker pattern (depends on M5✅/M6.2). Expect ~3–4× speedup with 4 workers for large N. See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.3.                                                                                                                                                                                    |
-| Low      | N=0 test                         | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                                                                                                                              |
-| Low      | WebGL performance                | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                                                                                                                                             |
-| Medium   | `scatter_add` primitive          | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices. See `ULTIMATE-ARCHITECTURE-PLAN.md` M2 for full AD math, `MemoryEffect.Mutate` registration, WebGPU CAS-loop shader, and wasmblr codegen.                                                           |
-| ~~Low~~  | ~~`using` declaration examples~~ | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                                                                                                                                    |
+| Priority   | Feature                          | Notes                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~Medium~~ | ~~`Primitive.AssociativeScan`~~  | ✅ **DONE** — Registered as `Primitive.AssociativeScan` with body sub-jaxpr, JVP/transpose/vmap/PE rules. Clean IR (one equation instead of O(log N)). See M7.1.                                                                                                                                                                                                                         |
+| Medium     | WASM compiled-loop for assocScan | Compile the full Kogge-Stone ladder into a single WASM module (analogous to scan's `codegenNativeScanGeneral`), reducing ceil(log₂ N) JS→WASM crossings to one. Depends on M7.1 ✅ so the JIT compiler can recognize the operation. WebGPU: ceil(log₂ N) dispatches is already the hardware-imposed floor (no cross-workgroup global barrier). See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.2. |
+| Low        | Multithreaded Kogge-Stone (WASM) | Parallelize inner loop across workers via `SharedArrayBuffer` + orchestrator-worker pattern (depends on M5✅/M6.2). Expect ~3–4× speedup with 4 workers for large N. See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.3.                                                                                                                                                                           |
+| Low        | N=0 test                         | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                                                                                                                     |
+| Low        | WebGL performance                | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                                                                                                                                    |
+| ~~Medium~~ | ~~`scatter_add` primitive~~      | ✅ Implemented as `Primitive.ScatterAdd` with JVP + transpose rules, WebGPU CAS-loop shader, WASM sequential scatter                                                                                                                                                                                                                                                                     |
+| ~~Low~~    | ~~`using` declaration examples~~ | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                                                                                                                           |
 
 ---
 
@@ -4177,8 +4189,8 @@ M0–M8 with dependency graph, code sketches, and test plans.
 | M5.3      | Kernel signature + dispatch   | **DONE**           | `(start, end, ...ptrs)` + parallel dispatch wiring        |
 | M6.1      | Mega-Module                   | Not done           | Depends on M4.2 completion + M5 ✅                        |
 | M6.2      | Mega-module multithreading    | Not done           | Depends on M5 ✅ + M6.1                                   |
-| M7.1      | `Primitive.AssociativeScan`   | Not done           | Still unrolls; no dedicated primitive                     |
-| M7.2–7.3  | Compiled/threaded Kogge-Stone | Not done           | Depends on M7.1 + M5✅/M6.2                               |
+| M7.1      | `Primitive.AssociativeScan`   | **DONE**           | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests     |
+| M7.2–7.3  | Compiled/threaded Kogge-Stone | Not done           | Depends on M7.1 ✅ + M5✅/M6.2                            |
 | M8        | Cleanup & benchmarking        | Not done           | Depends on all others                                     |
 
 ## Dependency Graph (Simplified)
@@ -4189,7 +4201,7 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
         ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
         ├──→ M4.1 ✅ ──→ M4.2 ~done ──→ M6.1 ❌
         └──→ M5 ✅ ──→ M6.2 ❌ (needs M6.1)
-                       M7.1 ❌ ──→ M7.2 ❌ ──→ M7.3 ❌ (needs M5✅+M6.2)
+                       M7.1 ✅ ──→ M7.2 ❌ ──→ M7.3 ❌ (needs M5✅+M6.2)
                                                   ↓
                                             M8 (cleanup) ❌
 ```
@@ -4199,7 +4211,7 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
 Per the dependency graph, the following milestones can be worked on next:
 
 1. **M6.1** — Mega-Module (depends on M4.2 completion + M5 ✅)
-2. **M7.1** — `Primitive.AssociativeScan` (independent)
+2. **M7.2** — WASM compiled Kogge-Stone (depends on M7.1 ✅)
 3. **M4.2** completion — Finish parameterized backend codegen (M4.1 done)
 
 ---
