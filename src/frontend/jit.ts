@@ -344,9 +344,6 @@ export class JitProgram {
         this._megaModule = canCompileToMegaModule(this.steps)
           ? compileToMegaModule(this.steps, this.inputs, this.outputs)
           : null;
-        if (DEBUG >= 1 && this._megaModule) {
-          console.info("jit: compiled mega-module");
-        }
       }
       if (this._megaModule) {
         const outputSlots = (this.backend as WasmBackend).executeMegaModule(

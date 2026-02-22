@@ -23,7 +23,7 @@ import type { JitId, JitStep } from "../../frontend/jit";
 import { Routine } from "../../routine";
 import { isSymbolicSize, type SizeExpr } from "../../shape";
 import { tuneNullopt } from "../../tuner";
-import { mapSetUnion, rep } from "../../utils";
+import { DEBUG, mapSetUnion, rep } from "../../utils";
 import {
   codegenReductionAccumulate,
   configureMemoryImport,
@@ -384,6 +384,31 @@ export function compileToMegaModule(
 
   const bytes = cg.finish();
   const module = new WebAssembly.Module(bytes);
+
+  // --- Debug logging ---
+  if (DEBUG >= 1) {
+    const extracted = kernelExports.filter((k) => !k.isReduction).length;
+    const inlined = kernelExports.filter((k) => k.isReduction).length;
+    console.info(
+      `mega-module: ${steps.length} steps, ${kernelExports.length} kernels ` +
+        `(${extracted} extracted, ${inlined} inlined), ${bytes.length} bytes`,
+    );
+  }
+  if (DEBUG >= 2) {
+    for (const ke of kernelExports) {
+      console.info(
+        `  ${ke.name}: size=${ke.size} ${ke.isReduction ? "inlined(reduction)" : "extracted"} ` +
+          `in=${ke.nInputs} out=${ke.nOutputs}`,
+      );
+    }
+  }
+  if (DEBUG >= 4) {
+    // Hex dump for wasm-dis / wasm-tools inspection
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(
+      " ",
+    );
+    console.info(`mega-module WASM bytes (${bytes.length}):\n${hex}`);
+  }
 
   return {
     module,

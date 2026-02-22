@@ -21,6 +21,51 @@ import {
 import { makeJaxpr } from "../src/frontend/jaxpr";
 import { jitCompile } from "../src/frontend/jit";
 
+// ---------------------------------------------------------------------------
+// Shared test helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Trace a function to a Jaxpr, jitCompile it, then call
+ * compileToMegaModule on the resulting steps. Returns the WasmMegaModule.
+ */
+function compileMega(
+  f: (...args: np.Array[]) => np.Array,
+  ...args: np.Array[]
+): WasmMegaModule | null {
+  const backend = getBackend();
+  const traced = makeJaxpr(f)(...args);
+  const program = jitCompile(backend, traced.jaxpr.jaxpr);
+  const mm = compileToMegaModule(
+    program.steps,
+    program.inputs,
+    program.outputs,
+  );
+  traced.jaxpr.dispose();
+  return mm;
+}
+
+/**
+ * Instantiate a WasmMegaModule with a fresh WebAssembly.Memory and stub
+ * imports. Returns the instance, memory, and a Float32Array view.
+ * Useful for directly calling exported kernel functions in tests.
+ */
+function instantiateMega(mm: WasmMegaModule): {
+  instance: WebAssembly.Instance;
+  memory: WebAssembly.Memory;
+  f32: Float32Array;
+} {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const instance = new WebAssembly.Instance(mm.module, {
+    env: {
+      memory,
+      alloc: () => 0,
+      free: () => {},
+    },
+  });
+  return { instance, memory, f32: new Float32Array(memory.buffer) };
+}
+
 describe("mega-module (M6.1)", () => {
   beforeAll(async () => {
     await init("wasm");
@@ -207,26 +252,6 @@ describe("extracted kernel functions (M6.2a)", () => {
     await init("wasm");
   });
 
-  /**
-   * Helper: trace a function to a Jaxpr, jitCompile it, then call
-   * compileToMegaModule on the resulting steps. Returns the WasmMegaModule.
-   */
-  function compileMega(
-    f: (...args: np.Array[]) => np.Array,
-    ...args: np.Array[]
-  ): WasmMegaModule | null {
-    const backend = getBackend();
-    const traced = makeJaxpr(f)(...args);
-    const program = jitCompile(backend, traced.jaxpr.jaxpr);
-    const mm = compileToMegaModule(
-      program.steps,
-      program.inputs,
-      program.outputs,
-    );
-    traced.jaxpr.dispose();
-    return mm;
-  }
-
   describe("kernelExports metadata", () => {
     it("elementwise chain produces non-reduction exports", () => {
       using x = np.array([1, 2, 3, 4]);
@@ -296,15 +321,7 @@ describe("extracted kernel functions (M6.2a)", () => {
       }, x);
       expect(mm).not.toBeNull();
 
-      // Instantiate the module to verify exports exist
-      const memory = new WebAssembly.Memory({ initial: 1 });
-      const instance = new WebAssembly.Instance(mm!.module, {
-        env: {
-          memory,
-          alloc: () => 0,
-          free: () => {},
-        },
-      });
+      const { instance } = instantiateMega(mm!);
 
       // mega_execute should always be exported
       expect(instance.exports.mega_execute).toBeTypeOf("function");
@@ -321,14 +338,7 @@ describe("extracted kernel functions (M6.2a)", () => {
       const mm = compileMega((x: np.Array) => x.sum(), x);
       expect(mm).not.toBeNull();
 
-      const memory = new WebAssembly.Memory({ initial: 1 });
-      const instance = new WebAssembly.Instance(mm!.module, {
-        env: {
-          memory,
-          alloc: () => 0,
-          free: () => {},
-        },
-      });
+      const { instance } = instantiateMega(mm!);
 
       // Reduction kernels should be marked isReduction but not exported
       const reductions = mm!.kernelExports.filter((ke) => ke.isReduction);
@@ -351,10 +361,8 @@ describe("extracted kernel functions (M6.2a)", () => {
       const ke = nonReduction[0];
 
       // Set up memory: input at offset 256, output at offset 512
-      const memory = new WebAssembly.Memory({ initial: 1 });
-      const f32View = new Float32Array(memory.buffer);
+      const { instance, f32 } = instantiateMega(mm!);
 
-      // Write input data at byte offset 256 (element offset 64)
       const inputOffset = 256; // bytes
       const outputOffset = 512; // bytes
       const inputElemOffset = inputOffset / 4;
@@ -362,22 +370,13 @@ describe("extracted kernel functions (M6.2a)", () => {
 
       // Write 8 floats as input
       for (let i = 0; i < 8; i++) {
-        f32View[inputElemOffset + i] = (i + 1) * 10; // 10,20,...,80
+        f32[inputElemOffset + i] = (i + 1) * 10; // 10,20,...,80
       }
 
       // Zero output region
       for (let i = 0; i < 8; i++) {
-        f32View[outputElemOffset + i] = 0;
+        f32[outputElemOffset + i] = 0;
       }
-
-      // Instantiate module
-      const instance = new WebAssembly.Instance(mm!.module, {
-        env: {
-          memory,
-          alloc: () => 0,
-          free: () => {},
-        },
-      });
 
       // Call the exported kernel with sub-range [2, 5)
       const kernelFn = instance.exports[ke.name] as (...args: number[]) => void;
@@ -385,18 +384,18 @@ describe("extracted kernel functions (M6.2a)", () => {
       kernelFn(2, 5, inputOffset, outputOffset);
 
       // Elements [0,1] should be untouched (0)
-      expect(f32View[outputElemOffset + 0]).toBe(0);
-      expect(f32View[outputElemOffset + 1]).toBe(0);
+      expect(f32[outputElemOffset + 0]).toBe(0);
+      expect(f32[outputElemOffset + 1]).toBe(0);
 
       // Elements [2,3,4] should be input[i] + 1
-      expect(f32View[outputElemOffset + 2]).toBe(31); // 30 + 1
-      expect(f32View[outputElemOffset + 3]).toBe(41); // 40 + 1
-      expect(f32View[outputElemOffset + 4]).toBe(51); // 50 + 1
+      expect(f32[outputElemOffset + 2]).toBe(31); // 30 + 1
+      expect(f32[outputElemOffset + 3]).toBe(41); // 40 + 1
+      expect(f32[outputElemOffset + 4]).toBe(51); // 50 + 1
 
       // Elements [5,6,7] should be untouched (0)
-      expect(f32View[outputElemOffset + 5]).toBe(0);
-      expect(f32View[outputElemOffset + 6]).toBe(0);
-      expect(f32View[outputElemOffset + 7]).toBe(0);
+      expect(f32[outputElemOffset + 5]).toBe(0);
+      expect(f32[outputElemOffset + 6]).toBe(0);
+      expect(f32[outputElemOffset + 7]).toBe(0);
     });
 
     it("full range (0, size) matches mega_execute results", () => {
