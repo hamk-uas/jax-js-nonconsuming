@@ -1028,6 +1028,139 @@ export class WasmBackend implements Backend {
 
     return outputSlots;
   }
+
+  // ---------------------------------------------------------------------------
+  // Parallel mega-module dispatch (M6.2c)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Register a mega-module on the worker pool for parallel dispatch (M6.2c).
+   * Workers get stub alloc/free imports (they only call kernel_N functions).
+   * Must be awaited before calling executeMegaModuleParallelSync.
+   */
+  async registerMegaModuleOnPool(megaModule: WasmMegaModule): Promise<void> {
+    const pool = this.#getWorkerPool();
+    if (!pool) throw new Error("Worker pool not available");
+    if (!pool.isModuleReady(megaModule.module)) {
+      await pool.registerMegaModule(megaModule.module);
+    }
+  }
+
+  /**
+   * Execute a mega-module with JS-driven step execution, dispatching large
+   * kernels in parallel via the WasmWorkerPool (M6.2c).
+   *
+   * Instead of calling `mega_execute` (which runs all steps sequentially in
+   * WASM), this method walks the step metadata on the main thread and calls
+   * individual extracted kernel functions. Kernels with size >= PARALLEL_THRESHOLD
+   * are dispatched across workers; smaller kernels run on the main thread only.
+   *
+   * Requires: the mega-module has been registered on the worker pool via
+   * `registerMegaModuleOnPool()`.
+   */
+  executeMegaModuleParallelSync(
+    megaModule: WasmMegaModule,
+    inputSlots: Slot[],
+  ): Slot[] {
+    const pool = this.#workerPool;
+    if (!pool) throw new Error("Worker pool not available for parallel dispatch");
+
+    const moduleId = pool.getModuleId(megaModule.module)!;
+
+    // Get or create a main-thread instance (with real alloc/free imports)
+    let instance = this.#instanceCache.get(megaModule.module);
+    if (!instance) {
+      instance = new WebAssembly.Instance(megaModule.module, {
+        env: {
+          memory: this.#memory,
+          alloc: (size: number) => this.#allocator.malloc(size),
+          free: (ptr: number) => this.#allocator.free(ptr),
+        },
+      });
+      this.#instanceCache.set(megaModule.module, instance);
+    }
+
+    // Initialize locals array: map input JitId indices → pointers
+    const locals = new Array<number>(megaModule.numLocals).fill(0);
+    for (let i = 0; i < inputSlots.length; i++) {
+      locals[i] = this.#getPtr(inputSlots[i]);
+    }
+
+    // Walk step metadata, executing each step
+    for (const step of megaModule.stepInfos) {
+      switch (step.type) {
+        case "malloc":
+          locals[step.outputIdx] = this.#allocator.malloc(step.size);
+          break;
+
+        case "free":
+          this.#allocator.free(locals[step.inputIdx]);
+          locals[step.inputIdx] = 0;
+          break;
+
+        case "recycle":
+          locals[step.toIdx] = locals[step.fromIdx];
+          locals[step.fromIdx] = 0;
+          break;
+
+        case "kernel": {
+          const args = [...step.inputIdxs, ...step.outputIdxs].map(
+            (idx) => locals[idx],
+          );
+
+          if (step.kernelSize >= PARALLEL_THRESHOLD) {
+            // Parallel dispatch across workers
+            pool.dispatchSync(
+              moduleId,
+              instance,
+              step.kernelSize,
+              args,
+              step.kernelIdx,
+            );
+          } else {
+            // Serial dispatch on main thread only
+            const fn = instance.exports[
+              `kernel_${step.kernelIdx}`
+            ] as (...a: number[]) => void;
+            fn(0, step.kernelSize, ...args);
+          }
+          break;
+        }
+      }
+    }
+
+    // Read output pointers from locals and create Slots
+    const outputSlots: Slot[] = [];
+    for (let i = 0; i < megaModule.numOutputs; i++) {
+      const ptr = locals[megaModule.outputLocalIdxs[i]];
+      const slot = this.#nextSlot++;
+      this.#buffers.set(slot, {
+        ptr,
+        size: megaModule.outputSizes[i],
+        ref: 1,
+      });
+      outputSlots.push(slot);
+    }
+
+    return outputSlots;
+  }
+
+  /**
+   * Check whether a mega-module should use the parallel execution path.
+   * Returns true if SharedArrayBuffer is available AND at least one kernel
+   * has size >= PARALLEL_THRESHOLD.
+   *
+   * Pure check — does NOT lazily create the worker pool. Pool creation
+   * is deferred to {@link registerMegaModuleOnPool}.
+   */
+  shouldUseParallelMegaModule(megaModule: WasmMegaModule): boolean {
+    if (!this.capabilities.sharedMemory || typeof Worker === "undefined") {
+      return false;
+    }
+    return megaModule.stepInfos.some(
+      (s) => s.type === "kernel" && s.kernelSize >= PARALLEL_THRESHOLD,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

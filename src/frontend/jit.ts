@@ -223,6 +223,9 @@ export class JitProgram {
   readonly poolHints: PoolHints;
   /** Cached mega-module: undefined = not attempted, null = unsupported. */
   private _megaModule?: WasmMegaModule | null;
+  /** M6.2c: worker pool registration state for parallel mega-module dispatch.
+   *  undefined = not attempted, false = registering, true = ready. */
+  private _megaModulePoolReady?: boolean;
 
   constructor(
     readonly backend: Backend,
@@ -346,7 +349,42 @@ export class JitProgram {
           : null;
       }
       if (this._megaModule) {
-        const outputSlots = (this.backend as WasmBackend).executeMegaModule(
+        const wasmBackend = this.backend as WasmBackend;
+
+        // M6.2c: parallel mega-module dispatch for programs with large kernels.
+        // First call triggers async worker registration (falls through to
+        // monolithic path). Once registered, subsequent calls use the parallel
+        // path which fans out large kernels across workers.
+        if (this._megaModulePoolReady === true) {
+          // Worker pool ready — use parallel step-by-step dispatch
+          const outputSlots = wasmBackend.executeMegaModuleParallelSync(
+            this._megaModule,
+            inputs,
+          );
+          return { outputs: outputSlots, pending: [] };
+        }
+
+        if (
+          this._megaModulePoolReady === undefined &&
+          wasmBackend.shouldUseParallelMegaModule(this._megaModule)
+        ) {
+          // First call: kick off async registration, fall through to
+          // monolithic path for this invocation.
+          this._megaModulePoolReady = false;
+          const mm = this._megaModule;
+          wasmBackend
+            .registerMegaModuleOnPool(mm)
+            .then(() => {
+              this._megaModulePoolReady = true;
+            })
+            .catch(() => {
+              // Registration failed — stay on monolithic path
+              this._megaModulePoolReady = undefined;
+            });
+        }
+
+        // Monolithic path: orchestrator (M6.2b) or direct execution
+        const outputSlots = wasmBackend.executeMegaModule(
           this._megaModule,
           inputs,
         );

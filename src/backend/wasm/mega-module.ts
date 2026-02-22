@@ -39,13 +39,30 @@ export interface ExtractedKernelInfo {
   readonly name: string;
   /** Number of elements this kernel processes. */
   readonly size: number;
-  /** Whether this kernel has a reduction (kept inlined, not extracted). */
+  /** Whether this kernel has a reduction. */
   readonly isReduction: boolean;
   /** Number of input buffer params (after start, end). */
   readonly nInputs: number;
   /** Number of output buffer params. */
   readonly nOutputs: number;
 }
+
+/**
+ * Step metadata for JS-driven parallel execution (M6.2c).
+ * Describes one step in the mega-module's execution sequence so the
+ * parallel dispatch path can replicate it without calling mega_execute.
+ */
+export type MegaStepInfo =
+  | { type: "malloc"; outputIdx: number; size: number }
+  | { type: "free"; inputIdx: number }
+  | { type: "recycle"; fromIdx: number; toIdx: number }
+  | {
+      type: "kernel";
+      kernelIdx: number;
+      kernelSize: number;
+      inputIdxs: number[];
+      outputIdxs: number[];
+    };
 
 /** Result of compiling a JitProgram into a mega-module. */
 export interface WasmMegaModule {
@@ -63,12 +80,29 @@ export interface WasmMegaModule {
    */
   readonly unsupportedSteps: string[];
   /**
-   * Info about extracted kernel functions (M6.2a).
-   * Non-reduction kernels are extracted into separate WASM functions with
-   * (start, end, ...bufs) signatures, callable independently by workers.
-   * Reduction kernels remain inlined in mega_execute.
+   * Info about extracted kernel functions (M6.2a/c).
+   * All kernels (elementwise and reduction) are extracted into separate
+   * WASM functions with (start, end, ...bufs) signatures.
    */
   readonly kernelExports: ExtractedKernelInfo[];
+  /**
+   * Step metadata for JS-driven parallel execution (M6.2c).
+   * JitId values are mapped to sequential indices (0..N). Input JitIds
+   * use indices 0..numInputs-1. Other JitIds get indices >= numInputs.
+   * The `stepInfos` array describes the full step sequence that
+   * mega_execute would perform, enabling a JS-driven parallel path.
+   */
+  readonly stepInfos: MegaStepInfo[];
+  /**
+   * Total number of JitId slots needed for parallel execution.
+   * This is the size of the locals array (maps JitId index → pointer).
+   */
+  readonly numLocals: number;
+  /**
+   * Mapping from output index (0..numOutputs-1) to the JitId local index
+   * that holds that output pointer after execution completes.
+   */
+  readonly outputLocalIdxs: number[];
 }
 
 /**
@@ -248,23 +282,23 @@ export function compileToMegaModule(
       const kernelSize = kernel.size as number;
       const exportName = `kernel_${kernelCounter}`;
 
-      if (!isReduction) {
-        // Extract into a separate WASM function
-        const funcRef = emitExtractedKernelFunc(
-          cg,
-          funcs,
-          kernel,
-          step.inputs.length,
-          step.outputs.length,
-        );
-        cg.export(funcRef, exportName);
-        extractedForStep.set(stepIdx, {
-          funcRef,
-          exportName,
-          nInputs: step.inputs.length,
-          nOutputs: step.outputs.length,
-        });
-      }
+      // M6.2c: extract ALL kernels (including reductions) into separate
+      // WASM functions with (start, end, ...bufs) signatures.
+      // Reductions are parallelizable by output element (gidx range).
+      const funcRef = emitExtractedKernelFunc(
+        cg,
+        funcs,
+        kernel,
+        step.inputs.length,
+        step.outputs.length,
+      );
+      cg.export(funcRef, exportName);
+      extractedForStep.set(stepIdx, {
+        funcRef,
+        exportName,
+        nInputs: step.inputs.length,
+        nOutputs: step.outputs.length,
+      });
 
       kernelExports.push({
         name: exportName,
@@ -387,17 +421,17 @@ export function compileToMegaModule(
 
   // --- Debug logging ---
   if (DEBUG >= 1) {
-    const extracted = kernelExports.filter((k) => !k.isReduction).length;
-    const inlined = kernelExports.filter((k) => k.isReduction).length;
+    const reductions = kernelExports.filter((k) => k.isReduction).length;
+    const elementwise = kernelExports.length - reductions;
     console.info(
       `mega-module: ${steps.length} steps, ${kernelExports.length} kernels ` +
-        `(${extracted} extracted, ${inlined} inlined), ${bytes.length} bytes`,
+        `(${elementwise} elementwise, ${reductions} reduction), all extracted, ${bytes.length} bytes`,
     );
   }
   if (DEBUG >= 2) {
     for (const ke of kernelExports) {
       console.info(
-        `  ${ke.name}: size=${ke.size} ${ke.isReduction ? "inlined(reduction)" : "extracted"} ` +
+        `  ${ke.name}: size=${ke.size} ${ke.isReduction ? "reduction" : "elementwise"} ` +
           `in=${ke.nInputs} out=${ke.nOutputs}`,
       );
     }
@@ -410,6 +444,61 @@ export function compileToMegaModule(
     console.info(`mega-module WASM bytes (${bytes.length}):\n${hex}`);
   }
 
+  // --- M6.2c: Build step metadata for JS-driven parallel execution ---
+  // Map JitId → sequential index: inputs first (0..numInputs-1), then others.
+  const jitIdToIdx = new Map<JitId, number>();
+  for (let i = 0; i < inputIds.length; i++) {
+    jitIdToIdx.set(inputIds[i], i);
+  }
+  let nextIdx = inputIds.length;
+  for (const id of allJitIds) {
+    if (!jitIdToIdx.has(id)) {
+      jitIdToIdx.set(id, nextIdx++);
+    }
+  }
+  const numLocals = nextIdx;
+
+  const stepInfos: MegaStepInfo[] = [];
+  let stepKernelCounter = 0;
+  for (const step of steps) {
+    switch (step.type) {
+      case "malloc":
+        stepInfos.push({
+          type: "malloc",
+          outputIdx: jitIdToIdx.get(step.output)!,
+          size: step.size as number,
+        });
+        break;
+      case "free":
+        stepInfos.push({
+          type: "free",
+          inputIdx: jitIdToIdx.get(step.input)!,
+        });
+        break;
+      case "recycle":
+        stepInfos.push({
+          type: "recycle",
+          fromIdx: jitIdToIdx.get(step.input)!,
+          toIdx: jitIdToIdx.get(step.output)!,
+        });
+        break;
+      case "execute":
+        if (step.source instanceof Kernel) {
+          stepInfos.push({
+            type: "kernel",
+            kernelIdx: stepKernelCounter,
+            kernelSize: step.source.size as number,
+            inputIdxs: step.inputs.map((id) => jitIdToIdx.get(id)!),
+            outputIdxs: step.outputs.map((id) => jitIdToIdx.get(id)!),
+          });
+          stepKernelCounter++;
+        }
+        break;
+    }
+  }
+
+  const outputLocalIdxs = outputIds.map((id) => jitIdToIdx.get(id)!);
+
   return {
     module,
     numInputs: numInputParams,
@@ -417,6 +506,9 @@ export function compileToMegaModule(
     outputSizes,
     unsupportedSteps: [],
     kernelExports,
+    stepInfos,
+    numLocals,
+    outputLocalIdxs,
   };
 }
 
@@ -499,6 +591,7 @@ function emitExtractedSingleOutputBody(
 ): void {
   const tune = tuneNullopt(kernel);
   const out = kernel.outputs[0];
+  const re = out.reduction;
   const storeAlign = Math.log2(byteWidth(out.dtype));
 
   const gidx = cg.local.declare(cg.i32);
@@ -524,8 +617,14 @@ function emitExtractedSingleOutputBody(
     cg.i32.mul();
     cg.i32.add();
 
-    // Translate expression
-    translateExpMega(cg, funcs, tune.exp, gidx, inputLocals);
+    if (re) {
+      // Reduction: accumulator + inner ridx loop
+      // Each output element independently reduces — parallelizable by gidx range
+      emitReductionBody(cg, funcs, tune, out, re, gidx, inputLocals);
+    } else {
+      // Translate expression
+      translateExpMega(cg, funcs, tune.exp, gidx, inputLocals);
+    }
 
     // Store result
     dty(cg, null, out.dtype).store(storeAlign);
@@ -595,7 +694,20 @@ function emitExtractedMultiOutputBody(
       cg.i32.mul();
       cg.i32.add();
 
-      translateExpMega(cg, funcs, tune.exp, gidx, inputLocals);
+      if (out.reduction) {
+        // Reduction output — each gidx independently reduces
+        emitReductionBody(
+          cg,
+          funcs,
+          tune,
+          out,
+          out.reduction,
+          gidx,
+          inputLocals,
+        );
+      } else {
+        translateExpMega(cg, funcs, tune.exp, gidx, inputLocals);
+      }
 
       dty(cg, null, out.dtype).store(storeAlign);
     }

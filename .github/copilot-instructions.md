@@ -1172,13 +1172,13 @@ field). Programs that can't be compiled fall through to the regular step-by-step
 
 **Key files:**
 
-| File                              | Purpose                                                                                                |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `src/backend/wasm/mega-module.ts` | Compiler: `compileToMegaModule()`                                                                      |
-| `src/backend/wasm.ts`             | `executeMegaModule()` method on WasmBackend                                                            |
-| `src/frontend/jit.ts`             | `_megaModule` cache + fast path in execute                                                             |
-| `test/mega-module.test.ts`        | Mega-module correctness + leak detection (M6.1), extracted kernels (M6.2a), orchestrator tests (M6.2b) |
-| `test/deno/orchestrator.test.ts`  | Deno-only orchestrator + worker pool tests (12 tests, requires native SAB)                             |
+| File                              | Purpose                                                                                                                       |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `src/backend/wasm/mega-module.ts` | Compiler: `compileToMegaModule()`                                                                                             |
+| `src/backend/wasm.ts`             | `executeMegaModule()` method on WasmBackend                                                                                   |
+| `src/frontend/jit.ts`             | `_megaModule` cache + fast path in execute                                                                                    |
+| `test/mega-module.test.ts`        | Mega-module correctness + leak detection (M6.1), extracted kernels (M6.2a), orchestrator tests (M6.2b), step metadata (M6.2c) |
+| `test/deno/orchestrator.test.ts`  | Deno-only orchestrator + worker pool tests (17 tests: 12 M6.2b + 5 M6.2c, requires native SAB)                                |
 
 ## Orchestrator Worker (M6.2b — Off-Main-Thread Mega-Module)
 
@@ -1232,12 +1232,19 @@ This is a fundamental Vitest limitation, not a jax-js bug. Consequently:
 
 - **Vitest tests** (`test/mega-module.test.ts`): 8 orchestrator tests use
   `describe.skipIf(!globalThis.crossOriginIsolated)` — always skipped in Vitest.
-- **Deno tests** (`test/deno/orchestrator.test.ts`): 12 tests exercise the full orchestrator +
+- **Deno tests** (`test/deno/orchestrator.test.ts`): 17 tests exercise the full orchestrator +
   worker pool. Deno has native `SharedArrayBuffer` support without COOP/COEP headers.
 
 **Worker cleanup:** `WasmBackend.destroyWorkers()` terminates both the orchestrator worker and the
 worker pool. Called in `test/setup.ts` `afterAll` hook to prevent worker threads from keeping the
 process alive after tests complete.
+
+**Blob URL revocation:** Both `WasmWorkerPool` and `OrchestratorWorker` create workers from blob
+URLs (`new Worker(URL.createObjectURL(...), { type: "module" })`). URL revocation is **deferred**
+via `setTimeout(() => URL.revokeObjectURL(url), 0)` because Deno's module worker loading is
+asynchronous — immediate revocation can cause `Module not found` errors when multiple worker sets
+are created in rapid succession (as happens when both pool and orchestrator are lazily created
+during the first `jit` call).
 
 **Key files:**
 
@@ -1247,8 +1254,93 @@ process alive after tests complete.
 | `src/backend/wasm/worker-pool.ts`          | WasmWorkerPool: parallel kernel dispatch                   |
 | `src/backend/wasm/shared-memory-config.ts` | Shared config: `MAX_SHARED_PAGES`, `configureMemoryImport` |
 | `src/backend/wasm.ts`                      | Lazy `#getOrchestrator()`, `#getWorkerPool()`, SAB detect  |
-| `test/deno/orchestrator.test.ts`           | 12 Deno tests for orchestrator + worker pool               |
+| `test/deno/orchestrator.test.ts`           | 17 Deno tests for orchestrator + worker pool + M6.2c       |
 | `test/mega-module.test.ts`                 | 8 orchestrator tests (skipped in Vitest, covered by Deno)  |
+
+## Parallel Kernel Dispatch (M6.2c — JS-Driven Mega-Module Step Execution)
+
+M6.2c adds a **parallel execution path** for mega-modules: instead of running `mega_execute` as a
+monolithic WASM call, the main thread walks per-step metadata (`MegaStepInfo[]`) and dispatches
+large kernels across workers via `WasmWorkerPool.dispatchSync`.
+
+**Architecture:**
+
+```
+JitProgram.execute()
+  → shouldUseParallelMegaModule() → true (pure check, no side effects)
+  → registerMegaModuleOnPool()    → async (first call only)
+  → executeMegaModuleParallelSync(megaModule, inputs)
+      ├─ for each MegaStepInfo:
+      │   "malloc"  → allocator.malloc(size)
+      │   "free"    → allocator.free(ptr)
+      │   "recycle" → locals[toIdx] = locals[fromIdx]
+      │   "kernel"  → if size >= 4096: pool.dispatchSync(kernelIdx, ...)
+      │               else:            mainInstance.exports.kernel_N(0, size, ...)
+      └─ return output slots
+```
+
+**Key types (`src/backend/wasm/mega-module.ts`):**
+
+```typescript
+type MegaStepInfo =
+  | { type: "malloc"; outputIdx: number; size: number }
+  | { type: "free"; inputIdx: number }
+  | { type: "recycle"; fromIdx: number; toIdx: number }
+  | {
+      type: "kernel";
+      kernelIdx: number;
+      kernelSize: number;
+      inputIdxs: number[];
+      outputIdxs: number[];
+    };
+```
+
+`WasmMegaModule` extended with: `stepInfos: MegaStepInfo[]`, `numLocals: number`,
+`outputLocalIdxs: number[]`.
+
+**Key design decisions:**
+
+- **All kernels extracted (M6.2c):** Both elementwise and reduction kernels are compiled as separate
+  WASM functions (`kernel_0`, `kernel_1`, ...) exported from the mega-module. Reductions are
+  parallelizable because each output element's reduction loop is independent (split by gidx range).
+- **Pure `shouldUseParallelMegaModule`:** This method does NOT lazily create the worker pool — it
+  only checks `capabilities.sharedMemory` and kernel sizes. Pool creation is deferred to
+  `registerMegaModuleOnPool()`.
+- **Lazy async registration:** First call: `shouldUseParallelMegaModule` returns true → kicks off
+  async `registerMegaModuleOnPool` → falls through to monolithic `executeMegaModule`. Once
+  registration completes (`_megaModulePoolReady === true`), subsequent calls use the parallel path.
+- **Worker stub imports:** Workers instantiate the mega-module with
+  `{ alloc: throwStub, free: noop }` — workers only call extracted `kernel_N` functions, never
+  `mega_execute`.
+- **PARALLEL_THRESHOLD = 4096:** Kernels with fewer elements run on the main thread only (dispatch
+  overhead would exceed compute savings).
+- **Named kernel dispatch:** `dispatchSync` gains a `kernelIdx` parameter. Workers select functions
+  via `exports["kernel_" + kernelIdx]` (index ≥ 0) or `exports.kernel` (index < 0, legacy path).
+
+**Worker pool control buffer layout (updated):**
+
+| Slot | Name              | Purpose                                               |
+| ---- | ----------------- | ----------------------------------------------------- |
+| 0    | `CTRL_STATE`      | Worker state (READY=0, WORK=1)                        |
+| 1    | `CTRL_MODULE_ID`  | Module ID for kernel lookup                           |
+| 2    | `CTRL_START`      | Work chunk start index                                |
+| 3    | `CTRL_END`        | Work chunk end index                                  |
+| 4    | `CTRL_KERNEL_IDX` | Kernel index: -1=default, 0+=named `kernel_N` (M6.2c) |
+| 5    | `CTRL_NUM_ARGS`   | Number of buffer pointer arguments                    |
+| 6-25 | `CTRL_ARGS`       | Buffer pointer arguments (max 20)                     |
+
+`WORKER_STRIDE = 26` per worker.
+
+**Key files:**
+
+| File                              | Purpose                                                        |
+| --------------------------------- | -------------------------------------------------------------- |
+| `src/backend/wasm/mega-module.ts` | `MegaStepInfo`, `compileToMegaModule` (all kernels extracted)  |
+| `src/backend/wasm/worker-pool.ts` | `registerMegaModule`, `CTRL_KERNEL_IDX`, named dispatch        |
+| `src/backend/wasm.ts`             | `executeMegaModuleParallelSync`, `shouldUseParallelMegaModule` |
+| `src/frontend/jit.ts`             | `_megaModulePoolReady`, 3-way dispatch in `execute()`          |
+| `test/mega-module.test.ts`        | 6 step metadata tests (M6.2c)                                  |
+| `test/deno/orchestrator.test.ts`  | 5 parallel dispatch tests (M6.2c)                              |
 
 ## Effect system (memory effects)
 
@@ -4146,10 +4238,10 @@ M0–M8 with dependency graph, code sketches, and test plans.
 | M6.1      | Mega-Module                   | **DONE**        | `compileToMegaModule()`, single WASM call, 16 tests                     |
 | M6.2a     | Extract kernel functions      | **DONE**        | Extracted WASM functions per kernel, 10 tests                           |
 | M6.2b     | Orchestrator worker           | **DONE**        | Off-main-thread mega-module via Web Worker, 12 Deno tests               |
-| M6.2c     | Parallel kernel dispatch      | Not done        | Large kernels fan out to compute workers via dispatchSync               |
+| M6.2c     | Parallel kernel dispatch      | **DONE**        | JS-driven step execution, workers dispatch large kernels, 5 Deno tests  |
 | M7.1      | `Primitive.AssociativeScan`   | **DONE**        | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests                   |
 | M7.2      | WASM compiled Kogge-Stone     | **DONE**        | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests                |
-| M7.3      | Multithreaded Kogge-Stone     | Not done        | Depends on M5✅ + M6.2c                                                 |
+| M7.3      | Multithreaded Kogge-Stone     | Not done        | Depends on M5✅ + M6.2c✅                                               |
 | M8        | Cleanup & benchmarking        | **In Progress** | M8.1 benchmarks ✅, M8.2 dead code audit ✅, M8.3 docs WIP              |
 
 ## Dependency Graph (Simplified)
@@ -4159,8 +4251,8 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
         ├──→ M2 (scatter_add) ✅
         ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
         ├──→ M4.1 ✅ ──→ M4.2 ✅ ──→ M6.1 ✅
-        └──→ M5 ✅ ──→ M6.2a ✅ ──→ M6.2b ✅ ──→ M6.2c ❌
-                       M7.1 ✅ ──→ M7.2 ✅ ──→ M7.3 ❌ (needs M5✅+M6.2c)
+        └──→ M5 ✅ ──→ M6.2a ✅ ──→ M6.2b ✅ ──→ M6.2c ✅
+                       M7.1 ✅ ──→ M7.2 ✅ ──→ M7.3 ❌ (needs M5✅+M6.2c✅)
                                                   ↓
                                             M8 (cleanup) ❌
 ```
@@ -4169,8 +4261,8 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
 
 Per the dependency graph, the following milestones can be worked on next:
 
-1. **M6.2c** — Parallel kernel dispatch (depends on M6.2b ✅ + M5 ✅)
-2. **M7.3** — Multithreaded Kogge-Stone (depends on M7.2 ✅ + M6.2c)
+1. **M7.3** — Multithreaded Kogge-Stone (depends on M7.2 ✅ + M6.2c ✅)
+2. **M8** — Cleanup & benchmarking (remaining: M8.3 docs)
 
 ---
 
@@ -4262,4 +4354,4 @@ Decisions made during development that future agents should understand:
 | M6.2 extracted-functions design                 | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension. |
 | Module Workers (`type: "module"`)               | Deno doesn't support classic blob-URL workers; module workers work in both Deno and Chromium. Applied to both `worker-pool.ts` and `orchestrator.ts`.                          |
 | SAB constructability over `crossOriginIsolated` | `try { new SharedArrayBuffer(1) }` works in Deno (native SAB) and browsers (with COOP/COEP); `crossOriginIsolated` is browser-only and false in Deno.                          |
-| Vitest SAB tests skipped, Deno covers           | COOP+COEP headers break Vitest's iframe runner. Orchestrator/worker pool features tested exclusively via Deno. 8 Vitest tests skip, 12 Deno tests cover.                       |
+| Vitest SAB tests skipped, Deno covers           | COOP+COEP headers break Vitest's iframe runner. Orchestrator/worker pool features tested exclusively via Deno. 8 Vitest tests skip, 17 Deno tests cover.                       |

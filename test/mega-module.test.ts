@@ -341,18 +341,18 @@ describe("extracted kernel functions (M6.2a)", () => {
       }
     });
 
-    it("reduction kernels are NOT exported as standalone functions", () => {
+    it("reduction kernels are exported as standalone functions (M6.2c)", () => {
       using x = np.array([1, 2, 3]);
       const mm = compileMega((x: np.Array) => x.sum(), x);
       expect(mm).not.toBeNull();
 
       const { instance } = instantiateMega(mm!);
 
-      // Reduction kernels should be marked isReduction but not exported
+      // M6.2c: all kernels (including reductions) are now extracted
       const reductions = mm!.kernelExports.filter((ke) => ke.isReduction);
       expect(reductions.length).toBeGreaterThan(0);
       for (const ke of reductions) {
-        expect(instance.exports[ke.name]).toBeUndefined();
+        expect(instance.exports[ke.name]).toBeTypeOf("function");
       }
     });
   });
@@ -455,6 +455,98 @@ describe("extracted kernel functions (M6.2a)", () => {
       using y = np.array([1, 2, 3]);
       using result = f(x, y);
       expect(result.js()).toEqual([5, 11, 17]);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // M6.2c: Step metadata for parallel dispatch
+  // -----------------------------------------------------------------------
+
+  describe("step metadata (M6.2c)", () => {
+    it("elementwise chain has correct stepInfos", () => {
+      using x = np.array([1, 2, 3, 4]);
+      const mm = compileMega((x: np.Array) => x.add(1).mul(2), x);
+      expect(mm).not.toBeNull();
+      expect(mm!.stepInfos.length).toBeGreaterThan(0);
+
+      // Should have at least one kernel step
+      const kernelSteps = mm!.stepInfos.filter((s) => s.type === "kernel");
+      expect(kernelSteps.length).toBeGreaterThan(0);
+
+      // Every kernel step should reference valid indices
+      for (const s of kernelSteps) {
+        if (s.type !== "kernel") continue;
+        expect(s.kernelIdx).toBeGreaterThanOrEqual(0);
+        expect(s.kernelSize).toBeGreaterThan(0);
+        for (const idx of [...s.inputIdxs, ...s.outputIdxs]) {
+          expect(idx).toBeGreaterThanOrEqual(0);
+          expect(idx).toBeLessThan(mm!.numLocals);
+        }
+      }
+    });
+
+    it("reduction has correct stepInfos", () => {
+      using x = np.array([1, 2, 3, 4]);
+      const mm = compileMega((x: np.Array) => x.sum(), x);
+      expect(mm).not.toBeNull();
+
+      // Sum produces a reduction kernel
+      const kernelSteps = mm!.stepInfos.filter((s) => s.type === "kernel");
+      expect(kernelSteps.length).toBeGreaterThan(0);
+    });
+
+    it("multi-step chain has malloc/recycle/kernel steps", () => {
+      using x = np.array([1, 2, 3, 4]);
+      const mm = compileMega(
+        (x: np.Array) => x.add(1).mul(2).sub(3),
+        x,
+      );
+      expect(mm).not.toBeNull();
+
+      const types = new Set(mm!.stepInfos.map((s) => s.type));
+      // Should have at least malloc + kernel steps
+      expect(types.has("kernel")).toBe(true);
+      // Intermediate buffers need malloc (unless all recycled)
+      expect(types.has("malloc") || types.has("recycle")).toBe(true);
+    });
+
+    it("numLocals >= numInputs + numOutputs", () => {
+      using x = np.array([1, 2, 3]);
+      const mm = compileMega((x: np.Array) => x.add(1), x);
+      expect(mm).not.toBeNull();
+      expect(mm!.numLocals).toBeGreaterThanOrEqual(
+        mm!.numInputs + mm!.numOutputs,
+      );
+    });
+
+    it("outputLocalIdxs are valid indices", () => {
+      using x = np.array([1, 2, 3]);
+      const mm = compileMega((x: np.Array) => x.add(1), x);
+      expect(mm).not.toBeNull();
+      expect(mm!.outputLocalIdxs.length).toBe(mm!.numOutputs);
+      for (const idx of mm!.outputLocalIdxs) {
+        expect(idx).toBeGreaterThanOrEqual(0);
+        expect(idx).toBeLessThan(mm!.numLocals);
+      }
+    });
+
+    it("kernelIdx in stepInfos matches kernelExports indices", () => {
+      using x = np.array([1, 2, 3, 4]);
+      const mm = compileMega(
+        (x: np.Array) => x.add(1).mul(2),
+        x,
+      );
+      expect(mm).not.toBeNull();
+
+      const kernelSteps = mm!.stepInfos!.filter(
+        (s) => s.type === "kernel",
+      ) as Extract<NonNullable<typeof mm>["stepInfos"][number], { type: "kernel" }>[];
+
+      for (const s of kernelSteps) {
+        // kernelIdx should be a valid index into kernelExports
+        expect(s.kernelIdx).toBeGreaterThanOrEqual(0);
+        expect(s.kernelIdx).toBeLessThan(mm!.kernelExports.length);
+      }
     });
   });
 });

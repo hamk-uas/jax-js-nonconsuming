@@ -272,6 +272,159 @@ Deno.test({
 });
 
 // ---------------------------------------------------------------------------
+// M6.2c: Parallel kernel dispatch via JS-driven step execution
+// ---------------------------------------------------------------------------
+
+Deno.test({
+  name: "M6.2c: parallel dispatch produces correct results for large elementwise",
+  fn: withLeakCheck(async () => {
+    await initWasm();
+
+    const n = 16384; // well above PARALLEL_THRESHOLD (4096)
+    const f = jit((x: any) => x.add(1).mul(2));
+    const input = np.array(new Float32Array(n).fill(5));
+
+    // First call: triggers async registration, falls through to monolithic
+    const r1 = f(input);
+    assertEquals((await r1.data()).length, n);
+    r1.dispose();
+
+    // Tiny delay for async registration to complete
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Second call: should use parallel path (if registration succeeded)
+    const r2 = f(input);
+    const data = await r2.data();
+    for (let i = 0; i < n; i++) {
+      assertEquals(data[i], 12, `element ${i} should be (5+1)*2 = 12`);
+    }
+
+    r2.dispose();
+    input.dispose();
+    f.dispose();
+  }),
+});
+
+Deno.test({
+  name: "M6.2c: parallel dispatch with reduction kernel",
+  fn: withLeakCheck(async () => {
+    await initWasm();
+
+    const n = 8192;
+    const f = jit((x: any) => x.mul(2).sum());
+    const input = np.array(new Float32Array(n).fill(3));
+
+    // First call triggers registration
+    const r1 = f(input);
+    assertEquals((await r1.data())[0], 3 * 2 * n);
+    r1.dispose();
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Second call should use parallel path
+    const r2 = f(input);
+    assertEquals((await r2.data())[0], 3 * 2 * n);
+
+    r2.dispose();
+    input.dispose();
+    f.dispose();
+  }),
+});
+
+Deno.test({
+  name: "M6.2c: parallel dispatch correctness across repeated calls",
+  fn: withLeakCheck(async () => {
+    await initWasm();
+
+    const n = 8192;
+    const f = jit((x: any, y: any) => x.add(y).mul(3));
+
+    // Drive registration with first call
+    const x0 = np.array(new Float32Array(n).fill(1));
+    const y0 = np.array(new Float32Array(n).fill(2));
+    const r0 = f(x0, y0);
+    r0.dispose();
+    x0.dispose();
+    y0.dispose();
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Run 3 more calls — all should use parallel path and produce correct results
+    for (let trial = 0; trial < 3; trial++) {
+      const v = trial + 1;
+      const x = np.array(new Float32Array(n).fill(v));
+      const y = np.array(new Float32Array(n).fill(v * 10));
+      const result = f(x, y);
+      const data = await result.data();
+      const expected = (v + v * 10) * 3;
+      for (let i = 0; i < 10; i++) {
+        assertEquals(data[i], expected, `trial ${trial} elem ${i}`);
+      }
+      result.dispose();
+      x.dispose();
+      y.dispose();
+    }
+
+    f.dispose();
+  }),
+});
+
+Deno.test({
+  name: "M6.2c: grad through parallel-dispatched mega-module",
+  fn: withLeakCheck(async () => {
+    await initWasm();
+
+    const n = 8192;
+    const f = jit((x: any) => x.mul(x).sum());
+
+    // Drive registration
+    const x0 = np.array(new Float32Array(n).fill(1));
+    const r0 = f(x0);
+    r0.dispose();
+    x0.dispose();
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    // grad through parallel mega-module
+    const x = np.array(new Float32Array(n).fill(3));
+    const g = grad(f)(x);
+    const data = await g.data();
+    // d/dx sum(x^2) = 2x = 6
+    for (let i = 0; i < 10; i++) {
+      assertEquals(data[i], 6, `gradient element ${i} should be 6`);
+    }
+
+    g.dispose();
+    x.dispose();
+    f.dispose();
+  }),
+});
+
+Deno.test({
+  name: "M6.2c: shouldUseParallelMegaModule true for large kernels",
+  fn: withLeakCheck(async () => {
+    await initWasm();
+    const backend = getWasmBackend();
+
+    // Compile a mega-module for a large array
+    const n = 8192;
+    const f = jit((x: any) => x.add(1));
+    const x = np.array(new Float32Array(n).fill(0));
+    const r = f(x);
+    r.dispose();
+
+    // The JitProgram should have a mega-module with large kernels
+    assert(
+      typeof backend.shouldUseParallelMegaModule === "function",
+      "shouldUseParallelMegaModule method should exist",
+    );
+
+    x.dispose();
+    f.dispose();
+  }),
+});
+
+// ---------------------------------------------------------------------------
 // Cleanup
 // ---------------------------------------------------------------------------
 

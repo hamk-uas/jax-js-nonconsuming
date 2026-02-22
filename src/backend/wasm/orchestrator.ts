@@ -187,7 +187,9 @@ export class OrchestratorWorker {
     const blob = new Blob([code], { type: "text/javascript" });
     const url = URL.createObjectURL(blob);
     this.#worker = new Worker(url, { type: "module" });
-    URL.revokeObjectURL(url);
+    // Defer revocation — Deno module workers may not have loaded the blob
+    // URL synchronously by the time revokeObjectURL is called.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
 
     // Send init message with shared memory and control buffer
     this.#worker.postMessage({

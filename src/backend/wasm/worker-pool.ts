@@ -35,8 +35,10 @@ const CTRL_STATE = 0;
 const CTRL_MODULE_ID = 1;
 const CTRL_START = 2;
 const CTRL_END = 3;
-const CTRL_NUM_ARGS = 4;
-const CTRL_ARGS = 5;
+/** Kernel index: -1 = default "kernel" export, 0+ = "kernel_N" export. */
+const CTRL_KERNEL_IDX = 4;
+const CTRL_NUM_ARGS = 5;
+const CTRL_ARGS = 6;
 
 /** Maximum number of buffer-pointer arguments per kernel dispatch. */
 const MAX_ARGS = 20;
@@ -77,6 +79,7 @@ self.onmessage = function (e) {
     var moduleId = Atomics.load(control, workBase + ${CTRL_MODULE_ID});
     var start = Atomics.load(control, workBase + ${CTRL_START});
     var end = Atomics.load(control, workBase + ${CTRL_END});
+    var kernelIdx = Atomics.load(control, workBase + ${CTRL_KERNEL_IDX});
     var numArgs = Atomics.load(control, workBase + ${CTRL_NUM_ARGS});
 
     var args = new Array(numArgs);
@@ -86,7 +89,11 @@ self.onmessage = function (e) {
 
     var instance = instances[moduleId];
     if (instance) {
-      instance.exports.kernel(start, end, args[0], args[1], args[2], args[3],
+      // M6.2c: select kernel by index (-1 = default "kernel", 0+ = "kernel_N")
+      var fn = kernelIdx < 0
+        ? instance.exports.kernel
+        : instance.exports["kernel_" + kernelIdx];
+      fn(start, end, args[0], args[1], args[2], args[3],
         args[4], args[5], args[6], args[7], args[8], args[9],
         args[10], args[11], args[12], args[13], args[14], args[15],
         args[16], args[17], args[18], args[19]);
@@ -98,6 +105,22 @@ self.onmessage = function (e) {
   } else if (msg.type === "register") {
     try {
       var inst = new WebAssembly.Instance(msg.module, { env: { memory: memory } });
+      instances[msg.moduleId] = inst;
+      self.postMessage({ type: "registered", moduleId: msg.moduleId });
+    } catch (err) {
+      self.postMessage({ type: "error", moduleId: msg.moduleId, error: String(err) });
+    }
+  } else if (msg.type === "register-mega") {
+    // Register a mega-module with stub alloc/free imports.
+    // Workers only call extracted kernel_N functions, never mega_execute.
+    try {
+      var inst = new WebAssembly.Instance(msg.module, {
+        env: {
+          memory: memory,
+          alloc: function() { throw new Error("worker: unexpected alloc"); },
+          free: function() {},
+        },
+      });
       instances[msg.moduleId] = inst;
       self.postMessage({ type: "registered", moduleId: msg.moduleId });
     } catch (err) {
@@ -154,7 +177,9 @@ export class WasmWorkerPool {
       w.postMessage({ type: "control", buffer: this.#controlBuf });
       this.#workers.push(w);
     }
-    URL.revokeObjectURL(url);
+    // Defer revocation — Deno module workers may not have loaded the blob
+    // URL synchronously by the time revokeObjectURL is called.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
   /**
@@ -192,6 +217,41 @@ export class WasmWorkerPool {
   }
 
   /**
+   * Register a mega-module on all workers (M6.2c). Mega-modules import
+   * `env.alloc` and `env.free` — workers get stub implementations since
+   * they only call extracted `kernel_N` functions, never `mega_execute`.
+   *
+   * Must be called (and awaited) before `dispatchSync` can use the module.
+   * Repeated calls with the same module return the cached ID instantly.
+   */
+  async registerMegaModule(module: WebAssembly.Module): Promise<number> {
+    const existing = this.#moduleIds.get(module);
+    if (existing !== undefined) return existing;
+
+    const id = this.#nextModuleId++;
+    this.#moduleIds.set(module, id);
+
+    // Send module to all workers with "register-mega" type
+    const promises = this.#workers.map(
+      (w) =>
+        new Promise<void>((resolve, reject) => {
+          const handler = (e: MessageEvent) => {
+            if (e.data.moduleId !== id) return;
+            w.removeEventListener("message", handler);
+            if (e.data.type === "registered") resolve();
+            else
+              reject(new Error(e.data.error ?? "worker mega registration failed"));
+          };
+          w.addEventListener("message", handler);
+          w.postMessage({ type: "register-mega", moduleId: id, module });
+        }),
+    );
+    await Promise.all(promises);
+    this.#registeredOnWorkers.add(id);
+    return id;
+  }
+
+  /**
    * Check if a module has been registered on all workers (i.e.,
    * `registerModule` has been awaited for this module).
    */
@@ -219,12 +279,14 @@ export class WasmWorkerPool {
    * @param mainInstance Instance on the main thread (same module, shared memory)
    * @param totalSize    Total number of elements to process
    * @param args         Buffer pointers (shared memory addresses)
+   * @param kernelIdx    Kernel index: -1 = default "kernel" export, 0+ = "kernel_N" (M6.2c)
    */
   dispatchSync(
     moduleId: number,
     mainInstance: WebAssembly.Instance,
     totalSize: number,
     args: number[],
+    kernelIdx: number = -1,
   ): void {
     if (this.#destroyed) throw new Error("WasmWorkerPool destroyed");
     if (!this.#registeredOnWorkers.has(moduleId)) {
@@ -248,6 +310,7 @@ export class WasmWorkerPool {
       Atomics.store(this.#control, base + CTRL_MODULE_ID, moduleId);
       Atomics.store(this.#control, base + CTRL_START, start);
       Atomics.store(this.#control, base + CTRL_END, end);
+      Atomics.store(this.#control, base + CTRL_KERNEL_IDX, kernelIdx);
       Atomics.store(this.#control, base + CTRL_NUM_ARGS, args.length);
       for (let a = 0; a < args.length; a++) {
         Atomics.store(this.#control, base + CTRL_ARGS + a, args[a]);
@@ -261,11 +324,12 @@ export class WasmWorkerPool {
     // Main thread processes chunk [0, chunkSize)
     const mainEnd = Math.min(chunkSize, totalSize);
     if (mainEnd > 0) {
-      (mainInstance.exports.kernel as (...a: number[]) => void)(
-        0,
-        mainEnd,
-        ...args,
-      );
+      // M6.2c: select kernel by index
+      const fn =
+        kernelIdx < 0
+          ? (mainInstance.exports.kernel as (...a: number[]) => void)
+          : (mainInstance.exports[`kernel_${kernelIdx}`] as (...a: number[]) => void);
+      fn(0, mainEnd, ...args);
     }
 
     // Spin-wait for all active workers to finish
