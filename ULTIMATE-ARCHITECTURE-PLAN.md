@@ -971,7 +971,7 @@ correct, just slightly slower (non-inlined call overhead is ~few ns).
 The extracted-functions approach wins because it preserves the mega-module's zero-crossing benefit
 for serial execution while enabling per-kernel parallelism.
 
-##### M6.2a — Extract Kernel Functions (refactoring, no behavior change)
+##### M6.2a — Extract Kernel Functions (refactoring, no behavior change) ✅ DONE
 
 **What:** Refactor `compileToMegaModule()` to emit each kernel body as a separate WASM function with
 `(start, end, ...bufs)` signature, instead of inlining kernel loops directly into `mega_execute`.

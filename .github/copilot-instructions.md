@@ -1155,12 +1155,12 @@ field). Programs that can't be compiled fall through to the regular step-by-step
 
 **Key files:**
 
-| File                              | Purpose                                     |
-| --------------------------------- | ------------------------------------------- |
-| `src/backend/wasm/mega-module.ts` | Compiler: `compileToMegaModule()`           |
-| `src/backend/wasm.ts`             | `executeMegaModule()` method on WasmBackend |
-| `src/frontend/jit.ts`             | `_megaModule` cache + fast path in execute  |
-| `test/mega-module.test.ts`        | 14 tests covering correctness + leaks       |
+| File                              | Purpose                                                                    |
+| --------------------------------- | -------------------------------------------------------------------------- |
+| `src/backend/wasm/mega-module.ts` | Compiler: `compileToMegaModule()`                                          |
+| `src/backend/wasm.ts`             | `executeMegaModule()` method on WasmBackend                                |
+| `src/frontend/jit.ts`             | `_megaModule` cache + fast path in execute                                 |
+| `test/mega-module.test.ts`        | Mega-module correctness + leak detection (M6.1), extracted kernels (M6.2a) |
 
 ## Effect system (memory effects)
 
@@ -4050,8 +4050,8 @@ M0–M8 with dependency graph, code sketches, and test plans.
 | M5.1      | SharedArrayBuffer memory pool | **DONE**        | Shared memory when `crossOriginIsolated`                                |
 | M5.2      | WasmWorkerPool                | **DONE**        | Atomics-based sync dispatch via Web Workers                             |
 | M5.3      | Kernel signature + dispatch   | **DONE**        | `(start, end, ...ptrs)` + parallel dispatch wiring                      |
-| M6.1      | Mega-Module                   | **DONE**        | `compileToMegaModule()`, single WASM call, 14 tests                     |
-| M6.2a     | Extract kernel functions      | Not done        | Refactor monolithic mega → extracted WASM functions per kernel          |
+| M6.1      | Mega-Module                   | **DONE**        | `compileToMegaModule()`, single WASM call, 16 tests                     |
+| M6.2a     | Extract kernel functions      | **DONE**        | Extracted WASM functions per kernel, 10 tests                           |
 | M6.2b     | Orchestrator worker           | Not done        | Mega-module runs off main thread, enables Atomics.wait                  |
 | M6.2c     | Parallel kernel dispatch      | Not done        | Large kernels fan out to compute workers via dispatchSync               |
 | M7.1      | `Primitive.AssociativeScan`   | **DONE**        | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests                   |
@@ -4066,7 +4066,7 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
         ├──→ M2 (scatter_add) ✅
         ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
         ├──→ M4.1 ✅ ──→ M4.2 ✅ ──→ M6.1 ✅
-        └──→ M5 ✅ ──→ M6.2a ❌ ──→ M6.2b ❌ ──→ M6.2c ❌
+        └──→ M5 ✅ ──→ M6.2a ✅ ──→ M6.2b ❌ ──→ M6.2c ❌
                        M7.1 ✅ ──→ M7.2 ✅ ──→ M7.3 ❌ (needs M5✅+M6.2c)
                                                   ↓
                                             M8 (cleanup) ❌
@@ -4076,10 +4076,9 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
 
 Per the dependency graph, the following milestones can be worked on next:
 
-1. **M6.2a** — Extract kernel functions from monolithic mega-module (depends on M6.1 ✅)
-2. **M6.2b** — Orchestrator worker (depends on M6.2a)
-3. **M6.2c** — Parallel kernel dispatch (depends on M6.2b + M5 ✅)
-4. **M7.3** — Multithreaded Kogge-Stone (depends on M7.2 ✅ + M6.2c)
+1. **M6.2b** — Orchestrator worker (depends on M6.2a ✅)
+2. **M6.2c** — Parallel kernel dispatch (depends on M6.2b + M5 ✅)
+3. **M7.3** — Multithreaded Kogge-Stone (depends on M7.2 ✅ + M6.2c)
 
 ---
 
