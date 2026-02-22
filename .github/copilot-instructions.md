@@ -1086,6 +1086,79 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
    effect on its first input (dst), enabling `effectDrivenAllocate` to recycle the dst buffer
    directly into the output slot (zero-copy when sizes match).
 
+## Mega-Module (WASM JIT Fusion)
+
+The mega-module compiler (`src/backend/wasm/mega-module.ts`) compiles a JitProgram's entire step
+list into a **single WASM function**, eliminating all JS↔WASM boundary crossings between kernel
+dispatches. This is the M6.1 milestone.
+
+**Key exports:**
+
+- `WasmMegaModule` — interface: `{ module, numInputs, numOutputs, outputSizes }`
+- `canCompileToMegaModule(steps)` — returns `false` for `incref`, `scan`, `dus`, `scatter_add`,
+  `assoc_scan`, Routine steps, or symbolic `malloc` sizes
+- `compileToMegaModule(steps, inputIds, outputIds)` — returns compiled module or `null`
+
+**Architecture:**
+
+```
+mega_execute(input0_ptr, ..., inputN_ptr, resultBufPtr) → void
+```
+
+Input pointers are function parameters. Output pointers are written to a caller-allocated result
+buffer. The module imports `env.alloc` and `env.free` from the host `WasmAllocator` for internal
+buffer allocations.
+
+**Step translation:**
+
+| JitStep   | WASM translation                                          |
+| --------- | --------------------------------------------------------- |
+| `malloc`  | `local.set(id, call $alloc(size))` — imported alloc       |
+| `free`    | `call $free(local.get(id))` — imported free               |
+| `recycle` | `local.set(new, local.get(old))` — zero-cost local rename |
+| `execute` | Inline kernel gidx loop body (no function call overhead)  |
+
+**What it catches vs. what it rejects:**
+
+| Pattern                          | Supported? | Why                                            |
+| -------------------------------- | ---------- | ---------------------------------------------- |
+| Elementwise chain (add→mul→sub)  | ✅         | All kernel execute steps, fused inline         |
+| Multi-output kernel steps        | ✅         | Each output written separately                 |
+| Reduction kernels (sum, max)     | ✅         | Reduction loop inlined via `emitReductionBody` |
+| JitProgram with `incref`         | ❌         | Refcount tracking inside WASM not supported    |
+| Routine steps (sort, cholesky)   | ❌         | Would need WASM imports for each routine       |
+| Scan / DUS / scatter_add steps   | ❌         | Complex control flow not yet inlined           |
+| Pass-through outputs (out=input) | ❌         | Steps may overwrite input locals               |
+| Symbolic malloc sizes            | ❌         | Needs M4.2 completion                          |
+
+**Integration in JitProgram.execute():**
+
+```typescript
+if (this.backend.type === "wasm") {
+  if (this._megaModule === undefined) {
+    this._megaModule = canCompileToMegaModule(this.steps)
+      ? compileToMegaModule(this.steps, this.inputs, this.outputs)
+      : null;
+  }
+  if (this._megaModule) {
+    const outputSlots = (this.backend as WasmBackend).executeMegaModule(this._megaModule, inputs);
+    return { outputs: outputSlots, pending: [] };
+  }
+}
+```
+
+The mega-module is compiled lazily on first execution and cached per JitProgram (`_megaModule`
+field). Programs that can't be compiled fall through to the regular step-by-step execution path.
+
+**Key files:**
+
+| File                              | Purpose                                     |
+| --------------------------------- | ------------------------------------------- |
+| `src/backend/wasm/mega-module.ts` | Compiler: `compileToMegaModule()`           |
+| `src/backend/wasm.ts`             | `executeMegaModule()` method on WasmBackend |
+| `src/frontend/jit.ts`             | `_megaModule` cache + fast path in execute  |
+| `test/mega-module.test.ts`        | 14 tests covering correctness + leaks       |
+
 ## Effect system (memory effects)
 
 The Jaxpr IR carries per-equation **memory effect annotations** that model how each primitive
@@ -4195,8 +4268,8 @@ M0–M8 with dependency graph, code sketches, and test plans.
 | M5.1      | SharedArrayBuffer memory pool | **DONE**           | Shared memory when `crossOriginIsolated`                  |
 | M5.2      | WasmWorkerPool                | **DONE**           | Atomics-based sync dispatch via Web Workers               |
 | M5.3      | Kernel signature + dispatch   | **DONE**           | `(start, end, ...ptrs)` + parallel dispatch wiring        |
-| M6.1      | Mega-Module                   | Not done           | Depends on M4.2 completion + M5 ✅                        |
-| M6.2      | Mega-module multithreading    | Not done           | Depends on M5 ✅ + M6.1                                   |
+| M6.1      | Mega-Module                   | **DONE**           | `compileToMegaModule()`, single WASM call, 14 tests       |
+| M6.2      | Mega-module multithreading    | Not done           | Depends on M5 ✅ + M6.1 ✅                                |
 | M7.1      | `Primitive.AssociativeScan`   | **DONE**           | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests     |
 | M7.2      | WASM compiled Kogge-Stone     | **DONE**           | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests  |
 | M7.3      | Multithreaded Kogge-Stone     | Not done           | Depends on M5✅ + M6.2                                    |
@@ -4208,8 +4281,8 @@ M0–M8 with dependency graph, code sketches, and test plans.
 M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
         ├──→ M2 (scatter_add) ✅
         ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
-        ├──→ M4.1 ✅ ──→ M4.2 ~done ──→ M6.1 ❌
-        └──→ M5 ✅ ──→ M6.2 ❌ (needs M6.1)
+        ├──→ M4.1 ✅ ──→ M4.2 ~done ──→ M6.1 ✅
+        └──→ M5 ✅ ──→ M6.2 ❌ (needs M6.1✅)
                        M7.1 ✅ ──→ M7.2 ✅ ──→ M7.3 ❌ (needs M5✅+M6.2)
                                                   ↓
                                             M8 (cleanup) ❌
@@ -4219,7 +4292,7 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
 
 Per the dependency graph, the following milestones can be worked on next:
 
-1. **M6.1** — Mega-Module (depends on M4.2 completion + M5 ✅)
+1. **M6.2** — Mega-Module multithreading (depends on M5 ✅ + M6.1 ✅)
 2. **M7.3** — Multithreaded Kogge-Stone (depends on M7.2 ✅ + M6.2)
 3. **M4.2** completion — Finish parameterized backend codegen (M4.1 done)
 
@@ -4305,3 +4378,4 @@ Decisions made during development that future agents should understand:
 | `invariance` ≠ `strict` ESLint config  | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                    |
 | WASM `(start, end, ...ptrs)` signature | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                              |
 | WASM compiled Kogge-Stone (assocScan)  | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan` |
+| Mega-module rejects pass-through       | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes  |

@@ -11,6 +11,11 @@ import {
 } from "../alu";
 import { Backend, Slot } from "../backend";
 import type { WasmBackend } from "../backend/wasm";
+import {
+  canCompileToMegaModule,
+  compileToMegaModule,
+  type WasmMegaModule,
+} from "../backend/wasm/mega-module";
 import { PPrint } from "../pprint";
 import { Routine } from "../routine";
 import {
@@ -48,8 +53,8 @@ import {
 } from "./core";
 import { Jaxpr, Lit, Var } from "./jaxpr";
 import { executeScan } from "./scan-executor";
-import type { ScanPlan, AssocScanPlan } from "./scan-plan";
-import { planScan, planAssociativeScan } from "./scan-plan";
+import type { AssocScanPlan, ScanPlan } from "./scan-plan";
+import { planAssociativeScan, planScan } from "./scan-plan";
 import type { ScanPath } from "../utils";
 
 export type JitId = number;
@@ -206,6 +211,8 @@ function computePoolHints(steps: JitStep[]): PoolHints {
 /** Result of compiling a Jaxpr. Can be evaluated on a series of inputs. */
 export class JitProgram {
   readonly poolHints: PoolHints;
+  /** Cached mega-module: undefined = not attempted, null = unsupported. */
+  private _megaModule?: WasmMegaModule | null;
 
   constructor(
     readonly backend: Backend,
@@ -318,6 +325,27 @@ export class JitProgram {
     // Tell the backend which buffer sizes we'll need and our peak memory,
     // so it can evict stale pool entries and cap retained bytes.
     this.backend.configurePool?.(this.poolHints);
+
+    // Mega-module fast path (WASM only, kernel-only programs):
+    // Compiles all steps into a single WASM function, eliminating
+    // JS↔WASM boundary crossings between kernel dispatches.
+    if (this.backend.type === "wasm") {
+      if (this._megaModule === undefined) {
+        this._megaModule = canCompileToMegaModule(this.steps)
+          ? compileToMegaModule(this.steps, this.inputs, this.outputs)
+          : null;
+        if (DEBUG >= 1 && this._megaModule) {
+          console.info("jit: compiled mega-module");
+        }
+      }
+      if (this._megaModule) {
+        const outputSlots = (this.backend as WasmBackend).executeMegaModule(
+          this._megaModule,
+          inputs,
+        );
+        return { outputs: outputSlots, pending: [] };
+      }
+    }
 
     const scope = new Map<JitId, Slot>();
     if (inputs.length !== this.inputs.length) {

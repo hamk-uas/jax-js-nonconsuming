@@ -1159,11 +1159,11 @@ free scratch buffers
 
 The WASM module function signature is `(N: i32, ...leafPtrs: i32[]) => void`. `N` is a runtime
 parameter resolved from the concrete input shape at execution time. The body kernels are compiled
-with concrete per-element sizes (strides, element widths) — only the outer loop bounds (`stride < N`,
-`i < N`) and buffer offsets (`i * elemSize`) use `N`. This means:
+with concrete per-element sizes (strides, element widths) — only the outer loop bounds
+(`stride < N`, `i < N`) and buffer offsets (`i * elemSize`) use `N`. This means:
 
-- **One compilation, any N:** The WASM module is compiled once per body-shape signature (e.g.,
-  "f32 scalar cumsum") and cached. Different call-site Ns reuse the same module.
+- **One compilation, any N:** The WASM module is compiled once per body-shape signature (e.g., "f32
+  scalar cumsum") and cached. Different call-site Ns reuse the same module.
 - **No SymDim in module codegen:** The WASM bytecode uses concrete element sizes throughout. Only
   the loop bounds reference the `N` local variable.
 - **Buffer allocation at call time:** Ping/pong scratch buffers are allocated by the caller
@@ -1172,17 +1172,17 @@ with concrete per-element sizes (strides, element widths) — only the outer loo
 
 **Integration with `dynamic_axes`:**
 
-| Layer | How N flows |
-| --- | --- |
-| `jit({ dynamic_axes: { 0: "T" } })` | Traces with `SymDim("T")` on axis 0 |
-| `Primitive.AssociativeScan` abstract eval | Output shapes preserve `SymDim("T")` |
-| `jitCompile()` → `assoc_scan` JitStep | Body jaxpr compiled, `N` left as runtime param |
-| `JitProgram.execute()` | Resolves `N` from concrete input shape or `dimBindings` |
-| WASM dispatch | `N` passed as first i32 arg to the compiled module |
+| Layer                                     | How N flows                                             |
+| ----------------------------------------- | ------------------------------------------------------- |
+| `jit({ dynamic_axes: { 0: "T" } })`       | Traces with `SymDim("T")` on axis 0                     |
+| `Primitive.AssociativeScan` abstract eval | Output shapes preserve `SymDim("T")`                    |
+| `jitCompile()` → `assoc_scan` JitStep     | Body jaxpr compiled, `N` left as runtime param          |
+| `JitProgram.execute()`                    | Resolves `N` from concrete input shape or `dimBindings` |
+| WASM dispatch                             | `N` passed as first i32 arg to the compiled module      |
 
-On WebGPU, the current unrolled path (ceil(log₂ N) dispatches) is already the hardware-imposed
-floor — no compiled-loop is possible. The WebGPU path continues to derive N from concrete shapes
-at execution time, which naturally supports polymorphic length through the existing
+On WebGPU, the current unrolled path (ceil(log₂ N) dispatches) is already the hardware-imposed floor
+— no compiled-loop is possible. The WebGPU path continues to derive N from concrete shapes at
+execution time, which naturally supports polymorphic length through the existing
 `_associativeScanCoreImpl` delegation. No WebGPU-specific changes are needed.
 
 **Scan plan structure:**
@@ -1196,6 +1196,7 @@ type AssocScanPlan =
 ```
 
 `planAssociativeScan()` in the backend checks eligibility:
+
 - Body is all elementwise Kernels (no Routines, no reductions requiring cross-element sync)
 - Backend is WASM (WebGPU returns `null` → fallback, which is already optimal)
 - All leaves have the same dtype and element size
@@ -1208,13 +1209,13 @@ type AssocScanPlan =
 
 **Test additions in** `test/lax-associative-scan.test.ts`:
 
-| Test name | What it verifies |
-| --- | --- |
-| `WASM compiled path matches unrolled` | Correctness for cumsum, cumprod |
-| `WASM compiled path N=65536` | Performance: single WASM call vs ceil(log₂ 65536) |
-| `pytree body on WASM compiled path` | Flattened pytree through single module |
+| Test name                                      | What it verifies                                                   |
+| ---------------------------------------------- | ------------------------------------------------------------------ |
+| `WASM compiled path matches unrolled`          | Correctness for cumsum, cumprod                                    |
+| `WASM compiled path N=65536`                   | Performance: single WASM call vs ceil(log₂ 65536)                  |
+| `pytree body on WASM compiled path`            | Flattened pytree through single module                             |
 | `polymorphic length: different N same program` | `jit({ dynamic_axes })` reuses compiled module for N=100 and N=200 |
-| `polymorphic length: N=1 and N=0 edge cases` | Edge cases with runtime N |
+| `polymorphic length: N=1 and N=0 edge cases`   | Edge cases with runtime N                                          |
 
 **Exit criteria:** `associativeScan` on WASM runs in a single JS→WASM call. A
 `jit({ dynamic_axes })` wrapping `associativeScan` handles different input lengths without

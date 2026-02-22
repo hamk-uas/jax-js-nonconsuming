@@ -31,6 +31,7 @@ import {
   wasm_sin,
   wasm_threefry2x32,
 } from "./wasm/builtins";
+import type { WasmMegaModule } from "./wasm/mega-module";
 import {
   getArgsortModule,
   getCholeskyModule,
@@ -139,7 +140,7 @@ let _useSharedMemory = false;
  * If shared memory is active, declares the import as shared with max pages
  * so that the module can be instantiated with a SharedArrayBuffer-backed memory.
  */
-function configureMemoryImport(cg: CodeGenerator): void {
+export function configureMemoryImport(cg: CodeGenerator): void {
   const mem = cg.memory.import("env", "memory");
   if (_useSharedMemory) {
     mem.shared(true).pages(0, MAX_SHARED_PAGES);
@@ -880,15 +881,75 @@ export class WasmBackend implements Backend {
       instance = new WebAssembly.Instance(exe.data.module, imports);
       this.#instanceCache.set(exe.data.module, instance);
     }
-    const scanFunc = instance.exports.assoc_scan as (
-      ...args: number[]
-    ) => void;
+    const scanFunc = instance.exports.assoc_scan as (...args: number[]) => void;
     scanFunc(...args);
 
     // Free scratch buffers
     this.#allocator.free(pingPtr);
     this.#allocator.free(pongPtr);
     for (const ptr of internalPtrs) this.#allocator.free(ptr);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Mega-Module dispatch (M6.1)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Execute a compiled mega-module with the given input Slots.
+   *
+   * The mega-module function allocates its own intermediates (via imported
+   * env.alloc/env.free) and writes output pointers to a result buffer.
+   * This method reads those pointers and creates proper backend Slots.
+   *
+   * For pass-through outputs (outputSizes[i] === 0), the output pointer
+   * matches an input pointer — the corresponding input Slot is incRef'd.
+   */
+  executeMegaModule(megaModule: WasmMegaModule, inputSlots: Slot[]): Slot[] {
+    // Map input Slots → raw pointers
+    const inputPtrs: number[] = inputSlots.map((s) => this.#getPtr(s));
+
+    // Allocate result buffer (numOutputs * 4 bytes for i32 pointers)
+    const resultBufSize = megaModule.numOutputs * 4;
+    const resultBufPtr = this.#allocator.malloc(resultBufSize);
+
+    // Get or create cached instance (with alloc/free imports)
+    let instance = this.#instanceCache.get(megaModule.module);
+    if (!instance) {
+      instance = new WebAssembly.Instance(megaModule.module, {
+        env: {
+          memory: this.#memory,
+          alloc: (size: number) => this.#allocator.malloc(size),
+          free: (ptr: number) => this.#allocator.free(ptr),
+        },
+      });
+      this.#instanceCache.set(megaModule.module, instance);
+    }
+
+    // Call mega_execute(input0_ptr, ..., inputN_ptr, resultBufPtr)
+    const func = instance.exports.mega_execute as (...args: number[]) => void;
+    func(...inputPtrs, resultBufPtr);
+
+    // Read output pointers from result buffer and create Slots.
+    // All outputs are new allocations (pass-through outputs are rejected
+    // at compile time by compileToMegaModule).
+    const view = new DataView(this.#memory.buffer, resultBufPtr, resultBufSize);
+    const outputSlots: Slot[] = [];
+
+    for (let i = 0; i < megaModule.numOutputs; i++) {
+      const ptr = view.getInt32(i * 4, true); // little-endian
+      const slot = this.#nextSlot++;
+      this.#buffers.set(slot, {
+        ptr,
+        size: megaModule.outputSizes[i],
+        ref: 1,
+      });
+      outputSlots.push(slot);
+    }
+
+    // Free the result buffer
+    this.#allocator.free(resultBufPtr);
+
+    return outputSlots;
   }
 }
 
@@ -900,7 +961,7 @@ export class WasmBackend implements Backend {
  * Import WASM helper functions (sin, cos, exp, etc.) needed by a set of AluOps.
  * Shared by regular kernel codegen and scan codegen.
  */
-function importWasmHelperFuncs(
+export function importWasmHelperFuncs(
   cg: CodeGenerator,
   ops: Set<AluOp> | Map<AluOp, Set<DType>>,
 ): Record<string, number> {
@@ -1123,7 +1184,7 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
  * The handleGlobalIndex callback is called to emit code that loads a value
  * from a buffer. After it returns, the value should be on the WASM stack.
  */
-interface TranslateExpContext {
+export interface TranslateExpContext {
   /** Get the value of a variable (e.g., "gidx", "ridx", "acc") */
   getVariable: (name: string) => number | undefined;
   /** Emit code to handle GlobalIndex. Should leave the loaded value on stack. */
@@ -1143,7 +1204,7 @@ interface TranslateExpContext {
  * This is the core expression translation shared by regular kernels and scan.
  * The context provides callbacks for variable resolution and GlobalIndex handling.
  */
-function translateExpCore(
+export function translateExpCore(
   cg: CodeGenerator,
   funcs: Record<string, number>,
   exp: AluExp,
@@ -1452,7 +1513,7 @@ function translateExp(
 // Reduction accumulate helper (shared by kernel and scan codegen)
 // ---------------------------------------------------------------------------
 
-function codegenReductionAccumulate(
+export function codegenReductionAccumulate(
   cg: CodeGenerator,
   re: { op: AluOp; dtype: DType; size: number; identity: number },
   acc: number,
@@ -2262,7 +2323,7 @@ function codegenNativeScanGeneral(
 // Type helpers
 // ---------------------------------------------------------------------------
 
-function dty(cg: CodeGenerator, op: AluOp | null, dtype: DType) {
+export function dty(cg: CodeGenerator, op: AluOp | null, dtype: DType) {
   switch (dtype) {
     case DType.Float32:
       return cg.f32;
@@ -2277,7 +2338,7 @@ function dty(cg: CodeGenerator, op: AluOp | null, dtype: DType) {
   }
 }
 
-function dtyF(
+export function dtyF(
   cg: CodeGenerator,
   op: AluOp | null,
   dtype: DType,
@@ -2350,10 +2411,17 @@ export interface NativeAssocScanParams {
 function codegenNativeAssociativeScan(
   params: NativeAssocScanParams,
 ): Uint8Array<ArrayBuffer> {
-  const { numConsts, constSizes, numLeaves, leafElemSizes, steps, internalSizes, reverse } =
-    params;
+  const {
+    numConsts,
+    constSizes: _constSizes,
+    numLeaves,
+    leafElemSizes,
+    steps,
+    internalSizes,
+    reverse,
+  } = params;
   const numInternal = internalSizes.length;
-  const totalLeafElemSize = leafElemSizes.reduce((a, b) => a + b, 0);
+  void _constSizes;
 
   // Collect all ops for helper function imports
   const allOps = new Set<AluOp>();
@@ -2552,7 +2620,9 @@ function codegenNativeAssociativeScan(
         for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
           const step = steps[stepIdx];
           if (!(step.source instanceof Kernel)) {
-            throw new Error("assoc_scan compiled-loop: only Kernel steps supported");
+            throw new Error(
+              "assoc_scan compiled-loop: only Kernel steps supported",
+            );
           }
           const kernel = step.source;
           const internalIdx = step.outputInternalIdx;
@@ -2586,8 +2656,10 @@ function codegenNativeAssociativeScan(
               translateExpCore(cg, funcs, exp, {
                 getVariable: (name) => {
                   if (name === "gidx") return gidx;
-                  if (name === "ridx" && extra.ridx !== undefined) return extra.ridx;
-                  if (name === "acc" && extra.acc !== undefined) return extra.acc;
+                  if (name === "ridx" && extra.ridx !== undefined)
+                    return extra.ridx;
+                  if (name === "acc" && extra.acc !== undefined)
+                    return extra.acc;
                   return undefined;
                 },
                 handleGlobalIndex: (cg, gen, gid, _len, indexExp, dtype) => {

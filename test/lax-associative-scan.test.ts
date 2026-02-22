@@ -664,10 +664,7 @@ describe("lax.associativeScan — WASM compiled-loop", () => {
     try {
       using xs = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
       using f = jit((x: np.Array) =>
-        lax.associativeScan(
-          (a: np.Array, b: np.Array) => np.add(a, b),
-          x,
-        ),
+        lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
       );
       const result = f(xs);
       expect(result).toBeAllclose([1, 3, 6, 10, 15, 21, 28, 36]);
@@ -697,11 +694,9 @@ describe("lax.associativeScan — WASM compiled-loop", () => {
     try {
       using xs = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
       using f = jit((x: np.Array) =>
-        lax.associativeScan(
-          (a: np.Array, b: np.Array) => np.add(a, b),
-          x,
-          { reverse: true },
-        ),
+        lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x, {
+          reverse: true,
+        }),
       );
       const result = f(xs);
       // Reverse cumsum: [15, 14, 12, 9, 5]
@@ -717,10 +712,7 @@ describe("lax.associativeScan — WASM compiled-loop", () => {
     try {
       using xs = np.array([42.0]);
       using f = jit((x: np.Array) =>
-        lax.associativeScan(
-          (a: np.Array, b: np.Array) => np.add(a, b),
-          x,
-        ),
+        lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
       );
       const result = f(xs);
       expect(result).toBeAllclose([42]);
@@ -735,10 +727,7 @@ describe("lax.associativeScan — WASM compiled-loop", () => {
     try {
       using xs = np.array([1, 2, 3, 4, 5, 6, 7], { dtype: DType.Float32 });
       using f = jit((x: np.Array) =>
-        lax.associativeScan(
-          (a: np.Array, b: np.Array) => np.add(a, b),
-          x,
-        ),
+        lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
       );
       const result = f(xs);
       expect(result).toBeAllclose([1, 3, 6, 10, 15, 21, 28]);
@@ -759,10 +748,7 @@ describe("lax.associativeScan — WASM compiled-loop", () => {
         [10, 11, 12],
       ]);
       using f = jit((x: np.Array) =>
-        lax.associativeScan(
-          (a: np.Array, b: np.Array) => np.add(a, b),
-          x,
-        ),
+        lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
       );
       const result = f(xs);
       expect(result).toBeAllclose([
