@@ -40,6 +40,7 @@ export {
   concreteDim,
   concreteShape,
   dimCompatible,
+  resolveDim,
   dimEquals,
   dimProduct,
   hasSymbolicDims,

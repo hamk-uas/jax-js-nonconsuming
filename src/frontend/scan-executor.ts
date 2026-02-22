@@ -232,6 +232,7 @@ function executeScanCompiledLoop(params: ExecuteScanParams): ExecuteScanResult {
     wasmBackend.dispatchNativeScanGeneral(
       plan.executable,
       plan.params as import("../backend/wasm").NativeScanGeneralParams,
+      params.length,
       constSlots,
       initCarrySlots,
       xsSlots,

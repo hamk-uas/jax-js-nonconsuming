@@ -2,6 +2,7 @@
 // jax-js-lint: allow-ref — .ref is the core ownership mechanism in autodiff internals
 
 import { AluOp, isFloatDtype } from "../alu";
+import { concreteDim } from "../dim";
 import {
   dispose as treeDispose,
   flatten as treeFlatten,
@@ -1831,12 +1832,13 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
   [Primitive.Scan](
     cts,
     args,
-    { jaxpr, numCarry, numConsts, length, reverse, checkpoint },
+    { jaxpr, numCarry, numConsts, length: lengthDim, reverse, checkpoint },
   ) {
     // Scan transpose rule for backward pass through scan.
     //
     // Delegates to ScanPullbackArtifact after building the backward spec
     // (forward jaxpr, tangent body, transposed body, dimension info).
+    const length = concreteDim(lengthDim, "scan transpose rule");
 
     const numX = args.length - numConsts - numCarry;
     const numY = cts.length - numCarry;

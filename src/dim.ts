@@ -49,6 +49,24 @@ export function concreteDim(d: Dim, context?: string): number {
 }
 
 /**
+ * Resolve a potentially-symbolic dimension using bindings.
+ * Returns the concrete number value.
+ */
+export function resolveDim(
+  d: Dim,
+  bindings: ReadonlyMap<string, number>,
+): number {
+  if (typeof d === "number") return d;
+  const val = bindings.get(d.name);
+  if (val === undefined) {
+    throw new Error(
+      `Unresolved symbolic dimension '${d.name}' — not in bindings`,
+    );
+  }
+  return val;
+}
+
+/**
  * Assert that all dimensions in a shape are concrete.
  * Returns the shape typed as number[]. Throws if any dimension is symbolic.
  */

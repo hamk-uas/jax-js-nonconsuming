@@ -101,7 +101,6 @@ export interface ScanRoutineInfo {
 
 /** Parameters for the general native scan codegen. */
 export interface NativeScanGeneralParams {
-  length: number;
   numConsts: number;
   constSizes: number[];
   numCarry: number;
@@ -790,6 +789,7 @@ export class WasmBackend implements Backend {
   dispatchNativeScanGeneral(
     exe: Executable<WasmProgram>,
     params: NativeScanGeneralParams,
+    length: number,
     constSlots: Slot[],
     carryInSlots: Slot[],
     xsSlots: Slot[],
@@ -818,13 +818,13 @@ export class WasmBackend implements Backend {
       dstBuf.set(srcBuf.subarray(0, carrySizes[c]));
     }
 
-    // Build args: [consts, carryOut, xs, carryOut, ysStacked, internals, aux?]
+    // Build args: [length, consts, carryOut, xs, carryOut, ysStacked, internals, aux?]
     // The scan function arguments are:
-    //   [...consts (numConsts), ...carryIn (numCarry), ...xs (numX),
+    //   [length, ...consts (numConsts), ...carryIn (numCarry), ...xs (numX),
     //    ...carryOut (numCarry), ...ysStacked (numY), ...internals (numInternal), aux?]
     // BUT carryIn is also carryOut in this layout (the codegen copies carryIn to carryOut
     // at step 1, so we pass carryOut pointers for both carryIn and carryOut positions).
-    const args: number[] = [];
+    const args: number[] = [length];
 
     // consts
     for (const slot of constSlots) args.push(this.#getPtr(slot));
@@ -2087,7 +2087,6 @@ function codegenNativeScanGeneral(
   params: NativeScanGeneralParams,
 ): Uint8Array<ArrayBuffer> {
   const {
-    length,
     numConsts,
     constSizes,
     numCarry,
@@ -2254,10 +2253,11 @@ function codegenNativeScanGeneral(
   const funcs = importWasmHelperFuncs(cg, allOps);
 
   // Function arguments layout:
-  // [...consts (numConsts), ...carryIn (numCarry), ...xs (numX),
+  // [length, ...consts (numConsts), ...carryIn (numCarry), ...xs (numX),
   //  ...carryOut (numCarry), ...ysStacked (numY), ...internals (numInternal), aux?]
   const needsAux = (params.auxBufferSize ?? 0) > 0;
   const numArgs =
+    1 +
     numConsts +
     numCarry +
     numX +
@@ -2266,7 +2266,7 @@ function codegenNativeScanGeneral(
     numInternal +
     (needsAux ? 1 : 0);
   const auxArgIdx = needsAux
-    ? numConsts + numCarry + numX + numCarry + numY + numInternal
+    ? 1 + numConsts + numCarry + numX + numCarry + numY + numInternal
     : -1;
 
   const scanFunc = cg.function(rep(numArgs, cg.i32), [], () => {
@@ -2275,13 +2275,14 @@ function codegenNativeScanGeneral(
     const gidx = cg.local.declare(cg.i32);
     const dataIdx = cg.local.declare(cg.i32);
 
-    // Argument indices
-    const constsBase = 0;
-    const carryInBase = numConsts;
-    const xsBase = numConsts + numCarry;
-    const carryOutBase = numConsts + numCarry + numX;
-    const ysStackedBase = numConsts + numCarry + numX + numCarry;
-    const internalsBase = numConsts + numCarry + numX + numCarry + numY;
+    // Argument indices (length is arg 0, everything else shifted by 1)
+    const lengthArg = 0;
+    const constsBase = 1;
+    const carryInBase = 1 + numConsts;
+    const xsBase = 1 + numConsts + numCarry;
+    const carryOutBase = 1 + numConsts + numCarry + numX;
+    const ysStackedBase = 1 + numConsts + numCarry + numX + numCarry;
+    const internalsBase = 1 + numConsts + numCarry + numX + numCarry + numY;
 
     // Step 1: Copy carryIn to carryOut (working buffer)
     for (let c = 0; c < numCarry; c++) {
@@ -2319,13 +2320,15 @@ function codegenNativeScanGeneral(
     {
       cg.block(cg.void);
       cg.local.get(iter);
-      cg.i32.const(length);
+      cg.local.get(lengthArg);
       cg.i32.ge_u();
       cg.br_if(0);
 
       // Compute dataIdx = reverse ? (length - 1 - iter) : iter
       if (reverse) {
-        cg.i32.const(length - 1);
+        cg.local.get(lengthArg);
+        cg.i32.const(1);
+        cg.i32.sub();
         cg.local.get(iter);
         cg.i32.sub();
         cg.local.set(dataIdx);

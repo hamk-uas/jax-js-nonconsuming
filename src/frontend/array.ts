@@ -14,7 +14,13 @@ import {
 } from "../alu";
 import { Backend, Device, Executable, getBackend, Slot } from "../backend";
 import { Routine } from "../routine";
-import { Pair, resolveShape, ShapeTracker, unravelAlu } from "../shape";
+import {
+  concreteDim,
+  Pair,
+  resolveShape,
+  ShapeTracker,
+  unravelAlu,
+} from "../shape";
 import {
   deepEqual,
   generalBroadcast,
@@ -1192,7 +1198,7 @@ export class Array extends Tracer {
       [Primitive.TriangularSolve]: Array.#routine(Primitive.TriangularSolve),
       [Primitive.Cholesky]: Array.#routine(Primitive.Cholesky),
       [Primitive.LU]: Array.#routine(Primitive.LU),
-      [Primitive.Jit](args, { jaxpr, name: _name, dynamicAxes }) {
+      [Primitive.Jit](args, { jaxpr, name: _name, numConsts, dynamicAxes }) {
         if (jaxpr.inBinders.length !== args.length) {
           throw new Error(
             `jit expects ${jaxpr.inBinders.length} args, got ${args.length}`,
@@ -1224,7 +1230,8 @@ export class Array extends Tracer {
           for (const [axisStr, dimName] of Object.entries(dynamicAxes)) {
             const axis = Number(axisStr);
             // Use the first dynamic arg's concrete shape to resolve the binding.
-            const concreteVal = args[0]?.shape[axis] as number;
+            // Skip captured constants — dynamic_axes refers to user input args.
+            const concreteVal = args[numConsts]?.shape[axis] as number;
             bindings.set(dimName, concreteVal);
           }
           dimBindings = bindings;
@@ -1402,12 +1409,13 @@ export class Array extends Tracer {
       },
       [Primitive.Scan](
         args,
-        { jaxpr, numCarry, numConsts, length, reverse, acceptPath },
+        { jaxpr, numCarry, numConsts, length: lengthDim, reverse, acceptPath },
       ) {
         // Scan primitive: executes jaxpr in a loop, threading carry state
         // Args layout: [...consts, ...initCarry, ...xs]
         // jaxpr inputs: [...consts, ...carry, ...x_slice]
         // jaxpr outputs: [...newCarry, ...y_slice]
+        const length = concreteDim(lengthDim, "scan eager impl");
 
         const _consts = args.slice(0, numConsts);
         const _initCarry = args.slice(numConsts, numConsts + numCarry);

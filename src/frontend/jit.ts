@@ -20,16 +20,20 @@ import { PPrint } from "../pprint";
 import { Routine } from "../routine";
 import {
   concreteDim,
+  concreteShape,
+  type Dim,
   dimProduct,
   hasSymbolicDims,
   isSymbolicDim,
   isSymbolicSize,
   Pair,
+  resolveDim,
   resolveShape,
   resolveSizeExpr,
   ShapeTracker,
   type SizeExpr,
   sizeExprKey,
+  sizeExprMul,
   unravelAlu,
 } from "../shape";
 import {
@@ -90,7 +94,7 @@ export type JitStep =
       plan: ScanPlan;
       bodyProgram: JitProgram;
       bodyJaxpr: Jaxpr;
-      length: number;
+      length: number | Dim;
       numCarry: number;
       numConsts: number;
       numX: number;
@@ -108,8 +112,8 @@ export type JitStep =
       src: JitId; // the source slice to copy
       output: JitId; // the result (same slot as dst if recycled, else separate)
       offsetBytes: number; // byte offset into dst where src is written
-      sliceBytes: number; // byte size of the src slice
-      dstSizeBytes: number; // total byte size of dst (= output size)
+      sliceBytes: SizeExpr; // byte size of the src slice
+      dstSizeBytes: SizeExpr; // total byte size of dst (= output size)
     }
   | {
       type: "scatter_add";
@@ -490,7 +494,10 @@ export class JitProgram {
             plan: step.plan,
             bodyProgram: step.bodyProgram,
             bodyJaxpr: step.bodyJaxpr,
-            length: step.length,
+            length:
+              typeof step.length === "number"
+                ? step.length
+                : resolveDim(step.length, dimBindings!),
             numCarry: step.numCarry,
             numConsts: step.numConsts,
             numX: step.numX,
@@ -530,13 +537,22 @@ export class JitProgram {
 
           // Zero-copy: if effectDrivenAllocate recycled dst → output,
           // skip the full copy (they share the same buffer).
+          const concreteDstSize =
+            typeof step.dstSizeBytes === "number"
+              ? step.dstSizeBytes
+              : resolveSizeExpr(step.dstSizeBytes, dimBindings!);
+          const concreteSliceSize =
+            typeof step.sliceBytes === "number"
+              ? step.sliceBytes
+              : resolveSizeExpr(step.sliceBytes, dimBindings!);
+
           if (dstSlot !== outSlot) {
             this.backend.copyBufferToBuffer!(
               dstSlot,
               0,
               outSlot,
               0,
-              step.dstSizeBytes,
+              concreteDstSize,
             );
           }
           // Copy src slice into output at the byte offset
@@ -545,7 +561,7 @@ export class JitProgram {
             0,
             outSlot,
             step.offsetBytes,
-            step.sliceBytes,
+            concreteSliceSize,
           );
           break;
         }
@@ -620,14 +636,20 @@ export class JitProgram {
             );
           } else {
             // Fallback: JS Kogge-Stone loop via vmap + evalJaxpr
-            // Create Array wrappers from input slots
+            // Create Array wrappers from input slots.
+            // Resolve symbolic shapes at execution time via dimBindings.
+            const resolveAvalShape = (shape: Dim[]): number[] =>
+              hasSymbolicDims(shape)
+                ? concreteShape(resolveShape(shape, dimBindings!))
+                : (shape as number[]);
+
             const constSlots = step.consts.map((id) => scope.get(id)!);
             const constArrays = constSlots.map((slot, i) => {
               this.backend.incRef(slot);
               const aval = step.constAvals[i];
               return new JaxArray({
                 source: slot,
-                st: ShapeTracker.fromShape(aval.shape as number[]),
+                st: ShapeTracker.fromShape(resolveAvalShape(aval.shape)),
                 dtype: aval.dtype,
                 weakType: aval.weakType,
                 backend: this.backend,
@@ -641,7 +663,7 @@ export class JitProgram {
               const aval = step.elemAvals[i];
               return new JaxArray({
                 source: slot,
-                st: ShapeTracker.fromShape(aval.shape as number[]),
+                st: ShapeTracker.fromShape(resolveAvalShape(aval.shape)),
                 dtype: aval.dtype,
                 weakType: aval.weakType,
                 backend: this.backend,
@@ -1137,7 +1159,7 @@ export function jitCompile(
         const outputIds: JitId[] = [];
         for (const outVar of eqn.outBinders) {
           const outId = builder.pushBuffer(
-            outVar.aval.size * byteWidth(outVar.aval.dtype),
+            sizeExprMul(outVar.aval.sizeExpr, byteWidth(outVar.aval.dtype)),
           );
           outputIds.push(outId);
           ctx.set(outVar, { type: "imm", arg: outId });
@@ -1233,8 +1255,8 @@ export function jitCompile(
           .slice(1)
           .reduce((a, b) => a * b, 1);
         const offsetBytes = offset * innerSize * elemBytes;
-        const sliceBytes = srcInput.aval.size * elemBytes;
-        const dstSizeBytes = outVar.aval.size * elemBytes;
+        const sliceBytes = sizeExprMul(srcInput.aval.sizeExpr, elemBytes);
+        const dstSizeBytes = sizeExprMul(outVar.aval.sizeExpr, elemBytes);
 
         // Allocate output buffer (same size as dst — recycling may reclaim dst)
         const outId = builder.pushBuffer(dstSizeBytes);
@@ -1292,7 +1314,7 @@ export function jitCompile(
         const outputIds: JitId[] = [];
         for (const outVar of eqn.outBinders) {
           const outId = builder.pushBuffer(
-            outVar.aval.size * byteWidth(outVar.aval.dtype),
+            sizeExprMul(outVar.aval.sizeExpr, byteWidth(outVar.aval.dtype)),
           );
           outputIds.push(outId);
           ctx.set(outVar, { type: "imm", arg: outId });
@@ -1359,7 +1381,10 @@ export function jitCompile(
         const targetShape = eqn.inputs[0].aval.shape as number[];
         const updatesLen = eqn.inputs[2].aval.shape[axis] as number;
         const dtype = outVar.aval.dtype;
-        const outSizeBytes = outVar.aval.size * byteWidth(dtype);
+        const outSizeBytes = sizeExprMul(
+          outVar.aval.sizeExpr,
+          byteWidth(dtype),
+        );
 
         // Allocate output buffer (same size as target — recycling may reclaim target)
         const outId = builder.pushBuffer(outSizeBytes);
@@ -1411,7 +1436,7 @@ export function jitCompile(
         const outputs: JitId[] = [];
         for (const outVar of eqn.outBinders) {
           const outId = builder.pushBuffer(
-            outVar.aval.size * byteWidth(outVar.aval.dtype),
+            sizeExprMul(outVar.aval.sizeExpr, byteWidth(outVar.aval.dtype)),
           );
           outputs.push(outId);
           ctx.set(outVar, { type: "imm", arg: outId });

@@ -18,6 +18,7 @@ import type {
 } from "../backend/webgpu";
 import type { WebGPUBackend } from "../backend/webgpu";
 import { Routine, Routines } from "../routine";
+import { type Dim, isSymbolicDim } from "../shape";
 import { DEBUG } from "../utils";
 import type { ScanPath } from "../utils";
 import type { Jaxpr } from "./jaxpr";
@@ -137,7 +138,6 @@ function tryPrepareWasmNativeScan(
   bodyProgram: JitProgram,
   bodyJaxpr: Jaxpr,
   executeSteps: ExecuteStep[],
-  length: number,
   numCarry: number,
   numConsts: number,
   numX: number,
@@ -418,7 +418,6 @@ function tryPrepareWasmNativeScan(
   }
 
   const params: NativeScanGeneralParams = {
-    length,
     numConsts,
     constSizes,
     numCarry,
@@ -690,7 +689,7 @@ function tryPrepareNativeScan(
   backend: Backend,
   bodyProgram: JitProgram,
   bodyJaxpr: Jaxpr,
-  length: number,
+  length: number | Dim,
   numCarry: number,
   numConsts: number,
   numX: number,
@@ -715,7 +714,6 @@ function tryPrepareNativeScan(
       bodyProgram,
       bodyJaxpr,
       executeSteps,
-      length,
       numCarry,
       numConsts,
       numX,
@@ -725,6 +723,13 @@ function tryPrepareNativeScan(
   }
 
   if (backend.type === "webgpu") {
+    if (isSymbolicDim(length)) {
+      if (DEBUG >= 1)
+        console.log(
+          "[compiled-loop] skipped, symbolic length not supported on WebGPU yet",
+        );
+      return null;
+    }
     return tryPrepareWebGPUNativeScan(
       backend,
       bodyProgram,
@@ -878,7 +883,7 @@ export function planScan(
   backend: Backend,
   bodyProgram: JitProgram,
   bodyJaxpr: Jaxpr,
-  length: number,
+  length: number | Dim,
   numCarry: number,
   numConsts: number,
   numX: number,
@@ -911,25 +916,28 @@ export function planScan(
   }
 
   // P4: preencoded-routine for WebGPU routine bodies
-  const preencodedResult = tryPreparePreencodedScan(
-    backend,
-    bodyProgram,
-    bodyJaxpr,
-    length,
-    numCarry,
-    numConsts,
-    numX,
-    numY,
-    reverse,
-  );
+  // WebGPU preencoded-routine requires concrete length (uniform offsets)
+  if (typeof length === "number") {
+    const preencodedResult = tryPreparePreencodedScan(
+      backend,
+      bodyProgram,
+      bodyJaxpr,
+      length,
+      numCarry,
+      numConsts,
+      numX,
+      numY,
+      reverse,
+    );
 
-  if (preencodedResult) {
-    const pathError = checkAcceptedPath("preencoded-routine", acceptPath);
-    if (pathError) throw new Error(pathError);
-    return {
-      path: "preencoded-routine",
-      preencodedParams: preencodedResult,
-    };
+    if (preencodedResult) {
+      const pathError = checkAcceptedPath("preencoded-routine", acceptPath);
+      if (pathError) throw new Error(pathError);
+      return {
+        path: "preencoded-routine",
+        preencodedParams: preencodedResult,
+      };
+    }
   }
 
   // Fallback: JS loop

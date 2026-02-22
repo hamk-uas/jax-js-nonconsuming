@@ -150,7 +150,7 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     jaxpr: Jaxpr;
     numCarry: number;
     numConsts: number;
-    length: number;
+    length: number | Dim;
     reverse: boolean;
     /** Accepted scan path(s). Throws if actual path is not in this list. */
     acceptPath?: string | string[];

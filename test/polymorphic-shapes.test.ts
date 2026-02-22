@@ -1,5 +1,7 @@
 import {
+  DType,
   jit,
+  lax,
   makeJaxpr,
   numpy as np,
   SymDim,
@@ -303,5 +305,104 @@ suite("M4.1: Symbolic Dimension Type & Shape Propagation", () => {
         f.dispose();
       }).toThrow();
     });
+  });
+});
+
+suite("Polymorphic-N: associativeScan + scan with dynamic_axes", () => {
+  test("associativeScan cumsum with polymorphic length", () => {
+    using f = jit(
+      (data: np.Array) =>
+        lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), data),
+      { dynamic_axes: { 0: "T" } },
+    );
+
+    // N=5 — first call triggers compilation
+    using x5 = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+    using r5 = f(x5) as np.Array;
+    expect(r5.js()).toEqual([1, 3, 6, 10, 15]);
+
+    // N=8 — reuses compiled program
+    using x8 = np.array([1, 1, 1, 1, 1, 1, 1, 1], { dtype: DType.Float32 });
+    using r8 = f(x8) as np.Array;
+    expect(r8.js()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+
+    // N=3
+    using x3 = np.array([10, 20, 30], { dtype: DType.Float32 });
+    using r3 = f(x3) as np.Array;
+    expect(r3.js()).toEqual([10, 30, 60]);
+
+    // N=1 — edge case
+    using x1 = np.array([42], { dtype: DType.Float32 });
+    using r1 = f(x1) as np.Array;
+    expect(r1.js()).toEqual([42]);
+  });
+
+  test("associativeScan cumprod with polymorphic length", () => {
+    using f = jit(
+      (data: np.Array) =>
+        lax.associativeScan(
+          (a: np.Array, b: np.Array) => np.multiply(a, b),
+          data,
+        ),
+      { dynamic_axes: { 0: "T" } },
+    );
+
+    using x4 = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
+    using r4 = f(x4) as np.Array;
+    expect(r4.js()).toEqual([1, 2, 6, 24]);
+
+    using x6 = np.array([2, 2, 2, 2, 2, 2], { dtype: DType.Float32 });
+    using r6 = f(x6) as np.Array;
+    expect(r6.js()).toEqual([2, 4, 8, 16, 32, 64]);
+  });
+
+  test("associativeScan reverse with polymorphic length", () => {
+    using f = jit(
+      (data: np.Array) =>
+        lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), data, {
+          reverse: true,
+        }),
+      { dynamic_axes: { 0: "T" } },
+    );
+
+    using x4 = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
+    using r4 = f(x4) as np.Array;
+    expect(r4.js()).toEqual([10, 9, 7, 4]);
+
+    using x3 = np.array([10, 20, 30], { dtype: DType.Float32 });
+    using r3 = f(x3) as np.Array;
+    expect(r3.js()).toEqual([60, 50, 30]);
+  });
+
+  test("lax.scan cumsum with polymorphic length", () => {
+    using f = jit(
+      (xs: np.Array) => {
+        const init = np.array([0], { dtype: DType.Float32 });
+        const [carry, ys] = lax.scan(
+          (c: np.Array, x: np.Array) => {
+            const nc = np.add(c, x);
+            return [nc, nc];
+          },
+          init,
+          xs,
+        );
+        init.dispose();
+        carry.dispose();
+        return ys;
+      },
+      { dynamic_axes: { 0: "T" } },
+    );
+
+    // N=4
+    using x4 = np.array([[1], [2], [3], [4]], { dtype: DType.Float32 });
+    using r4 = f(x4) as np.Array;
+    expect(r4.js()).toEqual([[1], [3], [6], [10]]);
+
+    // N=6 — should reuse compiled program
+    using x6 = np.array([[1], [1], [1], [1], [1], [1]], {
+      dtype: DType.Float32,
+    });
+    using r6 = f(x6) as np.Array;
+    expect(r6.js()).toEqual([[1], [2], [3], [4], [5], [6]]);
   });
 });
