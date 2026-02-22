@@ -66,7 +66,7 @@ import {
   triangularSolve,
   where,
 } from "./core";
-import { ClosedJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
+import { ClosedJaxpr, evalJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
 import { moveaxis } from "./vmap";
 
 class JVPTracer extends Tracer {
@@ -715,6 +715,131 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
 
     const primalsOut = [...carryOutP, ...ysP];
     const tangentsOut = [...carryOutT, ...ysT];
+
+    return [primalsOut, tangentsOut];
+  },
+
+  [Primitive.AssociativeScan](
+    primals,
+    tangents,
+    { jaxpr, numLeaves, axis, reverse },
+  ) {
+    // JVP of associativeScan: double the body to compute both primals and tangents
+    // in a single associativeScan with 2× numLeaves.
+    //
+    // Original body: (consts, a, b) -> result   (each group has numLeaves arrays)
+    // JVP body from jvpJaxpr expects: [primals..., tangents...] order
+    //   i.e., [consts, a, b, consts_dot, a_dot, b_dot] -> [result, result_dot]
+    //
+    // But doubled associativeScan feeds body in scan order:
+    //   [constsP, constsT, aP, aT, bP, bT]
+    //
+    // Wrapper reorders: scan order -> jvp order for inputs.
+    // Outputs [resultP, resultT] are already in correct scan order.
+
+    const numConsts = primals.length - numLeaves;
+
+    // Transform body jaxpr for JVP
+    const jvpBody = jvpJaxpr(jaxpr);
+    const numJvpConsts = jvpBody.consts.length;
+    const numBodyInputs = numConsts + numLeaves * 2; // consts + a + b
+
+    // Get avals in JVP order (primals then tangents)
+    const jvpOrderAvals = jvpBody.jaxpr.inBinders
+      .slice(numJvpConsts)
+      .map((v) => v.aval);
+
+    // Split JVP-order avals into groups
+    const constsP_avals = jvpOrderAvals.slice(0, numConsts);
+    const aP_avals = jvpOrderAvals.slice(numConsts, numConsts + numLeaves);
+    const bP_avals = jvpOrderAvals.slice(numConsts + numLeaves, numBodyInputs);
+    const constsT_avals = jvpOrderAvals.slice(
+      numBodyInputs,
+      numBodyInputs + numConsts,
+    );
+    const aT_avals = jvpOrderAvals.slice(
+      numBodyInputs + numConsts,
+      numBodyInputs + numConsts + numLeaves,
+    );
+    const bT_avals = jvpOrderAvals.slice(numBodyInputs + numConsts + numLeaves);
+
+    // Wrapper in-avals in scan order: [constsP, constsT, aP, aT, bP, bT]
+    const wrapperInAvals = [
+      ...constsP_avals,
+      ...constsT_avals,
+      ...aP_avals,
+      ...aT_avals,
+      ...bP_avals,
+      ...bT_avals,
+    ];
+
+    const { jaxpr: wrapperJaxpr } = makeJaxpr(
+      (...scanOrderArgs: Tracer[]): Tracer[] => {
+        // scanOrderArgs layout: [constsP, constsT, aP, aT, bP, bT]
+        const cP = scanOrderArgs.slice(0, numConsts);
+        const cT = scanOrderArgs.slice(numConsts, numConsts * 2);
+        const aP = scanOrderArgs.slice(
+          numConsts * 2,
+          numConsts * 2 + numLeaves,
+        );
+        const aT = scanOrderArgs.slice(
+          numConsts * 2 + numLeaves,
+          numConsts * 2 + numLeaves * 2,
+        );
+        const bP = scanOrderArgs.slice(
+          numConsts * 2 + numLeaves * 2,
+          numConsts * 2 + numLeaves * 2 + numLeaves,
+        );
+        const bT = scanOrderArgs.slice(
+          numConsts * 2 + numLeaves * 2 + numLeaves,
+        );
+
+        // Reorder to jvp order: [constsP, aP, bP, constsT, aT, bT]
+        const jvpOrderArgs = [...cP, ...aP, ...bP, ...cT, ...aT, ...bT];
+
+        // Inline the jvpBody jaxpr via evalJaxpr instead of bind(Primitive.Jit).
+        // Using Primitive.Jit here would JIT-compile the body with the traced
+        // element shapes (e.g., scalar []), producing shape-specialized kernels
+        // that return scalar outputs even when the impl rule feeds batched
+        // inputs ([N-stride, ...]). evalJaxpr inlines the equations into the
+        // wrapper jaxpr, preserving shape-polymorphic evaluation.
+        //
+        // Protect jvpBody.consts with .ref so evalJaxpr's auto-disposal
+        // decrements but doesn't free them (they're cache-owned via jvpJaxprCache).
+        const jvpOutputs = evalJaxpr(jvpBody.jaxpr, [
+          ...jvpBody.consts.map((c) => (c as Tracer).ref), // jax-js-lint: allow-ref
+          ...jvpOrderArgs,
+        ]);
+
+        // Outputs: [resultP..., resultT...] — already in correct scan order
+        return jvpOutputs;
+      },
+    )(...wrapperInAvals);
+
+    // Build doubled primitive args
+    const constsP = primals.slice(0, numConsts);
+    const elemsP = primals.slice(numConsts);
+    const constsT = tangents.slice(0, numConsts);
+    const elemsT = tangents.slice(numConsts);
+
+    const results = bind(
+      Primitive.AssociativeScan,
+      [...wrapperJaxpr.consts, ...constsP, ...constsT, ...elemsP, ...elemsT],
+      {
+        jaxpr: wrapperJaxpr.jaxpr,
+        numLeaves: numLeaves * 2,
+        axis,
+        reverse,
+      },
+    );
+
+    // Dispose the wrapper jaxpr (not cached)
+    // Note: jvpBody is cached via jvpJaxprCache, so we don't dispose it
+    wrapperJaxpr.dispose();
+
+    // Results: [resultP_0..nL-1, resultT_0..nL-1]
+    const primalsOut = results.slice(0, numLeaves);
+    const tangentsOut = results.slice(numLeaves);
 
     return [primalsOut, tangentsOut];
   },

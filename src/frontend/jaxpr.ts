@@ -1406,6 +1406,30 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
 
     return [...carryOutTypes, ...yTypes];
   },
+  [Primitive.AssociativeScan](
+    args,
+    { jaxpr: bodyJaxpr, numLeaves, axis: _axis },
+  ) {
+    // Args: [...consts, ...elems_leaves]
+    // bodyJaxpr: (a_leaves..., b_leaves...) -> result_leaves...
+    // Output: same shape as elems_leaves (prefix scan result)
+    const numConsts = args.length - numLeaves;
+    const { outTypes } = typecheckJaxpr(bodyJaxpr);
+
+    if (bodyJaxpr.inBinders.length !== numConsts + numLeaves * 2) {
+      throw new TypeError(
+        `AssociativeScan body jaxpr expects ${bodyJaxpr.inBinders.length} inputs, got ${numConsts + numLeaves * 2}`,
+      );
+    }
+    if (outTypes.length !== numLeaves) {
+      throw new TypeError(
+        `AssociativeScan body jaxpr returns ${outTypes.length} outputs, expected ${numLeaves}`,
+      );
+    }
+
+    // Output shapes = input elem shapes (prefix scan preserves shape)
+    return args.slice(numConsts);
+  },
 };
 
 function splitIdx(values: any[], argnums: Set<number>): [any[], any[]] {

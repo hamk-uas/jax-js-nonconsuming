@@ -650,6 +650,12 @@ class PartialEvalTrace extends Trace {
         tracers,
       );
     }
+    if (primitive === Primitive.AssociativeScan) {
+      return this.#partialEvalAssociativeScan(
+        params as PrimitiveParams<Primitive.AssociativeScan>,
+        tracers,
+      );
+    }
     const tracersIn = tracers.map((t) => this.instantiateConst(t));
     const avalsIn = tracersIn.map((t) => t.pval.aval);
     const avalsOut = abstractEvalRules[primitive](avalsIn, params);
@@ -881,6 +887,112 @@ class PartialEvalTrace extends Trace {
     }
 
     // tracerRefsOut: known positions get null ref
+    recipe.tracerRefsOut = tracersOut.map((t) =>
+      t.pval.isKnown ? (null as any) : new WeakRef(t),
+    );
+
+    return tracersOut;
+  }
+
+  /**
+   * Partial eval for AssociativeScan primitive.
+   *
+   * Same approach as scan PE: if JVP-doubled (even numLeaves), split
+   * primal (known) from tangent (unknown) outputs.
+   */
+  #partialEvalAssociativeScan(
+    params: PrimitiveParams<Primitive.AssociativeScan>,
+    tracers: PartialEvalTracer[],
+  ): Tracer[] {
+    const { numLeaves } = params;
+    const isKnown = tracers.map((t) => t.pval.isKnown);
+    const hasUnknown = isKnown.some((k) => !k);
+
+    if (!hasUnknown) {
+      const inputs = tracers.map((t) => t.fullLower());
+      return bind(Primitive.AssociativeScan, inputs, params);
+    }
+
+    const avalsIn = tracers.map((t) => t.pval.aval);
+    const avalsOut = abstractEvalRules[Primitive.AssociativeScan](
+      avalsIn,
+      params,
+    );
+
+    const isJvpScan = numLeaves % 2 === 0;
+
+    if (!isJvpScan) {
+      const tracersIn = tracers.map((t) => this.instantiateConst(t));
+      const recipe: JaxprRecipe = {
+        type: "JaxprEqn",
+        prim: Primitive.AssociativeScan,
+        tracersIn,
+        params,
+        avalsOut,
+        tracerRefsOut: [],
+      };
+      const tracersOut = avalsOut.map((aval, i) => {
+        if (i > 0) tracersIn.forEach((t) => t.ref);
+        return new PartialEvalTracer(this, PartialVal.unknown(aval), recipe);
+      });
+      recipe.tracerRefsOut = tracersOut.map((t) => new WeakRef(t));
+      return tracersOut;
+    }
+
+    const numOrigLeaves = numLeaves / 2;
+
+    // Run full scan with zeros for unknown inputs
+    const synthesizedZeroInputs: Tracer[] = [];
+    const fullInputs = tracers.map((t) => {
+      if (t.pval.isKnown) {
+        return (t.pval.val as Tracer).ref;
+      } else {
+        const z = zeros(t.pval.aval.shape as number[], {
+          dtype: t.pval.aval.dtype,
+        });
+        synthesizedZeroInputs.push(z);
+        return z;
+      }
+    });
+
+    const fullOuts = bind(Primitive.AssociativeScan, fullInputs, params);
+
+    const tracersIn = tracers.map((t) => this.instantiateConst(t));
+    const recipe: JaxprRecipe = {
+      type: "JaxprEqn",
+      prim: Primitive.AssociativeScan,
+      tracersIn,
+      params,
+      avalsOut,
+      tracerRefsOut: [],
+    };
+
+    const tracersOut: PartialEvalTracer[] = [];
+
+    // First numOrigLeaves outputs are known (primal results)
+    for (let i = 0; i < numOrigLeaves; i++) {
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.known(fullOuts[i]), null),
+      );
+    }
+
+    // Last numOrigLeaves outputs are unknown (tangent results)
+    for (let i = numOrigLeaves; i < numLeaves; i++) {
+      fullOuts[i].dispose();
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.unknown(avalsOut[i]), recipe),
+      );
+    }
+
+    const retainedKnownOutputs = new Set<Tracer>(
+      fullOuts.slice(0, numOrigLeaves),
+    );
+    for (const inp of fullInputs) {
+      if (!retainedKnownOutputs.has(inp) && inp.refCount > 0) {
+        inp.dispose();
+      }
+    }
+
     recipe.tracerRefsOut = tracersOut.map((t) =>
       t.pval.isKnown ? (null as any) : new WeakRef(t),
     );
@@ -1930,6 +2042,309 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     );
 
     return artifact.run(cts);
+  },
+  [Primitive.AssociativeScan](cts, args, params) {
+    // AssociativeScan transpose: reverse sequential recurrence.
+    //
+    // Forward:  y[0] = x[0],  y[i] = body(y[i-1], x[i])  for i=1..N-1
+    // Backward: iterate N-1..1, transposing body at each position.
+    //   ct_carry += ct_y[i]; [ct_a, ct_b] = body_T(ct_carry, residuals_i)
+    //   ct_x[i] = ct_b; ct_carry = ct_a
+    //   ct_x[0] = ct_carry + ct_y[0]
+
+    const {
+      jaxpr: bodyJaxpr,
+      numLeaves,
+      axis: _axis,
+      reverse,
+    } = params as PrimitiveParams<Primitive.AssociativeScan>;
+    const numConsts = args.length - numLeaves;
+    const numOrigLeaves = numLeaves / 2;
+
+    // Build body undef mask: which body inputs are tangent?
+    const undefMask = args.map((x) => x instanceof UndefPrimal);
+    const bodyUndefPrimals: boolean[] = [];
+    for (let i = 0; i < bodyJaxpr.inBinders.length; i++) {
+      if (i < numConsts) {
+        bodyUndefPrimals.push(undefMask[i]);
+      } else if (i < numConsts + numLeaves) {
+        bodyUndefPrimals.push(i - numConsts >= numOrigLeaves);
+      } else {
+        bodyUndefPrimals.push(i - numConsts - numLeaves >= numOrigLeaves);
+      }
+    }
+
+    const numTangentConsts = bodyUndefPrimals
+      .slice(0, numConsts)
+      .filter((x) => x).length;
+
+    // Transpose the full body jaxpr (cache-owned)
+    const transposedBody = transposeJaxpr(bodyJaxpr, bodyUndefPrimals);
+
+    // Get primal residuals
+    const constResiduals = args
+      .slice(0, numConsts)
+      .filter((_, i) => !undefMask[i]) as Tracer[];
+    let primalElems = args.slice(
+      numConsts,
+      numConsts + numOrigLeaves,
+    ) as Tracer[];
+
+    const N = primalElems[0].shape[0]; // axis is always 0
+
+    // For reverse= true, flip primal elems and cotangents so backward
+    // loop works in "forward order".
+    if (reverse) {
+      primalElems = primalElems.map((e) => flip(e, [0]));
+    }
+
+    // ----- Recompute forward primals y_P[0..N-1] -----
+
+    // Helper: slice a leaf array at position idx along axis 0
+    const sliceAt = (arr: Tracer, idx: number): Tracer => {
+      const ranges: [number, number][] = [[idx, idx + 1]];
+      for (let d = 1; d < arr.ndim; d++) ranges.push([0, arr.shape[d]]);
+      const sl = shrink(arr, ranges);
+      const r = reshape(sl, arr.shape.slice(1));
+      sl.dispose();
+      return r;
+    };
+
+    // Primal-only evaluation of body
+    const evalPrimalBody = (aLeaves: Tracer[], bLeaves: Tracer[]): Tracer[] => {
+      const bodyArgs: Tracer[] = [];
+      let cri = 0;
+      for (let i = 0; i < numConsts; i++) {
+        if (bodyUndefPrimals[i]) {
+          bodyArgs.push(
+            zeros(bodyJaxpr.inBinders[i].aval.shape as number[], {
+              dtype: bodyJaxpr.inBinders[i].aval.dtype,
+            }),
+          );
+        } else {
+          bodyArgs.push(constResiduals[cri++].ref);
+        }
+      }
+      for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(aLeaves[i].ref);
+      for (let i = numOrigLeaves; i < numLeaves; i++) {
+        bodyArgs.push(
+          zeros(bodyJaxpr.inBinders[numConsts + i].aval.shape as number[], {
+            dtype: bodyJaxpr.inBinders[numConsts + i].aval.dtype,
+          }),
+        );
+      }
+      for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(bLeaves[i].ref);
+      for (let i = numOrigLeaves; i < numLeaves; i++) {
+        bodyArgs.push(
+          zeros(
+            bodyJaxpr.inBinders[numConsts + numLeaves + i].aval
+              .shape as number[],
+            {
+              dtype: bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.dtype,
+            },
+          ),
+        );
+      }
+      const outs = evalJaxpr(bodyJaxpr, bodyArgs);
+      const pOuts = outs.slice(0, numOrigLeaves);
+      for (let i = numOrigLeaves; i < outs.length; i++) outs[i].dispose();
+      return pOuts;
+    };
+
+    // allYP[i] = primal prefix result at position i   (indexed 0..N-1)
+    const allYP: Tracer[][] = [];
+    allYP.push(primalElems.map((e) => sliceAt(e, 0)));
+    for (let i = 1; i < N; i++) {
+      const xi = primalElems.map((e) => sliceAt(e, i));
+      const newY = evalPrimalBody(allYP[i - 1], xi);
+      for (const x of xi) x.dispose();
+      allYP.push(newY);
+    }
+
+    // ----- Backward loop -----
+
+    // Split cotangents: first numOrigLeaves are primal (zero), rest tangent.
+    // Cotangents may be aliased (e.g., add transpose returns [ct, ct]), so
+    // use a Set to avoid double-free.
+    const ctPrimal = cts.slice(0, numOrigLeaves);
+    let ctTangent = cts.slice(numOrigLeaves);
+    const disposedCts = new Set<Tracer>();
+    for (const c of ctPrimal) {
+      if (!disposedCts.has(c)) {
+        disposedCts.add(c);
+        c.dispose();
+      }
+    }
+
+    if (reverse) {
+      ctTangent = ctTangent.map((c) => flip(c, [0]));
+    }
+
+    // Initialize carry cotangent to zeros
+    let ctCarry: Tracer[] = allYP[0].map((y) =>
+      zeros(y.shape as number[], { dtype: y.dtype }),
+    );
+    let ctConstsAccum: Tracer[] | null = null;
+    const ctXsPerLeaf: Tracer[][] = Array.from(
+      { length: numOrigLeaves },
+      () => [],
+    );
+
+    for (let i = N - 1; i >= 1; i--) {
+      // Slice tangent cotangent at position i
+      const ctYi = ctTangent.map((c) => sliceAt(c, i));
+      // Effective cotangent = ctCarry + ctYi
+      const ctEff = ctCarry.map((c, j) => add(c, ctYi[j]));
+      for (const c of ctCarry) c.dispose();
+      for (const c of ctYi) c.dispose();
+
+      // Slice primal x at position i
+      const xPi = primalElems.map((e) => sliceAt(e, i));
+      // Primal y at position i-1
+      const yPrev = allYP[i - 1];
+
+      // Build transposed body inputs: [consts, residuals, cotangents]
+      const tbInputs = [
+        ...transposedBody.consts.map((c) => c.ref),
+        ...constResiduals.map((c) => c.ref),
+      ];
+      for (const y of yPrev) tbInputs.push(y.ref);
+      for (const x of xPi) tbInputs.push(x.ref);
+      // Cotangents for body outputs: zero for primal, ctEff for tangent
+      for (let j = 0; j < numOrigLeaves; j++) {
+        tbInputs.push(
+          zeros(allYP[0][j].shape as number[], {
+            dtype: allYP[0][j].dtype,
+          }),
+        );
+      }
+      for (const c of ctEff) tbInputs.push(c.ref);
+
+      const tbOuts = evalJaxpr(transposedBody.jaxpr, tbInputs);
+
+      // Extract: [ct_constT, ct_aT, ct_bT]
+      // IMPORTANT: transposed body may return aliased outputs (e.g., add's
+      // transpose sends cotangent to both inputs → same array for ct_a and ct_b).
+      // We .ref any ctBIter entry that aliases ctANew (ctCarry), since ctCarry
+      // will be disposed later and ctBIter must survive for stacking.
+      let oi = 0;
+      const ctConstsI: Tracer[] = [];
+      for (let j = 0; j < numTangentConsts; j++) ctConstsI.push(tbOuts[oi++]);
+      const ctANew: Tracer[] = [];
+      for (let j = 0; j < numOrigLeaves; j++) ctANew.push(tbOuts[oi++]);
+      const ctBIter: Tracer[] = [];
+      for (let j = 0; j < numOrigLeaves; j++) {
+        const ct = tbOuts[oi++];
+        // If this output aliases a ctANew entry, .ref it so dispose of
+        // ctCarry (= ctANew) doesn't kill it.
+        if (ctANew.includes(ct)) ct.ref; // jax-js-lint: allow-ref
+        ctBIter.push(ct);
+      }
+
+      ctCarry = ctANew;
+
+      // Accumulate const cotangents
+      if (ctConstsAccum === null) {
+        ctConstsAccum = ctConstsI;
+      } else {
+        for (let j = 0; j < ctConstsAccum.length; j++) {
+          const s = add(ctConstsAccum[j], ctConstsI[j]);
+          ctConstsAccum[j].dispose();
+          ctConstsI[j].dispose();
+          ctConstsAccum[j] = s;
+        }
+      }
+
+      for (let j = 0; j < numOrigLeaves; j++) ctXsPerLeaf[j].push(ctBIter[j]);
+
+      for (const x of xPi) x.dispose();
+      for (const c of ctEff) c.dispose();
+    }
+
+    // Position 0: ct_xT[0] = ctCarry + ct_y_T[0]
+    const ctY0 = ctTangent.map((c) => sliceAt(c, 0));
+    const ctX0 = ctCarry.map((c, j) => {
+      const s = add(c, ctY0[j]);
+      c.dispose();
+      ctY0[j].dispose();
+      return s;
+    });
+    for (let j = 0; j < numOrigLeaves; j++) ctXsPerLeaf[j].push(ctX0[j]);
+
+    // Dispose forward primals
+    for (const yp of allYP) for (const y of yp) y.dispose();
+    // Dispose tangent cts (may be aliased — deduplicate)
+    for (const ct of ctTangent) {
+      if (!disposedCts.has(ct)) {
+        disposedCts.add(ct);
+        ct.dispose();
+      }
+    }
+    // Dispose flipped primal elems if reverse
+    if (reverse) for (const e of primalElems) e.dispose();
+
+    // Stack per-position x cotangents (collected in reverse order)
+    const ctXsStacked: Tracer[] = [];
+    for (let j = 0; j < numOrigLeaves; j++) {
+      const perPos = ctXsPerLeaf[j].reverse();
+      const expanded = perPos.map((ct) => broadcast(ct, [1, ...ct.shape], [0]));
+      let stacked = concatenate(expanded, 0);
+      if (reverse) {
+        const flipped = flip(stacked, [0]);
+        stacked.dispose();
+        stacked = flipped;
+      }
+      const disposed = new Set<Tracer>();
+      for (const ct of expanded) {
+        if (!disposed.has(ct)) {
+          disposed.add(ct);
+          ct.dispose();
+        }
+      }
+      for (const ct of perPos) {
+        if (!disposed.has(ct)) {
+          disposed.add(ct);
+          ct.dispose();
+        }
+      }
+      ctXsStacked.push(stacked);
+    }
+
+    // Assemble output: null for known primals, cotangent for unknowns.
+    //
+    // Key subtlety: some tangent inputs may be known (concrete zeros, because
+    // their primal doesn't depend on the grad argument). These are NOT
+    // UndefPrimal in `args`, so they must get null. But ctXsStacked is indexed
+    // by structural tangent leaf position (0..numOrigLeaves-1), not by a
+    // running counter over UndefPrimal args. Use the structural index
+    // (i - numConsts - numOrigLeaves) to pick the right ctXsStacked entry.
+    const result: (Tracer | null)[] = [];
+    let ctCI = 0;
+    for (let i = 0; i < args.length; i++) {
+      if (!(args[i] instanceof UndefPrimal)) {
+        result.push(null);
+      } else if (i < numConsts) {
+        result.push(ctConstsAccum![ctCI++]);
+      } else {
+        // Tangent leaf at structural index within the elems
+        const tangentLeafIdx = i - numConsts - numOrigLeaves;
+        result.push(ctXsStacked[tangentLeafIdx]);
+      }
+    }
+
+    // Dispose unused ctXsStacked entries (for tangent leaves that were known,
+    // not UndefPrimal, so their ctXsStacked wasn't consumed above).
+    const consumedIdxs = new Set<number>();
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] instanceof UndefPrimal && i >= numConsts) {
+        consumedIdxs.add(i - numConsts - numOrigLeaves);
+      }
+    }
+    for (let j = 0; j < ctXsStacked.length; j++) {
+      if (!consumedIdxs.has(j)) ctXsStacked[j].dispose();
+    }
+
+    return result;
   },
 };
 

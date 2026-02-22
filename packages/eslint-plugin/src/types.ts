@@ -29,6 +29,25 @@ export function hasAllowComment(
     if (c.value.includes(marker)) return true;
   }
 
+  // Check inline/trailing comments on the same line as the node.
+  // getCommentsBefore() only returns comments between the previous token
+  // and the node, so it misses trailing `// jax-js-lint: allow-ref` on
+  // the same line.  Fall back to raw source-text scanning.
+  const sourceText = source.getText();
+  const lines = sourceText.split("\n");
+  if (nodeLine <= lines.length) {
+    const lineText = lines[nodeLine - 1];
+    const slashIdx = lineText.indexOf("//");
+    if (slashIdx >= 0 && lineText.slice(slashIdx).includes(marker)) {
+      return true;
+    }
+    // Also check block comments /* ... */ on the same line
+    const blockMatch = lineText.match(/\/\*[\s\S]*?\*\//g);
+    if (blockMatch?.some((c) => c.includes(marker))) {
+      return true;
+    }
+  }
+
   let current: any = node;
   while (current) {
     const comments = source.getCommentsBefore(current);

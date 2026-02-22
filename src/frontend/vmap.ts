@@ -604,6 +604,65 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
 
     return [[...carryOut, ...movedYs], rep(numCarry + numY, 0)];
   },
+  [Primitive.AssociativeScan](
+    axisSize,
+    args,
+    dims,
+    { jaxpr, numLeaves, axis, reverse },
+  ) {
+    // vmap of associativeScan: batch over independent scans
+    //
+    // AssociativeScan args: [...consts, ...elems_leaves]
+    // Body takes: [...consts, ...a_leaves, ...b_leaves] -> [...result_leaves]
+    //
+    // Move all batch dims to axis 0, then run batched scan with scan axis
+    // shifted to axis+1 (since batch is at axis 0).
+
+    const numConsts = args.length - numLeaves;
+
+    const consts = args.slice(0, numConsts);
+    const elems = args.slice(numConsts);
+
+    const constDims = dims.slice(0, numConsts);
+    const elemDims = dims.slice(numConsts);
+
+    // Move batch to axis 0 for all args
+    const movedConsts = consts.map((c, i) =>
+      moveBatchAxis(axisSize, constDims[i], 0, c),
+    );
+    const movedElems = elems.map((e, i) =>
+      moveBatchAxis(axisSize, elemDims[i], 0, e),
+    );
+
+    // Body dims: all batch at axis 0
+    // (consts get batch at 0, a_leaves get batch at 0, b_leaves get batch at 0)
+    const bodyDims: (number | null)[] = [
+      ...rep(numConsts, 0),
+      ...rep(numLeaves * 2, 0),
+    ];
+
+    const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims);
+
+    const newArgs = [...vmappedBody.consts, ...movedConsts, ...movedElems];
+
+    const results = bind(Primitive.AssociativeScan, newArgs, {
+      jaxpr: vmappedBody.jaxpr,
+      numLeaves,
+      axis: axis + 1, // scan axis shifts since batch is at axis 0
+      reverse,
+    });
+
+    // Dispose moved intermediates
+    for (let i = 0; i < movedConsts.length; i++) {
+      if (movedConsts[i] !== consts[i]) movedConsts[i][Symbol.dispose]();
+    }
+    for (let i = 0; i < movedElems.length; i++) {
+      if (movedElems[i] !== elems[i]) movedElems[i][Symbol.dispose]();
+    }
+
+    // Results have batch at axis 0
+    return [results, rep(numLeaves, 0)];
+  },
 };
 
 const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();

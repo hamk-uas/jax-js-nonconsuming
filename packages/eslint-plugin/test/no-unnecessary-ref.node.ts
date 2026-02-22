@@ -90,6 +90,26 @@ function f(x) {
   assert.equal(messages.length, 0);
 });
 
+test("no-unnecessary-ref: allows .ref with inline trailing allow-ref comment", async () => {
+  const code = `
+function f(x) {
+  const y = x.ref; // jax-js-lint: allow-ref
+}
+`;
+  const messages = await lintRef(code);
+  assert.equal(messages.length, 0);
+});
+
+test("no-unnecessary-ref: allows .ref with inline allow-ref in map callback", async () => {
+  const code = `
+function f(arr) {
+  const y = arr.map((c) => c.ref); // jax-js-lint: allow-ref
+}
+`;
+  const messages = await lintRef(code);
+  assert.equal(messages.length, 0);
+});
+
 test("no-unnecessary-ref: allows file-level allow-ref directive", async () => {
   const code = `// jax-js-lint: allow-ref
 function f(x) {

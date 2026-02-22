@@ -32,10 +32,11 @@ import {
   range,
   rep,
 } from "../utils";
-import { aluCompare, PendingExecute } from "./array";
+import { aluCompare, Array as JaxArray, PendingExecute } from "./array";
 import { _registerJitCacheDisposer } from "./check-leaks";
 import { pool, poolTranspose, prepareConv } from "./convolution";
 import {
+  _associativeScanCoreImpl,
   Primitive,
   PrimitiveParams,
   promoteAvals,
@@ -111,6 +112,19 @@ export type JitStep =
       targetShape: number[];
       updatesLen: number; // number of updates along the scatter axis
       dtype: DType;
+    }
+  | {
+      type: "assoc_scan";
+      bodyJaxpr: Jaxpr;
+      numLeaves: number;
+      numConsts: number;
+      axis: number;
+      reverse: boolean;
+      consts: JitId[];
+      elems: JitId[];
+      constAvals: ShapedArray[];
+      elemAvals: ShapedArray[];
+      outputs: JitId[];
     };
 
 /** Per-type step counts from {@link JitProgram.stepCounts}. */
@@ -123,6 +137,7 @@ export interface JitStepCounts {
   scan: number;
   dus: number;
   scatter_add: number;
+  assoc_scan: number;
 }
 
 /**
@@ -238,6 +253,11 @@ export class JitProgram {
           return PPrint.pp(
             `%${step.output} = scatter_add %${step.target} %${step.indices} %${step.updates} axis=${step.axis}`,
           );
+        case "assoc_scan":
+          return PPrint.pp(
+            `assoc_scan numLeaves=${step.numLeaves} numConsts=${step.numConsts} axis=${step.axis}` +
+              (step.reverse ? " reverse" : ""),
+          );
       }
     });
     const display = PPrint.prototype.concat(
@@ -273,6 +293,7 @@ export class JitProgram {
       scan: 0,
       dus: 0,
       scatter_add: 0,
+      assoc_scan: 0,
     };
     for (const step of this.steps) {
       counts[step.type]++;
@@ -481,6 +502,76 @@ export class JitProgram {
           );
           break;
         }
+        case "assoc_scan": {
+          // Flush pending ops — assoc_scan needs materialized inputs
+          for (const p of pending) {
+            p.prepareSync();
+            p.submit();
+          }
+          pending.length = 0;
+
+          // Create Array wrappers from input slots
+          const constSlots = step.consts.map((id) => scope.get(id)!);
+          const constArrays = constSlots.map((slot, i) => {
+            this.backend.incRef(slot);
+            const aval = step.constAvals[i];
+            return new JaxArray({
+              source: slot,
+              st: ShapeTracker.fromShape(aval.shape as number[]),
+              dtype: aval.dtype,
+              weakType: aval.weakType,
+              backend: this.backend,
+              committed: false,
+            });
+          });
+
+          const elemSlots = step.elems.map((id) => scope.get(id)!);
+          const elemArrays = elemSlots.map((slot, i) => {
+            this.backend.incRef(slot);
+            const aval = step.elemAvals[i];
+            return new JaxArray({
+              source: slot,
+              st: ShapeTracker.fromShape(aval.shape as number[]),
+              dtype: aval.dtype,
+              weakType: aval.weakType,
+              backend: this.backend,
+              committed: false,
+            });
+          });
+
+          // Call Kogge-Stone core impl with body jaxpr + consts.
+          // The core impl uses vmap internally to vectorize the element-level
+          // body jaxpr over the batch dimension.
+          const results = _associativeScanCoreImpl!(
+            step.bodyJaxpr,
+            constArrays,
+            elemArrays,
+            step.numLeaves,
+            step.axis,
+            step.reverse,
+          );
+
+          // Extract slots from results and store in output scope.
+          // Must flush pending ops first — result arrays from associativeScanCore
+          // have PendingExecute items (from concat/kernels) that haven't been
+          // submitted yet. Without flushing, the slot buffer contains zeros.
+          for (let i = 0; i < step.numLeaves; i++) {
+            const resultArr = results[i] as JaxArray;
+            resultArr._flushPendingSync();
+            const slot = resultArr._realizeSource();
+            this.backend.incRef(slot);
+            // Free the pre-allocated output buffer before overwriting scope
+            const oldSlot = scope.get(step.outputs[i]);
+            if (oldSlot !== undefined) this.backend.decRef(oldSlot);
+            scope.set(step.outputs[i], slot);
+            resultArr.dispose();
+          }
+
+          // Dispose input Array wrappers
+          for (const a of constArrays) a.dispose();
+          for (const a of elemArrays) a.dispose();
+          break;
+        }
         default:
           step satisfies never;
       }
@@ -514,6 +605,12 @@ function stepUsesId(step: JitStep, id: JitId): boolean {
         step.indices === id ||
         step.updates === id ||
         step.output === id
+      );
+    case "assoc_scan":
+      return (
+        step.outputs.includes(id) ||
+        step.consts.includes(id) ||
+        step.elems.includes(id)
       );
     default:
       return false;
@@ -1029,6 +1126,68 @@ export function jitCompile(
           offsetBytes,
           sliceBytes,
           dstSizeBytes,
+        });
+        continue;
+      }
+
+      // Handle Primitive.AssociativeScan — creates an assoc_scan JitStep
+      // that runs the Kogge-Stone loop at execution time.
+      if (eqn.primitive === Primitive.AssociativeScan) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<
+          typeof Primitive.AssociativeScan
+        >;
+        const { jaxpr: bodyJaxpr, numLeaves, axis, reverse } = params;
+        const numConsts = eqn.inputs.length - numLeaves;
+
+        // Resolve input JitIds
+        const allInputIds: JitId[] = [];
+        for (const input of eqn.inputs) {
+          if (input instanceof Var) {
+            const jv = ctx.get(input)!;
+            if (jv.type !== "imm") {
+              throw new Error(
+                "jit: AssociativeScan primitive input is not imm",
+              );
+            }
+            allInputIds.push(jv.arg);
+          } else if (input instanceof Lit) {
+            allInputIds.push(builder.pushLit(input));
+          }
+        }
+
+        const constsIds = allInputIds.slice(0, numConsts);
+        const elemsIds = allInputIds.slice(numConsts);
+
+        const constAvals = eqn.inputs
+          .slice(0, numConsts)
+          .map((v) => v.aval as ShapedArray);
+        const elemAvals = eqn.inputs
+          .slice(numConsts)
+          .map((v) => v.aval as ShapedArray);
+
+        // Allocate output buffers
+        const outputIds: JitId[] = [];
+        for (const outVar of eqn.outBinders) {
+          const outId = builder.pushBuffer(
+            outVar.aval.size * byteWidth(outVar.aval.dtype),
+          );
+          outputIds.push(outId);
+          ctx.set(outVar, { type: "imm", arg: outId });
+        }
+
+        builder.steps.push({
+          type: "assoc_scan",
+          bodyJaxpr,
+          numLeaves,
+          numConsts,
+          axis,
+          reverse,
+          consts: constsIds,
+          elems: elemsIds,
+          constAvals,
+          elemAvals,
+          outputs: outputIds,
         });
         continue;
       }
@@ -1646,6 +1805,11 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   [Primitive.ScatterAdd]() {
     throw new Error("internal: ScatterAdd is handled specially in jitCompile");
   },
+  [Primitive.AssociativeScan]() {
+    throw new Error(
+      "internal: AssociativeScan is handled specially in jitCompile",
+    );
+  },
 };
 
 /** Determines how to split the Jaxpr into kernels via dataflow analysis. */
@@ -1811,6 +1975,7 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     Primitive.Scan,
     Primitive.DynamicUpdateSlice,
     Primitive.ScatterAdd,
+    Primitive.AssociativeScan,
   ];
   for (let i = jaxpr.eqns.length - 1; i >= 0; i--) {
     const eqn = jaxpr.eqns[i];

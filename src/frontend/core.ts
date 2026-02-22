@@ -110,6 +110,7 @@ export enum Primitive {
 
   // Control flow
   Scan = "scan",
+  AssociativeScan = "associative_scan",
 }
 
 interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
@@ -160,6 +161,12 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
      * - `false`: store all intermediate carries (O(N) memory, no recomputation)
      */
     checkpoint?: boolean | number;
+  };
+  [Primitive.AssociativeScan]: {
+    jaxpr: Jaxpr;
+    numLeaves: number;
+    axis: number;
+    reverse: boolean;
   };
 }
 
@@ -1618,4 +1625,29 @@ export class UseAfterFreeError extends ReferenceError {
   constructor(tracer: Tracer) {
     super(`Referenced tracer ${tracer.toString()} has been disposed`);
   }
+}
+
+// Late-bound hook for the associativeScan Kogge-Stone core algorithm.
+// Registered by `lax-associative-scan.ts` at module load to avoid circular imports
+// between `array.ts` and the library module.
+//
+// Accepts the body jaxpr (traced with element shapes, scan axis removed) + consts,
+// and uses vmap internally to vectorize the body over the batch dimension.
+/** @internal */
+export let _associativeScanCoreImpl:
+  | ((
+      bodyJaxpr: any,
+      consts: any[],
+      elems: any[],
+      numLeaves: number,
+      axis: number,
+      reverse: boolean,
+    ) => any[])
+  | null = null;
+
+/** @internal */
+export function _registerAssociativeScanCoreImpl(
+  impl: NonNullable<typeof _associativeScanCoreImpl>,
+): void {
+  _associativeScanCoreImpl = impl;
 }

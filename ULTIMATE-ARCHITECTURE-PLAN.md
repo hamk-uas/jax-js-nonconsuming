@@ -999,32 +999,52 @@ both browsers (via orchestrator worker) and Node.js/Deno (direct main-thread exe
 
 ### M7 — Native `associativeScan` Compilers (4–6 days)
 
-**Design decision — Primitive vs trace-through:**
+**Design decision — Primitive with polymorphic-N-compatible transpose:**
 
-Currently `associativeScan` is NOT a primitive — it unrolls the Kogge-Stone ladder into standard
-operations during tracing. This works for AD (O(log N) depth is preserved) and is sufficient for
-WebGPU (ceil(log₂ N) dispatches is the hardware-imposed floor).
-
-However, `associativeScan` should **eventually become a Primitive** (`Primitive.AssociativeScan`)
-with a body sub-jaxpr, for three reasons:
+`associativeScan` is registered as `Primitive.AssociativeScan` with a body sub-jaxpr. This gives:
 
 1. **Clean IR representation** — one Jaxpr equation with a body sub-jaxpr vs O(body_ops × log N)
    unrolled equations. This matches how `Primitive.Scan` represents `lax.scan`.
 2. **Backend specialization** — the JIT compiler can recognize the primitive and route to
-   `codegenNativeAssociativeScan()` automatically. Without a primitive, the optimization lives at
-   the library level (a pre-JIT check in `lax.associativeScan`).
+   `codegenNativeAssociativeScan()` automatically.
 3. **Consistency** — both `scan` and `associativeScan` are higher-order control flow operations.
-   Having one as a primitive but not the other creates an asymmetry.
+4. **Polymorphic forward execution** — the `assoc_scan` JitStep runs Kogge-Stone at runtime with
+   concrete N from input shapes. When M4 adds `SymDim` + `dynamic_axes`, a single JIT compilation
+   reuses across different N values without re-tracing.
 
-**AD compatibility:** Making it a primitive does NOT break autodiff. The JVP rule doubles the body
-(primal+tangent inputs) and runs a single scan with the doubled body. For transposition, the
-simplest approach is to unroll during tracing: when `insideAbstractTrace()` is true, the primitive's
-impl rule calls the Kogge-Stone algorithm directly, producing the same unrolled graph that AD
-handles today. This means `grad(associativeScan)` produces identical results whether or not it's a
-primitive.
+**AD compatibility — why "unroll-during-trace" is wrong for this primitive:**
 
-**Scope for M7:** M7.1 introduces `Primitive.AssociativeScan` with the unroll-during-trace AD
-strategy. M7.2 adds the WASM compiled Kogge-Stone backend. M7.3 adds multithreaded inner loops.
+The JVP rule doubles the body and is straightforward. For transposition (backward pass), the naive
+approach — calling `associativeScanCore()` to unroll `ceil(log₂ N)` Kogge-Stone rounds into the
+traced Jaxpr — is **incompatible with polymorphic N** because `ceil(log₂ N)` is not computable when
+N is a `SymDim`. This also applies to `Primitive.Scan`'s transpose (which uses concrete loops).
+
+Instead, the transpose rule implements a **reverse sequential recurrence** that walks backward
+through the scan positions. The forward associative scan computes:
+
+```
+y[0] = x[0]
+y[i] = fn(y[i-1], x[i])    for i = 1..N-1
+```
+
+The adjoint (backward) of this linear map is:
+
+```
+ct_carry = 0
+for i = N-1 down to 1:
+    ct_carry += ct_y[i]
+    [ct_a, ct_b] = fn_T(ct_carry, primals y[i-1] and x[i])
+    ct_x[i] = ct_b
+    ct_carry = ct_a
+ct_x[0] = ct_carry + ct_y[0]
+```
+
+This is a reverse sequential scan of N-1 iterations. For M7.1 it runs as a concrete loop (matching
+`Primitive.Scan`'s transpose approach). For future polymorphic N, it would emit `Primitive.Scan`
+instead of unrolling — the same upgrade path both primitives share.
+
+**Scope for M7:** M7.1 introduces `Primitive.AssociativeScan` with proper PE and transpose. M7.2
+adds the WASM compiled Kogge-Stone backend. M7.3 adds multithreaded inner loops.
 
 #### M7.1 — `Primitive.AssociativeScan` & Transform Rules
 
@@ -1038,7 +1058,7 @@ AssociativeScan = "associative_scan",
 
 // Add to PrimitiveParams:
 [Primitive.AssociativeScan]: {
-  jaxpr: ClosedJaxpr;  // body: (a: T, b: T) => T
+  jaxpr: Jaxpr;        // body: (consts..., a_leaves..., b_leaves...) => result_leaves
   numLeaves: number;    // number of pytree leaves
   axis: number;
   reverse: boolean;
@@ -1047,17 +1067,34 @@ AssociativeScan = "associative_scan",
 
 **Transform rules:**
 
-| Transform | Strategy                                                                          |
-| --------- | --------------------------------------------------------------------------------- |
-| JVP       | Double the body (primal+tangent), run single associativeScan with 2× leaves       |
-| Transpose | Unroll: call `associativeScanCore()` inside `makeJaxpr` trace (produces O(log N)) |
-| Vmap      | Move batch dim, run batched associativeScan (same as current impl)                |
-| PE        | Forward to impl (unroll at trace time)                                            |
+| Transform | Strategy                                                                                      |
+| --------- | --------------------------------------------------------------------------------------------- |
+| JVP       | Double the body (primal+tangent), run single associativeScan with 2× leaves                   |
+| Transpose | Reverse sequential recurrence (concrete loop; emits `Primitive.Scan` when M4 adds polymorphic |
+|           | length). Mirrors `Scan`'s transpose approach. Needs forward primals as residuals.             |
+| Vmap      | Move batch dim, run batched associativeScan (same as current impl)                            |
+| PE        | JVP-split: run primals forward (known), mark tangents unknown (mirrors `#partialEvalScan`)    |
 
-**Key insight — unroll-during-trace for AD:** When the primitive is encountered during
-`evalJaxprTransposed` or PE tracing, its impl rule calls the existing `associativeScanCore()` which
-unrolls the Kogge-Stone rounds into standard ops. The traced graph captures these ops normally. This
-means no new transpose rule is needed — the unrolled ops have their own transpose rules.
+**Key design — reverse sequential transpose:**
+
+The transpose rule computes the backward pass as a reverse sequential recurrence:
+
+1. Extract primal (concrete) and tangent (UndefPrimal) inputs from `args`
+2. Recompute forward primals `y_P[0..N-1]` from primal inputs
+3. Construct the transposed body jaxpr (transpose w.r.t. tangent inputs only, primals as residuals)
+4. Run backward loop: iterate from N-1 down to 1, applying the transposed body at each position
+5. Return cotangents for tangent inputs
+
+The concrete loop runs N-1 iterations. With M4's `SymDim`, this would emit `Primitive.Scan` — the
+same polymorphic-N upgrade path that `Primitive.Scan`'s own transpose will follow.
+
+**Polymorphic N status:**
+
+| Component   | Polymorphic? | Notes                                                            |
+| ----------- | ------------ | ---------------------------------------------------------------- |
+| Forward JIT | ✅ Runtime N | `assoc_scan` JitStep runs Kogge-Stone with concrete N from shape |
+| JIT caching | ⏳ Needs M4  | Same shape → cache hit; different N → re-trace until M4 SymDim   |
+| Backward    | ⏳ Needs M4  | Concrete loop for now; emit `Primitive.Scan` for symbolic N      |
 
 **Files touched:**
 
@@ -1066,6 +1103,7 @@ means no new transpose rule is needed — the unrolled ops have their own transp
 - `src/frontend/array.ts` — eager impl rule (calls `associativeScanCore`)
 - `src/frontend/jvp.ts` — JVP rule (double the body)
 - `src/frontend/vmap.ts` — batching rule
+- `src/frontend/linearize.ts` — PE dispatch (`#partialEvalAssociativeScan`), transpose rule
 - `src/library/lax-associative-scan.ts` — emit primitive instead of calling core directly
 - `src/frontend/jit.ts` — `associative_scan` JitStep type, blackNode classification
 
@@ -1074,8 +1112,8 @@ single `associative_scan` equation. `grad(associativeScan)` produces correct res
 
 **Migration verification:** The public `lax.associativeScan()` entry point always emits
 `Primitive.AssociativeScan` — the old direct call to `associativeScanCore()` is removed from the
-public path. `associativeScanCore()` is retained ONLY as the primitive's impl rule body (for eager
-execution and for unrolling during abstract tracing).
+public path. `associativeScanCore()` is retained as the primitive's impl rule body (for eager
+execution and JIT step execution).
 
 ```bash
 # lax-associative-scan.ts should emit the primitive, not call core directly:

@@ -48,42 +48,19 @@
 
 import type { Array } from "../frontend/array";
 import * as core from "../frontend/core";
-import { insideAbstractTrace } from "../frontend/core";
-import { jit } from "../frontend/jaxpr";
-import { moveaxis } from "../frontend/vmap";
+import {
+  _registerAssociativeScanCoreImpl,
+  bind,
+  Primitive,
+  setScanBodyTraceActive,
+  ShapedArray,
+} from "../frontend/core";
+import { evalJaxpr, makeJaxpr } from "../frontend/jaxpr";
+import type { Jaxpr } from "../frontend/jaxpr";
+import { moveaxis, vmap } from "../frontend/vmap";
 import * as tree from "../tree";
 import type { JsTree } from "../tree";
 import { checkAxis } from "../utils";
-
-type AssocFn = (a: any, b: any) => any;
-type AssocCompiled = ReturnType<typeof jit<(elems: any) => any>>;
-
-const associativeScanJitCache = new WeakMap<
-  AssocFn,
-  Map<string, AssocCompiled>
->();
-
-function getOrCreateAssociativeScanJit(
-  fn: AssocFn,
-  axis: number,
-  reverse: boolean,
-): AssocCompiled {
-  let byOpts = associativeScanJitCache.get(fn);
-  if (!byOpts) {
-    byOpts = new Map<string, AssocCompiled>();
-    associativeScanJitCache.set(fn, byOpts);
-  }
-
-  const key = `${axis}|${reverse ? 1 : 0}`;
-  let compiled = byOpts.get(key);
-  if (!compiled) {
-    compiled = jit((elems: any) =>
-      associativeScanCore(fn as any, elems, { axis, reverse }),
-    );
-    byOpts.set(key, compiled);
-  }
-  return compiled;
-}
 
 /**
  * Options for {@link associativeScan}.
@@ -325,16 +302,132 @@ export function associativeScan<T extends JsTree<Array>>(
   elems: T,
   { axis = 0, reverse = false }: AssociativeScanOptions = {},
 ): T {
-  // In eager mode, run through a cached whole-function JIT so round orchestration
-  // does not execute as op-by-op eager dispatches. During abstract tracing,
-  // execute core directly so transforms can see the full computation graph.
-  if (!insideAbstractTrace()) {
-    const compiled = getOrCreateAssociativeScanJit(
-      fn as AssocFn,
-      axis,
-      reverse,
-    );
-    return compiled(elems as any) as T;
+  // 1. Flatten and validate
+  const [flatElems, treedef] = tree.flatten<Array>(elems);
+  if (flatElems.length === 0) {
+    throw new Error("associativeScan: elems must have at least one leaf array");
   }
-  return associativeScanCore(fn, elems, { axis, reverse });
+  const ndim = flatElems[0].ndim;
+  if (ndim === 0) {
+    throw new Error("associativeScan: leaf arrays must be at least 1-D");
+  }
+  const normAxis = checkAxis(axis, ndim);
+  const N = flatElems[0].shape[normAxis];
+  const numLeaves = flatElems.length;
+
+  // 2. Move scan axis to position 0
+  const movedElems = flatElems.map((a) => moveaxis(a, normAxis, 0) as Array);
+  const movedOwned = flatElems.map((a, i) => movedElems[i] !== a);
+
+  // 3. Trivial cases (N ≤ 1): no body application needed
+  if (N <= 1) {
+    const result = movedElems.map((a, i) => {
+      const back = moveaxis(a, 0, normAxis) as Array;
+      if (movedOwned[i] && back !== a) a.dispose();
+      return back;
+    });
+    return tree.unflatten(treedef, result) as T;
+  }
+
+  // 4. Trace fn into a body jaxpr (per-element shapes, scan axis removed).
+  //    If tracing fails (e.g. compose fn uses ops that explicitly reference
+  //    the scan axis like einsum "nij,njk->nik"), fall back to the direct
+  //    Kogge-Stone path via associativeScanCore.
+  const elemAvals = movedElems.map(
+    (e) => new ShapedArray(e.shape.slice(1) as number[], e.dtype, false),
+  );
+
+  // Tag inline np.array() calls as anonymous builder-owned consts
+  setScanBodyTraceActive(true);
+  let closedJaxpr;
+  try {
+    ({ jaxpr: closedJaxpr } = makeJaxpr((...args: any[]) => {
+      const a = tree.unflatten(treedef, args.slice(0, numLeaves));
+      const b = tree.unflatten(treedef, args.slice(numLeaves));
+      const result = fn(a as T, b as T);
+      return tree.flatten<Array>(result)[0];
+    })(...elemAvals, ...elemAvals));
+  } catch {
+    // Body can't be traced per-element; fall back to direct Kogge-Stone.
+    // This unrolls the algorithm into the current trace (jit/grad), which
+    // produces a larger graph but works with compose fns that explicitly
+    // reference the batch dimension.
+    setScanBodyTraceActive(false);
+    for (let i = 0; i < movedElems.length; i++) {
+      if (movedOwned[i]) movedElems[i].dispose();
+    }
+    return associativeScanCore(fn, elems, { axis, reverse }) as T;
+  } finally {
+    setScanBodyTraceActive(false);
+  }
+
+  // 5. Emit primitive
+  const results = bind(
+    Primitive.AssociativeScan,
+    [...closedJaxpr.consts, ...movedElems],
+    {
+      jaxpr: closedJaxpr.jaxpr,
+      numLeaves,
+      axis: 0,
+      reverse,
+    },
+  );
+
+  // 6. Cleanup
+  closedJaxpr.dispose();
+  for (let i = 0; i < movedElems.length; i++) {
+    if (movedOwned[i]) movedElems[i].dispose();
+  }
+
+  // 7. Move axis back if needed
+  let finalResults = results as Array[];
+  if (normAxis !== 0) {
+    finalResults = (results as Array[]).map((r) => {
+      const back = moveaxis(r, 0, normAxis) as Array;
+      if (back !== r) (r as Array).dispose();
+      return back;
+    });
+  }
+
+  return tree.unflatten(treedef, finalResults) as T;
 }
+
+// Registered implementation for the AssociativeScan primitive.
+// Called by array.ts (eager impl) and jit.ts (JIT execution).
+//
+// The body jaxpr was traced with per-element shapes (scan axis removed).
+// associativeScanCore calls fn with batched sub-arrays (scan axis present).
+// We bridge the gap using vmap: it vectorizes the element-level evalJaxpr
+// over the batch dimension, so operations correctly handle the extra axis.
+function associativeScanFromJaxpr(
+  bodyJaxpr: Jaxpr,
+  consts: Array[],
+  elems: Array[],
+  numLeaves: number,
+  axis: number,
+  reverse: boolean,
+): Array[] {
+  const inAxes = new globalThis.Array(numLeaves * 2).fill(0);
+
+  const fn = (aLeaves: Array[], bLeaves: Array[]): Array[] => {
+    // Vectorize the element-level body jaxpr over axis 0 (batch dim).
+    const inner = (...args: Array[]): Array[] => {
+      const bodyArgs = [
+        ...consts.map((c) => c.ref), // jax-js-lint: allow-ref
+        ...args.map((a) => a.ref), // jax-js-lint: allow-ref
+      ];
+      return evalJaxpr(bodyJaxpr, bodyArgs) as Array[];
+    };
+    const allArgs = [...aLeaves, ...bLeaves];
+    const vmapped = vmap(inner, inAxes);
+    const result = vmapped(...allArgs);
+    const resultArr = (
+      globalThis.Array.isArray(result) ? result : [result]
+    ) as Array[];
+    return resultArr;
+  };
+
+  return associativeScanCore(fn, elems, { axis, reverse }) as Array[];
+}
+
+_registerAssociativeScanCoreImpl(associativeScanFromJaxpr);

@@ -39,6 +39,7 @@ import {
   prepareConv,
 } from "./convolution";
 import {
+  _associativeScanCoreImpl,
   _peArrayCreationTracker,
   AbstractValue,
   CompareOp,
@@ -1566,6 +1567,34 @@ export class Array extends Tracer {
         }
 
         return outputs;
+      },
+      [Primitive.AssociativeScan](
+        args,
+        { jaxpr: bodyJaxpr, numLeaves, axis, reverse },
+      ) {
+        // Eager impl: delegate to the Kogge-Stone core algorithm
+        // registered by lax-associative-scan.ts.
+        // The core impl uses vmap internally to vectorize the element-level
+        // body jaxpr over the batch dimension.
+        const numConsts = args.length - numLeaves;
+        const consts = args.slice(0, numConsts);
+        const elemsLeaves = args.slice(numConsts);
+
+        if (!_associativeScanCoreImpl) {
+          throw new Error(
+            "AssociativeScan: core implementation not registered. " +
+              "Import lax-associative-scan.ts first.",
+          );
+        }
+
+        return _associativeScanCoreImpl(
+          bodyJaxpr,
+          consts,
+          elemsLeaves,
+          numLeaves,
+          axis,
+          reverse,
+        );
       },
     };
   }

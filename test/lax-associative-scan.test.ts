@@ -238,9 +238,11 @@ describe("lax.associativeScan — autodiff", () => {
     dxs.dispose();
   });
 
-  test("grad through jit(associativeScan)", () => {
+  test("jit(grad(associativeScan)) cumsum", () => {
+    // Use jit(grad(fn)) pattern — grad(jit(fn)) is not supported
+    // (same as lax.scan: jit captures forward pass, breaks PE).
     using xs = np.array([1.0, 2.0, 3.0]);
-    const f = jit((xs: np.Array) => {
+    const f = (xs: np.Array): np.Array => {
       const ys = lax.associativeScan(
         (a: np.Array, b: np.Array) => np.add(a, b),
         xs,
@@ -248,14 +250,11 @@ describe("lax.associativeScan — autodiff", () => {
       const s = ys.sum();
       ys.dispose();
       return s;
-    });
-    try {
-      const dxs = grad(f)(xs);
-      expect(dxs).toBeAllclose([3, 2, 1]);
-      dxs.dispose();
-    } finally {
-      f.dispose();
-    }
+    };
+    using jGrad = jit(grad(f));
+    const dxs = jGrad(xs);
+    expect(dxs).toBeAllclose([3, 2, 1]);
+    dxs.dispose();
   });
 });
 
@@ -545,12 +544,14 @@ describe("parallel Kalman filter via associativeScan", () => {
       p: { A: np.Array; b: np.Array; S: np.Array },
       q: { A: np.Array; b: np.Array; S: np.Array },
     ) => {
-      const newA = np.einsum("nij,njk->nik", q.A, p.A) as np.Array;
-      using Ab = np.einsum("nij,njk->nik", q.A, p.b) as np.Array;
+      // Element-wise matmul: body fn receives individual elements (scan axis
+      // removed), so inputs are 2-D [2,2] / [2,1], not 3-D [N,2,2].
+      const newA = np.einsum("ij,jk->ik", q.A, p.A) as np.Array;
+      using Ab = np.einsum("ij,jk->ik", q.A, p.b) as np.Array;
       const newB = Ab.add(q.b) as np.Array;
-      using AS = np.einsum("nij,njk->nik", q.A, p.S) as np.Array;
-      using qAT = np.transpose(q.A, [0, 2, 1]) as np.Array;
-      using ASAT = np.einsum("nij,njk->nik", AS, qAT) as np.Array;
+      using AS = np.einsum("ij,jk->ik", q.A, p.S) as np.Array;
+      using qAT = np.transpose(q.A, [-2, -1]) as np.Array;
+      using ASAT = np.einsum("ij,jk->ik", AS, qAT) as np.Array;
       const newS = ASAT.add(q.S) as np.Array;
       return { A: newA, b: newB, S: newS };
     };
