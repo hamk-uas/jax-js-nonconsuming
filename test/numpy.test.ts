@@ -2367,6 +2367,15 @@ suite.each(devices)("device:%s", (device) => {
         expect(r.js()).toEqual([false, true, false, false]);
       }
     });
+
+    test("isnan with where under jit (regression: WebGPU Cmpne NaN detection)", () => {
+      // np.isnan uses Cmpne (x != x) which was broken on WebGPU — NaN comparison
+      // was not handled correctly via min() heuristic. Now uses IEEE 754 bitcast.
+      using nanToZero = jit((x: np.Array) => np.where(np.isnan(x), 0, x));
+      using a = np.array([NaN, 1.0, NaN, 2.0], { dtype: np.float32 });
+      using result = nanToZero(a);
+      expect(result.js()).toEqual([0, 1, 0, 2]);
+    });
   });
 
   suite("jax.numpy.nanToNum()", () => {

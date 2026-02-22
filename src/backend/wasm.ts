@@ -1063,7 +1063,8 @@ export class WasmBackend implements Backend {
     inputSlots: Slot[],
   ): Slot[] {
     const pool = this.#workerPool;
-    if (!pool) throw new Error("Worker pool not available for parallel dispatch");
+    if (!pool)
+      throw new Error("Worker pool not available for parallel dispatch");
 
     const moduleId = pool.getModuleId(megaModule.module)!;
 
@@ -1119,9 +1120,9 @@ export class WasmBackend implements Backend {
             );
           } else {
             // Serial dispatch on main thread only
-            const fn = instance.exports[
-              `kernel_${step.kernelIdx}`
-            ] as (...a: number[]) => void;
+            const fn = instance.exports[`kernel_${step.kernelIdx}`] as (
+              ...a: number[]
+            ) => void;
             fn(0, step.kernelSize, ...args);
           }
           break;

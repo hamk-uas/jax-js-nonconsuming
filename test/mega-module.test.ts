@@ -465,6 +465,7 @@ describe("extracted kernel functions (M6.2a)", () => {
   describe("step metadata (M6.2c)", () => {
     it("elementwise chain has correct stepInfos", () => {
       using x = np.array([1, 2, 3, 4]);
+      // eslint-disable-next-line jax-js/no-array-chain
       const mm = compileMega((x: np.Array) => x.add(1).mul(2), x);
       expect(mm).not.toBeNull();
       expect(mm!.stepInfos.length).toBeGreaterThan(0);
@@ -498,6 +499,7 @@ describe("extracted kernel functions (M6.2a)", () => {
     it("multi-step chain has malloc/recycle/kernel steps", () => {
       using x = np.array([1, 2, 3, 4]);
       const mm = compileMega(
+        // eslint-disable-next-line jax-js/no-array-chain
         (x: np.Array) => x.add(1).mul(2).sub(3),
         x,
       );
@@ -533,6 +535,7 @@ describe("extracted kernel functions (M6.2a)", () => {
     it("kernelIdx in stepInfos matches kernelExports indices", () => {
       using x = np.array([1, 2, 3, 4]);
       const mm = compileMega(
+        // eslint-disable-next-line jax-js/no-array-chain
         (x: np.Array) => x.add(1).mul(2),
         x,
       );
@@ -540,7 +543,10 @@ describe("extracted kernel functions (M6.2a)", () => {
 
       const kernelSteps = mm!.stepInfos!.filter(
         (s) => s.type === "kernel",
-      ) as Extract<NonNullable<typeof mm>["stepInfos"][number], { type: "kernel" }>[];
+      ) as Extract<
+        NonNullable<typeof mm>["stepInfos"][number],
+        { type: "kernel" }
+      >[];
 
       for (const s of kernelSteps) {
         // kernelIdx should be a valid index into kernelExports

@@ -240,7 +240,9 @@ export class WasmWorkerPool {
             w.removeEventListener("message", handler);
             if (e.data.type === "registered") resolve();
             else
-              reject(new Error(e.data.error ?? "worker mega registration failed"));
+              reject(
+                new Error(e.data.error ?? "worker mega registration failed"),
+              );
           };
           w.addEventListener("message", handler);
           w.postMessage({ type: "register-mega", moduleId: id, module });
@@ -328,7 +330,9 @@ export class WasmWorkerPool {
       const fn =
         kernelIdx < 0
           ? (mainInstance.exports.kernel as (...a: number[]) => void)
-          : (mainInstance.exports[`kernel_${kernelIdx}`] as (...a: number[]) => void);
+          : (mainInstance.exports[`kernel_${kernelIdx}`] as (
+              ...a: number[]
+            ) => void);
       fn(0, mainEnd, ...args);
     }
 

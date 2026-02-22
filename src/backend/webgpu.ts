@@ -1723,12 +1723,35 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
       } else if (op === AluOp.Cmplt) source = `(${a} < ${b})`;
       else if (op === AluOp.Cmpne) {
         // Edge case: WebGPU doesn't handle NaN correctly, it's unspecified.
-        // This is a reliable way I found to detect NaNs, since the spec says
-        // for `max()`: if one operand is a NaN, the other is returned.
+        // Use bitcast to check the IEEE 754 bit pattern instead:
+        // f32 NaN: exponent all-1s (0x7F800000) AND mantissa non-zero.
+        // f16 NaN: exponent all-1s (0x7C00) AND mantissa non-zero.
         if (isFloatDtype(src[0].dtype)) {
           const x = isGensym(a) ? a : gensym();
           if (x !== a) emit(`let ${x} = ${a};`);
-          source = `(${x} != ${b} || min(${x}, ${dtypeToWgsl(src[0].dtype)}(inf())) != ${x})`;
+          const y = isGensym(b) ? b : gensym();
+          if (y !== b) emit(`let ${y} = ${b};`);
+          if (src[0].dtype === DType.Float16) {
+            const bitsX = gensym();
+            const bitsY = gensym();
+            emit(
+              `let ${bitsX} = bitcast<u32>(vec2<f16>(${x}, f16(0.0))) & 0xFFFFu;`,
+            );
+            emit(
+              `let ${bitsY} = bitcast<u32>(vec2<f16>(${y}, f16(0.0))) & 0xFFFFu;`,
+            );
+            const isNanX = `((${bitsX} & 0x7C00u) == 0x7C00u && (${bitsX} & 0x03FFu) != 0u)`;
+            const isNanY = `((${bitsY} & 0x7C00u) == 0x7C00u && (${bitsY} & 0x03FFu) != 0u)`;
+            source = `(${x} != ${y} || ${isNanX} || ${isNanY})`;
+          } else {
+            const bitsX = gensym();
+            const bitsY = gensym();
+            emit(`let ${bitsX} = bitcast<u32>(${x});`);
+            emit(`let ${bitsY} = bitcast<u32>(${y});`);
+            const isNanX = `((${bitsX} & 0x7F800000u) == 0x7F800000u && (${bitsX} & 0x007FFFFFu) != 0u)`;
+            const isNanY = `((${bitsY} & 0x7F800000u) == 0x7F800000u && (${bitsY} & 0x007FFFFFu) != 0u)`;
+            source = `(${x} != ${y} || ${isNanX} || ${isNanY})`;
+          }
         } else {
           source = `(${a} != ${b})`;
         }
