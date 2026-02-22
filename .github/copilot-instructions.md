@@ -159,10 +159,11 @@ pnpm run test:arch                 # architectural mode: failures must match .ci
 pnpm run test:arch:record          # record current failing tests into expected-failure manifest
 pnpm run test:all                  # Vitest + Deno WebGPU (auto-fallback)
 pnpm run test:deno                 # Deno WebGPU tests only (headless GPU)
-pnpm run lint:ownership:internal   # maintainer-only transform ownership lint checks
+pnpm run lint:ownership:internal   # maintainer-only transform ownership lint checks (now in main config)
 pnpm test test/conv.test.ts        # single file
 pnpm run check                     # tsc type-check
 pnpm run lint && pnpm run format   # ESLint + Prettier
+pnpm vitest bench bench/<file>     # run Vitest benchmarks (e.g. bench/mega-module.bench.ts)
 pnpm -C website dev                # local dev server for demos
 ```
 
@@ -197,7 +198,7 @@ Full-profile pre-commit takes ~82s total. The breakdown:
 | `format:check`       | 4s        | Prettier                                    |
 | `build`              | 3s        | tsdown (5 packages)                         |
 | `check`              | 3s        | TypeScript type checking                    |
-| `lint:ownership:*`   | 5s        | Internal + website ownership checks         |
+| `lint:ownership:*`   | 5s        | Website ownership checks                    |
 | `core invariants`    | 2s        | refcount + transform-compositions           |
 | `test:eslint-plugin` | 1s        | Plugin unit tests                           |
 
@@ -2565,15 +2566,16 @@ contributors should be aware of:
 
 ### Test files
 
-| File                            | Purpose                                        |
-| ------------------------------- | ---------------------------------------------- |
-| `test/lax-scan.test.ts`         | Main scan test suite (~1880 lines)             |
-| `test/scan-backends.test.ts`    | Backend coverage & `copyBufferToBuffer` checks |
-| `test/scan-bench.test.ts`       | Scan benchmark tests                           |
-| `test/deno/webgpu.test.ts`      | Headless WebGPU tests via Deno                 |
-| `test/deno/pool-memory.test.ts` | Pool peak memory guarantee (Deno WebGPU)       |
-| `test/deno/scan.bench.ts`       | Deno WebGPU scan benchmarks                    |
-| `test/wasm-parallel.test.ts`    | WASM parallel dispatch + kernel signature (M5) |
+| File                            | Purpose                                         |
+| ------------------------------- | ----------------------------------------------- |
+| `test/lax-scan.test.ts`         | Main scan test suite (~1880 lines)              |
+| `test/scan-backends.test.ts`    | Backend coverage & `copyBufferToBuffer` checks  |
+| `test/scan-bench.test.ts`       | Scan benchmark tests                            |
+| `test/deno/webgpu.test.ts`      | Headless WebGPU tests via Deno                  |
+| `test/deno/pool-memory.test.ts` | Pool peak memory guarantee (Deno WebGPU)        |
+| `test/deno/scan.bench.ts`       | Deno WebGPU scan benchmarks                     |
+| `test/wasm-parallel.test.ts`    | WASM parallel dispatch + kernel signature (M5)  |
+| `test/mega-module.test.ts`      | Mega-module correctness + leak detection (M6.1) |
 
 ### Deno WebGPU test guidelines
 
@@ -3015,6 +3017,30 @@ Benchmarks three categories:
 To A/B test, comment out `builder.recycleBuffers()` in `jit.ts` and pool usage in `webgpu.ts`,
 rebuild, and compare.
 
+### Vitest benchmarks (M8.1)
+
+Three Vitest benchmark files in `bench/` measure key subsystems:
+
+```bash
+pnpm build && pnpm vitest bench bench/mega-module.bench.ts
+pnpm build && pnpm vitest bench bench/scatter-add.bench.ts
+pnpm build && pnpm vitest bench bench/associative-scan.bench.ts
+```
+
+| File                              | Benchmarks | What it measures                                                        |
+| --------------------------------- | ---------- | ----------------------------------------------------------------------- |
+| `bench/mega-module.bench.ts`      | 7          | Mega-module vs step-by-step: chains, multi-output, reduce, grad, matmul |
+| `bench/scatter-add.bench.ts`      | 3          | `scatterAdd` throughput at 1K/10K/100K elements                         |
+| `bench/associative-scan.bench.ts` | 6          | `associativeScan` vs sequential `scan` for cumsum/cumprod               |
+
+**Import notes:**
+
+- `bench/scatter-add.bench.ts` imports from `../src/frontend/core` (not the public API) because
+  `scatterAdd` is not exported from `src/index.ts`. Uses `type Array as JaxArray` to avoid global
+  `Array` collision.
+- Other bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`).
+- All bench files use `DType.Float32` / `DType.Int32` enums, not string literals.
+
 ---
 
 ## Known Limitations & Future Work
@@ -3262,12 +3288,15 @@ for flat-config consumers.
 
 Current rollout in this repo:
 
-- `jax-js/require-using`: `warn` on `src/**`, `packages/**`
-- `jax-js/no-unnecessary-ref`: `warn` on `src/**`, `packages/**`
-- `jax-js/no-use-after-dispose`: `warn` on `src/**`, `packages/**`
-- `jax-js/no-dispose-then-reassign-param`: `warn` on `src/**`, `packages/**`
-- `jax-js/no-array-chain`: `off`
-- all `jax-js/*` rules: `off` on `test/**`
+- All `jax-js/*` rules: `warn` globally (base config)
+- `configs.invariance` overlay: upgrades to `error` on `src/**`, `packages/**`, `test/**`
+- `jax-js/require-using`: `off` for internal framework code (`src/frontend/**`, `src/library/**`,
+  `src/backend/**`) — internal code manipulates Slots/Jaxprs, not `np.Array`
+- `jax-js/no-array-chain`: `warn` everywhere (intentional benchmark chains use inline disable
+  comments)
+- Internal transform rules (`require-retained-release`, `require-try-finally-symmetry`,
+  `require-wrapper-dispose-symmetry`): `warn` globally — no longer require a separate
+  `lint:ownership:internal` script invocation
 
 **Shared configs:**
 
@@ -3293,6 +3322,8 @@ Implemented rules:
   hazards
 - `jax-js/no-unnecessary-ref` — **autofix** (removes `.ref` with `--fix`)
 - `jax-js/no-array-chain` — reports outermost chain only (no duplicate subchain reports)
+- `jax-js/require-scan-result-dispose` — warns when `lax.scan()` destructured results are not
+  disposed; currently `off` in config (planned for future enablement)
 - `jax-js/require-retained-release` — retained `.ref` handles must have explicit terminal paths
 - `jax-js/require-try-finally-symmetry` — `.ref` temporaries in `try` must be cleaned in `finally`
 - `jax-js/require-wrapper-dispose-symmetry` — wrapper `dispose()` should release retained state
@@ -4252,28 +4283,28 @@ M0–M8 with dependency graph, code sketches, and test plans.
 
 ## Milestone Status
 
-| Milestone | Title                         | Status             | Notes                                                     |
-| --------- | ----------------------------- | ------------------ | --------------------------------------------------------- |
-| M0.1      | Record baseline tests         | **DONE**           | `tmp/m0-*` baseline files captured                        |
-| M0.2      | Hardware feature detection    | **DONE**           | `BackendCapabilities` interface in `src/backend.ts`       |
-| M1.1      | `ScanBackwardArtifact` type   | **DONE**           | `ScanPullbackArtifact.run()` encapsulates backward pass   |
-| M1.2      | Unify `vjpFlat` transposition | **DONE**           | `jaxprNeedsCallTimeTranspose` fully removed               |
-| M2.1      | `scatter_add` IR & AD rules   | **DONE**           | `Primitive.ScatterAdd` with JVP + transpose rules         |
-| M2.2      | WebGPU CAS loop shader        | **DONE**           | `dispatchScatterAdd()` in `webgpu.ts`                     |
-| M2.3      | WASM sequential scatter       | **DONE**           | `dispatchScatterAdd()` in `wasm.ts`                       |
-| M3.1      | Multi-output `Kernel`         | **DONE**           | `KernelOutput[]`, `Kernel.single()`, multi-output codegen |
-| M3.2      | Epilogue fusion chain walk    | **DONE**           | Already implemented; verified via `stepCounts()` tests    |
-| M4.1      | `SymDim` & shape propagation  | **DONE**           | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`          |
-| M4.2      | Parameterized backend codegen | **DONE** (partial) | `SizeExpr`, `_currentDimBindings`, symbolic cache keys    |
-| M5.1      | SharedArrayBuffer memory pool | **DONE**           | Shared memory when `crossOriginIsolated`                  |
-| M5.2      | WasmWorkerPool                | **DONE**           | Atomics-based sync dispatch via Web Workers               |
-| M5.3      | Kernel signature + dispatch   | **DONE**           | `(start, end, ...ptrs)` + parallel dispatch wiring        |
-| M6.1      | Mega-Module                   | **DONE**           | `compileToMegaModule()`, single WASM call, 14 tests       |
-| M6.2      | Mega-module multithreading    | Not done           | Depends on M5 ✅ + M6.1 ✅                                |
-| M7.1      | `Primitive.AssociativeScan`   | **DONE**           | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests     |
-| M7.2      | WASM compiled Kogge-Stone     | **DONE**           | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests  |
-| M7.3      | Multithreaded Kogge-Stone     | Not done           | Depends on M5✅ + M6.2                                    |
-| M8        | Cleanup & benchmarking        | Not done           | Depends on all others                                     |
+| Milestone | Title                         | Status             | Notes                                                      |
+| --------- | ----------------------------- | ------------------ | ---------------------------------------------------------- |
+| M0.1      | Record baseline tests         | **DONE**           | `tmp/m0-*` baseline files captured                         |
+| M0.2      | Hardware feature detection    | **DONE**           | `BackendCapabilities` interface in `src/backend.ts`        |
+| M1.1      | `ScanBackwardArtifact` type   | **DONE**           | `ScanPullbackArtifact.run()` encapsulates backward pass    |
+| M1.2      | Unify `vjpFlat` transposition | **DONE**           | `jaxprNeedsCallTimeTranspose` fully removed                |
+| M2.1      | `scatter_add` IR & AD rules   | **DONE**           | `Primitive.ScatterAdd` with JVP + transpose rules          |
+| M2.2      | WebGPU CAS loop shader        | **DONE**           | `dispatchScatterAdd()` in `webgpu.ts`                      |
+| M2.3      | WASM sequential scatter       | **DONE**           | `dispatchScatterAdd()` in `wasm.ts`                        |
+| M3.1      | Multi-output `Kernel`         | **DONE**           | `KernelOutput[]`, `Kernel.single()`, multi-output codegen  |
+| M3.2      | Epilogue fusion chain walk    | **DONE**           | Already implemented; verified via `stepCounts()` tests     |
+| M4.1      | `SymDim` & shape propagation  | **DONE**           | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`           |
+| M4.2      | Parameterized backend codegen | **DONE** (partial) | `SizeExpr`, `_currentDimBindings`, symbolic cache keys     |
+| M5.1      | SharedArrayBuffer memory pool | **DONE**           | Shared memory when `crossOriginIsolated`                   |
+| M5.2      | WasmWorkerPool                | **DONE**           | Atomics-based sync dispatch via Web Workers                |
+| M5.3      | Kernel signature + dispatch   | **DONE**           | `(start, end, ...ptrs)` + parallel dispatch wiring         |
+| M6.1      | Mega-Module                   | **DONE**           | `compileToMegaModule()`, single WASM call, 14 tests        |
+| M6.2      | Mega-module multithreading    | Not done           | Depends on M5 ✅ + M6.1 ✅                                 |
+| M7.1      | `Primitive.AssociativeScan`   | **DONE**           | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests      |
+| M7.2      | WASM compiled Kogge-Stone     | **DONE**           | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests   |
+| M7.3      | Multithreaded Kogge-Stone     | Not done           | Depends on M5✅ + M6.2                                     |
+| M8        | Cleanup & benchmarking        | **In Progress**    | M8.1 benchmarks ✅, M8.2 dead code audit ✅, M8.3 docs WIP |
 
 ## Dependency Graph (Simplified)
 
@@ -4350,8 +4381,11 @@ These details are frequently lost when conversation context is summarized:
 2. **Test imports from `dist/`**: Source edits in `src/` are invisible to Vitest tests until
    `pnpm build` runs. This causes confusion when an edit "doesn't work" in tests.
 
-3. **eslint.config.ts structure**: The invariance config applies to `test/**`, strict applies
-   nowhere by default, internalTransforms rules run via a separate `lint:ownership:internal` script.
+3. **eslint.config.ts structure**: All jax-js rules are `warn` globally; the invariance overlay
+   upgrades to `error` for `src/**`, `packages/**`, `test/**`. Internal transform rules
+   (`require-retained-release`, `require-try-finally-symmetry`, `require-wrapper-dispose-symmetry`)
+   are now in the main config — the separate `lint:ownership:internal` script is no longer needed
+   for pre-commit (but is kept for targeted runs).
 
 4. **`_currentDimBindings` is module-level state**: Set/cleared in `jitCompile()` via try/finally.
    Any new compilation code that reads symbolic dimensions must go through this.
@@ -4379,3 +4413,4 @@ Decisions made during development that future agents should understand:
 | WASM `(start, end, ...ptrs)` signature | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                              |
 | WASM compiled Kogge-Stone (assocScan)  | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan` |
 | Mega-module rejects pass-through       | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes  |
+| `scatterAdd` not in public API         | Not exported from `src/index.ts`; bench/test import from `src/frontend/core` directly. Add to public API when stable    |

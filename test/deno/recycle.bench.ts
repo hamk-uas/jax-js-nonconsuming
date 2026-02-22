@@ -226,6 +226,7 @@ const eagerX4k = np.ones([4096]);
 await blockUntilReady(eagerX4k);
 
 Deno.bench("eager chain x5 4096 [pool]", { group: "eager" }, () => {
+  // eslint-disable-next-line jax-js/no-array-chain -- intentional chain benchmark
   eagerX4k.add(1).mul(2).sub(3).add(4).mul(0.5).dispose();
 });
 
@@ -235,6 +236,7 @@ const eagerX64k = np.ones([65536]);
 await blockUntilReady(eagerX64k);
 
 Deno.bench("eager chain x5 65536 [pool]", { group: "eager" }, () => {
+  // eslint-disable-next-line jax-js/no-array-chain -- intentional chain benchmark
   eagerX64k.add(1).mul(2).sub(3).add(4).mul(0.5).dispose();
 });
 
