@@ -184,7 +184,7 @@ export class CpuBackend implements Backend {
         for (let i = 0; i < (kernel.size as number); i++) {
           let acc = out.reduction.identity;
           let comp = 0; // Kahan compensation
-          for (let j = 0; j < out.reduction.size; j++) {
+          for (let j = 0; j < (out.reduction.size as number); j++) {
             const item = tune.exp.evaluate({ gidx: i, ridx: j }, globals);
             if (useKahan) {
               const y = item - comp;

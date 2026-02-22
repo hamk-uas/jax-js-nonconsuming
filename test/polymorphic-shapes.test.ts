@@ -58,20 +58,110 @@ suite("M4.2: Parameterized Backend Codegen", () => {
     expect(data2[199][31]).toBe(3.5);
   });
 
-  test("reduce along dynamic axis is not yet supported", () => {
-    // Reducing along the dynamic axis (axis 0) requires Reduction.size to be
-    // SizeExpr (the reduction loop bound must be dynamic). This is future work.
-    const f = jit((x: np.Array) => np.sum(x, 0), {
+  test("reduce along dynamic axis produces correct results for different sizes", () => {
+    // Reducing along the dynamic axis (axis 0) uses a symbolic Reduction.size.
+    // The cached JitProgram resolves the reduction bound at execution time.
+    using f = jit((x: np.Array) => np.sum(x, 0), {
       dynamic_axes: { 0: "T" },
     });
+
+    // First call: T=3
     using x1 = np.ones([3, 4]);
-    // Should throw because the concrete reduction size from first call (3)
-    // can't be reused for arbitrary dynamic sizes.
-    // For now just verify it doesn't crash on the first call.
     using y1 = f(x1) as np.Array;
     expect(y1.shape).toEqual([4]);
     expect(y1.js()).toEqual([3, 3, 3, 3]);
-    f.dispose();
+
+    // Second call: T=5 — reuses cached program with different reduction size
+    using x2 = np.ones([5, 4]);
+    using y2 = f(x2) as np.Array;
+    expect(y2.shape).toEqual([4]);
+    expect(y2.js()).toEqual([5, 5, 5, 5]);
+
+    // Third call: T=1 — edge case
+    using x3 = np.ones([1, 4]);
+    using y3 = f(x3) as np.Array;
+    expect(y3.shape).toEqual([4]);
+    expect(y3.js()).toEqual([1, 1, 1, 1]);
+  });
+
+  test("reduce along dynamic axis with non-uniform values", () => {
+    using f = jit((x: np.Array) => np.sum(x, 0), {
+      dynamic_axes: { 0: "T" },
+    });
+
+    // T=3 with varying values
+    using x1 = np.array([
+      [1, 2],
+      [3, 4],
+      [5, 6],
+    ]);
+    using y1 = f(x1) as np.Array;
+    expect(y1.js()).toEqual([9, 12]);
+
+    // T=2 — different reduction size
+    using x2 = np.array([
+      [10, 20],
+      [30, 40],
+    ]);
+    using y2 = f(x2) as np.Array;
+    expect(y2.js()).toEqual([40, 60]);
+  });
+
+  test("max reduction along dynamic axis", () => {
+    using f = jit((x: np.Array) => np.max(x, 0), {
+      dynamic_axes: { 0: "T" },
+    });
+
+    using x1 = np.array([
+      [1, 5],
+      [3, 2],
+      [2, 4],
+    ]);
+    using y1 = f(x1) as np.Array;
+    expect(y1.js()).toEqual([3, 5]);
+
+    using x2 = np.array([
+      [10, 1],
+      [5, 20],
+    ]);
+    using y2 = f(x2) as np.Array;
+    expect(y2.js()).toEqual([10, 20]);
+  });
+
+  test("concrete kernel size + symbolic reduction size (reduce 2D along axis 1 with dynamic axis 0)", () => {
+    // Shape [T, 4]: reducing along axis 1 gives kernel.size=T (symbolic),
+    // reduction.size=4 (concrete). This tests that concrete reductions
+    // still work correctly when combined with dynamic total size.
+    using f = jit((x: np.Array) => np.sum(x, 1), {
+      dynamic_axes: { 0: "T" },
+    });
+
+    using x1 = np.ones([3, 4]);
+    using y1 = f(x1) as np.Array;
+    expect(y1.shape).toEqual([3]);
+    expect(y1.js()).toEqual([4, 4, 4]);
+
+    using x2 = np.ones([7, 4]);
+    using y2 = f(x2) as np.Array;
+    expect(y2.shape).toEqual([7]);
+    expect(y2.js()).toEqual([4, 4, 4, 4, 4, 4, 4]);
+  });
+
+  test("chained elementwise + reduce along dynamic axis", () => {
+    // x.mul(2).sum(0) — fused elementwise with symbolic reduction
+    using f = jit((x: np.Array) => x.mul(np.array(2.0)).sum(0), {
+      dynamic_axes: { 0: "T" },
+    });
+
+    using x1 = np.ones([4, 3]);
+    using y1 = f(x1) as np.Array;
+    expect(y1.shape).toEqual([3]);
+    expect(y1.js()).toEqual([8, 8, 8]); // 4 * 2 = 8 per column
+
+    using x2 = np.ones([2, 3]);
+    using y2 = f(x2) as np.Array;
+    expect(y2.shape).toEqual([3]);
+    expect(y2.js()).toEqual([4, 4, 4]); // 2 * 2 = 4 per column
   });
 });
 

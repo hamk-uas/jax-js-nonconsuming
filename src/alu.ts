@@ -1,4 +1,4 @@
-import { isSymbolicSize, type SizeExpr, sizeExprMul } from "./dim";
+import { isSymbolicSize, type SizeExpr, sizeExprKey, sizeExprMul } from "./dim";
 import { PPrint } from "./pprint";
 import { ShapeTracker } from "./shape";
 import { clamp, FpHash, FpHashable, gcd, strip1 } from "./utils";
@@ -1524,6 +1524,18 @@ export class Kernel implements FpHashable {
     return isSymbolicSize(this.size);
   }
 
+  /** Whether any output has a symbolic (non-concrete) reduction size. */
+  get hasSymbolicReduction(): boolean {
+    return this.outputs.some(
+      (o) => o.reduction != null && isSymbolicSize(o.reduction.size),
+    );
+  }
+
+  /** Whether this kernel needs any dynamic parameters at dispatch time. */
+  get needsDynamicParams(): boolean {
+    return this.isSymbolic || this.hasSymbolicReduction;
+  }
+
   /**
    * Concrete size hint for the simplifier (set during jitCompile when
    * dimBindings are available). When set, tuneNullopt uses this instead
@@ -1626,13 +1638,16 @@ export class Kernel implements FpHashable {
  * at this level since they depend on GPU, versus CPU or Wasm.
  */
 export class Reduction implements FpHashable {
+  /** Concrete hint for the reduction size when it's symbolic. */
+  concreteHint?: number;
+
   constructor(
     /** Data type of the values being reduced over. */
     readonly dtype: DType,
     /** Operation to perform. Only ops in `AluGroup.Reduce` are supported. */
     readonly op: AluOp,
-    /** Size of the reduction axis. */
-    readonly size: number,
+    /** Size of the reduction axis (concrete or symbolic). */
+    readonly size: SizeExpr,
     /** Follow-up expression defined with the "acc" variable, defaults to identity. */
     readonly epilogue: AluExp = AluVar.acc(dtype),
   ) {
@@ -1653,11 +1668,14 @@ export class Reduction implements FpHashable {
   }
 
   hash(state: FpHash): void {
-    state
-      .update(this.dtype)
-      .update(this.op)
-      .update(this.size)
-      .update(this.epilogue);
+    state.update(this.dtype).update(this.op);
+    // Hash symbolic sizes by their canonical key (parallels Kernel.hash).
+    if (isSymbolicSize(this.size)) {
+      state.update(sizeExprKey(this.size));
+    } else {
+      state.update(this.size);
+    }
+    state.update(this.epilogue);
   }
 
   toString(): string {

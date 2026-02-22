@@ -20,6 +20,7 @@ import { PPrint } from "../pprint";
 import { Routine } from "../routine";
 import {
   concreteDim,
+  dimProduct,
   hasSymbolicDims,
   isSymbolicDim,
   isSymbolicSize,
@@ -171,9 +172,18 @@ function computePoolHints(steps: JitStep[]): PoolHints {
   const sizeOf = new Map<JitId, number>();
   for (const s of steps) {
     if (s.type === "malloc") {
-      // Skip symbolic sizes — can't compute concrete pool hints for them.
-      if (typeof s.size !== "number") continue;
-      const padded = Math.ceil(s.size / 4) * 4;
+      // Resolve symbolic sizes using the current dim bindings (set during
+      // jitCompile). If no bindings are available, skip — can't compute
+      // concrete pool hints.
+      let concreteSize: number;
+      if (typeof s.size === "number") {
+        concreteSize = s.size;
+      } else if (_currentDimBindings) {
+        concreteSize = resolveSizeExpr(s.size, _currentDimBindings);
+      } else {
+        continue;
+      }
+      const padded = Math.ceil(concreteSize / 4) * 4;
       sizeOf.set(s.output, padded);
       mallocSizes.add(padded);
     }
@@ -368,15 +378,21 @@ export class JitProgram {
           ) {
             throw new Error(`internal: JitProgram scope undefined`);
           }
-          // Compute dynamicParams for symbolic kernels
+          // Compute dynamicParams for kernels with symbolic dimensions
           let dynamicParams: number[] | undefined;
           if (
             step.source instanceof Kernel &&
-            step.source.isSymbolic &&
+            step.source.needsDynamicParams &&
             dimBindings
           ) {
+            // dynamicParams[0]: resolved total size (concrete or symbolic)
             const resolvedSize = resolveSizeExpr(step.source.size, dimBindings);
             dynamicParams = [resolvedSize];
+            // dynamicParams[1]: resolved reduction size (when symbolic)
+            const re = step.source.outputs[0].reduction;
+            if (re && isSymbolicSize(re.size)) {
+              dynamicParams.push(resolveSizeExpr(re.size, dimBindings));
+            }
           }
           pending.push(
             new PendingExecute(
@@ -922,6 +938,17 @@ export function jitCompile(
           size,
           _currentDimBindings,
         ) as number;
+      }
+      // Also set concreteHint on any symbolic reductions.
+      if (_currentDimBindings) {
+        for (const o of kernel.outputs) {
+          if (o.reduction && isSymbolicSize(o.reduction.size)) {
+            o.reduction.concreteHint = resolveSizeExpr(
+              o.reduction.size,
+              _currentDimBindings,
+            ) as number;
+          }
+        }
       }
     };
 
@@ -1694,9 +1721,16 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     const reductionSize = prod(shiftedAxes.map((ax) => shape[ax]));
     newShape.push(reductionSize);
 
+    // Compute the reduction size as SizeExpr from the original (possibly
+    // symbolic) shape so that the Reduction caches correctly under a
+    // symbolic key and the dynamic loop bound is resolved at execute time.
+    const reductionSizeExpr: SizeExpr = hasSymbolicDims(as.shape)
+      ? dimProduct(shiftedAxes.map((ax) => as.shape[ax]))
+      : reductionSize;
+
     const perm = keptAxes.concat(shiftedAxes);
     a = reshapeViews(a, (st) => st.permute(perm).reshape(newShape), true);
-    const reduction = new Reduction(a.dtype, op, reductionSize);
+    const reduction = new Reduction(a.dtype, op, reductionSizeExpr);
     return { exp: [a], reduction };
   },
   [Primitive.Pool]: reshapeJit((st, { window, strides }) =>

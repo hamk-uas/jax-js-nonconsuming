@@ -685,70 +685,50 @@ dims are resolved and checked against cached compilations.
 **Exit criteria:** A JIT function traced with `dynamic_axes: {0: "T"}` handles inputs of different
 leading dimensions without recompilation.
 
-#### M4.2 — Parameterized Backend Codegen
+#### M4.2 — Parameterized Backend Codegen ✅
 
-**What:** Update codegen to accept symbolic dimensions as runtime parameters.
+**Status: DONE** — Symbolic reduction sizes are now fully supported across all backends.
 
-**Wasm:**
+**What was done:**
 
-```typescript
-// Current kernel signature: (ptr0, ptr1, ..., ptrOut) -> ()
-// New with symbolic dims: (ptr0, ptr1, ..., ptrOut, T_dim) -> ()
-// T_dim replaces all compile-time size references
+1. **Core type change:** `Reduction.size: number → SizeExpr` (`src/alu.ts`). Added
+   `Reduction.concreteHint?: number` for expression simplification during compilation.
+2. **Kernel getters:** `Kernel.hasSymbolicReduction` and `Kernel.needsDynamicParams` (`src/alu.ts`).
+3. **Tuner fallback:** `tuneWebgpu()` falls back to `tuneNullopt()` when
+   `kernel.hasSymbolicReduction` (`src/tuner.ts`).
+4. **WASM codegen:** `codegenWasm()` and `codegenWasmMulti()` add an extra i32 parameter for
+   resolved reduction size when symbolic. `emitKernelBody()` accepts `reduceSizeLocal` option for
+   dynamic loop bound. `dispatch()` extracts `dynamicParams.slice(1)` as extra args.
+5. **WebGPU codegen:** `pipelineSource()` builds `struct Dims` conditionally (total_size and/or
+   reduce_size). Reduction for-loop uses `dims.reduce_size` when symbolic. `pipelineSubmit()` builds
+   uniform buffer matching struct Dims layout from `dynamicParams`.
+6. **JIT execution:** `dynamicParams` layout is `[resolvedTotalSize, resolvedReduceSize?]`. Built
+   when `kernel.needsDynamicParams` is true.
+7. **Pool hints:** `computePoolHints()` resolves symbolic sizes via `_currentDimBindings` instead of
+   skipping them.
+8. **Mega-module:** `canCompileToMegaModule()` rejects kernels with symbolic reduction sizes (cannot
+   inline reduction loops with symbolic bounds as i32.const). Type signatures updated for SizeExpr.
+
+**`dynamicParams` layout:**
+
+```
+dynamicParams[0] = resolvedTotalSize (always present when needsDynamicParams)
+dynamicParams[1] = resolvedReduceSize (when kernel has symbolic reduction)
 ```
 
-- `codegenWasm()`: When `kernel.size` is symbolic, add an extra `i32` parameter for each symbolic
-  dim. Replace `cg.i32.const(kernel.size)` with `cg.local.get(symDimLocal)`.
-- Disable loop unrolling (`forLoopUnrolled`) for symbolic-dim loops.
+**WASM kernel signature:** `(start, end, ...ptrs, [reduceSize])` — extra i32 when symbolic
+reduction.
 
-**WebGPU:**
+**WebGPU `struct Dims`:** Conditionally includes `total_size: u32` and/or `reduce_size: u32` at
+`@group(1) @binding(0)`.
 
-```wgsl
-// Pass symbolic dims via a uniform buffer:
-struct Dims { T: u32 }
-@group(0) @binding(N) var<uniform> dims : Dims;
+**Files touched:** `src/alu.ts`, `src/tuner.ts`, `src/frontend/jit.ts`, `src/backend/wasm.ts`,
+`src/backend/webgpu.ts`, `src/backend/webgpu/codegen.ts`, `src/backend/wasm/mega-module.ts`.
 
-// Grid size computed dynamically in JS:
-const gridSize = concreteT; // resolved at call time
-encoder.dispatchWorkgroups(calculateGrid(gridSize));
-```
-
-- `pipelineSource()`: Add uniform buffer binding for symbolic dims. Replace hardcoded sizes with
-  `dims.T`.
-- `JitProgram.execute()`: Resolve symbolic dims from input shapes, write to uniform buffer, compute
-  grid dynamically.
-
-**Interaction with buffer recycling and pool (`effectDrivenAllocate`, `computePoolHints`):**
-
-The JIT compiler's memory management operates on byte sizes. With symbolic dims, these become
-symbolic expressions. Both `effectDrivenAllocate()` and `computePoolHints()` need adaptation:
-
-- **`effectDrivenAllocate()`:** Currently keys the free pool on concrete `number` byte sizes. With
-  symbolic dims, two malloc steps with sizes like `T * 256` and `T * 256` are structurally identical
-  and CAN be recycled. Strategy: key the free pool by a canonical symbolic expression string (e.g.,
-  `"T*256"`) instead of a number. Only structurally identical expressions match. Different
-  expressions (`T * 256` vs `T * 128`) provably differ without knowing `T`.
-
-- **`computePoolHints()`:** Currently computes literal `peakBytes: number` and
-  `mallocSizes: Set<number>`. With symbolic dims, these become symbolic expressions. Strategy:
-  `PoolHints` type becomes `{ peakBytes: number | SymExpr, mallocSizes: Set<number | SymExpr> }`.
-  `JitProgram.execute()` resolves all symbolic expressions against the actual input shapes at call
-  time, producing concrete numbers for `configurePool()`. The peak-memory guarantee is preserved.
-
-- **Mega-Module (M6):** Compute byte sizes from symbolic dim parameters at runtime within Wasm. The
-  `malloc` calls inside the module become `call $bump_alloc(local.get(T) * 256)` etc. This is
-  straightforward arithmetic, not a general expression evaluator.
-
-**Files touched:**
-
-- `src/backend/wasm.ts` — `codegenWasm()` symbolic-dim parameter
-- `src/backend/webgpu.ts` — `pipelineSource()` uniform dim buffer
-- `src/frontend/jit.ts` — `JitProgram.execute()` symbolic dim resolution, `effectDrivenAllocate()`
-  symbolic byte sizes, `computePoolHints()` symbolic `PoolHints`
-
-**Exit criteria:** A JIT-compiled function handles `[100, 64]` and `[150, 64]` inputs without
-recompilation, producing correct results on both backends. Buffer recycling works for same-symbolic-
-size intermediates.
+**Exit criteria (met):** Reducing along a dynamic axis (e.g., `np.sum(x, 0)` with
+`dynamic_axes: { 0: "T" }`) produces correct results for different input sizes without
+recompilation. 5 new tests in `test/polymorphic-shapes.test.ts` verify sum, max, non-uniform values,
+concrete+symbolic combinations, and chained elementwise+reduce patterns.
 
 ---
 

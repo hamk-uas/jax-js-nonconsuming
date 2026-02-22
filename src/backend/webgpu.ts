@@ -1605,22 +1605,33 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
   );
 
   const symbolic = isSymbolicSize(tune.threadCount);
+  const symbolicReduce = isSymbolicSize(tune.size.reduce);
 
   // For symbolic kernels, use a uniform buffer to pass the total element count
   // at dispatch time. For concrete kernels, bake the count into the shader.
+  // When the reduction axis is symbolic, also pass reduce_size via uniform.
   let workgroupSize: number;
   let gridX: number;
   let gridY: number;
 
-  if (symbolic) {
-    workgroupSize = 256;
-    // Grid and guard are resolved at dispatch time from dynamicParams.
-    // Use placeholder grid [1,1] — overridden by pipelineSubmit.
-    gridX = 1;
-    gridY = 1;
+  if (symbolic || symbolicReduce) {
+    workgroupSize = symbolic ? 256 : findPow2(tune.threadCount as number, 256);
+    if (symbolic) {
+      // Grid resolved at dispatch time from dynamicParams.
+      gridX = 1;
+      gridY = 1;
+    } else {
+      const tc = tune.threadCount as number;
+      const gridSize = Math.ceil(tc / workgroupSize);
+      [gridX, gridY] = calculateGrid(gridSize);
+    }
+    // Build struct Dims with the fields we need
+    const dimsFields: string[] = [];
+    if (symbolic) dimsFields.push("total_size: u32");
+    if (symbolicReduce) dimsFields.push("reduce_size: u32");
     emit(
       "",
-      "struct Dims { total_size: u32 }",
+      `struct Dims { ${dimsFields.join(", ")} }`,
       "@group(1) @binding(0) var<uniform> dims: Dims;",
     );
   } else {
@@ -1806,8 +1817,11 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
       ); // Initialize accumulators.
     }
 
+    const reduceBound = symbolicReduce
+      ? "i32(dims.reduce_size)"
+      : `${tune.size.reduce}`;
     emit(
-      `for (var ridx: i32 = 0; ridx < ${tune.size.reduce}; ridx++) {`,
+      `for (var ridx: i32 = 0; ridx < ${reduceBound}; ridx++) {`,
       pushIndent,
     );
 
@@ -1896,10 +1910,11 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     code: shader.join("\n"),
     numInputs: nargs,
     numOutputs: 1,
-    hasUniform: symbolic,
+    hasUniform: symbolic || symbolicReduce,
     passes: [{ grid: [gridX, gridY] }],
     isSymbolic: symbolic || undefined,
     workgroupSize: symbolic ? workgroupSize : undefined,
+    hasSymbolicReduction: symbolicReduce || undefined,
   };
 }
 
@@ -2325,19 +2340,37 @@ function pipelineSubmit(
     let uniformAlignment = 0;
 
     // Symbolic shaders: compute grid dynamically from dynamicParams and
-    // create a uniform buffer containing the resolved total element count.
+    // create a uniform buffer with resolved dimension values.
+    // struct Dims layout matches the shader:
+    //   isSymbolic + hasSymbolicReduction → { total_size: u32, reduce_size: u32 }
+    //   isSymbolic only                   → { total_size: u32 }
+    //   hasSymbolicReduction only         → { reduce_size: u32 }
     let symbolicGrid: [number, number] | null = null;
-    if (shader.isSymbolic && dynamicParams && dynamicParams.length > 0) {
-      const totalSize = dynamicParams[0];
-      const wgSize = shader.workgroupSize!;
-      const gridSize = Math.ceil(totalSize / wgSize);
-      symbolicGrid = calculateGrid(gridSize);
+    const needsSymbolicUniform =
+      (shader.isSymbolic || shader.hasSymbolicReduction) &&
+      dynamicParams &&
+      dynamicParams.length > 0;
+    if (needsSymbolicUniform) {
+      if (shader.isSymbolic) {
+        const totalSize = dynamicParams[0];
+        const wgSize = shader.workgroupSize!;
+        const gridSize = Math.ceil(totalSize / wgSize);
+        symbolicGrid = calculateGrid(gridSize);
+      }
 
-      // Create uniform buffer with total_size as u32
-      const uniformData = new Uint8Array(4);
-      new DataView(uniformData.buffer).setUint32(0, totalSize, true);
+      // Build uniform data matching the shader's struct Dims field order
+      const uniformFields: number[] = [];
+      if (shader.isSymbolic) uniformFields.push(dynamicParams[0]); // total_size
+      if (shader.hasSymbolicReduction) uniformFields.push(dynamicParams[1]); // reduce_size
+      const dataSize = uniformFields.length * 4;
+      const uniformData = new Uint8Array(dataSize);
+      const dv = new DataView(uniformData.buffer);
+      for (let fi = 0; fi < uniformFields.length; fi++) {
+        dv.setUint32(fi * 4, uniformFields[fi], true);
+      }
+
       const minAlign = device.limits.minUniformBufferOffsetAlignment;
-      const alignment = Math.ceil(4 / minAlign) * minAlign;
+      const alignment = Math.ceil(dataSize / minAlign) * minAlign;
       const uniformBuffer = device.createBuffer({
         size: alignment,
         usage: GPUBufferUsage.UNIFORM,

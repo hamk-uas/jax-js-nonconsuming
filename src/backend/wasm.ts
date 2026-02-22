@@ -16,6 +16,7 @@ import {
   SlotError,
   UnsupportedOpError,
 } from "../backend";
+import { isSymbolicSize, type SizeExpr } from "../dim";
 import { Routine, Routines, runCpuRoutine } from "../routine";
 import { tuneNullopt } from "../tuner";
 import { DEBUG, FpHash, mapSetUnion, rep, runWithCache } from "../utils";
@@ -359,9 +360,12 @@ export class WasmBackend implements Backend {
     const ptrs = [...inputs, ...outputs].map(
       (slot) => this.#buffers.get(slot)!.ptr,
     );
-    // Kernel signature: (start, end, ...ptrs).
+    // Kernel signature: (start, end, ...ptrs, [reduceSize]).
     // For symbolic kernels, dynamicParams[0] is the resolved total size.
+    // dynamicParams[1] is the resolved reduction size (when kernel has symbolic reduction).
     const totalSize = dynamicParams?.[0] ?? (exe.source.size as number);
+    const extraArgs =
+      dynamicParams && dynamicParams.length > 1 ? dynamicParams.slice(1) : [];
 
     // Parallel dispatch: use workers when pool is available, module is registered,
     // and array is large enough for the overhead to pay off.
@@ -371,10 +375,13 @@ export class WasmBackend implements Backend {
       this.#workerPool.isModuleReady(exe.data.module)
     ) {
       const moduleId = this.#workerPool.getModuleId(exe.data.module)!;
-      this.#workerPool.dispatchSync(moduleId, instance, totalSize, ptrs);
+      this.#workerPool.dispatchSync(moduleId, instance, totalSize, [
+        ...ptrs,
+        ...extraArgs,
+      ]);
     } else {
       const func = instance.exports.kernel as (...args: number[]) => void;
-      func(0, totalSize, ...ptrs);
+      func(0, totalSize, ...ptrs, ...extraArgs);
     }
   }
 
@@ -1008,10 +1015,17 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   );
   const funcs = importWasmHelperFuncs(cg, distinctOps);
 
-  // Signature: (start, end, ptr0, ..., ptrOut) -> ()
+  // Signature: (start, end, ptr0, ..., ptrOut, [reduceSize]) -> ()
   // start and end are the element range for parallel dispatch (M5.3).
-  // Single-threaded: kernel(0, totalSize, ...ptrs)
-  const nParams = RANGE_PARAMS + kernel.nargs + 1;
+  // Single-threaded: kernel(0, totalSize, ...ptrs, [reduceSize])
+  // When the kernel has a symbolic reduction, an extra i32 param holds the
+  // resolved reduction size (passed at dispatch time via dynamicParams[1]).
+  const re = kernel.outputs[0].reduction;
+  const hasSymbolicReduction = re != null && isSymbolicSize(re.size);
+  const nParams =
+    RANGE_PARAMS + kernel.nargs + 1 + (hasSymbolicReduction ? 1 : 0);
+  // Index of the reduction size parameter (valid only when hasSymbolicReduction)
+  const reduceSizeParamIdx = RANGE_PARAMS + kernel.nargs + 1;
 
   const kernelFunc = cg.function(rep(nParams, cg.i32), [], () => {
     const gidx = cg.local.declare(cg.i32);
@@ -1023,6 +1037,7 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
       gidx,
       startLocal: 0,
       endLocal: 1,
+      reduceSizeLocal: hasSymbolicReduction ? reduceSizeParamIdx : undefined,
       emitOutputAddr: () => {
         cg.local.get(RANGE_PARAMS + kernel.nargs); // output buffer param (shifted)
         cg.local.get(gidx);
@@ -1074,8 +1089,15 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
   const funcs = importWasmHelperFuncs(cg, allOps);
 
   // Function params: start, end, nargs inputs + numOutputs outputs, all i32
-  // Signature: (start, end, ptr0, ..., ptrN-1, out0, ..., outM-1) -> ()
-  const nParams = RANGE_PARAMS + kernel.nargs + numOutputs;
+  // When any output has a symbolic reduction, an extra i32 param holds the
+  // resolved reduction size (passed at dispatch time via dynamicParams[1]).
+  // Signature: (start, end, ptr0, ..., ptrN-1, out0, ..., outM-1, [reduceSize])
+  const hasSymbolicReduction = kernel.outputs.some(
+    (o) => o.reduction != null && isSymbolicSize(o.reduction.size),
+  );
+  const nParams =
+    RANGE_PARAMS + kernel.nargs + numOutputs + (hasSymbolicReduction ? 1 : 0);
+  const reduceSizeParamIdx = RANGE_PARAMS + kernel.nargs + numOutputs;
 
   const kernelFunc = cg.function(rep(nParams, cg.i32), [], () => {
     const gidx = cg.local.declare(cg.i32);
@@ -1128,7 +1150,11 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
           {
             cg.block(cg.void);
             cg.local.get(ridx);
-            cg.i32.const(re.size);
+            if (hasSymbolicReduction && isSymbolicSize(re.size)) {
+              cg.local.get(reduceSizeParamIdx);
+            } else {
+              cg.i32.const(re.size as number);
+            }
             cg.i32.ge_u();
             cg.br_if(0);
 
@@ -1515,7 +1541,7 @@ function translateExp(
 
 export function codegenReductionAccumulate(
   cg: CodeGenerator,
-  re: { op: AluOp; dtype: DType; size: number; identity: number },
+  re: { op: AluOp; dtype: DType; size: SizeExpr; identity: number },
   acc: number,
   kahanComp?: number,
 ): void {
@@ -1628,6 +1654,13 @@ function emitKernelBody(opts: {
    * parameterized / parallel kernels whose range is determined at dispatch.
    */
   endLocal?: number;
+  /**
+   * Optional WASM local holding the reduction size (loop bound for ridx).
+   * When provided, uses `local.get(reduceSizeLocal)` instead of
+   * `i32.const(re.size)` — enabling parameterized kernels where the
+   * reduction axis has a symbolic dimension resolved at dispatch time.
+   */
+  reduceSizeLocal?: number;
 }): void {
   const {
     cg,
@@ -1638,6 +1671,7 @@ function emitKernelBody(opts: {
     emitStore,
     startLocal,
     endLocal,
+    reduceSizeLocal,
   } = opts;
   const tune = tuneNullopt(kernel);
   const re = kernel.outputs[0].reduction;
@@ -1688,7 +1722,11 @@ function emitKernelBody(opts: {
       {
         cg.block(cg.void);
         cg.local.get(ridx);
-        cg.i32.const(re.size);
+        if (reduceSizeLocal !== undefined) {
+          cg.local.get(reduceSizeLocal);
+        } else {
+          cg.i32.const(re.size as number);
+        }
         cg.i32.ge_u();
         cg.br_if(0);
 

@@ -18,6 +18,12 @@ export interface ShaderInfo {
   isSymbolic?: boolean;
   /** Workgroup size for dynamic grid computation (only set when isSymbolic). */
   workgroupSize?: number;
+  /**
+   * When true, the shader's reduction loop uses a runtime reduce_size value
+   * from `dynamicParams[1]`. The uniform buffer includes `reduce_size: u32`
+   * after `total_size` (if also symbolic) or as the sole field.
+   */
+  hasSymbolicReduction?: boolean;
 }
 
 export const headerWgsl = String.raw`

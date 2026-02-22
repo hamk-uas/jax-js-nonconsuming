@@ -48,7 +48,7 @@ export interface TuneResult {
     groups?: number;
 
     /** Number of iterations for the reduce loop, `AluExp.special("ridx")`. */
-    reduce: number;
+    reduce: SizeExpr;
 
     /** Amount to upcast in reduce loop, set via `AluVar.unroll`. */
     unroll?: number;
@@ -200,7 +200,10 @@ export function tuneNullopt(kernel: Kernel): TuneResult {
   const gidxSize = kernel.concreteSizeHint ?? kernel.size;
   vars.gidx = AluExp.special(DType.Int32, "gidx", gidxSize);
   if (o.reduction) {
-    vars.ridx = AluExp.special(DType.Int32, "ridx", o.reduction.size);
+    // Use concrete hint for ridx bound (for expression simplification),
+    // falling back to the actual size (which may be symbolic).
+    const ridxBound = o.reduction.concreteHint ?? o.reduction.size;
+    vars.ridx = AluExp.special(DType.Int32, "ridx", ridxBound);
     if (exp.dtype !== o.reduction.dtype)
       exp = AluExp.cast(o.reduction.dtype, exp);
   }
@@ -253,6 +256,8 @@ export function tuneWebgpu(kernel: Kernel): TuneResult {
   if (!reduction) return tuneNullopt(kernel);
   // Symbolic kernels can't use upcast/unroll optimizations (unknown size).
   if (kernel.isSymbolic) return tuneNullopt(kernel);
+  // Symbolic reduction axis can't use upcast/unroll (unknown reduction size).
+  if (kernel.hasSymbolicReduction) return tuneNullopt(kernel);
 
   const exp = AluExp.cast(reduction.dtype, kernel.outputs[0].exp);
   const globalIndexes = exp.collect((exp) => exp.op === AluOp.GlobalIndex);

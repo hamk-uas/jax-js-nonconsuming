@@ -58,6 +58,9 @@ export function canCompileToMegaModule(steps: JitStep[]): boolean {
   for (const step of steps) {
     switch (step.type) {
       case "malloc":
+        // Symbolic malloc sizes require runtime resolution — not supported.
+        if (isSymbolicSize(step.size)) return false;
+        break;
       case "free":
       case "recycle":
         break;
@@ -69,6 +72,11 @@ export function canCompileToMegaModule(steps: JitStep[]): boolean {
       case "execute":
         // Support kernels (routines not yet supported)
         if (step.source instanceof Routine) return false;
+        // Symbolic reduction sizes require runtime resolution via dynamicParams —
+        // the mega-module inlines reduction loops with i32.const bounds, which
+        // can't represent symbolic sizes. Reject and fall through to step-by-step.
+        if (step.source instanceof Kernel && step.source.hasSymbolicReduction)
+          return false;
         break;
       case "scan":
       case "dus":
@@ -467,11 +475,11 @@ function emitReductionBody(
     reduction?: {
       op: AluOp;
       dtype: DType;
-      size: number;
+      size: SizeExpr;
       identity: number;
     } | null;
   },
-  re: { op: AluOp; dtype: DType; size: number; identity: number },
+  re: { op: AluOp; dtype: DType; size: SizeExpr; identity: number },
   gidx: number,
   inputLocals: number[],
 ): void {
@@ -493,11 +501,13 @@ function emitReductionBody(
   cg.local.set(ridx);
 
   // Inner reduction loop
+  // Note: mega-module rejects symbolic sizes in canCompileToMegaModule(),
+  // so re.size is guaranteed to be concrete here.
   cg.loop(cg.void);
   {
     cg.block(cg.void);
     cg.local.get(ridx);
-    cg.i32.const(re.size);
+    cg.i32.const(re.size as number);
     cg.i32.ge_u();
     cg.br_if(0);
 

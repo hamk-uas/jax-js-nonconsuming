@@ -1130,7 +1130,8 @@ buffer allocations.
 | Routine steps (sort, cholesky)   | ❌         | Would need WASM imports for each routine       |
 | Scan / DUS / scatter_add steps   | ❌         | Complex control flow not yet inlined           |
 | Pass-through outputs (out=input) | ❌         | Steps may overwrite input locals               |
-| Symbolic malloc sizes            | ❌         | Needs M4.2 completion                          |
+| Symbolic malloc sizes            | ❌         | Rejected; needs runtime alloc resolution       |
+| Symbolic reduction sizes         | ❌         | Rejected; loop bound can't be i32.const        |
 
 **Integration in JitProgram.execute():**
 
@@ -4266,11 +4267,8 @@ on each compilation, but the cache key matches on the symbolic expression.
 
 ## Current Limitations
 
-- `Reduction.size` is still `number`, not `SizeExpr` — reductions on symbolic axes need work
-- Full buffer pool integration with symbolic `PoolHints` not yet implemented
-- WebGPU uniform dim buffer (`struct Dims { T: u32 }`) not yet implemented
-- WASM codegen extra `i32` parameters for symbolic dims not yet implemented
-- Dynamic grid size computation from resolved symbolic dims at execution time not yet implemented
+- Mega-module rejects kernels with symbolic reduction sizes (cannot inline i32.const loop bounds)
+- Mega-module rejects symbolic malloc sizes (cannot resolve at compile time)
 
 ---
 
@@ -4283,28 +4281,28 @@ M0–M8 with dependency graph, code sketches, and test plans.
 
 ## Milestone Status
 
-| Milestone | Title                         | Status             | Notes                                                      |
-| --------- | ----------------------------- | ------------------ | ---------------------------------------------------------- |
-| M0.1      | Record baseline tests         | **DONE**           | `tmp/m0-*` baseline files captured                         |
-| M0.2      | Hardware feature detection    | **DONE**           | `BackendCapabilities` interface in `src/backend.ts`        |
-| M1.1      | `ScanBackwardArtifact` type   | **DONE**           | `ScanPullbackArtifact.run()` encapsulates backward pass    |
-| M1.2      | Unify `vjpFlat` transposition | **DONE**           | `jaxprNeedsCallTimeTranspose` fully removed                |
-| M2.1      | `scatter_add` IR & AD rules   | **DONE**           | `Primitive.ScatterAdd` with JVP + transpose rules          |
-| M2.2      | WebGPU CAS loop shader        | **DONE**           | `dispatchScatterAdd()` in `webgpu.ts`                      |
-| M2.3      | WASM sequential scatter       | **DONE**           | `dispatchScatterAdd()` in `wasm.ts`                        |
-| M3.1      | Multi-output `Kernel`         | **DONE**           | `KernelOutput[]`, `Kernel.single()`, multi-output codegen  |
-| M3.2      | Epilogue fusion chain walk    | **DONE**           | Already implemented; verified via `stepCounts()` tests     |
-| M4.1      | `SymDim` & shape propagation  | **DONE**           | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`           |
-| M4.2      | Parameterized backend codegen | **DONE** (partial) | `SizeExpr`, `_currentDimBindings`, symbolic cache keys     |
-| M5.1      | SharedArrayBuffer memory pool | **DONE**           | Shared memory when `crossOriginIsolated`                   |
-| M5.2      | WasmWorkerPool                | **DONE**           | Atomics-based sync dispatch via Web Workers                |
-| M5.3      | Kernel signature + dispatch   | **DONE**           | `(start, end, ...ptrs)` + parallel dispatch wiring         |
-| M6.1      | Mega-Module                   | **DONE**           | `compileToMegaModule()`, single WASM call, 14 tests        |
-| M6.2      | Mega-module multithreading    | Not done           | Depends on M5 ✅ + M6.1 ✅                                 |
-| M7.1      | `Primitive.AssociativeScan`   | **DONE**           | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests      |
-| M7.2      | WASM compiled Kogge-Stone     | **DONE**           | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests   |
-| M7.3      | Multithreaded Kogge-Stone     | Not done           | Depends on M5✅ + M6.2                                     |
-| M8        | Cleanup & benchmarking        | **In Progress**    | M8.1 benchmarks ✅, M8.2 dead code audit ✅, M8.3 docs WIP |
+| Milestone | Title                         | Status          | Notes                                                                   |
+| --------- | ----------------------------- | --------------- | ----------------------------------------------------------------------- |
+| M0.1      | Record baseline tests         | **DONE**        | `tmp/m0-*` baseline files captured                                      |
+| M0.2      | Hardware feature detection    | **DONE**        | `BackendCapabilities` interface in `src/backend.ts`                     |
+| M1.1      | `ScanBackwardArtifact` type   | **DONE**        | `ScanPullbackArtifact.run()` encapsulates backward pass                 |
+| M1.2      | Unify `vjpFlat` transposition | **DONE**        | `jaxprNeedsCallTimeTranspose` fully removed                             |
+| M2.1      | `scatter_add` IR & AD rules   | **DONE**        | `Primitive.ScatterAdd` with JVP + transpose rules                       |
+| M2.2      | WebGPU CAS loop shader        | **DONE**        | `dispatchScatterAdd()` in `webgpu.ts`                                   |
+| M2.3      | WASM sequential scatter       | **DONE**        | `dispatchScatterAdd()` in `wasm.ts`                                     |
+| M3.1      | Multi-output `Kernel`         | **DONE**        | `KernelOutput[]`, `Kernel.single()`, multi-output codegen               |
+| M3.2      | Epilogue fusion chain walk    | **DONE**        | Already implemented; verified via `stepCounts()` tests                  |
+| M4.1      | `SymDim` & shape propagation  | **DONE**        | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`                        |
+| M4.2      | Parameterized backend codegen | **DONE**        | Symbolic reduction sizes, `dynamicParams` layout, mega-module rejection |
+| M5.1      | SharedArrayBuffer memory pool | **DONE**        | Shared memory when `crossOriginIsolated`                                |
+| M5.2      | WasmWorkerPool                | **DONE**        | Atomics-based sync dispatch via Web Workers                             |
+| M5.3      | Kernel signature + dispatch   | **DONE**        | `(start, end, ...ptrs)` + parallel dispatch wiring                      |
+| M6.1      | Mega-Module                   | **DONE**        | `compileToMegaModule()`, single WASM call, 14 tests                     |
+| M6.2      | Mega-module multithreading    | Not done        | Depends on M5 ✅ + M6.1 ✅                                              |
+| M7.1      | `Primitive.AssociativeScan`   | **DONE**        | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests                   |
+| M7.2      | WASM compiled Kogge-Stone     | **DONE**        | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests                |
+| M7.3      | Multithreaded Kogge-Stone     | Not done        | Depends on M5✅ + M6.2                                                  |
+| M8        | Cleanup & benchmarking        | **In Progress** | M8.1 benchmarks ✅, M8.2 dead code audit ✅, M8.3 docs WIP              |
 
 ## Dependency Graph (Simplified)
 
@@ -4312,7 +4310,7 @@ M0–M8 with dependency graph, code sketches, and test plans.
 M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
         ├──→ M2 (scatter_add) ✅
         ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
-        ├──→ M4.1 ✅ ──→ M4.2 ~done ──→ M6.1 ✅
+        ├──→ M4.1 ✅ ──→ M4.2 ✅ ──→ M6.1 ✅
         └──→ M5 ✅ ──→ M6.2 ❌ (needs M6.1✅)
                        M7.1 ✅ ──→ M7.2 ✅ ──→ M7.3 ❌ (needs M5✅+M6.2)
                                                   ↓
@@ -4325,7 +4323,7 @@ Per the dependency graph, the following milestones can be worked on next:
 
 1. **M6.2** — Mega-Module multithreading (depends on M5 ✅ + M6.1 ✅)
 2. **M7.3** — Multithreaded Kogge-Stone (depends on M7.2 ✅ + M6.2)
-3. **M4.2** completion — Finish parameterized backend codegen (M4.1 done)
+3. ~~**M4.2** completion~~ — ✅ **DONE** — Symbolic reduction sizes across all backends
 
 ---
 
