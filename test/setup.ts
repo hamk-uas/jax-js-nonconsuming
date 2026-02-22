@@ -21,7 +21,7 @@ afterEach(() => {
 afterAll(() => {
   for (const dev of devices) {
     try {
-      const b = getBackend(dev) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+      const b = getBackend(dev) as any;
       if (typeof b.destroyWorkers === "function") {
         b.destroyWorkers();
       }

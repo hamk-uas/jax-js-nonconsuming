@@ -431,10 +431,7 @@ export class WasmBackend implements Backend {
       pool.isModuleReady(exe.data.module)
     ) {
       const moduleId = pool.getModuleId(exe.data.module)!;
-      pool.dispatchSync(moduleId, instance, totalSize, [
-        ...ptrs,
-        ...extraArgs,
-      ]);
+      pool.dispatchSync(moduleId, instance, totalSize, [...ptrs, ...extraArgs]);
     } else {
       const func = instance.exports.kernel as (...args: number[]) => void;
       func(0, totalSize, ...ptrs, ...extraArgs);
@@ -979,9 +976,7 @@ export class WasmBackend implements Backend {
     if (orch && inputPtrs.length <= 64) {
       // --- Orchestrator path (M6.2b): off-main-thread execution ---
       // Register the module if not already known to the orchestrator.
-      const moduleId = orch.registerModuleSync(
-        megaModule.module,
-      );
+      const moduleId = orch.registerModuleSync(megaModule.module);
       // Dispatch to orchestrator. The main thread spin-waits here,
       // servicing alloc/free proxy requests via the control buffer.
       orch.dispatch(
@@ -1007,9 +1002,7 @@ export class WasmBackend implements Backend {
       }
 
       // Call mega_execute(input0_ptr, ..., inputN_ptr, resultBufPtr)
-      const func = instance.exports.mega_execute as (
-        ...args: number[]
-      ) => void;
+      const func = instance.exports.mega_execute as (...args: number[]) => void;
       func(...inputPtrs, resultBufPtr);
     }
 

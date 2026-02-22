@@ -261,9 +261,7 @@ export class OrchestratorWorker {
   ): void {
     if (this.#destroyed) throw new Error("OrchestratorWorker destroyed");
     if (!this.#registeredModules.has(moduleId)) {
-      throw new Error(
-        `Orchestrator: module ${moduleId} not registered`,
-      );
+      throw new Error(`Orchestrator: module ${moduleId} not registered`);
     }
     if (inputPtrs.length > MAX_INPUTS) {
       throw new Error(

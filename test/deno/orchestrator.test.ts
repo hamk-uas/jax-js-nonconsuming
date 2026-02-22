@@ -12,7 +12,7 @@
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import { assert } from "https://deno.land/std@0.224.0/assert/mod.ts";
 
-import { checkLeaks, withLeakCheck } from "./harness.ts";
+import { withLeakCheck } from "./harness.ts";
 import {
   defaultDevice,
   getBackend,
@@ -236,7 +236,10 @@ Deno.test({
     }
 
     // Worker pool should now exist
-    assert(backend.workerPool != null, "workerPool should be created for large arrays");
+    assert(
+      backend.workerPool != null,
+      "workerPool should be created for large arrays",
+    );
 
     a.dispose();
     b.dispose();
