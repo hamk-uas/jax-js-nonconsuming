@@ -13,6 +13,7 @@
  */
 
 import {
+  defaultDevice,
   DType,
   grad,
   init,
@@ -650,5 +651,188 @@ describe("parallel Kalman filter via associativeScan", () => {
     // theta0 disposed by `using`
     ones_n.dispose();
     c_const.dispose();
+  });
+});
+
+// ============================================================================
+// WASM compiled-loop path (M7.2)
+// ============================================================================
+
+describe("lax.associativeScan — WASM compiled-loop", () => {
+  test("cumsum via jit matches reference", () => {
+    defaultDevice("wasm");
+    try {
+      using xs = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+      using f = jit((x: np.Array) =>
+        lax.associativeScan(
+          (a: np.Array, b: np.Array) => np.add(a, b),
+          x,
+        ),
+      );
+      const result = f(xs);
+      expect(result).toBeAllclose([1, 3, 6, 10, 15, 21, 28, 36]);
+      result.dispose();
+    } finally {
+      defaultDevice("wasm");
+    }
+  });
+
+  test("cumprod via jit matches reference", () => {
+    defaultDevice("wasm");
+    try {
+      using xs = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+      using f = jit((x: np.Array) =>
+        lax.associativeScan((a: np.Array, b: np.Array) => a.mul(b), x),
+      );
+      const result = f(xs);
+      expect(result).toBeAllclose([1, 2, 6, 24, 120]);
+      result.dispose();
+    } finally {
+      defaultDevice("wasm");
+    }
+  });
+
+  test("reverse cumsum via jit", () => {
+    defaultDevice("wasm");
+    try {
+      using xs = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+      using f = jit((x: np.Array) =>
+        lax.associativeScan(
+          (a: np.Array, b: np.Array) => np.add(a, b),
+          x,
+          { reverse: true },
+        ),
+      );
+      const result = f(xs);
+      // Reverse cumsum: [15, 14, 12, 9, 5]
+      expect(result).toBeAllclose([15, 14, 12, 9, 5]);
+      result.dispose();
+    } finally {
+      defaultDevice("wasm");
+    }
+  });
+
+  test("N=1 edge case", () => {
+    defaultDevice("wasm");
+    try {
+      using xs = np.array([42.0]);
+      using f = jit((x: np.Array) =>
+        lax.associativeScan(
+          (a: np.Array, b: np.Array) => np.add(a, b),
+          x,
+        ),
+      );
+      const result = f(xs);
+      expect(result).toBeAllclose([42]);
+      result.dispose();
+    } finally {
+      defaultDevice("wasm");
+    }
+  });
+
+  test("non-power-of-two length", () => {
+    defaultDevice("wasm");
+    try {
+      using xs = np.array([1, 2, 3, 4, 5, 6, 7], { dtype: DType.Float32 });
+      using f = jit((x: np.Array) =>
+        lax.associativeScan(
+          (a: np.Array, b: np.Array) => np.add(a, b),
+          x,
+        ),
+      );
+      const result = f(xs);
+      expect(result).toBeAllclose([1, 3, 6, 10, 15, 21, 28]);
+      result.dispose();
+    } finally {
+      defaultDevice("wasm");
+    }
+  });
+
+  test("cumsum with multi-element arrays (2-D)", () => {
+    defaultDevice("wasm");
+    try {
+      // Shape [4, 3] — scan axis=0, per-element shape=[3]
+      using xs = np.array([
+        [1, 2, 3],
+        [4, 5, 6],
+        [7, 8, 9],
+        [10, 11, 12],
+      ]);
+      using f = jit((x: np.Array) =>
+        lax.associativeScan(
+          (a: np.Array, b: np.Array) => np.add(a, b),
+          x,
+        ),
+      );
+      const result = f(xs);
+      expect(result).toBeAllclose([
+        [1, 2, 3],
+        [5, 7, 9],
+        [12, 15, 18],
+        [22, 26, 30],
+      ]);
+      result.dispose();
+    } finally {
+      defaultDevice("wasm");
+    }
+  });
+
+  test("pytree affine composition via jit", () => {
+    defaultDevice("wasm");
+    try {
+      // Associative composition: compose(p, q) = (p.a*q.a, q.a*p.b + q.b)
+      const compose = (
+        p: { a: np.Array; b: np.Array },
+        q: { a: np.Array; b: np.Array },
+      ) => {
+        const newA = p.a.mul(q.a) as np.Array;
+        using tmp = q.a.mul(p.b) as np.Array;
+        const newB = tmp.add(q.b) as np.Array;
+        return { a: newA, b: newB };
+      };
+
+      using a = np.array([2, 3, 1, 4], { dtype: DType.Float32 });
+      using b = np.array([1, 0, 5, 2], { dtype: DType.Float32 });
+
+      using f = jit((aIn: np.Array, bIn: np.Array) =>
+        lax.associativeScan(compose, { a: aIn, b: bIn }),
+      );
+
+      const result = f(a, b) as any as { a: np.Array; b: np.Array };
+      // Sequential reference:
+      // i=0: (2, 1)
+      // i=1: compose((2,1), (3,0)) = (6, 3)
+      // i=2: compose((6,3), (1,5)) = (6, 8)
+      // i=3: compose((6,8), (4,2)) = (24, 34)
+      expect(result.a).toBeAllclose([2, 6, 6, 24]);
+      expect(result.b).toBeAllclose([1, 3, 8, 34]);
+      result.a.dispose();
+      result.b.dispose();
+    } finally {
+      defaultDevice("wasm");
+    }
+  });
+
+  test("grad through compiled-loop cumsum", () => {
+    defaultDevice("wasm");
+    try {
+      const lossFn = (xs: np.Array) => {
+        using result = lax.associativeScan(
+          (a: np.Array, b: np.Array) => np.add(a, b),
+          xs,
+        ) as np.Array;
+        return result.sum();
+      };
+
+      using xs = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
+      using g = jit(grad(lossFn));
+      const dxs = g(xs);
+      // d(sum(cumsum(xs)))/d(xs) = [4, 3, 2, 1]
+      // Because xs[0] contributes to cumsum[0..3], xs[1] to cumsum[1..3], etc.
+      expect(dxs).toBeAllclose([4, 3, 2, 1]);
+      dxs.dispose();
+    } finally {
+      defaultDevice("wasm");
+    }
   });
 });

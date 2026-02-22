@@ -6,6 +6,7 @@ import { AluExp, AluOp, byteWidth, Kernel, Reduction } from "../alu";
 import type { Backend, Executable } from "../backend";
 import {
   getScanRoutineInfo,
+  NativeAssocScanParams,
   NativeScanGeneralParams,
   ScanRoutineInfo,
   WasmBackend,
@@ -35,6 +36,21 @@ export type ScanPlan =
       internalSizes?: number[];
     }
   | { path: "preencoded-routine"; preencodedParams: PreparedPreencodedScan };
+
+/**
+ * Execution plan for `lax.associativeScan` (Kogge-Stone parallel prefix scan).
+ *
+ * - `compiled-loop`: Entire Kogge-Stone ladder compiled to a single WASM module.
+ *   N is a runtime parameter — the same compiled module supports any input length.
+ * - `fallback`: JS-driven Kogge-Stone loop calling body program per round.
+ */
+export type AssocScanPlan =
+  | {
+      path: "compiled-loop";
+      executable: Executable;
+      params: NativeAssocScanParams;
+    }
+  | { path: "fallback" };
 
 type ExecuteStep = Extract<JitStep, { type: "execute" }>;
 
@@ -926,4 +942,215 @@ export function planScan(
   if (pathError) throw new Error(pathError);
 
   return { path: "fallback", extraInfo };
+}
+
+// ---------------------------------------------------------------------------
+// planAssociativeScan: decide execution strategy for associative scan (M7.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Plan execution strategy for `lax.associativeScan`.
+ *
+ * Tries compiled-loop (WASM) first, falls back to JS Kogge-Stone.
+ * The compiled WASM module takes N as a runtime parameter, enabling
+ * polymorphic length: a single compilation can serve any input length.
+ *
+ * @param backend         Backend to compile for
+ * @param bodyProgram     JIT-compiled body program (per-element, N-independent)
+ * @param bodyJaxpr       Body jaxpr (per-element shapes, no scan axis)
+ * @param numLeaves       Number of pytree leaves
+ * @param numConsts       Number of constant inputs closed over by the body
+ * @param reverse         Whether to reverse the scan direction
+ */
+export function planAssociativeScan(
+  backend: Backend,
+  bodyProgram: JitProgram,
+  bodyJaxpr: Jaxpr,
+  numLeaves: number,
+  numConsts: number,
+  reverse: boolean,
+): AssocScanPlan {
+  // Only WASM backend supports compiled-loop for assoc scan
+  if (backend.type !== "wasm") {
+    if (DEBUG >= 1) {
+      console.log(
+        `[assoc-scan] skipping compiled-loop: backend is ${backend.type}, not wasm`,
+      );
+    }
+    return { path: "fallback" };
+  }
+
+  // Extract execute steps from body program
+  const executeSteps = bodyProgram.steps.filter(
+    (s): s is ExecuteStep => s.type === "execute",
+  );
+
+  if (executeSteps.length === 0) {
+    if (DEBUG >= 1) {
+      console.log("[assoc-scan] skipping compiled-loop: no execute steps");
+    }
+    return { path: "fallback" };
+  }
+
+  // Check that all steps are kernel-only (no routines for now)
+  for (const step of executeSteps) {
+    if (step.source instanceof Routine) {
+      if (DEBUG >= 1) {
+        console.log(
+          `[assoc-scan] skipping compiled-loop: routine ${step.source.name} in body`,
+        );
+      }
+      return { path: "fallback" };
+    }
+  }
+
+  // Check for non-execute steps that would make compilation impossible
+  for (const step of bodyProgram.steps) {
+    if (
+      step.type !== "execute" &&
+      step.type !== "malloc" &&
+      step.type !== "free" &&
+      step.type !== "recycle" &&
+      step.type !== "incref"
+    ) {
+      if (DEBUG >= 1) {
+        console.log(
+          `[assoc-scan] skipping compiled-loop: unsupported step type "${step.type}"`,
+        );
+      }
+      return { path: "fallback" };
+    }
+  }
+
+  const numInputs = numConsts + 2 * numLeaves;
+
+  // Build slot-to-internal mapping
+  const slotToInternal = new Map<JitId, number>();
+  const stepToInternalBase = new Map<number, number>();
+  const internalSizes: number[] = [];
+
+  for (let i = 0; i < executeSteps.length; i++) {
+    const step = executeSteps[i];
+    const source = step.source;
+    if (!(source instanceof Kernel)) continue; // already checked above
+    const internalIdx = internalSizes.length;
+    stepToInternalBase.set(i, internalIdx);
+    slotToInternal.set(step.outputs[0], internalIdx);
+    internalSizes.push(
+      (source.size as number) * byteWidth(source.outputs[0].dtype),
+    );
+  }
+
+  // Determine leaf-to-internal mapping (which internal produced each output leaf)
+  const leafToInternalIdx: number[] = [];
+  for (let k = 0; k < numLeaves; k++) {
+    const outputId = bodyProgram.outputs[k];
+    const internalIdx = slotToInternal.get(outputId);
+    if (internalIdx === undefined) {
+      // Output is a passthrough from input (not produced by a kernel).
+      // This means fn(a,b) = a or fn(a,b) = b, which is unusual
+      // but valid. Fall back for now.
+      if (DEBUG >= 1) {
+        console.log(
+          `[assoc-scan] skipping compiled-loop: output leaf ${k} is passthrough`,
+        );
+      }
+      return { path: "fallback" };
+    }
+    leafToInternalIdx.push(internalIdx);
+  }
+
+  // Build reindexed steps
+  type LocalStep = import("../backend/wasm").GeneralScanStep;
+  const steps: LocalStep[] = [];
+
+  for (let i = 0; i < executeSteps.length; i++) {
+    const step = executeSteps[i];
+    const source = step.source as Kernel;
+
+    // Map each input JitId to a global input ID or internal buffer
+    const inputSlots: number[] = [];
+    for (const inputId of step.inputs) {
+      if (inputId < numInputs) {
+        inputSlots.push(inputId);
+      } else {
+        const intIdx = slotToInternal.get(inputId);
+        if (intIdx === undefined) {
+          if (DEBUG >= 1) {
+            console.log(
+              `[assoc-scan] skipping compiled-loop: unmapped slot ${inputId}`,
+            );
+          }
+          return { path: "fallback" };
+        }
+        inputSlots.push(numInputs + intIdx);
+      }
+    }
+
+    // Reindex kernel expression GlobalIndex IDs
+    const reindexMap = inputSlots;
+    const reindexedExp = source.outputs[0].exp.reindexGids(reindexMap);
+    const reindexedReduction = source.outputs[0].reduction
+      ? new Reduction(
+          source.outputs[0].reduction.dtype,
+          source.outputs[0].reduction.op,
+          source.outputs[0].reduction.size,
+          source.outputs[0].reduction.epilogue.reindexGids(reindexMap),
+        )
+      : undefined;
+    const reindexedKernel = Kernel.single(
+      numInputs + internalSizes.length,
+      source.size,
+      reindexedExp,
+      reindexedReduction,
+    );
+
+    const internalBase = stepToInternalBase.get(i)!;
+    steps.push({
+      source: reindexedKernel,
+      inputSlots,
+      outputInternalIdx: internalBase,
+    });
+  }
+
+  // Build per-element leaf sizes
+  const leafElemSizes: number[] = [];
+  for (let k = 0; k < numLeaves; k++) {
+    const aval = bodyJaxpr.inBinders[numConsts + k].aval;
+    leafElemSizes.push(aval.size * byteWidth(aval.dtype));
+  }
+
+  // Build const sizes
+  const constSizes: number[] = [];
+  for (let k = 0; k < numConsts; k++) {
+    const aval = bodyJaxpr.inBinders[k].aval;
+    constSizes.push(aval.size * byteWidth(aval.dtype));
+  }
+
+  const params: NativeAssocScanParams = {
+    numConsts,
+    constSizes,
+    numLeaves,
+    leafElemSizes,
+    steps,
+    internalSizes,
+    reverse,
+    leafToInternalIdx,
+  };
+
+  try {
+    const wasmBackend = backend as WasmBackend;
+    const exe = wasmBackend.prepareNativeAssociativeScan(params);
+    if (DEBUG >= 1) {
+      console.log(
+        `[assoc-scan] SUCCESS! Using WASM compiled-loop with ${steps.length} step(s)`,
+      );
+    }
+    return { path: "compiled-loop", executable: exe, params };
+  } catch (e) {
+    if (DEBUG >= 2) {
+      console.warn("[assoc-scan] compilation failed:", e);
+    }
+    return { path: "fallback" };
+  }
 }

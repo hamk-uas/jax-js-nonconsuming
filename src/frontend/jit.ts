@@ -10,10 +10,13 @@ import {
   Reduction,
 } from "../alu";
 import { Backend, Slot } from "../backend";
+import type { WasmBackend } from "../backend/wasm";
 import { PPrint } from "../pprint";
 import { Routine } from "../routine";
 import {
+  concreteDim,
   hasSymbolicDims,
+  isSymbolicDim,
   isSymbolicSize,
   Pair,
   resolveShape,
@@ -45,8 +48,8 @@ import {
 } from "./core";
 import { Jaxpr, Lit, Var } from "./jaxpr";
 import { executeScan } from "./scan-executor";
-import type { ScanPlan } from "./scan-plan";
-import { planScan } from "./scan-plan";
+import type { ScanPlan, AssocScanPlan } from "./scan-plan";
+import { planScan, planAssociativeScan } from "./scan-plan";
 import type { ScanPath } from "../utils";
 
 export type JitId = number;
@@ -115,6 +118,8 @@ export type JitStep =
     }
   | {
       type: "assoc_scan";
+      plan: AssocScanPlan;
+      bodyProgram: JitProgram;
       bodyJaxpr: Jaxpr;
       numLeaves: number;
       numConsts: number;
@@ -255,7 +260,7 @@ export class JitProgram {
           );
         case "assoc_scan":
           return PPrint.pp(
-            `assoc_scan numLeaves=${step.numLeaves} numConsts=${step.numConsts} axis=${step.axis}` +
+            `assoc_scan [${step.plan.path}] numLeaves=${step.numLeaves} numConsts=${step.numConsts} axis=${step.axis}` +
               (step.reverse ? " reverse" : ""),
           );
       }
@@ -510,66 +515,93 @@ export class JitProgram {
           }
           pending.length = 0;
 
-          // Create Array wrappers from input slots
-          const constSlots = step.consts.map((id) => scope.get(id)!);
-          const constArrays = constSlots.map((slot, i) => {
-            this.backend.incRef(slot);
-            const aval = step.constAvals[i];
-            return new JaxArray({
-              source: slot,
-              st: ShapeTracker.fromShape(aval.shape as number[]),
-              dtype: aval.dtype,
-              weakType: aval.weakType,
-              backend: this.backend,
-              committed: false,
+          if (step.plan.path === "compiled-loop") {
+            // Native WASM compiled-loop path: entire Kogge-Stone loop runs
+            // in a single WASM invocation. N is a runtime parameter,
+            // enabling polymorphic shapes (same compiled module for any N).
+            const nDim = step.elemAvals[0].shape[step.axis];
+            const N = isSymbolicDim(nDim)
+              ? concreteDim(
+                  resolveShape([nDim], dimBindings!)[0],
+                  "assoc_scan N",
+                )
+              : (nDim as number);
+
+            const constSlots = step.consts.map((id) => scope.get(id)!);
+            const elemSlots = step.elems.map((id) => scope.get(id)!);
+            const outputSlots = step.outputs.map((id) => scope.get(id)!);
+
+            (this.backend as WasmBackend).dispatchNativeAssociativeScan(
+              step.plan.executable,
+              step.plan.params,
+              N,
+              constSlots,
+              elemSlots,
+              outputSlots,
+            );
+          } else {
+            // Fallback: JS Kogge-Stone loop via vmap + evalJaxpr
+            // Create Array wrappers from input slots
+            const constSlots = step.consts.map((id) => scope.get(id)!);
+            const constArrays = constSlots.map((slot, i) => {
+              this.backend.incRef(slot);
+              const aval = step.constAvals[i];
+              return new JaxArray({
+                source: slot,
+                st: ShapeTracker.fromShape(aval.shape as number[]),
+                dtype: aval.dtype,
+                weakType: aval.weakType,
+                backend: this.backend,
+                committed: false,
+              });
             });
-          });
 
-          const elemSlots = step.elems.map((id) => scope.get(id)!);
-          const elemArrays = elemSlots.map((slot, i) => {
-            this.backend.incRef(slot);
-            const aval = step.elemAvals[i];
-            return new JaxArray({
-              source: slot,
-              st: ShapeTracker.fromShape(aval.shape as number[]),
-              dtype: aval.dtype,
-              weakType: aval.weakType,
-              backend: this.backend,
-              committed: false,
+            const elemSlots = step.elems.map((id) => scope.get(id)!);
+            const elemArrays = elemSlots.map((slot, i) => {
+              this.backend.incRef(slot);
+              const aval = step.elemAvals[i];
+              return new JaxArray({
+                source: slot,
+                st: ShapeTracker.fromShape(aval.shape as number[]),
+                dtype: aval.dtype,
+                weakType: aval.weakType,
+                backend: this.backend,
+                committed: false,
+              });
             });
-          });
 
-          // Call Kogge-Stone core impl with body jaxpr + consts.
-          // The core impl uses vmap internally to vectorize the element-level
-          // body jaxpr over the batch dimension.
-          const results = _associativeScanCoreImpl!(
-            step.bodyJaxpr,
-            constArrays,
-            elemArrays,
-            step.numLeaves,
-            step.axis,
-            step.reverse,
-          );
+            // Call Kogge-Stone core impl with body jaxpr + consts.
+            // The core impl uses vmap internally to vectorize the element-level
+            // body jaxpr over the batch dimension.
+            const results = _associativeScanCoreImpl!(
+              step.bodyJaxpr,
+              constArrays,
+              elemArrays,
+              step.numLeaves,
+              step.axis,
+              step.reverse,
+            );
 
-          // Extract slots from results and store in output scope.
-          // Must flush pending ops first — result arrays from associativeScanCore
-          // have PendingExecute items (from concat/kernels) that haven't been
-          // submitted yet. Without flushing, the slot buffer contains zeros.
-          for (let i = 0; i < step.numLeaves; i++) {
-            const resultArr = results[i] as JaxArray;
-            resultArr._flushPendingSync();
-            const slot = resultArr._realizeSource();
-            this.backend.incRef(slot);
-            // Free the pre-allocated output buffer before overwriting scope
-            const oldSlot = scope.get(step.outputs[i]);
-            if (oldSlot !== undefined) this.backend.decRef(oldSlot);
-            scope.set(step.outputs[i], slot);
-            resultArr.dispose();
+            // Extract slots from results and store in output scope.
+            // Must flush pending ops first — result arrays from associativeScanCore
+            // have PendingExecute items (from concat/kernels) that haven't been
+            // submitted yet. Without flushing, the slot buffer contains zeros.
+            for (let i = 0; i < step.numLeaves; i++) {
+              const resultArr = results[i] as JaxArray;
+              resultArr._flushPendingSync();
+              const slot = resultArr._realizeSource();
+              this.backend.incRef(slot);
+              // Free the pre-allocated output buffer before overwriting scope
+              const oldSlot = scope.get(step.outputs[i]);
+              if (oldSlot !== undefined) this.backend.decRef(oldSlot);
+              scope.set(step.outputs[i], slot);
+              resultArr.dispose();
+            }
+
+            // Dispose input Array wrappers
+            for (const a of constArrays) a.dispose();
+            for (const a of elemArrays) a.dispose();
           }
-
-          // Dispose input Array wrappers
-          for (const a of constArrays) a.dispose();
-          for (const a of elemArrays) a.dispose();
           break;
         }
         default:
@@ -1176,8 +1208,23 @@ export function jitCompile(
           ctx.set(outVar, { type: "imm", arg: outId });
         }
 
+        // Compile the body jaxpr → JitProgram (for fallback path)
+        const bodyProgram = jitCompile(backend, bodyJaxpr);
+
+        // Plan the assoc scan — try compiled-loop (WASM), fallback otherwise
+        const assocPlan = planAssociativeScan(
+          backend,
+          bodyProgram,
+          bodyJaxpr,
+          numLeaves,
+          numConsts,
+          reverse,
+        );
+
         builder.steps.push({
           type: "assoc_scan",
+          plan: assocPlan,
+          bodyProgram,
           bodyJaxpr,
           numLeaves,
           numConsts,

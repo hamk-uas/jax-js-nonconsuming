@@ -1122,11 +1122,19 @@ grep -n 'associativeScanCore' src/library/lax-associative-scan.ts
 pnpm check
 ```
 
-#### M7.2 — WASM Compiled Kogge-Stone
+#### M7.2 — WASM Compiled Kogge-Stone + Polymorphic Length
 
 **What:** Add `codegenNativeAssociativeScan()` to `src/backend/wasm.ts` that compiles the full
 Kogge-Stone ladder — stride-doubling loop, ping-pong buffers, per-round `fn` application — into one
-Wasm module.
+Wasm module. The module takes `N` as a runtime parameter so a single compilation serves all input
+lengths.
+
+**Why polymorphic length matters:** When a user writes
+`jit((xs) => lax.associativeScan(fn, xs), { dynamic_axes: { 0: "T" } })`, the JIT-compiled program
+must handle different lengths without re-tracing or recompilation. The body jaxpr is N-independent
+(traced with per-element shapes, scan axis removed), and the Kogge-Stone structure is the same for
+any N — only loop bounds and buffer sizes change. Making length a runtime parameter is both natural
+and required for the `dynamic_axes` use case.
 
 **Algorithm inside the Wasm module:**
 
@@ -1134,10 +1142,11 @@ The compiled module runs single-threaded within one Wasm invocation. The primary
 ceil(log₂ N) JS→Wasm crossings.
 
 ```
-allocate ping/pong buffers (2 × N × elemSize)
-copy input to ping buffer
+// N is a runtime parameter (i32 function argument)
+allocate ping/pong buffers (2 × N × leafBytes)
+copy input leaves to ping buffer
 for stride = 1, 2, 4, ..., while stride < N:
-    for i = stride..N:  // parallelizable per-element loop
+    for i = stride..N:  // per-element fn application
         pong[i] = fn(ping[i - stride], ping[i])
     for i = 0..stride:
         pong[i] = ping[i]  // prefix: unchanged
@@ -1146,28 +1155,70 @@ copy result from ping to output
 free scratch buffers
 ```
 
-**Integration:** The JIT compiler recognizes `Primitive.AssociativeScan` and emits an
-`associative_scan` JitStep. The WASM backend's `planAssociativeScan()` checks if the body jaxpr is
-eligible for compilation (elementwise kernels only, no routines) and returns a compiled
-`Executable`. On WebGPU, returns `null` (the unrolled JIT path is already optimal — ceil(log₂ N)
-dispatches is the hardware-imposed floor).
+**Polymorphic length design:**
+
+The WASM module function signature is `(N: i32, ...leafPtrs: i32[]) => void`. `N` is a runtime
+parameter resolved from the concrete input shape at execution time. The body kernels are compiled
+with concrete per-element sizes (strides, element widths) — only the outer loop bounds (`stride < N`,
+`i < N`) and buffer offsets (`i * elemSize`) use `N`. This means:
+
+- **One compilation, any N:** The WASM module is compiled once per body-shape signature (e.g.,
+  "f32 scalar cumsum") and cached. Different call-site Ns reuse the same module.
+- **No SymDim in module codegen:** The WASM bytecode uses concrete element sizes throughout. Only
+  the loop bounds reference the `N` local variable.
+- **Buffer allocation at call time:** Ping/pong scratch buffers are allocated by the caller
+  (JS-side) based on the concrete N, then passed as pointers to the WASM function. This avoids
+  WASM-side `memory.grow` and lets the allocator/pool manage memory.
+
+**Integration with `dynamic_axes`:**
+
+| Layer | How N flows |
+| --- | --- |
+| `jit({ dynamic_axes: { 0: "T" } })` | Traces with `SymDim("T")` on axis 0 |
+| `Primitive.AssociativeScan` abstract eval | Output shapes preserve `SymDim("T")` |
+| `jitCompile()` → `assoc_scan` JitStep | Body jaxpr compiled, `N` left as runtime param |
+| `JitProgram.execute()` | Resolves `N` from concrete input shape or `dimBindings` |
+| WASM dispatch | `N` passed as first i32 arg to the compiled module |
+
+On WebGPU, the current unrolled path (ceil(log₂ N) dispatches) is already the hardware-imposed
+floor — no compiled-loop is possible. The WebGPU path continues to derive N from concrete shapes
+at execution time, which naturally supports polymorphic length through the existing
+`_associativeScanCoreImpl` delegation. No WebGPU-specific changes are needed.
+
+**Scan plan structure:**
+
+The `assoc_scan` JitStep gains an optional `plan` field (analogous to `scan`'s `ScanPlan`):
+
+```typescript
+type AssocScanPlan =
+  | { path: "compiled-loop"; executable: WasmAssocScanExecutable }
+  | { path: "fallback" }; // JS Kogge-Stone (current impl)
+```
+
+`planAssociativeScan()` in the backend checks eligibility:
+- Body is all elementwise Kernels (no Routines, no reductions requiring cross-element sync)
+- Backend is WASM (WebGPU returns `null` → fallback, which is already optimal)
+- All leaves have the same dtype and element size
 
 **Files touched:**
 
 - `src/backend/wasm.ts` — `codegenNativeAssociativeScan()`, `planAssociativeScan()`
 - `src/backend.ts` — add optional `planAssociativeScan` to `Backend` interface
-- `src/frontend/jit.ts` — `associative_scan` JitStep execution delegates to backend plan
+- `src/frontend/jit.ts` — `assoc_scan` JitStep gains `plan` field; execution dispatches via plan
 
 **Test additions in** `test/lax-associative-scan.test.ts`:
 
-| Test name                             | What it verifies                                  |
-| ------------------------------------- | ------------------------------------------------- |
-| `WASM compiled path matches unrolled` | Correctness for cumsum, cumprod                   |
-| `WASM compiled path N=65536`          | Performance: single WASM call vs ceil(log₂ 65536) |
-| `pytree body on WASM compiled path`   | Flattened pytree through single module            |
+| Test name | What it verifies |
+| --- | --- |
+| `WASM compiled path matches unrolled` | Correctness for cumsum, cumprod |
+| `WASM compiled path N=65536` | Performance: single WASM call vs ceil(log₂ 65536) |
+| `pytree body on WASM compiled path` | Flattened pytree through single module |
+| `polymorphic length: different N same program` | `jit({ dynamic_axes })` reuses compiled module for N=100 and N=200 |
+| `polymorphic length: N=1 and N=0 edge cases` | Edge cases with runtime N |
 
-**Exit criteria:** `associativeScan` on WASM runs in a single JS→WASM call. Performance matches or
-exceeds `lax.scan`'s compiled-loop for associative bodies.
+**Exit criteria:** `associativeScan` on WASM runs in a single JS→WASM call. A
+`jit({ dynamic_axes })` wrapping `associativeScan` handles different input lengths without
+recompilation. Performance matches or exceeds `lax.scan`'s compiled-loop for associative bodies.
 
 #### M7.3 — Multithreaded Kogge-Stone (depends on M5/M6.2)
 

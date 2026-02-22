@@ -3622,18 +3622,18 @@ On **WASM**, a true compiled-loop is achievable: the entire Kogge-Stone ladder �
 loop plus ping-pong buffers — could be compiled into a single WASM module analogous to scan's
 `codegenNativeScanGeneral`, reducing ceil(log₂ N) JS→WASM crossings to one. It remains future work.
 
-| Backend    | What each Kogge-Stone round does                                                                                                                                                                                                                                               | Performance vs `lax.scan`                                                                                                                                                                                                                  |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **WebGPU** | ceil(log₂ N) JS-driven kernel dispatches total: one per round (fn output materialized before each Concatenate). Hardware-imposed floor — no cross-workgroup global barrier exists. Reductions in `fn` add extra dispatches per round. Eager mode uses cached whole-call `jit`. | **Faster** for N≳1024: ceil(log₂ N) dispatches vs N sequential in-shader iterations (scan compiled-loop). Already optimal for WebGPU. Measured ~5–8× for N=65536 scalar prefix product.                                                    |
-| **WASM**   | 1 JS→WASM kernel call per `fn` step + 1 `concat` allocation per leaf per round; O(N log N) total work                                                                                                                                                                          | **Slower** than `lax.scan`: scan compiled-loop runs all N iterations in a single WASM invocation (~62M iter/sec); assocScan pays the JS→WASM boundary ceil(log₂ N) times. A WASM compiled-loop path is achievable but not yet implemented. |
-| **CPU**    | Same as WASM (interpreted JS TypedArray ops per round)                                                                                                                                                                                                                         | **Slower** for the same reasons                                                                                                                                                                                                            |
-| **WebGL**  | 1 WebGL shader dispatch per round (scan uses JS fallback on WebGL)                                                                                                                                                                                                             | Likely faster than `lax.scan` on WebGL since scan has no compiled-loop there; untested                                                                                                                                                     |
+| Backend    | What each Kogge-Stone round does                                                                                                                                                                                                                                               | Performance vs `lax.scan`                                                                                                                                                                   |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **WebGPU** | ceil(log₂ N) JS-driven kernel dispatches total: one per round (fn output materialized before each Concatenate). Hardware-imposed floor — no cross-workgroup global barrier exists. Reductions in `fn` add extra dispatches per round. Eager mode uses cached whole-call `jit`. | **Faster** for N≳1024: ceil(log₂ N) dispatches vs N sequential in-shader iterations (scan compiled-loop). Already optimal for WebGPU. Measured ~5–8× for N=65536 scalar prefix product.     |
+| **WASM**   | **Compiled-loop (M7.2):** Full Kogge-Stone ladder compiled into one WASM module. Single JS→WASM call for any N. N as runtime i32 parameter enables polymorphic length. Ping-pong buffers allocated at dispatch time.                                                           | **Fast** — single WASM invocation eliminates ceil(log₂ N) JS→WASM crossings. Comparable to `lax.scan` compiled-loop. O(N log N) total work vs scan's O(N), but with zero boundary overhead. |
+| **CPU**    | Same as WASM (interpreted JS TypedArray ops per round)                                                                                                                                                                                                                         | **Slower** for the same reasons                                                                                                                                                             |
+| **WebGL**  | 1 WebGL shader dispatch per round (scan uses JS fallback on WebGL)                                                                                                                                                                                                             | Likely faster than `lax.scan` on WebGL since scan has no compiled-loop there; untested                                                                                                      |
 
-**WASM improvement paths.** Two orthogonal wins are possible on WASM:
+**WASM improvement paths.** One orthogonal win remains on WASM:
 
-1. **Compiled-loop (near-term):** Eliminate the ceil(log₂ N) JS→WASM boundary crossings by compiling
-   the entire Kogge-Stone ladder into a single WASM module (see Future Work below). Each round still
-   runs the N elements sequentially inside WASM, but all round orchestration stays in native code.
+1. ~~**Compiled-loop (near-term):**~~ ✅ **DONE (M7.2)** — Full Kogge-Stone ladder compiled into one
+   WASM module via `codegenNativeAssociativeScan()`. N is a runtime i32 parameter, enabling
+   polymorphic length. Ping-pong buffers allocated by caller at dispatch time. Single JS→WASM call.
 2. **Element-level parallelism (long-term):** Run each round's N elements in parallel across WASM
    workers via `SharedArrayBuffer`. Requires `Cross-Origin-Isolation` HTTP headers and a redesigned
    dispatch model — **M5 provides the foundation** (SharedArrayBuffer + WasmWorkerPool + range
@@ -3820,17 +3820,18 @@ const composeLeak = (p, q) => ({
   N=4096 on WebGPU. For the RTS backward smoother specifically, see: Särkkä, S. & García-Fernández,
   Á. F. (2020). "Temporal Parallelization of Bayesian Smoothers." _IEEE Transactions on Automatic
   Control_. [arXiv:1905.13002](https://arxiv.org/abs/1905.13002)
-- **On WASM/CPU:** `lax.associativeScan` is generally **slower** than `lax.scan` for large N. Scan's
-  compiled-loop runs the entire N-iteration loop inside a single WASM module invocation (~62M
-  iter/sec); assocScan does O(N log N) total work split across ceil(log₂ N) separate JS→WASM kernel
-  dispatches plus a `concat` allocation per round. There is no speed advantage on WASM today. Prefer
-  `lax.scan` on WASM for any N > a few hundred.
+- **On WASM/CPU:** With M7.2's compiled-loop, `lax.associativeScan` on WASM runs the entire
+  Kogge-Stone ladder in a single JS→WASM call, eliminating per-round boundary overhead. Still does
+  O(N log N) total work vs scan's O(N), but the zero-boundary-overhead makes it competitive for
+  moderate N. For very large N with simple scalar bodies, `lax.scan`'s compiled-loop may still be
+  faster due to O(N) vs O(N log N) work. Use `associativeScan` when the function is associative and
+  you need autodiff (O(log N) depth gradient).
 
 ---
 
 ## Test Coverage
 
-`test/lax-associative-scan.test.ts` — 19 tests:
+`test/lax-associative-scan.test.ts` — 27 tests:
 
 | Category                    | Tests | Notes                                                                                                                                                                                             | File                                      |
 | --------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
@@ -3842,6 +3843,7 @@ const composeLeak = (p, q) => ({
 | Parallel Kalman filter      | 2     | Sequential vs parallel correctness (8 obs), differentiable wrt obs                                                                                                                                | `test/lax-associative-scan.test.ts`       |
 | Vmap                        | 1     | `vmap(associativeScan)` batches independent scans                                                                                                                                                 | `test/lax-associative-scan.test.ts`       |
 | Einsum fallback             | 1     | Body tracing fallback for einsum with batch-dependent subscripts                                                                                                                                  | `test/lax-associative-scan.test.ts`       |
+| WASM compiled-loop          | 8     | cumsum, cumprod, reverse, N=1, non-power-of-two, 2-D, pytree affine, grad through compiled-loop                                                                                                   | `test/lax-associative-scan.test.ts`       |
 | Deno WebGPU perf            | 1     | N=65536 prefix product: assocScan (16 JS-driven rounds, ceil(log₂ 65536)) must be ≥3× faster than scan (65536 sequential in-shader iterations on 1 GPU thread); measured ~5–8× on tested hardware | `test/deno/associative-scan-perf.test.ts` |
 
 **Kalman filter test:** Scalar constant-coefficient Kalman filter expressed as a prefix scan of
@@ -3853,15 +3855,15 @@ reference and parallel scan results are compared to 5 decimal places.
 
 ## Future Work
 
-| Priority   | Feature                          | Notes                                                                                                                                                                                                                                                                                                                                                                                    |
-| ---------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ~~Medium~~ | ~~`Primitive.AssociativeScan`~~  | ✅ **DONE** — Registered as `Primitive.AssociativeScan` with body sub-jaxpr, JVP/transpose/vmap/PE rules. Clean IR (one equation instead of O(log N)). See M7.1.                                                                                                                                                                                                                         |
-| Medium     | WASM compiled-loop for assocScan | Compile the full Kogge-Stone ladder into a single WASM module (analogous to scan's `codegenNativeScanGeneral`), reducing ceil(log₂ N) JS→WASM crossings to one. Depends on M7.1 ✅ so the JIT compiler can recognize the operation. WebGPU: ceil(log₂ N) dispatches is already the hardware-imposed floor (no cross-workgroup global barrier). See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.2. |
-| Low        | Multithreaded Kogge-Stone (WASM) | Parallelize inner loop across workers via `SharedArrayBuffer` + orchestrator-worker pattern (depends on M5✅/M6.2). Expect ~3–4× speedup with 4 workers for large N. See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.3.                                                                                                                                                                           |
-| Low        | N=0 test                         | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                                                                                                                     |
-| Low        | WebGL performance                | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                                                                                                                                    |
-| ~~Medium~~ | ~~`scatter_add` primitive~~      | ✅ Implemented as `Primitive.ScatterAdd` with JVP + transpose rules, WebGPU CAS-loop shader, WASM sequential scatter                                                                                                                                                                                                                                                                     |
-| ~~Low~~    | ~~`using` declaration examples~~ | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                                                                                                                           |
+| Priority   | Feature                              | Notes                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~Medium~~ | ~~`Primitive.AssociativeScan`~~      | ✅ **DONE** — Registered as `Primitive.AssociativeScan` with body sub-jaxpr, JVP/transpose/vmap/PE rules. Clean IR (one equation instead of O(log N)). See M7.1.                                                                                                                                                                                                                                                      |
+| ~~Medium~~ | ~~WASM compiled-loop for assocScan~~ | ✅ **DONE (M7.2)** — Full Kogge-Stone ladder compiled into one WASM module via `codegenNativeAssociativeScan()`. N as runtime i32 parameter for polymorphic length. `AssocScanPlan` type + `planAssociativeScan()` planning. JIT `assoc_scan` step dispatches compiled-loop on WASM, fallback on other backends. 8 new WASM compiled-loop tests (cumsum, cumprod, reverse, N=1, non-power-of-two, 2-D, pytree, grad). |
+| Low        | Multithreaded Kogge-Stone (WASM)     | Parallelize inner loop across workers via `SharedArrayBuffer` + orchestrator-worker pattern (depends on M5✅/M6.2). Expect ~3–4× speedup with 4 workers for large N. See `ULTIMATE-ARCHITECTURE-PLAN.md` M7.3.                                                                                                                                                                                                        |
+| Low        | N=0 test                             | Verify empty-sequence edge case behavior matches JAX                                                                                                                                                                                                                                                                                                                                                                  |
+| Low        | WebGL performance                    | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                                                                                                                                                                                                                                                                 |
+| ~~Medium~~ | ~~`scatter_add` primitive~~          | ✅ Implemented as `Primitive.ScatterAdd` with JVP + transpose rules, WebGPU CAS-loop shader, WASM sequential scatter                                                                                                                                                                                                                                                                                                  |
+| ~~Low~~    | ~~`using` declaration examples~~     | ✅ Documented in copilot-instructions + README                                                                                                                                                                                                                                                                                                                                                                        |
 
 ---
 
@@ -4190,7 +4192,8 @@ M0–M8 with dependency graph, code sketches, and test plans.
 | M6.1      | Mega-Module                   | Not done           | Depends on M4.2 completion + M5 ✅                        |
 | M6.2      | Mega-module multithreading    | Not done           | Depends on M5 ✅ + M6.1                                   |
 | M7.1      | `Primitive.AssociativeScan`   | **DONE**           | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests     |
-| M7.2–7.3  | Compiled/threaded Kogge-Stone | Not done           | Depends on M7.1 ✅ + M5✅/M6.2                            |
+| M7.2      | WASM compiled Kogge-Stone     | **DONE**           | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests  |
+| M7.3      | Multithreaded Kogge-Stone     | Not done           | Depends on M5✅ + M6.2                                    |
 | M8        | Cleanup & benchmarking        | Not done           | Depends on all others                                     |
 
 ## Dependency Graph (Simplified)
@@ -4201,7 +4204,7 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
         ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
         ├──→ M4.1 ✅ ──→ M4.2 ~done ──→ M6.1 ❌
         └──→ M5 ✅ ──→ M6.2 ❌ (needs M6.1)
-                       M7.1 ✅ ──→ M7.2 ❌ ──→ M7.3 ❌ (needs M5✅+M6.2)
+                       M7.1 ✅ ──→ M7.2 ✅ ──→ M7.3 ❌ (needs M5✅+M6.2)
                                                   ↓
                                             M8 (cleanup) ❌
 ```
@@ -4211,7 +4214,7 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
 Per the dependency graph, the following milestones can be worked on next:
 
 1. **M6.1** — Mega-Module (depends on M4.2 completion + M5 ✅)
-2. **M7.2** — WASM compiled Kogge-Stone (depends on M7.1 ✅)
+2. **M7.3** — Multithreaded Kogge-Stone (depends on M7.2 ✅ + M6.2)
 3. **M4.2** completion — Finish parameterized backend codegen (M4.1 done)
 
 ---
