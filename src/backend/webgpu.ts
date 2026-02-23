@@ -122,6 +122,8 @@ export interface PreparedPreencodedScan {
   offsetAlignment: number;
   /** Per-carry copy strategy for ys stacking (true = use shader copy). */
   copyUsesShader: boolean[];
+  /** Bind group layout for the uniform offset group (with dynamic offset). */
+  uniformLayout: GPUBindGroupLayout;
 }
 
 const COPY_WORKGROUP_SIZE = 64;
@@ -239,6 +241,14 @@ export class WebGPUBackend implements Backend {
    * reduce peak GPU memory. Reset via `resetPeakGpuAllocatedBytes()`.
    */
   #gpuPeakBytes: number = 0;
+
+  // --- Batch dispatch state ---
+  // When non-null, dispatch() encodes into this shared encoder instead of
+  // creating a new one per call. endBatch() submits and cleans up.
+  #batchEncoder: GPUCommandEncoder | null = null;
+  #batchDepth = 0;
+  #batchUniformsToDestroy: GPUBuffer[] = [];
+  #batchDeferredFreeBuffers: GPUBuffer[] = [];
 
   constructor(readonly device: GPUDevice) {
     if (DEBUG >= 3 && device.adapterInfo) {
@@ -378,8 +388,11 @@ export class WebGPUBackend implements Backend {
     if (buffer.ref === 0) {
       this.buffers.delete(slot);
       if (buffer.buffer !== this.#reusableZsb) {
-        // Try to return the buffer to the pool for reuse.
-        if (!this.#poolPush(buffer.buffer)) {
+        if (this.#batchEncoder) {
+          // Defer pool-or-destroy: buffer may still be referenced by
+          // commands in the batch encoder that haven't been submitted yet.
+          this.#batchDeferredFreeBuffers.push(buffer.buffer);
+        } else if (!this.#poolPush(buffer.buffer)) {
           this.#gpuAllocatedBytes -= buffer.buffer.size;
           buffer.buffer.destroy();
         }
@@ -436,9 +449,9 @@ export class WebGPUBackend implements Backend {
     const srcBuf = this.#getBuffer(src);
     const dstBuf = this.#getBuffer(dst);
     // WebGPU copyBufferToBuffer requires 4-byte alignment on offsets and size.
-    // If alignment is satisfied, use the fast GPU copy path.
+    const encoder = this.device.createCommandEncoder();
     if (srcOffset % 4 === 0 && dstOffset % 4 === 0 && size % 4 === 0) {
-      const encoder = this.device.createCommandEncoder();
+      // Fast GPU copy path — all alignments satisfied.
       encoder.copyBufferToBuffer(
         srcBuf.buffer,
         srcOffset,
@@ -448,9 +461,17 @@ export class WebGPUBackend implements Backend {
       );
       this.device.queue.submit([encoder.finish()]);
     } else {
-      // Unaligned fallback: read + write via CPU
-      const data = this.syncReader.read(srcBuf.buffer, srcOffset, size);
-      this.device.queue.writeBuffer(dstBuf.buffer, dstOffset, data);
+      // Unaligned fallback: use WGSL copy shader (stays on GPU).
+      const uniformBuf = this.#encodeCopyWithShader(
+        encoder,
+        srcBuf.buffer,
+        srcOffset,
+        dstBuf.buffer,
+        dstOffset,
+        size,
+      );
+      this.device.queue.submit([encoder.finish()]);
+      if (uniformBuf) uniformBuf.destroy();
     }
   }
 
@@ -512,6 +533,8 @@ export class WebGPUBackend implements Backend {
       inputBuffers,
       outputBuffers,
       dynamicParams,
+      this.#batchEncoder ?? undefined,
+      this.#batchEncoder ? this.#batchUniformsToDestroy : undefined,
     );
   }
 
@@ -709,6 +732,19 @@ export class WebGPUBackend implements Backend {
 
     // Wrap each shader with scan offset support
     const wrappedShaders: ShaderDispatch[] = [];
+
+    // Shared layout for group(1) with dynamic offset support — identical
+    // for all shaders (single uniform binding for scan offsets).
+    const uniformLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "uniform", hasDynamicOffset: true },
+        },
+      ],
+    });
+
     for (const shader of bodyRoutine.data) {
       // Shaders that already use uniforms (like Sort) conflict with our offset uniform
       if (shader.hasUniform) {
@@ -725,8 +761,19 @@ export class WebGPUBackend implements Backend {
       }
 
       const module = this.device.createShaderModule({ code: wrapped.code });
-      const pipeline = this.device.createComputePipeline({
+
+      // Create auto-layout pipeline to extract group(0)'s layout, then
+      // rebuild with explicit group(1) that has hasDynamicOffset: true.
+      const autoPipeline = this.device.createComputePipeline({
         layout: "auto",
+        compute: { module, entryPoint: "main" },
+      });
+      const group0Layout = autoPipeline.getBindGroupLayout(0);
+      const pipelineLayout = this.device.createPipelineLayout({
+        bindGroupLayouts: [group0Layout, uniformLayout],
+      });
+      const pipeline = this.device.createComputePipeline({
+        layout: pipelineLayout,
         compute: { module, entryPoint: "main" },
       });
 
@@ -773,6 +820,7 @@ export class WebGPUBackend implements Backend {
       offsetBuffer,
       offsetAlignment,
       copyUsesShader,
+      uniformLayout,
     };
   }
 
@@ -796,6 +844,7 @@ export class WebGPUBackend implements Backend {
       offsetBuffer,
       offsetAlignment,
       copyUsesShader,
+      uniformLayout,
     } = prepared;
     const {
       length,
@@ -894,26 +943,20 @@ export class WebGPUBackend implements Backend {
       const pingBindGroup = createStorageBindGroup(carryPing, carryPong);
       const pongBindGroup = createStorageBindGroup(carryPong, carryPing);
 
-      // Create per-iteration uniform bind groups for offset data
-      const uniformBindGroups: GPUBindGroup[] = [];
-      for (let iter = 0; iter < length; iter++) {
-        const iterOffset = iter * offsetAlignment;
-        uniformBindGroups.push(
-          this.device.createBindGroup({
-            layout: pipeline.getBindGroupLayout(1),
-            entries: [
-              {
-                binding: 0,
-                resource: {
-                  buffer: offsetBuffer,
-                  offset: iterOffset,
-                  size: offsetAlignment,
-                },
-              },
-            ],
-          }),
-        );
-      }
+      // Create single uniform bind group with dynamic offset support
+      const uniformBindGroup = this.device.createBindGroup({
+        layout: uniformLayout,
+        entries: [
+          {
+            binding: 0,
+            resource: {
+              buffer: offsetBuffer,
+              offset: 0,
+              size: offsetAlignment,
+            },
+          },
+        ],
+      });
 
       const filteredPasses = passes.filter(({ grid }) => prod(grid) > 0);
 
@@ -924,7 +967,9 @@ export class WebGPUBackend implements Backend {
           const passEncoder = commandEncoder.beginComputePass();
           passEncoder.setPipeline(pipeline);
           passEncoder.setBindGroup(0, storageBindGroup);
-          passEncoder.setBindGroup(1, uniformBindGroups[iter]);
+          passEncoder.setBindGroup(1, uniformBindGroup, [
+            iter * offsetAlignment,
+          ]);
           passEncoder.dispatchWorkgroups(grid[0], grid[1]);
           passEncoder.end();
         }
@@ -1081,6 +1126,42 @@ export class WebGPUBackend implements Backend {
         }
       }
       if (!evicted) break;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Batch dispatch: encode multiple dispatches into one command submission
+  // ---------------------------------------------------------------------------
+
+  beginBatch(): void {
+    if (this.#batchDepth === 0) {
+      this.#batchEncoder = this.device.createCommandEncoder();
+      this.#batchUniformsToDestroy = [];
+      this.#batchDeferredFreeBuffers = [];
+    }
+    this.#batchDepth++;
+  }
+
+  endBatch(): void {
+    if (this.#batchDepth === 0) return;
+    this.#batchDepth--;
+    if (this.#batchDepth === 0) {
+      const encoder = this.#batchEncoder;
+      if (!encoder) return;
+      this.#batchEncoder = null;
+      this.device.queue.submit([encoder.finish()]);
+      // Destroy uniform buffers created during batch encoding
+      for (const buf of this.#batchUniformsToDestroy) buf.destroy();
+      this.#batchUniformsToDestroy = [];
+      // Process deferred buffer frees (delayed to avoid destroying buffers
+      // that are referenced by commands in the batch encoder)
+      for (const gpuBuf of this.#batchDeferredFreeBuffers) {
+        if (!this.#poolPush(gpuBuf)) {
+          this.#gpuAllocatedBytes -= gpuBuf.size;
+          gpuBuf.destroy();
+        }
+      }
+      this.#batchDeferredFreeBuffers = [];
     }
   }
 
@@ -2329,8 +2410,11 @@ function pipelineSubmit(
   inputs: GPUBuffer[],
   outputs: GPUBuffer[],
   dynamicParams?: number[],
+  batchEncoder?: GPUCommandEncoder,
+  batchUniformCollector?: GPUBuffer[],
 ) {
-  const commandEncoder = device.createCommandEncoder();
+  const commandEncoder = batchEncoder ?? device.createCommandEncoder();
+  const uniformBuffersToDestroy: GPUBuffer[] = [];
   for (const { pipeline, ...shader } of pipelines) {
     if (
       inputs.length !== shader.numInputs ||
@@ -2401,6 +2485,7 @@ function pipelineSubmit(
       });
       new Uint8Array(uniformBuffer.getMappedRange()).set(uniformData);
       uniformBuffer.unmap();
+      uniformBuffersToDestroy.push(uniformBuffer);
       uniformAlignment = alignment;
       uniformBindGroup = device.createBindGroup({
         layout: pipeline.getBindGroupLayout(1),
@@ -2413,6 +2498,7 @@ function pipelineSubmit(
       // values for each pass of the shader (use dynamic offsets).
       const uniforms = filteredPasses.map(({ uniform }) => uniform!);
       const [uniformBuffer, alignment] = combineUniforms(device, uniforms);
+      uniformBuffersToDestroy.push(uniformBuffer);
       uniformAlignment = alignment;
       uniformBindGroup = device.createBindGroup({
         layout: pipeline.getBindGroupLayout(1),
@@ -2433,7 +2519,13 @@ function pipelineSubmit(
       passEncoder.end();
     }
   }
-  device.queue.submit([commandEncoder.finish()]);
+  if (batchEncoder) {
+    // In batch mode: collect uniforms for caller to destroy after submit
+    batchUniformCollector!.push(...uniformBuffersToDestroy);
+  } else {
+    device.queue.submit([commandEncoder.finish()]);
+    for (const buf of uniformBuffersToDestroy) buf.destroy();
+  }
 }
 
 function combineUniforms(

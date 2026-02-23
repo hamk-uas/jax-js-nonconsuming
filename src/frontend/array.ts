@@ -853,7 +853,12 @@ export class Array extends Tracer {
     if (pending) {
       // Compile all pending executables concurrently.
       await Promise.all(pending.map((p) => p.prepare()));
-      for (const p of pending) p.submit();
+      this.#backend.beginBatch?.();
+      try {
+        for (const p of pending) p.submit();
+      } finally {
+        this.#backend.endBatch?.();
+      }
     }
     // While the array is contiguous, it might not be the whole buffer.
     const byteCount = byteWidth(this.#dtype) * this.size;
@@ -881,7 +886,12 @@ export class Array extends Tracer {
     if (pending) {
       // Compile all pending executables concurrently.
       await Promise.all(pending.map((p) => p.prepare()));
-      for (const p of pending) p.submit();
+      this.#backend.beginBatch?.();
+      try {
+        for (const p of pending) p.submit();
+      } finally {
+        this.#backend.endBatch?.();
+      }
     }
     await this.#backend.read(this.#source, 0, 0);
     return this;
@@ -900,9 +910,17 @@ export class Array extends Tracer {
       return this.#dataInline();
     }
     this.#realize();
-    for (const p of this.#pending) {
-      p.prepareSync();
-      p.submit();
+    const pending = this.#pending;
+    if (pending.length > 0) {
+      this.#backend.beginBatch?.();
+      try {
+        for (const p of pending) {
+          p.prepareSync();
+          p.submit();
+        }
+      } finally {
+        this.#backend.endBatch?.();
+      }
     }
     // While the array is contiguous, it might not be the whole buffer.
     const byteCount = byteWidth(this.#dtype) * this.size;
@@ -1628,9 +1646,16 @@ export class Array extends Tracer {
    */
   _flushPendingSync(): void {
     this.#realize();
-    for (const p of this.#pending) {
-      p.prepareSync();
-      p.submit();
+    const pending = this.#pending;
+    if (pending.length === 0) return;
+    this.#backend.beginBatch?.();
+    try {
+      for (const p of pending) {
+        p.prepareSync();
+        p.submit();
+      }
+    } finally {
+      this.#backend.endBatch?.();
     }
   }
 

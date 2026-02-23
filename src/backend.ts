@@ -250,6 +250,20 @@ export interface Backend {
   }): void;
 
   /**
+   * Optional: begin batching dispatches into a single command submission.
+   * When active, `dispatch()` accumulates into a shared command encoder
+   * instead of submitting individually. Call `endBatch()` to submit.
+   * No-op for backends without dispatch submission overhead (WASM, CPU).
+   */
+  beginBatch?(): void;
+
+  /**
+   * Optional: submit all batched dispatches accumulated since `beginBatch()`.
+   * Must be called after `beginBatch()` to flush the accumulated commands.
+   */
+  endBatch?(): void;
+
+  /**
    * Optional: dispatch a scatter-add operation.
    * Accumulates `updates` into `target` (already copied to output) at
    * positions given by `indices` along `axis`.

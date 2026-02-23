@@ -284,11 +284,18 @@ function executeScanPreencodedRoutine(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Flush all pending GPU/WASM operations. */
+/** Flush all pending GPU/WASM operations, batching dispatches when possible. */
 function flushPending(pending: PendingExecute[]): void {
-  for (const p of pending) {
-    p.prepareSync();
-    p.submit();
+  if (pending.length === 0) return;
+  const backend = pending[0].backend;
+  backend.beginBatch?.();
+  try {
+    for (const p of pending) {
+      p.prepareSync();
+      p.submit();
+    }
+  } finally {
+    backend.endBatch?.();
   }
   pending.length = 0;
 }

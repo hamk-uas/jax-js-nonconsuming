@@ -473,11 +473,7 @@ export class JitProgram {
         }
         case "scan": {
           // Flush pending ops before scan — scan needs materialized inputs
-          for (const p of pending) {
-            p.prepareSync();
-            p.submit();
-          }
-          pending.length = 0;
+          flushPendingBatched(pending, this.backend);
 
           // Resolve slots from scope
           const constSlots = step.consts.map((id) => scope.get(id)!);
@@ -525,11 +521,7 @@ export class JitProgram {
         }
         case "dus": {
           // Flush pending ops — DUS needs materialized inputs
-          for (const p of pending) {
-            p.prepareSync();
-            p.submit();
-          }
-          pending.length = 0;
+          flushPendingBatched(pending, this.backend);
 
           const dstSlot = scope.get(step.dst)!;
           const srcSlot = scope.get(step.src)!;
@@ -567,11 +559,7 @@ export class JitProgram {
         }
         case "scatter_add": {
           // Flush pending ops — scatter_add needs materialized inputs
-          for (const p of pending) {
-            p.prepareSync();
-            p.submit();
-          }
-          pending.length = 0;
+          flushPendingBatched(pending, this.backend);
 
           const targetSlot = scope.get(step.target)!;
           const indicesSlot = scope.get(step.indices)!;
@@ -604,11 +592,7 @@ export class JitProgram {
         }
         case "assoc_scan": {
           // Flush pending ops — assoc_scan needs materialized inputs
-          for (const p of pending) {
-            p.prepareSync();
-            p.submit();
-          }
-          pending.length = 0;
+          flushPendingBatched(pending, this.backend);
 
           if (step.plan.path === "compiled-loop") {
             // Native WASM compiled-loop path: entire Kogge-Stone loop runs
@@ -714,6 +698,24 @@ export class JitProgram {
       pending,
     };
   }
+}
+
+/** Flush pending ops with batched dispatch when the backend supports it. */
+function flushPendingBatched(
+  pending: PendingExecute[],
+  backend: Backend,
+): void {
+  if (pending.length === 0) return;
+  backend.beginBatch?.();
+  try {
+    for (const p of pending) {
+      p.prepareSync();
+      p.submit();
+    }
+  } finally {
+    backend.endBatch?.();
+  }
+  pending.length = 0;
 }
 
 /** Check whether a JitStep references the given JitId as input or output. */
