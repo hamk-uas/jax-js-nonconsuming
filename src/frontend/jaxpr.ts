@@ -1362,6 +1362,18 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
       new ShapedArray([...batch, m], DType.Int32, false),
     ];
   },
+  [Primitive.QR]([a]) {
+    if (a.ndim < 2)
+      throw new TypeError(`qr: requires at least 2D input, got ${a}`);
+    const batch = a.shape.slice(0, -2);
+    const m = a.shape[a.ndim - 2] as number;
+    const n = a.shape[a.ndim - 1] as number;
+    const k = Math.min(m, n);
+    return [
+      new ShapedArray([...batch, m, k], a.dtype, a.weakType),
+      new ShapedArray([...batch, k, n], a.dtype, a.weakType),
+    ];
+  },
   [Primitive.Jit](args, { jaxpr }) {
     const { inTypes, outTypes } = typecheckJaxpr(jaxpr);
     if (args.length !== inTypes.length) {

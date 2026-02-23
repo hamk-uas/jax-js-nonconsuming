@@ -672,6 +672,107 @@ export function columnStack(xs: ArrayLike[]): Array {
   }
 }
 
+/**
+ * Assemble an nd-array from nested lists of blocks.
+ *
+ * `block` is a generalization of `vstack` and `hstack`. Blocks in the
+ * innermost lists are concatenated along the last axis, then those results
+ * are concatenated along the second-to-last axis, and so on.
+ *
+ * For the common 2-D case, `block([[A, B], [C, D]])` is equivalent to
+ * `vstack([hstack([A, B]), hstack([C, D])])`.
+ *
+ * @param arrays - A nested list of arrays (or scalars). Nesting depth
+ *   determines which axes are concatenated. All blocks in a row must agree on
+ *   dimensions perpendicular to concatenation.
+ *
+ * @returns The assembled array.
+ *
+ * @example
+ * ```ts
+ * import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+ *
+ * const A = np.ones([2, 2]);
+ * const B = np.zeros([2, 3]);
+ * const C = np.zeros([3, 2]);
+ * const D = np.ones([3, 3]);
+ * const M = np.block([[A, B], [C, D]]);
+ * // M has shape [5, 5]
+ *
+ * A.dispose(); B.dispose(); C.dispose(); D.dispose(); M.dispose();
+ * ```
+ */
+export function block(arrays: any): Array {
+  return _blockImpl(arrays, 0);
+}
+
+function _blockImpl(arrays: any, depth: number): Array {
+  // Base case: a single array or scalar
+  if (!globalThis.Array.isArray(arrays)) {
+    return fudgeArray(arrays);
+  }
+  if (arrays.length === 0) {
+    throw new Error("Need at least one array to block");
+  }
+
+  // Recursively process each element, then concatenate along the appropriate
+  // axis. Innermost lists (highest depth) concatenate along the last axis,
+  // so we track the depth and compute the axis at the end.
+  const processed: Array[] = [];
+  const toDispose: Array[] = [];
+  try {
+    for (const item of arrays) {
+      const arr = _blockImpl(item, depth + 1);
+      processed.push(arr);
+      // Track only arrays we created (recursive calls), not user inputs
+      if (globalThis.Array.isArray(item)) {
+        toDispose.push(arr);
+      }
+    }
+
+    if (processed.length === 1) {
+      // If only one element, just return it without concatenation.
+      // Remove from toDispose if present — we're transferring ownership to caller.
+      const idx = toDispose.indexOf(processed[0]);
+      if (idx >= 0) toDispose.splice(idx, 1);
+      return processed[0];
+    }
+
+    // Determine the axis: depth 0 → axis 0, depth 1 → axis 1, etc.
+    // But we need to ensure arrays have enough dimensions.
+    // NumPy/JAX's block infers the total nesting depth first, then pads
+    // arrays to that rank.
+    const maxNdim = Math.max(...processed.map((a) => a.ndim));
+    const axis = depth;
+
+    // Promote all arrays to at least (axis + 1) dimensions if needed
+    const promoted: Array[] = [];
+    const promotedToDispose: Array[] = [];
+    for (const arr of processed) {
+      if (arr.ndim < maxNdim) {
+        // Prepend dimensions to match max rank
+        const newShape = [
+          ...new globalThis.Array(maxNdim - arr.ndim).fill(1),
+          ...arr.shape,
+        ];
+        const reshaped = arr.reshape(newShape);
+        promoted.push(reshaped);
+        promotedToDispose.push(reshaped);
+      } else {
+        promoted.push(arr);
+      }
+    }
+
+    try {
+      return concatenate(promoted, axis);
+    } finally {
+      for (const a of promotedToDispose) a.dispose();
+    }
+  } finally {
+    for (const a of toDispose) a.dispose();
+  }
+}
+
 /** Flip an array vertically (axis=0). */
 export function flipud(x: ArrayLike): Array {
   return flip(x, 0);

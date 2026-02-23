@@ -104,6 +104,7 @@ export enum Primitive {
   TriangularSolve = "triangular_solve", // A is upper triangular, A @ X.T = B.T
   Cholesky = "cholesky", // A is positive-definite, A = L @ L^T
   LU = "lu", // LU decomposition with partial pivoting
+  QR = "qr", // QR decomposition via Householder reflections
 
   // JIT compilation
   Jit = "jit",
@@ -191,6 +192,7 @@ export const routinePrimitives = new Map([
   [Primitive.TriangularSolve, Routines.TriangularSolve],
   [Primitive.Cholesky, Routines.Cholesky],
   [Primitive.LU, Routines.LU],
+  [Primitive.QR, Routines.QR],
 ]);
 
 export function add(x: TracerValue, y: TracerValue) {
@@ -636,6 +638,13 @@ export function lu(x: TracerValue) {
   if (aval.ndim < 2)
     throw new Error(`lu: expected batch of matrices, got ${aval}`);
   return bind(Primitive.LU, [x]);
+}
+
+export function qr(x: TracerValue) {
+  const aval = ShapedArray.fromAval(getAval(x));
+  if (aval.ndim < 2)
+    throw new Error(`qr: expected batch of matrices, got ${aval}`);
+  return bind(Primitive.QR, [x]);
 }
 
 export function sort(x: TracerValue) {

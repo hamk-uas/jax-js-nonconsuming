@@ -173,7 +173,7 @@ Most operations behave the same way as they do in JAX.
 | `bitwise_right_shift` | 🔴      |                                              |
 | `bitwise_xor`         | 🔴      |                                              |
 | `blackman`            | 🟠      |                                              |
-| `block`               | 🟠      |                                              |
+| `block`               | �      |                                              |
 | `broadcast_arrays`    | 🟢      |                                              |
 | `broadcast_shapes`    | 🟢      |                                              |
 | `broadcast_to`        | 🟢      |                                              |
@@ -504,9 +504,9 @@ in pairs of real and imaginary parts.
 
 Similarly, the `linalg` module has some very important operations for linear algebra and matrices.
 Most of these will be tricky to implement as routines with backend-specific lowering. We have
-Cholesky, LU (with partial pivoting), and triangular solve. Still missing:
+Cholesky, LU (with partial pivoting), triangular solve, and QR decomposition. Still missing:
 
-- Householder iteration (QR, SVD, eigenvalues)
+- SVD, eigenvalues
 
 | API                | Support | Notes                                   |
 | ------------------ | ------- | --------------------------------------- |
@@ -530,7 +530,7 @@ Cholesky, LU (with partial pivoting), and triangular solve. Still missing:
 | `norm`             | 🟠      |                                         |
 | `outer`            | 🟢      |                                         |
 | `pinv`             | 🔴      |                                         |
-| `qr`               | 🔴      |                                         |
+| `qr`               | �      | Differentiable (Householder QR)         |
 | `slogdet`          | 🟢      |                                         |
 | `solve`            | 🟢      | Differentiable (direct LU→triSolve)     |
 | `svd`              | 🔴      |                                         |
@@ -694,7 +694,7 @@ Available `tree` utilities:
 
 These modules are unimplemented:
 
-- `jax.scipy`
+- `jax.scipy` (partial: `scipy.special` — erf, erfc, logit, logsumexp, softmax, logSoftmax; `scipy.linalg` — solveTriangular, cholesky)
 - `jax.sharding`
 - `jax.debug`
 - `jax.dlpack`

@@ -35,6 +35,7 @@ import * as lax from "./library/lax";
 import * as nn from "./library/nn";
 import * as numpy from "./library/numpy";
 import * as random from "./library/random";
+import * as scipyLinalg from "./library/scipy-linalg";
 import * as scipySpecial from "./library/scipy-special";
 import * as tree from "./tree";
 import type { JsTree, JsTreeDef, MapJsTree } from "./tree";
@@ -79,6 +80,7 @@ export {
   type ResidualPack,
   _setVerifyEffects,
   setDebug,
+  scipyLinalg,
   scipySpecial,
   type ScanPath,
   type SnapshotEntry,

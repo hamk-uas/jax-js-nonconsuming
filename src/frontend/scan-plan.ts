@@ -339,6 +339,11 @@ function tryPrepareWasmNativeScan(
       } else if (routineName === Routines.Argsort) {
         const inputShape = routine.type.inputShapes[0];
         staticParams = [inputShape[inputShape.length - 1]];
+      } else if (routineName === Routines.QR) {
+        const inputShape = routine.type.inputShapes[0];
+        const m = inputShape[inputShape.length - 2];
+        const n = inputShape[inputShape.length - 1];
+        staticParams = [m, n];
       }
 
       steps.push({

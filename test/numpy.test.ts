@@ -2071,6 +2071,54 @@ suite.each(devices)("device:%s", (device) => {
       using c = f([_a1f, _a2, _a3]);
       expect(c.js()).toEqual([2, 1, 3, 4, 5]);
     });
+
+    test("block() assembles 2D block matrix", () => {
+      using A = np.ones([2, 2]);
+      using B = np.zeros([2, 3]);
+      using C = np.zeros([3, 2]);
+      using D = np.ones([3, 3]);
+      using M = np.block([
+        [A, B],
+        [C, D],
+      ]);
+      expect(M.shape).toEqual([5, 5]);
+      // Top-left block should be ones
+      const data = M.js() as number[][];
+      expect(data[0][0]).toBeCloseTo(1);
+      expect(data[0][1]).toBeCloseTo(1);
+      // Top-right block should be zeros
+      expect(data[0][2]).toBeCloseTo(0);
+      // Bottom-left should be zeros
+      expect(data[2][0]).toBeCloseTo(0);
+      // Bottom-right should be ones
+      expect(data[3][3]).toBeCloseTo(1);
+    });
+
+    test("block() with 1D arrays (single row)", () => {
+      using a = np.array([1, 2, 3]);
+      using b = np.array([4, 5]);
+      using M = np.block([a, b]);
+      expect(M.js()).toEqual([1, 2, 3, 4, 5]);
+    });
+
+    test("block() with scalar-like values", () => {
+      using a = np.array([[1, 2]]);
+      using b = np.array([[3]]);
+      using M = np.block([[a, b]]);
+      expect(M.js()).toEqual([[1, 2, 3]]);
+    });
+
+    test("block() identity-like pattern", () => {
+      using I = np.eye(2);
+      using Z = np.zeros([2, 2]);
+      using M = np.block([
+        [I, Z],
+        [Z, I],
+      ]);
+      expect(M.shape).toEqual([4, 4]);
+      using expected = np.eye(4);
+      expect(M).toBeAllclose(expected);
+    });
   });
 
   suite("jax.numpy.argmax()", () => {

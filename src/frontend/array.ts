@@ -717,10 +717,16 @@ export class Array extends Tracer {
       const outputs = avalsOut.map((x) =>
         backend.malloc(byteWidth(x.dtype) * x.size),
       );
-      const pending = arrays.flatMap((ar) => ar.#pending);
-      for (const exe of pending) exe.updateRc(+outputs.length);
-      pending.push(new PendingExecute(backend, routine, inputs, outputs));
-      pending[pending.length - 1].updateRc(+outputs.length - 1);
+      // Deduplicate inherited PEs with a Set (like #naryCustom) — the same PE
+      // can appear in multiple input arrays' pending lists when an array is
+      // used as input to multiple operations. Without dedup, updateRc(+1)
+      // would be called multiple times for the same PE, but the output's
+      // Set-based #pendingSet only calls updateRc(-1) once on dispose.
+      const inherited = new Set(arrays.flatMap((ar) => ar.#pending));
+      for (const exe of inherited) exe.updateRc(+outputs.length);
+      const routinePE = new PendingExecute(backend, routine, inputs, outputs);
+      routinePE.updateRc(+outputs.length - 1);
+      const pending = [...inherited, routinePE];
 
       return outputs.map(
         (output, i) =>
@@ -1198,6 +1204,7 @@ export class Array extends Tracer {
       [Primitive.TriangularSolve]: Array.#routine(Primitive.TriangularSolve),
       [Primitive.Cholesky]: Array.#routine(Primitive.Cholesky),
       [Primitive.LU]: Array.#routine(Primitive.LU),
+      [Primitive.QR]: Array.#routine(Primitive.QR),
       [Primitive.Jit](args, { jaxpr, name: _name, numConsts, dynamicAxes }) {
         if (jaxpr.inBinders.length !== args.length) {
           throw new Error(

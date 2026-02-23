@@ -65,7 +65,7 @@ describe("polymorphic JIT (dynamic_axes, M4)", () => {
   // Without dynamic_axes, each new size triggers recompilation.
 
   const polyF = jit((x: any) => x.mul(2).add(1).sub(0.5), {
-    dynamic_axes: { T: 0 },
+    dynamic_axes: { 0: "T" },
   });
 
   // Warmup with first size to trigger compilation

@@ -332,4 +332,40 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       expect(xPred).toBeAllclose(xTrue, { rtol: 1e-2, atol: 1e-4 });
     });
   });
+
+  suite("numpy.linalg.qr()", () => {
+    test("computes thin QR for 3x2 matrix", () => {
+      using A = np.array([
+        [1.0, 2.0],
+        [3.0, 4.0],
+        [5.0, 6.0],
+      ]);
+      const [Q, R] = np.linalg.qr(A);
+      using _Q = Q;
+      using _R = R;
+      expect(Q.shape).toEqual([3, 2]);
+      expect(R.shape).toEqual([2, 2]);
+
+      using reconstructed = np.matmul(Q, R);
+      expect(reconstructed).toBeAllclose(A, { atol: 1e-5 });
+    });
+
+    test("gradient through QR", () => {
+      const f = (A: np.Array) => {
+        const [Q, R] = np.linalg.qr(A);
+        Q.dispose();
+        return R.sum();
+      };
+      using A = np.array([
+        [2.0, 1.0],
+        [1.0, 3.0],
+      ]);
+      using dA = grad(f)(A);
+      // Gradient should be finite
+      const vals = (dA.js() as number[][]).flat();
+      for (const v of vals) {
+        expect(isFinite(v)).toBe(true);
+      }
+    });
+  });
 });

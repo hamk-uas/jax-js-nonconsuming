@@ -76,6 +76,36 @@ export function lu(x: ArrayLike): [Array, Array, Array] {
 }
 
 /**
+ * QR decomposition.
+ *
+ * Computes the thin QR factorization `A = Q @ R`, where `Q` has orthonormal
+ * columns and `R` is upper triangular.
+ *
+ * @param a - A batch of matrices with shape `[..., m, n]` where `m >= n`.
+ *
+ * @returns A tuple `[Q, R]` where:
+ * - `Q`: orthogonal matrix with shape `[..., m, k]`, `k = min(m, n)`.
+ * - `R`: upper triangular matrix with shape `[..., k, n]`.
+ *
+ * @example
+ * ```ts
+ * import { lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+ *
+ * const A = np.array([[1., 2.], [3., 4.], [5., 6.]]);
+ * const [Q, R] = lax.linalg.qr(A);
+ * // Q has shape [3, 2], R has shape [2, 2]
+ * // Q^T @ Q ≈ I, Q @ R ≈ A
+ *
+ * A.dispose();
+ * Q.dispose();
+ * R.dispose();
+ * ```
+ */
+export function qr(a: ArrayLike): [Array, Array] {
+  return core.qr(a) as [Array, Array];
+}
+
+/**
  * Solve a triangular linear system.
  *
  * Solves `a @ x = b` (if leftSide=true) or `x @ a = b` (if leftSide=false)

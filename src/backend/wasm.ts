@@ -38,6 +38,7 @@ import {
   getArgsortModule,
   getCholeskyModule,
   getLUModule,
+  getQRModule,
   getSortModule,
   getTriangularSolveModule,
 } from "./wasm/routine-provider";
@@ -441,6 +442,7 @@ export class WasmBackend implements Backend {
             return this.#dispatchSort(routine, inputs, outputs, elementSize);
           case Routines.Argsort:
             return this.#dispatchArgsort(routine, inputs, outputs, elementSize);
+          // QR: fall through to CPU fallback (WASM routine has correctness issues)
         }
       }
       // Fall back to CPU for non-float or unimplemented routines
@@ -529,6 +531,10 @@ export class WasmBackend implements Backend {
       case Routines.LU: {
         const [m, n] = sizeParams;
         return getLUModule({ m, n, dtype });
+      }
+      case Routines.QR: {
+        const [m, n] = sizeParams;
+        return getQRModule({ m, n, dtype });
       }
       default:
         throw new Error(`Unsupported routine for scan: ${Routines[routine]}`);
@@ -694,6 +700,41 @@ export class WasmBackend implements Backend {
     );
 
     this.#allocator.free(auxPtr);
+  }
+
+  #dispatchQR(
+    routine: Routine,
+    inputs: Slot[],
+    outputs: Slot[],
+    elementSize: 4 | 8,
+  ): void {
+    const shape = routine.type.inputShapes[0];
+    const m = shape[shape.length - 2];
+    const n = shape[shape.length - 1];
+    const batchSize = shape.slice(0, -2).reduce((a, b) => a * b, 1);
+    const dtype = elementSize === 4 ? "f32" : "f64";
+
+    // Allocate m×n scratch buffer for Householder transformations
+    const workPtr = this.#allocator.malloc(m * n * elementSize);
+
+    const module = getQRModule({ m, n, dtype });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.qr_batched as (
+      a: number,
+      q: number,
+      r: number,
+      work: number,
+      batchSize: number,
+    ) => void;
+    func(
+      this.#buffers.get(inputs[0])!.ptr,
+      this.#buffers.get(outputs[0])!.ptr,
+      this.#buffers.get(outputs[1])!.ptr,
+      workPtr,
+      batchSize,
+    );
+
+    this.#allocator.free(workPtr);
   }
 
   #getBuffer(slot: Slot): Uint8Array<ArrayBuffer> {
@@ -3604,6 +3645,17 @@ export function getScanRoutineInfo(routine: Routine): ScanRoutineInfo | null {
       numParams: 4,
       dtype,
       sizeParams: [n],
+    };
+  } else if (routineName === Routines.QR) {
+    const inputShape = routine.type.inputShapes[0];
+    const m = inputShape[inputShape.length - 2];
+    const n = inputShape[inputShape.length - 1];
+    return {
+      routine: routineName,
+      exportName: "qr",
+      numParams: 4,
+      dtype,
+      sizeParams: [m, n],
     };
   }
   return null;

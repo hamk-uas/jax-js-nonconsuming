@@ -46,6 +46,7 @@ import {
   log,
   lu,
   max,
+  qr,
   min,
   mod,
   neg,
@@ -436,6 +437,36 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     using rhsT = db.sub(mTdax); // (dB.T - triu(dA) @ X.T).T
     const dx = triangularSolve(a, rhsT, { unitDiagonal });
     return [[x], [dx]];
+  },
+  [Primitive.QR]([a], [da]) {
+    // QR decomposition JVP (thin QR, m >= n only).
+    // From A = QR: dA = dQ R + Q dR, with Q^T dQ skew-symmetric.
+    // Let F = Q^T dA R^{-1} = M + dR R^{-1}.
+    // Then dR = triu(F) R, dQ = (dA - Q dR) R^{-T}.
+    const [Q, R] = qr(a);
+    const m = a.shape[a.ndim - 2] as number;
+    const n = a.shape[a.ndim - 1] as number;
+    if (m < n)
+      throw new Error(
+        "qr jvp: m < n (wide matrices) not yet supported, got " +
+          `${m}x${n}`,
+      );
+    // F = Q^T @ dA @ R^{-1}
+    using Qt = mT(Q);
+    using QtdA_tmp = mT(da);
+    using QtdA = batchMatmulT(Qt, QtdA_tmp); // Q^T @ dA
+    using Rt = mT(R);
+    using F = triangularSolve(Rt, QtdA, { lower: true }); // QtdA @ R^{-1}
+    // dR = triu(F) @ R
+    using triuF = triu(F as any) as Tracer;
+    using mTR = mT(R);
+    const dR = batchMatmulT(triuF, mTR); // triu(F) @ R
+    // dQ = (dA - Q @ dR) @ R^{-T}
+    using QdR_tmp = mT(dR);
+    using QdR = batchMatmulT(Q, QdR_tmp); // Q @ dR
+    using residual = da.sub(QdR);
+    const dQ = triangularSolve(R, residual); // (dA - Q dR) @ R^{-T}
+    return [[Q, R], [dQ, dR]];
   },
   [Primitive.Cholesky]([a], [da]) {
     // If L = cholesky(A), so that A = L @ L^T, then

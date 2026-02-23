@@ -362,4 +362,153 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       expect(x).toBeAllclose([[2, 5 / 3]]);
     });
   });
+
+  suite("jax.lax.linalg.qr()", () => {
+    test("computes QR decomposition for 3x2 matrix", () => {
+      using A = np.array([
+        [1.0, 2.0],
+        [3.0, 4.0],
+        [5.0, 6.0],
+      ]);
+      const [Q, R] = lax.linalg.qr(A);
+      using _Q = Q;
+      using _R = R;
+
+      // Q has shape [3, 2], R has shape [2, 2]
+      expect(Q.shape).toEqual([3, 2]);
+      expect(R.shape).toEqual([2, 2]);
+
+      // Q^T @ Q ≈ I
+      using Qt = np.matrixTranspose(Q);
+      using QtQ = np.matmul(Qt, Q);
+      using eye2 = np.eye(2);
+      expect(QtQ).toBeAllclose(eye2, { atol: 1e-5 });
+
+      // Q @ R ≈ A
+      using reconstructed = np.matmul(Q, R);
+      expect(reconstructed).toBeAllclose(A, { atol: 1e-5 });
+    });
+
+    test("computes QR decomposition for square matrix", () => {
+      using A = np.array([
+        [4.0, 7.0],
+        [2.0, 6.0],
+      ]);
+      const [Q, R] = lax.linalg.qr(A);
+      using _Q = Q;
+      using _R = R;
+
+      expect(Q.shape).toEqual([2, 2]);
+      expect(R.shape).toEqual([2, 2]);
+
+      // Verify Q^T Q ≈ I
+      using Qt = np.matrixTranspose(Q);
+      using QtQ = np.matmul(Qt, Q);
+      using eye2 = np.eye(2);
+      expect(QtQ).toBeAllclose(eye2, { atol: 1e-5 });
+
+      // Verify Q R ≈ A
+      using reconstructed = np.matmul(Q, R);
+      expect(reconstructed).toBeAllclose(A, { atol: 1e-5 });
+
+      // R should be upper triangular
+      const rData = R.js() as number[][];
+      expect(Math.abs(rData[1][0])).toBeLessThan(1e-5);
+    });
+
+    test("computes QR for random 4x3 matrix", () => {
+      const key = random.key(42);
+      using A = random.uniform(key, [4, 3]);
+      key.dispose();
+
+      const [Q, R] = lax.linalg.qr(A);
+      using _Q = Q;
+      using _R = R;
+
+      expect(Q.shape).toEqual([4, 3]);
+      expect(R.shape).toEqual([3, 3]);
+
+      // Q @ R ≈ A
+      using reconstructed = np.matmul(Q, R);
+      expect(reconstructed).toBeAllclose(A, { atol: 1e-4 });
+
+      // Q^T Q ≈ I
+      using Qt = np.matrixTranspose(Q);
+      using QtQ = np.matmul(Qt, Q);
+      using eye3 = np.eye(3);
+      expect(QtQ).toBeAllclose(eye3, { atol: 1e-4 });
+    });
+
+    test("QR with batched matrices", () => {
+      using A = np.array([
+        [
+          [1.0, 2.0],
+          [3.0, 4.0],
+          [5.0, 6.0],
+        ],
+        [
+          [7.0, 8.0],
+          [9.0, 10.0],
+          [11.0, 12.0],
+        ],
+      ]);
+
+      const [Q, R] = lax.linalg.qr(A);
+      using _Q = Q;
+      using _R = R;
+
+      expect(Q.shape).toEqual([2, 3, 2]);
+      expect(R.shape).toEqual([2, 2, 2]);
+
+      // Verify Q @ R ≈ A for each batch
+      using reconstructed = np.matmul(Q, R);
+      expect(reconstructed).toBeAllclose(A, { atol: 1e-4 });
+    });
+
+    test("gradient through QR decomposition", () => {
+      // grad of sum(R) w.r.t. A
+      const f = (A: np.Array) => {
+        const [Q, R] = lax.linalg.qr(A);
+        Q.dispose();
+        return R.sum();
+      };
+      using A = np.array([
+        [1.0, 2.0],
+        [3.0, 4.0],
+      ]);
+      using dA = grad(f)(A);
+
+      // Verify gradient is finite and non-zero
+      const dAData = dA.js() as number[][];
+      for (const row of dAData)
+        for (const v of row)
+          expect(Math.abs(v)).toBeLessThan(100);
+      // At least one entry should be non-zero
+      const maxAbs = Math.max(
+        ...dAData.flat().map((v) => Math.abs(v)),
+      );
+      expect(maxAbs).toBeGreaterThan(1e-6);
+    });
+
+    test("JVP through QR decomposition", () => {
+      using A = np.array([
+        [1.0, 2.0],
+        [3.0, 4.0],
+      ]);
+      using dA = np.eye(2);
+
+      const f = (a: np.Array) => {
+        const [Q, R] = lax.linalg.qr(a);
+        Q.dispose();
+        return R;
+      };
+
+      const [R, dR] = jvp(f, [A], [dA]);
+      using _R = R;
+      using _dR = dR;
+
+      // dR should exist and have correct shape
+      expect(dR.shape).toEqual([2, 2]);
+    });
+  });
 });

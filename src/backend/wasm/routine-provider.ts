@@ -17,6 +17,7 @@ import {
   buildCholeskyModuleSized,
   buildCholeskySimdModule,
   buildLUModuleSized,
+  buildQRModuleSized,
   buildSortModuleSized,
   buildTriangularSolveModuleSized,
 } from "./routines/index";
@@ -130,6 +131,13 @@ export interface ArgsortParams {
   dtype: "f32" | "f64";
 }
 
+/** Parameters for QR size specialization */
+export interface QRParams {
+  m: number;
+  n: number;
+  dtype: "f32" | "f64";
+}
+
 // ============================================================================
 // Cache key generation
 // ============================================================================
@@ -152,6 +160,10 @@ function sortKey(params: SortParams): string {
 
 function argsortKey(params: ArgsortParams): string {
   return `argsort:${params.dtype}:${params.n}`;
+}
+
+function qrKey(params: QRParams): string {
+  return `qr:${params.dtype}:${params.m}:${params.n}`;
 }
 
 // ============================================================================
@@ -240,6 +252,21 @@ export function getArgsortModule(params: ArgsortParams): WebAssembly.Module {
   let module = moduleCache.get(key);
   if (!module) {
     const bytes = buildArgsortModuleSized(params.n, params.dtype);
+    module = new WebAssembly.Module(bytes);
+    moduleCache.set(key, module);
+  }
+  return module;
+}
+
+/**
+ * Get a size-specialized QR module.
+ * Exports: qr(aPtr, qPtr, rPtr, workPtr), qr_batched(aPtr, qPtr, rPtr, workPtr, batch)
+ */
+export function getQRModule(params: QRParams): WebAssembly.Module {
+  const key = qrKey(params);
+  let module = moduleCache.get(key);
+  if (!module) {
+    const bytes = buildQRModuleSized(params.m, params.n, params.dtype);
     module = new WebAssembly.Module(bytes);
     moduleCache.set(key, module);
   }

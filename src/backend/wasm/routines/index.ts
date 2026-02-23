@@ -9,3 +9,4 @@ export { buildTriangularSolveModuleSized } from "./triangular-solve";
 export { buildLUModuleSized } from "./lu";
 export { buildSortModuleSized } from "./sort";
 export { buildArgsortModuleSized } from "./argsort";
+export { buildQRModuleSized } from "./qr";

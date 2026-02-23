@@ -74,6 +74,19 @@ export enum Routines {
    *   such that `P = eye(M).slice(Permutation)` -> `P @ A = L @ U`.
    */
   LU = "LU",
+
+  /**
+   * QR decomposition of 2D rectangular matrices.
+   *
+   * The input is a batch of shape `[..., M, N]`, and the output is a tuple of
+   * two arrays: `Q, R`.
+   *
+   * - `Q` is of shape `[..., M, K]` where K = min(M, N), an orthonormal matrix.
+   * - `R` is of shape `[..., K, N]`, an upper triangular matrix.
+   *
+   * Uses Householder reflections.
+   */
+  QR = "QR",
 }
 
 export interface RoutineType {
@@ -109,6 +122,8 @@ export function runCpuRoutine(
       return runCholesky(type, inputAr, outputAr);
     case Routines.LU:
       return runLU(type, inputAr, outputAr);
+    case Routines.QR:
+      return runQR(type, inputAr, outputAr);
     default:
       name satisfies never; // Exhaustiveness check
   }
@@ -265,5 +280,100 @@ function runLU(
         }
       }
     }
+  }
+}
+
+function runQR(
+  type: RoutineType,
+  [a]: DataArray[],
+  [q, r]: DataArray[],
+) {
+  const shape = type.inputShapes[0];
+  if (shape.length < 2) throw new Error("qr: input must be at least 2D");
+  const m = shape[shape.length - 2]; // rows
+  const n = shape[shape.length - 1]; // cols
+  const k = Math.min(m, n);
+
+  for (let offset = 0; offset < a.length; offset += m * n) {
+    const ar = a.subarray(offset, offset + m * n);
+    const batchIdx = offset / (m * n);
+    const qOut = q.subarray(batchIdx * m * k, (batchIdx + 1) * m * k);
+    const rOut = r.subarray(batchIdx * k * n, (batchIdx + 1) * k * n);
+
+    // Copy A into a working buffer (will become R)
+    const work = new Float64Array(m * n);
+    for (let i = 0; i < m * n; i++) work[i] = ar[i];
+
+    // Householder QR decomposition — two-phase algorithm:
+    // Phase 1: Forward pass — compute R and store Householder vectors/taus
+    // Phase 2: Backward pass — build Q by applying reflections in reverse
+
+    const vs: Float64Array[] = [];
+    const taus: number[] = [];
+
+    for (let j = 0; j < k; j++) {
+      // Compute the Householder vector for column j
+      // v = work[j:m, j]
+      let norm = 0;
+      for (let i = j; i < m; i++) norm += work[i * n + j] * work[i * n + j];
+      norm = Math.sqrt(norm);
+      if (norm === 0) {
+        vs.push(new Float64Array(0));
+        taus.push(0);
+        continue;
+      }
+
+      const sign = work[j * n + j] >= 0 ? 1 : -1;
+      const alpha = -sign * norm;
+      // v[0] = work[j,j] - alpha
+      const v = new Float64Array(m - j);
+      v[0] = work[j * n + j] - alpha;
+      for (let i = 1; i < m - j; i++) v[i] = work[(j + i) * n + j];
+
+      // Normalize v
+      let vNormSq = 0;
+      for (let i = 0; i < v.length; i++) vNormSq += v[i] * v[i];
+      if (vNormSq === 0) {
+        vs.push(new Float64Array(0));
+        taus.push(0);
+        continue;
+      }
+      const tau = 2 / vNormSq;
+      vs.push(v);
+      taus.push(tau);
+
+      // Apply Householder reflection to work[j:m, j:n]: H = I - tau * v * v^T
+      // work[j:m, j:n] -= tau * v * (v^T @ work[j:m, j:n])
+      for (let col = j; col < n; col++) {
+        let dot = 0;
+        for (let i = 0; i < m - j; i++) dot += v[i] * work[(j + i) * n + col];
+        for (let i = 0; i < m - j; i++)
+          work[(j + i) * n + col] -= tau * v[i] * dot;
+      }
+    }
+
+    // Phase 2: Build Q = H_0 H_1 ... H_{k-1} by applying in reverse
+    // Q starts as identity (m x k)
+    const qWork = new Float64Array(m * k);
+    for (let i = 0; i < Math.min(m, k); i++) qWork[i * k + i] = 1;
+
+    for (let j = k - 1; j >= 0; j--) {
+      const v = vs[j];
+      const tau = taus[j];
+      if (v.length === 0) continue;
+
+      // Q[j:m, :k] -= tau * v * (v^T @ Q[j:m, :k])
+      for (let col = 0; col < k; col++) {
+        let dot = 0;
+        for (let i = 0; i < m - j; i++) dot += v[i] * qWork[(j + i) * k + col];
+        for (let i = 0; i < m - j; i++)
+          qWork[(j + i) * k + col] -= tau * v[i] * dot;
+      }
+    }
+
+    // Extract Q (m x k) and R (k x n)
+    for (let i = 0; i < m * k; i++) qOut[i] = qWork[i];
+    for (let i = 0; i < k; i++)
+      for (let j = 0; j < n; j++) rOut[i * n + j] = work[i * n + j];
   }
 }

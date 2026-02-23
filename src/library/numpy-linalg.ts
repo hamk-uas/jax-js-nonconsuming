@@ -92,6 +92,32 @@ export function inv(a: ArrayLike): Array {
 }
 
 /**
+ * Compute the QR decomposition of a (batched) matrix.
+ *
+ * Returns the thin QR factorization `A = Q @ R`, where `Q` has orthonormal
+ * columns and `R` is upper triangular.
+ *
+ * @param a - A matrix or batch of matrices with shape `[..., m, n]`.
+ * @returns A tuple `[Q, R]` where `Q` has shape `[..., m, k]` and `R` has
+ *   shape `[..., k, n]`, with `k = min(m, n)`.
+ *
+ * @example
+ * ```ts
+ * import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+ *
+ * const A = np.array([[1., 2.], [3., 4.], [5., 6.]]);
+ * const [Q, R] = np.linalg.qr(A);
+ * // Q has shape [3, 2], R has shape [2, 2]
+ * A.dispose();
+ * Q.dispose();
+ * R.dispose();
+ * ```
+ */
+export function qr(a: ArrayLike): [Array, Array] {
+  return lax.linalg.qr(a);
+}
+
+/**
  * Return the least-squares solution to a linear equation.
  *
  * For overdetermined systems, this finds the `x` that minimizes `norm(ax - b)`.
