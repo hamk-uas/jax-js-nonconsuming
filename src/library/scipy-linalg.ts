@@ -1,8 +1,8 @@
 // Mirrors the `jax.scipy.linalg` module in JAX.
 
+import * as laxLinalg from "./lax-linalg";
 import { type ArrayLike } from "../frontend/array";
 import type { Array } from "../frontend/array";
-import * as laxLinalg from "./lax-linalg";
 
 /**
  * Solve the equation `a @ x = b` for `x`, assuming `a` is a triangular matrix.

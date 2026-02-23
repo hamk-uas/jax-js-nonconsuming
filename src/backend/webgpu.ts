@@ -1195,16 +1195,27 @@ export class WebGPUBackend implements Backend {
     const totalUpdates = updatesLen * outerSize * innerSize;
     const [gridX, gridY] = calculateGrid(Math.ceil(totalUpdates / 64));
 
-    const cacheKey = `scatter_add_${dtype}_${ndim}_${axis}_${outerSize}_${innerSize}_${axisSize}_${updatesLen}`;
+    // Use native atomicAdd for f32 when the device supports shader-f32-atomic-add
+    const useNativeF32Atomic =
+      dtype === DType.Float32 && this.capabilities.atomicF32Add;
+
+    const cacheKey = `scatter_add_${dtype}_${ndim}_${axis}_${outerSize}_${innerSize}_${axisSize}_${updatesLen}_${useNativeF32Atomic ? "native" : "cas"}`;
     let pipeline = this.#scatterAddPipelineCache.get(cacheKey);
 
     if (!pipeline) {
       const wgslType = dtypeToWgsl(dtype);
       const isFloat = dtype === DType.Float32 || dtype === DType.Float16;
-      const atomicType = isFloat ? "u32" : wgslType === "i32" ? "i32" : "u32";
+      const atomicType = useNativeF32Atomic
+        ? "f32"
+        : isFloat
+          ? "u32"
+          : wgslType === "i32"
+            ? "i32"
+            : "u32";
 
       // Build shader
-      let code = `
+      let code = useNativeF32Atomic ? "enable shader_f32_atomic_add;\n" : "";
+      code += `
 @group(0) @binding(0) var<storage, read_write> output: array<atomic<${atomicType}>>;
 @group(0) @binding(1) var<storage, read> indices: array<i32>;
 @group(0) @binding(2) var<storage, read> updates: array<${wgslType}>;
@@ -1237,10 +1248,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let val = updates[flat];
 `;
 
-      if (isFloat) {
-        // CAS loop for f32 atomics (bitcast through u32)
+      if (useNativeF32Atomic) {
+        // Native f32 atomicAdd via shader-f32-atomic-add extension
         code += `
-  // CAS loop: atomically add f32 via bitcast<u32>
+  atomicAdd(&output[outFlat], val);
+`;
+      } else if (isFloat) {
+        // CAS loop for f32/f16 atomics (bitcast through u32)
+        code += `
+  // CAS loop: atomically add via bitcast<u32>
   var old_bits = atomicLoad(&output[outFlat]);
   loop {
     let old_val = bitcast<${wgslType}>(old_bits);

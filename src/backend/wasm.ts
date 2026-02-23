@@ -39,6 +39,7 @@ import {
   getCholeskyModule,
   getLUModule,
   getQRModule,
+  getScatterAddModule,
   getSortModule,
   getTriangularSolveModule,
 } from "./wasm/routine-provider";
@@ -702,6 +703,7 @@ export class WasmBackend implements Backend {
     this.#allocator.free(auxPtr);
   }
 
+  // eslint-disable-next-line no-unused-private-class-members
   #dispatchQR(
     routine: Routine,
     inputs: Slot[],
@@ -762,98 +764,37 @@ export class WasmBackend implements Backend {
     updatesLen: number,
     dtype: DType,
   ): void {
-    const outBuf = this.#getBuffer(output);
-    const idxBuf = this.#getBuffer(indices);
-    const updBuf = this.#getBuffer(updates);
-
     const ndim = targetShape.length;
     const innerSize =
       ndim > 0 ? targetShape.slice(axis + 1).reduce((a, b) => a * b, 1) : 1;
     const outerSize =
       ndim > 0 ? targetShape.slice(0, axis).reduce((a, b) => a * b, 1) : 1;
     const axisSize = ndim > 0 ? targetShape[axis] : 1;
-    const targetInnerStride = axisSize * innerSize;
 
-    // Create typed views for the output and updates
-    const idxView = new Int32Array(
-      idxBuf.buffer,
-      idxBuf.byteOffset,
+    let wasmDtype: "f32" | "f64" | "i32";
+    if (dtype === DType.Float32) wasmDtype = "f32";
+    else if (dtype === DType.Float64) wasmDtype = "f64";
+    else if (dtype === DType.Int32) wasmDtype = "i32";
+    else throw new Error(`ScatterAdd: unsupported dtype ${dtype}`);
+
+    const module = getScatterAddModule({
+      outerSize,
       updatesLen,
+      innerSize,
+      axisSize,
+      dtype: wasmDtype,
+    });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.scatter_add as (
+      outPtr: number,
+      idxPtr: number,
+      updPtr: number,
+    ) => void;
+    func(
+      this.#buffers.get(output)!.ptr,
+      this.#buffers.get(indices)!.ptr,
+      this.#buffers.get(updates)!.ptr,
     );
-
-    // Sequential scatter-add loop
-    if (dtype === DType.Float32) {
-      const out = new Float32Array(
-        outBuf.buffer,
-        outBuf.byteOffset,
-        outBuf.byteLength / 4,
-      );
-      const upd = new Float32Array(
-        updBuf.buffer,
-        updBuf.byteOffset,
-        updBuf.byteLength / 4,
-      );
-      for (let o = 0; o < outerSize; o++) {
-        for (let j = 0; j < updatesLen; j++) {
-          const targetAxisIdx = idxView[j];
-          if (targetAxisIdx < 0 || targetAxisIdx >= axisSize) continue;
-          for (let k = 0; k < innerSize; k++) {
-            const outIdx =
-              o * targetInnerStride + targetAxisIdx * innerSize + k;
-            const updIdx = o * updatesLen * innerSize + j * innerSize + k;
-            out[outIdx] += upd[updIdx];
-          }
-        }
-      }
-    } else if (dtype === DType.Float64) {
-      const out = new Float64Array(
-        outBuf.buffer,
-        outBuf.byteOffset,
-        outBuf.byteLength / 8,
-      );
-      const upd = new Float64Array(
-        updBuf.buffer,
-        updBuf.byteOffset,
-        updBuf.byteLength / 8,
-      );
-      for (let o = 0; o < outerSize; o++) {
-        for (let j = 0; j < updatesLen; j++) {
-          const targetAxisIdx = idxView[j];
-          if (targetAxisIdx < 0 || targetAxisIdx >= axisSize) continue;
-          for (let k = 0; k < innerSize; k++) {
-            const outIdx =
-              o * targetInnerStride + targetAxisIdx * innerSize + k;
-            const updIdx = o * updatesLen * innerSize + j * innerSize + k;
-            out[outIdx] += upd[updIdx];
-          }
-        }
-      }
-    } else if (dtype === DType.Int32) {
-      const out = new Int32Array(
-        outBuf.buffer,
-        outBuf.byteOffset,
-        outBuf.byteLength / 4,
-      );
-      const upd = new Int32Array(
-        updBuf.buffer,
-        updBuf.byteOffset,
-        updBuf.byteLength / 4,
-      );
-      for (let o = 0; o < outerSize; o++) {
-        for (let j = 0; j < updatesLen; j++) {
-          const targetAxisIdx = idxView[j];
-          if (targetAxisIdx < 0 || targetAxisIdx >= axisSize) continue;
-          for (let k = 0; k < innerSize; k++) {
-            const outIdx =
-              o * targetInnerStride + targetAxisIdx * innerSize + k;
-            const updIdx = o * updatesLen * innerSize + j * innerSize + k;
-            out[outIdx] += upd[updIdx];
-          }
-        }
-      }
-    } else {
-      throw new Error(`ScatterAdd: unsupported dtype ${dtype}`);
-    }
   }
 
   /**

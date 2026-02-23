@@ -25,6 +25,7 @@ import { WasmHl } from "../wasmblr-hl";
  * @param dtype - f32 or f64
  * @returns Function index for qr(aPtr, qPtr, rPtr)
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function genQRSized(
   cg: CodeGenerator,
   hl: WasmHl,
@@ -33,8 +34,8 @@ function genQRSized(
   dtype: "f32" | "f64",
 ): number {
   const ty = dtype === "f32" ? cg.f32 : cg.f64;
-  const elemSize = dtype === "f32" ? 4 : 8;
-  const k = Math.min(m, n);
+  const _elemSize = dtype === "f32" ? 4 : 8;
+  const _k = Math.min(m, n);
 
   // qr(aPtr, qPtr, rPtr)
   return cg.function([cg.i32, cg.i32, cg.i32], [], () => {
@@ -174,29 +175,24 @@ function genQRSizedWithWork(
       // Compute norm of work[j:m, j]
       hl.const(dtype, 0);
       cg.local.set(norm);
-      hl.forLoop(
-        i,
-        hl.getExpr(j),
-        m,
-        () => {
-          // val = work[i * n + j]
-          hl.load(dtype, workPtr, () => {
-            cg.local.get(i);
-            cg.i32.const(n);
-            cg.i32.mul();
-            cg.local.get(j);
-            cg.i32.add();
-          });
-          cg.local.set(val);
-          // norm += val * val
-          cg.local.get(norm);
-          cg.local.get(val);
-          cg.local.get(val);
-          hl.binOp(dtype, "mul");
-          hl.binOp(dtype, "add");
-          cg.local.set(norm);
-        },
-      );
+      hl.forLoop(i, hl.getExpr(j), m, () => {
+        // val = work[i * n + j]
+        hl.load(dtype, workPtr, () => {
+          cg.local.get(i);
+          cg.i32.const(n);
+          cg.i32.mul();
+          cg.local.get(j);
+          cg.i32.add();
+        });
+        cg.local.set(val);
+        // norm += val * val
+        cg.local.get(norm);
+        cg.local.get(val);
+        cg.local.get(val);
+        hl.binOp(dtype, "mul");
+        hl.binOp(dtype, "add");
+        cg.local.set(norm);
+      });
       // norm = sqrt(norm)
       cg.local.get(norm);
       hl.sqrt(dtype);
@@ -609,49 +605,45 @@ function genQRBatchedSized(
   const aBytes = m * n * elemSize;
   const qBytes = m * k * elemSize;
   const rBytes = k * n * elemSize;
-  const workBytes = m * n * elemSize;
+  const _workBytes = m * n * elemSize;
 
   // qr_batched(aPtr, qPtr, rPtr, workPtr, batchSize)
-  return cg.function(
-    [cg.i32, cg.i32, cg.i32, cg.i32, cg.i32],
-    [],
-    () => {
-      const aPtr = 0;
-      const qPtr = 1;
-      const rPtr = 2;
-      const workPtr = 3;
-      const batchSize = 4;
+  return cg.function([cg.i32, cg.i32, cg.i32, cg.i32, cg.i32], [], () => {
+    const aPtr = 0;
+    const qPtr = 1;
+    const rPtr = 2;
+    const workPtr = 3;
+    const batchSize = 4;
 
-      const b = cg.local.declare(cg.i32);
+    const b = cg.local.declare(cg.i32);
 
-      hl.forLoop(b, 0, hl.getExpr(batchSize), () => {
-        // Call single QR
-        cg.local.get(aPtr);
-        cg.local.get(b);
-        cg.i32.const(aBytes);
-        cg.i32.mul();
-        cg.i32.add();
+    hl.forLoop(b, 0, hl.getExpr(batchSize), () => {
+      // Call single QR
+      cg.local.get(aPtr);
+      cg.local.get(b);
+      cg.i32.const(aBytes);
+      cg.i32.mul();
+      cg.i32.add();
 
-        cg.local.get(qPtr);
-        cg.local.get(b);
-        cg.i32.const(qBytes);
-        cg.i32.mul();
-        cg.i32.add();
+      cg.local.get(qPtr);
+      cg.local.get(b);
+      cg.i32.const(qBytes);
+      cg.i32.mul();
+      cg.i32.add();
 
-        cg.local.get(rPtr);
-        cg.local.get(b);
-        cg.i32.const(rBytes);
-        cg.i32.mul();
-        cg.i32.add();
+      cg.local.get(rPtr);
+      cg.local.get(b);
+      cg.i32.const(rBytes);
+      cg.i32.mul();
+      cg.i32.add();
 
-        // workPtr is shared scratch — each batch item uses the same area
-        // (sequential batching, no parallelism)
-        cg.local.get(workPtr);
+      // workPtr is shared scratch — each batch item uses the same area
+      // (sequential batching, no parallelism)
+      cg.local.get(workPtr);
 
-        cg.call(singleFunc);
-      });
-    },
-  );
+      cg.call(singleFunc);
+    });
+  });
 }
 
 /**

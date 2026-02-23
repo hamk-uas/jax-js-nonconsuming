@@ -51,19 +51,13 @@ describe("lax.scan backend coverage", () => {
         const { getBackend } = await import("@hamk-uas/jax-js-nonconsuming");
         const backend = getBackend(device) as any;
 
-        if (typeof backend.copyBufferToBuffer === "function") {
-          const slot1 = backend.malloc(16);
-          const slot2 = backend.malloc(16);
-          try {
-            backend.copyBufferToBuffer(slot1, 0, slot2, 0, 16);
-          } finally {
-            backend.decRef(slot1);
-            backend.decRef(slot2);
-          }
-        } else {
-          if (device !== "webgl") {
-            throw new Error(`Backend ${device} missing copyBufferToBuffer`);
-          }
+        const slot1 = backend.malloc(16);
+        const slot2 = backend.malloc(16);
+        try {
+          backend.copyBufferToBuffer(slot1, 0, slot2, 0, 16);
+        } finally {
+          backend.decRef(slot1);
+          backend.decRef(slot2);
         }
       }
 

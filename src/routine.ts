@@ -283,11 +283,7 @@ function runLU(
   }
 }
 
-function runQR(
-  type: RoutineType,
-  [a]: DataArray[],
-  [q, r]: DataArray[],
-) {
+function runQR(type: RoutineType, [a]: DataArray[], [q, r]: DataArray[]) {
   const shape = type.inputShapes[0];
   if (shape.length < 2) throw new Error("qr: input must be at least 2D");
   const m = shape[shape.length - 2]; // rows

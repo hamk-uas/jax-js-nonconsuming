@@ -162,6 +162,8 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
      * - `false`: store all intermediate carries (O(N) memory, no recomputation)
      */
     checkpoint?: boolean | number;
+    /** Set by JVP rule when this scan was produced by differentiating an outer scan. */
+    isJvpTransformed?: boolean;
   };
   [Primitive.AssociativeScan]: {
     jaxpr: Jaxpr;

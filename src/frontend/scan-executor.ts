@@ -345,27 +345,5 @@ function copySliceToBuffer(
   sliceBytes: number,
 ): void {
   const dstOffset = iterIdx * strideBytes;
-  if (backend.copyBufferToBuffer) {
-    backend.copyBufferToBuffer(src, 0, dst, dstOffset, sliceBytes);
-  } else {
-    // Fallback: read + write via malloc. This is slow but correct.
-    const data = backend.readSync(src, 0, sliceBytes);
-    // Write into dst at the correct offset.
-    // We need a backend method for this. For now, use readSync of entire dst,
-    // patch, and write back. This is very inefficient but correct for P0.
-    const dstData = backend.readSync(dst);
-    const dstArray = new Uint8Array(dstData.buffer.slice(0));
-    dstArray.set(data, dstOffset);
-
-    // We need to write this back. The only way without copyBufferToBuffer
-    // is to create a new slot and swap. This is a P0 hack — all real
-    // backends (WASM, WebGPU) implement copyBufferToBuffer.
-    //
-    // For WASM, we can write directly into the memory buffer.
-    // For CPU, same. So copyBufferToBuffer should always exist.
-    // Throw if it doesn't — this forces us to add copyBufferToBuffer.
-    throw new Error(
-      "internal: copySliceToBuffer requires backend.copyBufferToBuffer",
-    );
-  }
+  backend.copyBufferToBuffer(src, 0, dst, dstOffset, sliceBytes);
 }

@@ -18,6 +18,7 @@ import {
   buildCholeskySimdModule,
   buildLUModuleSized,
   buildQRModuleSized,
+  buildScatterAddModule,
   buildSortModuleSized,
   buildTriangularSolveModuleSized,
 } from "./routines/index";
@@ -138,6 +139,15 @@ export interface QRParams {
   dtype: "f32" | "f64";
 }
 
+/** Parameters for ScatterAdd size specialization */
+export interface ScatterAddParams {
+  outerSize: number;
+  updatesLen: number;
+  innerSize: number;
+  axisSize: number;
+  dtype: "f32" | "f64" | "i32";
+}
+
 // ============================================================================
 // Cache key generation
 // ============================================================================
@@ -164,6 +174,10 @@ function argsortKey(params: ArgsortParams): string {
 
 function qrKey(params: QRParams): string {
   return `qr:${params.dtype}:${params.m}:${params.n}`;
+}
+
+function scatterAddKey(params: ScatterAddParams): string {
+  return `scatter_add:${params.dtype}:${params.outerSize}:${params.updatesLen}:${params.innerSize}:${params.axisSize}`;
 }
 
 // ============================================================================
@@ -267,6 +281,29 @@ export function getQRModule(params: QRParams): WebAssembly.Module {
   let module = moduleCache.get(key);
   if (!module) {
     const bytes = buildQRModuleSized(params.m, params.n, params.dtype);
+    module = new WebAssembly.Module(bytes);
+    moduleCache.set(key, module);
+  }
+  return module;
+}
+
+/**
+ * Get a size-specialized ScatterAdd module.
+ * Exports: scatter_add(outPtr, idxPtr, updPtr)
+ */
+export function getScatterAddModule(
+  params: ScatterAddParams,
+): WebAssembly.Module {
+  const key = scatterAddKey(params);
+  let module = moduleCache.get(key);
+  if (!module) {
+    const bytes = buildScatterAddModule(
+      params.outerSize,
+      params.updatesLen,
+      params.innerSize,
+      params.axisSize,
+      params.dtype,
+    );
     module = new WebAssembly.Module(bytes);
     moduleCache.set(key, module);
   }

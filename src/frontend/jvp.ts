@@ -46,7 +46,6 @@ import {
   log,
   lu,
   max,
-  qr,
   min,
   mod,
   neg,
@@ -55,6 +54,7 @@ import {
   pad,
   Primitive,
   PrimitiveParams,
+  qr,
   reciprocal,
   reduce,
   scatterAdd,
@@ -448,8 +448,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const n = a.shape[a.ndim - 1] as number;
     if (m < n)
       throw new Error(
-        "qr jvp: m < n (wide matrices) not yet supported, got " +
-          `${m}x${n}`,
+        "qr jvp: m < n (wide matrices) not yet supported, got " + `${m}x${n}`,
       );
     // F = Q^T @ dA @ R^{-1}
     using Qt = mT(Q);
@@ -466,7 +465,10 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     using QdR = batchMatmulT(Q, QdR_tmp); // Q @ dR
     using residual = da.sub(QdR);
     const dQ = triangularSolve(R, residual); // (dA - Q dR) @ R^{-T}
-    return [[Q, R], [dQ, dR]];
+    return [
+      [Q, R],
+      [dQ, dR],
+    ];
   },
   [Primitive.Cholesky]([a], [da]) {
     // If L = cholesky(A), so that A = L @ L^T, then
@@ -732,6 +734,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
       length,
       reverse,
       checkpoint,
+      isJvpTransformed: true,
     });
 
     // Dispose the wrapper jaxpr (not cached)

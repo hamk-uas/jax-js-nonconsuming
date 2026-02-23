@@ -770,8 +770,7 @@ class PartialEvalTrace extends Trace {
     const avalsOut = abstractEvalRules[Primitive.Scan](avalsIn, params);
     const numY = avalsOut.length - numCarry;
 
-    // Check if this looks like a JVP'd scan (even numCarry and numY).
-    const isJvpScan = numCarry % 2 === 0 && numY % 2 === 0;
+    const isJvpScan = params.isJvpTransformed ?? false;
 
     if (!isJvpScan) {
       // Not a JVP scan, mark all outputs as unknown
@@ -1832,7 +1831,15 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
   [Primitive.Scan](
     cts,
     args,
-    { jaxpr, numCarry, numConsts, length: lengthDim, reverse, checkpoint },
+    {
+      jaxpr,
+      numCarry,
+      numConsts,
+      length: lengthDim,
+      reverse,
+      checkpoint,
+      isJvpTransformed,
+    },
   ) {
     // Scan transpose rule for backward pass through scan.
     //
@@ -1843,8 +1850,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     const numX = args.length - numConsts - numCarry;
     const numY = cts.length - numCarry;
 
-    // Detect JVP structure: even numCarry, numX, and numY.
-    const isJvpScan = numCarry % 2 === 0 && numY % 2 === 0 && numX % 2 === 0;
+    const isJvpScan = isJvpTransformed ?? false;
 
     const numPrimalCarry = isJvpScan ? numCarry / 2 : 0;
     const numPrimalX = isJvpScan ? numX / 2 : 0;

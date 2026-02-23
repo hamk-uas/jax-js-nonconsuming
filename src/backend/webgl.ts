@@ -265,6 +265,58 @@ export class WebGLBackend implements Backend {
     return new Uint8Array(byteData.slice(start, start + count));
   }
 
+  copyBufferToBuffer(
+    src: Slot,
+    srcOffset: number,
+    dst: Slot,
+    dstOffset: number,
+    size: number,
+  ): void {
+    const srcData = this.readSync(src, srcOffset, size);
+    const dstBuf = this.#buffers.get(dst);
+    if (!dstBuf) throw new SlotError(dst);
+
+    // Read entire dst texture, patch in the source bytes, re-upload
+    const gl = this.gl;
+    const totalFloats = dstBuf.width * dstBuf.height * 4;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.#fbo);
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D,
+      dstBuf.texture,
+      0,
+    );
+    const floatData = new Float32Array(totalFloats);
+    gl.readPixels(
+      0,
+      0,
+      dstBuf.width,
+      dstBuf.height,
+      gl.RGBA,
+      gl.FLOAT,
+      floatData,
+    );
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    new Uint8Array(floatData.buffer as ArrayBuffer).set(srcData, dstOffset);
+
+    gl.bindTexture(gl.TEXTURE_2D, dstBuf.texture);
+    gl.texSubImage2D(
+      gl.TEXTURE_2D,
+      0,
+      0,
+      0,
+      dstBuf.width,
+      dstBuf.height,
+      gl.RGBA,
+      gl.FLOAT,
+      floatData,
+    );
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+
   async prepareKernel(kernel: Kernel): Promise<Executable<ShaderDispatch>> {
     return this.prepareKernelSync(kernel);
   }

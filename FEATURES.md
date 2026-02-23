@@ -173,7 +173,7 @@ Most operations behave the same way as they do in JAX.
 | `bitwise_right_shift` | 🔴      |                                              |
 | `bitwise_xor`         | 🔴      |                                              |
 | `blackman`            | 🟠      |                                              |
-| `block`               | �      |                                              |
+| `block`               | �       |                                              |
 | `broadcast_arrays`    | 🟢      |                                              |
 | `broadcast_shapes`    | 🟢      |                                              |
 | `broadcast_to`        | 🟢      |                                              |
@@ -530,7 +530,7 @@ Cholesky, LU (with partial pivoting), triangular solve, and QR decomposition. St
 | `norm`             | 🟠      |                                         |
 | `outer`            | 🟢      |                                         |
 | `pinv`             | 🔴      |                                         |
-| `qr`               | �      | Differentiable (Householder QR)         |
+| `qr`               | �       | Differentiable (Householder QR)         |
 | `slogdet`          | 🟢      |                                         |
 | `solve`            | 🟢      | Differentiable (direct LU→triSolve)     |
 | `svd`              | 🔴      |                                         |
@@ -694,7 +694,8 @@ Available `tree` utilities:
 
 These modules are unimplemented:
 
-- `jax.scipy` (partial: `scipy.special` — erf, erfc, logit, logsumexp, softmax, logSoftmax; `scipy.linalg` — solveTriangular, cholesky)
+- `jax.scipy` (partial: `scipy.special` — erf, erfc, logit, logsumexp, softmax, logSoftmax;
+  `scipy.linalg` — solveTriangular, cholesky)
 - `jax.sharding`
 - `jax.debug`
 - `jax.dlpack`

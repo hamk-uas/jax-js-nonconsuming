@@ -657,15 +657,16 @@ See [WebGPU preencoded-routine details](#webgpu-preencoded-routine-details-routi
 
 ### Features exploited
 
-| Feature                     | How jax-js uses it                                               | Location                           |
-| --------------------------- | ---------------------------------------------------------------- | ---------------------------------- |
-| **shader-f16**              | Float16 dtype support; requested at device creation              | `src/backend.ts` feature requests  |
-| **Workgroup shared memory** | Sort uses `var<workgroup>` for bitonic sort local exchanges      | `src/backend/webgpu/routines.ts`   |
-| **workgroupBarrier()**      | Synchronizes threads within Sort workgroups                      | `bitonicSortShader` in routines.ts |
-| **storageBarrier()**        | Memory fence for shared variable consistency                     | Sort, Cholesky, LU in routines.ts  |
-| **Pipeline caching**        | Compiled pipelines stored by shader hash                         | `pipelineCache` in webgpu.ts       |
-| **Command batching**        | Multiple dispatches encoded before single queue.submit()         | `PendingExecute` in webgpu.ts      |
-| **WGSL copy shader**        | Byte-level buffer copy when `copyBufferToBuffer` alignment fails | `COPY_SHADER_CODE` in webgpu.ts    |
+| Feature                     | How jax-js uses it                                               | Location                            |
+| --------------------------- | ---------------------------------------------------------------- | ----------------------------------- |
+| **shader-f16**              | Float16 dtype support; requested at device creation              | `src/backend.ts` feature requests   |
+| **Workgroup shared memory** | Sort uses `var<workgroup>` for bitonic sort local exchanges      | `src/backend/webgpu/routines.ts`    |
+| **workgroupBarrier()**      | Synchronizes threads within Sort workgroups                      | `bitonicSortShader` in routines.ts  |
+| **storageBarrier()**        | Memory fence for shared variable consistency                     | Sort, Cholesky, LU in routines.ts   |
+| **Pipeline caching**        | Compiled pipelines stored by shader hash                         | `pipelineCache` in webgpu.ts        |
+| **Command batching**        | Multiple dispatches encoded before single queue.submit()         | `PendingExecute` in webgpu.ts       |
+| **WGSL copy shader**        | Byte-level buffer copy when `copyBufferToBuffer` alignment fails | `COPY_SHADER_CODE` in webgpu.ts     |
+| **shader-f32-atomic-add**   | Native f32 `atomicAdd` in scatter-add shader (when available)    | `dispatchScatterAdd()` in webgpu.ts |
 
 **Scan additionally uses:**
 
@@ -1012,7 +1013,8 @@ All public symbols must be exported from `src/index.ts`. Key exports:
 - Transformations: `jit`, `grad`, `valueAndGrad`, `jvp`, `vjp`, `vmap`, `jacfwd`, `jacrev`,
   `hessian`, `linearize`, `makeJaxpr`
 - Device control: `init`, `defaultDevice`, `devicePut`, `blockUntilReady`, `devices`, `getBackend`
-- Namespaces: `numpy`, `lax`, `nn`, `random`, `scipySpecial`, `tree`
+- Functions: `scatterAdd`
+- Namespaces: `numpy`, `lax`, `nn`, `random`, `scipySpecial`, `scipyLinalg`, `tree`
 - Testing utilities: `ScanPath` (type)
 - Types: `AssociativeScanOptions`
 
@@ -1505,11 +1507,14 @@ copied first, then the scatter-add dispatch accumulates updates in-place into th
 
 ### Backend implementations
 
-**WebGPU — Compare-and-Swap (CAS) loop:**
+**WebGPU — Native atomicAdd or Compare-and-Swap (CAS) fallback:**
 
-`dispatchScatterAdd()` in `webgpu.ts` uses an atomic CAS loop for floating-point scatter-add because
-WGSL has no native `atomicAdd` for `f32`. The output buffer is declared as `array<atomic<u32>>`, and
-the shader performs:
+`dispatchScatterAdd()` in `webgpu.ts` checks `capabilities.atomicF32Add` to select the f32 scatter
+strategy:
+
+- **With `shader-f32-atomic-add`:** Uses `enable shader_f32_atomic_add;` and native
+  `atomicAdd(&output[outFlat], val)` on `array<atomic<f32>>`. No bitcast needed.
+- **Without (CAS fallback):** Uses an atomic CAS loop via `bitcast<u32>` on `array<atomic<u32>>`:
 
 ```wgsl
 loop {
@@ -1522,15 +1527,19 @@ loop {
 }
 ```
 
-For integer dtypes, native `atomicAdd` is used directly. The shader parallelizes across all update
-elements with a 3D index decomposition: `(outerSize, updatesLen, innerSize)` derived from `axis`.
+The pipeline cache key includes a `"native"` or `"cas"` suffix so both shader variants coexist. For
+integer dtypes, native `atomicAdd` is used directly in both cases. The shader parallelizes across
+all update elements with a 3D index decomposition: `(outerSize, updatesLen, innerSize)` derived from
+`axis`.
 
-**WASM — Sequential scatter:**
+**WASM — Size-specialized wasmblr module:**
 
-`dispatchScatterAdd()` in `wasm.ts` generates a sequential triple-nested loop
-`(outerSize × updatesLen × innerSize)` via wasmblr. Each iteration computes
-`output[outer * targetAxisLen * innerSize + idx * innerSize + inner] += updates[...]`. Sequential
-execution means no atomics needed.
+`dispatchScatterAdd()` in `wasm.ts` delegates to a size-specialized WASM module built by
+`buildScatterAddModule()` in `src/backend/wasm/routines/scatter-add.ts`. All loop bounds
+(`outerSize`, `updatesLen`, `innerSize`, `axisSize`) are baked as compile-time constants. The module
+exports `scatter_add(outPtr, idxPtr, updPtr)` which performs the triple-nested loop
+`(outerSize × updatesLen × innerSize)` with bounds checking in native WASM. Module instances are
+cached via `getScatterAddModule()` in `routine-provider.ts`.
 
 ### Autodiff rules
 
@@ -1543,17 +1552,19 @@ The transpose rule for updates uses a `gather` operation to extract the relevant
 
 ### Key files
 
-| File                         | Purpose                                                |
-| ---------------------------- | ------------------------------------------------------ |
-| `src/frontend/core.ts`       | `Primitive.ScatterAdd` enum, `scatterAdd()` function   |
-| `src/frontend/jvp.ts`        | JVP rule (linear in target + updates)                  |
-| `src/frontend/linearize.ts`  | Transpose rule (gather for updates cotangent)          |
-| `src/frontend/jit.ts`        | `scatter_add` JitStep emission + execution             |
-| `src/frontend/jaxpr.ts`      | `MemoryEffect.Mutate` on target input                  |
-| `src/backend/webgpu.ts`      | `dispatchScatterAdd()` — CAS loop shader               |
-| `src/backend/wasm.ts`        | `dispatchScatterAdd()` — sequential wasmblr loop       |
-| `test/scatter-add.test.ts`   | ~13 tests: basic, multi-dim, grad, JIT, effect checker |
-| `bench/scatter-add.bench.ts` | Throughput benchmarks at 1K/10K/100K elements          |
+| File                                       | Purpose                                                |
+| ------------------------------------------ | ------------------------------------------------------ |
+| `src/frontend/core.ts`                     | `Primitive.ScatterAdd` enum, `scatterAdd()` function   |
+| `src/frontend/jvp.ts`                      | JVP rule (linear in target + updates)                  |
+| `src/frontend/linearize.ts`                | Transpose rule (gather for updates cotangent)          |
+| `src/frontend/jit.ts`                      | `scatter_add` JitStep emission + execution             |
+| `src/frontend/jaxpr.ts`                    | `MemoryEffect.Mutate` on target input                  |
+| `src/backend/webgpu.ts`                    | `dispatchScatterAdd()` — native atomic / CAS shader    |
+| `src/backend/wasm.ts`                      | `dispatchScatterAdd()` — delegates to wasmblr module   |
+| `src/backend/wasm/routines/scatter-add.ts` | Size-specialized wasmblr scatter-add module            |
+| `src/backend/wasm/routine-provider.ts`     | `getScatterAddModule()` — cached module getter         |
+| `test/scatter-add.test.ts`                 | ~13 tests: basic, multi-dim, grad, JIT, effect checker |
+| `bench/scatter-add.bench.ts`               | Throughput benchmarks at 1K/10K/100K elements          |
 
 ## Common pitfalls
 
@@ -1714,6 +1725,9 @@ const [finalCarry, stackedOutputs] = await lax.scan(f, initCarry, xs, options);
 - `checkpoint?: boolean | number` — Control gradient checkpointing for `grad(scan)`. Default
   (undefined/true) uses √N checkpointing. A number specifies the segment size. `false` stores all
   carries (O(N) memory).
+- `isJvpTransformed?: boolean` — (internal) Set by the JVP rule to mark scans produced by
+  differentiating an outer scan. Used by `linearize.ts` PE/transpose rules to detect JVP-doubled
+  scan structure instead of the previous modulo-based heuristic.
 - Fallback Y stacking: the JS fallback scan path preallocates the stacked Y output buffer and writes
   each iteration's Y directly via `copyBufferToBuffer` (4-byte aligned) or the WGSL copy shader
   (unaligned). This avoids stack overflow on long scans and reduces O(length) intermediate arrays
@@ -1889,19 +1903,16 @@ executes the body program per iteration. This works correctly but lacks optimiza
 The fallback `executeScan()` path is backend-agnostic and tested with CPU/WASM/WebGPU, so WebGL
 should work identically. To verify manually, run website demos in a WebGL-capable browser.
 
-**WASM `copyBufferToBuffer` Support:**
+**`copyBufferToBuffer` (required on all backends):**
 
-The WASM backend implements `copyBufferToBuffer` using `Uint8Array.copyWithin` on the main WASM
-memory buffer. This allows `scan-executor.ts` to stack `xs` slices and `ys` outputs during fallback
-execution without allocating temporary TypedArrays, significantly reducing GC pressure.
+`copyBufferToBuffer` is a required method on the `Backend` interface. All backends implement it:
 
-> **When is copyBufferToBuffer used?**  
-> WASM supports `compiled-loop` for almost all scan patterns, so the fallback path is rarely hit in
-> production. However, `copyBufferToBuffer` is critical for:
->
-> 1.  Debugging: When fallback scan is forced (e.g., via backend capability mocking).
-> 2.  Reliability: Ensuring a working fallback exists for any future unsupported pattern.
-> 3.  Completeness: Fulfilling the `Backend` interface contract.
+- **WASM:** `Uint8Array.copyWithin` on the main WASM memory buffer.
+- **WebGPU:** `GPUCommandEncoder.copyBufferToBuffer` (aligned) or WGSL copy shader (unaligned).
+- **WebGL:** Read-patch-reupload via `readPixels` + `texSubImage2D`.
+- **CPU:** Direct `Uint8Array.set` on the backing buffer.
+
+`scan-executor.ts` calls `backend.copyBufferToBuffer()` directly — no optional check or fallback.
 
 ---
 
@@ -2731,16 +2742,6 @@ correctly since each buffer is typed independently.
 
 These are not bugs but areas where the implementation uses pragmatic shortcuts that future
 contributors should be aware of:
-
-- **JVP detection heuristic:** `linearize.ts` uses `numCarry % 2 === 0 && numY % 2 === 0` to detect
-  JVP-transformed scans during partial evaluation and transposition. This works because JVP always
-  doubles carries/outputs, and this code only runs during autodiff. However, it could theoretically
-  misclassify a user scan with even counts. Consider adding an explicit `isJvpTransformed` flag to
-  `ScanParams` if this causes issues.
-
-- **`_yTreedef` side-channel:** In `lax-scan.ts`, the Y treedef is stashed on the `flatF` function
-  object via `(flatF as any)._yTreedef = yTreedef`. This is invisible to TypeScript and could be
-  replaced with a closure variable.
 
 - **Fallback Y stacking:** The `executeScanFallback()` in `scan-executor.ts` handles Y stacking via
   `copySliceToBuffer`. Both the JIT-path and non-JIT `Primitive.Scan` impl use the same
@@ -4576,7 +4577,7 @@ Decisions made during development that future agents should understand:
 | M7.3 per-j indexed internal buffers             | Each worker sees `internal[idx] + j * internalSizes[idx]` — non-overlapping regions prevent races. Parallel path allocates `internalSize * N`, monolithic allocates `internalSize`                                   |
 | WASM compiled scan polymorphic length           | Length as runtime i32 param (arg 0); `NativeScanGeneralParams` no longer contains `length`; dispatch prepends length to args; `dimBindings` resolution uses `args[numConsts]`                                        |
 | Mega-module rejects pass-through                | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes                                                                                               |
-| `scatterAdd` not in public API                  | Not exported from `src/index.ts`; bench/test import from `src/frontend/core` directly. Add to public API when stable                                                                                                 |
+| `scatterAdd` exported from public API           | Exported from `src/index.ts` as of the tech debt audit. Bench files still import from `src/frontend/core` for `DType` enums.                                                                                         |
 | M6.2 extracted-functions design                 | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension.                                       |
 | Module Workers (`type: "module"`)               | Deno doesn't support classic blob-URL workers; module workers work in both Deno and Chromium. Applied to both `worker-pool.ts` and `orchestrator.ts`.                                                                |
 | SAB constructability over `crossOriginIsolated` | `try { new SharedArrayBuffer(1) }` works in Deno (native SAB) and browsers (with COOP/COEP); `crossOriginIsolated` is browser-only and false in Deno.                                                                |

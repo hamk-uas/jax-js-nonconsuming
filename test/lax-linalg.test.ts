@@ -481,12 +481,9 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       // Verify gradient is finite and non-zero
       const dAData = dA.js() as number[][];
       for (const row of dAData)
-        for (const v of row)
-          expect(Math.abs(v)).toBeLessThan(100);
+        for (const v of row) expect(Math.abs(v)).toBeLessThan(100);
       // At least one entry should be non-zero
-      const maxAbs = Math.max(
-        ...dAData.flat().map((v) => Math.abs(v)),
-      );
+      const maxAbs = Math.max(...dAData.flat().map((v) => Math.abs(v)));
       expect(maxAbs).toBeGreaterThan(1e-6);
     });
 

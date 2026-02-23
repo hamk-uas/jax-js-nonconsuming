@@ -199,8 +199,8 @@ export interface Backend {
   /** Read a range of bytes from a buffer, blocking variant. */
   readSync(slot: Slot, start?: number, count?: number): Uint8Array<ArrayBuffer>;
 
-  /** Copy bytes between two device buffers. Optional — not all backends need it. */
-  copyBufferToBuffer?(
+  /** Copy bytes between two device buffers. */
+  copyBufferToBuffer(
     src: Slot,
     srcOffset: number,
     dst: Slot,
