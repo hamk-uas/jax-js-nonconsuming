@@ -194,11 +194,11 @@ export const pad = core.pad as (
 
 /**
  * @function
- * Return the number of dimensions of an array. Does not consume array reference.
+ * Return the number of dimensions of an array.
  */
 export const ndim = core.ndim as (x: ArrayLike) => number;
 
-/** @function Return the shape of an array. Does not consume array reference. */
+/** @function Return the shape of an array. */
 export const shape = core.getShape as (x: ArrayLike) => number[];
 
 /**
@@ -231,7 +231,6 @@ export const fullLike = fullLikeTracer as (
 
 /**
  * Return the number of elements in an array, optionally along an axis.
- * Does not consume array reference.
  */
 export function size(a: ArrayLike, axis?: number): number {
   const s = shape(a);

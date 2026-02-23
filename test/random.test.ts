@@ -421,26 +421,23 @@ suite.each(devices)("device:%s", (device) => {
       expect(variance).toBeCloseTo(Math.PI ** 2 / 6, 1);
     });
 
-    if (device === "cpu" || device === "wasm") {
-      // TODO: cholesky not yet supported on webgpu
-      test("multivariate normal distribution", () => {
-        using key = random.key(42);
-        const count = 5000;
-        using mean = np.array([1.0, 2.0]);
-        using cov = np.array([
-          [1.0, 0.5],
-          [0.5, 2.0],
-        ]);
-        using y = random.multivariateNormal(key, mean, cov, [count]);
-        expect(y.shape).toEqual([count, 2]);
+    test("multivariate normal distribution", () => {
+      using key = random.key(42);
+      const count = 5000;
+      using mean = np.array([1.0, 2.0]);
+      using cov = np.array([
+        [1.0, 0.5],
+        [0.5, 2.0],
+      ]);
+      using y = random.multivariateNormal(key, mean, cov, [count]);
+      expect(y.shape).toEqual([count, 2]);
 
-        using meanResult = np.mean(y, 0);
-        expect(meanResult).toBeAllclose(mean, { atol: 3e-2 });
-        using covResult = np.cov(y, null, { rowvar: false });
-        expect(covResult).toBeAllclose(cov, {
-          atol: 3e-2,
-        });
+      using meanResult = np.mean(y, 0);
+      expect(meanResult).toBeAllclose(mean, { atol: 3e-2 });
+      using covResult = np.cov(y, null, { rowvar: false });
+      expect(covResult).toBeAllclose(cov, {
+        atol: 3e-2,
       });
-    }
+    });
   });
 });
