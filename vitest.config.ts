@@ -34,12 +34,14 @@ export default defineConfig({
   },
   // SharedArrayBuffer + Worker features (M5 WasmWorkerPool, M6.2b
   // OrchestratorWorker) require crossOriginIsolated in Chromium, which needs
-  // COOP + COEP response headers.  Unfortunately those headers break vitest's
-  // iframe-based test runner — the test page never connects back.  No
-  // Chromium flag combination can bypass this.  Therefore SAB features are
-  // tested exclusively via the Deno test suite (`pnpm run test:deno`), which
-  // has native SharedArrayBuffer support.  The vitest suite exercises all
-  // non-parallel WASM paths.
+  // COOP + COEP response headers.  Vitest browser mode supports these via
+  // server.headers since vitest-dev/vitest#4890 (Vitest ≥1.2).
+  server: {
+    headers: {
+      "Cross-Origin-Embedder-Policy": "require-corp",
+      "Cross-Origin-Opener-Policy": "same-origin",
+    },
+  },
   test: {
     watch: false, // Run once and exit, don't wait for 'q'
     browser: {

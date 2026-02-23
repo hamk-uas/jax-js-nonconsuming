@@ -161,6 +161,23 @@ export class WasmBackend implements Backend {
   /** Cache WebAssembly instances keyed by module for reuse in dispatch. */
   #instanceCache: WeakMap<WebAssembly.Module, WebAssembly.Instance>;
   /**
+   * Whether this thread can spin-wait for Workers to complete.
+   *
+   * On browser main threads, `Atomics.wait` is forbidden (throws TypeError)
+   * and — critically — `postMessage` delivery to Worker threads requires the
+   * main thread's event loop to process the message.  A tight `Atomics.load`
+   * spin-loop blocks the event loop, so the Worker never receives the message,
+   * causing deadlock.  This affects **all** browser engines (Chrome, Firefox,
+   * Safari) running on the main thread.
+   *
+   * On Deno and Node.js, `Atomics.wait` works on the main thread and message
+   * delivery is independent of the event loop, so spin-waits work correctly.
+   *
+   * We detect this by probing `Atomics.wait` — if it throws, we're on a
+   * browser main thread where spin-wait Worker patterns are broken.
+   */
+  #canSpinWaitWorkers: boolean;
+  /**
    * Worker pool for parallel kernel dispatch (only when shared memory).
    * Created lazily on first parallel dispatch to avoid spawning Workers
    * when they are never needed (most tests use arrays < PARALLEL_THRESHOLD).
@@ -188,16 +205,37 @@ export class WasmBackend implements Backend {
     this.#nextSlot = 1;
     this.#buffers = new Map();
     this.#instanceCache = new WeakMap();
+
+    // Probe whether spin-wait Worker patterns work on this thread.
+    // Atomics.wait throws on browser main threads — use that as a proxy.
+    this.#canSpinWaitWorkers = (() => {
+      if (!shared) return false;
+      try {
+        const probe = new Int32Array(new SharedArrayBuffer(4));
+        // value !== 0, so returns "not-equal" immediately (no actual wait)
+        Atomics.wait(probe, 0, 1, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    })();
     // Workers/orchestrator are created lazily — see #getWorkerPool(), #getOrchestrator().
   }
 
   /**
    * Lazily create or return the WasmWorkerPool.
-   * Returns null when SharedArrayBuffer or Workers are unavailable.
+   * Returns null when SharedArrayBuffer, Workers, or main-thread spin-waits
+   * are unavailable (browsers forbid Atomics.wait on the main thread, and
+   * postMessage delivery to Workers requires the event loop to process —
+   * a main-thread spin-loop prevents message delivery, causing deadlock).
    */
   #getWorkerPool(): WasmWorkerPool | null {
     if (this.#workerPool !== undefined) return this.#workerPool;
-    if (!this.capabilities.sharedMemory || typeof Worker === "undefined") {
+    if (
+      !this.capabilities.sharedMemory ||
+      typeof Worker === "undefined" ||
+      !this.#canSpinWaitWorkers
+    ) {
       this.#workerPool = null;
       return null;
     }
@@ -212,11 +250,16 @@ export class WasmBackend implements Backend {
 
   /**
    * Lazily create or return the OrchestratorWorker.
-   * Returns null when SharedArrayBuffer or Workers are unavailable.
+   * Returns null when SharedArrayBuffer, Workers, or main-thread spin-waits
+   * are unavailable (see #getWorkerPool comment for rationale).
    */
   #getOrchestrator(): OrchestratorWorker | null {
     if (this.#orchestrator !== undefined) return this.#orchestrator;
-    if (!this.capabilities.sharedMemory || typeof Worker === "undefined") {
+    if (
+      !this.capabilities.sharedMemory ||
+      typeof Worker === "undefined" ||
+      !this.#canSpinWaitWorkers
+    ) {
       this.#orchestrator = null;
       return null;
     }
@@ -236,6 +279,11 @@ export class WasmBackend implements Backend {
   /** The orchestrator worker, if available. Exposed for testing. */
   get orchestrator(): OrchestratorWorker | null {
     return this.#orchestrator ?? null;
+  }
+
+  /** Whether spin-wait Worker patterns work on this thread. Exposed for testing. */
+  get canSpinWaitWorkers(): boolean {
+    return this.#canSpinWaitWorkers;
   }
 
   /**
@@ -1324,7 +1372,11 @@ export class WasmBackend implements Backend {
    * is deferred to {@link registerMegaModuleOnPool}.
    */
   shouldUseParallelMegaModule(megaModule: WasmMegaModule): boolean {
-    if (!this.capabilities.sharedMemory || typeof Worker === "undefined") {
+    if (
+      !this.capabilities.sharedMemory ||
+      typeof Worker === "undefined" ||
+      !this.#canSpinWaitWorkers
+    ) {
       return false;
     }
     return megaModule.stepInfos.some(

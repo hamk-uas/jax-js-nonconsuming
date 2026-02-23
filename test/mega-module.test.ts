@@ -561,7 +561,22 @@ describe("extracted kernel functions (M6.2a)", () => {
 // M6.2b: Orchestrator worker (off-main-thread mega-module execution)
 // ---------------------------------------------------------------------------
 
-describe.skipIf(!globalThis.crossOriginIsolated)(
+// Orchestrator tests require both SharedArrayBuffer (crossOriginIsolated) AND
+// main-thread spin-wait support (Atomics.wait must not throw).  Browser main
+// threads forbid Atomics.wait and don't deliver postMessage during spin-loops,
+// so the orchestrator can only work in Deno/Node.js.
+const canSpinWait = (() => {
+  try {
+    if (!globalThis.crossOriginIsolated) return false;
+    const probe = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(probe, 0, 1, 0); // value !== 0 → returns "not-equal" immediately
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+describe.skipIf(!canSpinWait)(
   "orchestrator worker (M6.2b)",
   () => {
     beforeAll(async () => {

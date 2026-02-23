@@ -1292,20 +1292,36 @@ address) crosses the postMessage boundary.
   `try { new SharedArrayBuffer(1).byteLength === 1 } catch { false }` instead of
   `crossOriginIsolated`. This works in Deno (native SAB support) and browsers (with COOP/COEP
   headers).
-- **PostMessage-based wake:** The worker uses pure `postMessage`/`onmessage` protocol (no
-  `Atomics.wait` on the main thread). The main thread creates a `Promise` per dispatch and resolves
-  it when the worker posts `{type: "done"}`.
+- **Spin-wait synchronization:** Both `registerModuleSync()` and `dispatch()` use
+  `Atomics.load`-based spin-wait on the main thread. The worker side uses `Atomics.wait` to block
+  until work arrives. This design requires the main thread to be able to spin without blocking
+  message delivery — see the browser limitation below.
 
-**SharedArrayBuffer testing limitation:**
+**Browser main-thread spin-wait limitation:**
 
-Vitest's browser mode uses iframes to isolate tests. Setting COOP+COEP headers (required for
-`crossOriginIsolated=true` in browsers) breaks the iframe communication — tests hang indefinitely.
-This is a fundamental Vitest limitation, not a jax-js bug. Consequently:
+On browser main threads, `postMessage` to Worker threads is **not delivered** while the main thread
+is in a synchronous spin-loop — the event loop must yield for message delivery. This means
+Atomics-based spin-wait patterns (used by both `OrchestratorWorker` and `WasmWorkerPool`) deadlock
+on browser main threads. This does NOT affect Deno or Node.js, where message delivery is independent
+of the event loop.
+
+`WasmBackend` detects this at construction time via an **`Atomics.wait` probe**: calling
+`Atomics.wait(probe, 0, 1, 0)` throws `TypeError` on browser main threads (per spec) but succeeds in
+Deno/Node.js. The result is stored in `#canSpinWaitWorkers`. When `false`, the backend skips
+orchestrator and worker pool creation entirely, falling back to direct (main-thread) mega-module
+execution.
+
+**COOP/COEP headers** are enabled in `vitest.config.ts` via `server.headers` (supported since Vitest
+≥1.2, [vitest-dev/vitest#4890](https://github.com/vitest-dev/vitest/issues/4890)). This makes
+`crossOriginIsolated === true` and `SharedArrayBuffer` constructable in Chromium browser tests.
+However, orchestrator/worker pool tests remain skipped in Vitest because the spin-wait deadlock is a
+fundamental browser limitation, not a Vitest bug.
 
 - **Vitest tests** (`test/mega-module.test.ts`): 8 orchestrator tests use
-  `describe.skipIf(!globalThis.crossOriginIsolated)` — always skipped in Vitest.
+  `describe.skipIf(!canSpinWait)` — skipped because `Atomics.wait` is unavailable on browser main
+  threads.
 - **Deno tests** (`test/deno/orchestrator.test.ts`): 17 tests exercise the full orchestrator +
-  worker pool. Deno has native `SharedArrayBuffer` support without COOP/COEP headers.
+  worker pool. Deno supports `Atomics.wait` on the main thread.
 
 **Worker cleanup:** `WasmBackend.destroyWorkers()` terminates both the orchestrator worker and the
 worker pool. Called in `test/setup.ts` `afterAll` hook to prevent worker threads from keeping the
@@ -3159,12 +3175,13 @@ rebuild, and compare.
 
 ### Vitest benchmarks (M8.1)
 
-Three Vitest benchmark files in `bench/` measure key subsystems:
+Four Vitest benchmark files in `bench/` measure key subsystems:
 
 ```bash
 pnpm build && pnpm vitest bench bench/mega-module.bench.ts
 pnpm build && pnpm vitest bench bench/scatter-add.bench.ts
 pnpm build && pnpm vitest bench bench/associative-scan.bench.ts
+pnpm build && pnpm vitest bench bench/parallel-wasm.bench.ts
 ```
 
 | File                              | Benchmarks | What it measures                                                        |
@@ -3172,6 +3189,9 @@ pnpm build && pnpm vitest bench bench/associative-scan.bench.ts
 | `bench/mega-module.bench.ts`      | 7          | Mega-module vs step-by-step: chains, multi-output, reduce, grad, matmul |
 | `bench/scatter-add.bench.ts`      | 3          | `scatterAdd` throughput at 1K/10K/100K elements                         |
 | `bench/associative-scan.bench.ts` | 6          | `associativeScan` vs sequential `scan` for cumsum/cumprod               |
+| `bench/parallel-wasm.bench.ts`    | 7          | Large elementwise baseline + polymorphic JIT (`dynamic_axes`)           |
+
+Results are saved to `docs/ULTIMATE-BENCHMARKS.md`.
 
 **Import notes:**
 
@@ -4543,22 +4563,22 @@ These details are frequently lost when conversation context is summarized:
 
 Decisions made during development that future agents should understand:
 
-| Decision                                        | Rationale                                                                                                                                                                          |
-| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Non-consuming ownership model                   | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting                                                                                             |
-| Concrete compilation + symbolic cache           | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                                                                                                 |
-| `effectDrivenAllocate` over two-pass            | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect                                                                                            |
-| Direct LU→triSolve gradient path                | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                                                                                             |
-| `transposeJaxprCache` is cache-owned            | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`                                                                                                   |
-| `invariance` ≠ `strict` ESLint config           | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                                                                               |
-| WASM `(start, end, ...ptrs)` signature          | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                                                                                         |
-| WASM compiled Kogge-Stone (assocScan)           | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan`                                                            |
-| M7.3 per-j indexed internal buffers             | Each worker sees `internal[idx] + j * internalSizes[idx]` — non-overlapping regions prevent races. Parallel path allocates `internalSize * N`, monolithic allocates `internalSize` |
-| WASM compiled scan polymorphic length           | Length as runtime i32 param (arg 0); `NativeScanGeneralParams` no longer contains `length`; dispatch prepends length to args; `dimBindings` resolution uses `args[numConsts]`      |
-| Mega-module rejects pass-through                | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes                                                             |
-| `scatterAdd` not in public API                  | Not exported from `src/index.ts`; bench/test import from `src/frontend/core` directly. Add to public API when stable                                                               |
-| M6.2 extracted-functions design                 | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension.     |
-| Module Workers (`type: "module"`)               | Deno doesn't support classic blob-URL workers; module workers work in both Deno and Chromium. Applied to both `worker-pool.ts` and `orchestrator.ts`.                              |
-| SAB constructability over `crossOriginIsolated` | `try { new SharedArrayBuffer(1) }` works in Deno (native SAB) and browsers (with COOP/COEP); `crossOriginIsolated` is browser-only and false in Deno.                              |
-| Vitest SAB tests skipped, Deno covers           | COOP+COEP headers break Vitest's iframe runner. Orchestrator/worker pool features tested exclusively via Deno. 8 Vitest tests skip, 17 Deno tests cover.                           |
-| M7.3 lazy registration + monolithic fallback    | First call with N ≥ PARALLEL_THRESHOLD (4096): `pool.registerModule()` async + monolithic fallback. Subsequent: `pool.isModuleReady()` → parallel. Same pattern as mega-module.    |
+| Decision                                        | Rationale                                                                                                                                                                                                            |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Non-consuming ownership model                   | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting                                                                                                                               |
+| Concrete compilation + symbolic cache           | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                                                                                                                                   |
+| `effectDrivenAllocate` over two-pass            | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect                                                                                                                              |
+| Direct LU→triSolve gradient path                | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                                                                                                                               |
+| `transposeJaxprCache` is cache-owned            | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`                                                                                                                                     |
+| `invariance` ≠ `strict` ESLint config           | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                                                                                                                 |
+| WASM `(start, end, ...ptrs)` signature          | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                                                                                                                           |
+| WASM compiled Kogge-Stone (assocScan)           | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan`                                                                                              |
+| M7.3 per-j indexed internal buffers             | Each worker sees `internal[idx] + j * internalSizes[idx]` — non-overlapping regions prevent races. Parallel path allocates `internalSize * N`, monolithic allocates `internalSize`                                   |
+| WASM compiled scan polymorphic length           | Length as runtime i32 param (arg 0); `NativeScanGeneralParams` no longer contains `length`; dispatch prepends length to args; `dimBindings` resolution uses `args[numConsts]`                                        |
+| Mega-module rejects pass-through                | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes                                                                                               |
+| `scatterAdd` not in public API                  | Not exported from `src/index.ts`; bench/test import from `src/frontend/core` directly. Add to public API when stable                                                                                                 |
+| M6.2 extracted-functions design                 | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension.                                       |
+| Module Workers (`type: "module"`)               | Deno doesn't support classic blob-URL workers; module workers work in both Deno and Chromium. Applied to both `worker-pool.ts` and `orchestrator.ts`.                                                                |
+| SAB constructability over `crossOriginIsolated` | `try { new SharedArrayBuffer(1) }` works in Deno (native SAB) and browsers (with COOP/COEP); `crossOriginIsolated` is browser-only and false in Deno.                                                                |
+| Vitest SAB tests skipped, Deno covers           | Browser main threads can't spin-wait (blocks Worker message delivery). COOP/COEP headers enabled in vitest.config.ts, but orchestrator/pool skip via `Atomics.wait` probe. 8 Vitest tests skip, 17 Deno tests cover. |
+| M7.3 lazy registration + monolithic fallback    | First call with N ≥ PARALLEL_THRESHOLD (4096): `pool.registerModule()` async + monolithic fallback. Subsequent: `pool.isModuleReady()` → parallel. Same pattern as mega-module.                                      |
