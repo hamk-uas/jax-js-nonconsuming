@@ -4277,30 +4277,30 @@ M0–M8 with dependency graph, code sketches, and test plans.
 
 ## Milestone Status
 
-| Milestone | Title                         | Status          | Notes                                                                      |
-| --------- | ----------------------------- | --------------- | -------------------------------------------------------------------------- |
-| M0.1      | Record baseline tests         | **DONE**        | `tmp/m0-*` baseline files captured                                         |
-| M0.2      | Hardware feature detection    | **DONE**        | `BackendCapabilities` interface in `src/backend.ts`                        |
-| M1.1      | `ScanBackwardArtifact` type   | **DONE**        | `ScanPullbackArtifact.run()` encapsulates backward pass                    |
-| M1.2      | Unify `vjpFlat` transposition | **DONE**        | `jaxprNeedsCallTimeTranspose` fully removed                                |
-| M2.1      | `scatter_add` IR & AD rules   | **DONE**        | `Primitive.ScatterAdd` with JVP + transpose rules                          |
-| M2.2      | WebGPU CAS loop shader        | **DONE**        | `dispatchScatterAdd()` in `webgpu.ts`                                      |
-| M2.3      | WASM sequential scatter       | **DONE**        | `dispatchScatterAdd()` in `wasm.ts`                                        |
-| M3.1      | Multi-output `Kernel`         | **DONE**        | `KernelOutput[]`, `Kernel.single()`, multi-output codegen                  |
-| M3.2      | Epilogue fusion chain walk    | **DONE**        | Already implemented; verified via `stepCounts()` tests                     |
-| M4.1      | `SymDim` & shape propagation  | **DONE**        | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`                           |
-| M4.2      | Parameterized backend codegen | **DONE**        | Symbolic reduction sizes, `dynamicParams` layout, mega-module rejection    |
-| M5.1      | SharedArrayBuffer memory pool | **DONE**        | Shared memory when SAB constructable (Deno native, browser COOP/COEP)      |
-| M5.2      | WasmWorkerPool                | **DONE**        | Atomics-based sync dispatch via Web Workers                                |
-| M5.3      | Kernel signature + dispatch   | **DONE**        | `(start, end, ...ptrs)` + parallel dispatch wiring                         |
-| M6.1      | Mega-Module                   | **DONE**        | `compileToMegaModule()`, single WASM call, 16 tests                        |
-| M6.2a     | Extract kernel functions      | **DONE**        | Extracted WASM functions per kernel, 10 tests                              |
-| M6.2b     | Orchestrator worker           | **DONE**        | Off-main-thread mega-module via Web Worker, 12 Deno tests                  |
-| M6.2c     | Parallel kernel dispatch      | **DONE**        | JS-driven step execution, workers dispatch large kernels, 5 Deno tests     |
-| M7.1      | `Primitive.AssociativeScan`   | **DONE**        | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests                      |
-| M7.2      | WASM compiled Kogge-Stone     | **DONE**        | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests                   |
-| M7.3      | Multithreaded Kogge-Stone     | **DONE**        | Parallel `kernel` export + `WasmWorkerPool`, per-j internals, 5 Deno tests |
-| M8        | Cleanup & benchmarking        | **In Progress** | M8.1 benchmarks ✅, M8.2 dead code audit ✅, M8.3 docs in progress         |
+| Milestone | Title                         | Status   | Notes                                                                      |
+| --------- | ----------------------------- | -------- | -------------------------------------------------------------------------- |
+| M0.1      | Record baseline tests         | **DONE** | `tmp/m0-*` baseline files captured                                         |
+| M0.2      | Hardware feature detection    | **DONE** | `BackendCapabilities` interface in `src/backend.ts`                        |
+| M1.1      | `ScanBackwardArtifact` type   | **DONE** | `ScanPullbackArtifact.run()` encapsulates backward pass                    |
+| M1.2      | Unify `vjpFlat` transposition | **DONE** | `jaxprNeedsCallTimeTranspose` fully removed                                |
+| M2.1      | `scatter_add` IR & AD rules   | **DONE** | `Primitive.ScatterAdd` with JVP + transpose rules                          |
+| M2.2      | WebGPU CAS loop shader        | **DONE** | `dispatchScatterAdd()` in `webgpu.ts`                                      |
+| M2.3      | WASM sequential scatter       | **DONE** | `dispatchScatterAdd()` in `wasm.ts`                                        |
+| M3.1      | Multi-output `Kernel`         | **DONE** | `KernelOutput[]`, `Kernel.single()`, multi-output codegen                  |
+| M3.2      | Epilogue fusion chain walk    | **DONE** | Already implemented; verified via `stepCounts()` tests                     |
+| M4.1      | `SymDim` & shape propagation  | **DONE** | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`                           |
+| M4.2      | Parameterized backend codegen | **DONE** | Symbolic reduction sizes, `dynamicParams` layout, mega-module rejection    |
+| M5.1      | SharedArrayBuffer memory pool | **DONE** | Shared memory when SAB constructable (Deno native, browser COOP/COEP)      |
+| M5.2      | WasmWorkerPool                | **DONE** | Atomics-based sync dispatch via Web Workers                                |
+| M5.3      | Kernel signature + dispatch   | **DONE** | `(start, end, ...ptrs)` + parallel dispatch wiring                         |
+| M6.1      | Mega-Module                   | **DONE** | `compileToMegaModule()`, single WASM call, 16 tests                        |
+| M6.2a     | Extract kernel functions      | **DONE** | Extracted WASM functions per kernel, 10 tests                              |
+| M6.2b     | Orchestrator worker           | **DONE** | Off-main-thread mega-module via Web Worker, 12 Deno tests                  |
+| M6.2c     | Parallel kernel dispatch      | **DONE** | JS-driven step execution, workers dispatch large kernels, 5 Deno tests     |
+| M7.1      | `Primitive.AssociativeScan`   | **DONE** | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests                      |
+| M7.2      | WASM compiled Kogge-Stone     | **DONE** | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests                   |
+| M7.3      | Multithreaded Kogge-Stone     | **DONE** | Parallel `kernel` export + `WasmWorkerPool`, per-j internals, 5 Deno tests |
+| M8        | Cleanup & benchmarking        | **DONE** | M8.1 benchmarks ✅, M8.2 dead code audit ✅, M8.3 final regression ✅      |
 
 ## Dependency Graph (Simplified)
 
@@ -4312,14 +4312,12 @@ M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
         └──→ M5 ✅ ──→ M6.2a ✅ ──→ M6.2b ✅ ──→ M6.2c ✅
                        M7.1 ✅ ──→ M7.2 ✅ ──→ M7.3 ✅
                                                   ↓
-                                            M8 (cleanup) ❌
+                                            M8 (cleanup) ✅
 ```
 
 ## Next Available Milestones
 
-Per the dependency graph, the only remaining milestone is:
-
-1. **M8** — Cleanup & benchmarking (remaining: M8.3 final docs)
+All milestones M0–M8 are complete. The ULTIMATE-ARCHITECTURE-PLAN is fully implemented.
 
 ---
 
