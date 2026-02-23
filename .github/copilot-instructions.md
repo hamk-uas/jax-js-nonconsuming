@@ -1054,29 +1054,101 @@ The JIT system lives in `src/frontend/jit.ts` and `src/frontend/jaxpr.ts`.
 | --------------------------------- | ------------ | ------------------------------------------ |
 | `Jaxpr`, `JaxprEqn`, `Var`, `Lit` | `jaxpr.ts`   | IR nodes and bindings                      |
 | `JitProgram`, `JitStep`           | `jit.ts`     | Compiled program + step types              |
-| `Kernel`                          | `alu.ts`     | Fused single-output kernel                 |
+| `Kernel`                          | `alu.ts`     | Fused kernel (single- or multi-output)     |
 | `Routine`                         | `routine.ts` | Backend-specific op (sort, cholesky, etc.) |
 
 **JitStep types:**
 
-| Type      | Purpose                                                                 |
-| --------- | ----------------------------------------------------------------------- |
-| `execute` | Dispatch a `Kernel` or `Routine` with inputs→outputs                    |
-| `malloc`  | Allocate a buffer                                                       |
-| `incref`  | Increment refcount on a slot                                            |
-| `free`    | Decrement refcount on a slot                                            |
-| `recycle` | Reuse a freed buffer for a new allocation (zero backend cost)           |
-| `scan`    | Scan loop (fallback, compiled-loop, or preencoded-routine via ScanPlan) |
-| `dus`     | Zero-copy DynamicUpdateSlice (copies src into dst at byte offset)       |
+| Type          | Purpose                                                                 |
+| ------------- | ----------------------------------------------------------------------- |
+| `execute`     | Dispatch a `Kernel` or `Routine` with inputs→outputs                    |
+| `malloc`      | Allocate a buffer                                                       |
+| `incref`      | Increment refcount on a slot                                            |
+| `free`        | Decrement refcount on a slot                                            |
+| `recycle`     | Reuse a freed buffer for a new allocation (zero backend cost)           |
+| `scan`        | Scan loop (fallback, compiled-loop, or preencoded-routine via ScanPlan) |
+| `dus`         | Zero-copy DynamicUpdateSlice (copies src into dst at byte offset)       |
+| `scatter_add` | Scatter-add: accumulate updates into target at indices                  |
+| `assoc_scan`  | Associative scan (Kogge-Stone prefix)                                   |
 
-**Kernel class:**
+**Kernel class (multi-output):**
 
-The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
+The `Kernel` class supports single- and multi-output kernels. It uses a private constructor; callers
+use factory methods:
 
-- `kernel.dtype` — dtype of the output
-- `kernel.size` — number of elements
-- `kernel.exp` — the ALU expression tree
-- `kernel.reduction` — optional reduction operation
+- `Kernel.single(nargs, size, exp, reduction?)` — creates a single-output kernel
+- `Kernel.multi(nargs, size, outputDescs)` — creates a multi-output kernel where `outputDescs` is
+  `{ exp: AluExp; reduction?: Reduction }[]`
+
+Key interface:
+
+```typescript
+interface KernelOutput {
+  readonly exp: AluExp;
+  readonly reduction?: Reduction;
+  readonly dtype: DType;
+  readonly bytes: SizeExpr;
+}
+```
+
+| Property/Accessor      | Type             | Description                               |
+| ---------------------- | ---------------- | ----------------------------------------- |
+| `kernel.outputs`       | `KernelOutput[]` | All outputs                               |
+| `kernel.numOutputs`    | `number`         | Number of outputs                         |
+| `kernel.isMultiOutput` | `boolean`        | `outputs.length > 1`                      |
+| `kernel.hasReduction`  | `boolean`        | Any output has a reduction                |
+| `kernel.size`          | `SizeExpr`       | Element count (may be symbolic)           |
+| `kernel.nargs`         | `number`         | Number of input buffer arguments          |
+| `kernel.dtypeAt(i)`    | `DType`          | Dtype of output `i`                       |
+| `kernel.totalBytes`    | `number`         | Sum of all outputs' bytes (concrete only) |
+| `kernel.isSymbolic`    | `boolean`        | Size is a `SymbolicSize`                  |
+
+### Multi-output kernel fusion
+
+Multiple independent elementwise outputs that share the same input set and size are fused into a
+single multi-output kernel dispatch. The JIT compiler batches pending kernel entries and groups them
+by `sizeExprKey(size) + ":" + inputArgs.join(",")`. Groups with >1 entry become `Kernel.multi()`
+calls. Reduction kernels always emit solo (can't be multi-output).
+
+A single `"execute"` JitStep is emitted with one source `Kernel` and multiple output JitIds. The
+backend dispatches one kernel invocation that writes to all output buffers.
+
+**Codegen:**
+
+- **WASM** (`codegenWasmMulti`): Single `gidx` loop iterates over all outputs sequentially per
+  element. Each output gets its own expression evaluation and store. Supports reductions per output
+  independently.
+- **WebGPU** (`pipelineSourceMulti`): Single WGSL shader with one `read_write` storage binding per
+  output (`result0`, `result1`, ...). CSE is shared across all output expressions — common
+  subexpressions between outputs are computed once.
+
+Backend capability: `multiOutputKernel: true` (WebGPU and WASM).
+
+### Epilogue fusion
+
+A **reduction epilogue** is a chain of elementwise ops downstream of a reduction that can be fused
+into the reduction kernel's output expression. `splitGraphDataflow()` identifies these chains:
+
+1. For each reduction primitive (`Reduce`, `Dot`, `Conv`, `PoolTranspose`), walk forward through the
+   graph from its output.
+2. At each step, check if the consumer is **single-use** and is a fusable op:
+   - **Always fusable**: unary ops (`Neg`, `Reciprocal`, `Floor`, `Ceil`, `Cast`, `Sin`, `Cos`,
+     `Exp`, `Log`, `Erf`, `Sqrt`, etc.)
+   - **Conditionally fusable**: binary ops (`Add`, `Mul`, etc.) only if the other input is a `Lit`
+     or an array that doesn't enlarge via broadcasting
+   - **Conditionally fusable**: `Where` — all non-chain inputs must be literals or same-shape
+3. Mark the chain as `reductionEpilogueEqns`. The final node becomes the `reductionEndpointEqn` (the
+   single black node dispatched as one kernel).
+4. Multi-use stops the chain — if the reduction output is used by ≥2 consumers, no fusion occurs.
+
+**Example:** `matmul(x, w).add(bias).relu()` → 1 dispatch (matmul+bias+relu fused).
+
+**Verification:** `JitProgram.stepCounts()` returns a `JitStepCounts` object with per-step-type
+counts. Tests use `expect(program.stepCounts().execute).toBe(1)` to verify fusion reduced dispatch
+count.
+
+**Key test file:** `test/multi-kernel.test.ts` — ~27 tests covering multi-output fusion, epilogue
+fusion correctness, dispatch count verification, and grad through multi-output kernels.
 
 **Adding a new primitive:**
 
@@ -1358,8 +1430,12 @@ sound buffer recycling decisions — including zero-copy DUS — without heurist
 | `Mutate`  | In-place modification (requires exclusive ownership of the input slot) |
 
 **`primitiveInputEffects` table:** Per-primitive overrides for input effects. Returns an array of
-effects for the primitive's inputs, or `undefined` for the default (all `Borrow`). Currently only
-`DynamicUpdateSlice` has an override — its first input (dst) is `Mutate`.
+effects for the primitive's inputs, or `undefined` for the default (all `Borrow`). Two primitives
+have overrides:
+
+- `DynamicUpdateSlice` — first input (dst) is `Mutate`
+- `ScatterAdd` — first input (target) is `Mutate`; remaining inputs (`indices`, `updates`) are
+  `Borrow`
 
 **`verifyJaxprEffects()` — static borrow checker:** Walks the Jaxpr and enforces:
 
@@ -1377,18 +1453,91 @@ via `test/effect-checker.test.ts`).
 **How effects drive buffer recycling:**
 
 The `effectDrivenAllocate()` method in `JitProgramBuilder` uses effect annotations to identify
-recycling opportunities. For DUS specifically, the `Mutate` effect on the dst input tells the
-allocator that dst's buffer is exclusively owned and can be reused as the output slot — enabling
-zero-copy `copyBufferToBuffer` within the same allocation. Without the effect annotation, the
-allocator would conservatively allocate a new buffer for the output.
+recycling opportunities. For both DUS and `ScatterAdd`, the `Mutate` effect on the first input tells
+the allocator that the buffer is exclusively owned and can be reused as the output slot — enabling
+zero-copy within the same allocation. Without the effect annotation, the allocator would
+conservatively allocate a new buffer for the output.
 
 **Key files:**
 
-| File                          | Purpose                                                |
-| ----------------------------- | ------------------------------------------------------ |
-| `src/frontend/jaxpr.ts`       | `MemoryEffect` enum, `primitiveInputEffects`, verifier |
-| `src/frontend/jit.ts`         | `effectDrivenAllocate()`, DUS JitStep emission         |
-| `test/effect-checker.test.ts` | 23 tests: effect annotations, verifier, DUS zero-copy  |
+| File                          | Purpose                                                          |
+| ----------------------------- | ---------------------------------------------------------------- |
+| `src/frontend/jaxpr.ts`       | `MemoryEffect` enum, `primitiveInputEffects`, verifier           |
+| `src/frontend/jit.ts`         | `effectDrivenAllocate()`, DUS/ScatterAdd JitStep emission        |
+| `test/effect-checker.test.ts` | 23 tests: effect annotations, verifier, DUS/ScatterAdd recycling |
+
+## Scatter-add primitive
+
+`scatterAdd(target, indices, updates, axis)` accumulates `updates` into `target` at positions given
+by `indices` along the specified axis. Multiple updates to the same index are summed (order is
+unspecified for floating-point).
+
+**Semantics:**
+
+```
+output = copy(target)
+for each index i in indices:
+  output[indices[i]] += updates[i]   // along axis
+```
+
+**Primitive:** `Primitive.ScatterAdd` with params `{ axis: number }`. Registered in
+`specialBlackPrimitives` — always materialized as a non-kernel black node in `splitGraphDataflow`.
+
+**JitStep type:** `"scatter_add"` with fields: `target`, `indices`, `updates`, `output`, `axis`,
+`targetShape`, `updatesLen`, `dtype`. At execution time, if `targetSlot !== outSlot` the target is
+copied first, then the scatter-add dispatch accumulates updates in-place into the output buffer.
+
+### Backend implementations
+
+**WebGPU — Compare-and-Swap (CAS) loop:**
+
+`dispatchScatterAdd()` in `webgpu.ts` uses an atomic CAS loop for floating-point scatter-add because
+WGSL has no native `atomicAdd` for `f32`. The output buffer is declared as `array<atomic<u32>>`, and
+the shader performs:
+
+```wgsl
+loop {
+  let old_bits = atomicLoad(&output[outFlat]);
+  let old_val = bitcast<f32>(old_bits);
+  let new_val = old_val + update_val;
+  let new_bits = bitcast<u32>(new_val);
+  let r = atomicCompareExchangeWeak(&output[outFlat], old_bits, new_bits);
+  if r.exchanged { break; }
+}
+```
+
+For integer dtypes, native `atomicAdd` is used directly. The shader parallelizes across all update
+elements with a 3D index decomposition: `(outerSize, updatesLen, innerSize)` derived from `axis`.
+
+**WASM — Sequential scatter:**
+
+`dispatchScatterAdd()` in `wasm.ts` generates a sequential triple-nested loop
+`(outerSize × updatesLen × innerSize)` via wasmblr. Each iteration computes
+`output[outer * targetAxisLen * innerSize + idx * innerSize + inner] += updates[...]`. Sequential
+execution means no atomics needed.
+
+### Autodiff rules
+
+| Rule      | Implementation                                                                |
+| --------- | ----------------------------------------------------------------------------- |
+| **JVP**   | Linear: tangent = `scatterAdd(dTarget, indices, dUpdates, axis)`              |
+| **Trans** | ∂target = cotangent (identity), ∂indices = null, ∂updates = `gather(ct, idx)` |
+
+The transpose rule for updates uses a `gather` operation to extract the relevant cotangent slices.
+
+### Key files
+
+| File                         | Purpose                                                |
+| ---------------------------- | ------------------------------------------------------ |
+| `src/frontend/core.ts`       | `Primitive.ScatterAdd` enum, `scatterAdd()` function   |
+| `src/frontend/jvp.ts`        | JVP rule (linear in target + updates)                  |
+| `src/frontend/linearize.ts`  | Transpose rule (gather for updates cotangent)          |
+| `src/frontend/jit.ts`        | `scatter_add` JitStep emission + execution             |
+| `src/frontend/jaxpr.ts`      | `MemoryEffect.Mutate` on target input                  |
+| `src/backend/webgpu.ts`      | `dispatchScatterAdd()` — CAS loop shader               |
+| `src/backend/wasm.ts`        | `dispatchScatterAdd()` — sequential wasmblr loop       |
+| `test/scatter-add.test.ts`   | ~13 tests: basic, multi-dim, grad, JIT, effect checker |
+| `bench/scatter-add.bench.ts` | Throughput benchmarks at 1K/10K/100K elements          |
 
 ## Common pitfalls
 
