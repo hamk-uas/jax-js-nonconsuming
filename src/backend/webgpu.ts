@@ -3179,21 +3179,52 @@ function assocScanFusedShaderSource(
 
     emit(`// Step ${stepIdx}`);
 
+    // After tuneNullopt, the expression uses AluOp.Special("gidx") for the
+    // output element index. In the fused scan shader, `gidx` is the scan
+    // position (thread ID). We must rewrite Special("gidx") → Special("eidx")
+    // so the expression indexes the per-position output element, not the scan
+    // position. `substitute()` only matches AluOp.Variable — it won't touch
+    // AluOp.Special nodes. Use `rewrite()` instead.
+    const eidxVar = AluExp.special(DType.Int32, "eidx", kernelSize);
+    const rewriteGidxToEidx = (exp: AluExp): AluExp =>
+      exp.rewrite((node) => {
+        if (node.op === AluOp.Special) {
+          const name = Array.isArray(node.arg) ? node.arg[0] : node.arg;
+          if (name === "gidx") return eidxVar;
+        }
+      });
+
     const re = kernel.outputs[0].reduction;
     if (re) {
-      // Reduction kernel
+      // Reduction kernel — must iterate over output elements (eidx)
+      // just like elementwise kernels. Each output element has its own
+      // reduction accumulator. For kernelSize=1 (scalar reduction) the
+      // loop body runs once; for kernelSize>1 (e.g. matmul output) it
+      // runs once per output element.
       const accTy = dtypeToWgsl(re.dtype, true);
       const redSize =
         typeof tune.size.reduce === "number"
           ? tune.size.reduce
           : (re.concreteHint ?? Number(tune.size.reduce));
-      emit(`{`);
-      emit(pushIndent);
+
+      const substExp = rewriteGidxToEidx(tune.exp);
+      const substEpilogue = rewriteGidxToEidx(tune.epilogue!);
+
+      if (kernelSize > 1) {
+        emit(
+          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+          pushIndent,
+        );
+      } else {
+        emit(`{`);
+        emit(pushIndent);
+        emit(`let eidx: i32 = 0;`);
+      }
       emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
       emit(`for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`, pushIndent);
 
       const expCode = genAssocScanExpression(
-        tune.exp,
+        substExp,
         dtype,
         numConsts,
         numLeaves,
@@ -3211,14 +3242,14 @@ function assocScanFusedShaderSource(
       emit(popIndent, "}");
 
       const epilogueCode = genAssocScanExpression(
-        tune.epilogue!,
+        substEpilogue,
         dtype,
         numConsts,
         numLeaves,
         leafElemCounts,
         internalElemCounts,
       );
-      emit(`internal_${step.outputInternalIdx}[0] = ${epilogueCode};`);
+      emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueCode};`);
       emit(popIndent, "}");
     } else {
       // Elementwise kernel — iterate over sub-elements
@@ -3226,10 +3257,7 @@ function assocScanFusedShaderSource(
         emit(`for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`);
         emit(pushIndent);
 
-        // Substitute gidx → eidx for sub-element access
-        const substExp = tune.exp.substitute({
-          gidx: AluExp.special(DType.Int32, "eidx", kernelSize),
-        });
+        const substExp = rewriteGidxToEidx(tune.exp);
         const expCode = genAssocScanExpression(
           substExp,
           dtype,

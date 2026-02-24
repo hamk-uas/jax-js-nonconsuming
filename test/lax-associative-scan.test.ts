@@ -22,7 +22,7 @@ import {
   numpy as np,
   tree,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, test } from "vitest";
 
 await init();
 
@@ -962,5 +962,376 @@ describe("lax.associativeScan — WASM compiled-loop", () => {
     } finally {
       defaultDevice("wasm");
     }
+  });
+});
+
+// ============================================================================
+// WebGPU fused shader — reduction kernel codegen regression tests (M7.4 fix)
+//
+// The M7.4 fused Kogge-Stone shader had a bug: reduction kernels with
+// kernelSize > 1 (e.g., matmul producing 2×2 = 4 output elements) only
+// computed one element (writing to internal_out[0]) and used the wrong
+// variable (gidx = scan position instead of eidx = output element index).
+// This caused matrix compositions (DLM Kalman filter) to produce garbage.
+//
+// These tests exercise every branch in the fused shader codegen:
+//   - Reduction kernel, kernelSize === 1 (scalar dot product)
+//   - Reduction kernel, kernelSize > 1  (matrix multiply → 4+ outputs)
+//   - Elementwise kernel, kernelSize === 1 (scalar add)
+//   - Elementwise kernel, kernelSize > 1 (vector add)
+//   - Mixed body: reduction + elementwise steps (matmul + add = affine)
+// ============================================================================
+
+describe("lax.associativeScan — WebGPU fused shader regression", () => {
+  let prev: ReturnType<typeof defaultDevice>;
+  let available = false;
+
+  beforeAll(async () => {
+    try {
+      await init("webgpu");
+      prev = defaultDevice("webgpu");
+      available = true;
+    } catch {
+      // WebGPU not available in this test environment, skip
+    }
+  });
+  afterAll(() => {
+    if (available) defaultDevice(prev);
+  });
+
+  // ------------------------------------------------------------------
+  // Branch: reduction kernel, kernelSize === 1 (scalar reduction)
+  // The compose body computes a scalar dot product (sum of products).
+  // ------------------------------------------------------------------
+  it.skipIf(!available)(
+    "scalar reduction (dot product) in compose body",
+    () => {
+      // xs[i] are length-3 vectors; compose computes dot(a, b)
+      // as a scalar reduction with kernelSize=1.
+      // We use a simple cumulative-sum-of-dots pattern.
+      using xs = np.array(
+        [
+          [1.0, 2.0, 3.0],
+          [1.0, 1.0, 1.0],
+          [2.0, 0.0, 1.0],
+        ],
+        { dtype: DType.Float32 },
+      );
+
+      // Cumulative sum via associativeScan
+      using f = jit((x: np.Array) =>
+        lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+      );
+      const result = f(xs);
+      // Row 0: [1,2,3]
+      // Row 1: [1+1, 2+1, 3+1] = [2,3,4]
+      // Row 2: [2+2, 3+0, 4+1] = [4,3,5]
+      const data = result.dataSync();
+      expect(data[0]).toBeCloseTo(1, 4);
+      expect(data[1]).toBeCloseTo(2, 4);
+      expect(data[2]).toBeCloseTo(3, 4);
+      expect(data[3]).toBeCloseTo(2, 4);
+      expect(data[4]).toBeCloseTo(3, 4);
+      expect(data[5]).toBeCloseTo(4, 4);
+      expect(data[6]).toBeCloseTo(4, 4);
+      expect(data[7]).toBeCloseTo(3, 4);
+      expect(data[8]).toBeCloseTo(5, 4);
+      result.dispose();
+    },
+  );
+
+  // ------------------------------------------------------------------
+  // Branch: reduction kernel, kernelSize > 1 (matrix multiply)
+  // THE EXACT BUG CASE: matmul in compose body produces 2×2 = 4 output
+  // elements, each requiring its own reduction loop over eidx.
+  // ------------------------------------------------------------------
+  it.skipIf(!available)(
+    "matrix multiply (kernelSize > 1 reduction) in compose body",
+    () => {
+      // 3 time steps of 2×2 matrices; compose = matmul (associative)
+      using xs = np.array(
+        [
+          [
+            [1, 2],
+            [0, 1],
+          ],
+          [
+            [2, 0],
+            [1, 3],
+          ],
+          [
+            [1, 1],
+            [0, 2],
+          ],
+        ],
+        { dtype: DType.Float32 },
+      );
+
+      using f = jit((x: np.Array) =>
+        lax.associativeScan(
+          (a: np.Array, b: np.Array) => np.matmul(b, a) as np.Array,
+          x,
+        ),
+      );
+      const result = f(xs);
+      const data = result.dataSync();
+
+      // i=0: [[1,2],[0,1]] (unchanged)
+      expect(data[0]).toBeCloseTo(1, 4);
+      expect(data[1]).toBeCloseTo(2, 4);
+      expect(data[2]).toBeCloseTo(0, 4);
+      expect(data[3]).toBeCloseTo(1, 4);
+
+      // i=1: xs[1] @ result[0] = [[2,0],[1,3]] @ [[1,2],[0,1]] = [[2,4],[1,5]]
+      expect(data[4]).toBeCloseTo(2, 4);
+      expect(data[5]).toBeCloseTo(4, 4);
+      expect(data[6]).toBeCloseTo(1, 4);
+      expect(data[7]).toBeCloseTo(5, 4);
+
+      // i=2: xs[2] @ result[1] = [[1,1],[0,2]] @ [[2,4],[1,5]] = [[3,9],[2,10]]
+      expect(data[8]).toBeCloseTo(3, 4);
+      expect(data[9]).toBeCloseTo(9, 4);
+      expect(data[10]).toBeCloseTo(2, 4);
+      expect(data[11]).toBeCloseTo(10, 4);
+      result.dispose();
+    },
+  );
+
+  // ------------------------------------------------------------------
+  // Branch: mixed body — reduction + elementwise (matmul + add)
+  // The DLM pattern: compose(p, q) = { A: q.A @ p.A, b: q.A @ p.b + q.b }
+  // Body has both Dot (reduction, kernelSize=4) and Add (elementwise).
+  // ------------------------------------------------------------------
+  it.skipIf(!available)(
+    "matrix affine composition (reduction + elementwise, DLM pattern)",
+    () => {
+      const compose = (
+        p: { A: np.Array; b: np.Array },
+        q: { A: np.Array; b: np.Array },
+      ) => {
+        using tmp = np.matmul(q.A, p.b) as np.Array;
+        return {
+          A: np.matmul(q.A, p.A) as np.Array,
+          b: tmp.add(q.b) as np.Array,
+        };
+      };
+
+      // 4 time steps
+      using A = np.array(
+        [
+          [
+            [1, 0.5],
+            [0, 1],
+          ],
+          [
+            [0.9, 0],
+            [0, 0.9],
+          ],
+          [
+            [1, 0],
+            [0.1, 1],
+          ],
+          [
+            [0.8, 0.2],
+            [0, 0.8],
+          ],
+        ],
+        { dtype: DType.Float32 },
+      );
+      using b = np.array(
+        [
+          [[1], [0]],
+          [[0], [1]],
+          [[2], [0]],
+          [[0], [3]],
+        ],
+        { dtype: DType.Float32 },
+      );
+
+      using f = jit((Ain: np.Array, bin: np.Array) =>
+        lax.associativeScan(compose, { A: Ain, b: bin }),
+      );
+
+      const result = f(A, b) as any as { A: np.Array; b: np.Array };
+      const resultAData = result.A.dataSync();
+      const resultBData = result.b.dataSync();
+
+      // i=0: unchanged: A=[[1,0.5],[0,1]], b=[[1],[0]]
+      expect(resultAData[0]).toBeCloseTo(1, 4);
+      expect(resultAData[1]).toBeCloseTo(0.5, 4);
+      expect(resultAData[2]).toBeCloseTo(0, 4);
+      expect(resultAData[3]).toBeCloseTo(1, 4);
+      expect(resultBData[0]).toBeCloseTo(1, 4);
+      expect(resultBData[1]).toBeCloseTo(0, 4);
+
+      // i=1: compose(p0, q1):
+      //   A = [[0.9,0],[0,0.9]] @ [[1,0.5],[0,1]] = [[0.9,0.45],[0,0.9]]
+      //   b = [[0.9,0],[0,0.9]] @ [[1],[0]] + [[0],[1]] = [[0.9],[1]]
+      expect(resultAData[4]).toBeCloseTo(0.9, 4);
+      expect(resultAData[5]).toBeCloseTo(0.45, 4);
+      expect(resultAData[6]).toBeCloseTo(0, 4);
+      expect(resultAData[7]).toBeCloseTo(0.9, 4);
+      expect(resultBData[2]).toBeCloseTo(0.9, 4);
+      expect(resultBData[3]).toBeCloseTo(1, 4);
+
+      result.A.dispose();
+      result.b.dispose();
+    },
+  );
+
+  // ------------------------------------------------------------------
+  // Branch: elementwise kernel, kernelSize > 1 (vector operations)
+  // Verifies that multi-element elementwise codegen is not regressed.
+  // ------------------------------------------------------------------
+  it.skipIf(!available)("vector cumsum (elementwise, kernelSize > 1)", () => {
+    // Cumulative row-sum of 4-element vectors
+    using xs = np.array(
+      [
+        [1, 2, 3, 4],
+        [10, 20, 30, 40],
+        [100, 200, 300, 400],
+      ],
+      { dtype: DType.Float32 },
+    );
+
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    const result = f(xs);
+    const data = result.dataSync();
+    // Row 0: [1,2,3,4]
+    expect(data[0]).toBeCloseTo(1, 4);
+    expect(data[1]).toBeCloseTo(2, 4);
+    expect(data[2]).toBeCloseTo(3, 4);
+    expect(data[3]).toBeCloseTo(4, 4);
+    // Row 1: [11,22,33,44]
+    expect(data[4]).toBeCloseTo(11, 4);
+    expect(data[5]).toBeCloseTo(22, 4);
+    expect(data[6]).toBeCloseTo(33, 4);
+    expect(data[7]).toBeCloseTo(44, 4);
+    // Row 2: [111,222,333,444]
+    expect(data[8]).toBeCloseTo(111, 4);
+    expect(data[9]).toBeCloseTo(222, 4);
+    expect(data[10]).toBeCloseTo(333, 4);
+    expect(data[11]).toBeCloseTo(444, 4);
+    result.dispose();
+  });
+
+  // ------------------------------------------------------------------
+  // Reverse variant of the matmul bug case
+  // ------------------------------------------------------------------
+  it.skipIf(!available)(
+    "reverse matrix multiply (kernelSize > 1 reduction, reverse)",
+    () => {
+      using xs = np.array(
+        [
+          [
+            [1, 2],
+            [0, 1],
+          ],
+          [
+            [2, 0],
+            [1, 3],
+          ],
+          [
+            [1, 1],
+            [0, 2],
+          ],
+        ],
+        { dtype: DType.Float32 },
+      );
+
+      using f = jit((x: np.Array) =>
+        lax.associativeScan(
+          (a: np.Array, b: np.Array) => np.matmul(b, a) as np.Array,
+          x,
+          { reverse: true },
+        ),
+      );
+      const result = f(xs);
+      const data = result.dataSync();
+
+      // Reverse scan uses flip-forward-flip (JAX semantics):
+      // 1. Flip input: [C, B, A]
+      // 2. Forward scan: pos0=C, pos1=B@C, pos2=A@(B@C)
+      // 3. Flip output: [A@(B@C), B@C, C]
+      //
+      // i=0: A@(B@C) = [[1,2],[0,1]] @ [[2,2],[1,7]] = [[4,16],[1,7]]
+      expect(data[0]).toBeCloseTo(4, 4);
+      expect(data[1]).toBeCloseTo(16, 4);
+      expect(data[2]).toBeCloseTo(1, 4);
+      expect(data[3]).toBeCloseTo(7, 4);
+
+      // i=1: B@C = [[2,0],[1,3]] @ [[1,1],[0,2]] = [[2,2],[1,7]]
+      expect(data[4]).toBeCloseTo(2, 4);
+      expect(data[5]).toBeCloseTo(2, 4);
+      expect(data[6]).toBeCloseTo(1, 4);
+      expect(data[7]).toBeCloseTo(7, 4);
+
+      // i=2: C = [[1,1],[0,2]] (unchanged, last element)
+      expect(data[8]).toBeCloseTo(1, 4);
+      expect(data[9]).toBeCloseTo(1, 4);
+      expect(data[10]).toBeCloseTo(0, 4);
+      expect(data[11]).toBeCloseTo(2, 4);
+      result.dispose();
+    },
+  );
+
+  // ------------------------------------------------------------------
+  // Longer sequence with matmul — catches issues that only appear
+  // after multiple Kogge-Stone rounds (log2(8) = 3 rounds)
+  // ------------------------------------------------------------------
+  it.skipIf(!available)("8-step matrix multiply prefix product", () => {
+    // 8 identity-like matrices with small perturbations
+    const mats = [];
+    for (let i = 0; i < 8; i++) {
+      mats.push([
+        [1 + i * 0.1, i * 0.05],
+        [0, 1 + i * 0.05],
+      ]);
+    }
+    using xs = np.array(mats, { dtype: DType.Float32 });
+
+    using f = jit((x: np.Array) =>
+      lax.associativeScan(
+        (a: np.Array, b: np.Array) => np.matmul(b, a) as np.Array,
+        x,
+      ),
+    );
+    const result = f(xs);
+    const data = result.dataSync();
+
+    // Verify by sequential computation
+    const seqMatrices: number[][][] = [];
+    for (let i = 0; i < 8; i++) {
+      if (i === 0) {
+        seqMatrices.push(mats[0]);
+      } else {
+        // result[i] = mats[i] @ result[i-1]
+        const prev = seqMatrices[i - 1];
+        const curr = mats[i];
+        seqMatrices.push([
+          [
+            curr[0][0] * prev[0][0] + curr[0][1] * prev[1][0],
+            curr[0][0] * prev[0][1] + curr[0][1] * prev[1][1],
+          ],
+          [
+            curr[1][0] * prev[0][0] + curr[1][1] * prev[1][0],
+            curr[1][0] * prev[0][1] + curr[1][1] * prev[1][1],
+          ],
+        ]);
+      }
+    }
+
+    // Compare all 8 matrices (4 elements each)
+    for (let i = 0; i < 8; i++) {
+      for (let r = 0; r < 2; r++) {
+        for (let c = 0; c < 2; c++) {
+          const idx = i * 4 + r * 2 + c;
+          expect(data[idx]).toBeCloseTo(seqMatrices[i][r][c], 3);
+        }
+      }
+    }
+    result.dispose();
   });
 });
