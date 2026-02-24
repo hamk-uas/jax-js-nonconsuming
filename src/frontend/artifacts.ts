@@ -5,7 +5,7 @@
  * ownership: each artifact owns exactly the resources it needs, implements
  * `[Symbol.dispose]`, and can be cleaned up deterministically.
  *
- * See AOT-LINEARIZATION-PLAN.md for design rationale and milestone tracking.
+ * See .github/copilot-instructions.md Part 4 (AOT linearization artifacts) for design rationale.
  */
 // jax-js-lint: allow-ref
 

@@ -7,7 +7,7 @@ These notes help AI coding agents be immediately productive. The document has ni
 5. **Associative Scan** — `lax.associativeScan` Kogge-Stone parallel prefix scan
 6. **Linear Algebra Autodiff** — `solve`, `inv`, TriangularSolve JVP fix
 7. **Polymorphic Shapes** — `SymDim`, `dynamic_axes`, symbolic caching
-8. **ULTIMATE-ARCHITECTURE-PLAN Progress** — M0–M8 milestone status
+8. **Completed Architecture & Future Performance Work** — M0–M8 milestone status
 9. **Session Continuity Notes** — build/test workflow, context preservation
 
 ---
@@ -967,7 +967,6 @@ Reductions and transcendentals (`sin`, `cos`, `exp`, `log`, `erf`, etc.) remain 
 | `src/backend/webgpu/codegen.ts`   | `ShaderInfo.sharedMemoryBytes`, `workgroupSize` multi-dim |
 | `src/backend/wasm.ts`             | `canVectorizeSimd`, `translateExpCoreSimd`, SIMD codegen  |
 | `src/backend/wasm/mega-module.ts` | SIMD in `emitExtractedSingleOutputBody`                   |
-| `TUNER-IMPROVEMENT-PLAN.md`       | Detailed plan with design rationale and status tracking   |
 
 ## Routine system
 
@@ -1816,8 +1815,6 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 | `README.md`                       | Main project intro, tutorial, Maintainer Guide | Major features, API changes, releases |
 | `FEATURES.md`                     | JAX/NumPy API compatibility table              | New supported functions               |
 | `.github/copilot-instructions.md` | AI agent onboarding, scan feature tracking     | New patterns, scan development        |
-| `TUNER-IMPROVEMENT-PLAN.md`       | Tuner improvements: design, status, rationale  | Tuner/codegen changes                 |
-| `PERFORMANCE-PLAN.md`             | Follow-up performance work (6 items P1–P6)     | Matmul/conv/SIMD/subgroup changes     |
 | `packages/*/README.md`            | Package-specific docs                          | Package feature changes               |
 
 ## Where to start reading
@@ -4586,56 +4583,60 @@ map otherwise. Used at scan step execution time in `jit.ts` to resolve `step.len
 
 ---
 
-# Part 8: ULTIMATE-ARCHITECTURE-PLAN Progress
+# Part 8: Completed Architecture & Future Performance Work
 
-## Plan Location
+## Completed Architecture Milestones (M0–M8)
 
-`ULTIMATE-ARCHITECTURE-PLAN.md` in the repo root. Contains detailed specifications for milestones
-M0–M8 with dependency graph, code sketches, and test plans.
+All architecture milestones from the original ULTIMATE-ARCHITECTURE-PLAN are complete:
 
-## Milestone Status
+- **M0:** Baseline tests + `BackendCapabilities` hardware detection
+- **M1:** Scan backward AOT (`ScanPullbackArtifact`, unified `vjpFlat` transposition)
+- **M2:** `Primitive.ScatterAdd` — IR, AD rules, WebGPU CAS shader, WASM dispatch
+- **M3:** Multi-output `Kernel` fusion + epilogue fusion chain walk
+- **M4:** Polymorphic shapes (`SymDim`, `dynamic_axes`, parameterized codegen)
+- **M5:** WASM parallel dispatch (`WasmWorkerPool`, SharedArrayBuffer, `(start,end,...ptrs)` sig)
+- **M6:** Mega-module + orchestrator worker + parallel kernel dispatch (M6.1/M6.2a/M6.2b/M6.2c)
+- **M7:** `Primitive.AssociativeScan` + WASM compiled Kogge-Stone + multithreaded dispatch
+  (M7.1–M7.3)
+- **M8:** Benchmark suite, dead code audit, final regression
 
-| Milestone | Title                         | Status   | Notes                                                                      |
-| --------- | ----------------------------- | -------- | -------------------------------------------------------------------------- |
-| M0.1      | Record baseline tests         | **DONE** | `tmp/m0-*` baseline files captured                                         |
-| M0.2      | Hardware feature detection    | **DONE** | `BackendCapabilities` interface in `src/backend.ts`                        |
-| M1.1      | `ScanBackwardArtifact` type   | **DONE** | `ScanPullbackArtifact.run()` encapsulates backward pass                    |
-| M1.2      | Unify `vjpFlat` transposition | **DONE** | `jaxprNeedsCallTimeTranspose` fully removed                                |
-| M2.1      | `scatter_add` IR & AD rules   | **DONE** | `Primitive.ScatterAdd` with JVP + transpose rules                          |
-| M2.2      | WebGPU CAS loop shader        | **DONE** | `dispatchScatterAdd()` in `webgpu.ts`                                      |
-| M2.3      | WASM sequential scatter       | **DONE** | `dispatchScatterAdd()` in `wasm.ts`                                        |
-| M3.1      | Multi-output `Kernel`         | **DONE** | `KernelOutput[]`, `Kernel.single()`, multi-output codegen                  |
-| M3.2      | Epilogue fusion chain walk    | **DONE** | Already implemented; verified via `stepCounts()` tests                     |
-| M4.1      | `SymDim` & shape propagation  | **DONE** | `SymDim`, `Dim`, `dynamic_axes` in `makeJaxpr()`                           |
-| M4.2      | Parameterized backend codegen | **DONE** | Symbolic reduction sizes, `dynamicParams` layout, mega-module rejection    |
-| M5.1      | SharedArrayBuffer memory pool | **DONE** | Shared memory when SAB constructable (Deno native, browser COOP/COEP)      |
-| M5.2      | WasmWorkerPool                | **DONE** | Atomics-based sync dispatch via Web Workers                                |
-| M5.3      | Kernel signature + dispatch   | **DONE** | `(start, end, ...ptrs)` + parallel dispatch wiring                         |
-| M6.1      | Mega-Module                   | **DONE** | `compileToMegaModule()`, single WASM call, 16 tests                        |
-| M6.2a     | Extract kernel functions      | **DONE** | Extracted WASM functions per kernel, 10 tests                              |
-| M6.2b     | Orchestrator worker           | **DONE** | Off-main-thread mega-module via Web Worker, 12 Deno tests                  |
-| M6.2c     | Parallel kernel dispatch      | **DONE** | JS-driven step execution, workers dispatch large kernels, 5 Deno tests     |
-| M7.1      | `Primitive.AssociativeScan`   | **DONE** | Body sub-jaxpr, JVP/PE/transpose/vmap rules, 19 tests                      |
-| M7.2      | WASM compiled Kogge-Stone     | **DONE** | `codegenNativeAssociativeScan()`, polymorphic N, 8 tests                   |
-| M7.3      | Multithreaded Kogge-Stone     | **DONE** | Parallel `kernel` export + `WasmWorkerPool`, per-j internals, 5 Deno tests |
-| M8        | Cleanup & benchmarking        | **DONE** | M8.1 benchmarks ✅, M8.2 dead code audit ✅, M8.3 final regression ✅      |
+Supporting plans (AOT-LINEARIZATION-PLAN, EFFECT-TYPED-IR-PLAN) are also fully implemented —
+artifact types in `src/frontend/artifacts.ts`, `MemoryEffect` enum in `src/frontend/jaxpr.ts`,
+`effectDrivenAllocate` in `src/frontend/jit.ts`.
 
-## Dependency Graph (Simplified)
+## Future Performance Work
 
-```
-M0 ✅ ──┬──→ M1 (scan backward AOT) ✅
-        ├──→ M2 (scatter_add) ✅
-        ├──→ M3.1 (multi-output kernel) ✅ ──→ M3.2 (epilogue fusion) ✅
-        ├──→ M4.1 ✅ ──→ M4.2 ✅ ──→ M6.1 ✅
-        └──→ M5 ✅ ──→ M6.2a ✅ ──→ M6.2b ✅ ──→ M6.2c ✅
-                       M7.1 ✅ ──→ M7.2 ✅ ──→ M7.3 ✅
-                                                  ↓
-                                            M8 (cleanup) ✅
-```
+Performance opportunities ordered by recommended execution sequence. Tiled matmul (P1) is the single
+largest win; benchmark suite (P6) should land first to establish baselines.
 
-## Next Available Milestones
+| ID  | Title                 | Priority | Description                                                                                                                              |
+| --- | --------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| P6  | Benchmark validation  | Medium   | Systematic benchmarks: matmul GFLOP/s, conv2d CNN sizes, SIMD chains, reductions. Extend `bench/matmul.bench.ts`, add conv2d/SIMD/reduce |
+| P1  | Tiled matmul (WebGPU) | **High** | Shared-memory blocking (`var<workgroup>`) for 5–10× matmul speedup. `TILE=16`, 2 KB shared mem. Conv2d benefits automatically via Dot    |
+| P3  | i64 in wasmblr        | Medium   | Native i64 support (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins. Zero browser risk                                         |
+| P2  | Relaxed SIMD FMA      | Medium   | `f32x4.relaxed_madd` for 2× dot-product throughput. Needs runtime detection — Safari doesn't support Relaxed SIMD                        |
+| P4  | Conv2d tuning         | Medium   | Phase 1: benchmark after P1 (tiled matmul gives free improvement). Phase 2 (conditional): specialized WGSL for small kernels (3×3, 5×5)  |
+| P5  | WebGPU subgroups      | Low      | `subgroupAdd()` for 2–4× faster reductions. **Blocked:** spec not stable, Chrome Canary only (Feb 2026). Implement when ≥2 browsers ship |
 
-All milestones M0–M8 are complete. The ULTIMATE-ARCHITECTURE-PLAN is fully implemented.
+**P1 acceptance criteria:** 2048×2048 f32 matmul at ≥40% theoretical GFLOP/s.
+
+**P2 implementation notes:** Peephole pattern `Add(Mul(a,b),c) → relaxed_madd` in
+`translateExpCoreSimd()`. Needs `F32x4.relaxed_madd` in wasmblr (opcode `0xFD 0x00AF`), runtime
+feature detection in `BackendCapabilities`. May differ by 0.5 ULP (acceptable for f32 ML).
+
+**P3 implementation notes:** Add `class I64` in wasmblr.ts, `encodeSigned64` for BigInt LEB128.
+Rewrite Threefry using `i64.rotl` (halves instruction count). Must produce bit-identical random
+streams.
+
+## Tuner Deferred Items
+
+Three tuner improvements were analyzed and deferred:
+
+| Item                        | Status          | Rationale                                                                                                                                             |
+| --------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| InstructionEmitter strategy | Skipped         | Polymorphic scalar/SIMD emitter was over-engineered for current scope; `translateExpCoreSimd()` used instead. Revisit if f64x2 or i32x4 SIMD is added |
+| Subgroups (tuner Imp 6)     | Deferred (= P5) | Same as P5 above — waiting on spec stability                                                                                                          |
+| Bind group caching (Imp 7)  | Partially done  | Pipeline layout caching implemented. Bind group caching skipped — buffer pooling invalidates cache (different `GPUBuffer` identities each call)       |
 
 ---
 
@@ -4644,11 +4645,8 @@ All milestones M0–M8 are complete. The ULTIMATE-ARCHITECTURE-PLAN is fully imp
 ## Before Starting Work
 
 1. **Build first**: Run `pnpm build` before running tests — Vitest imports from `dist/`, not `src/`.
-2. **Check branch**: `git branch` to confirm you're on the right branch (currently
-   `docs/ultimate-architecture-plan`).
-3. **Read the plan**: `ULTIMATE-ARCHITECTURE-PLAN.md` documents the completed M0–M8 milestones (all
-   done). Useful for understanding design rationale and acceptance criteria.
-4. **Check git log**: `git log --oneline -10` to see recent commits and understand context.
+2. **Check branch**: `git branch` to confirm you're on the right branch.
+3. **Check git log**: `git log --oneline -10` to see recent commits and understand context.
 
 ## Key Implementation Patterns
 
@@ -4683,28 +4681,23 @@ pnpm check                    # TypeScript type check
 
 These details are frequently lost when conversation context is summarized:
 
-1. **The M-numbering discrepancy**: Early git commits are labeled M0–M4 but refer to foundational
-   work, NOT the ULTIMATE-ARCHITECTURE-PLAN milestones. The plan's milestones are a separate
-   numbering system. Always check `ULTIMATE-ARCHITECTURE-PLAN.md` for the canonical milestone
-   definitions.
-
-2. **Test imports from `dist/`**: Source edits in `src/` are invisible to Vitest tests until
+1. **Test imports from `dist/`**: Source edits in `src/` are invisible to Vitest tests until
    `pnpm build` runs. This causes confusion when an edit "doesn't work" in tests.
 
-3. **eslint.config.ts structure**: All jax-js rules are `warn` globally; the invariance overlay
+2. **eslint.config.ts structure**: All jax-js rules are `warn` globally; the invariance overlay
    upgrades to `error` for `src/**`, `packages/**`, `test/**`. Internal transform rules
    (`require-retained-release`, `require-try-finally-symmetry`, `require-wrapper-dispose-symmetry`)
    are now in the main config — the separate `lint:ownership:internal` script is no longer needed
    for pre-commit (but is kept for targeted runs).
 
-4. **`_currentDimBindings` is module-level state**: Set/cleared in `jitCompile()` via try/finally.
+3. **`_currentDimBindings` is module-level state**: Set/cleared in `jitCompile()` via try/finally.
    Any new compilation code that reads symbolic dimensions must go through this.
 
-5. **Multi-output kernel access pattern**: `Kernel` has no single-output shims. All call sites
+4. **Multi-output kernel access pattern**: `Kernel` has no single-output shims. All call sites
    access `kernel.outputs[0].exp`, `kernel.outputs[0].reduction`, `kernel.outputs[0].dtype`,
    `kernel.outputs[0].bytes` explicitly. Multi-output paths iterate `kernel.outputs`.
 
-6. **The `no-array-chain` rule is NOT in the `invariance` config** — only in `strict`. The
+5. **The `no-array-chain` rule is NOT in the `invariance` config** — only in `strict`. The
    `invariance` config focuses on ownership correctness (eager/JIT equivalence), not performance
    patterns.
 
