@@ -38,6 +38,7 @@ import {
   add,
   bind,
   broadcast,
+  cast,
   concatenate,
   conv,
   currentTraceLevel,
@@ -1548,6 +1549,10 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       if (result !== prod) prod.dispose();
       return [null, result];
     }
+  },
+  [Primitive.Cast]([ct], [x], { dtype: _dtype }) {
+    if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Cast);
+    return [cast(ct, x.aval.dtype)];
   },
   [Primitive.Neg]([ct], [x]) {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Neg);

@@ -1,4 +1,11 @@
-import { defaultDevice, jit, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import {
+  defaultDevice,
+  DType,
+  grad,
+  jit,
+  jvp,
+  numpy as np,
+} from "@hamk-uas/jax-js-nonconsuming";
 import { beforeEach, expect, suite, test } from "vitest";
 
 beforeEach(() => {
@@ -143,5 +150,65 @@ suite("weak types", () => {
     expect(b.dtype).toBe(np.int32);
     expect(b.weakType).toBe(false);
     expect(b.js()).toEqual(10);
+  });
+});
+
+suite("cast autodiff", () => {
+  test("grad through f32 -> f64 cast", () => {
+    // cast is linear: grad should cast cotangent back to input dtype
+    const f = (x: np.Array) => {
+      using y = x.astype(DType.Float64);
+      return y.sum();
+    };
+    using x = np.array([1.0, 2.0, 3.0]);
+    using gx = grad(f)(x);
+    expect(gx.dtype).toBe(DType.Float32);
+    expect(gx.js()).toEqual([1, 1, 1]);
+  });
+
+  test("grad through f64 -> f32 cast", () => {
+    const f = (x: np.Array) => {
+      using y = x.astype(DType.Float32);
+      return y.sum();
+    };
+    using x = np.array([1.0, 2.0, 3.0], { dtype: DType.Float64 });
+    using gx = grad(f)(x);
+    expect(gx.dtype).toBe(DType.Float64);
+    expect(gx).toBeAllclose([1, 1, 1]);
+  });
+
+  test("jit(grad) through cast", () => {
+    const f = (x: np.Array) => {
+      using y = x.astype(DType.Float64);
+      return y.sum();
+    };
+    using x = np.array([1.0, 2.0, 3.0]);
+    using gx = jit(grad(f))(x);
+    expect(gx.dtype).toBe(DType.Float32);
+    expect(gx.js()).toEqual([1, 1, 1]);
+  });
+
+  test("grad through cast in expression chain", () => {
+    // f(x) = sum(cast(2*x, f64)) → df/dx = 2
+    const f = (x: np.Array) => {
+      using scaled = x.mul(np.array(2.0));
+      using casted = scaled.astype(DType.Float64);
+      return casted.sum();
+    };
+    using x = np.array([1.0, 2.0, 3.0]);
+    using gx = grad(f)(x);
+    expect(gx.dtype).toBe(DType.Float32);
+    expect(gx.js()).toEqual([2, 2, 2]);
+  });
+
+  test("jvp through cast preserves tangent dtype", () => {
+    const f = (x: np.Array) => x.astype(DType.Float64);
+    using x = np.array([1.0, 2.0]);
+    using dx = np.array([1.0, 0.0]);
+    const [y, dy] = jvp(f, [x], [dx]);
+    expect(y.dtype).toBe(DType.Float64);
+    expect(dy.dtype).toBe(DType.Float64);
+    y.dispose();
+    dy.dispose();
   });
 });

@@ -115,365 +115,365 @@ possible._
 Most operations behave the same way as they do in JAX.
 [API docs](https://hamk-uas.github.io/jax-js-nonconsuming/docs/modules/_jax-js_jax.numpy.html).
 
-| API                   | Support | Notes                                        |
-| --------------------- | ------- | -------------------------------------------- |
-| `ndarray.at`          | ⚪️      | Python-specific                              |
-| `abs`                 | 🟢      |                                              |
-| `absolute`            | 🟢      |                                              |
-| `acos`                | 🟢      |                                              |
-| `acosh`               | 🟢      |                                              |
-| `add`                 | 🟢      |                                              |
-| `all`                 | 🟢      |                                              |
-| `allclose`            | 🟡      | no `equal_nan` option                        |
-| `amax`                | ⚪️      | alias of `max`                               |
-| `amin`                | ⚪️      | alias of `min`                               |
-| `angle`               | ⚪️      | complex numbers                              |
-| `any`                 | 🟢      |                                              |
-| `append`              | 🟠      |                                              |
-| `apply_along_axis`    | 🟠      |                                              |
-| `apply_over_axes`     | 🟠      |                                              |
-| `arange`              | 🟢      |                                              |
-| `arccos`              | 🟢      |                                              |
-| `arccosh`             | 🟢      |                                              |
-| `arcsin`              | 🟢      |                                              |
-| `arcsinh`             | 🟢      |                                              |
-| `arctan`              | 🟢      |                                              |
-| `arctan2`             | 🟢      |                                              |
-| `arctanh`             | 🟢      |                                              |
-| `argmax`              | 🟢      |                                              |
-| `argmin`              | 🟢      |                                              |
-| `argpartition`        | 🟠      | sorting                                      |
-| `argsort`             | 🟢      | sorting                                      |
-| `argwhere`            | 🟠      | sorting                                      |
-| `around`              | ⚪️      | alias of `round`                             |
-| `array`               | 🟢      |                                              |
-| `array_equal`         | 🔴      |                                              |
-| `array_equiv`         | 🔴      |                                              |
-| `array_repr`          | 🔴      |                                              |
-| `array_split`         | 🟠      | `split` is supported                         |
-| `array_str`           | 🔴      |                                              |
-| `asarray`             | ⚪️      | alias of `array`                             |
-| `asin`                | 🟢      |                                              |
-| `asinh`               | 🟢      |                                              |
-| `astype`              | 🟢      |                                              |
-| `atan`                | 🟢      |                                              |
-| `atanh`               | 🟢      |                                              |
-| `atan2`               | 🟢      |                                              |
-| `atleast_1d`          | ⚪️      | confusing, use `reshape`                     |
-| `atleast_2d`          | ⚪️      | confusing, use `reshape`                     |
-| `atleast_3d`          | ⚪️      | confusing, use `reshape`                     |
-| `average`             | 🟠      | `mean` is supported                          |
-| `bartlett`            | 🟠      |                                              |
-| `bincount`            | 🟠      |                                              |
-| `bitwise_and`         | 🔴      |                                              |
-| `bitwise_count`       | 🔴      |                                              |
-| `bitwise_invert`      | 🔴      |                                              |
-| `bitwise_left_shift`  | 🔴      |                                              |
-| `bitwise_not`         | 🔴      |                                              |
-| `bitwise_or`          | 🔴      |                                              |
-| `bitwise_right_shift` | 🔴      |                                              |
-| `bitwise_xor`         | 🔴      |                                              |
-| `blackman`            | 🟠      |                                              |
-| `block`               | �       |                                              |
-| `broadcast_arrays`    | 🟢      |                                              |
-| `broadcast_shapes`    | 🟢      |                                              |
-| `broadcast_to`        | 🟢      |                                              |
-| `c_`                  | ⚪️      | Python-specific                              |
-| `can_cast`            | 🟠      |                                              |
-| `cbrt`                | 🟢      |                                              |
-| `ceil`                | 🟢      |                                              |
-| `choose`              | ⚪️      | confusing API                                |
-| `clip`                | 🟢      |                                              |
-| `column_stack`        | 🟢      |                                              |
-| `compress`            | 🔴      |                                              |
-| `concat`              | ⚪️      | use `concatenate`                            |
-| `concatenate`         | 🟢      |                                              |
-| `conj`                | ⚪️      | complex numbers                              |
-| `conjugate`           | ⚪️      | complex numbers                              |
-| `convolve`            | 🟢      | `lax.conv_general_dilated` is supported      |
-| `copy`                | ⚪️      | not needed — operations don't consume inputs |
-| `copysign`            | 🟠      |                                              |
-| `corrcoef`            | 🟢      |                                              |
-| `correlate`           | 🟢      | `lax.conv_general_dilated` is supported      |
-| `cos`                 | 🟢      |                                              |
-| `cosh`                | 🟢      |                                              |
-| `count_nonzero`       | 🟠      |                                              |
-| `cov`                 | 🟢      |                                              |
-| `cross`               | 🟠      |                                              |
-| `cumprod`             | 🟠      |                                              |
-| `cumsum`              | 🟡      | Quadratic-time                               |
-| `cumulative_prod`     | 🟠      |                                              |
-| `cumulative_sum`      | 🟡      | Quadratic-time                               |
-| `deg2rad`             | 🟢      |                                              |
-| `degrees`             | 🟢      |                                              |
-| `delete`              | 🟠      |                                              |
-| `diag`                | 🟢      |                                              |
-| `diag_indices`        | 🟠      |                                              |
-| `diag_indices_from`   | 🟠      |                                              |
-| `diagflat`            | 🟠      |                                              |
-| `diagonal`            | 🟢      |                                              |
-| `diff`                | 🟠      |                                              |
-| `digitize`            | 🟠      |                                              |
-| `divide`              | 🟢      |                                              |
-| `divmod`              | 🟢      |                                              |
-| `dot`                 | 🟢      |                                              |
-| `dsplit`              | 🟠      | `split` is supported                         |
-| `dstack`              | 🟢      |                                              |
-| `dtype`               | ⚪️      | can access `Array.dtype`                     |
-| `ediff1d`             | 🟠      |                                              |
-| `einsum`              | 🟢      | Fast path for batch matmul patterns          |
-| `einsum_path`         | ⚪️      | path is currently private                    |
-| `empty`               | ⚪️      | use `zeros`                                  |
-| `empty_like`          | ⚪️      | use `zeros_like`                             |
-| `equal`               | 🟢      |                                              |
-| `exp`                 | 🟢      |                                              |
-| `exp2`                | 🟢      |                                              |
-| `expand_dims`         | 🟠      |                                              |
-| `expm1`               | 🟡      | implemented as `exp(x)-1`                    |
-| `extract`             | 🔴      |                                              |
-| `eye`                 | 🟢      |                                              |
-| `fabs`                | ⚪️      | use `abs`                                    |
-| `fill_diagonal`       | 🟠      |                                              |
-| `finfo`               | 🟢      |                                              |
-| `fix`                 | ⚪️      | use `trunc`                                  |
-| `flatnonzero`         | 🔴      |                                              |
-| `flip`                | 🟢      |                                              |
-| `fliplr`              | 🟢      |                                              |
-| `flipud`              | 🟢      |                                              |
-| `float_power`         | 🟠      |                                              |
-| `floor`               | 🟢      |                                              |
-| `floor_divide`        | 🟢      |                                              |
-| `fmax`                | 🟠      | use `maximum`                                |
-| `fmin`                | 🟠      | use `minimum`                                |
-| `fmod`                | 🟢      |                                              |
-| `frexp`               | 🟢      |                                              |
-| `frombuffer`          | 🟠      |                                              |
-| `fromfile`            | ⚪️      | Python-specific                              |
-| `fromfunction`        | 🟠      |                                              |
-| `fromiter`            | ⚪️      | Python-specific                              |
-| `frompyfunc`          | ⚪️      | Python-specific                              |
-| `fromstring`          | ⚪️      | Python-specific                              |
-| `from_dlpack`         | ⚪️      | Python-specific                              |
-| `full`                | 🟢      |                                              |
-| `full_like`           | 🟢      |                                              |
-| `gcd`                 | 🔴      |                                              |
-| `geomspace`           | 🟠      |                                              |
-| `get_printoptions`    | ⚪️      | Python-specific                              |
-| `gradient`            | 🟠      |                                              |
-| `greater`             | 🟢      |                                              |
-| `greater_equal`       | 🟢      |                                              |
-| `hamming`             | 🟢      |                                              |
-| `hanning`             | 🟢      |                                              |
-| `heaviside`           | 🟢      |                                              |
-| `histogram`           | 🔴      |                                              |
-| `histogram_bin_edges` | 🔴      |                                              |
-| `histogram2d`         | 🔴      |                                              |
-| `histogramdd`         | 🔴      |                                              |
-| `hsplit`              | 🟠      | `split` is supported                         |
-| `hstack`              | 🟢      |                                              |
-| `hypot`               | 🟡      | implemented as `sqrt(x^2 + y^2)`             |
-| `i0`                  | 🔴      | transcendental                               |
-| `identity`            | 🟢      |                                              |
-| `iinfo`               | 🟢      |                                              |
-| `imag`                | ⚪️      | complex numbers                              |
-| `index_exp`           | ⚪️      | Python-specific                              |
-| `indices`             | 🟠      |                                              |
-| `inner`               | 🟢      |                                              |
-| `insert`              | 🟠      |                                              |
-| `interp`              | 🟠      |                                              |
-| `intersect1d`         | 🔴      | sorting                                      |
-| `invert`              | 🔴      |                                              |
-| `isclose`             | ⚪️      | use `allclose`                               |
-| `iscomplex`           | ⚪️      | complex numbers                              |
-| `iscomplexobj`        | ⚪️      | complex numbers                              |
-| `isdtype`             | 🟠      |                                              |
-| `isfinite`            | 🟢      |                                              |
-| `isin`                | 🔴      |                                              |
-| `isinf`               | 🟢      |                                              |
-| `isnan`               | 🟢      |                                              |
-| `isneginf`            | 🟢      |                                              |
-| `isposinf`            | 🟢      |                                              |
-| `isreal`              | ⚪️      | complex numbers                              |
-| `isrealobj`           | ⚪️      | complex numbers                              |
-| `isscalar`            | 🟠      |                                              |
-| `issubdtype`          | 🟠      |                                              |
-| `iterable`            | ⚪️      | Python-specific                              |
-| `ix_`                 | ⚪️      | Python-specific                              |
-| `kaiser`              | 🔴      | transcendental                               |
-| `kron`                | 🟠      |                                              |
-| `lcm`                 | 🔴      |                                              |
-| `ldexp`               | 🟢      |                                              |
-| `left_shift`          | 🔴      |                                              |
-| `less`                | 🟢      |                                              |
-| `less_equal`          | 🟢      |                                              |
-| `lexsort`             | 🔴      | sorting                                      |
-| `linspace`            | 🟢      |                                              |
-| `load`                | ⚪️      | file I/O                                     |
-| `log`                 | 🟢      |                                              |
-| `log10`               | 🟢      |                                              |
-| `log1p`               | 🟡      | implemented as `log(1+x)`                    |
-| `log2`                | 🟢      |                                              |
-| `logaddexp`           | 🟠      |                                              |
-| `logaddexp2`          | 🟠      |                                              |
-| `logical_and`         | 🟠      |                                              |
-| `logical_not`         | 🟠      |                                              |
-| `logical_or`          | 🟠      |                                              |
-| `logical_xor`         | 🟠      |                                              |
-| `logspace`            | 🟢      |                                              |
-| `mask_indices`        | 🟠      |                                              |
-| `matmul`              | 🟢      | batch broadcasting, 1D vector support        |
-| `matrix_transpose`    | 🟢      |                                              |
-| `matvec`              | 🟠      |                                              |
-| `max`                 | 🟢      |                                              |
-| `maximum`             | 🟢      |                                              |
-| `mean`                | 🟢      |                                              |
-| `median`              | 🟠      | sorting                                      |
-| `meshgrid`            | 🟢      |                                              |
-| `mgrid`               | ⚪️      | Python-specific                              |
-| `min`                 | 🟢      |                                              |
-| `minimum`             | 🟢      |                                              |
-| `mod`                 | ⚪️      | Skipped for clarity, use `remainder()`       |
-| `modf`                | 🟠      |                                              |
-| `moveaxis`            | 🟢      |                                              |
-| `multiply`            | 🟢      |                                              |
-| `nan_to_num`          | 🟢      |                                              |
-| `nanargmax`           | 🟠      |                                              |
-| `nanargmin`           | 🟠      |                                              |
-| `nancumprod`          | 🟠      |                                              |
-| `nancumsum`           | 🟠      |                                              |
-| `nanmax`              | 🟠      |                                              |
-| `nanmean`             | 🟠      |                                              |
-| `nanmedian`           | 🟠      | sorting                                      |
-| `nanmin`              | 🟠      |                                              |
-| `nanpercentile`       | 🟠      | sorting                                      |
-| `nanprod`             | 🟠      |                                              |
-| `nanquantile`         | 🟠      | sorting                                      |
-| `nanstd`              | 🟠      |                                              |
-| `nansum`              | 🟠      |                                              |
-| `nanvar`              | 🟠      |                                              |
-| `ndarray`             | 🟢      | just `Array` in jax-js                       |
-| `ndim`                | 🟢      |                                              |
-| `negative`            | 🟢      |                                              |
-| `nextafter`           | 🔴      |                                              |
-| `nonzero`             | 🔴      |                                              |
-| `not_equal`           | 🟢      |                                              |
-| `ogrid`               | ⚪️      | Python-specific                              |
-| `ones`                | 🟢      |                                              |
-| `ones_like`           | 🟢      |                                              |
-| `outer`               | 🟢      |                                              |
-| `packbits`            | ⚪️      | no uint8 support                             |
-| `pad`                 | 🟢      |                                              |
-| `partition`           | 🟠      | sorting                                      |
-| `percentile`          | 🟠      | sorting                                      |
-| `permute_dims`        | 🟢      |                                              |
-| `piecewise`           | 🔴      | `lax.switch` control flow                    |
-| `place`               | 🔴      |                                              |
-| `poly`                | 🔴      |                                              |
-| `polyadd`             | 🟠      |                                              |
-| `polyder`             | 🟠      |                                              |
-| `polydiv`             | 🔴      |                                              |
-| `polyfit`             | 🔴      |                                              |
-| `polyint`             | 🟠      |                                              |
-| `polymul`             | 🟠      |                                              |
-| `polysub`             | 🟠      |                                              |
-| `polyval`             | 🟠      |                                              |
-| `positive`            | 🟢      |                                              |
-| `pow`                 | 🟢      |                                              |
-| `power`               | 🟢      |                                              |
-| `printoptions`        | ⚪️      | Python-specific                              |
-| `prod`                | 🟢      |                                              |
-| `promote_types`       | 🟢      |                                              |
-| `ptp`                 | 🟢      |                                              |
-| `put`                 | 🟠      |                                              |
-| `put_along_axis`      | 🟠      |                                              |
-| `quantile`            | 🟠      | sorting                                      |
-| `r_`                  | ⚪️      | Python-specific                              |
-| `rad2deg`             | 🟢      |                                              |
-| `radians`             | 🟢      |                                              |
-| `ravel`               | 🟢      |                                              |
-| `ravel_multi_index`   | 🟠      |                                              |
-| `real`                | ⚪️      | complex numbers                              |
-| `reciprocal`          | 🟢      |                                              |
-| `remainder`           | 🟢      |                                              |
-| `repeat`              | 🟢      |                                              |
-| `reshape`             | 🟢      |                                              |
-| `resize`              | 🟠      |                                              |
-| `result_type`         | 🟠      | see `promote_types`                          |
-| `right_shift`         | 🔴      |                                              |
-| `rint`                | 🟠      |                                              |
-| `roll`                | 🟠      |                                              |
-| `rollaxis`            | 🟠      |                                              |
-| `roots`               | 🔴      |                                              |
-| `rot90`               | 🟠      |                                              |
-| `round`               | 🟠      |                                              |
-| `s_`                  | ⚪️      | Python-specific                              |
-| `save`                | ⚪️      | file I/O                                     |
-| `savez`               | ⚪️      | file I/O                                     |
-| `searchsorted`        | 🔴      | sorting                                      |
-| `select`              | 🟠      |                                              |
-| `set_printoptions`    | ⚪️      | Python-specific                              |
-| `setdiff1d`           | ⚪️      | Python-specific                              |
-| `setxor1d`            | ⚪️      | Python-specific                              |
-| `shape`               | 🟢      |                                              |
-| `sign`                | 🟢      |                                              |
-| `signbit`             | 🔴      |                                              |
-| `sin`                 | 🟢      |                                              |
-| `sinc`                | 🟡      | JVP not supported at x=0                     |
-| `sinh`                | 🟢      |                                              |
-| `size`                | 🟢      |                                              |
-| `sort`                | 🟢      | sorting                                      |
-| `sort_complex`        | ⚪️      | complex numbers                              |
-| `spacing`             | 🔴      |                                              |
-| `split`               | 🟢      |                                              |
-| `sqrt`                | 🟢      |                                              |
-| `square`              | 🟢      |                                              |
-| `squeeze`             | 🟢      |                                              |
-| `stack`               | 🟢      |                                              |
-| `std`                 | 🟢      |                                              |
-| `subtract`            | 🟢      |                                              |
-| `sum`                 | 🟢      |                                              |
-| `swapaxes`            | 🟢      |                                              |
-| `take`                | 🟢      |                                              |
-| `take_along_axis`     | 🟠      |                                              |
-| `tan`                 | 🟢      |                                              |
-| `tanh`                | 🟢      |                                              |
-| `tensordot`           | 🟢      |                                              |
-| `tile`                | 🟢      |                                              |
-| `trace`               | 🟢      |                                              |
-| `trapezoid`           | 🟠      |                                              |
-| `transpose`           | 🟢      |                                              |
-| `tri`                 | 🟢      |                                              |
-| `tril`                | 🟢      |                                              |
-| `tril_indices`        | 🟠      |                                              |
-| `tril_indices_from`   | 🟠      |                                              |
-| `trim_zeros`          | 🟠      |                                              |
-| `triu`                | 🟢      |                                              |
-| `triu_indices`        | 🟠      |                                              |
-| `triu_indices_from`   | 🟠      |                                              |
-| `true_divide`         | 🟢      |                                              |
-| `trunc`               | 🟢      |                                              |
-| `ufunc`               | ⚪️      | Python-specific                              |
-| `union1d`             | 🔴      | sorting                                      |
-| `unique`              | 🔴      | sorting                                      |
-| `unique_all`          | 🔴      | sorting                                      |
-| `unique_counts`       | 🔴      | sorting                                      |
-| `unique_inverse`      | 🔴      | sorting                                      |
-| `unique_values`       | 🔴      | sorting                                      |
-| `unpackbits`          | ⚪️      | no uint8 support                             |
-| `unravel_index`       | 🟠      |                                              |
-| `unstack`             | 🟠      |                                              |
-| `unwrap`              | 🔴      |                                              |
-| `vander`              | 🟠      |                                              |
-| `var`                 | 🟢      |                                              |
-| `vdot`                | 🟢      |                                              |
-| `vecdot`              | 🟢      |                                              |
-| `vecmat`              | 🟠      |                                              |
-| `vectorize`           | 🟠      |                                              |
-| `vsplit`              | 🟠      | `split` is supported                         |
-| `vstack`              | 🟢      |                                              |
-| `where`               | 🟢      | AD through condition not yet supported       |
-| `zeros`               | 🟢      |                                              |
-| `zeros_like`          | 🟢      |                                              |
+| API                   | Support | Notes                                                    |
+| --------------------- | ------- | -------------------------------------------------------- |
+| `ndarray.at`          | ⚪️      | Python-specific                                          |
+| `abs`                 | 🟢      |                                                          |
+| `absolute`            | 🟢      |                                                          |
+| `acos`                | 🟢      |                                                          |
+| `acosh`               | 🟢      |                                                          |
+| `add`                 | 🟢      |                                                          |
+| `all`                 | 🟢      |                                                          |
+| `allclose`            | 🟡      | no `equal_nan` option                                    |
+| `amax`                | ⚪️      | alias of `max`                                           |
+| `amin`                | ⚪️      | alias of `min`                                           |
+| `angle`               | ⚪️      | complex numbers                                          |
+| `any`                 | 🟢      |                                                          |
+| `append`              | 🟠      |                                                          |
+| `apply_along_axis`    | 🟠      |                                                          |
+| `apply_over_axes`     | 🟠      |                                                          |
+| `arange`              | 🟢      |                                                          |
+| `arccos`              | 🟢      |                                                          |
+| `arccosh`             | 🟢      |                                                          |
+| `arcsin`              | 🟢      |                                                          |
+| `arcsinh`             | 🟢      |                                                          |
+| `arctan`              | 🟢      |                                                          |
+| `arctan2`             | 🟢      |                                                          |
+| `arctanh`             | 🟢      |                                                          |
+| `argmax`              | 🟢      |                                                          |
+| `argmin`              | 🟢      |                                                          |
+| `argpartition`        | 🟠      | sorting                                                  |
+| `argsort`             | 🟢      | sorting                                                  |
+| `argwhere`            | 🟠      | sorting                                                  |
+| `around`              | ⚪️      | alias of `round`                                         |
+| `array`               | 🟢      |                                                          |
+| `array_equal`         | 🔴      |                                                          |
+| `array_equiv`         | 🔴      |                                                          |
+| `array_repr`          | 🔴      |                                                          |
+| `array_split`         | 🟠      | `split` is supported                                     |
+| `array_str`           | 🔴      |                                                          |
+| `asarray`             | ⚪️      | alias of `array`                                         |
+| `asin`                | 🟢      |                                                          |
+| `asinh`               | 🟢      |                                                          |
+| `astype`              | 🟢      |                                                          |
+| `atan`                | 🟢      |                                                          |
+| `atanh`               | 🟢      |                                                          |
+| `atan2`               | 🟢      |                                                          |
+| `atleast_1d`          | ⚪️      | confusing, use `reshape`                                 |
+| `atleast_2d`          | ⚪️      | confusing, use `reshape`                                 |
+| `atleast_3d`          | ⚪️      | confusing, use `reshape`                                 |
+| `average`             | 🟠      | `mean` is supported                                      |
+| `bartlett`            | 🟠      |                                                          |
+| `bincount`            | 🟠      |                                                          |
+| `bitwise_and`         | 🔴      |                                                          |
+| `bitwise_count`       | 🔴      |                                                          |
+| `bitwise_invert`      | 🔴      |                                                          |
+| `bitwise_left_shift`  | 🔴      |                                                          |
+| `bitwise_not`         | 🔴      |                                                          |
+| `bitwise_or`          | 🔴      |                                                          |
+| `bitwise_right_shift` | 🔴      |                                                          |
+| `bitwise_xor`         | 🔴      |                                                          |
+| `blackman`            | 🟠      |                                                          |
+| `block`               | �       |                                                          |
+| `broadcast_arrays`    | 🟢      |                                                          |
+| `broadcast_shapes`    | 🟢      |                                                          |
+| `broadcast_to`        | 🟢      |                                                          |
+| `c_`                  | ⚪️      | Python-specific                                          |
+| `can_cast`            | 🟠      |                                                          |
+| `cbrt`                | 🟢      |                                                          |
+| `ceil`                | 🟢      |                                                          |
+| `choose`              | ⚪️      | confusing API                                            |
+| `clip`                | 🟢      |                                                          |
+| `column_stack`        | 🟢      |                                                          |
+| `compress`            | 🔴      |                                                          |
+| `concat`              | ⚪️      | use `concatenate`                                        |
+| `concatenate`         | 🟢      |                                                          |
+| `conj`                | ⚪️      | complex numbers                                          |
+| `conjugate`           | ⚪️      | complex numbers                                          |
+| `convolve`            | 🟢      | `lax.conv_general_dilated` is supported                  |
+| `copy`                | ⚪️      | not needed — operations don't consume inputs             |
+| `copysign`            | 🟠      |                                                          |
+| `corrcoef`            | 🟢      |                                                          |
+| `correlate`           | 🟢      | `lax.conv_general_dilated` is supported                  |
+| `cos`                 | 🟢      |                                                          |
+| `cosh`                | 🟢      |                                                          |
+| `count_nonzero`       | 🟠      |                                                          |
+| `cov`                 | 🟢      |                                                          |
+| `cross`               | 🟠      |                                                          |
+| `cumprod`             | 🟠      |                                                          |
+| `cumsum`              | 🟡      | Quadratic-time                                           |
+| `cumulative_prod`     | 🟠      |                                                          |
+| `cumulative_sum`      | 🟡      | Quadratic-time                                           |
+| `deg2rad`             | 🟢      |                                                          |
+| `degrees`             | 🟢      |                                                          |
+| `delete`              | 🟠      |                                                          |
+| `diag`                | 🟢      |                                                          |
+| `diag_indices`        | 🟠      |                                                          |
+| `diag_indices_from`   | 🟠      |                                                          |
+| `diagflat`            | 🟠      |                                                          |
+| `diagonal`            | 🟢      |                                                          |
+| `diff`                | 🟠      |                                                          |
+| `digitize`            | 🟠      |                                                          |
+| `divide`              | 🟢      |                                                          |
+| `divmod`              | 🟢      |                                                          |
+| `dot`                 | 🟢      |                                                          |
+| `dsplit`              | 🟠      | `split` is supported                                     |
+| `dstack`              | 🟢      |                                                          |
+| `dtype`               | ⚪️      | can access `Array.dtype`                                 |
+| `ediff1d`             | 🟠      |                                                          |
+| `einsum`              | 🟢      | Fast path for batch matmul patterns                      |
+| `einsum_path`         | ⚪️      | path is currently private                                |
+| `empty`               | ⚪️      | use `zeros`                                              |
+| `empty_like`          | ⚪️      | use `zeros_like`                                         |
+| `equal`               | 🟢      |                                                          |
+| `exp`                 | 🟢      |                                                          |
+| `exp2`                | 🟢      |                                                          |
+| `expand_dims`         | 🟠      |                                                          |
+| `expm1`               | 🟡      | implemented as `exp(x)-1`                                |
+| `extract`             | 🔴      |                                                          |
+| `eye`                 | 🟢      |                                                          |
+| `fabs`                | ⚪️      | use `abs`                                                |
+| `fill_diagonal`       | 🟠      |                                                          |
+| `finfo`               | 🟢      |                                                          |
+| `fix`                 | ⚪️      | use `trunc`                                              |
+| `flatnonzero`         | 🔴      |                                                          |
+| `flip`                | 🟢      |                                                          |
+| `fliplr`              | 🟢      |                                                          |
+| `flipud`              | 🟢      |                                                          |
+| `float_power`         | 🟠      |                                                          |
+| `floor`               | 🟢      |                                                          |
+| `floor_divide`        | 🟢      |                                                          |
+| `fmax`                | 🟠      | use `maximum`                                            |
+| `fmin`                | 🟠      | use `minimum`                                            |
+| `fmod`                | 🟢      |                                                          |
+| `frexp`               | 🟢      |                                                          |
+| `frombuffer`          | 🟠      |                                                          |
+| `fromfile`            | ⚪️      | Python-specific                                          |
+| `fromfunction`        | 🟠      |                                                          |
+| `fromiter`            | ⚪️      | Python-specific                                          |
+| `frompyfunc`          | ⚪️      | Python-specific                                          |
+| `fromstring`          | ⚪️      | Python-specific                                          |
+| `from_dlpack`         | ⚪️      | Python-specific                                          |
+| `full`                | 🟢      |                                                          |
+| `full_like`           | 🟢      |                                                          |
+| `gcd`                 | 🔴      |                                                          |
+| `geomspace`           | 🟠      |                                                          |
+| `get_printoptions`    | ⚪️      | Python-specific                                          |
+| `gradient`            | 🟠      |                                                          |
+| `greater`             | 🟢      |                                                          |
+| `greater_equal`       | 🟢      |                                                          |
+| `hamming`             | 🟢      |                                                          |
+| `hanning`             | 🟢      |                                                          |
+| `heaviside`           | 🟢      |                                                          |
+| `histogram`           | 🔴      |                                                          |
+| `histogram_bin_edges` | 🔴      |                                                          |
+| `histogram2d`         | 🔴      |                                                          |
+| `histogramdd`         | 🔴      |                                                          |
+| `hsplit`              | 🟠      | `split` is supported                                     |
+| `hstack`              | 🟢      |                                                          |
+| `hypot`               | 🟡      | implemented as `sqrt(x^2 + y^2)`                         |
+| `i0`                  | 🔴      | transcendental                                           |
+| `identity`            | 🟢      |                                                          |
+| `iinfo`               | 🟢      |                                                          |
+| `imag`                | ⚪️      | complex numbers                                          |
+| `index_exp`           | ⚪️      | Python-specific                                          |
+| `indices`             | 🟠      |                                                          |
+| `inner`               | 🟢      |                                                          |
+| `insert`              | 🟠      |                                                          |
+| `interp`              | 🟠      |                                                          |
+| `intersect1d`         | 🔴      | sorting                                                  |
+| `invert`              | 🔴      |                                                          |
+| `isclose`             | ⚪️      | use `allclose`                                           |
+| `iscomplex`           | ⚪️      | complex numbers                                          |
+| `iscomplexobj`        | ⚪️      | complex numbers                                          |
+| `isdtype`             | 🟠      |                                                          |
+| `isfinite`            | 🟢      |                                                          |
+| `isin`                | 🔴      |                                                          |
+| `isinf`               | 🟢      |                                                          |
+| `isnan`               | 🟢      |                                                          |
+| `isneginf`            | 🟢      |                                                          |
+| `isposinf`            | 🟢      |                                                          |
+| `isreal`              | ⚪️      | complex numbers                                          |
+| `isrealobj`           | ⚪️      | complex numbers                                          |
+| `isscalar`            | 🟠      |                                                          |
+| `issubdtype`          | 🟠      |                                                          |
+| `iterable`            | ⚪️      | Python-specific                                          |
+| `ix_`                 | ⚪️      | Python-specific                                          |
+| `kaiser`              | 🔴      | transcendental                                           |
+| `kron`                | 🟠      |                                                          |
+| `lcm`                 | 🔴      |                                                          |
+| `ldexp`               | 🟢      |                                                          |
+| `left_shift`          | 🔴      |                                                          |
+| `less`                | 🟢      |                                                          |
+| `less_equal`          | 🟢      |                                                          |
+| `lexsort`             | 🔴      | sorting                                                  |
+| `linspace`            | 🟢      |                                                          |
+| `load`                | ⚪️      | file I/O                                                 |
+| `log`                 | 🟢      |                                                          |
+| `log10`               | 🟢      |                                                          |
+| `log1p`               | 🟡      | implemented as `log(1+x)`                                |
+| `log2`                | 🟢      |                                                          |
+| `logaddexp`           | 🟠      |                                                          |
+| `logaddexp2`          | 🟠      |                                                          |
+| `logical_and`         | 🟠      |                                                          |
+| `logical_not`         | 🟠      |                                                          |
+| `logical_or`          | 🟠      |                                                          |
+| `logical_xor`         | 🟠      |                                                          |
+| `logspace`            | 🟢      |                                                          |
+| `mask_indices`        | 🟠      |                                                          |
+| `matmul`              | 🟢      | batch broadcasting, 1D vector support                    |
+| `matrix_transpose`    | 🟢      |                                                          |
+| `matvec`              | 🟠      |                                                          |
+| `max`                 | 🟢      |                                                          |
+| `maximum`             | 🟢      |                                                          |
+| `mean`                | 🟢      |                                                          |
+| `median`              | 🟠      | sorting                                                  |
+| `meshgrid`            | 🟢      |                                                          |
+| `mgrid`               | ⚪️      | Python-specific                                          |
+| `min`                 | 🟢      |                                                          |
+| `minimum`             | 🟢      |                                                          |
+| `mod`                 | ⚪️      | Skipped for clarity, use `remainder()`                   |
+| `modf`                | 🟠      |                                                          |
+| `moveaxis`            | 🟢      |                                                          |
+| `multiply`            | 🟢      |                                                          |
+| `nan_to_num`          | 🟢      |                                                          |
+| `nanargmax`           | 🟠      |                                                          |
+| `nanargmin`           | 🟠      |                                                          |
+| `nancumprod`          | 🟠      |                                                          |
+| `nancumsum`           | 🟠      |                                                          |
+| `nanmax`              | 🟠      |                                                          |
+| `nanmean`             | 🟠      |                                                          |
+| `nanmedian`           | 🟠      | sorting                                                  |
+| `nanmin`              | 🟠      |                                                          |
+| `nanpercentile`       | 🟠      | sorting                                                  |
+| `nanprod`             | 🟠      |                                                          |
+| `nanquantile`         | 🟠      | sorting                                                  |
+| `nanstd`              | 🟠      |                                                          |
+| `nansum`              | 🟠      |                                                          |
+| `nanvar`              | 🟠      |                                                          |
+| `ndarray`             | 🟢      | just `Array` in jax-js                                   |
+| `ndim`                | 🟢      |                                                          |
+| `negative`            | 🟢      |                                                          |
+| `nextafter`           | 🔴      |                                                          |
+| `nonzero`             | 🔴      |                                                          |
+| `not_equal`           | 🟢      |                                                          |
+| `ogrid`               | ⚪️      | Python-specific                                          |
+| `ones`                | 🟢      |                                                          |
+| `ones_like`           | 🟢      |                                                          |
+| `outer`               | 🟢      |                                                          |
+| `packbits`            | ⚪️      | no uint8 support                                         |
+| `pad`                 | 🟢      |                                                          |
+| `partition`           | 🟠      | sorting                                                  |
+| `percentile`          | 🟠      | sorting                                                  |
+| `permute_dims`        | 🟢      |                                                          |
+| `piecewise`           | 🔴      | `lax.switch` control flow                                |
+| `place`               | 🔴      |                                                          |
+| `poly`                | 🔴      |                                                          |
+| `polyadd`             | 🟠      |                                                          |
+| `polyder`             | 🟠      |                                                          |
+| `polydiv`             | 🔴      |                                                          |
+| `polyfit`             | 🔴      |                                                          |
+| `polyint`             | 🟠      |                                                          |
+| `polymul`             | 🟠      |                                                          |
+| `polysub`             | 🟠      |                                                          |
+| `polyval`             | 🟠      |                                                          |
+| `positive`            | 🟢      |                                                          |
+| `pow`                 | 🟢      |                                                          |
+| `power`               | 🟢      |                                                          |
+| `printoptions`        | ⚪️      | Python-specific                                          |
+| `prod`                | 🟢      |                                                          |
+| `promote_types`       | 🟢      |                                                          |
+| `ptp`                 | 🟢      |                                                          |
+| `put`                 | 🟠      |                                                          |
+| `put_along_axis`      | 🟠      |                                                          |
+| `quantile`            | 🟠      | sorting                                                  |
+| `r_`                  | ⚪️      | Python-specific                                          |
+| `rad2deg`             | 🟢      |                                                          |
+| `radians`             | 🟢      |                                                          |
+| `ravel`               | 🟢      |                                                          |
+| `ravel_multi_index`   | 🟠      |                                                          |
+| `real`                | ⚪️      | complex numbers                                          |
+| `reciprocal`          | 🟢      |                                                          |
+| `remainder`           | 🟢      |                                                          |
+| `repeat`              | 🟢      |                                                          |
+| `reshape`             | 🟢      |                                                          |
+| `resize`              | 🟠      |                                                          |
+| `result_type`         | 🟠      | see `promote_types`                                      |
+| `right_shift`         | 🔴      |                                                          |
+| `rint`                | 🟠      |                                                          |
+| `roll`                | 🟠      |                                                          |
+| `rollaxis`            | 🟠      |                                                          |
+| `roots`               | 🔴      |                                                          |
+| `rot90`               | 🟠      |                                                          |
+| `round`               | 🟠      |                                                          |
+| `s_`                  | ⚪️      | Python-specific                                          |
+| `save`                | ⚪️      | file I/O                                                 |
+| `savez`               | ⚪️      | file I/O                                                 |
+| `searchsorted`        | 🔴      | sorting                                                  |
+| `select`              | 🟠      |                                                          |
+| `set_printoptions`    | ⚪️      | Python-specific                                          |
+| `setdiff1d`           | ⚪️      | Python-specific                                          |
+| `setxor1d`            | ⚪️      | Python-specific                                          |
+| `shape`               | 🟢      |                                                          |
+| `sign`                | 🟢      |                                                          |
+| `signbit`             | 🔴      |                                                          |
+| `sin`                 | 🟢      |                                                          |
+| `sinc`                | 🟡      | JVP not supported at x=0                                 |
+| `sinh`                | 🟢      |                                                          |
+| `size`                | 🟢      |                                                          |
+| `sort`                | 🟢      | sorting                                                  |
+| `sort_complex`        | ⚪️      | complex numbers                                          |
+| `spacing`             | 🔴      |                                                          |
+| `split`               | 🟢      |                                                          |
+| `sqrt`                | 🟢      |                                                          |
+| `square`              | 🟢      |                                                          |
+| `squeeze`             | 🟢      |                                                          |
+| `stack`               | 🟢      |                                                          |
+| `std`                 | 🟢      |                                                          |
+| `subtract`            | 🟢      |                                                          |
+| `sum`                 | 🟢      |                                                          |
+| `swapaxes`            | 🟢      |                                                          |
+| `take`                | 🟢      |                                                          |
+| `take_along_axis`     | 🟠      |                                                          |
+| `tan`                 | 🟢      |                                                          |
+| `tanh`                | 🟢      |                                                          |
+| `tensordot`           | 🟢      |                                                          |
+| `tile`                | 🟢      |                                                          |
+| `trace`               | 🟢      |                                                          |
+| `trapezoid`           | 🟠      |                                                          |
+| `transpose`           | 🟢      |                                                          |
+| `tri`                 | 🟢      |                                                          |
+| `tril`                | 🟢      |                                                          |
+| `tril_indices`        | 🟠      |                                                          |
+| `tril_indices_from`   | 🟠      |                                                          |
+| `trim_zeros`          | 🟠      |                                                          |
+| `triu`                | 🟢      |                                                          |
+| `triu_indices`        | 🟠      |                                                          |
+| `triu_indices_from`   | 🟠      |                                                          |
+| `true_divide`         | 🟢      |                                                          |
+| `trunc`               | 🟢      |                                                          |
+| `ufunc`               | ⚪️      | Python-specific                                          |
+| `union1d`             | 🔴      | sorting                                                  |
+| `unique`              | 🔴      | sorting                                                  |
+| `unique_all`          | 🔴      | sorting                                                  |
+| `unique_counts`       | 🔴      | sorting                                                  |
+| `unique_inverse`      | 🔴      | sorting                                                  |
+| `unique_values`       | 🔴      | sorting                                                  |
+| `unpackbits`          | ⚪️      | no uint8 support                                         |
+| `unravel_index`       | 🟠      |                                                          |
+| `unstack`             | 🟠      |                                                          |
+| `unwrap`              | 🔴      |                                                          |
+| `vander`              | 🟠      |                                                          |
+| `var`                 | 🟢      |                                                          |
+| `vdot`                | 🟢      |                                                          |
+| `vecdot`              | 🟢      |                                                          |
+| `vecmat`              | 🟠      |                                                          |
+| `vectorize`           | 🟠      |                                                          |
+| `vsplit`              | 🟠      | `split` is supported                                     |
+| `vstack`              | 🟢      |                                                          |
+| `where`               | 🟢      | AD through x/y branches; condition is non-differentiable |
+| `zeros`               | 🟢      |                                                          |
+| `zeros_like`          | 🟢      |                                                          |
 
 ## [`jax.numpy.fft` module](https://docs.jax.dev/en/latest/jax.numpy.html#module-jax.numpy.fft)
 
