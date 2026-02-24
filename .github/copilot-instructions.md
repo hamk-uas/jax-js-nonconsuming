@@ -1764,6 +1764,7 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 | `FEATURES.md`                     | JAX/NumPy API compatibility table              | New supported functions               |
 | `.github/copilot-instructions.md` | AI agent onboarding, scan feature tracking     | New patterns, scan development        |
 | `TUNER-IMPROVEMENT-PLAN.md`       | Tuner improvements: design, status, rationale  | Tuner/codegen changes                 |
+| `PERFORMANCE-PLAN.md`             | Follow-up performance work (6 items P1–P6)     | Matmul/conv/SIMD/subgroup changes     |
 | `packages/*/README.md`            | Package-specific docs                          | Package feature changes               |
 
 ## Where to start reading
