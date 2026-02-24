@@ -1402,6 +1402,157 @@ export function importWasmHelperFuncs(
  */
 const RANGE_PARAMS = 2;
 
+// ---------------------------------------------------------------------------
+// WASM SIMD vectorization (Improvement 5)
+// ---------------------------------------------------------------------------
+
+/** Ops that have direct f32x4 / i32x4 SIMD equivalents. */
+const SIMD_OK_OPS = new Set([
+  AluOp.Add,
+  AluOp.Sub,
+  AluOp.Mul,
+  AluOp.Min,
+  AluOp.Max,
+  AluOp.Sqrt,
+  AluOp.Floor,
+  AluOp.Ceil,
+  AluOp.Reciprocal,
+  AluOp.Const,
+  AluOp.Special,
+]);
+
+/**
+ * Check if an expression can be vectorized using WASM SIMD (f32x4).
+ * Returns true only for f32 elementwise expressions with contiguous access.
+ */
+export function canVectorizeSimd(exp: AluExp, dtype: DType): boolean {
+  if (dtype !== DType.Float32) return false;
+  return !exp.some((e) => {
+    if (SIMD_OK_OPS.has(e.op)) return false; // OK → don't stop
+    if (e.op === AluOp.GlobalIndex) {
+      // After tuneNullopt, contiguous arrays have indexExp = Special(gidx)
+      // (the simplifier eliminates redundant Mod when gidx range < dim).
+      // Broadcast arrays (stride=0) have indexExp = Const(0).
+      return (
+        e.src[0].op !== AluOp.Special && e.src[0].op !== AluOp.Const
+      );
+    }
+    return true; // Unknown op → not vectorizable
+  });
+}
+
+/**
+ * Translate an AluExp to WASM SIMD instructions (f32x4, 4-wide).
+ * Handles only the SIMD-compatible subset of AluOps. The caller must
+ * verify eligibility with `canVectorizeSimd` first.
+ *
+ * @param getInputLocal - Returns the WASM local index holding the base pointer
+ *   for input buffer `gid`. In codegenWasm: `gid + RANGE_PARAMS`.
+ *   In mega-module: `inputLocals[gid]`.
+ *
+ * Leaves a v128 result on the WASM stack.
+ */
+export function translateExpCoreSimd(
+  cg: CodeGenerator,
+  exp: AluExp,
+  gidxLocal: number,
+  getInputLocal: (gid: number) => number,
+): void {
+  // CSE: count references for local.tee caching (same as scalar path)
+  const references = new Map<AluExp, number>();
+  const seen = new Set<AluExp>();
+  const countReferences = (e: AluExp) => {
+    references.set(e, (references.get(e) ?? 0) + 1);
+    if (!seen.has(e)) {
+      seen.add(e);
+      for (const src of e.src) countReferences(src);
+    }
+  };
+
+  const expContext = new Map<AluExp, number>();
+  const gen = (e: AluExp): void => {
+    if (expContext.has(e)) {
+      cg.local.get(expContext.get(e)!);
+      return;
+    }
+    const { op, src, arg } = e;
+
+    if (op === AluOp.Add) {
+      gen(src[0]);
+      gen(src[1]);
+      cg.f32x4.add();
+    } else if (op === AluOp.Sub) {
+      gen(src[0]);
+      gen(src[1]);
+      cg.f32x4.sub();
+    } else if (op === AluOp.Mul) {
+      gen(src[0]);
+      gen(src[1]);
+      cg.f32x4.mul();
+    } else if (op === AluOp.Min) {
+      gen(src[0]);
+      gen(src[1]);
+      cg.f32x4.min();
+    } else if (op === AluOp.Max) {
+      gen(src[0]);
+      gen(src[1]);
+      cg.f32x4.max();
+    } else if (op === AluOp.Sqrt) {
+      gen(src[0]);
+      cg.f32x4.sqrt();
+    } else if (op === AluOp.Floor) {
+      gen(src[0]);
+      cg.f32x4.floor();
+    } else if (op === AluOp.Ceil) {
+      gen(src[0]);
+      cg.f32x4.ceil();
+    } else if (op === AluOp.Reciprocal) {
+      cg.f32.const(1);
+      cg.f32x4.splat();
+      gen(src[0]);
+      cg.f32x4.div();
+    } else if (op === AluOp.Const) {
+      cg.f32.const(arg as number);
+      cg.f32x4.splat();
+    } else if (op === AluOp.Special) {
+      // gidx → not directly needed as v128; handled via GlobalIndex loads
+      // This case shouldn't be reached as a top-level node in practice
+      cg.local.get(gidxLocal);
+      cg.f32.convert_i32_s();
+      cg.f32x4.splat();
+    } else if (op === AluOp.GlobalIndex) {
+      const [gid, _len] = arg as [number, number];
+      if (src[0].op === AluOp.Const) {
+        // Broadcast: load one f32 at constant offset, splat to all 4 lanes
+        const constIdx = src[0].arg as number;
+        cg.local.get(getInputLocal(gid));
+        cg.f32.load(2, constIdx * 4);
+        cg.f32x4.splat();
+      } else {
+        // Contiguous v128.load: base + gidx * 4
+        cg.local.get(getInputLocal(gid));
+        cg.local.get(gidxLocal);
+        cg.i32.const(4); // byteWidth(Float32)
+        cg.i32.mul();
+        cg.i32.add();
+        cg.v128.load(2, 0); // align hint = 4 bytes
+      }
+    } else {
+      throw new Error(`SIMD: unsupported op ${op}`);
+    }
+
+    // CSE: cache in v128 local if referenced multiple times
+    if ((references.get(e) ?? 0) > 1) {
+      const local = cg.local.declare(cg.v128);
+      cg.local.tee(local);
+      expContext.set(e, local);
+    }
+  };
+
+  countReferences(exp);
+  gen(exp);
+}
+
 function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   if (kernel.isMultiOutput) {
     return codegenWasmMulti(kernel);
@@ -1411,6 +1562,15 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
 
   if (DEBUG >= 3) {
     console.info(`kernel.exp: ${kernel.outputs[0].exp}\ntune.exp: ${tune.exp}`);
+  }
+
+  // Check SIMD eligibility: f32 elementwise, no reduction, contiguous access
+  const re = kernel.outputs[0].reduction;
+  const useSimd =
+    !re && canVectorizeSimd(tune.exp, kernel.outputs[0].dtype);
+
+  if (DEBUG >= 2 && useSimd) {
+    console.info(`wasm: SIMD f32x4 path for kernel (nargs=${kernel.nargs})`);
   }
 
   const cg = new CodeGenerator();
@@ -1427,7 +1587,6 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   // Single-threaded: kernel(0, totalSize, ...ptrs, [reduceSize])
   // When the kernel has a symbolic reduction, an extra i32 param holds the
   // resolved reduction size (passed at dispatch time via dynamicParams[1]).
-  const re = kernel.outputs[0].reduction;
   const hasSymbolicReduction = re != null && isSymbolicSize(re.size);
   const nParams =
     RANGE_PARAMS + kernel.nargs + 1 + (hasSymbolicReduction ? 1 : 0);
@@ -1437,28 +1596,110 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   const kernelFunc = cg.function(rep(nParams, cg.i32), [], () => {
     const gidx = cg.local.declare(cg.i32);
 
-    emitKernelBody({
-      cg,
-      funcs,
-      kernel,
-      gidx,
-      startLocal: 0,
-      endLocal: 1,
-      reduceSizeLocal: hasSymbolicReduction ? reduceSizeParamIdx : undefined,
-      emitOutputAddr: () => {
-        cg.local.get(RANGE_PARAMS + kernel.nargs); // output buffer param (shifted)
+    if (useSimd) {
+      // ----- SIMD path: main f32x4 loop + scalar tail -----
+      const outParam = RANGE_PARAMS + kernel.nargs;
+
+      // SIMD main loop: process 4 f32 elements per iteration
+      cg.local.get(0); // start
+      cg.local.set(gidx);
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        // Break if gidx + 4 > end  (i.e. fewer than 4 elements left)
         cg.local.get(gidx);
-        cg.i32.const(byteWidth(kernel.outputs[0].dtype));
+        cg.i32.const(4);
+        cg.i32.add();
+        cg.local.get(1); // end
+        cg.i32.gt_u();
+        cg.br_if(0);
+
+        // Push output address: outBase + gidx * 4
+        cg.local.get(outParam);
+        cg.local.get(gidx);
+        cg.i32.const(4); // byteWidth(Float32)
         cg.i32.mul();
         cg.i32.add();
-      },
-      emitExp: (exp, { ridx, acc }) => {
-        const vars: Record<string, number> = { gidx };
-        if (ridx !== undefined) vars.ridx = ridx;
-        if (acc !== undefined) vars.acc = acc;
-        translateExp(cg, funcs, exp, vars, RANGE_PARAMS);
-      },
-    });
+
+        // Emit SIMD expression → v128 on stack
+        translateExpCoreSimd(
+          cg,
+          tune.exp,
+          gidx,
+          (gid) => gid + RANGE_PARAMS,
+        );
+
+        // v128.store (pops value, then address)
+        cg.v128.store(2, 0);
+
+        // gidx += 4
+        cg.local.get(gidx);
+        cg.i32.const(4);
+        cg.i32.add();
+        cg.local.set(gidx);
+
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+
+      // Scalar tail: process remaining elements one at a time
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(gidx);
+        cg.local.get(1); // end
+        cg.i32.ge_u();
+        cg.br_if(0);
+
+        // Push output address
+        cg.local.get(outParam);
+        cg.local.get(gidx);
+        cg.i32.const(4);
+        cg.i32.mul();
+        cg.i32.add();
+
+        // Scalar expression
+        translateExp(cg, funcs, tune.exp, { gidx }, RANGE_PARAMS);
+
+        // f32.store
+        cg.f32.store(2);
+
+        // gidx++
+        cg.local.get(gidx);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(gidx);
+
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+    } else {
+      // ----- Scalar path (existing) -----
+      emitKernelBody({
+        cg,
+        funcs,
+        kernel,
+        gidx,
+        startLocal: 0,
+        endLocal: 1,
+        reduceSizeLocal: hasSymbolicReduction ? reduceSizeParamIdx : undefined,
+        emitOutputAddr: () => {
+          cg.local.get(RANGE_PARAMS + kernel.nargs);
+          cg.local.get(gidx);
+          cg.i32.const(byteWidth(kernel.outputs[0].dtype));
+          cg.i32.mul();
+          cg.i32.add();
+        },
+        emitExp: (exp, { ridx, acc }) => {
+          const vars: Record<string, number> = { gidx };
+          if (ridx !== undefined) vars.ridx = ridx;
+          if (acc !== undefined) vars.acc = acc;
+          translateExp(cg, funcs, exp, vars, RANGE_PARAMS);
+        },
+      });
+    }
   });
   cg.export(kernelFunc, "kernel");
 

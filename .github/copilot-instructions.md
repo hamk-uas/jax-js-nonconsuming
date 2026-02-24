@@ -115,10 +115,11 @@ When deciding what to work on, prefer work in this order:
 2. **API breadth** — approximate NumPy/JAX API compatibility (see `FEATURES.md` for the status
    table). The goal is that common JAX/NumPy patterns can be ported with minimal changes.
 3. **Performance** — there is significant headroom, especially in:
-   - WASM backend (SIMD is used for Cholesky f32; extending to matmul/elementwise kernels. M5 added
-     `WasmWorkerPool` for parallel kernel dispatch via `SharedArrayBuffer` + Web Workers — active
-     when `SharedArrayBuffer` is constructable, dispatches kernels with ≥ 4096 elements across
-     cores. M6.2b added `OrchestratorWorker` for off-main-thread mega-module execution).
+   - WASM backend (SIMD f32x4 vectorization for JIT elementwise kernels and mega-module extracted
+     kernels. M5 added `WasmWorkerPool` for parallel kernel dispatch via `SharedArrayBuffer` + Web
+     Workers — active when `SharedArrayBuffer` is constructable, dispatches kernels with ≥ 4096
+     elements across cores. M6.2b added `OrchestratorWorker` for off-main-thread mega-module
+     execution).
    - Transformer inference (currently ~1/3 of raw matmul GFLOP/s).
    - Conv2d and other operations that haven't been tuned yet.
 4. **Demos and applications** — fluid simulations, neural networks, audio processing, embedding
@@ -657,16 +658,17 @@ See [WebGPU preencoded-routine details](#webgpu-preencoded-routine-details-routi
 
 ### Features exploited
 
-| Feature                     | How jax-js uses it                                               | Location                            |
-| --------------------------- | ---------------------------------------------------------------- | ----------------------------------- |
-| **shader-f16**              | Float16 dtype support; requested at device creation              | `src/backend.ts` feature requests   |
-| **Workgroup shared memory** | Sort uses `var<workgroup>` for bitonic sort local exchanges      | `src/backend/webgpu/routines.ts`    |
-| **workgroupBarrier()**      | Synchronizes threads within Sort workgroups                      | `bitonicSortShader` in routines.ts  |
-| **storageBarrier()**        | Memory fence for shared variable consistency                     | Sort, Cholesky, LU in routines.ts   |
-| **Pipeline caching**        | Compiled pipelines stored by shader hash                         | `pipelineCache` in webgpu.ts        |
-| **Command batching**        | Multiple dispatches encoded before single queue.submit()         | `PendingExecute` in webgpu.ts       |
-| **WGSL copy shader**        | Byte-level buffer copy when `copyBufferToBuffer` alignment fails | `COPY_SHADER_CODE` in webgpu.ts     |
-| **shader-f32-atomic-add**   | Native f32 `atomicAdd` in scatter-add shader (when available)    | `dispatchScatterAdd()` in webgpu.ts |
+| Feature                     | How jax-js uses it                                                        | Location                            |
+| --------------------------- | ------------------------------------------------------------------------- | ----------------------------------- |
+| **shader-f16**              | Float16 dtype support; requested at device creation                       | `src/backend.ts` feature requests   |
+| **Workgroup shared memory** | Sort local exchanges; JIT cooperative reductions (`pipelineSource` tuner) | routines.ts, webgpu.ts              |
+| **workgroupBarrier()**      | Sort workgroups; JIT shared-memory reduction tree                         | routines.ts, webgpu.ts              |
+| **storageBarrier()**        | Memory fence for shared variable consistency                              | Sort, Cholesky, LU in routines.ts   |
+| **Pipeline caching**        | Compiled pipelines stored by shader hash                                  | `pipelineCache` in webgpu.ts        |
+| **Pipeline layout caching** | `GPUPipelineLayout` cached by `numInputs:numOutputs:hasUniform` signature | `ShaderPipelineCache` in webgpu.ts  |
+| **Command batching**        | Multiple dispatches encoded before single queue.submit()                  | `PendingExecute` in webgpu.ts       |
+| **WGSL copy shader**        | Byte-level buffer copy when `copyBufferToBuffer` alignment fails          | `COPY_SHADER_CODE` in webgpu.ts     |
+| **shader-f32-atomic-add**   | Native f32 `atomicAdd` in scatter-add shader (when available)             | `dispatchScatterAdd()` in webgpu.ts |
 
 **Scan additionally uses:**
 
@@ -753,15 +755,16 @@ control flow. WebGPU is more restricted but faster when patterns fit.
 
 ### Key WebGPU files
 
-| File                                 | Purpose                                            |
-| ------------------------------------ | -------------------------------------------------- |
-| `src/backend.ts`                     | WebGPU init, adapter/device creation, feature reqs |
-| `src/backend/webgpu.ts`              | Main backend: kernels, scan, command encoding      |
-| `src/backend/webgpu/codegen.ts`      | `calculateGrid()`, WGSL helpers, `ShaderInfo`      |
-| `src/backend/webgpu/routines.ts`     | Bitonic sort, Cholesky, LU, TriangularSolve WGSL   |
-| `src/backend/webgpu/scan-wrapper.ts` | Transforms routine shaders for scan with offsets   |
-| `src/backend/webgpu/reader.ts`       | `SyncReader` for synchronous buffer readback       |
-| `src/backend/webgpu/builtins.ts`     | Shader snippets for special functions (erf, etc.)  |
+| File                                 | Purpose                                               |
+| ------------------------------------ | ----------------------------------------------------- |
+| `src/backend.ts`                     | WebGPU init, adapter/device creation, feature reqs    |
+| `src/backend/webgpu.ts`              | Main backend: kernels, scan, command encoding         |
+| `src/backend/webgpu/codegen.ts`      | `calculateGrid()`, WGSL helpers, `ShaderInfo`         |
+| `src/backend/webgpu/routines.ts`     | Bitonic sort, Cholesky, LU, TriangularSolve WGSL      |
+| `src/backend/webgpu/scan-wrapper.ts` | Transforms routine shaders for scan with offsets      |
+| `src/backend/webgpu/reader.ts`       | `SyncReader` for synchronous buffer readback          |
+| `src/backend/webgpu/builtins.ts`     | Shader snippets for special functions (erf, etc.)     |
+| `src/tuner.ts`                       | Kernel tuner: axis splitting, unrolling, SIMD, groups |
 
 ### Autodiff and ownership
 
@@ -787,11 +790,13 @@ Understanding this structure is essential for adding scan codegen paths.
 
 | Function                        | Role                                                             |
 | ------------------------------- | ---------------------------------------------------------------- |
-| `translateExpCore()`            | Shared core handling all `AluOp` cases                           |
+| `translateExpCore()`            | Shared core handling all `AluOp` cases (scalar)                  |
 | `TranslateExpContext` interface | Callbacks for `getVariable` and `handleGlobalIndex`              |
 | `translateExp()`                | Wrapper with bounds-check GlobalIndex; `paramOffset` for M5      |
+| `canVectorizeSimd()`            | Checks if AluExp tree is SIMD-eligible (f32 only)                |
+| `translateExpCoreSimd()`        | SIMD f32x4 expression translation (contiguous + broadcast)       |
 | `emitKernelBody()`              | Shared gidx loop + reduction + store; `startLocal`/`endLocal` M5 |
-| `codegenWasm()`                 | Kernel codegen: `(start, end, ...ptrs)` signature (M5)           |
+| `codegenWasm()`                 | Kernel codegen with SIMD fast path: `(start, end, ...ptrs)` (M5) |
 | `codegenWasmMulti()`            | Multi-output kernel codegen: `(start, end, ...ptrs)` (M5)        |
 
 **`AluOp.Where` — cost-based branching (WASM only):**
@@ -835,6 +840,82 @@ logic.
 
 Scan adds `genScanExpressionWithRidx` (scan-specific GlobalIndex + inline generation) and
 `nativeScanMultiShaderSource()` (full scan shader).
+
+## Tuner system
+
+The tuner (`src/tuner.ts`) transforms `Kernel` objects into `TuneResult`s that control how kernels
+are dispatched. It splits axes for parallelism, unrolling, upcasting, and cooperative reductions.
+
+**Key types:**
+
+| Type               | Purpose                                                                          |
+| ------------------ | -------------------------------------------------------------------------------- |
+| `TuneDims`         | Mutable axis layout: `[global \| local \| groups \| reduce \| unroll \| upcast]` |
+| `TuneResult`       | Base result: substituted `exp`, `threadCount`, axis sizes                        |
+| `WebGPUTuneResult` | Extends `TuneResult` with `groups`, `local` for cooperative threading            |
+| `WasmTuneResult`   | Extends `TuneResult` (reserved for future SIMD width fields)                     |
+
+**Tuner functions:**
+
+| Function        | Backend | What it does                                                                |
+| --------------- | ------- | --------------------------------------------------------------------------- |
+| `tuneNullopt()` | All     | Base tuning: substitute gidx, rewrite GlobalViews, simplify expressions     |
+| `tuneWebgpu()`  | WebGPU  | Extends `tuneNullopt` with groups (cooperative reduction), local axis,      |
+|                 |         | unrolling (capped by `maxComputeWorkgroupSizeX`), upcast, memory coalescing |
+
+**Axis layout in `TuneDims`:**
+
+```
+[global | local | groups | reduce | unroll | upcast]
+  ↑        ↑        ↑        ↑         ↑        ↑
+workgroup  local_id  local_id  loop    unrolled  inlined
+  _id               (sub-range)        loop      expressions
+```
+
+- **global** → `workgroup_id` — independent output elements
+- **local** → `local_invocation_id` — cooperative threads within a workgroup
+- **groups** → `local_invocation_id` (sub-range) — threads for shared-memory reductions
+- **reduce** → sequential loop per thread
+- **unroll** → explicit loop unrolling
+- **upcast** → inlined vector-width expressions
+
+**WebGPU shared-memory reductions (`groups > 1`):**
+
+When the tuner sets `groups > 1` for large reductions (≥256 elements), `pipelineSource()` emits:
+
+1. `var<workgroup> shared_data: array<f32, WORKGROUP_SIZE>;` — shared memory allocation
+2. Each thread accumulates a partial result over `reduceSize / groups` elements
+3. Writes partial to `shared_data[local_invocation_id]`
+4. `workgroupBarrier()` — synchronize
+5. Tree reduction within workgroup (power-of-two halving)
+6. Thread 0 writes final result to output buffer
+
+The `ShaderInfo.sharedMemoryBytes` field conveys the shared memory requirement to
+`pipelineSubmit()`.
+
+**WASM SIMD vectorization (`canVectorizeSimd` + `translateExpCoreSimd`):**
+
+`codegenWasm()` checks `canVectorizeSimd(exp, dtype)` — if the expression tree contains only
+SIMD-compatible f32 ops (`Add`, `Sub`, `Mul`, `Min`, `Max`, `Sqrt`, `Floor`, `Ceil`, `Reciprocal`)
+and all buffer accesses are contiguous or broadcast, it emits a two-loop structure:
+
+1. **Main f32x4 loop** (`gidx += 4`): `v128.load` for contiguous inputs, `f32.load + f32x4.splat`
+   for broadcast inputs, f32x4 arithmetic, `v128.store` output
+2. **Scalar tail loop** (`gidx += 1`): standard `translateExpCore` for remaining elements
+
+This also applies to mega-module extracted kernel bodies (`emitExtractedSingleOutputBody`).
+Reductions and transcendentals (`sin`, `cos`, `exp`, `log`, `erf`, etc.) remain scalar.
+
+**Key files:**
+
+| File                              | Purpose                                                   |
+| --------------------------------- | --------------------------------------------------------- |
+| `src/tuner.ts`                    | `TuneDims`, `tuneNullopt`, `tuneWebgpu`, axis splitting   |
+| `src/backend/webgpu.ts`           | `pipelineSource()` shared-memory reduction codegen        |
+| `src/backend/webgpu/codegen.ts`   | `ShaderInfo.sharedMemoryBytes`, `workgroupSize` multi-dim |
+| `src/backend/wasm.ts`             | `canVectorizeSimd`, `translateExpCoreSimd`, SIMD codegen  |
+| `src/backend/wasm/mega-module.ts` | SIMD in `emitExtractedSingleOutputBody`                   |
+| `TUNER-IMPROVEMENT-PLAN.md`       | Detailed plan with design rationale and status tracking   |
 
 ## Routine system
 
@@ -1682,6 +1763,7 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 | `README.md`                       | Main project intro, tutorial, Maintainer Guide | Major features, API changes, releases |
 | `FEATURES.md`                     | JAX/NumPy API compatibility table              | New supported functions               |
 | `.github/copilot-instructions.md` | AI agent onboarding, scan feature tracking     | New patterns, scan development        |
+| `TUNER-IMPROVEMENT-PLAN.md`       | Tuner improvements: design, status, rationale  | Tuner/codegen changes                 |
 | `packages/*/README.md`            | Package-specific docs                          | Package feature changes               |
 
 ## Where to start reading

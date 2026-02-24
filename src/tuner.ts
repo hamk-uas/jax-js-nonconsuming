@@ -23,6 +23,7 @@
  */
 
 import { accessorGlobal, AluExp, AluOp, AluVar, DType, Kernel } from "./alu";
+import type { BackendCapabilities } from "./backend";
 import { ShapeTracker, type SizeExpr, unravelAlu } from "./shape";
 import { DEBUG, deepEqual, lexCompare, prod, range, sorted } from "./utils";
 
@@ -41,12 +42,6 @@ export interface TuneResult {
 
   /** Sizes of various dimensions of the kernel. */
   size: {
-    /**
-     * Number of threads for each group.
-     * If greater than 1, group index is available as `AluExp.special("group")`.
-     */
-    groups?: number;
-
     /** Number of iterations for the reduce loop, `AluExp.special("ridx")`. */
     reduce: SizeExpr;
 
@@ -58,12 +53,34 @@ export interface TuneResult {
   };
 }
 
+/** WebGPU-specific tune result — adds cooperative threading fields. */
+export interface WebGPUTuneResult extends TuneResult {
+  size: TuneResult["size"] & {
+    /**
+     * Number of threads for each group.
+     * If greater than 1, group index is available as `AluExp.special("group")`.
+     */
+    groups?: number;
+
+    /** Workgroup-local dimension size (future: shared memory tiling). */
+    local?: number;
+  };
+}
+
+/** WASM-specific tune result — adds vectorization fields. */
+export interface WasmTuneResult extends TuneResult {
+  size: TuneResult["size"] & {
+    /** SIMD lane width (e.g. 4 for f32x4, 2 for f64x2). */
+    simdWidth?: number;
+  };
+}
+
 /** Stores dimensions of the kernel's applied shape. Globals start at 0. */
 class TuneDims {
   st: ShapeTracker; // Shape tracker including reduction axes.
   outputSt: ShapeTracker; // Shape tracker including only output axes.
 
-  // local: number; // TODO: Split gidx -> global and local axes during tuning.
+  local: number; // Local axes start here (maps to local_invocation_id).
   groups: number; // Reductions start here, with groups.
   reduce: number; // Single reduction thread.
   unroll: number; // Upcast along the reduce dimension.
@@ -76,6 +93,7 @@ class TuneDims {
   constructor(shape: number[]) {
     this.st = ShapeTracker.fromShape(shape);
     this.outputSt = ShapeTracker.fromShape(shape.slice(0, -1));
+    this.local = this.st.shape.length - 1;
     this.groups = this.st.shape.length - 1;
     this.reduce = this.st.shape.length - 1;
     this.unroll = this.st.shape.length;
@@ -84,14 +102,14 @@ class TuneDims {
 
   // Place the axis at the end of the shape, so it is part of each workgroup.
   applyLocal(axis: number, amount: number) {
-    if (axis >= this.groups) throw new Error("Cannot localize reduction axis");
+    if (axis >= this.local) throw new Error("Cannot localize non-global axis");
     const length = this.st.shape[axis];
     if (length % amount !== 0)
       throw new Error(`Localize by ${amount} on axis length ${length}`);
 
     if (length !== amount) {
       // First split it.
-      (this.groups++, this.reduce++, this.unroll++, this.upcast++);
+      (this.local++, this.groups++, this.reduce++, this.unroll++, this.upcast++);
       this.st = this.st.reshape([
         ...this.st.shape.slice(0, axis),
         length / amount,
@@ -107,7 +125,7 @@ class TuneDims {
       axis++;
     }
 
-    // Now permute axis to the end of the real axes, before groups.
+    // Now permute axis to the end of the global axes, before local/groups.
     this.st = this.st.permute([
       ...range(axis),
       ...range(axis + 1, this.groups),
@@ -120,6 +138,7 @@ class TuneDims {
       axis,
       ...range(this.groups, this.outputSt.shape.length),
     ]);
+    this.local--;
   }
 
   applyUpcast(axis: number, amount: number) {
@@ -187,6 +206,30 @@ class TuneDims {
       this.upcast++;
     }
   }
+
+  /**
+   * Split the first reduce axis into cooperative group threads.
+   * Creates [amount, length/amount] where `amount` threads run in parallel
+   * and each processes `length/amount` elements sequentially.
+   * The results are combined via workgroup shared memory.
+   */
+  applyGroups(amount: number) {
+    if (this.groups !== this.reduce) throw new Error("Groups already applied");
+    if (this.reduce >= this.unroll) throw new Error("No reduce axis to group");
+    const axis = this.reduce;
+    const length = this.st.shape[axis];
+    if (length % amount !== 0)
+      throw new Error(`Group by ${amount} on reduce axis length ${length}`);
+    this.st = this.st.reshape([
+      ...this.st.shape.slice(0, axis),
+      amount,
+      length / amount,
+      ...this.st.shape.slice(axis + 1),
+    ]);
+    this.reduce++;
+    this.unroll++;
+    this.upcast++;
+  }
 }
 
 /** Tuning step that does not apply any optimization. */
@@ -251,7 +294,10 @@ function unlimitGlobalIndexLen(exp: AluExp): AluExp {
 }
 
 /** Tuning for WebGPU kernels. */
-export function tuneWebgpu(kernel: Kernel): TuneResult {
+export function tuneWebgpu(
+  kernel: Kernel,
+  caps?: BackendCapabilities,
+): WebGPUTuneResult {
   const reduction = kernel.outputs[0].reduction;
   if (!reduction) return tuneNullopt(kernel);
   // Symbolic kernels can't use upcast/unroll optimizations (unknown size).
@@ -337,10 +383,30 @@ export function tuneWebgpu(kernel: Kernel): TuneResult {
     }
   }
 
+  // Apply cooperative groups for large parallel reductions.
+  // When the sequential reduction is large enough, split it into
+  // groupSize parallel threads that combine via shared memory.
+  if (dim.reduce < dim.unroll) {
+    const seqReduce = prod(dim.st.shape.slice(dim.reduce, dim.unroll));
+    if (seqReduce >= 256) {
+      const maxWg = Math.min(caps?.maxComputeWorkgroupSizeX ?? 256, 256);
+      let groupSize = maxWg;
+      while (
+        groupSize > 1 &&
+        (seqReduce % groupSize !== 0 || seqReduce / groupSize < 2)
+      ) {
+        groupSize >>= 1;
+      }
+      if (groupSize > 1) {
+        dim.applyGroups(groupSize);
+      }
+    }
+  }
+
   // Try to do loop unrolling on the reduce axis, with an upcast limit.
   // Skip doing this on mobile browsers, as it may reduce performance.
   if (
-    !/Mobi|Android/i.test(navigator.userAgent) &&
+    (caps?.maxComputeWorkgroupSizeX ?? 1024) > 256 &&
     dim.reduce < dim.unroll &&
     (prod(dim.st.shape.slice(dim.unroll)) <= 4 ||
       (dim.unroll === dim.upcast && prod(dim.st.shape.slice(dim.upcast)) < 64))
@@ -364,13 +430,17 @@ export function tuneWebgpu(kernel: Kernel): TuneResult {
     }
   }
 
-  for (const ax of sorted(upcastedAxis)) {
-    const s = dim.st.shape[ax];
-    // TODO: These applyLocal() calls are a hack / bad heuristic, make this better.
-    for (const amount of [8, 4]) {
-      if (s % amount === 0) {
-        dim.applyLocal(ax, amount);
-        break;
+  // Skip local tiling when cooperative groups are active — the workgroup
+  // is already dedicated to the shared-memory reduction.
+  if (dim.groups === dim.reduce) {
+    for (const ax of sorted(upcastedAxis)) {
+      const s = dim.st.shape[ax];
+      // TODO: These applyLocal() calls are a hack / bad heuristic, make this better.
+      for (const amount of [8, 4]) {
+        if (s % amount === 0) {
+          dim.applyLocal(ax, amount);
+          break;
+        }
       }
     }
   }
@@ -455,6 +525,7 @@ export function tuneWebgpu(kernel: Kernel): TuneResult {
   }
 
   const size = {
+    local: prod(dim.st.shape.slice(dim.local, dim.groups)),
     groups: prod(dim.st.shape.slice(dim.groups, dim.reduce)),
     reduce: prod(dim.st.shape.slice(dim.reduce, dim.unroll)),
     unroll: prod(dim.st.shape.slice(dim.unroll, dim.upcast)),

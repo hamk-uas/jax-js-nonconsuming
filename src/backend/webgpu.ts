@@ -18,7 +18,7 @@ import {
 } from "../backend";
 import { Routine } from "../routine";
 import { isSymbolicSize } from "../shape";
-import { tuneNullopt, tuneWebgpu } from "../tuner";
+import { tuneNullopt, tuneWebgpu, type WebGPUTuneResult } from "../tuner";
 import {
   DEBUG,
   findPow2,
@@ -265,6 +265,8 @@ export class WebGPUBackend implements Backend {
       ),
       sharedMemory: false,
       multiOutputKernel: true,
+      maxComputeWorkgroupSizeX:
+        device.limits.maxComputeWorkgroupSizeX,
     };
     this.pipelines = new ShaderPipelineCache(device);
     this.syncReader = new SyncReader(device);
@@ -479,7 +481,7 @@ export class WebGPUBackend implements Backend {
     const cacheKey = FpHash.hash(kernel);
     let result = this.#cachedShaderMap.get(cacheKey);
     if (!result) {
-      result = pipelineSource(this.device, kernel);
+      result = pipelineSource(this.device, kernel, this.capabilities);
       this.#cachedShaderMap.set(cacheKey, result);
     }
     return result;
@@ -1359,15 +1361,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * Multi-output kernels are always non-reduction (enforced by jitCompile batching).
  * Generates one result binding per output and one store per output per gidx.
  */
-function pipelineSourceMulti(device: GPUDevice, kernel: Kernel): ShaderInfo {
+function pipelineSourceMulti(
+  device: GPUDevice,
+  kernel: Kernel,
+  caps?: BackendCapabilities,
+): ShaderInfo {
   const { nargs } = kernel;
   const numOutputs = kernel.numOutputs;
   const args = Array.from({ length: nargs }, (_, i) => `in${i}`);
 
-  // Tune each output individually (all non-reduction → tuneNullopt)
+  // Tune each output individually
   const tunes = kernel.outputs.map((o) => {
     const tmp = Kernel.single(nargs, kernel.size, o.exp, o.reduction);
-    return tuneNullopt(tmp);
+    return tuneWebgpu(tmp, caps);
   });
 
   // All outputs share the same threadCount (same size, no reductions)
@@ -1625,12 +1631,16 @@ function pipelineSourceMulti(device: GPUDevice, kernel: Kernel): ShaderInfo {
  * Returns the shader source and the number of workgroups to dispatch along x
  * and y axes, to run the kernel.
  */
-function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
+function pipelineSource(
+  device: GPUDevice,
+  kernel: Kernel,
+  caps?: BackendCapabilities,
+): ShaderInfo {
   if (kernel.isMultiOutput) {
-    return pipelineSourceMulti(device, kernel);
+    return pipelineSourceMulti(device, kernel, caps);
   }
 
-  const tune = tuneWebgpu(kernel);
+  const tune = tuneWebgpu(kernel, caps);
   if (DEBUG >= 3) {
     console.info(`kernel.exp: ${kernel.outputs[0].exp}\ntune.exp: ${tune.exp}`);
   }
@@ -1733,9 +1743,26 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     );
   } else {
     const threadCount = tune.threadCount as number;
-    workgroupSize = findPow2(threadCount, 256);
+    const tuneLocal = tune.size.local ?? 1;
+    const tuneGroups = (tune as WebGPUTuneResult).size.groups ?? 1;
+    if (tuneGroups > 1) {
+      workgroupSize = tuneGroups;
+    } else if (tuneLocal > 1) {
+      workgroupSize = tuneLocal;
+    } else {
+      workgroupSize = findPow2(threadCount, 256);
+    }
     const gridSize = Math.ceil(threadCount / workgroupSize);
     [gridX, gridY] = calculateGrid(gridSize);
+  }
+
+  // Shared memory for cooperative group reductions.
+  const groupSize = re ? ((tune as WebGPUTuneResult).size.groups ?? 1) : 1;
+  const useSharedMem = groupSize > 1;
+  if (useSharedMem) {
+    const upcast = (tune as WebGPUTuneResult).size.upcast ?? 1;
+    const shmemTy = dtypeToWgsl(re!.dtype);
+    emit(`var<workgroup> shmem: array<${shmemTy}, ${groupSize * upcast}>;`);
   }
 
   emit(
@@ -1756,16 +1783,30 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
   } else {
     const threadCount = tune.threadCount as number;
     if (gridY === 1) {
-      emit(
-        `if (id.x >= ${threadCount}) { return; }`,
-        "let gidx: i32 = i32(id.x);",
-      );
+      emit(`if (id.x >= ${threadCount}u) { return; }`);
+      if (useSharedMem) {
+        emit(
+          `let gidx: i32 = i32(id.x / ${groupSize}u);`,
+          `let group: i32 = i32(id.x % ${groupSize}u);`,
+        );
+      } else {
+        emit("let gidx: i32 = i32(id.x);");
+      }
     } else {
       const sizeX = gridX * workgroupSize;
-      emit(
-        `if (${sizeX} * id.y + id.x >= ${threadCount}) { return; }`,
-        `let gidx: i32 = i32(${sizeX} * id.y + id.x);`,
-      );
+      if (useSharedMem) {
+        emit(
+          `let _tid: u32 = ${sizeX}u * id.y + id.x;`,
+          `if (_tid >= ${threadCount}u) { return; }`,
+          `let gidx: i32 = i32(_tid / ${groupSize}u);`,
+          `let group: i32 = i32(_tid % ${groupSize}u);`,
+        );
+      } else {
+        emit(
+          `if (${sizeX} * id.y + id.x >= ${threadCount}) { return; }`,
+          `let gidx: i32 = i32(${sizeX} * id.y + id.x);`,
+        );
+      }
     }
   }
 
@@ -1924,9 +1965,6 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     if (resultTy !== dtypeToWgsl(tune.exp.dtype)) rhs = `${resultTy}(${rhs})`;
     emit(`result[gidx] = ${rhs};`);
   } else {
-    if ((tune.size.groups ?? 1) > 1) {
-      throw new Error("WebGPU backend does not support group optimization yet");
-    }
     const unroll = tune.size.unroll ?? 1;
     const upcast = tune.size.upcast ?? 1;
 
@@ -1995,6 +2033,44 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     }
     emit(popIndent, "}");
 
+    // Shared-memory tree reduction: each thread wrote its partial into acc[i],
+    // now combine across workgroup threads via shmem.
+    if (useSharedMem) {
+      // Store each thread's partial into shared memory.
+      for (let i = 0; i < upcast; i++) {
+        emit(
+          `shmem[${i * groupSize} + group] = ${acc[i]};`,
+        );
+      }
+      emit("workgroupBarrier();");
+
+      // Tree reduction with halving stride.
+      for (let stride = groupSize >> 1; stride >= 1; stride >>= 1) {
+        emit(`if (group < ${stride}) {`, pushIndent);
+        for (let i = 0; i < upcast; i++) {
+          const thisSlot = `shmem[${i * groupSize} + group]`;
+          const otherSlot = `shmem[${i * groupSize} + group + ${stride}]`;
+          if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
+          else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
+          else if (re.op === AluOp.Min) {
+            if (re.dtype === DType.Bool) emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
+            else emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
+          } else if (re.op === AluOp.Max) {
+            if (re.dtype === DType.Bool) emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
+            else emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
+          }
+        }
+        emit(popIndent, "}");
+        emit("workgroupBarrier();");
+      }
+
+      // Thread 0 reads the final reduced value back into accumulators.
+      emit("if (group == 0) {", pushIndent);
+      for (let i = 0; i < upcast; i++) {
+        emit(`${acc[i]} = shmem[${i * groupSize}];`);
+      }
+    }
+
     // Exited the reduction loop scope. Erase any local variables.
     expContext.clear();
     references.clear();
@@ -2023,9 +2099,18 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
         rhs = `${resultTy}(${rhs})`;
       emit(`result[${index}] = ${rhs};`);
     }
+
+    // Close the thread-0 guard for shared-memory reductions.
+    if (useSharedMem) {
+      emit(popIndent, "}");
+    }
   }
 
   emit(popIndent, "}");
+
+  const sharedBytes = useSharedMem
+    ? groupSize * ((tune as WebGPUTuneResult).size.upcast ?? 1) * byteWidth(re!.dtype)
+    : undefined;
   return {
     code: shader.join("\n"),
     numInputs: nargs,
@@ -2035,6 +2120,7 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     isSymbolic: symbolic || undefined,
     workgroupSize: symbolic ? workgroupSize : undefined,
     hasSymbolicReduction: symbolicReduce || undefined,
+    sharedMemoryBytes: sharedBytes,
   };
 }
 
@@ -2476,7 +2562,10 @@ function pipelineSubmit(
     if (needsSymbolicUniform) {
       if (shader.isSymbolic) {
         const totalSize = dynamicParams[0];
-        const wgSize = shader.workgroupSize!;
+        const wgSize =
+          typeof shader.workgroupSize === "number"
+            ? shader.workgroupSize
+            : shader.workgroupSize?.[0] ?? 256;
         const gridSize = Math.ceil(totalSize / wgSize);
         symbolicGrid = calculateGrid(gridSize);
       }
@@ -2582,10 +2671,12 @@ function combineUniforms(
 class ShaderPipelineCache {
   cache: Map<string, GPUComputePipeline>;
   inProgress: Map<string, Promise<GPUComputePipeline>>;
+  #layoutCache: Map<string, GPUPipelineLayout>;
 
   constructor(readonly device: GPUDevice) {
     this.cache = new Map();
     this.inProgress = new Map();
+    this.#layoutCache = new Map();
   }
 
   #getLayout(shader: ShaderInfo): GPUPipelineLayout {
@@ -2593,15 +2684,17 @@ class ShaderPipelineCache {
       shader.numInputs + shader.numOutputs >
       this.device.limits.maxStorageBuffersPerShaderStage
     ) {
-      // This is a hard limit in WebGPU. All platforms have at least 8 storage
-      // buffers per shader stage, and >99% support 10. If you pass more than this
-      // many inputs then you risk running into this limit.
       const actual = shader.numInputs + shader.numOutputs;
       const max = this.device.limits.maxStorageBuffersPerShaderStage;
       throw new Error(
         `Too many buffers (${actual}) for WebGPU pipeline (max: ${max})`,
       );
     }
+    // Cache by signature: most JIT programs share the same layout shape.
+    const key = `${shader.numInputs}:${shader.numOutputs}:${shader.hasUniform ? 1 : 0}`;
+    const cached = this.#layoutCache.get(key);
+    if (cached) return cached;
+
     const bindGroupLayouts: GPUBindGroupLayout[] = [
       this.device.createBindGroupLayout({
         entries: range(shader.numInputs + shader.numOutputs).map((i) => ({
@@ -2626,7 +2719,9 @@ class ShaderPipelineCache {
         }),
       );
     }
-    return this.device.createPipelineLayout({ bindGroupLayouts });
+    const layout = this.device.createPipelineLayout({ bindGroupLayouts });
+    this.#layoutCache.set(key, layout);
+    return layout;
   }
 
   async prepare(shader: ShaderInfo): Promise<GPUComputePipeline> {

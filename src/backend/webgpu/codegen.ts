@@ -16,14 +16,18 @@ export interface ShaderInfo {
    * The grid and guard check are computed from `dynamicParams[0]` at dispatch.
    */
   isSymbolic?: boolean;
-  /** Workgroup size for dynamic grid computation (only set when isSymbolic). */
-  workgroupSize?: number;
+  /** Workgroup size for dynamic grid computation (only set when isSymbolic).
+   *  Number for 1-D, tuple for multi-dimensional.
+   */
+  workgroupSize?: number | [number, number?, number?];
   /**
    * When true, the shader's reduction loop uses a runtime reduce_size value
    * from `dynamicParams[1]`. The uniform buffer includes `reduce_size: u32`
    * after `total_size` (if also symbolic) or as the sole field.
    */
   hasSymbolicReduction?: boolean;
+  /** Bytes of workgroup shared memory required by the shader (0 = none). */
+  sharedMemoryBytes?: number;
 }
 
 export const headerWgsl = String.raw`

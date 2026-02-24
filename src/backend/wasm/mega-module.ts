@@ -25,11 +25,13 @@ import { isSymbolicSize, type SizeExpr } from "../../shape";
 import { tuneNullopt } from "../../tuner";
 import { DEBUG, mapSetUnion, rep } from "../../utils";
 import {
+  canVectorizeSimd,
   codegenReductionAccumulate,
   configureMemoryImport,
   dty,
   importWasmHelperFuncs,
   translateExpCore,
+  translateExpCoreSimd,
 } from "../wasm";
 import { CodeGenerator } from "./wasmblr";
 
@@ -594,51 +596,137 @@ function emitExtractedSingleOutputBody(
   const re = out.reduction;
   const storeAlign = Math.log2(byteWidth(out.dtype));
 
+  // SIMD eligibility: f32 elementwise, no reduction, contiguous access
+  const useSimd = !re && canVectorizeSimd(tune.exp, out.dtype);
+
+  if (DEBUG >= 2 && useSimd) {
+    console.info(
+      `mega-module: SIMD f32x4 path for extracted kernel (nargs=${kernel.nargs})`,
+    );
+  }
+
   const gidx = cg.local.declare(cg.i32);
 
-  // gidx = start
-  cg.local.get(startParam);
-  cg.local.set(gidx);
+  if (useSimd) {
+    // ----- SIMD path: main f32x4 loop + scalar tail -----
 
-  // loop
-  cg.loop(cg.void);
-  {
-    // if (gidx >= end) break
-    cg.block(cg.void);
-    cg.local.get(gidx);
-    cg.local.get(endParam);
-    cg.i32.ge_u();
-    cg.br_if(0);
+    // SIMD main loop
+    cg.local.get(startParam);
+    cg.local.set(gidx);
+    cg.loop(cg.void);
+    {
+      cg.block(cg.void);
+      // Break if gidx + 4 > end
+      cg.local.get(gidx);
+      cg.i32.const(4);
+      cg.i32.add();
+      cg.local.get(endParam);
+      cg.i32.gt_u();
+      cg.br_if(0);
 
-    // Output address: outputLocal + gidx * byteWidth
-    cg.local.get(outputLocal);
-    cg.local.get(gidx);
-    cg.i32.const(byteWidth(out.dtype));
-    cg.i32.mul();
-    cg.i32.add();
+      // Push output address: outBase + gidx * 4
+      cg.local.get(outputLocal);
+      cg.local.get(gidx);
+      cg.i32.const(4); // byteWidth(Float32)
+      cg.i32.mul();
+      cg.i32.add();
 
-    if (re) {
-      // Reduction: accumulator + inner ridx loop
-      // Each output element independently reduces — parallelizable by gidx range
-      emitReductionBody(cg, funcs, tune, out, re, gidx, inputLocals);
-    } else {
-      // Translate expression
-      translateExpMega(cg, funcs, tune.exp, gidx, inputLocals);
+      // Emit SIMD expression
+      translateExpCoreSimd(
+        cg,
+        tune.exp,
+        gidx,
+        (gid) => inputLocals[gid],
+      );
+
+      // v128.store
+      cg.v128.store(2, 0);
+
+      // gidx += 4
+      cg.local.get(gidx);
+      cg.i32.const(4);
+      cg.i32.add();
+      cg.local.set(gidx);
+
+      cg.br(1);
+      cg.end();
     }
+    cg.end();
 
-    // Store result
-    dty(cg, null, out.dtype).store(storeAlign);
+    // Scalar tail
+    cg.loop(cg.void);
+    {
+      cg.block(cg.void);
+      cg.local.get(gidx);
+      cg.local.get(endParam);
+      cg.i32.ge_u();
+      cg.br_if(0);
 
-    // gidx++
-    cg.local.get(gidx);
-    cg.i32.const(1);
-    cg.i32.add();
+      cg.local.get(outputLocal);
+      cg.local.get(gidx);
+      cg.i32.const(4);
+      cg.i32.mul();
+      cg.i32.add();
+
+      translateExpMega(cg, funcs, tune.exp, gidx, inputLocals);
+
+      cg.f32.store(2);
+
+      cg.local.get(gidx);
+      cg.i32.const(1);
+      cg.i32.add();
+      cg.local.set(gidx);
+
+      cg.br(1);
+      cg.end();
+    }
+    cg.end();
+  } else {
+    // ----- Scalar path (existing) -----
+
+    // gidx = start
+    cg.local.get(startParam);
     cg.local.set(gidx);
 
-    cg.br(1);
+    // loop
+    cg.loop(cg.void);
+    {
+      // if (gidx >= end) break
+      cg.block(cg.void);
+      cg.local.get(gidx);
+      cg.local.get(endParam);
+      cg.i32.ge_u();
+      cg.br_if(0);
+
+      // Output address: outputLocal + gidx * byteWidth
+      cg.local.get(outputLocal);
+      cg.local.get(gidx);
+      cg.i32.const(byteWidth(out.dtype));
+      cg.i32.mul();
+      cg.i32.add();
+
+      if (re) {
+        // Reduction: accumulator + inner ridx loop
+        emitReductionBody(cg, funcs, tune, out, re, gidx, inputLocals);
+      } else {
+        // Translate expression
+        translateExpMega(cg, funcs, tune.exp, gidx, inputLocals);
+      }
+
+      // Store result
+      dty(cg, null, out.dtype).store(storeAlign);
+
+      // gidx++
+      cg.local.get(gidx);
+      cg.i32.const(1);
+      cg.i32.add();
+      cg.local.set(gidx);
+
+      cg.br(1);
+      cg.end();
+    }
     cg.end();
   }
-  cg.end();
 }
 
 /**
