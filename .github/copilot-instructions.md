@@ -1908,7 +1908,7 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 - Demos: `website/src/routes/repl/`, `website/src/routes/mobileclip/`
 - Deno WebGPU tests: `test/deno/webgpu.test.ts` — headless hardware GPU testing
 - Scan tests: `test/lax-scan.test.ts` — comprehensive scan suite (~1880 lines)
-- Associative scan tests: `test/lax-associative-scan.test.ts` — 27 tests covering correctness,
+- Associative scan tests: `test/lax-associative-scan.test.ts` — 30 tests covering correctness,
   reverse, non-zero axis, pytrees, autodiff, parallel Kalman filter, WASM compiled-loop
 
 ---
@@ -4046,22 +4046,23 @@ result[i] = fn(result[i-1], elems[i])   for i ≥ 1
 
 **Key files:**
 
-| File                                  | Purpose                                                |
-| ------------------------------------- | ------------------------------------------------------ |
-| `src/library/lax-associative-scan.ts` | Public API, Kogge-Stone core, primitive-based JIT path |
-| `src/frontend/core.ts`                | `Primitive.AssociativeScan` enum + params type         |
-| `src/frontend/jaxpr.ts`               | Abstract eval rule                                     |
-| `src/frontend/array.ts`               | Eager `Primitive.AssociativeScan` impl                 |
-| `src/frontend/jit.ts`                 | JIT step for `Primitive.AssociativeScan`               |
-| `src/frontend/scan-plan.ts`           | `AssocScanPlan` type, `planAssociativeScan()` planning |
-| `src/backend/wasm.ts`                 | `codegenNativeAssociativeScan()` compiled-loop codegen |
-| `src/frontend/jvp.ts`                 | JVP rule (forward-mode AD with doubled inputs)         |
-| `src/frontend/linearize.ts`           | PE rule + transpose rule for `grad`                    |
-| `src/frontend/vmap.ts`                | Vmap rule (batches independent scans along batch axis) |
+| File                                  | Purpose                                                                     |
+| ------------------------------------- | --------------------------------------------------------------------------- |
+| `src/library/lax-associative-scan.ts` | Public API, Kogge-Stone core, primitive-based JIT path                      |
+| `src/frontend/core.ts`                | `Primitive.AssociativeScan` enum + params type                              |
+| `src/frontend/jaxpr.ts`               | Abstract eval rule                                                          |
+| `src/frontend/array.ts`               | Eager `Primitive.AssociativeScan` impl                                      |
+| `src/frontend/jit.ts`                 | JIT step for `Primitive.AssociativeScan`                                    |
+| `src/frontend/scan-plan.ts`           | `AssocScanPlan` type, `planAssociativeScan()` planning                      |
+| `src/backend/wasm.ts`                 | `codegenNativeAssociativeScan()` compiled-loop codegen                      |
+| `src/backend/webgpu.ts`               | `assocScanFusedShaderSource()`, `prepareAssocScan()`, `dispatchAssocScan()` |
+| `src/frontend/jvp.ts`                 | JVP rule (forward-mode AD with doubled inputs)                              |
+| `src/frontend/linearize.ts`           | PE rule + transpose rule for `grad`                                         |
+| `src/frontend/vmap.ts`                | Vmap rule (batches independent scans along batch axis)                      |
 
 **Export path:** `lax.associativeScan` (re-exported from `src/library/lax.ts`)
 
-**Test file:** `test/lax-associative-scan.test.ts` — 27 tests
+**Test file:** `test/lax-associative-scan.test.ts` — 30 tests
 
 ---
 
@@ -4107,8 +4108,11 @@ direct `associativeScanCore` which unrolls into the current trace.
 The Kogge-Stone rounds use high-level array primitives internally: `core.shrink` (O(1) ShapeTracker
 slice views), `core.flip`, `core.concatenate`, and `moveaxis`. On **WASM**, M7.2 added a dedicated
 compiled-loop (`codegenNativeAssociativeScan()`) that compiles the entire Kogge-Stone ladder into a
-single WASM module with N as a runtime i32 parameter. On **WebGPU**, the JS-driven ceil(log₂ N)
-dispatch path is already the hardware-imposed floor — no further backend specialization is needed.
+single WASM module with N as a runtime i32 parameter. On **WebGPU**, M7.4 added a fused shader path
+(`assocScanFusedShaderSource()`) that packs all body kernel steps into a single WGSL compute shader
+per Kogge-Stone round — leaves are interleaved into ping/pong buffers, reducing per-round dispatches
+from ~20 (one per kernel step) to exactly 1. The ceil(log₂ N) rounds remain the hardware-imposed
+floor (no cross-workgroup global barrier in WebGPU). Requires homogeneous dtype across all leaves.
 M7.3 added multithreaded Kogge-Stone: a parallel inner-round `kernel` export enables
 `WasmWorkerPool` to split work across cores for arrays ≥ 4096 elements.
 
@@ -4119,7 +4123,7 @@ JS→WASM boundary crossings.
 
 | Backend    | What each Kogge-Stone round does                                                                                                                                                                                                                                                                                                                   | Performance vs `lax.scan`                                                                                                                                                                |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **WebGPU** | ceil(log₂ N) JS-driven kernel dispatches total: one per round (fn output materialized before each Concatenate). Hardware-imposed floor — no cross-workgroup global barrier exists. Reductions in `fn` add extra dispatches per round. Eager mode uses cached whole-call `jit`.                                                                     | **Faster** for N≳1024: ceil(log₂ N) dispatches vs N sequential in-shader iterations (scan compiled-loop). Already optimal for WebGPU. Measured ~5–8× for N=65536 scalar prefix product.  |
+| **WebGPU** | **Fused shader (M7.4):** All body kernel steps fused into a single WGSL compute shader. Leaves interleaved into ping/pong buffers. JS drives ceil(log₂ N) rounds, each = 1 GPU dispatch regardless of body complexity. Requires homogeneous dtype. Eager mode uses cached whole-call `jit`.                                                        | **Faster** for N≳1024: ceil(log₂ N) fused dispatches vs N sequential in-shader iterations (scan compiled-loop). Measured ~5–8× for N=65536 scalar prefix product.                        |
 | **WASM**   | **Compiled-loop (M7.2 + M7.3):** Full Kogge-Stone ladder compiled into one WASM module. Single JS→WASM call for any N (monolithic). M7.3 adds a parallel `kernel` export: for N ≥ 4096, JS drives the Kogge-Stone loop and dispatches each round's kernel across `WasmWorkerPool` workers. Per-j indexed internal buffers prevent race conditions. | **Fast** — monolithic: single WASM invocation, zero boundary overhead. Parallel (M7.3): JS-driven rounds with multi-core work-splitting per round. O(N log N) total work vs scan's O(N). |
 | **CPU**    | Same as WASM (interpreted JS TypedArray ops per round)                                                                                                                                                                                                                                                                                             | **Slower** for the same reasons                                                                                                                                                          |
 | **WebGL**  | 1 WebGL shader dispatch per round (scan uses JS fallback on WebGL)                                                                                                                                                                                                                                                                                 | Likely faster than `lax.scan` on WebGL since scan has no compiled-loop there; untested                                                                                                   |
@@ -4280,20 +4284,20 @@ const composeLeak = (p, q) => ({
 
 ## Difference from `lax.scan`
 
-| Aspect                       | `lax.scan`                               | `lax.associativeScan`                                                                                                                             |
-| ---------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Algorithm                    | Sequential recurrence with carry         | Parallel prefix (Kogge-Stone)                                                                                                                     |
-| `fn` signature               | `(carry, x) => [newCarry, y]`            | `(a: T, b: T) => T`                                                                                                                               |
-| `fn` can be non-associative? | Yes                                      | No — must be associative                                                                                                                          |
-| Output                       | `[finalCarry, stackedYs]`                | Full prefix result (same shape as input)                                                                                                          |
-| Complexity                   | O(N) sequential depth                    | O(N log N) total work, O(log N) depth                                                                                                             |
-| WebGPU dispatch rounds       | N (fallback) or 1 (compiled-loop)        | ceil(log₂ N) JS-driven dispatches — already the hardware-imposed floor (no cross-workgroup global barrier on WebGPU; more if `fn` has reductions) |
-| WASM/CPU dispatch rounds     | 1 compiled WASM invocation (entire loop) | 1 compiled WASM invocation (entire Kogge-Stone ladder, M7.2); CPU: ceil(log₂ N) JS round-trips                                                    |
-| Reverse option               | ✅                                       | ✅                                                                                                                                                |
-| Pytrees                      | ✅                                       | ✅                                                                                                                                                |
-| `xs=null` / `Y=null`         | ✅                                       | N/A                                                                                                                                               |
-| Carry state threading        | ✅                                       | N/A (output IS the prefix)                                                                                                                        |
-| Autodiff                     | ✅ (dedicated JVP/transpose rules)       | ✅ (dedicated JVP/PE/transpose/vmap rules via `Primitive.AssociativeScan`)                                                                        |
+| Aspect                       | `lax.scan`                               | `lax.associativeScan`                                                                                                                 |
+| ---------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Algorithm                    | Sequential recurrence with carry         | Parallel prefix (Kogge-Stone)                                                                                                         |
+| `fn` signature               | `(carry, x) => [newCarry, y]`            | `(a: T, b: T) => T`                                                                                                                   |
+| `fn` can be non-associative? | Yes                                      | No — must be associative                                                                                                              |
+| Output                       | `[finalCarry, stackedYs]`                | Full prefix result (same shape as input)                                                                                              |
+| Complexity                   | O(N) sequential depth                    | O(N log N) total work, O(log N) depth                                                                                                 |
+| WebGPU dispatch rounds       | N (fallback) or 1 (compiled-loop)        | ceil(log₂ N) fused dispatches — 1 GPU dispatch per round (M7.4); hardware-imposed floor (no cross-workgroup global barrier on WebGPU) |
+| WASM/CPU dispatch rounds     | 1 compiled WASM invocation (entire loop) | 1 compiled WASM invocation (entire Kogge-Stone ladder, M7.2); CPU: ceil(log₂ N) JS round-trips                                        |
+| Reverse option               | ✅                                       | ✅                                                                                                                                    |
+| Pytrees                      | ✅                                       | ✅                                                                                                                                    |
+| `xs=null` / `Y=null`         | ✅                                       | N/A                                                                                                                                   |
+| Carry state threading        | ✅                                       | N/A (output IS the prefix)                                                                                                            |
+| Autodiff                     | ✅ (dedicated JVP/transpose rules)       | ✅ (dedicated JVP/PE/transpose/vmap rules via `Primitive.AssociativeScan`)                                                            |
 
 **When to use which:**
 
@@ -4317,21 +4321,21 @@ const composeLeak = (p, q) => ({
 
 ## Test Coverage
 
-`test/lax-associative-scan.test.ts` — 27 tests:
+`test/lax-associative-scan.test.ts` — 30 tests:
 
-| Category                    | Tests | Notes                                                                                                                                                                                             | File                                      |
-| --------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| 1-D basic                   | 6     | cumsum, cumprod, running max, N=1, N=8, N=7 (non-power-of-two)                                                                                                                                    | `test/lax-associative-scan.test.ts`       |
-| Reverse                     | 2     | reverse cumsum, reverse cummax                                                                                                                                                                    | `test/lax-associative-scan.test.ts`       |
-| Non-zero axis               | 2     | axis=1 and axis=0 on 2-D arrays                                                                                                                                                                   | `test/lax-associative-scan.test.ts`       |
-| Pytree (affine composition) | 1     | Composition of arity-2 pytree with internal intermediate disposal                                                                                                                                 | `test/lax-associative-scan.test.ts`       |
-| Autodiff                    | 4     | `grad`, `grad(jit)`, `jit(grad)` with 2-tuple, `jit(grad)` with 3-tuple compose                                                                                                                   | `test/lax-associative-scan.test.ts`       |
-| Parallel Kalman filter      | 2     | Sequential vs parallel correctness (8 obs), differentiable wrt obs                                                                                                                                | `test/lax-associative-scan.test.ts`       |
-| Vmap                        | 1     | `vmap(associativeScan)` batches independent scans                                                                                                                                                 | `test/lax-associative-scan.test.ts`       |
-| Einsum fallback             | 1     | Body tracing fallback for einsum with batch-dependent subscripts                                                                                                                                  | `test/lax-associative-scan.test.ts`       |
-| WASM compiled-loop          | 8     | cumsum, cumprod, reverse, N=1, non-power-of-two, 2-D, pytree affine, grad through compiled-loop                                                                                                   | `test/lax-associative-scan.test.ts`       |
-| Deno WebGPU perf            | 1     | N=65536 prefix product: assocScan (16 JS-driven rounds, ceil(log₂ 65536)) must be ≥3× faster than scan (65536 sequential in-shader iterations on 1 GPU thread); measured ~5–8× on tested hardware | `test/deno/associative-scan-perf.test.ts` |
-| Deno WASM parallel (M7.3)   | 5     | cumsum N=8192, cumprod N=4096, reverse cumsum, 2-D multi-element N=8192×4, repeated calls consistency — all via `WasmWorkerPool` parallel dispatch                                                | `test/deno/parallel-assoc-scan.test.ts`   |
+| Category                    | Tests | Notes                                                                                                                                              | File                                      |
+| --------------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| 1-D basic                   | 7     | cumsum, cumsum split-points, cumprod, running max, N=1, N=8, N=7 (non-power-of-two)                                                                | `test/lax-associative-scan.test.ts`       |
+| Reverse                     | 2     | reverse cumsum, reverse cummax                                                                                                                     | `test/lax-associative-scan.test.ts`       |
+| Non-zero axis               | 2     | axis=1 and axis=0 on 2-D arrays                                                                                                                    | `test/lax-associative-scan.test.ts`       |
+| Pytree (affine composition) | 1     | Composition of arity-2 pytree with internal intermediate disposal                                                                                  | `test/lax-associative-scan.test.ts`       |
+| Constant body shape         | 2     | [1,m,m] constant inside body + hoisted outside compose                                                                                             | `test/lax-associative-scan.test.ts`       |
+| Autodiff                    | 2     | `grad`, `jit(grad)` cumsum                                                                                                                         | `test/lax-associative-scan.test.ts`       |
+| Parallel Kalman filter      | 2     | Sequential vs parallel correctness (8 obs), differentiable wrt obs                                                                                 | `test/lax-associative-scan.test.ts`       |
+| Regressions                 | 3     | constant pytree grad, DLM-like einsum fallback, 3-tuple WebGPU buffer limit                                                                        | `test/lax-associative-scan.test.ts`       |
+| WASM compiled-loop          | 9     | cumsum, cumprod, reverse, N=1, non-power-of-two, 2-D, pytree affine, grad, DLM matrix compose                                                      | `test/lax-associative-scan.test.ts`       |
+| Deno WebGPU perf            | 1     | N=65536 prefix product: assocScan (16 fused rounds) must be ≥3× faster than scan; measured ~5–8× on tested hardware                                | `test/deno/associative-scan-perf.test.ts` |
+| Deno WASM parallel (M7.3)   | 5     | cumsum N=8192, cumprod N=4096, reverse cumsum, 2-D multi-element N=8192×4, repeated calls consistency — all via `WasmWorkerPool` parallel dispatch | `test/deno/parallel-assoc-scan.test.ts`   |
 
 **Kalman filter test:** Scalar constant-coefficient Kalman filter expressed as a prefix scan of
 affine maps `x_t = A_t * x_{t-1} + b_t`. The composition rule
@@ -4342,11 +4346,12 @@ reference and parallel scan results are compared to 5 decimal places.
 
 ## Future Work
 
-| Priority | Feature                       | Notes                                                                                                                                                           |
-| -------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| —        | ~~Multithreaded Kogge-Stone~~ | **Done (M7.3).** Parallel inner-round `kernel` export + `WasmWorkerPool` dispatch for N ≥ 4096. Per-j indexed internal buffers for thread safety. 5 Deno tests. |
-| Low      | N=0 test                      | Verify empty-sequence edge case behavior matches JAX                                                                                                            |
-| Low      | WebGL performance             | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.           |
+| Priority | Feature                       | Notes                                                                                                                                                                        |
+| -------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| —        | ~~Multithreaded Kogge-Stone~~ | **Done (M7.3).** Parallel inner-round `kernel` export + `WasmWorkerPool` dispatch for N ≥ 4096. Per-j indexed internal buffers for thread safety. 5 Deno tests.              |
+| —        | ~~WebGPU fused shader~~       | **Done (M7.4).** All body kernel steps fused into single WGSL compute shader per round. Interleaved ping/pong buffers, custom bind group layout. Requires homogeneous dtype. |
+| Low      | N=0 test                      | Verify empty-sequence edge case behavior matches JAX                                                                                                                         |
+| Low      | WebGL performance             | WebGL has no compiled-loop for scan (JS fallback), so assocScan's O(log N) shader dispatches may already beat scan's N dispatches. Needs measurement.                        |
 
 ---
 
@@ -4680,8 +4685,8 @@ All architecture milestones from the original ULTIMATE-ARCHITECTURE-PLAN are com
 - **M4:** Polymorphic shapes (`SymDim`, `dynamic_axes`, parameterized codegen)
 - **M5:** WASM parallel dispatch (`WasmWorkerPool`, SharedArrayBuffer, `(start,end,...ptrs)` sig)
 - **M6:** Mega-module + orchestrator worker + parallel kernel dispatch (M6.1/M6.2a/M6.2b/M6.2c)
-- **M7:** `Primitive.AssociativeScan` + WASM compiled Kogge-Stone + multithreaded dispatch
-  (M7.1–M7.3)
+- **M7:** `Primitive.AssociativeScan` + WASM compiled Kogge-Stone + multithreaded dispatch + WebGPU
+  fused shader (M7.1–M7.4)
 - **M8:** Benchmark suite, dead code audit, final regression
 
 Supporting plans (AOT-LINEARIZATION-PLAN, EFFECT-TYPED-IR-PLAN) are also fully implemented —
@@ -4789,26 +4794,27 @@ These details are frequently lost when conversation context is summarized:
 
 Decisions made during development that future agents should understand:
 
-| Decision                                        | Rationale                                                                                                                                                                                                                              |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Non-consuming ownership model                   | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting                                                                                                                                                 |
-| Concrete compilation + symbolic cache           | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                                                                                                                                                     |
-| `effectDrivenAllocate` over two-pass            | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect                                                                                                                                                |
-| Direct LU→triSolve gradient path                | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                                                                                                                                                 |
-| `transposeJaxprCache` is cache-owned            | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`                                                                                                                                                       |
-| `invariance` ≠ `strict` ESLint config           | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                                                                                                                                   |
-| WASM `(start, end, ...ptrs)` signature          | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                                                                                                                                             |
-| WASM compiled Kogge-Stone (assocScan)           | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan`                                                                                                                |
-| M7.3 per-j indexed internal buffers             | Each worker sees `internal[idx] + j * internalSizes[idx]` — non-overlapping regions prevent races. Parallel path allocates `internalSize * N`, monolithic allocates `internalSize`                                                     |
-| WASM compiled scan polymorphic length           | Length as runtime i32 param (arg 0); `NativeScanGeneralParams` no longer contains `length`; dispatch prepends length to args; `dimBindings` resolution uses `args[numConsts]`                                                          |
-| Mega-module rejects pass-through                | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes                                                                                                                 |
-| `scatterAdd` exported from public API           | Exported from `src/index.ts` as of the tech debt audit.                                                                                                                                                                                |
-| M6.2 extracted-functions design                 | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension.                                                         |
-| Module Workers (`type: "module"`)               | Deno doesn't support classic blob-URL workers; module workers work in both Deno and Chromium. Applied to both `worker-pool.ts` and `orchestrator.ts`.                                                                                  |
-| SAB constructability over `crossOriginIsolated` | `try { new SharedArrayBuffer(1) }` works in Deno (native SAB) and browsers (with COOP/COEP); `crossOriginIsolated` is browser-only and false in Deno.                                                                                  |
-| Vitest SAB tests skipped, Deno covers           | Browser main threads can't spin-wait (blocks Worker message delivery). COOP/COEP headers enabled in vitest.config.ts, but orchestrator/pool skip via `Atomics.wait` probe. 8 Vitest tests skip, 17 Deno tests cover.                   |
-| M7.3 lazy registration + monolithic fallback    | First call with N ≥ PARALLEL_THRESHOLD (4096): `pool.registerModule()` async + monolithic fallback. Subsequent: `pool.isModuleReady()` → parallel. Same pattern as mega-module.                                                        |
-| DUS vmap shrink+concat decomposition            | JIT `dus` step uses `copyBufferToBuffer` (axis=0 only). Vmap shifts axis 0→1, breaking the contiguity assumption. Instead of extending the JIT, decompose into `concatenate([shrink(left), src, shrink(right)])` which fuses natively. |
-| ScatterAdd vmap: shared indices only            | Indices are 1-D `[updatesLen]`, same positions for all outer/inner. Per-batch indices can't be represented → vmap throws for `iBdim !== null`.                                                                                         |
-| DUS JVP via `linearTangentsJvp`                 | DUS is linear in both dst and src, so JVP is trivially `bind(Primitive.DUS, tangents, params)`. No hand-written rule needed.                                                                                                           |
-| All primitives have complete transform rules    | Pool, PoolTranspose, DUS, ScatterAdd all have JVP + transpose + vmap rules. No more stub `throw` in transform tables. `test/ad-gaps.test.ts` covers all 6 new rules.                                                                   |
+| Decision                                        | Rationale                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Non-consuming ownership model                   | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting                                                                                                                                                                                                                                                                                                                                            |
+| Concrete compilation + symbolic cache           | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                                                                                                                                                                                                                                                                                                                                                |
+| `effectDrivenAllocate` over two-pass            | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect                                                                                                                                                                                                                                                                                                                                           |
+| Direct LU→triSolve gradient path                | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                                                                                                                                                                                                                                                                                                                                            |
+| `transposeJaxprCache` is cache-owned            | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`                                                                                                                                                                                                                                                                                                                                                  |
+| `invariance` ≠ `strict` ESLint config           | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                                                                                                                                                                                                                                                                                                                              |
+| WASM `(start, end, ...ptrs)` signature          | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                                                                                                                                                                                                                                                                                                                                        |
+| WASM compiled Kogge-Stone (assocScan)           | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan`                                                                                                                                                                                                                                                                                                           |
+| M7.3 per-j indexed internal buffers             | Each worker sees `internal[idx] + j * internalSizes[idx]` — non-overlapping regions prevent races. Parallel path allocates `internalSize * N`, monolithic allocates `internalSize`                                                                                                                                                                                                                                                |
+| WASM compiled scan polymorphic length           | Length as runtime i32 param (arg 0); `NativeScanGeneralParams` no longer contains `length`; dispatch prepends length to args; `dimBindings` resolution uses `args[numConsts]`                                                                                                                                                                                                                                                     |
+| Mega-module rejects pass-through                | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes                                                                                                                                                                                                                                                                                                            |
+| `scatterAdd` exported from public API           | Exported from `src/index.ts` as of the tech debt audit.                                                                                                                                                                                                                                                                                                                                                                           |
+| M6.2 extracted-functions design                 | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension.                                                                                                                                                                                                                                                    |
+| Module Workers (`type: "module"`)               | Deno doesn't support classic blob-URL workers; module workers work in both Deno and Chromium. Applied to both `worker-pool.ts` and `orchestrator.ts`.                                                                                                                                                                                                                                                                             |
+| SAB constructability over `crossOriginIsolated` | `try { new SharedArrayBuffer(1) }` works in Deno (native SAB) and browsers (with COOP/COEP); `crossOriginIsolated` is browser-only and false in Deno.                                                                                                                                                                                                                                                                             |
+| Vitest SAB tests skipped, Deno covers           | Browser main threads can't spin-wait (blocks Worker message delivery). COOP/COEP headers enabled in vitest.config.ts, but orchestrator/pool skip via `Atomics.wait` probe. 8 Vitest tests skip, 17 Deno tests cover.                                                                                                                                                                                                              |
+| M7.3 lazy registration + monolithic fallback    | First call with N ≥ PARALLEL_THRESHOLD (4096): `pool.registerModule()` async + monolithic fallback. Subsequent: `pool.isModuleReady()` → parallel. Same pattern as mega-module.                                                                                                                                                                                                                                                   |
+| M7.4 WebGPU fused assocScan shader              | Interleaved ping/pong buffer layout packs all leaves into 2 GPU buffers. Custom bind group layout (not ShaderPipelineCache) because assocScan needs read-only ping + read-write pong + consts + uniforms — a layout not shared with any other shader type. Homogeneous dtype required across all leaves (single buffer type per binding). Transient ping/pong buffers created/destroyed within `dispatchAssocScan()`, not pooled. |
+| DUS vmap shrink+concat decomposition            | JIT `dus` step uses `copyBufferToBuffer` (axis=0 only). Vmap shifts axis 0→1, breaking the contiguity assumption. Instead of extending the JIT, decompose into `concatenate([shrink(left), src, shrink(right)])` which fuses natively.                                                                                                                                                                                            |
+| ScatterAdd vmap: shared indices only            | Indices are 1-D `[updatesLen]`, same positions for all outer/inner. Per-batch indices can't be represented → vmap throws for `iBdim !== null`.                                                                                                                                                                                                                                                                                    |
+| DUS JVP via `linearTangentsJvp`                 | DUS is linear in both dst and src, so JVP is trivially `bind(Primitive.DUS, tangents, params)`. No hand-written rule needed.                                                                                                                                                                                                                                                                                                      |
+| All primitives have complete transform rules    | Pool, PoolTranspose, DUS, ScatterAdd all have JVP + transpose + vmap rules. No more stub `throw` in transform tables. `test/ad-gaps.test.ts` covers all 6 new rules.                                                                                                                                                                                                                                                              |

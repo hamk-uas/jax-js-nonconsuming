@@ -60,6 +60,7 @@ import { Jaxpr, Lit, Var } from "./jaxpr";
 import { executeScan } from "./scan-executor";
 import type { AssocScanPlan, ScanPlan } from "./scan-plan";
 import { planAssociativeScan, planScan } from "./scan-plan";
+import type { WebGPUBackend } from "../backend/webgpu";
 import type { ScanPath } from "../utils";
 
 export type JitId = number;
@@ -617,6 +618,31 @@ export class JitProgram {
               constSlots,
               elemSlots,
               outputSlots,
+            );
+          } else if (step.plan.path === "webgpu-fused") {
+            // WebGPU fused path: entire Kogge-Stone ladder runs with
+            // one GPU dispatch per round (all body steps fused into
+            // a single WGSL shader). Ping-pong buffers swap each round.
+            const nDim = step.elemAvals[0].shape[step.axis];
+            const N = isSymbolicDim(nDim)
+              ? concreteDim(
+                  resolveShape([nDim], dimBindings!)[0],
+                  "assoc_scan N",
+                )
+              : (nDim as number);
+
+            const constSlots = step.consts.map((id) => scope.get(id)!);
+            const elemSlots = step.elems.map((id) => scope.get(id)!);
+            const outputSlots = step.outputs.map((id) => scope.get(id)!);
+
+            (this.backend as WebGPUBackend).dispatchAssocScan(
+              step.plan.prepared,
+              step.plan.params,
+              constSlots,
+              elemSlots,
+              outputSlots,
+              N,
+              step.reverse,
             );
           } else {
             // Fallback: JS Kogge-Stone loop via vmap + evalJaxpr

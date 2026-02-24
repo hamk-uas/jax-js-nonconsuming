@@ -15,6 +15,8 @@ import type {
   NativeScanMultiParams,
   NativeScanMultiStep,
   PreparedPreencodedScan,
+  PreparedWebGPUAssocScan,
+  WebGPUAssocScanParams,
 } from "../backend/webgpu";
 import type { WebGPUBackend } from "../backend/webgpu";
 import { Routine, Routines } from "../routine";
@@ -50,6 +52,11 @@ export type AssocScanPlan =
       path: "compiled-loop";
       executable: Executable;
       params: NativeAssocScanParams;
+    }
+  | {
+      path: "webgpu-fused";
+      prepared: PreparedWebGPUAssocScan;
+      params: WebGPUAssocScanParams;
     }
   | { path: "fallback" };
 
@@ -983,12 +990,10 @@ export function planAssociativeScan(
   numConsts: number,
   reverse: boolean,
 ): AssocScanPlan {
-  // Only WASM backend supports compiled-loop for assoc scan
-  if (backend.type !== "wasm") {
+  // Only WASM and WebGPU backends support native assoc scan
+  if (backend.type !== "wasm" && backend.type !== "webgpu") {
     if (DEBUG >= 1) {
-      console.log(
-        `[assoc-scan] skipping compiled-loop: backend is ${backend.type}, not wasm`,
-      );
+      console.log(`[assoc-scan] skipping native: backend is ${backend.type}`);
     }
     return { path: "fallback" };
   }
@@ -1126,11 +1131,14 @@ export function planAssociativeScan(
     });
   }
 
-  // Build per-element leaf sizes
+  // Build per-element leaf sizes (bytes) for WASM
   const leafElemSizes: number[] = [];
+  // Build per-element leaf counts (typed elements) for WebGPU
+  const leafElemCounts: number[] = [];
   for (let k = 0; k < numLeaves; k++) {
     const aval = bodyJaxpr.inBinders[numConsts + k].aval;
     leafElemSizes.push(aval.size * byteWidth(aval.dtype));
+    leafElemCounts.push(aval.size);
   }
 
   // Build const sizes
@@ -1140,6 +1148,70 @@ export function planAssociativeScan(
     constSizes.push(aval.size * byteWidth(aval.dtype));
   }
 
+  // --- WebGPU fused path ---
+  if (backend.type === "webgpu") {
+    // Determine the dtype — must be homogeneous across all leaves
+    const dtype0 = bodyJaxpr.inBinders[numConsts].aval.dtype;
+    let homogeneous = true;
+    for (let k = 1; k < numLeaves; k++) {
+      if (bodyJaxpr.inBinders[numConsts + k].aval.dtype !== dtype0) {
+        homogeneous = false;
+        break;
+      }
+    }
+    if (!homogeneous) {
+      if (DEBUG >= 1) {
+        console.log(
+          "[assoc-scan] skipping webgpu-fused: mixed dtypes across leaves",
+        );
+      }
+      return { path: "fallback" };
+    }
+
+    // Compute internal element counts (typed elements, not bytes)
+    const internalElemCounts = internalSizes.map((s) => s / byteWidth(dtype0));
+
+    // Build WebGPU-specific step list (shares same structure as GeneralScanStep
+    // but typed as AssocScanStep)
+    const webgpuSteps: import("../backend/webgpu").AssocScanStep[] = steps.map(
+      (s) => ({
+        kernel: s.source as Kernel,
+        inputSlots: s.inputSlots,
+        outputInternalIdx: s.outputInternalIdx,
+      }),
+    );
+
+    const webgpuParams: WebGPUAssocScanParams = {
+      numConsts,
+      numLeaves,
+      leafElemCounts,
+      steps: webgpuSteps,
+      internalElemCounts,
+      reverse,
+      leafToInternalIdx,
+      dtype: dtype0,
+    };
+
+    try {
+      const webgpuBackend = backend as WebGPUBackend;
+      const prepared = webgpuBackend.prepareAssocScan(webgpuParams);
+      if (prepared) {
+        if (DEBUG >= 1) {
+          console.log(
+            `[assoc-scan] SUCCESS! Using WebGPU fused with ${webgpuSteps.length} step(s)`,
+          );
+        }
+        return { path: "webgpu-fused", prepared, params: webgpuParams };
+      }
+    } catch (e) {
+      if (DEBUG >= 2) {
+        console.warn("[assoc-scan] WebGPU fused compilation failed:", e);
+      }
+    }
+    return { path: "fallback" };
+  }
+
+  // --- WASM compiled-loop path ---
   const params: NativeAssocScanParams = {
     numConsts,
     constSizes,

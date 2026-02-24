@@ -80,6 +80,63 @@ export interface NativeScanMultiParams {
 }
 
 // ---------------------------------------------------------------------------
+// Types for WebGPU native associative scan (fused Kogge-Stone)
+// ---------------------------------------------------------------------------
+
+/** A reindexed kernel step for the associative scan body. */
+export interface AssocScanStep {
+  /** Reindexed kernel (gids relative to [consts, a-leaves, b-leaves, internals]). */
+  kernel: Kernel;
+  /** Input mapping for this step. */
+  inputSlots: number[];
+  /** Which internal buffer this step writes to. */
+  outputInternalIdx: number;
+}
+
+/**
+ * Parameters for WebGPU fused associative scan.
+ * The shader fuses all body kernel steps into a single dispatch per
+ * Kogge-Stone round, reducing from ~20 dispatches/round to 1.
+ */
+export interface WebGPUAssocScanParams {
+  /** Number of constant inputs. */
+  numConsts: number;
+  /** Number of pytree leaves. */
+  numLeaves: number;
+  /** Per-leaf element count in typed values (e.g. 16 for a 4×4 f32 matrix). */
+  leafElemCounts: number[];
+  /** Body kernel steps with reindexed gids. */
+  steps: AssocScanStep[];
+  /** Typed element counts for internal buffers. */
+  internalElemCounts: number[];
+  /** Whether to reverse the scan direction. */
+  reverse: boolean;
+  /**
+   * Mapping from output leaf index to internal buffer index.
+   * leafToInternalIdx[k] = the internal buffer that produces leaf k.
+   */
+  leafToInternalIdx: number[];
+  /** dtype for all leaves (must be homogeneous). */
+  dtype: DType;
+}
+
+/**
+ * Prepared WebGPU fused associative scan — ready to dispatch.
+ */
+export interface PreparedWebGPUAssocScan {
+  /** Compiled compute pipeline for one Kogge-Stone round. */
+  pipeline: GPUComputePipeline;
+  /** Bind group layout for storage bindings (ping, pong, consts). */
+  storageLayout: GPUBindGroupLayout;
+  /** Bind group layout for uniform bindings (stride, N). */
+  uniformLayout: GPUBindGroupLayout;
+  /** Workgroup size for dispatches. */
+  workgroupSize: number;
+  /** Shader source code (for debugging). */
+  code: string;
+}
+
+// ---------------------------------------------------------------------------
 // Types for WebGPU preencoded-routine scan (P4)
 // ---------------------------------------------------------------------------
 
@@ -616,6 +673,339 @@ export class WebGPUBackend implements Backend {
       }
     }
     this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fused associative scan methods (WebGPU Kogge-Stone)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compile the fused Kogge-Stone shader and create a reusable pipeline.
+   *
+   * Returns `PreparedWebGPUAssocScan` containing the pipeline plus the
+   * precomputed bind group layout. The pipeline is cached by shader source.
+   */
+  prepareAssocScan(
+    params: WebGPUAssocScanParams,
+  ): PreparedWebGPUAssocScan | null {
+    try {
+      const { code, workgroupSize } = assocScanFusedShaderSource(
+        this.device,
+        params,
+      );
+
+      if (DEBUG >= 2) {
+        console.info(
+          "=========== WebGPU assocScan shader ===========\n" + code,
+        );
+      }
+
+      // Build bind group layout:
+      //   group(0): ping (read), pong (read_write), const0..constK (read)
+      //   group(1): uniforms (uniform, hasDynamicOffset=false)
+      const { numConsts } = params;
+      const storageEntries: GPUBindGroupLayoutEntry[] = [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "read-only-storage" },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "storage" },
+        },
+      ];
+      for (let i = 0; i < numConsts; i++) {
+        storageEntries.push({
+          binding: i + 2,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "read-only-storage" },
+        });
+      }
+      const storageLayout = this.device.createBindGroupLayout({
+        entries: storageEntries,
+      });
+      const uniformLayout = this.device.createBindGroupLayout({
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "uniform" },
+          },
+        ],
+      });
+      const pipelineLayout = this.device.createPipelineLayout({
+        bindGroupLayouts: [storageLayout, uniformLayout],
+      });
+
+      const shaderModule = this.device.createShaderModule({ code });
+      const pipeline = this.device.createComputePipeline({
+        layout: pipelineLayout,
+        compute: { module: shaderModule, entryPoint: "main" },
+      });
+
+      return {
+        pipeline,
+        storageLayout,
+        uniformLayout,
+        workgroupSize,
+        code,
+      };
+    } catch (e) {
+      if (DEBUG >= 1) {
+        console.warn("WebGPU assocScan codegen failed:", e);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Execute the full Kogge-Stone scan: ceil(log₂ N) dispatches of the
+   * fused shader, swapping ping/pong buffers each round.
+   *
+   * @param prepared  Compiled pipeline from `prepareAssocScan()`
+   * @param params    Scan parameters (leaf info, steps, etc.)
+   * @param constSlots  Constant input slots (backend Slots)
+   * @param elemSlots   Input leaf element slots (one per leaf)
+   * @param outputSlots Output slots (one per leaf, caller-allocated)
+   * @param N           Number of positions (scan length)
+   * @param reverse     Whether to process in reverse order
+   */
+  dispatchAssocScan(
+    prepared: PreparedWebGPUAssocScan,
+    params: WebGPUAssocScanParams,
+    constSlots: Slot[],
+    elemSlots: Slot[],
+    outputSlots: Slot[],
+    N: number,
+    reverse: boolean,
+  ): void {
+    const { numLeaves, leafElemCounts, dtype } = params;
+    const bytesPerElem = byteWidth(dtype);
+
+    // Compute total interleaved buffer size:
+    // sum(leafElemCounts) * N * bytesPerElem
+    const totalElemsPerPos = leafElemCounts.reduce((a, b) => a + b, 0);
+    const totalBytes = totalElemsPerPos * N * bytesPerElem;
+    const paddedBytes = Math.max(Math.ceil(totalBytes / 4) * 4, 4);
+
+    // Allocate transient ping/pong GPU buffers
+    const pingBuf = this.#createBuffer(paddedBytes);
+    const pongBuf = this.#createBuffer(paddedBytes);
+
+    // Compute leaf start offsets (prefix sum of elemCounts)
+    const leafStarts: number[] = [0];
+    for (let k = 1; k < numLeaves; k++) {
+      leafStarts[k] = leafStarts[k - 1] + leafElemCounts[k - 1];
+    }
+
+    // Create const GPU buffers array
+    const constBuffers = constSlots.map((slot) => this.#getBuffer(slot).buffer);
+
+    // Copy input elems into ping buffer (interleaved layout)
+    // For each leaf k, copy elemSlots[k] → ping at offset leafStarts[k]*N*bytesPerElem
+    // Each elemSlot[k] has shape [N, ...leafShape], stored contiguously as
+    // N * leafElemCounts[k] typed elements — this matches our interleaved layout
+    // [leaf0: N*ec0 | leaf1: N*ec1 | ...]
+    const commandEncoder = this.device.createCommandEncoder();
+    for (let k = 0; k < numLeaves; k++) {
+      const srcBuf = this.#getBuffer(elemSlots[k]).buffer;
+      const dstOffset = leafStarts[k] * N * bytesPerElem;
+      const copySize = leafElemCounts[k] * N * bytesPerElem;
+      if (copySize > 0 && copySize % 4 === 0) {
+        commandEncoder.copyBufferToBuffer(
+          srcBuf,
+          0,
+          pingBuf,
+          dstOffset,
+          copySize,
+        );
+      } else if (copySize > 0) {
+        // Unaligned copy — use the WGSL copy shader
+        this.#encodeCopyWithShader(
+          commandEncoder,
+          srcBuf,
+          0,
+          pingBuf,
+          dstOffset,
+          copySize,
+        );
+      }
+    }
+
+    // If reverse, we need to reverse the input data along the scan axis.
+    // Approach: reverse at copy-in by writing position j as (N-1-j) in the output,
+    // but that would require a shader. Simpler: reverse the output at the end.
+    // For now we reverse at copy-in/copy-out with dedicated reversal dispatches.
+    // Actually, since the scan body fn is associative, we can just reverse
+    // input, scan forward, reverse output. But that adds 2 extra dispatches.
+    // Better approach: modify the shader to swap a_pos logic.
+    // For simple implementation, handle reverse by reversing copy-in and copy-out.
+    // TODO: For better perf, generate a reverse-aware shader variant.
+
+    this.device.queue.submit([commandEncoder.finish()]);
+
+    // If reverse, we need to flip the data in the ping buffer
+    if (reverse && N > 1) {
+      this.#reverseAssocScanBuffer(
+        pingBuf,
+        N,
+        numLeaves,
+        leafElemCounts,
+        leafStarts,
+        bytesPerElem,
+      );
+    }
+
+    // Kogge-Stone: ceil(log₂ N) rounds
+    const numRounds = Math.ceil(Math.log2(N));
+
+    // Alternate which buffer is ping (read) and which is pong (write)
+    let curPing = pingBuf;
+    let curPong = pongBuf;
+
+    for (let round = 0; round < numRounds; round++) {
+      const stride = 1 << round;
+
+      // Create uniform buffer with stride and N
+      const uniformData = new Uint32Array([stride, N]);
+      const minAlign = this.device.limits.minUniformBufferOffsetAlignment;
+      const uniformSize = Math.max(
+        Math.ceil(uniformData.byteLength / minAlign) * minAlign,
+        uniformData.byteLength,
+      );
+      const uniformBuf = this.device.createBuffer({
+        size: uniformSize,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(
+        uniformBuf,
+        0,
+        uniformData.buffer,
+        0,
+        uniformData.byteLength,
+      );
+
+      // Create bind groups
+      const storageEntries: GPUBindGroupEntry[] = [
+        { binding: 0, resource: { buffer: curPing } },
+        { binding: 1, resource: { buffer: curPong } },
+      ];
+      for (let i = 0; i < constBuffers.length; i++) {
+        storageEntries.push({
+          binding: i + 2,
+          resource: { buffer: constBuffers[i] },
+        });
+      }
+      const storageBindGroup = this.device.createBindGroup({
+        layout: prepared.storageLayout,
+        entries: storageEntries,
+      });
+      const uniformBindGroup = this.device.createBindGroup({
+        layout: prepared.uniformLayout,
+        entries: [{ binding: 0, resource: { buffer: uniformBuf } }],
+      });
+
+      // Dispatch
+      const wgSize = prepared.workgroupSize;
+      const numWorkgroups = Math.ceil(N / wgSize);
+      const [gridX, gridY] = calculateGrid(numWorkgroups);
+
+      const enc = this.device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(prepared.pipeline);
+      pass.setBindGroup(0, storageBindGroup);
+      pass.setBindGroup(1, uniformBindGroup);
+      pass.dispatchWorkgroups(gridX, gridY);
+      pass.end();
+      this.device.queue.submit([enc.finish()]);
+
+      uniformBuf.destroy();
+
+      // Swap ping/pong
+      const tmp = curPing;
+      curPing = curPong;
+      curPong = tmp;
+    }
+
+    // After all rounds, result is in curPing (last write target became ping after swap)
+
+    // If reverse, flip the result data back
+    if (reverse && N > 1) {
+      this.#reverseAssocScanBuffer(
+        curPing,
+        N,
+        numLeaves,
+        leafElemCounts,
+        leafStarts,
+        bytesPerElem,
+      );
+    }
+
+    // Copy results from ping buffer (interleaved) to output slots
+    const outEncoder = this.device.createCommandEncoder();
+    for (let k = 0; k < numLeaves; k++) {
+      const dstBuf = this.#getBuffer(outputSlots[k]).buffer;
+      const srcOffset = leafStarts[k] * N * bytesPerElem;
+      const copySize = leafElemCounts[k] * N * bytesPerElem;
+      if (copySize > 0 && copySize % 4 === 0) {
+        outEncoder.copyBufferToBuffer(curPing, srcOffset, dstBuf, 0, copySize);
+      } else if (copySize > 0) {
+        this.#encodeCopyWithShader(
+          outEncoder,
+          curPing,
+          srcOffset,
+          dstBuf,
+          0,
+          copySize,
+        );
+      }
+    }
+    this.device.queue.submit([outEncoder.finish()]);
+
+    // Destroy transient buffers
+    pingBuf.destroy();
+    pongBuf.destroy();
+    this.#gpuAllocatedBytes -= paddedBytes * 2;
+  }
+
+  /**
+   * Reverse elements along the scan axis (position 0..N-1) in an interleaved
+   * buffer. Uses a simple GPU copy shader: position j ↔ position (N-1-j).
+   */
+  #reverseAssocScanBuffer(
+    buffer: GPUBuffer,
+    N: number,
+    numLeaves: number,
+    leafElemCounts: number[],
+    leafStarts: number[],
+    bytesPerElem: number,
+  ): void {
+    // Create a temp buffer, copy reversed, copy back
+    const totalElemsPerPos = leafElemCounts.reduce((a, b) => a + b, 0);
+    const totalBytes = totalElemsPerPos * N * bytesPerElem;
+    const paddedBytes = Math.max(Math.ceil(totalBytes / 4) * 4, 4);
+    const tempBuf = this.#createBuffer(paddedBytes);
+
+    const enc = this.device.createCommandEncoder();
+    for (let k = 0; k < numLeaves; k++) {
+      const ec = leafElemCounts[k];
+      const leafOffset = leafStarts[k] * N * bytesPerElem;
+      const elemBytes = ec * bytesPerElem;
+      for (let j = 0; j < N; j++) {
+        const srcOff = leafOffset + j * elemBytes;
+        const dstOff = leafOffset + (N - 1 - j) * elemBytes;
+        if (elemBytes % 4 === 0) {
+          enc.copyBufferToBuffer(buffer, srcOff, tempBuf, dstOff, elemBytes);
+        }
+      }
+    }
+    // Copy temp back to buffer
+    enc.copyBufferToBuffer(tempBuf, 0, buffer, 0, paddedBytes);
+    this.device.queue.submit([enc.finish()]);
+    tempBuf.destroy();
+    this.#gpuAllocatedBytes -= paddedBytes;
   }
 
   // ---------------------------------------------------------------------------
@@ -2513,6 +2903,401 @@ function nativeScanMultiShaderSource(
     hasUniform: false,
     passes: [{ grid: [gridX, gridY] }],
   };
+}
+
+// ---------------------------------------------------------------------------
+// Fused associative scan shader (WebGPU Kogge-Stone)
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate a WGSL expression for an associative scan body kernel step.
+ *
+ * Maps GlobalIndex gids to:
+ *   - gid < numConsts         → const{gid}[idx]
+ *   - gid ∈ [numConsts, numConsts+numLeaves)  → "a" leaf: ping at position (gidx - stride)
+ *   - gid ∈ [numConsts+numLeaves, numConsts+2*numLeaves) → "b" leaf: ping at position gidx
+ *   - gid ≥ numInputs         → internal_N[idx] (private array)
+ *
+ * Ping buffer layout: [leaf0: N * elemCount0][leaf1: N * elemCount1]...
+ * Leaf k at position j, sub-index idx: ping[leafStart_k * uniforms.N + j * elemCount_k + idx]
+ */
+function genAssocScanExpression(
+  exp: AluExp,
+  _dtype: DType,
+  numConsts: number,
+  numLeaves: number,
+  leafElemCounts: number[],
+  _internalElemCounts: number[],
+): string {
+  const numInputs = numConsts + 2 * numLeaves;
+
+  // Compute prefix sums for leaf start offsets (in typed elements relative to N=1).
+  // leafStarts[k] = sum of leafElemCounts[0..k-1]
+  const leafStarts: number[] = [0];
+  for (let k = 1; k < numLeaves; k++) {
+    leafStarts[k] = leafStarts[k - 1] + leafElemCounts[k - 1];
+  }
+
+  const gen = (e: AluExp): string => {
+    const { op, src, dtype: eDtype, arg } = e;
+
+    if (op === AluOp.GlobalIndex) {
+      const gid = arg[0] as number;
+      const idxCode = gen(src[0]);
+
+      if (gid < numConsts) {
+        // Constant buffer
+        const access = `const${gid}[${idxCode}]`;
+        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      } else if (gid < numConsts + numLeaves) {
+        // "a" leaf — read from ping at position (gidx - stride)
+        const leafIdx = gid - numConsts;
+        const elemCount = leafElemCounts[leafIdx];
+        const start = leafStarts[leafIdx];
+        const access = `ping[${start}u * uniforms.N + u32(a_pos) * ${elemCount}u + u32(${idxCode})]`;
+        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      } else if (gid < numInputs) {
+        // "b" leaf — read from ping at position gidx
+        const leafIdx = gid - numConsts - numLeaves;
+        const elemCount = leafElemCounts[leafIdx];
+        const start = leafStarts[leafIdx];
+        const access = `ping[${start}u * uniforms.N + u32(gidx) * ${elemCount}u + u32(${idxCode})]`;
+        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      } else {
+        // Internal buffer (var<private>)
+        const intIdx = gid - numInputs;
+        const access = `internal_${intIdx}[${idxCode}]`;
+        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      }
+    }
+
+    if (op === AluOp.Const) return constToWgsl(eDtype, arg);
+
+    if (op === AluOp.Special) {
+      const name = Array.isArray(arg) ? arg[0] : arg;
+      if (name === "gidx") return "gidx";
+      if (name === "ridx") return "ridx";
+      return name as string;
+    }
+
+    if (op === AluOp.Variable) {
+      if (arg === "acc") return "acc";
+      if (arg === "gidx") return "gidx";
+      if (arg === "ridx") return "ridx";
+      return arg as string;
+    }
+
+    if (op === AluOp.Erf || op === AluOp.Erfc) {
+      const funcName = op === AluOp.Erf ? "erf" : "erfc";
+      const a = strip1(gen(src[0]));
+      if (eDtype !== DType.Float32) {
+        return `${dtypeToWgsl(eDtype)}(${funcName}(f32(${a})))`;
+      }
+      return `${funcName}(${a})`;
+    }
+
+    if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
+      const a = gen(src[0]);
+      const b = gen(src[1]);
+      if (op === AluOp.Add) {
+        return eDtype === DType.Bool ? `(${a} || ${b})` : `(${a} + ${b})`;
+      }
+      if (op === AluOp.Sub) return `(${a} - ${b})`;
+      if (op === AluOp.Mul) {
+        return eDtype === DType.Bool ? `(${a} && ${b})` : `(${a} * ${b})`;
+      }
+      if (op === AluOp.Idiv) {
+        return isFloatDtype(eDtype) ? `trunc(${a} / ${b})` : `(${a} / ${b})`;
+      }
+      if (op === AluOp.Mod) return `(${a} % ${b})`;
+      if (op === AluOp.Min) {
+        return eDtype === DType.Bool
+          ? `(${a} && ${b})`
+          : `min(${strip1(a)}, ${strip1(b)})`;
+      }
+      if (op === AluOp.Max) {
+        return eDtype === DType.Bool
+          ? `(${a} || ${b})`
+          : `max(${strip1(a)}, ${strip1(b)})`;
+      }
+      if (op === AluOp.Cmplt) return `(${a} < ${b})`;
+      if (op === AluOp.Cmpne) return `(${a} != ${b})`;
+    }
+
+    if (AluGroup.Unary.has(op)) {
+      const a = gen(src[0]);
+      if (op === AluOp.Sin) return `sin(${strip1(a)})`;
+      if (op === AluOp.Cos) return `cos(${strip1(a)})`;
+      if (op === AluOp.Asin) return `asin(${strip1(a)})`;
+      if (op === AluOp.Atan) return `atan(${strip1(a)})`;
+      if (op === AluOp.Exp) return `exp(${strip1(a)})`;
+      if (op === AluOp.Log) return `log(${strip1(a)})`;
+      if (op === AluOp.Sqrt) return `sqrt(${strip1(a)})`;
+      if (op === AluOp.Reciprocal) return `(1.0 / ${a})`;
+      if (op === AluOp.Floor) return `floor(${strip1(a)})`;
+      if (op === AluOp.Ceil) return `ceil(${strip1(a)})`;
+      if (op === AluOp.Cast) return `${dtypeToWgsl(eDtype)}(${strip1(a)})`;
+      if (op === AluOp.Bitcast) {
+        return `bitcast<${dtypeToWgsl(eDtype)}>(${strip1(a)})`;
+      }
+    }
+
+    if (op === AluOp.Where) {
+      return `select(${strip1(gen(src[2]))}, ${strip1(gen(src[1]))}, ${strip1(gen(src[0]))})`;
+    }
+
+    throw new Error(`genAssocScanExpression: unsupported op ${AluOp[op]}`);
+  };
+
+  return strip1(gen(exp));
+}
+
+/**
+ * Generate WGSL shader source for one Kogge-Stone round of a fused
+ * associative scan. Each GPU thread processes one element position:
+ *
+ *   if gidx >= stride:
+ *     result = fn(ping[gidx - stride], ping[gidx])
+ *     pong[gidx] = result
+ *   else:
+ *     pong[gidx] = ping[gidx]  (copy)
+ *
+ * Buffer layout (ping and pong):
+ *   [leaf0: N * elemCount0 | leaf1: N * elemCount1 | ...]
+ *
+ * Bindings:
+ *   group(0) binding(0):     ping (storage, read)
+ *   group(0) binding(1):     pong (storage, read_write)
+ *   group(0) binding(2..2+K): const0..constK (storage, read)
+ *   group(1) binding(0):     uniforms { stride: u32, N: u32 }
+ */
+function assocScanFusedShaderSource(
+  device: GPUDevice,
+  params: WebGPUAssocScanParams,
+): { code: string; workgroupSize: number } {
+  const {
+    numConsts,
+    numLeaves,
+    leafElemCounts,
+    steps,
+    internalElemCounts,
+    leafToInternalIdx,
+    dtype,
+  } = params;
+
+  const resultTy = dtypeToWgsl(dtype, true);
+
+  // Compute max per-position elements across all leaves for thread count
+  // Compute leaf start offsets (prefix sum of elemCounts)
+  const leafStarts: number[] = [0];
+  for (let k = 1; k < numLeaves; k++) {
+    leafStarts[k] = leafStarts[k - 1] + leafElemCounts[k - 1];
+  }
+
+  const { emit, pushIndent, popIndent, getCode } = createShaderEmitter();
+
+  if (dtype === DType.Float16) {
+    if (!device.features.has("shader-f16")) {
+      throw new Error("WebGPU device does not support shader-f16 feature");
+    }
+    emit("enable f16;");
+  }
+
+  emit(headerWgsl);
+
+  // Collect ops that need global function definitions
+  const allDistinctOps = new Set<AluOp>();
+  for (const step of steps) {
+    const tune = tuneNullopt(step.kernel);
+    for (const [op] of tune.exp.distinctOps()) allDistinctOps.add(op);
+    if (tune.epilogue) {
+      for (const [op] of tune.epilogue.distinctOps()) allDistinctOps.add(op);
+    }
+  }
+  if (allDistinctOps.has(AluOp.Threefry2x32)) emit(threefrySrc);
+  if (allDistinctOps.has(AluOp.Erf) || allDistinctOps.has(AluOp.Erfc)) {
+    emit(erfSrc);
+  }
+
+  emit("");
+
+  // Uniform struct
+  emit("struct AssocScanUniforms {");
+  emit("  stride: u32,");
+  emit("  N: u32,");
+  emit("}");
+  emit("");
+
+  // Buffer bindings
+  emit(`@group(0) @binding(0) var<storage, read> ping: array<${resultTy}>;`);
+  emit(
+    `@group(0) @binding(1) var<storage, read_write> pong: array<${resultTy}>;`,
+  );
+  for (let i = 0; i < numConsts; i++) {
+    emit(
+      `@group(0) @binding(${i + 2}) var<storage, read> const${i}: array<${resultTy}>;`,
+    );
+  }
+  emit("@group(1) @binding(0) var<uniform> uniforms: AssocScanUniforms;");
+  emit("");
+
+  // Compute shader
+  // Each thread handles one "position" in the scan, but iterates over
+  // all sub-elements within that position (multiple leaves, each with
+  // multiple typed elements).
+  const workgroupSize = 256;
+
+  emit(`@compute @workgroup_size(${workgroupSize})`);
+  emit("fn main(@builtin(global_invocation_id) id: vec3<u32>) {");
+  emit(pushIndent);
+  emit("let gidx = i32(id.x);");
+  emit("if (u32(gidx) >= uniforms.N) { return; }");
+  emit("");
+
+  // Declare private internal buffers for intermediate step results
+  for (let i = 0; i < internalElemCounts.length; i++) {
+    const count = internalElemCounts[i];
+    emit(`var internal_${i}: array<${resultTy}, ${count}>;`);
+  }
+
+  emit("");
+  emit("let a_pos = gidx - i32(uniforms.stride);");
+  emit("");
+
+  emit("if (a_pos >= 0) {");
+  emit(pushIndent);
+
+  // Execute all body steps — this is the fused fn(a, b) computation
+  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+    const step = steps[stepIdx];
+    const kernel = step.kernel;
+    const tune = tuneNullopt(kernel);
+    const kernelSize =
+      typeof kernel.size === "number"
+        ? kernel.size
+        : (kernel.concreteSizeHint ?? 1);
+
+    emit(`// Step ${stepIdx}`);
+
+    const re = kernel.outputs[0].reduction;
+    if (re) {
+      // Reduction kernel
+      const accTy = dtypeToWgsl(re.dtype, true);
+      const redSize =
+        typeof tune.size.reduce === "number"
+          ? tune.size.reduce
+          : (re.concreteHint ?? Number(tune.size.reduce));
+      emit(`{`);
+      emit(pushIndent);
+      emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
+      emit(`for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`, pushIndent);
+
+      const expCode = genAssocScanExpression(
+        tune.exp,
+        dtype,
+        numConsts,
+        numLeaves,
+        leafElemCounts,
+        internalElemCounts,
+      );
+      emit(`let val = ${expCode};`);
+
+      if (re.op === AluOp.Add) emit(`acc = acc + val;`);
+      else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
+      else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
+      else if (re.op === AluOp.Max) emit(`acc = max(acc, val);`);
+      else throw new Error(`Unsupported reduction op: ${re.op}`);
+
+      emit(popIndent, "}");
+
+      const epilogueCode = genAssocScanExpression(
+        tune.epilogue!,
+        dtype,
+        numConsts,
+        numLeaves,
+        leafElemCounts,
+        internalElemCounts,
+      );
+      emit(`internal_${step.outputInternalIdx}[0] = ${epilogueCode};`);
+      emit(popIndent, "}");
+    } else {
+      // Elementwise kernel — iterate over sub-elements
+      if (kernelSize > 1) {
+        emit(`for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`);
+        emit(pushIndent);
+
+        // Substitute gidx → eidx for sub-element access
+        const substExp = tune.exp.substitute({
+          gidx: AluExp.special(DType.Int32, "eidx", kernelSize),
+        });
+        const expCode = genAssocScanExpression(
+          substExp,
+          dtype,
+          numConsts,
+          numLeaves,
+          leafElemCounts,
+          internalElemCounts,
+        );
+        emit(`internal_${step.outputInternalIdx}[eidx] = ${expCode};`);
+        emit(popIndent, "}");
+      } else {
+        const expCode = genAssocScanExpression(
+          tune.exp,
+          dtype,
+          numConsts,
+          numLeaves,
+          leafElemCounts,
+          internalElemCounts,
+        );
+        emit(`internal_${step.outputInternalIdx}[0] = ${expCode};`);
+      }
+    }
+    emit("");
+  }
+
+  // Write results from internal buffers to pong
+  for (let k = 0; k < numLeaves; k++) {
+    const intIdx = leafToInternalIdx[k];
+    const elemCount = leafElemCounts[k];
+    const start = leafStarts[k];
+    if (elemCount > 1) {
+      emit(`for (var wi: u32 = 0u; wi < ${elemCount}u; wi++) {`);
+      emit(pushIndent);
+      emit(
+        `pong[${start}u * uniforms.N + u32(gidx) * ${elemCount}u + wi] = internal_${intIdx}[wi];`,
+      );
+      emit(popIndent, "}");
+    } else {
+      emit(`pong[${start}u * uniforms.N + u32(gidx)] = internal_${intIdx}[0];`);
+    }
+  }
+
+  emit(popIndent, "} else {");
+  emit(pushIndent);
+
+  // Copy: pong[gidx] = ping[gidx] for all leaf elements
+  emit("// Copy: position before stride, no fn application");
+  for (let k = 0; k < numLeaves; k++) {
+    const elemCount = leafElemCounts[k];
+    const start = leafStarts[k];
+    if (elemCount > 1) {
+      emit(`for (var ci: u32 = 0u; ci < ${elemCount}u; ci++) {`);
+      emit(pushIndent);
+      emit(
+        `pong[${start}u * uniforms.N + u32(gidx) * ${elemCount}u + ci] = ping[${start}u * uniforms.N + u32(gidx) * ${elemCount}u + ci];`,
+      );
+      emit(popIndent, "}");
+    } else {
+      emit(
+        `pong[${start}u * uniforms.N + u32(gidx)] = ping[${start}u * uniforms.N + u32(gidx)];`,
+      );
+    }
+  }
+
+  emit(popIndent, "}");
+  emit(popIndent, "}");
+
+  return { code: getCode(), workgroupSize };
 }
 
 function pipelineSubmit(

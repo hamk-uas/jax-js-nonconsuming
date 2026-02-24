@@ -11,23 +11,17 @@
 // fusion via JIT (ceil(log₂ N) dispatch roundtrips instead of N).
 //
 // Backend performance notes:
-//   WebGPU: ceil(log₂ N) JS-driven kernel dispatches total — one per
-//     Kogge-Stone round. The JIT graph forces each round's `fn` output to
-//     be materialized before `Concatenate` (which requires clean inputs),
-//     yielding one dispatch per round for elementwise `fn`; reductions in
-//     `fn` (e.g., matmul, sum) add extra dispatches per round.
-//     This count is the hardware-imposed floor: Kogge-Stone requires all
-//     threads to see round k's complete results before round k+1 begins,
-//     and WebGPU provides no cross-workgroup global barrier — a
-//     single-dispatch compiled-loop is architecturally impossible.
-//     For large N, ceil(log₂ N) × dispatch_cost << N × per_iter_GPU_cost,
-//     so associativeScan is still significantly faster than lax.scan
-//     fallback (measured ~5–8× for N=65536 scalar prefix product).
-//   WASM: each round is a separate JS→WASM kernel call plus a concat
-//     allocation per leaf. lax.scan's compiled-loop runs the full N-step
-//     loop in a single WASM invocation (~62M iter/sec), making it faster
-//     than associativeScan for all practical N on WASM. There is no
-//     WASM-native compiled path for associativeScan today.
+//   WebGPU (M7.4 fused): All body kernel steps fused into a single WGSL
+//     compute shader per Kogge-Stone round. Leaves are interleaved into
+//     ping/pong buffers; JS drives ceil(log₂ N) rounds, each requiring
+//     exactly 1 GPU dispatch regardless of body complexity. This is the
+//     hardware-imposed floor: Kogge-Stone needs a global barrier between
+//     rounds, and WebGPU has no cross-workgroup barrier within a single
+//     dispatch. Requires all leaves to share the same dtype (homogeneous).
+//   WASM (M7.2 compiled-loop + M7.3 parallel): Full Kogge-Stone ladder
+//     compiled into a single WASM module with N as runtime i32 parameter.
+//     M7.3 adds parallel inner-round dispatch via WasmWorkerPool for
+//     N ≥ 4096. O(N log N) total work vs scan's O(N).
 //   CPU: same JS-loop overhead as WASM; lax.scan is faster.
 //   WebGL: no compiled-loop for scan (uses JS fallback), so assocScan's
 //     O(log N) shader dispatches may be competitive — untested.

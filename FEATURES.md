@@ -554,7 +554,8 @@ A few functions in `jax.lax` have been implemented:
 - `associativeScan()` for parallel prefix scans via any associative binary operator (Kogge-Stone
   O(log N) depth algorithm, supports pytrees, arbitrary axis, reverse, and full autodiff; WASM
   compiled-loop compiles entire Kogge-Stone ladder into a single WASM module with polymorphic N;
-  eager mode uses a cached whole-call JIT wrapper outside abstract tracing)
+  WebGPU fused shader packs all body kernel steps into a single GPU dispatch per round; eager mode
+  uses a cached whole-call JIT wrapper outside abstract tracing)
 - `linalg.triangular_solve()` for triangular system solving
 
 In the future, the library may need a rework to add support for more `lax` operations, which are
