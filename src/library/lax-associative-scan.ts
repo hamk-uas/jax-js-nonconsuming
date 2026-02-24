@@ -361,7 +361,31 @@ export function associativeScan<T extends JsTree<Array>>(
     setScanBodyTraceActive(false);
   }
 
-  // 5. Emit primitive
+  // 4b. Validate body output shapes match input shapes.
+  // Constants like reshape(eye, [1,m,m]) can broadcast per-element [m,m]
+  // outputs to [1,m,m], which vmap then inflates to [batch,1,m,m] — shape
+  // mismatch at the Kogge-Stone concatenation. Fall back when this happens.
+  {
+    const bodyOuts = closedJaxpr.jaxpr.outs;
+    const shapeOk = bodyOuts.every((out, i) => {
+      const expected = elemAvals[i % numLeaves].shape;
+      const actual = out.aval.shape;
+      return (
+        actual.length === expected.length &&
+        actual.every((d, j) => d === expected[j])
+      );
+    });
+    if (!shapeOk) {
+      closedJaxpr.dispose();
+      for (let i = 0; i < movedElems.length; i++) {
+        if (movedOwned[i]) movedElems[i].dispose();
+      }
+      return associativeScanCore(fn, elems, { axis, reverse }) as T;
+    }
+  }
+
+  // 5. Emit primitive (closedJaxpr is live here — early return above if !shapeOk)
+  /* eslint-disable jax-js/no-use-after-dispose */
   const results = bind(
     Primitive.AssociativeScan,
     [...closedJaxpr.consts, ...movedElems],
@@ -375,6 +399,7 @@ export function associativeScan<T extends JsTree<Array>>(
 
   // 6. Cleanup
   closedJaxpr.dispose();
+  /* eslint-enable jax-js/no-use-after-dispose */
   for (let i = 0; i < movedElems.length; i++) {
     if (movedOwned[i]) movedElems[i].dispose();
   }

@@ -471,7 +471,7 @@ Most operations behave the same way as they do in JAX.
 | `vectorize`           | 🟠      |                                              |
 | `vsplit`              | 🟠      | `split` is supported                         |
 | `vstack`              | 🟢      |                                              |
-| `where`               | 🟢      |                                              |
+| `where`               | 🟢      | AD through condition not yet supported       |
 | `zeros`               | 🟢      |                                              |
 | `zeros_like`          | 🟢      |                                              |
 

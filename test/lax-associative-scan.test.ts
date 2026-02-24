@@ -214,6 +214,62 @@ describe("lax.associativeScan — pytree (affine composition)", () => {
 });
 
 // ============================================================================
+// Constants with leading-1 dimension (issue: vmap-constant-shape)
+// ============================================================================
+
+describe("lax.associativeScan — [1,m,m] constant shape", () => {
+  test("compose with [1,m,m] constant inside body does not crash", () => {
+    const m = 2;
+    const N = 6;
+    // Simple compose: result = I + a.C @ b.C
+    // The [1,m,m] reshape is the trigger — without the fix, vmap produces
+    // [batch,1,m,m] outputs causing a concatenate shape mismatch.
+    const compose = (
+      a: { A: np.Array; C: np.Array },
+      b: { A: np.Array; C: np.Array },
+    ) => {
+      using eye = np.eye(m);
+      using I1 = np.reshape(eye, [1, m, m]);
+      using prod = np.matmul(a.C, b.C);
+      const newC = np.add(I1, prod) as np.Array;
+      const newA = np.matmul(b.A, a.A) as np.Array;
+      return { A: newA, C: newC };
+    };
+
+    using flatA = np.ones([N * m * m]);
+    using A = np.reshape(flatA, [N, m, m]);
+    using flatC = np.array(
+      Array.from({ length: N * m * m }, (_, i) => (i % (m * m)) * 0.1),
+    );
+    using C = np.reshape(flatC, [N, m, m]);
+
+    using result = tree.makeDisposable(lax.associativeScan(compose, { A, C }));
+    const res = result as { A: np.Array; C: np.Array };
+    expect(res.A.shape).toEqual([N, m, m]);
+    expect(res.C.shape).toEqual([N, m, m]);
+  });
+
+  test("hoisted [1,m,m] constant outside compose does not crash", () => {
+    const m = 2;
+    const N = 6;
+    using eye = np.eye(m);
+    using I1 = np.reshape(eye, [1, m, m]);
+
+    const compose = (a: { v: np.Array }, b: { v: np.Array }) => {
+      using sum = np.add(a.v, b.v);
+      const newV = np.add(sum, I1) as np.Array;
+      return { v: newV };
+    };
+
+    using flatV = np.ones([N * m * m]);
+    using V = np.reshape(flatV, [N, m, m]);
+    using result = tree.makeDisposable(lax.associativeScan(compose, { v: V }));
+    const res = result as { v: np.Array };
+    expect(res.v.shape).toEqual([N, m, m]);
+  });
+});
+
+// ============================================================================
 // Differentiability
 // ============================================================================
 

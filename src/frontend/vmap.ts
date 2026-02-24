@@ -487,6 +487,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   },
   [Primitive.Cholesky]: lastDimsBatcher(Primitive.Cholesky, 2),
   [Primitive.LU]: lastDimsBatcher(Primitive.LU, 2, 3),
+  [Primitive.QR]: lastDimsBatcher(Primitive.QR, 2, 2),
   [Primitive.Jit](axisSize, args, dims, { name, jaxpr }) {
     const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims);
     const outs = bind(Primitive.Jit, [...newJaxpr.consts, ...args], {

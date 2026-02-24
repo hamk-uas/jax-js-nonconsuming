@@ -71,7 +71,7 @@ function encodeOpcode(opcode: number | [number, number]): number[] {
 }
 
 function concat(out: number[], inp: number[]): void {
-  out.push(...inp);
+  for (let i = 0; i < inp.length; i++) out.push(inp[i]);
 }
 
 class Function_ {
