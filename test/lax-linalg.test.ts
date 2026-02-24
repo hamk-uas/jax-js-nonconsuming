@@ -3,10 +3,12 @@ import {
   Device,
   grad,
   init,
+  jit,
   jvp,
   lax,
   numpy as np,
   random,
+  vmap,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { beforeEach, expect, suite, test } from "vitest";
 
@@ -506,6 +508,292 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
 
       // dR should exist and have correct shape
       expect(dR.shape).toEqual([2, 2]);
+    });
+
+    test("vmap over QR decomposition", () => {
+      // Batch of 3 matrices, each 3×2
+      using flat = np.array(
+        [1, 2, 3, 4, 5, 6, 2, 1, 0, 3, 1, 2, 4, 0, 1, 3, 2, 5],
+        { dtype: np.DType.Float32 },
+      );
+      using batch = np.reshape(flat, [3, 3, 2]);
+
+      const qrFn = (A: np.Array) => {
+        const [Q, R] = lax.linalg.qr(A);
+        return [Q, R];
+      };
+
+      using f = jit(vmap(qrFn));
+      const [Q, R] = f(batch) as [np.Array, np.Array];
+      using _Q = Q;
+      using _R = R;
+
+      expect(Q.shape).toEqual([3, 3, 2]);
+      expect(R.shape).toEqual([3, 2, 2]);
+
+      // Verify Q @ R ≈ A for each batch element
+      using reconstructed = np.matmul(Q, R);
+      expect(reconstructed).toBeAllclose(batch, { atol: 1e-4 });
+    });
+
+    test("jit(qr) produces correct decomposition", () => {
+      using A = np.array([
+        [1.0, 2.0],
+        [3.0, 4.0],
+        [5.0, 6.0],
+      ]);
+
+      using f = jit((a: np.Array) => {
+        const [Q, R] = lax.linalg.qr(a);
+        return [Q, R];
+      });
+
+      const [Q, R] = f(A) as [np.Array, np.Array];
+      using _Q = Q;
+      using _R = R;
+
+      expect(Q.shape).toEqual([3, 2]);
+      expect(R.shape).toEqual([2, 2]);
+
+      using reconstructed = np.matmul(Q, R);
+      expect(reconstructed).toBeAllclose(A, { atol: 1e-5 });
+    });
+
+    test("JVP through QR matches finite differences", () => {
+      using A = np.array([
+        [1.0, 2.0],
+        [3.0, 4.0],
+      ]);
+      using dA = np.array([
+        [0.1, 0.05],
+        [0.05, 0.1],
+      ]);
+
+      const f = (a: np.Array) => {
+        const [Q, R] = lax.linalg.qr(a);
+        Q.dispose();
+        return R;
+      };
+
+      const [R, dR] = jvp(f, [A], [dA]);
+      using _R = R;
+      using _dR = dR;
+
+      // Finite-difference verification: (f(A + eps*dA) - f(A)) / eps ≈ dR
+      const eps = 1e-4;
+      using dAe = dA.mul(eps);
+      using Ape = A.add(dAe);
+      using R2 = f(Ape);
+      using R2subR = R2.sub(R);
+      using dR_fd = R2subR.div(eps);
+      expect(dR).toBeAllclose(dR_fd, { rtol: 1e-2, atol: 2e-3 });
+    });
+
+    test("grad through QR matches finite differences", () => {
+      using A = np.array([
+        [4.0, 1.0],
+        [2.0, 3.0],
+      ]);
+
+      // Loss: sum of squared R elements
+      const f = (a: np.Array) => {
+        const [Q, R] = lax.linalg.qr(a);
+        Q.dispose();
+        using _R = R;
+        using sq = np.square(R);
+        return sq.sum();
+      };
+
+      using dA = grad(f)(A);
+
+      // Verify gradient by central finite differences
+      const eps = 1e-4;
+      const aData = A.js() as number[][];
+      const expected: number[][] = [[], []];
+      for (let i = 0; i < 2; i++) {
+        for (let j = 0; j < 2; j++) {
+          const ap = aData.map((row) => [...row]);
+          const am = aData.map((row) => [...row]);
+          ap[i][j] += eps;
+          am[i][j] -= eps;
+          using arrP = np.array(ap);
+          using fpArr = f(arrP);
+          const fp = fpArr.js() as number;
+          using arrM = np.array(am);
+          using fmArr = f(arrM);
+          const fm = fmArr.js() as number;
+          expected[i][j] = (fp - fm) / (2 * eps);
+        }
+      }
+      expect(dA).toBeAllclose(expected, { rtol: 1e-2, atol: 1e-3 });
+    });
+
+    test("grad through QR for tall matrix", () => {
+      // Tall (3×2) matrix: grad through R.sum()
+      using A = np.array([
+        [3.0, 1.0],
+        [1.0, 4.0],
+        [2.0, 2.0],
+      ]);
+
+      const f = (a: np.Array) => {
+        const [Q, R] = lax.linalg.qr(a);
+        Q.dispose();
+        using _R = R;
+        return R.sum();
+      };
+
+      using dA = grad(f)(A);
+
+      // Verify gradient by central finite differences
+      const eps = 1e-4;
+      const aData = A.js() as number[][];
+      const expected: number[][] = [[], [], []];
+      for (let i = 0; i < 3; i++) {
+        for (let j = 0; j < 2; j++) {
+          const ap = aData.map((row) => [...row]);
+          const am = aData.map((row) => [...row]);
+          ap[i][j] += eps;
+          am[i][j] -= eps;
+          using arrP = np.array(ap);
+          using fpArr = f(arrP);
+          const fp = fpArr.js() as number;
+          using arrM = np.array(am);
+          using fmArr = f(arrM);
+          const fm = fmArr.js() as number;
+          expected[i][j] = (fp - fm) / (2 * eps);
+        }
+      }
+      expect(dA).toBeAllclose(expected, { rtol: 1e-2, atol: 1e-3 });
+    });
+
+    test("grad through Q factor of QR", () => {
+      // Use tall matrix (3×2) where sum(Q) is NOT constant
+      // (for square matrices, sum(Q^2) = trace(Q^T Q) = n, so grad = 0)
+      using A = np.array([
+        [2.0, 1.0],
+        [1.0, 3.0],
+        [0.5, 2.0],
+      ]);
+
+      // Loss depends on Q, not R
+      const f = (a: np.Array) => {
+        const [Q, R] = lax.linalg.qr(a);
+        R.dispose();
+        using _Q = Q;
+        return Q.sum();
+      };
+
+      using dA = grad(f)(A);
+
+      // Finite-difference check
+      const eps = 1e-4;
+      const aData = A.js() as number[][];
+      const expected: number[][] = [[], [], []];
+      for (let i = 0; i < 3; i++) {
+        for (let j = 0; j < 2; j++) {
+          const ap = aData.map((row) => [...row]);
+          const am = aData.map((row) => [...row]);
+          ap[i][j] += eps;
+          am[i][j] -= eps;
+          using arrP = np.array(ap);
+          using fpArr = f(arrP);
+          const fp = fpArr.js() as number;
+          using arrM = np.array(am);
+          using fmArr = f(arrM);
+          const fm = fmArr.js() as number;
+          expected[i][j] = (fp - fm) / (2 * eps);
+        }
+      }
+      expect(dA).toBeAllclose(expected, { rtol: 1e-2, atol: 2e-3 });
+    });
+
+    test("grad through QR is consistent across batch elements", () => {
+      // Test that grad produces consistent results for different matrices,
+      // verifying each individually against finite differences.
+      const matrices = [
+        [
+          [4.0, 1.0],
+          [2.0, 3.0],
+        ],
+        [
+          [3.0, 1.0],
+          [1.0, 4.0],
+        ],
+        [
+          [2.0, 0.5],
+          [0.5, 2.0],
+        ],
+      ];
+
+      const f = (a: np.Array) => {
+        const [Q, R] = lax.linalg.qr(a);
+        Q.dispose();
+        using _R = R;
+        return R.sum();
+      };
+
+      for (const mat of matrices) {
+        using A = np.array(mat);
+        using dA = grad(f)(A);
+
+        // Verify gradient by central finite differences
+        const eps = 1e-4;
+        const expected: number[][] = [[], []];
+        for (let i = 0; i < 2; i++) {
+          for (let j = 0; j < 2; j++) {
+            const ap = mat.map((row) => [...row]);
+            const am = mat.map((row) => [...row]);
+            ap[i][j] += eps;
+            am[i][j] -= eps;
+            using arrP = np.array(ap);
+            using fpArr = f(arrP);
+            const fp = fpArr.js() as number;
+            using arrM = np.array(am);
+            using fmArr = f(arrM);
+            const fm = fmArr.js() as number;
+            expected[i][j] = (fp - fm) / (2 * eps);
+          }
+        }
+        expect(dA).toBeAllclose(expected, { rtol: 1e-2, atol: 1e-3 });
+      }
+    });
+
+    test("JVP through both Q and R factors", () => {
+      using A = np.array([
+        [1.0, 2.0],
+        [3.0, 4.0],
+        [5.0, 6.0],
+      ]);
+      using dA = np.array([
+        [0.1, 0.0],
+        [0.0, 0.1],
+        [0.05, 0.05],
+      ]);
+
+      const [primals, tangents] = jvp(
+        (a: np.Array) => {
+          const [Q, R] = lax.linalg.qr(a);
+          return [Q, R];
+        },
+        [A],
+        [dA],
+      );
+      const [Q, R] = primals as [np.Array, np.Array];
+      const [dQ, dR] = tangents as [np.Array, np.Array];
+      using _Q = Q;
+      using _R = R;
+      using _dQ = dQ;
+      using _dR = dR;
+
+      expect(dQ.shape).toEqual([3, 2]);
+      expect(dR.shape).toEqual([2, 2]);
+
+      // Verify: d(Q @ R) = dQ @ R + Q @ dR ≈ dA
+      using dQR = np.matmul(dQ, R);
+      using QdR = np.matmul(Q, dR);
+      using dA_reconstructed = np.add(dQR, QdR);
+      expect(dA_reconstructed).toBeAllclose(dA, { atol: 1e-4 });
     });
   });
 });

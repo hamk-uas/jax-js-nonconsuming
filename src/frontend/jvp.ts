@@ -440,9 +440,9 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   },
   [Primitive.QR]([a], [da]) {
     // QR decomposition JVP (thin QR, m >= n only).
-    // From A = QR: dA = dQ R + Q dR, with Q^T dQ skew-symmetric.
-    // Let F = Q^T dA R^{-1} = M + dR R^{-1}.
-    // Then dR = triu(F) R, dQ = (dA - Q dR) R^{-T}.
+    // Reference: Papanicolopulos (2024), arXiv:2409.13374, §4.1, eqs. (9)–(12).
+    // B = dA R⁻¹,  E = QᵀB,  Ψ = triu(E) + tril(E,−1)ᵀ,
+    // dR = Ψ R,  dQ = B − QΨ.
     const [Q, R] = qr(a);
     const m = a.shape[a.ndim - 2] as number;
     const n = a.shape[a.ndim - 1] as number;
@@ -450,21 +450,25 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
       throw new Error(
         "qr jvp: m < n (wide matrices) not yet supported, got " + `${m}x${n}`,
       );
-    // F = Q^T @ dA @ R^{-1}
-    using Qt = mT(Q);
-    using QtdA_tmp = mT(da);
-    using QtdA = batchMatmulT(Qt, QtdA_tmp); // Q^T @ dA
+    // B = dA R⁻¹  [m × n]
+    // core.triangularSolve(Rᵀ, x, {lower:true}) = x R⁻¹
     using Rt = mT(R);
-    using F = triangularSolve(Rt, QtdA, { lower: true }); // QtdA @ R^{-1}
-    // dR = triu(F) @ R
-    using triuF = triu(F as any) as Tracer;
-    using mTR = mT(R);
-    const dR = batchMatmulT(triuF, mTR); // triu(F) @ R
-    // dQ = (dA - Q @ dR) @ R^{-T}
-    using QdR_tmp = mT(dR);
-    using QdR = batchMatmulT(Q, QdR_tmp); // Q @ dR
-    using residual = da.sub(QdR);
-    const dQ = triangularSolve(R, residual); // (dA - Q dR) @ R^{-T}
+    using B = triangularSolve(Rt, da, { lower: true }) as Tracer;
+    // E = Qᵀ B  [n × n]
+    using Qt = mT(Q);
+    using Bt = mT(B);
+    using E = batchMatmulT(Qt, Bt) as Tracer;
+    // Ψ = triu(E) + tril(E,−1)ᵀ  (upper triangular)
+    using trilE = tril(E as any, -1) as Tracer;
+    using trilEt = mT(trilE);
+    using triuE = triu(E as any) as Tracer;
+    using Psi = triuE.add(trilEt) as Tracer;
+    // dR = Ψ R  [n × n]
+    const dR = batchMatmulT(Psi, Rt);
+    // dQ = B − QΨ  [m × n]
+    using Psit = mT(Psi);
+    using QPsi = batchMatmulT(Q, Psit) as Tracer;
+    const dQ = B.sub(QPsi);
     return [
       [Q, R],
       [dQ, dR],

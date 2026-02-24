@@ -221,6 +221,50 @@ pnpm vitest bench bench/<file>     # run Vitest benchmarks (e.g. bench/mega-modu
 pnpm -C website dev                # local dev server for demos
 ```
 
+### Production bundle optimization
+
+The build produces four ESM chunks (~236 kB total gzip). Most of the size is legitimate new
+functionality (mega-module WASM JIT, worker pool, orchestrator, scipy modules, autodiff). However
+~10–15 kB gzip is **dev-only code that ships in every production bundle** by default:
+
+| Dev-only code                                                                                            | Default        | Problem                                                                     | Fix                                                                                              |
+| -------------------------------------------------------------------------------------------------------- | -------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| 53 `if (DEBUG >= N)` branches in main + backend                                                          | Bundled always | `export let DEBUG = 0` is a mutable `let` — Rolldown can't DCE the branches | Add `define: { DEBUG: '0' }` to the release build target in `tsdown.config.mjs`                  |
+| `checkLeaks` infrastructure (564 lines: `FinalizationRegistry`, stack-frame parsing, `_leakTrackingMap`) | Bundled always | Exported from `src/index.ts` — can't be tree-shaken                         | Move to a `./debug` sub-path entry; update test imports to `@hamk-uas/jax-js-nonconsuming/debug` |
+| `verifyJaxprEffects` / `_setVerifyEffects`                                                               | Bundled always | Runtime flag — only runs in tests via `_setVerifyEffects(true)`             | Move to `./debug` sub-path, or gate with `define: { VERIFY_EFFECTS: 'false' }`                   |
+
+**Quickest win — DEBUG define in `tsdown.config.mjs`:**
+
+```ts
+// Release build only:
+define: {
+  DEBUG: "0";
+}
+```
+
+This lets Rolldown fold all `if (0 >= 1)` checks to dead code and eliminate the 53 branches (~4–6 kB
+gzip savings). `setDebug()` would still work in non-release builds.
+
+**Structural fix — `./debug` sub-entry:**
+
+```json
+// package.json "exports"
+{
+  ".": "./dist/index.js",
+  "./debug": "./dist/debug.js"
+}
+```
+
+Move `checkLeaks`, `verifyJaxprEffects`, and `_setVerifyEffects` out of `src/index.ts` and into a
+new `src/index-debug.ts` built as the `debug` entry. Then update `test/setup.ts` and any other
+consumer of those APIs to import from `@hamk-uas/jax-js-nonconsuming/debug`. Users who don't import
+`./debug` pay nothing. Combined with the `DEBUG` define this brings the main chunk from ~135 kB to
+roughly ~120 kB gzip.
+
+**What is NOT eliminable (legitimate production code):** `wasmblr` + `mega-module` (runtime WASM JIT
+for compiled-loop scan and associativeScan), `WasmWorkerPool`, `OrchestratorWorker`, all
+library/frontend autodiff code.
+
 ### Pre-commit CI checks
 
 Husky runs `lint-staged` on commit, which auto-fixes ESLint and Prettier issues on staged files. The
@@ -1083,6 +1127,22 @@ WASM.
 | opt  | `src/routine.ts`                       | Add CPU fallback in `runCpuRoutine()`                                |
 | opt  | `src/frontend/jvp.ts`                  | Add JVP rule if autodiff needed                                      |
 | opt  | `src/frontend/linearize.ts`            | Add transpose rule if grad needed                                    |
+| opt  | `test/*.test.ts`                       | Add transform tests (see below)                                      |
+
+**Transform testing requirement:** When a new routine or primitive has hand-written JVP/transpose
+rules (not auto-generated from elementwise ALU ops), you **must** add dedicated transform tests.
+Auto-diff through elementwise ops is validated by the existing test infrastructure, but hand-written
+rules for opaque primitives (Cholesky, QR, LU, TriangularSolve, etc.) can have subtle bugs — e.g.,
+missing triangle masks, wrong solve conventions — that only surface when the derivative is verified
+against finite differences. At minimum, add:
+
+1. **JVP vs finite differences** — perturb input, compare `jvp(f, [x], [dx])` against
+   `(f(x + eps*dx) - f(x)) / eps`.
+2. **Grad vs finite differences** — compare `grad(loss ∘ f)(x)` against central FD for each input
+   element.
+3. **Product rule** (for multi-output primitives like QR, LU) — verify `dQ @ R + Q @ dR ≈ dA`.
+
+See `test/lax-linalg.test.ts` QR tests for reference.
 
 **Size key convention:** Cache keys include dtype and all size dimensions, e.g., `cholesky_f32_4` or
 `triangular_solve_f64_8_16_lower_unit`.
@@ -1295,6 +1355,9 @@ fusion correctness, dispatch count verification, and grad through multi-output k
    and is classified as a non-kernel black node in `splitGraphDataflow()`. DUS carries a `Mutate`
    effect on its first input (dst), enabling `effectDrivenAllocate` to recycle the dst buffer
    directly into the output slot (zero-copy when sizes match).
+6. If the primitive has **hand-written JVP/transpose rules** (not auto-derived from elementwise
+   ops), add transform tests verifying JVP and grad against finite differences. See the routine
+   checklist's "Transform testing requirement" section for details.
 
 ## Mega-Module (WASM JIT Fusion)
 
