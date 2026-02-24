@@ -1143,6 +1143,7 @@ All public symbols must be exported from `src/index.ts`. Key exports:
   `hessian`, `linearize`, `makeJaxpr`
 - Device control: `init`, `defaultDevice`, `devicePut`, `blockUntilReady`, `devices`, `getBackend`
 - Functions: `scatterAdd`
+- Memory: `clearCaches`, `checkLeaks`
 - Namespaces: `numpy`, `lax`, `nn`, `random`, `scipySpecial`, `scipyLinalg`, `tree`
 - Testing utilities: `ScanPath` (type)
 - Types: `AssociativeScanOptions`

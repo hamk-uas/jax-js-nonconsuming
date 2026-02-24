@@ -1104,25 +1104,50 @@ export function allclose(
   }
 }
 
-/** Matrix product of two arrays. */
-export function matmul(x: ArrayLike, y: ArrayLike) {
+/** Matrix product of two arrays with NumPy-style broadcasting of batch dims. */
+export function matmul(x: ArrayLike, y: ArrayLike): Array {
   if (ndim(x) === 0 || ndim(y) === 0) {
     throw new Error("matmul: x and y must be at least 1D");
   }
   ((x = x as Array), (y = y as Array));
-  if (y.ndim === 1) {
-    // Matrix-vector product
+  if (x.ndim === 1 && y.ndim === 1) {
     return core.dot(x, y) as Array;
   }
-
-  // Otherwise, we multiply x: [..., N, K] and y: [..., K, M]
-  const numBatchDims = Math.min(Math.max(x.ndim, 2), y.ndim) - 2;
-  return lax.dot(x, y, {
-    lhsContractingDims: [-1],
-    rhsContractingDims: [-2],
-    lhsBatchDims: range(-2 - numBatchDims, -2),
-    rhsBatchDims: range(-2 - numBatchDims, -2),
-  });
+  if (x.ndim === 1) {
+    // [K] @ [..., K, M] → [..., M]: prepend 1, matmul, squeeze
+    using x2 = reshape(x, [1, x.shape[0]]);
+    using result = matmul(x2, y);
+    return squeeze(result, -2);
+  }
+  if (y.ndim === 1) {
+    // [..., N, K] @ [K] → [..., N]: append 1, matmul, squeeze
+    using y2 = reshape(y, [y.shape[0], 1]);
+    using result = matmul(x, y2);
+    return squeeze(result, -1);
+  }
+  // Both >= 2D: x [...batchX, N, K], y [...batchY, K, M]
+  const xBatch = x.shape.slice(0, -2);
+  const yBatch = y.shape.slice(0, -2);
+  const batchShape = broadcastShapes(xBatch, yBatch);
+  const numBatchDims = batchShape.length;
+  // Broadcast batch dims if needed (O(1) ShapeTracker views, no allocation)
+  const xTarget = [...batchShape, x.shape.at(-2)!, x.shape.at(-1)!];
+  const yTarget = [...batchShape, y.shape.at(-2)!, y.shape.at(-1)!];
+  const xNeedsBroadcast = !deepEqual(x.shape, xTarget);
+  const yNeedsBroadcast = !deepEqual(y.shape, yTarget);
+  const xB = xNeedsBroadcast ? broadcastTo(x, xTarget) : x;
+  const yB = yNeedsBroadcast ? broadcastTo(y, yTarget) : y;
+  try {
+    return lax.dot(xB, yB, {
+      lhsContractingDims: [-1],
+      rhsContractingDims: [-2],
+      lhsBatchDims: range(numBatchDims),
+      rhsBatchDims: range(numBatchDims),
+    });
+  } finally {
+    if (xNeedsBroadcast) (xB as Array).dispose();
+    if (yNeedsBroadcast) (yB as Array).dispose();
+  }
 }
 
 /** Dot product of two arrays. */

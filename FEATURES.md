@@ -74,6 +74,7 @@ functions.
 | `custom_batching`    | 🔴      | core engine feature                              |
 | `Array`              | 🟢      |                                                  |
 | `checkLeaks`         | 🟢      | leak diagnostic (slot count delta + stack trace) |
+| `clearCaches`        | 🟢      | flush JIT caches to free GPU/WASM memory         |
 
 Array primitives need to be called with methods like `a.add(b)` / `a.mul(b)` instead of `a + b` and
 `a * b` as in Python, which has overloading.
@@ -320,7 +321,7 @@ Most operations behave the same way as they do in JAX.
 | `logical_xor`         | 🟠      |                                              |
 | `logspace`            | 🟢      |                                              |
 | `mask_indices`        | 🟠      |                                              |
-| `matmul`              | 🟢      |                                              |
+| `matmul`              | 🟢      | batch broadcasting, 1D vector support        |
 | `matrix_transpose`    | 🟢      |                                              |
 | `matvec`              | 🟠      |                                              |
 | `max`                 | 🟢      |                                              |

@@ -82,6 +82,36 @@ function _disposeAllJitCaches(): void {
   // (they're registered once when the jit function is created).
 }
 
+/**
+ * Flush all internal JIT compilation caches, freeing GPU/WASM memory held
+ * by cached `ClosedJaxpr` constants.
+ *
+ * Call this when you create many short-lived `jit()` closures (e.g., in an
+ * optimization loop where each iteration builds a new loss function). Without
+ * clearing, each closure's cached constants accumulate until GC runs — which
+ * may never happen for GPU buffers.
+ *
+ * After calling `clearCaches()`, existing `jit()` functions remain usable —
+ * they will re-trace and re-compile on their next call.
+ *
+ * @example
+ * ```ts
+ * import { clearCaches, jit, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+ *
+ * for (let i = 0; i < 100; i++) {
+ *   const f = jit((x) => x.mul(np.array([i])).sum());
+ *   const result = f(np.array([1, 2, 3]));
+ *   result.dispose();
+ *   f.dispose(); // free this closure's cache
+ * }
+ * // Or clear everything at once:
+ * clearCaches();
+ * ```
+ */
+export function clearCaches(): void {
+  _disposeAllJitCaches();
+}
+
 // ── Tracking state (checked on the hot path) ──
 
 /** True only between start() and stop(). Checked in Array ctor/dispose. */

@@ -13,6 +13,7 @@ import type {
 } from "./frontend/artifacts";
 import {
   checkLeaks,
+  clearCaches,
   type LeakReport,
   type SnapshotEntry,
 } from "./frontend/check-leaks";
@@ -54,6 +55,7 @@ export {
   init,
   Array,
   checkLeaks,
+  clearCaches,
   ClosedJaxpr,
   defaultDevice,
   type Device,
