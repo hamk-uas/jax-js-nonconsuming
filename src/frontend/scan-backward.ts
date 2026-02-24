@@ -166,6 +166,14 @@ export class ScanPullbackArtifact {
     }
 
     // Slice cotangent of y for this iteration
+    // numY is doubled by JVP (primal + tangent outputs); the tangent y's
+    // are in the second half. Assert the invariant that JVP doubling
+    // produces an even numY.
+    if (numY % 2 !== 0) {
+      throw new Error(
+        `scan backward: expected even numY from JVP doubling, got ${numY}`,
+      );
+    }
     const ctYSlices: Tracer[] = [];
     for (let i = Math.floor(numY / 2); i < ctYsAll.length; i++) {
       const ctY = ctYsAll[i];

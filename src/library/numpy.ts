@@ -416,8 +416,8 @@ export function argmax(
 /**
  * Cumulative sum of elements along an axis.
  *
- * Currently this function is `O(n^2)`, we'll improve this later on with a
- * two-phase parallel reduction algorithm.
+ * Uses `lax.associativeScan` for O(N log N) work with O(log N) parallel depth,
+ * replacing the previous O(N²) tril+matmul approach.
  */
 export function cumsum(a: ArrayLike, axis?: number): Array {
   a = fudgeArray(a);
@@ -428,17 +428,9 @@ export function cumsum(a: ArrayLike, axis?: number): Array {
   } else {
     axis = checkAxis(axis, a.ndim);
   }
-  const n = a.shape[axis];
-  const a1 = moveaxis(a, axis, -1);
   try {
-    using a2 = core.broadcast(a1, a1.shape.concat(n), [-2]) as Array;
-    using trilA = tril(a2);
-    const summed = trilA.sum(-1);
-    const result = moveaxis(summed, -1, axis);
-    if (result !== summed) summed.dispose();
-    return result;
+    return lax.associativeScan((x: Array, y: Array) => x.add(y), a, { axis });
   } finally {
-    if (a1 !== a) a1.dispose();
     if (a !== inputA) a.dispose();
   }
 }
@@ -1690,16 +1682,21 @@ export const hypot = jit(function hypot(x1: Array, x2: Array) {
  * The output is ill-defined when both x and y are zero.
  */
 export const atan2 = jit(function atan2(y: Array, x: Array) {
-  const r = sqrt(square(x).add(square(y)));
-  const xNeg = less(x, 0);
+  using r = sqrt(square(x).add(square(y)));
+  using xNeg = less(x, 0);
 
   // Select numerator and denominator based on sign of x
   // When x >= 0: numer = y,     denom = r + x
   // When x < 0:  numer = r - x, denom = y
-  const numer = where(xNeg, r.sub(x), y);
-  const denom = where(xNeg, y, r.add(x));
+  using numer = where(xNeg, r.sub(x), y) as Array;
+  using denom = where(xNeg, y, r.add(x)) as Array;
 
-  return atan(numer.div(denom)).mul(2);
+  using atanResult = atan(numer.div(denom)).mul(2) as Array;
+  // atan2(0, 0) = 0 by NumPy convention (the formula above produces NaN)
+  using xZero = equal(x, 0);
+  using yZero = equal(y, 0);
+  using bothZero = xZero.mul(yZero);
+  return where(bothZero, 0, atanResult);
 });
 
 export { asin as arcsin, acos as arccos, atan as arctan, atan2 as arctan2 };
@@ -1771,11 +1768,16 @@ export const fmod = jit(function fmod(x: Array, y: Array): Array {
  * Calculate element-wise remainder of the division (matches sign of y).
  */
 export const remainder = jit(function remainder(x: Array, y: Array): Array {
-  // The `Mod` primitive matches the sign of x, following JS rounding rules.
-  // This function must match the sign of y instead.
-  using inner = core.mod(x, y) as Array;
-  using shifted = inner.add(y);
-  return core.mod(shifted, y) as Array;
+  // The `Mod` primitive matches the sign of x (JS truncation rounding).
+  // This function must match the sign of y instead (Python/NumPy floor modulo).
+  // Single-mod + conditional correction: add y when signs of r and y disagree.
+  using r = core.mod(x, y) as Array;
+  // Need correction when r != 0 and sign(r) != sign(y).
+  // sign(r) != sign(y) iff r*y < 0.
+  using ry = r.mul(y);
+  using needsCorrection = ry.less(0);
+  using corrected = r.add(y);
+  return where(needsCorrection, corrected, r);
 });
 
 /**
@@ -1854,18 +1856,36 @@ export function log10(x: ArrayLike): Array {
   return logX.mul(Math.LOG10E);
 }
 
-/** Calculate `exp(x) - 1` element-wise. */
+/** Calculate `exp(x) - 1` element-wise with improved precision for small x. */
 export function expm1(x: ArrayLike): Array {
-  // TODO: This isn't actually higher precision than just exp(x)-1 right now.
-  using expX = exp(x);
-  return expX.sub(1);
+  // Kahan's formula: u = exp(x); if u == 1 then x, else (u-1)*x/log(u).
+  // This avoids catastrophic cancellation when x is near zero.
+  using u = exp(x);
+  using um1 = u.sub(1);
+  using logU = log(u);
+  // When u == 1 (x ≈ 0), log(u) is also 0. Guard the denominator to avoid
+  // 0/0 = NaN, which would leak through autodiff (where differentiates both branches).
+  using uEq1 = u.equal(1);
+  using safeLogU = where(uEq1, 1, logU) as Array;
+  using um1x = um1.mul(fudgeArray(x));
+  using ratio = um1x.div(safeLogU);
+  return where(uEq1, x, ratio);
 }
 
-/** Calculate the natural logarithm of `1 + x` element-wise. */
+/** Calculate the natural logarithm of `1 + x` element-wise with improved precision for small x. */
 export function log1p(x: ArrayLike): Array {
-  // TODO: This isn't actually higher precision than just log(1+x) right now.
-  using sum = add(1, x);
-  return log(sum);
+  // Kahan's formula: u = 1 + x; if u == 1 then x, else log(u)*x/(u-1).
+  // This avoids catastrophic cancellation when x is near zero.
+  using u = add(1, x);
+  using logU = log(u);
+  using um1 = u.sub(1);
+  // When u == 1 (x ≈ 0), u-1 is 0. Guard the denominator to avoid
+  // 0/0 = NaN, which would leak through autodiff (where differentiates both branches).
+  using uEq1 = u.equal(1);
+  using safeUm1 = where(uEq1, 1, um1) as Array;
+  using logUx = logU.mul(fudgeArray(x));
+  using ratio = logUx.div(safeUm1);
+  return where(uEq1, x, ratio);
 }
 
 /** Convert angles from degrees to radians. */
@@ -1891,13 +1911,13 @@ export const degrees = rad2deg;
 export const power = jit(function power(x1: Array, x2: Array) {
   // TODO: This is a little bit inefficient since we need to handle negative
   // numbers to integer exponents, should eventually move it into the backend.
-  const x2i = trunc(x2);
+  using x2i = trunc(x2);
   // Should be NaN if x1 < 0 and x2 is non-integer.
-  const shouldBeNaN = multiply(x2.notEqual(x2i), x1.less(0));
+  using shouldBeNaN = multiply(x2.notEqual(x2i), x1.less(0));
   // If x2 is odd integer, result sign matches x1, else it's positive.
   using parityRaw = core.mod(x2i, 2) as Array;
   using parityOdd = parityRaw.notEqual(0);
-  const resultSign = where(parityOdd, where(x1.less(0), -1, 1), 1);
+  using resultSign = where(parityOdd, where(x1.less(0), -1, 1), 1) as Array;
   using absX1 = absolute(x1);
   using logAbsX1 = log(absX1);
   using scaled = logAbsX1.mul(x2);
@@ -1911,7 +1931,7 @@ export { power as pow };
 /** @function Calculate the element-wise cube root of the input array. */
 export const cbrt = jit(function cbrt(x: Array) {
   // This isn't just power(x, 1/3) since we need to handle negative numbers.
-  const sgn = where(less(x, 0), -1, 1);
+  using sgn = where(less(x, 0), -1, 1) as Array;
   using signedX = x.mul(sgn);
   using logSignedX = log(signedX);
   using scaled = logSignedX.mul(1 / 3);
@@ -1926,8 +1946,8 @@ export const cbrt = jit(function cbrt(x: Array) {
  * `sinh(x) = (exp(x) - exp(-x)) / 2`
  */
 export const sinh = jit(function sinh(x: Array) {
-  const ex = exp(x);
-  const emx = reciprocal(ex);
+  using ex = exp(x);
+  using emx = reciprocal(ex);
   using diff = ex.sub(emx);
   return diff.mul(0.5);
 });
@@ -1939,8 +1959,8 @@ export const sinh = jit(function sinh(x: Array) {
  * `cosh(x) = (exp(x) + exp(-x)) / 2`
  */
 export const cosh = jit(function cosh(x: Array) {
-  const ex = exp(x);
-  const emx = reciprocal(ex);
+  using ex = exp(x);
+  using emx = reciprocal(ex);
   using sum = ex.add(emx);
   return sum.mul(0.5);
 });
@@ -1999,7 +2019,11 @@ export const arccosh = jit(function arccosh(x: Array) {
  * `arctanh(x) = 0.5 * ln((1 + x) / (1 - x))`
  */
 export const arctanh = jit(function arctanh(x: Array) {
-  return log(add(1, x).div(subtract(1, x))).mul(0.5);
+  using onePlusX = add(1, x);
+  using oneMinusX = subtract(1, x);
+  using ratio = onePlusX.div(oneMinusX);
+  using logRatio = log(ratio);
+  return logRatio.mul(0.5);
 });
 
 export { arcsinh as asinh, arccosh as acosh, arctanh as atanh };
@@ -2176,8 +2200,10 @@ export function nanToNum(
  */
 export const isfinite = jit(function isfinite(x: Array): Array {
   if (!isFloatDtype(x.dtype)) return fullLike(x, true);
-  using nanMask = isnan(x);
-  using infMask = isinf(x);
-  using union = nanMask.add(infMask);
-  return union.notEqual(true);
+  // A value is finite iff it equals itself (not NaN) and its absolute value
+  // is not infinity. Combine into a single boolean expression.
+  using absX = absolute(x);
+  using notInf = absX.notEqual(Infinity);
+  using notNan = x.equal(x);
+  return notInf.mul(notNan);
 });
