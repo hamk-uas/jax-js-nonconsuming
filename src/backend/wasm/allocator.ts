@@ -57,7 +57,7 @@ export class WasmAllocator {
 
     // Top-of-heap compaction: if the freed block is at the top of the
     // heap, move the bump pointer backward instead of adding to free list.
-    const alignedSize = (sizeClass + 63) & -64;
+    const alignedSize = Math.ceil(sizeClass / 64) * 64;
     if (ptr + alignedSize === this.#headPtr) {
       this.#headPtr = ptr;
       // Recursively compact: check if the block now at the top is also free.
@@ -79,7 +79,7 @@ export class WasmAllocator {
     while (found) {
       found = false;
       for (const [freePtr, freeSizeClass] of this.#freeBlocks) {
-        const alignedSize = (freeSizeClass + 63) & -64;
+        const alignedSize = Math.ceil(freeSizeClass / 64) * 64;
         if (freePtr + alignedSize === this.#headPtr) {
           this.#headPtr = freePtr;
           this.#freeBlocks.delete(freePtr);
@@ -99,7 +99,8 @@ export class WasmAllocator {
 
   #bumpAlloc(size: number): number {
     const ptr = this.#headPtr;
-    size = (size + 63) & -64; // Align to 64 bytes, like Arrow.
+    // Use Math.ceil (not bitwise & -64) to avoid int32 overflow above 2 GiB.
+    size = Math.ceil(size / 64) * 64;
     this.#headPtr += size;
     if (ptr + size > this.#memory.buffer.byteLength) {
       // Note: 4 GiB = max memory32 size
@@ -134,7 +135,8 @@ export class WasmAllocator {
       return sizeClass;
     }
     // Very large sizes: 64 KiB increments starting from 128 KiB.
-    return (size + 65535) & -65536;
+    // Use Math.ceil (not bitwise & -65536) to avoid int32 overflow above 2 GiB.
+    return Math.ceil(size / 65536) * 65536;
   }
 
   // Debug methods
