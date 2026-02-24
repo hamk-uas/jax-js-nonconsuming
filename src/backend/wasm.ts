@@ -308,6 +308,11 @@ export class WasmBackend implements Backend {
     return this.#buffers.size;
   }
 
+  /** Return WASM allocator statistics for diagnostics and testing. */
+  allocatorStats(): { totalAllocated: number; freeListSizes: Map<number, number> } {
+    return this.#allocator.getStats();
+  }
+
   malloc(size: number, initialData?: Uint8Array): Slot {
     const ptr = this.#allocator.malloc(size);
 
