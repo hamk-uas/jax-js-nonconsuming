@@ -821,4 +821,90 @@ describe("lax.associativeScan — WASM compiled-loop", () => {
       defaultDevice("wasm");
     }
   });
+
+  test("matrix affine composition via compiled-loop (DLM pattern)", () => {
+    // This test mimics the dlm-js composeForward pattern:
+    // compose(p, q) = { A: q.A @ p.A, b: q.A @ p.b + q.b }
+    // Uses matmul (Dot reduction kernel) + add (elementwise kernel) = multi-step body.
+    defaultDevice("wasm");
+    try {
+      const compose = (
+        p: { A: np.Array; b: np.Array },
+        q: { A: np.Array; b: np.Array },
+      ) => {
+        using tmp = np.matmul(q.A, p.b) as np.Array;
+        return {
+          A: np.matmul(q.A, p.A) as np.Array,
+          b: tmp.add(q.b) as np.Array,
+        };
+      };
+
+      // 4 time steps of 2×2 matrices and 2×1 vectors
+      using A = np.array(
+        [
+          [
+            [1, 0.5],
+            [0, 1],
+          ],
+          [
+            [0.9, 0],
+            [0, 0.9],
+          ],
+          [
+            [1, 0],
+            [0.1, 1],
+          ],
+          [
+            [0.8, 0.2],
+            [0, 0.8],
+          ],
+        ],
+        { dtype: DType.Float32 },
+      );
+      using b = np.array(
+        [
+          [[1], [0]],
+          [[0], [1]],
+          [[2], [0]],
+          [[0], [3]],
+        ],
+        { dtype: DType.Float32 },
+      );
+
+      using f = jit((Ain: np.Array, bin: np.Array) =>
+        lax.associativeScan(compose, { A: Ain, b: bin }),
+      );
+
+      const result = f(A, b) as any as { A: np.Array; b: np.Array };
+
+      // Verify by sequential computation:
+      // i=0: (A0, b0) = ([[1,0.5],[0,1]], [[1],[0]])
+      // i=1: compose(p0, q1):
+      //   A = q1.A @ p0.A = [[0.9,0],[0,0.9]] @ [[1,0.5],[0,1]] = [[0.9,0.45],[0,0.9]]
+      //   b = q1.A @ p0.b + q1.b = [[0.9,0],[0,0.9]]@[[1],[0]] + [[0],[1]] = [[0.9],[1]]
+      const resultAData = result.A.dataSync();
+      const resultBData = result.b.dataSync();
+
+      // Check i=0 is identity (first element unchanged)
+      expect(resultAData[0]).toBeCloseTo(1, 4);
+      expect(resultAData[1]).toBeCloseTo(0.5, 4);
+      expect(resultAData[2]).toBeCloseTo(0, 4);
+      expect(resultAData[3]).toBeCloseTo(1, 4);
+      expect(resultBData[0]).toBeCloseTo(1, 4);
+      expect(resultBData[1]).toBeCloseTo(0, 4);
+
+      // Check i=1: A = [[0.9,0.45],[0,0.9]], b = [[0.9],[1]]
+      expect(resultAData[4]).toBeCloseTo(0.9, 4);
+      expect(resultAData[5]).toBeCloseTo(0.45, 4);
+      expect(resultAData[6]).toBeCloseTo(0, 4);
+      expect(resultAData[7]).toBeCloseTo(0.9, 4);
+      expect(resultBData[2]).toBeCloseTo(0.9, 4);
+      expect(resultBData[3]).toBeCloseTo(1, 4);
+
+      result.A.dispose();
+      result.b.dispose();
+    } finally {
+      defaultDevice("wasm");
+    }
+  });
 });

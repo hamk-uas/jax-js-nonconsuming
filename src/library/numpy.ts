@@ -1184,6 +1184,92 @@ export function tensordot(
   });
 }
 
+// ── Einsum fast-path for common batch-matmul patterns ────────────────────
+// Skips parseEinsumExpression, computeEinsumPath, and processSingleTensor
+// for patterns that lower directly to matmul / swapaxes. Returns null when
+// the pattern is not recognised — caller falls through to general einsum.
+
+function einsumFastPath(subscripts: string, args: any[]): Array | null {
+  const nOps = args.length - 1; // first arg is the subscripts string
+
+  // 1-operand: batch transpose
+  if (nOps === 1) {
+    if (subscripts === "nij->nji" || subscripts === "ij->ji") {
+      return swapaxes(fudgeArray(args[1]), -2, -1);
+    }
+    return null;
+  }
+
+  // 2-operand: batch matmul variants
+  if (nOps === 2) {
+    const a = fudgeArray(args[1]);
+    const b = fudgeArray(args[2]);
+    switch (subscripts) {
+      // Standard matmul (batch or unbatched)
+      case "nij,njk->nik":
+      case "ij,jk->ik":
+      case "ij,njk->nik":
+      case "nij,jk->nik":
+        return matmul(a, b);
+      // Matmul with B transposed
+      case "nij,nkj->nik":
+      case "ij,kj->ik":
+      case "ij,nkj->nik": {
+        using bt = swapaxes(b, -2, -1);
+        return matmul(a, bt);
+      }
+      // Matmul with A transposed
+      case "nji,njk->nik":
+      case "ji,jk->ik": {
+        using at = swapaxes(a, -2, -1);
+        return matmul(at, b);
+      }
+      // Batched matrix-vector product
+      case "nij,nj->ni":
+      case "ij,j->i": {
+        using bCol = expandDims(b, -1);
+        using result = matmul(a, bCol);
+        return squeeze(result, [-1]);
+      }
+    }
+    return null;
+  }
+
+  // 3-operand: matmul chains (A×B then ×C or ×C^T)
+  if (nOps === 3) {
+    const a = fudgeArray(args[1]);
+    const b = fudgeArray(args[2]);
+    const c = fudgeArray(args[3]);
+    switch (subscripts) {
+      // AB × C^T
+      case "nij,njk,nlk->nil":
+      case "ij,jk,lk->il":
+      case "nij,jk,nlk->nil":
+      case "ij,njk,lk->nil":
+      case "ij,njk,nlk->nil": {
+        using ab = matmul(a, b);
+        using ct = swapaxes(c, -2, -1);
+        return matmul(ab, ct);
+      }
+      // AB × C
+      case "nij,njk,nkl->nil":
+      case "ij,jk,kl->il": {
+        using ab = matmul(a, b);
+        return matmul(ab, c);
+      }
+      // A^T × B × C
+      case "ji,jk,kl->il": {
+        using at = swapaxes(a, -2, -1);
+        using atb = matmul(at, b);
+        return matmul(atb, c);
+      }
+    }
+    return null;
+  }
+
+  return null;
+}
+
 /**
  * Einstein summation with string subscripts.
  *
@@ -1233,6 +1319,14 @@ export function einsum(...args: (ArrayLike | number[])[]): Array;
 export function einsum(...args: any[]): Array {
   if (args.length === 0)
     throw new Error("einsum: must provide at least one argument");
+
+  // Fast path: detect common batch-matmul / transpose patterns and lower
+  // directly to matmul, skipping subscript parsing and path computation.
+  if (typeof args[0] === "string" && args.length >= 2) {
+    const fast = einsumFastPath(args[0] as string, args);
+    if (fast !== null) return fast;
+  }
+
   let input: EinsumInput;
   let operands: Array[] = [];
   if (typeof args[0] === "string") {

@@ -2,6 +2,7 @@ import * as lax from "./lax";
 import { triangularSolve } from "./lax-linalg";
 import * as np from "./numpy";
 import { Array, ArrayLike, fudgeArray } from "../frontend/array";
+import * as core from "../frontend/core";
 import { generalBroadcast } from "../utils";
 
 /**
@@ -83,12 +84,236 @@ export function det(a: ArrayLike): Array {
 
 export { diagonal } from "./numpy";
 
-/** Compute the inverse of a square matrix (batched). */
+/**
+ * Compute the inverse of a square matrix (batched).
+ *
+ * For small matrices (n ≤ 4), uses an analytical Cramer's rule formula
+ * (adjugate / determinant) that compiles to a single fused kernel under JIT.
+ * Larger matrices fall through to LU-based `solve(A, I)`.
+ */
 export function inv(a: ArrayLike): Array {
   a = fudgeArray(a);
   const n = checkSquare("inv", a);
+
+  // Analytical fast path for small matrices.
+  // Uses Cramer's rule: inv(A) = adj(A) / det(A).
+  // All operations are elementwise and fuse into a single JIT kernel.
+  // AD works natively through these standard ops — no custom rules needed.
+  if (n === 1) {
+    return np.reciprocal(a);
+  }
+  if (n === 2) {
+    return inv2x2(a);
+  }
+  if (n === 3) {
+    return inv3x3(a);
+  }
+  if (n === 4) {
+    return inv4x4(a);
+  }
+
   using eye = np.eye(n, { dtype: a.dtype });
   return solve(a, eye);
+}
+
+// ── Analytical small-matrix inverse helpers ──────────────────────────────
+// All use [..., i, j] slicing for batch support.  Intermediates are tracked
+// with `using` for ownership correctness in both eager and JIT modes.
+
+/** Analytical 2×2 inverse: [[d,-b],[-c,a]] / (ad-bc) */
+function inv2x2(a: Array): Array {
+  // Extract elements: a[...,0,0], a[...,0,1], a[...,1,0], a[...,1,1]
+  using a00 = idx2d(a, 0, 0);
+  using a01 = idx2d(a, 0, 1);
+  using a10 = idx2d(a, 1, 0);
+  using a11 = idx2d(a, 1, 1);
+
+  // det = a00*a11 - a01*a10
+  using p1 = a00.mul(a11) as Array;
+  using p2 = a01.mul(a10) as Array;
+  using det = p1.sub(p2) as Array;
+  using invDet = np.reciprocal(det);
+
+  // adjugate: [[a11, -a01], [-a10, a00]]
+  using neg_a01 = a01.neg() as Array;
+  using neg_a10 = a10.neg() as Array;
+  using row0 = np.stack([a11, neg_a01], -1);
+  using row1 = np.stack([neg_a10, a00], -1);
+  using adj = np.stack([row0, row1], -2);
+
+  // Expand invDet to [..., 1, 1] for broadcasting
+  using invDet1 = np.expandDims(invDet, -1);
+  using invDet2 = np.expandDims(invDet1, -1);
+  return adj.mul(invDet2) as Array;
+}
+
+/** Analytical 3×3 inverse via cofactor matrix / determinant. */
+function inv3x3(a: Array): Array {
+  using a00 = idx2d(a, 0, 0);
+  using a01 = idx2d(a, 0, 1);
+  using a02 = idx2d(a, 0, 2);
+  using a10 = idx2d(a, 1, 0);
+  using a11 = idx2d(a, 1, 1);
+  using a12 = idx2d(a, 1, 2);
+  using a20 = idx2d(a, 2, 0);
+  using a21 = idx2d(a, 2, 1);
+  using a22 = idx2d(a, 2, 2);
+
+  // Adjugate matrix entries (cofactors, transposed)
+  using c00 = det2(a11, a22, a12, a21);
+  using c01 = det2(a02, a21, a01, a22);
+  using c02 = det2(a01, a12, a02, a11);
+  using c10 = det2(a12, a20, a10, a22);
+  using c11 = det2(a00, a22, a02, a20);
+  using c12 = det2(a02, a10, a00, a12);
+  using c20 = det2(a10, a21, a11, a20);
+  using c21 = det2(a01, a20, a00, a21);
+  using c22 = det2(a00, a11, a01, a10);
+
+  // det via Laplace expansion along row 0
+  using cof01 = det2(a10, a22, a12, a20);
+  using cof02 = det2(a10, a21, a11, a20);
+  using t1 = a00.mul(c00) as Array;
+  using t2 = a01.mul(cof01) as Array;
+  using t3 = a02.mul(cof02) as Array;
+  using t12 = t1.sub(t2) as Array;
+  using det = t12.add(t3) as Array;
+  using invDet = np.reciprocal(det);
+
+  using row0 = np.stack([c00, c01, c02], -1);
+  using row1 = np.stack([c10, c11, c12], -1);
+  using row2 = np.stack([c20, c21, c22], -1);
+  using adj = np.stack([row0, row1, row2], -2);
+
+  using invDet1 = np.expandDims(invDet, -1);
+  using invDet2 = np.expandDims(invDet1, -1);
+  return adj.mul(invDet2) as Array;
+}
+
+/** Analytical 4×4 inverse via cofactor matrix / determinant. */
+function inv4x4(a: Array): Array {
+  // Extract all 16 elements
+  using a00 = idx2d(a, 0, 0);
+  using a01 = idx2d(a, 0, 1);
+  using a02 = idx2d(a, 0, 2);
+  using a03 = idx2d(a, 0, 3);
+  using a10 = idx2d(a, 1, 0);
+  using a11 = idx2d(a, 1, 1);
+  using a12 = idx2d(a, 1, 2);
+  using a13 = idx2d(a, 1, 3);
+  using a20 = idx2d(a, 2, 0);
+  using a21 = idx2d(a, 2, 1);
+  using a22 = idx2d(a, 2, 2);
+  using a23 = idx2d(a, 2, 3);
+  using a30 = idx2d(a, 3, 0);
+  using a31 = idx2d(a, 3, 1);
+  using a32 = idx2d(a, 3, 2);
+  using a33 = idx2d(a, 3, 3);
+
+  // 2×2 minors from rows 2,3
+  using s0 = det2(a20, a31, a30, a21);
+  using s1 = det2(a20, a32, a30, a22);
+  using s2 = det2(a20, a33, a30, a23);
+  using s3 = det2(a21, a32, a31, a22);
+  using s4 = det2(a21, a33, a31, a23);
+  using s5 = det2(a22, a33, a32, a23);
+
+  // 2×2 minors from rows 0,1
+  using c0 = det2(a00, a11, a10, a01);
+  using c1 = det2(a00, a12, a10, a02);
+  using c2 = det2(a00, a13, a10, a03);
+  using c3 = det2(a01, a12, a11, a02);
+  using c4 = det2(a01, a13, a11, a03);
+  using c5 = det2(a02, a13, a12, a03);
+
+  // det = c0*s5 - c1*s4 + c2*s3 + c3*s2 - c4*s1 + c5*s0
+  using d1 = c0.mul(s5) as Array;
+  using d2 = c1.mul(s4) as Array;
+  using d3 = c2.mul(s3) as Array;
+  using d4 = c3.mul(s2) as Array;
+  using d5 = c4.mul(s1) as Array;
+  using d6 = c5.mul(s0) as Array;
+  using dt1 = d1.sub(d2) as Array;
+  using dt2 = dt1.add(d3) as Array;
+  using dt3 = dt2.add(d4) as Array;
+  using dt4 = dt3.sub(d5) as Array;
+  using det = dt4.add(d6) as Array;
+  using invDet = np.reciprocal(det);
+
+  // Adjugate matrix (transposed cofactors)
+  using adj00 = madd3(a11, s5, a13, s3, a12, s4); // a11*s5 - a12*s4 + a13*s3
+  using adj01n = madd3(a01, s5, a03, s3, a02, s4);
+  using adj01 = adj01n.neg() as Array;
+  using adj02 = madd3(a31, c5, a33, c3, a32, c4);
+  using adj03n = madd3(a21, c5, a23, c3, a22, c4);
+  using adj03 = adj03n.neg() as Array;
+
+  using adj10n = madd3(a10, s5, a13, s1, a12, s2);
+  using adj10 = adj10n.neg() as Array;
+  using adj11 = madd3(a00, s5, a03, s1, a02, s2);
+  using adj12n = madd3(a30, c5, a33, c1, a32, c2);
+  using adj12 = adj12n.neg() as Array;
+  using adj13 = madd3(a20, c5, a23, c1, a22, c2);
+
+  using adj20 = madd3(a10, s4, a13, s0, a11, s2);
+  using adj21n = madd3(a00, s4, a03, s0, a01, s2);
+  using adj21 = adj21n.neg() as Array;
+  using adj22 = madd3(a30, c4, a33, c0, a31, c2);
+  using adj23n = madd3(a20, c4, a23, c0, a21, c2);
+  using adj23 = adj23n.neg() as Array;
+
+  using adj30n = madd3(a10, s3, a12, s0, a11, s1);
+  using adj30 = adj30n.neg() as Array;
+  using adj31 = madd3(a00, s3, a02, s0, a01, s1);
+  using adj32n = madd3(a30, c3, a32, c0, a31, c1);
+  using adj32 = adj32n.neg() as Array;
+  using adj33 = madd3(a20, c3, a22, c0, a21, c1);
+
+  using row0 = np.stack([adj00, adj01, adj02, adj03], -1);
+  using row1 = np.stack([adj10, adj11, adj12, adj13], -1);
+  using row2 = np.stack([adj20, adj21, adj22, adj23], -1);
+  using row3 = np.stack([adj30, adj31, adj32, adj33], -1);
+  using adj = np.stack([row0, row1, row2, row3], -2);
+
+  using invDet1 = np.expandDims(invDet, -1);
+  using invDet2 = np.expandDims(invDet1, -1);
+  return adj.mul(invDet2) as Array;
+}
+
+/** Compute a*b - c*d, disposing intermediates. */
+function det2(a: Array, b: Array, c: Array, d: Array): Array {
+  using ab = a.mul(b) as Array;
+  using cd = c.mul(d) as Array;
+  return ab.sub(cd) as Array;
+}
+
+/** Compute a*b - c*d + e*f, disposing intermediates. */
+function madd3(
+  a: Array,
+  b: Array,
+  e: Array,
+  f: Array,
+  c: Array,
+  d: Array,
+): Array {
+  using ab = a.mul(b) as Array;
+  using cd = c.mul(d) as Array;
+  using ef = e.mul(f) as Array;
+  using t1 = ab.sub(cd) as Array;
+  return t1.add(ef) as Array;
+}
+
+/**
+ * Extract element a[..., i, j] from a batched matrix, returning shape [...].
+ * Uses core.shrink (ShapeTracker view) + reshape — O(1), no data copy.
+ */
+function idx2d(a: Array, i: number, j: number): Array {
+  const nd = a.ndim;
+  const slices: [number, number][] = [];
+  for (let d = 0; d < nd - 2; d++) slices.push([0, a.shape[d]]);
+  slices.push([i, i + 1], [j, j + 1]);
+  using sliced = core.shrink(a, slices) as Array;
+  return np.squeeze(sliced, [-1, -2]);
 }
 
 /**

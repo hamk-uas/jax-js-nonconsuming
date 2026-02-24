@@ -9,6 +9,7 @@
 // jax-js-lint: allow-ref — .ref is essential for evalJaxpr input ownership
 
 import { add, broadcast, concatenate, reshape, shrink, Tracer } from "./core";
+import { byteWidth } from "../alu";
 import { ClosedJaxpr, evalJaxpr } from "./jaxpr";
 
 // ---------------------------------------------------------------------------
@@ -274,10 +275,25 @@ export class ScanPullbackArtifact {
 
     // ---- Step 1: Forward pass to collect checkpoint carries ----
 
-    const useCheckpointing = checkpoint !== false;
+    // Auto-disable √N checkpointing when total carry memory is small.
+    // Storing all N carries avoids ~25-30% recomputation overhead for typical
+    // DLM/Kalman filter workloads where carry is a small matrix (m≤13).
+    const AUTO_CHECKPOINT_THRESHOLD = 4 * 1024 * 1024; // 4 MB
+    let effectiveCheckpoint = checkpoint;
+    if (effectiveCheckpoint === undefined || effectiveCheckpoint === true) {
+      const carryBytes = this.carryResiduals.reduce(
+        (total, c) => total + c.size * byteWidth(c.dtype),
+        0,
+      );
+      if (carryBytes * length <= AUTO_CHECKPOINT_THRESHOLD) {
+        effectiveCheckpoint = false;
+      }
+    }
+
+    const useCheckpointing = effectiveCheckpoint !== false;
     const segmentSize = useCheckpointing
-      ? typeof checkpoint === "number"
-        ? checkpoint
+      ? typeof effectiveCheckpoint === "number"
+        ? effectiveCheckpoint
         : Math.max(1, Math.ceil(Math.sqrt(length)))
       : length;
 
