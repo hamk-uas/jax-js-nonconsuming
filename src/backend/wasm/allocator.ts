@@ -104,8 +104,15 @@ export class WasmAllocator {
     if (ptr + size > this.#memory.buffer.byteLength) {
       // Note: 4 GiB = max memory32 size
       // https://spidermonkey.dev/blog/2025/01/15/is-memory64-actually-worth-using.html
+      const needed = ptr + size;
+      if (needed > 0xffff_ffff) {
+        throw new RangeError(
+          `WASM allocation would exceed 4 GiB limit (need ${(needed / 2 ** 30).toFixed(1)} GiB)`,
+        );
+      }
+      // Use >>> (unsigned right shift) — signed >> wraps negative above 2 GiB.
       this.#memory.grow(
-        ((ptr + size + 65535) >> 16) - (this.#memory.buffer.byteLength >> 16),
+        ((needed + 65535) >>> 16) - (this.#memory.buffer.byteLength >>> 16),
       );
     }
     return ptr;

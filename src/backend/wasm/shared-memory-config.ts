@@ -8,8 +8,8 @@
 
 import type { CodeGenerator } from "./wasmblr";
 
-/** Maximum pages for shared WebAssembly.Memory (512 MiB = 8192 × 64 KiB). */
-export const MAX_SHARED_PAGES = 8192;
+/** Maximum pages for shared WebAssembly.Memory (4 GiB = 65536 × 64 KiB, WASM32 ceiling). */
+export const MAX_SHARED_PAGES = 65536;
 
 /**
  * Module-level flag: whether the WASM backend uses shared memory.
