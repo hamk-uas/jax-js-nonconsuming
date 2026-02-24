@@ -236,6 +236,43 @@ result.dispose(); // caller disposes the output when done
 f.dispose(); // free captured constants when the function is no longer needed
 ```
 
+JIT functions support `using` for automatic cleanup — ideal for short-lived compiled functions:
+
+```ts
+{
+  using f = jit((x: np.Array) => x.mul(x).sum());
+  const result = f(input);
+  console.log(await result.data());
+  result.dispose();
+  // f's captured constants freed automatically at block end
+}
+```
+
+**JIT cache hierarchy.** Disposing a `jit` function frees its captured GPU/WASM buffer constants
+(the expensive part), but lightweight metadata caches survive for reuse:
+
+| Cache                        | Freed by `f.dispose()`? | Freed by `clearCaches()`? |
+| ---------------------------- | ----------------------- | ------------------------- |
+| Captured constants (buffers) | **Yes**                 | **Yes**                   |
+| JIT compilation cache        | No (lightweight)        | **Yes**                   |
+| GPU shader pipelines         | No (cheap handles)      | No (device lifetime)      |
+
+For long-running applications (optimization loops, servers), call `clearCaches()` periodically to
+reclaim all JIT metadata. This is rarely needed — the metadata caches are small — but it prevents
+unbounded growth when creating many distinct JIT closures:
+
+```ts
+import { clearCaches } from "@hamk-uas/jax-js-nonconsuming";
+
+for (const batch of batches) {
+  using f = jit((x) => model(params, x));
+  const loss = f(batch);
+  // ... update params ...
+  loss.dispose();
+}
+clearCaches(); // flush all JIT metadata after the loop
+```
+
 The `@hamk-uas/eslint-plugin-jax-js` catches the most common memory leaks (missing `using`,
 use-after-dispose, unnecessary `.ref`) at edit time — see the
 [plugin README](packages/eslint-plugin) for setup.

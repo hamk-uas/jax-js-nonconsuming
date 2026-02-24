@@ -1,10 +1,14 @@
-These notes help AI coding agents be immediately productive. The document has two parts:
+These notes help AI coding agents be immediately productive. The document has nine parts:
 
 1. **Repository Overview** — General jax-js knowledge for any development work
 2. **Scan Feature Reference** — `lax.scan` implementation details and backend-specific behavior
 3. **Buffer Recycling & WebGPU Buffer Pool** — JIT `recycle` step and pool architecture
 4. **Ownership Friction Points, Debugging & Future Work** — edge cases, debugging strategies
 5. **Associative Scan** — `lax.associativeScan` Kogge-Stone parallel prefix scan
+6. **Linear Algebra Autodiff** — `solve`, `inv`, TriangularSolve JVP fix
+7. **Polymorphic Shapes** — `SymDim`, `dynamic_axes`, symbolic caching
+8. **ULTIMATE-ARCHITECTURE-PLAN Progress** — M0–M8 milestone status
+9. **Session Continuity Notes** — build/test workflow, context preservation
 
 ---
 
@@ -3787,6 +3791,41 @@ using result = tree.makeDisposable({ x: np.array([1]), y: np.array([2]) });
 When a JIT function returns the same tracer under multiple output keys (e.g.,
 `{ xf_0, yhat: xf_0 }`), the materialised result contains independent `np.Array` instances — one per
 key. Each can be disposed independently.
+
+**7. JIT function disposal — cache hierarchy:**
+
+`jit()` returns an `OwnedFunction` with `.dispose()` and `[Symbol.dispose]` (`using`-compatible).
+Disposal frees captured `ClosedJaxpr` constants (GPU/WASM buffers) and clears the per-function
+tracing cache. However, downstream compiled artifacts are **not** freed:
+
+| Cache layer                        | Contents                      | Freed by `f.dispose()`? | Freed by `clearCaches()`? | Lifetime     |
+| ---------------------------------- | ----------------------------- | ----------------------- | ------------------------- | ------------ |
+| Per-function `cache` (jaxpr.ts)    | `ClosedJaxpr` + const buffers | **Yes**                 | **Yes**                   | Per jit fn   |
+| `jitCompileCache` (jit.ts)         | `JitProgram` step lists       | No                      | **Yes**                   | Module-level |
+| `transposeJaxprCache` (linearize)  | Transposed body jaxprs        | No                      | **Yes**                   | Module-level |
+| `jvpJaxprCache` / `vmapJaxprCache` | Differentiated/vmapped jaxprs | No                      | **Yes**                   | Module-level |
+| `ShaderPipelineCache` (WebGPU)     | `GPUComputePipeline` handles  | No                      | No                        | `GPUDevice`  |
+| WASM routine LRU cache             | Compiled WASM modules         | No                      | No                        | Backend      |
+
+**Cost profile:** Captured constants are the expensive part (actual GPU/WASM buffers). The
+`jitCompileCache` and transform caches hold lightweight metadata (~KB each). GPU pipeline handles
+are intentionally never freed — recompiling shaders is expensive (~5–10 µs) and the handles are
+cheap.
+
+**When to use each cleanup level:**
+
+| Pattern                                  | Cleanup method                 | When to use                              |
+| ---------------------------------------- | ------------------------------ | ---------------------------------------- |
+| Short-lived JIT fn in a block            | `using f = jit(...)`           | Most common — auto-disposes at block end |
+| Long-lived JIT fn (module-level)         | `f.dispose()` when truly done  | On shutdown or model swap                |
+| Optimization loop creating many closures | `clearCaches()` after the loop | Prevents unbounded metadata growth       |
+| Switching models in a long-running app   | `clearCaches()` between models | Reclaims all JIT metadata                |
+
+**Workaround signature (AEP §2):** If downstream code accumulates JIT closures in a loop (e.g.,
+`for (...) { const f = jit(...); ... }`) without disposal, GPU/WASM memory grows unboundedly.
+**Fix:** wrap in `using` or call `clearCaches()` after the loop. If the consumer has a custom "cache
+clearing" utility or periodic `init()`/`destroy()` cycle, replace it with `clearCaches()` — it
+handles all internal caches atomically.
 
 ### Migration guide from move semantics
 
