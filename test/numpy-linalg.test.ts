@@ -74,7 +74,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       using aInv = np.linalg.inv(a);
       using identity = np.matmul(a, aInv);
       using expected = np.eye(2);
-      // f32 rounding through LU -> A @ A^{-1} is identity to ~1e-7; loosen atol.
+      // 2×2 uses analytical Cramer's rule; f32 rounding -> loosen atol.
       expect(identity).toBeAllclose(expected, { atol: 1e-6 });
     });
 
@@ -111,6 +111,60 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       using expected = leftRight.mul(-1);
 
       expect(da).toBeAllclose(expected, { rtol: 1e-4, atol: 1e-4 });
+    });
+
+    test("1×1 inverse (reciprocal path)", () => {
+      using a = np.array([[4.0]]);
+      using aInv = np.linalg.inv(a);
+      using expected = np.array([[0.25]]);
+      expect(aInv).toBeAllclose(expected, { atol: 1e-7 });
+    });
+
+    test("3×3 inverse (cofactor/Cramer's rule path)", () => {
+      using a = np.array([
+        [1.0, 2.0, 3.0],
+        [0.0, 1.0, 4.0],
+        [5.0, 6.0, 0.0],
+      ]);
+      using aInv = np.linalg.inv(a);
+      using identity = np.matmul(a, aInv);
+      using expected = np.eye(3);
+      expect(identity).toBeAllclose(expected, { atol: 1e-5 });
+    });
+
+    test("gradient of sum(inv(A)) for 3×3", () => {
+      using a = np.array([
+        [2.0, 0.3, 0.1],
+        [0.1, 1.7, 0.2],
+        [0.4, 0.1, 1.5],
+      ]);
+      const f = (x: np.Array) => np.linalg.inv(x).sum();
+      using da = grad(f)(a);
+      using aInv = np.linalg.inv(a);
+      using aInvT = np.matrixTranspose(aInv);
+      using ones = np.ones([3, 3]);
+      using left = np.matmul(aInvT, ones);
+      using leftRight = np.matmul(left, aInvT);
+      using expected = leftRight.mul(-1);
+      expect(da).toBeAllclose(expected, { rtol: 1e-3, atol: 1e-3 });
+    });
+
+    test("gradient of sum(inv(A)) for 4×4", () => {
+      using a = np.array([
+        [3.0, 0.2, 0.1, 0.0],
+        [0.1, 2.5, 0.3, 0.1],
+        [0.2, 0.1, 2.0, 0.2],
+        [0.0, 0.1, 0.1, 1.8],
+      ]);
+      const f = (x: np.Array) => np.linalg.inv(x).sum();
+      using da = grad(f)(a);
+      using aInv = np.linalg.inv(a);
+      using aInvT = np.matrixTranspose(aInv);
+      using ones = np.ones([4, 4]);
+      using left = np.matmul(aInvT, ones);
+      using leftRight = np.matmul(left, aInvT);
+      using expected = leftRight.mul(-1);
+      expect(da).toBeAllclose(expected, { rtol: 1e-3, atol: 1e-3 });
     });
   });
 

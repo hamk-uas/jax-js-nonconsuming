@@ -221,7 +221,7 @@ Most operations behave the same way as they do in JAX.
 | `dstack`              | 🟢      |                                              |
 | `dtype`               | ⚪️      | can access `Array.dtype`                     |
 | `ediff1d`             | 🟠      |                                              |
-| `einsum`              | 🟢      |                                              |
+| `einsum`              | 🟢      | Fast path for batch matmul patterns          |
 | `einsum_path`         | ⚪️      | path is currently private                    |
 | `empty`               | ⚪️      | use `zeros`                                  |
 | `empty_like`          | ⚪️      | use `zeros_like`                             |
@@ -509,39 +509,39 @@ Cholesky, LU (with partial pivoting), triangular solve, and QR decomposition. St
 
 - SVD, eigenvalues
 
-| API                | Support | Notes                                   |
-| ------------------ | ------- | --------------------------------------- |
-| `cholesky`         | 🟢      |                                         |
-| `cond`             | 🔴      |                                         |
-| `cross`            | 🟠      |                                         |
-| `det`              | 🟢      |                                         |
-| `diagonal`         | 🟢      |                                         |
-| `eig`              | 🔴      |                                         |
-| `eigh`             | 🔴      |                                         |
-| `eigvals`          | 🔴      |                                         |
-| `eigvalsh`         | 🔴      |                                         |
-| `inv`              | 🟢      | Differentiable (via `solve`)            |
-| `lstsq`            | 🟡      | Cholesky-based, less stable than QR/SVD |
-| `matmul`           | 🟢      |                                         |
-| `matrix_norm`      | 🟠      |                                         |
-| `matrix_power`     | 🟢      |                                         |
-| `matrix_rank`      | 🔴      |                                         |
-| `matrix_transpose` | 🟢      |                                         |
-| `multi_dot`        | 🟠      |                                         |
-| `norm`             | 🟠      |                                         |
-| `outer`            | 🟢      |                                         |
-| `pinv`             | 🔴      |                                         |
-| `qr`               | �       | Differentiable (Householder QR)         |
-| `slogdet`          | 🟢      |                                         |
-| `solve`            | 🟢      | Differentiable (direct LU→triSolve)     |
-| `svd`              | 🔴      |                                         |
-| `svdvals`          | 🔴      |                                         |
-| `tensordot`        | 🟢      |                                         |
-| `tensorinv`        | 🔴      |                                         |
-| `tensorsolve`      | 🔴      |                                         |
-| `trace`            | 🟢      |                                         |
-| `vector_norm`      | 🟠      |                                         |
-| `vecdot`           | 🟢      |                                         |
+| API                | Support | Notes                                                                        |
+| ------------------ | ------- | ---------------------------------------------------------------------------- |
+| `cholesky`         | 🟢      |                                                                              |
+| `cond`             | 🔴      |                                                                              |
+| `cross`            | 🟠      |                                                                              |
+| `det`              | 🟢      |                                                                              |
+| `diagonal`         | 🟢      |                                                                              |
+| `eig`              | 🔴      |                                                                              |
+| `eigh`             | 🔴      |                                                                              |
+| `eigvals`          | 🔴      |                                                                              |
+| `eigvalsh`         | 🔴      |                                                                              |
+| `inv`              | 🟢      | Analytical (Cramer's rule) for m≤4; LU-based `solve` for m≥5. Differentiable |
+| `lstsq`            | 🟡      | Cholesky-based, less stable than QR/SVD                                      |
+| `matmul`           | 🟢      |                                                                              |
+| `matrix_norm`      | 🟠      |                                                                              |
+| `matrix_power`     | 🟢      |                                                                              |
+| `matrix_rank`      | 🔴      |                                                                              |
+| `matrix_transpose` | 🟢      |                                                                              |
+| `multi_dot`        | 🟠      |                                                                              |
+| `norm`             | 🟠      |                                                                              |
+| `outer`            | 🟢      |                                                                              |
+| `pinv`             | 🔴      |                                                                              |
+| `qr`               | �       | Differentiable (Householder QR)                                              |
+| `slogdet`          | 🟢      |                                                                              |
+| `solve`            | 🟢      | Differentiable (direct LU→triSolve)                                          |
+| `svd`              | 🔴      |                                                                              |
+| `svdvals`          | 🔴      |                                                                              |
+| `tensordot`        | 🟢      |                                                                              |
+| `tensorinv`        | 🔴      |                                                                              |
+| `tensorsolve`      | 🔴      |                                                                              |
+| `trace`            | 🟢      |                                                                              |
+| `vector_norm`      | 🟠      |                                                                              |
+| `vecdot`           | 🟢      |                                                                              |
 
 ## [`jax.lax` module](https://docs.jax.dev/en/latest/jax.lax.html)
 
@@ -549,8 +549,8 @@ A few functions in `jax.lax` have been implemented:
 
 - `conv_general_dilated()` for convolutions
 - `dot()` for general tensor contractions
-- `scan()` for sequential loops with carry state (supports JIT, autodiff with √N checkpointing,
-  vmap, and native compilation on WASM/WebGPU)
+- `scan()` for sequential loops with carry state (supports JIT, autodiff with √N checkpointing that
+  auto-bypasses for small carries ≤4 MB, vmap, and native compilation on WASM/WebGPU)
 - `associativeScan()` for parallel prefix scans via any associative binary operator (Kogge-Stone
   O(log N) depth algorithm, supports pytrees, arbitrary axis, reverse, and full autodiff; WASM
   compiled-loop compiles entire Kogge-Stone ladder into a single WASM module with polymorphic N;

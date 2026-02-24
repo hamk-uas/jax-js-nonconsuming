@@ -2773,7 +2773,7 @@ Handles: gidx loop, bounds check, reduction identity/accumulate/epilogue via
 | WebGPU internal buffer deps in scan                  | Falls back to batched JS loop (O(N/256) submissions via `beginBatch`)                                                   | WebGPU  |
 | Mixed kernel+routine bodies on WebGPU                | Falls back to batched JS loop                                                                                           | WebGPU  |
 | **`grad(scan)` backward on WebGPU with linalg body** | **Batched fallback** — transposed body has intra-step deps; reformulate backward pass as `associativeScan`, or use WASM | WebGPU  |
-| `grad(scan)` ~2× compute overhead                    | Use `{ checkpoint: false }` for O(N)                                                                                    | All     |
+| `grad(scan)` ~2× compute overhead                    | Auto-bypassed for small carries (≤4 MB total); use `{ checkpoint: false }` for O(N) memory on large carries             | All     |
 | Sort in scan body on WebGPU                          | Uses JS loop (uniforms)                                                                                                 | WebGPU  |
 | Mixed-dtype carries on WebGPU                        | Use WASM backend or same-dtype carry                                                                                    | WebGPU  |
 
@@ -4411,20 +4411,21 @@ the TriSolve JVP, jax-js achieves the same correctness with zero extra infrastru
 | Composability        | Manual rule for each transform    | Free (`jit`, `grad`, `vmap` compose) |
 | Maintenance          | Custom primitive to maintain      | Nothing extra — standard AD pipeline |
 
-### Why `inv` is just `solve(A, I)`
+### `inv` implementation: analytical fast path + `solve` fallback
 
-With `solve` handling gradients correctly, `inv` is simply:
+For small matrices (n ≤ 4), `inv` uses closed-form Cramer's rule formulas — computing the
+determinant and cofactor matrix directly. This avoids LU decomposition overhead and is significantly
+faster for the small matrices common in state-space models (2×2 to 4×4 covariance matrices). For n ≥
+5, `inv` delegates to `solve(A, I)` which uses LU decomposition.
 
-```ts
-export function inv(a: ArrayLike): Array {
-  const n = checkSquare("inv", a);
-  using eye = np.eye(n, { dtype: a.dtype });
-  return solve(a, eye);
-}
-```
+Both paths are fully differentiable:
 
-The gradient `∂L/∂A` for `inv(A)` reduces to $-A^{-T} G A^{-T}$ (where $G$ is the cotangent), which
-falls out of `solve`'s gradient formula automatically.
+- **n ≤ 4 (analytical):** Gradient flows through the elementwise Cramer's rule operations.
+- **n ≥ 5 (LU-based):** Gradient flows through `solve` → `lu` → `triangularSolve` (with the
+  `triu(dA)` mask fix ensuring correctness).
+
+The gradient `∂L/∂A` for `inv(A)` reduces to $-A^{-T} G A^{-T}$ (where $G$ is the cotangent) in both
+cases.
 
 ---
 
