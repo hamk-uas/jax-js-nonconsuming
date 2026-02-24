@@ -265,8 +265,7 @@ export class WebGPUBackend implements Backend {
       ),
       sharedMemory: false,
       multiOutputKernel: true,
-      maxComputeWorkgroupSizeX:
-        device.limits.maxComputeWorkgroupSizeX,
+      maxComputeWorkgroupSizeX: device.limits.maxComputeWorkgroupSizeX,
     };
     this.pipelines = new ShaderPipelineCache(device);
     this.syncReader = new SyncReader(device);
@@ -450,8 +449,11 @@ export class WebGPUBackend implements Backend {
     if (size === 0) return;
     const srcBuf = this.#getBuffer(src);
     const dstBuf = this.#getBuffer(dst);
+    // Use batch encoder when a batch is active (e.g., fallback scan loop),
+    // otherwise create a standalone command encoder.
+    const encoder = this.#batchEncoder ?? this.device.createCommandEncoder();
+    const ownEncoder = !this.#batchEncoder;
     // WebGPU copyBufferToBuffer requires 4-byte alignment on offsets and size.
-    const encoder = this.device.createCommandEncoder();
     if (srcOffset % 4 === 0 && dstOffset % 4 === 0 && size % 4 === 0) {
       // Fast GPU copy path — all alignments satisfied.
       encoder.copyBufferToBuffer(
@@ -461,7 +463,7 @@ export class WebGPUBackend implements Backend {
         dstOffset,
         size,
       );
-      this.device.queue.submit([encoder.finish()]);
+      if (ownEncoder) this.device.queue.submit([encoder.finish()]);
     } else {
       // Unaligned fallback: use WGSL copy shader (stays on GPU).
       const uniformBuf = this.#encodeCopyWithShader(
@@ -472,8 +474,13 @@ export class WebGPUBackend implements Backend {
         dstOffset,
         size,
       );
-      this.device.queue.submit([encoder.finish()]);
-      if (uniformBuf) uniformBuf.destroy();
+      if (ownEncoder) {
+        this.device.queue.submit([encoder.finish()]);
+        if (uniformBuf) uniformBuf.destroy();
+      } else if (uniformBuf) {
+        // Defer uniform buffer destruction until batch ends
+        this.#batchUniformsToDestroy.push(uniformBuf);
+      }
     }
   }
 
@@ -2038,9 +2045,7 @@ function pipelineSource(
     if (useSharedMem) {
       // Store each thread's partial into shared memory.
       for (let i = 0; i < upcast; i++) {
-        emit(
-          `shmem[${i * groupSize} + group] = ${acc[i]};`,
-        );
+        emit(`shmem[${i * groupSize} + group] = ${acc[i]};`);
       }
       emit("workgroupBarrier();");
 
@@ -2053,10 +2058,12 @@ function pipelineSource(
           if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
           else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
           else if (re.op === AluOp.Min) {
-            if (re.dtype === DType.Bool) emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
+            if (re.dtype === DType.Bool)
+              emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
             else emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
           } else if (re.op === AluOp.Max) {
-            if (re.dtype === DType.Bool) emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
+            if (re.dtype === DType.Bool)
+              emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
             else emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
           }
         }
@@ -2109,7 +2116,9 @@ function pipelineSource(
   emit(popIndent, "}");
 
   const sharedBytes = useSharedMem
-    ? groupSize * ((tune as WebGPUTuneResult).size.upcast ?? 1) * byteWidth(re!.dtype)
+    ? groupSize *
+      ((tune as WebGPUTuneResult).size.upcast ?? 1) *
+      byteWidth(re!.dtype)
     : undefined;
   return {
     code: shader.join("\n"),
@@ -2565,7 +2574,7 @@ function pipelineSubmit(
         const wgSize =
           typeof shader.workgroupSize === "number"
             ? shader.workgroupSize
-            : shader.workgroupSize?.[0] ?? 256;
+            : (shader.workgroupSize?.[0] ?? 256);
         const gridSize = Math.ceil(totalSize / wgSize);
         symbolicGrid = calculateGrid(gridSize);
       }

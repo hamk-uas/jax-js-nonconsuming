@@ -105,64 +105,95 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
   // Track pending operations
   const pending: PendingExecute[] = [];
 
-  for (let step = 0; step < length; step++) {
-    const i = reverse ? length - 1 - step : step;
+  // Sub-batch GPU commands: instead of one queue.submit() per iteration,
+  // batch SCAN_BATCH_SIZE iterations into one submit. This reduces O(2N)
+  // submits to O(N/SCAN_BATCH_SIZE) while limiting deferred buffer
+  // accumulation. The batch encoder accumulates dispatches and copies;
+  // nested flushPending calls become no-ops (depth tracking).
+  const SCAN_BATCH_SIZE = 256;
+  const useBatching = backend.beginBatch != null && length > 1;
 
-    // Invariant 1: Flush pending ops before each body invocation
-    flushPending(pending);
+  if (useBatching) backend.beginBatch!();
 
-    // Slice xs for this iteration
-    const xSlices = sliceXsAtIteration(backend, xsSlots, xsStrides, xsAvals, i);
+  try {
+    for (let step = 0; step < length; step++) {
+      const i = reverse ? length - 1 - step : step;
 
-    // IncRef consts so body can consume them
-    for (const slot of constSlots) backend.incRef(slot);
+      // Invariant 1: Flush pending ops before each body invocation
+      flushPending(pending);
 
-    // Build body inputs: [consts, carry, xSlices]
-    // carry is consumed (body takes ownership)
-    const bodyInputs = [...constSlots, ...carry, ...xSlices];
+      // Slice xs for this iteration
+      const xSlices = sliceXsAtIteration(
+        backend,
+        xsSlots,
+        xsStrides,
+        xsAvals,
+        i,
+      );
 
-    // Execute body
-    const bodyResult = bodyProgram.execute(bodyInputs);
-    pending.push(...bodyResult.pending);
+      // IncRef consts so body can consume them
+      for (const slot of constSlots) backend.incRef(slot);
 
-    // Flush pending ops from body execution before reading output slots
-    // (the body's kernels must be dispatched before we can copy from them)
-    flushPending(pending);
+      // Build body inputs: [consts, carry, xSlices]
+      // carry is consumed (body takes ownership)
+      const bodyInputs = [...constSlots, ...carry, ...xSlices];
 
-    const newCarry = bodyResult.outputs.slice(0, numCarry);
-    const ySlices = bodyResult.outputs.slice(numCarry);
+      // Execute body
+      const bodyResult = bodyProgram.execute(bodyInputs);
+      pending.push(...bodyResult.pending);
 
-    // Release borrowed consts and created x slice slots.
-    // Note: JitProgram.execute() already inserts incref steps for any output
-    // that is a passthrough from an input or appears multiple times in the
-    // output list, so each output position has its own reference. No extra
-    // alias-protection incRef is needed here — the JIT's refs protect outputs
-    // from being prematurely freed by these input decRefs.
-    for (const slot of constSlots) backend.decRef(slot);
-    for (const slot of xSlices) backend.decRef(slot);
+      // Flush pending ops from body execution before reading output slots
+      // (the body's kernels must be dispatched before we can copy from them)
+      flushPending(pending);
 
-    // Invariant 3: Y stacking — copy y slices into preallocated output buffers
-    for (let yi = 0; yi < numY; yi++) {
-      if (ysStrides[yi] > 0) {
-        copySliceToBuffer(
-          backend,
-          ysOutputSlots[yi],
-          ySlices[yi],
-          i,
-          ysStrides[yi],
-          ysStrides[yi],
-        );
+      const newCarry = bodyResult.outputs.slice(0, numCarry);
+      const ySlices = bodyResult.outputs.slice(numCarry);
+
+      // Release borrowed consts and created x slice slots.
+      // Note: JitProgram.execute() already inserts incref steps for any output
+      // that is a passthrough from an input or appears multiple times in the
+      // output list, so each output position has its own reference. No extra
+      // alias-protection incRef is needed here — the JIT's refs protect outputs
+      // from being prematurely freed by these input decRefs.
+      for (const slot of constSlots) backend.decRef(slot);
+      for (const slot of xSlices) backend.decRef(slot);
+
+      // Invariant 3: Y stacking — copy y slices into preallocated output buffers
+      for (let yi = 0; yi < numY; yi++) {
+        if (ysStrides[yi] > 0) {
+          copySliceToBuffer(
+            backend,
+            ysOutputSlots[yi],
+            ySlices[yi],
+            i,
+            ysStrides[yi],
+            ysStrides[yi],
+          );
+        }
+        // Free the y slice (it's been copied into the output buffer)
+        backend.decRef(ySlices[yi]);
       }
-      // Free the y slice (it's been copied into the output buffer)
-      backend.decRef(ySlices[yi]);
-    }
 
-    // Invariant 2: Carry lifecycle — body.execute() borrows inputs (does not
-    // consume them). We must explicitly release old carry slots. The JIT's
-    // incref for passthrough/duplicate outputs ensures that any carry slot
-    // reappearing in newCarry has an extra ref, so this decRef is safe.
-    for (const slot of carry) backend.decRef(slot);
-    carry = newCarry;
+      // Invariant 2: Carry lifecycle — body.execute() borrows inputs (does not
+      // consume them). We must explicitly release old carry slots. The JIT's
+      // incref for passthrough/duplicate outputs ensures that any carry slot
+      // reappearing in newCarry has an extra ref, so this decRef is safe.
+      for (const slot of carry) backend.decRef(slot);
+      carry = newCarry;
+
+      // Periodic flush: end current batch and start a new one to release
+      // deferred buffers and limit GPU memory accumulation.
+      if (
+        useBatching &&
+        step < length - 1 &&
+        (step + 1) % SCAN_BATCH_SIZE === 0
+      ) {
+        backend.endBatch!();
+        backend.beginBatch!();
+      }
+    }
+  } finally {
+    if (useBatching) backend.endBatch!();
   }
 
   // Flush any remaining pending ops before writing final carry

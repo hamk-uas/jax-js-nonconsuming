@@ -632,12 +632,7 @@ function emitExtractedSingleOutputBody(
       cg.i32.add();
 
       // Emit SIMD expression
-      translateExpCoreSimd(
-        cg,
-        tune.exp,
-        gidx,
-        (gid) => inputLocals[gid],
-      );
+      translateExpCoreSimd(cg, tune.exp, gidx, (gid) => inputLocals[gid]);
 
       // v128.store
       cg.v128.store(2, 0);

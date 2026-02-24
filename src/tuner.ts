@@ -109,7 +109,11 @@ class TuneDims {
 
     if (length !== amount) {
       // First split it.
-      (this.local++, this.groups++, this.reduce++, this.unroll++, this.upcast++);
+      (this.local++,
+        this.groups++,
+        this.reduce++,
+        this.unroll++,
+        this.upcast++);
       this.st = this.st.reshape([
         ...this.st.shape.slice(0, axis),
         length / amount,

@@ -8,14 +8,14 @@ improvements.
 
 ## Priority Summary
 
-| # | Feature                          | Priority    | Expected Impact | Risk   |
-|---|----------------------------------|-------------|-----------------|--------|
-| P1| Tiled matmul (WebGPU)            | **High**    | 5–10× large mm  | Low    |
-| P2| Relaxed SIMD FMA (WASM)          | **Medium**  | ~2× dot product | Medium |
-| P3| WASM i64 in wasmblr              | **Medium**  | Medium-High     | Low    |
-| P4| Conv2d tuning                    | **Medium**  | 2–5× conv       | Low    |
-| P5| WebGPU subgroups                 | **Low**     | 2–4× reductions | High   |
-| P6| Benchmark validation suite       | **Medium**  | N/A (tooling)   | None   |
+| #   | Feature                    | Priority   | Expected Impact | Risk   |
+| --- | -------------------------- | ---------- | --------------- | ------ |
+| P1  | Tiled matmul (WebGPU)      | **High**   | 5–10× large mm  | Low    |
+| P2  | Relaxed SIMD FMA (WASM)    | **Medium** | ~2× dot product | Medium |
+| P3  | WASM i64 in wasmblr        | **Medium** | Medium-High     | Low    |
+| P4  | Conv2d tuning              | **Medium** | 2–5× conv       | Low    |
+| P5  | WebGPU subgroups           | **Low**    | 2–4× reductions | High   |
+| P6  | Benchmark validation suite | **Medium** | N/A (tooling)   | None   |
 
 ---
 
@@ -26,9 +26,9 @@ improvements.
 ### Problem
 
 Current matmul compiles as `Dot = Mul → Reduce`. Each output element `C[i,j]` is computed by one
-thread doing a full dot product across the K dimension: `C[i,j] = sum(A[i,:] * B[:,j])`. Each
-thread loads an entire row of A and column of B from global memory independently. For `N×N` matmul
-this means `N³` global loads with no data reuse — far below peak.
+thread doing a full dot product across the K dimension: `C[i,j] = sum(A[i,:] * B[:,j])`. Each thread
+loads an entire row of A and column of B from global memory independently. For `N×N` matmul this
+means `N³` global loads with no data reuse — far below peak.
 
 **Current codegen path:**
 
@@ -68,13 +68,12 @@ This converts `O(N)` global loads per thread to `O(N/TILE_K)` shared loads — d
 
 **Step 1: Detect tiled matmul eligibility**
 
-In `splitGraphDataflow()` or `jitCompile()` (`src/frontend/jit.ts`), detect when a `Kernel` is a
-Dot reduction (Mul+Add reduce over last axis) with two 2D matrix inputs. Set a flag on the Kernel
-or emit a dedicated `"tiled_matmul"` JitStep type.
+In `splitGraphDataflow()` or `jitCompile()` (`src/frontend/jit.ts`), detect when a `Kernel` is a Dot
+reduction (Mul+Add reduce over last axis) with two 2D matrix inputs. Set a flag on the Kernel or
+emit a dedicated `"tiled_matmul"` JitStep type.
 
 Location: `src/frontend/jit.ts:1817` — the `Primitive.Dot` jit rule is the natural detection point.
-Currently it lowers to `Mul → Reduce`; instead, for eligible shapes, it can emit a specialized
-step.
+Currently it lowers to `Mul → Reduce`; instead, for eligible shapes, it can emit a specialized step.
 
 Eligibility: `lhsContractingDims.length === 1` (single inner-product axis), both inputs 2D or
 batched-2D, f32 dtype, K ≥ TILE_K (e.g., 16), M and N ≥ TILE_M (e.g., 16).
@@ -112,8 +111,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
 }
 ```
 
-Tile sizes should be tunable. Start with `TILE = 16`, which uses
-`2 × 16 × 16 × 4 = 2048 bytes` shared memory — well within typical limits.
+Tile sizes should be tunable. Start with `TILE = 16`, which uses `2 × 16 × 16 × 4 = 2048 bytes`
+shared memory — well within typical limits.
 
 **Step 3: Dispatch path**
 
@@ -127,24 +126,24 @@ Cache key: include tile dimensions in the pipeline cache key via `ShaderPipeline
 
 **Step 4: Batched matmul**
 
-Extend to batched matmul: add a batch dimension loop or a 3D workgroup grid where `wg.z` indexes
-the batch.
+Extend to batched matmul: add a batch dimension loop or a 3D workgroup grid where `wg.z` indexes the
+batch.
 
 ### Source References
 
-| File                           | Line/Symbol                   | Relevance                                          |
-|--------------------------------|-------------------------------|---------------------------------------------------|
-| `src/frontend/jit.ts`          | `jitRules[Primitive.Dot]`     | Where Dot is lowered to Mul+Reduce (line 1817)    |
-| `src/frontend/jit.ts`          | `Primitive.Conv` rule         | Conv also lowers through Dot (line 1827)          |
-| `src/backend/webgpu.ts`        | `pipelineSource()`            | Current shader codegen for reductions (line 1634) |
-| `src/backend/webgpu.ts`        | `pipelineSubmit()`            | Dispatches compute pipelines (handles ShaderInfo) |
-| `src/backend/webgpu/codegen.ts`| `calculateGrid()`             | Grid splitting for large dispatches               |
-| `src/backend/webgpu/codegen.ts`| `ShaderInfo`                  | Carries `sharedMemoryBytes`, `workgroupSize`      |
-| `src/tuner.ts`                 | `tuneWebgpu()`                | Already has groups/local/shared-memory support    |
-| `bench/matmul.bench.ts`        | 2048×2048, 4096×4096          | Existing matmul benchmarks                        |
+| File                              | Line/Symbol                | Relevance                                         |
+| --------------------------------- | -------------------------- | ------------------------------------------------- |
+| `src/frontend/jit.ts`             | `jitRules[Primitive.Dot]`  | Where Dot is lowered to Mul+Reduce (line 1817)    |
+| `src/frontend/jit.ts`             | `Primitive.Conv` rule      | Conv also lowers through Dot (line 1827)          |
+| `src/backend/webgpu.ts`           | `pipelineSource()`         | Current shader codegen for reductions (line 1634) |
+| `src/backend/webgpu.ts`           | `pipelineSubmit()`         | Dispatches compute pipelines (handles ShaderInfo) |
+| `src/backend/webgpu/codegen.ts`   | `calculateGrid()`          | Grid splitting for large dispatches               |
+| `src/backend/webgpu/codegen.ts`   | `ShaderInfo`               | Carries `sharedMemoryBytes`, `workgroupSize`      |
+| `src/tuner.ts`                    | `tuneWebgpu()`             | Already has groups/local/shared-memory support    |
+| `bench/matmul.bench.ts`           | 2048×2048, 4096×4096       | Existing matmul benchmarks                        |
 | `.github/copilot-instructions.md` | "Tiled matmul opportunity" | Notes this is a 5–10× opportunity                 |
-| `src/library/numpy.ts`         | `matmul()`                    | Public API, calls `lax.dot` (line 1108)           |
-| `src/library/lax.ts`           | `dot()`                       | General contraction, transposes inputs (line 41)  |
+| `src/library/numpy.ts`            | `matmul()`                 | Public API, calls `lax.dot` (line 1108)           |
+| `src/library/lax.ts`              | `dot()`                    | General contraction, transposes inputs (line 41)  |
 
 ### Tests
 
@@ -166,18 +165,18 @@ the batch.
 
 ### Problem
 
-WASM SIMD dot products currently use separate `f32x4.mul` + `f32x4.add` instructions. The
-Relaxed SIMD proposal adds `f32x4.relaxed_madd(a, b, c)` which computes `a*b+c` in a single
-instruction, potentially using hardware FMA. This doubles multiply-accumulate throughput.
+WASM SIMD dot products currently use separate `f32x4.mul` + `f32x4.add` instructions. The Relaxed
+SIMD proposal adds `f32x4.relaxed_madd(a, b, c)` which computes `a*b+c` in a single instruction,
+potentially using hardware FMA. This doubles multiply-accumulate throughput.
 
 ### Current SIMD Usage
 
-| Location                              | Pattern                      | Would benefit from FMA |
-|---------------------------------------|------------------------------|------------------------|
-| `src/backend/wasm/wasmblr-hl.ts:594`  | `simdReductionF32()`         | **Yes** — inner loop   |
-| `src/backend/wasm/wasmblr-hl.ts:721`  | `simdReductionF64()`         | **Yes** (f64x2 madd)   |
-| `src/backend/wasm.ts:1410`            | `SIMD_OK_OPS` + JIT codegen  | **Yes** — fused a*b+c  |
-| `src/backend/wasm/mega-module.ts`     | `emitExtractedSingleOutputBody()` | **Yes** — mega SIMD |
+| Location                             | Pattern                           | Would benefit from FMA |
+| ------------------------------------ | --------------------------------- | ---------------------- |
+| `src/backend/wasm/wasmblr-hl.ts:594` | `simdReductionF32()`              | **Yes** — inner loop   |
+| `src/backend/wasm/wasmblr-hl.ts:721` | `simdReductionF64()`              | **Yes** (f64x2 madd)   |
+| `src/backend/wasm.ts:1410`           | `SIMD_OK_OPS` + JIT codegen       | **Yes** — fused a\*b+c |
+| `src/backend/wasm/mega-module.ts`    | `emitExtractedSingleOutputBody()` | **Yes** — mega SIMD    |
 
 ### Implementation Plan
 
@@ -190,13 +189,21 @@ Add Relaxed SIMD detection in `src/backend.ts` or `src/backend/wasm.ts`:
 function detectRelaxedSimd(): boolean {
   try {
     const bytes = new Uint8Array([
-      0x00, 0x61, 0x73, 0x6d, // magic
-      0x01, 0x00, 0x00, 0x00, // version
+      0x00,
+      0x61,
+      0x73,
+      0x6d, // magic
+      0x01,
+      0x00,
+      0x00,
+      0x00, // version
       // ... minimal module with relaxed_madd opcode
     ]);
     new WebAssembly.Module(bytes);
     return true;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 ```
 
@@ -236,15 +243,15 @@ and emit `f32x4.relaxed_madd` when available. This is a peephole optimization in
 
 ### Source References
 
-| File                              | Line/Symbol               | Relevance                                     |
-|-----------------------------------|---------------------------|-----------------------------------------------|
-| `src/backend/wasm/wasmblr.ts`     | `class F32x4` (~line 990) | Where to add `relaxed_madd` instruction       |
-| `src/backend/wasm/wasmblr-hl.ts`  | `simdReductionF32` (594)  | Inner dot-product loop — primary beneficiary  |
-| `src/backend/wasm/wasmblr-hl.ts`  | `simdReductionF64` (721)  | f64x2 dot products                            |
-| `src/backend/wasm.ts`             | `SIMD_OK_OPS` (1410)      | JIT SIMD eligibility set (needs FMA addition) |
-| `src/backend/wasm.ts`             | `translateExpCoreSimd()`  | JIT SIMD codegen (peephole target)            |
-| `src/backend.ts`                  | `BackendCapabilities` (20)| Where to add `relaxedSimd` flag               |
-| `.github/copilot-instructions.md` | WASM feature opportunities| Listed as "Medium priority"                   |
+| File                              | Line/Symbol                | Relevance                                     |
+| --------------------------------- | -------------------------- | --------------------------------------------- |
+| `src/backend/wasm/wasmblr.ts`     | `class F32x4` (~line 990)  | Where to add `relaxed_madd` instruction       |
+| `src/backend/wasm/wasmblr-hl.ts`  | `simdReductionF32` (594)   | Inner dot-product loop — primary beneficiary  |
+| `src/backend/wasm/wasmblr-hl.ts`  | `simdReductionF64` (721)   | f64x2 dot products                            |
+| `src/backend/wasm.ts`             | `SIMD_OK_OPS` (1410)       | JIT SIMD eligibility set (needs FMA addition) |
+| `src/backend/wasm.ts`             | `translateExpCoreSimd()`   | JIT SIMD codegen (peephole target)            |
+| `src/backend.ts`                  | `BackendCapabilities` (20) | Where to add `relaxedSimd` flag               |
+| `.github/copilot-instructions.md` | WASM feature opportunities | Listed as "Medium priority"                   |
 
 ### Risks
 
@@ -355,19 +362,19 @@ Split back to two i32 outputs at the end via `i64.wrap_i32` and shift.
 **Step 4: Enable f64 builtins**
 
 With i64 available, implement `wasm_exp_f64`, `wasm_log_f64`, `wasm_sin_f64` etc. in
-`src/backend/wasm/builtins.ts` using the standard Cephes/FDLIBM algorithms that extract exponent
-via `i64.reinterpret_f64` + `i64.shr_u`.
+`src/backend/wasm/builtins.ts` using the standard Cephes/FDLIBM algorithms that extract exponent via
+`i64.reinterpret_f64` + `i64.shr_u`.
 
 ### Source References
 
-| File                                | Line/Symbol                | Relevance                                |
-|-------------------------------------|----------------------------|------------------------------------------|
-| `src/backend/wasm/wasmblr.ts`       | `class CodeGenerator` (182)| Where to add i64 field                   |
-| `src/backend/wasm/wasmblr.ts`       | `class I32` (~280)         | Pattern to follow for I64                |
-| `src/backend/wasm/wasmblr.ts`       | `encodeSigned()` (~325)    | LEB128 encoder (needs 64-bit variant)    |
-| `src/backend/wasm/builtins.ts`      | `wasm_threefry2x32()` (502)| Primary beneficiary — PRNG, 20 i32.rotl  |
-| `src/backend/wasm/builtins.test.ts` | Threefry tests             | Correctness validation                   |
-| `src/backend/wasm/wasmblr.test.ts`  | wasmblr unit tests         | Pattern for new i64 tests                |
+| File                                | Line/Symbol                 | Relevance                               |
+| ----------------------------------- | --------------------------- | --------------------------------------- |
+| `src/backend/wasm/wasmblr.ts`       | `class CodeGenerator` (182) | Where to add i64 field                  |
+| `src/backend/wasm/wasmblr.ts`       | `class I32` (~280)          | Pattern to follow for I64               |
+| `src/backend/wasm/wasmblr.ts`       | `encodeSigned()` (~325)     | LEB128 encoder (needs 64-bit variant)   |
+| `src/backend/wasm/builtins.ts`      | `wasm_threefry2x32()` (502) | Primary beneficiary — PRNG, 20 i32.rotl |
+| `src/backend/wasm/builtins.test.ts` | Threefry tests              | Correctness validation                  |
+| `src/backend/wasm/wasmblr.test.ts`  | wasmblr unit tests          | Pattern for new i64 tests               |
 
 ### Risk
 
@@ -412,16 +419,16 @@ optimization.
 1. **Tiled matmul (P1) automatically helps** — once P1 is implemented, Conv benefits because Conv
    lowers to Dot. This is the biggest win with zero Conv-specific work.
 
-2. **Im2col avoidance** — `prepareConv()` uses ShapeTracker views to avoid materializing the
-   im2col matrix. This is already efficient for memory. The compute bottleneck is the reduction.
+2. **Im2col avoidance** — `prepareConv()` uses ShapeTracker views to avoid materializing the im2col
+   matrix. This is already efficient for memory. The compute bottleneck is the reduction.
 
 3. **Specialized conv shader** — For small kernels (3×3, 5×5), a direct convolution shader with
-   unrolled kernel loops can outperform the generic Dot path by exploiting spatial locality. This
-   is lower priority since P1 covers the common case.
+   unrolled kernel loops can outperform the generic Dot path by exploiting spatial locality. This is
+   lower priority since P1 covers the common case.
 
 4. **WASM SIMD for conv** — The JIT SIMD path (`canVectorizeSimd`) currently excludes reduction
-   kernels. Extending it to handle the conv reduction inner loop would help. This ties into P2
-   (FMA) — the conv inner loop is a multiply-accumulate.
+   kernels. Extending it to handle the conv reduction inner loop would help. This ties into P2 (FMA)
+   — the conv inner loop is a multiply-accumulate.
 
 ### Implementation Plan
 
@@ -447,16 +454,16 @@ kernel spatial dims are small enough.
 
 ### Source References
 
-| File                              | Line/Symbol              | Relevance                                      |
-|-----------------------------------|--------------------------|-------------------------------------------------|
-| `src/frontend/jit.ts`             | `Primitive.Conv` (1827)  | Conv JIT rule, lowers through Dot               |
-| `src/frontend/convolution.ts`     | `prepareConv()`          | ShapeTracker manipulation for conv→dot lowering |
-| `src/frontend/convolution.ts`     | `pool()`, `poolTranspose()` | Pooling operations (same pattern)            |
-| `src/library/lax.ts`              | `conv_general_dilated()` | Public API entry point                          |
-| `src/library/nn.ts`               | `conv()`                 | High-level neural network conv wrapper          |
-| `test/conv.test.ts`               | Conv2d correctness tests | Existing tests to validate                      |
-| `website/src/routes/bench/conv2d/`| Conv2d benchmark page    | Existing web benchmark                          |
-| `.github/copilot-instructions.md` | "Conv2d not tuned yet"   | Confirms this is a known gap (line 124)         |
+| File                               | Line/Symbol                 | Relevance                                       |
+| ---------------------------------- | --------------------------- | ----------------------------------------------- |
+| `src/frontend/jit.ts`              | `Primitive.Conv` (1827)     | Conv JIT rule, lowers through Dot               |
+| `src/frontend/convolution.ts`      | `prepareConv()`             | ShapeTracker manipulation for conv→dot lowering |
+| `src/frontend/convolution.ts`      | `pool()`, `poolTranspose()` | Pooling operations (same pattern)               |
+| `src/library/lax.ts`               | `conv_general_dilated()`    | Public API entry point                          |
+| `src/library/nn.ts`                | `conv()`                    | High-level neural network conv wrapper          |
+| `test/conv.test.ts`                | Conv2d correctness tests    | Existing tests to validate                      |
+| `website/src/routes/bench/conv2d/` | Conv2d benchmark page       | Existing web benchmark                          |
+| `.github/copilot-instructions.md`  | "Conv2d not tuned yet"      | Confirms this is a known gap (line 124)         |
 
 ### Tests
 
@@ -506,17 +513,17 @@ Already detailed in `TUNER-IMPROVEMENT-PLAN.md` — Improvement 6 section (line 
    // Thread 0 reduces across subgroup results
    ```
 
-4. Composes with Improvement 4 (shared memory): subgroups replace the inner tree reduction,
-   reducing `log2(workgroupSize)` barrier steps to `log2(workgroupSize / subgroupSize)`.
+4. Composes with Improvement 4 (shared memory): subgroups replace the inner tree reduction, reducing
+   `log2(workgroupSize)` barrier steps to `log2(workgroupSize / subgroupSize)`.
 
 ### Source References
 
-| File                          | Line/Symbol              | Relevance                                   |
-|-------------------------------|--------------------------|---------------------------------------------|
-| `TUNER-IMPROVEMENT-PLAN.md`   | Improvement 6 (line 628) | Full detailed plan with code sketches       |
-| `src/backend.ts`              | `BackendCapabilities` (20)| Where to add `subgroups` flag              |
-| `src/backend/webgpu.ts`       | `pipelineSource()` (1634)| Shader codegen — where to add subgroup path |
-| `src/tuner.ts`                | `tuneWebgpu()`           | Groups splitting logic                      |
+| File                        | Line/Symbol                | Relevance                                   |
+| --------------------------- | -------------------------- | ------------------------------------------- |
+| `TUNER-IMPROVEMENT-PLAN.md` | Improvement 6 (line 628)   | Full detailed plan with code sketches       |
+| `src/backend.ts`            | `BackendCapabilities` (20) | Where to add `subgroups` flag               |
+| `src/backend/webgpu.ts`     | `pipelineSource()` (1634)  | Shader codegen — where to add subgroup path |
+| `src/tuner.ts`              | `tuneWebgpu()`             | Groups splitting logic                      |
 
 ### Acceptance
 
@@ -543,18 +550,18 @@ Existing benchmarks in `bench/` are ad-hoc. No systematic tracking of:
 
 **Step 1: Extend `bench/matmul.bench.ts`**
 
-Add sizes: 128, 256, 512, 1024 (currently only 2048, 4096). Add batched: `[32, 64, 64]`.
-Report GFLOP/s: `2 * M * N * K / time_ns`.
+Add sizes: 128, 256, 512, 1024 (currently only 2048, 4096). Add batched: `[32, 64, 64]`. Report
+GFLOP/s: `2 * M * N * K / time_ns`.
 
 **Step 2: Create `bench/conv2d.bench.ts`**
 
 Standard CNN layers:
 
-| Layer       | Input              | Kernel  | Output            |
-|-------------|--------------------|---------|--------------------|
-| Conv1       | 1×224×224×3        | 7×7     | 1×112×112×64      |
-| ResBlock    | 1×56×56×64         | 3×3     | 1×56×56×64        |
-| MobileNet   | 1×112×112×32       | 3×3 dw  | 1×112×112×32      |
+| Layer     | Input        | Kernel | Output       |
+| --------- | ------------ | ------ | ------------ |
+| Conv1     | 1×224×224×3  | 7×7    | 1×112×112×64 |
+| ResBlock  | 1×56×56×64   | 3×3    | 1×56×56×64   |
+| MobileNet | 1×112×112×32 | 3×3 dw | 1×112×112×32 |
 
 **Step 3: Create `bench/simd-elementwise.bench.ts`**
 
@@ -579,13 +586,13 @@ script that runs all benchmark files and generates a summary.
 
 ### Source References
 
-| File                       | Line/Symbol       | Relevance                          |
-|----------------------------|-------------------|------------------------------------|
-| `bench/matmul.bench.ts`    | Existing          | Pattern to follow                  |
-| `bench/mega-module.bench.ts`| Existing         | 7 benchmarks, WASM focus           |
-| `bench/scatter-add.bench.ts`| Existing         | Throughput at 1K/10K/100K          |
-| `docs/ULTIMATE-BENCHMARKS.md`| Existing        | Results storage                    |
-| `vitest.config.ts`         | Test/bench config | Benchmark runner configuration     |
+| File                          | Line/Symbol       | Relevance                      |
+| ----------------------------- | ----------------- | ------------------------------ |
+| `bench/matmul.bench.ts`       | Existing          | Pattern to follow              |
+| `bench/mega-module.bench.ts`  | Existing          | 7 benchmarks, WASM focus       |
+| `bench/scatter-add.bench.ts`  | Existing          | Throughput at 1K/10K/100K      |
+| `docs/ULTIMATE-BENCHMARKS.md` | Existing          | Results storage                |
+| `vitest.config.ts`            | Test/bench config | Benchmark runner configuration |
 
 ### Acceptance
 

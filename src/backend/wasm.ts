@@ -309,7 +309,10 @@ export class WasmBackend implements Backend {
   }
 
   /** Return WASM allocator statistics for diagnostics and testing. */
-  allocatorStats(): { totalAllocated: number; freeListSizes: Map<number, number> } {
+  allocatorStats(): {
+    totalAllocated: number;
+    freeListSizes: Map<number, number>;
+  } {
     return this.#allocator.getStats();
   }
 
@@ -1438,9 +1441,7 @@ export function canVectorizeSimd(exp: AluExp, dtype: DType): boolean {
       // After tuneNullopt, contiguous arrays have indexExp = Special(gidx)
       // (the simplifier eliminates redundant Mod when gidx range < dim).
       // Broadcast arrays (stride=0) have indexExp = Const(0).
-      return (
-        e.src[0].op !== AluOp.Special && e.src[0].op !== AluOp.Const
-      );
+      return e.src[0].op !== AluOp.Special && e.src[0].op !== AluOp.Const;
     }
     return true; // Unknown op → not vectorizable
   });
@@ -1571,8 +1572,7 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
 
   // Check SIMD eligibility: f32 elementwise, no reduction, contiguous access
   const re = kernel.outputs[0].reduction;
-  const useSimd =
-    !re && canVectorizeSimd(tune.exp, kernel.outputs[0].dtype);
+  const useSimd = !re && canVectorizeSimd(tune.exp, kernel.outputs[0].dtype);
 
   if (DEBUG >= 2 && useSimd) {
     console.info(`wasm: SIMD f32x4 path for kernel (nargs=${kernel.nargs})`);
@@ -1627,12 +1627,7 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
         cg.i32.add();
 
         // Emit SIMD expression → v128 on stack
-        translateExpCoreSimd(
-          cg,
-          tune.exp,
-          gidx,
-          (gid) => gid + RANGE_PARAMS,
-        );
+        translateExpCoreSimd(cg, tune.exp, gidx, (gid) => gid + RANGE_PARAMS);
 
         // v128.store (pops value, then address)
         cg.v128.store(2, 0);

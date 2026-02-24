@@ -8,6 +8,54 @@ These notes help AI coding agents be immediately productive. The document has tw
 
 ---
 
+# The Agentic Evolution Protocol (AEP)
+
+## 1. The Core Mandate: Asymptotic Velocity & Debt Collection
+
+Your success is measured by the **net reduction in total system complexity**.
+
+- **Ruthless Refactoring:** Scale is an asset. Refactor 1,000 files to achieve a cleaner
+  architecture rather than patching the edges. Workarounds are not solutions — they are debt that
+  compounds.
+
+## 2. Provider Mode: Writing for the "Downstream Agent"
+
+When you modify our public API, your task is to provide a "Migration Bundle" that includes:
+
+- **Deterministic Mapping:** Raw structural diffs (e.g.,
+  `Class.oldMethod(x) -> NewModule.fetch(x)`).
+- **Workaround Signatures (The "Debt Collector"):** Explicitly identify patterns that consumers
+  likely used to bypass old limitations.
+  - _Example:_ "If the consumer has a local utility that manually merges X and Y because v1 didn't
+    support it, delete that utility and use the new `nativeMerge` endpoint."
+
+## 3. Consumer Mode: The Upgrade & Optimization Loop
+
+When an upstream dependency evolves, follow this loop:
+
+- **Contract-First Verification:** Update all local mocks and test fixtures to the new upstream
+  reality _before_ touching our code.
+- **The Workaround Hunt:** Scan our codebase for the "Workaround Signatures" provided by the
+  upstream agent. Prioritize deleting our internal "helper" functions, wrappers, and polyfills in
+  favor of the new native API implementation.
+- **Viral Propagation:** Follow the change through our entire call stack. Do not hide a new Async
+  requirement behind a Sync wrapper.
+
+## 4. Continuous Knowledge Capture (Decentralized)
+
+- **Architecture Decision Records (ADRs):** Document the "Why" behind large restructurings in a way
+  that future sessions benefit from it. Don't keep stale information.
+
+## 5. Methodology
+
+1. **The Plan:** For large tasks, generate a "Refactor Plan." List the "Workaround Signatures" you
+   intend to hunt.
+2. **The Ground Truth:** Run the native test suite. **Test Integrity is Absolute.**
+3. **The Cleanup:** Remove all deprecated code paths, dead variables, and legacy comments. If you
+   find a "todo" that the new API fixes, resolve it.
+
+---
+
 # Part 1: Repository Overview
 
 ## What is jax-js?

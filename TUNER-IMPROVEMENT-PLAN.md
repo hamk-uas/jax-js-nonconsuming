@@ -29,7 +29,8 @@ implemented. All existing tests must pass — no behavior change whatsoever.
 
 **Priority:** Phase 0 prerequisite for Improvement 5 (WASM SIMD)  
 **Effort:** Medium  
-**Status:** ⏭ Skipped — separate `translateExpCoreSimd()` used instead of refactoring `translateExpCore`
+**Status:** ⏭ Skipped — separate `translateExpCoreSimd()` used instead of refactoring
+`translateExpCore`
 
 ### Problem
 
@@ -515,7 +516,8 @@ splitting the reduction.
 
 **Priority:** Medium-High (significant WASM perf opportunity)  
 **Effort:** Large  
-**Status:** ✅ Implemented (f32x4 contiguous + broadcast; no R1 InstructionEmitter — used separate `translateExpCoreSimd`)  
+**Status:** ✅ Implemented (f32x4 contiguous + broadcast; no R1 InstructionEmitter — used separate
+`translateExpCoreSimd`)  
 **Files:** `src/backend/wasm.ts`, `src/backend/wasm/mega-module.ts`
 
 ### Problem
@@ -675,7 +677,8 @@ improvement should be gated behind a runtime feature check, never assumed.
 
 **Priority:** Medium (dispatch overhead reduction)  
 **Effort:** Small  
-**Status:** ✅ Partially implemented — layout caching done; bind group caching skipped (buffer pooling invalidates cache on most invocations)  
+**Status:** ✅ Partially implemented — layout caching done; bind group caching skipped (buffer
+pooling invalidates cache on most invocations)  
 **Files:** `src/backend/webgpu.ts`
 
 ### Problem
@@ -791,9 +794,9 @@ All actionable improvements are complete. Improvement 6 (Subgroups) is deferred 
   `src/backend/wasm.ts` handles SIMD codegen. The interface would have been over-engineered for the
   current scope (only f32x4 elementwise vectorization). If f64x2 or i32x4 vectorization is added
   later, R1 may become worthwhile.
-- **Improvement 5 (SIMD)** covers both `codegenWasm()` (eager/JIT kernels) and mega-module
-  extracted kernel bodies. Handles contiguous arrays (`v128.load`) and broadcast arrays
-  (`f32.load` + `f32x4.splat`). Reductions and transcendentals remain scalar.
+- **Improvement 5 (SIMD)** covers both `codegenWasm()` (eager/JIT kernels) and mega-module extracted
+  kernel bodies. Handles contiguous arrays (`v128.load`) and broadcast arrays (`f32.load` +
+  `f32x4.splat`). Reductions and transcendentals remain scalar.
 - **Improvement 7 (Bind Group Caching)** only implemented layout caching (`GPUPipelineLayout` by
   `numInputs:numOutputs:hasUniform` signature). Full bind group caching was analyzed and skipped
   because WebGPU buffer pooling causes different `GPUBuffer` objects between invocations, making

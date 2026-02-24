@@ -15,12 +15,14 @@ const opts = {
   },
   format: ["cjs", "esm"],
   platform: "browser",
-  dts: {
-    // Without newContext, dts generation in watch mode has trouble updating
-    // when files are changed.
-    // https://github.com/rolldown/tsdown/issues/396
-    newContext: true,
-  },
+  dts: watchMode
+    ? {
+        // Without newContext, dts generation in watch mode has trouble updating
+        // when files are changed.
+        // https://github.com/rolldown/tsdown/issues/396
+        newContext: true,
+      }
+    : true,
 };
 
 export default defineConfig([
