@@ -58,7 +58,7 @@ functions.
 | `custom_gradient`    | 🔴      | core engine feature                              |
 | `closure_convert`    | 🔴      | core engine feature                              |
 | `checkpoint`         | 🔴      | core engine feature                              |
-| `vmap`               | 🟡      | some ops do not have vmap support yet            |
+| `vmap`               | �       | all primitives have vmap rules                   |
 | `shard_map`          | ⚪️      | device sharding                                  |
 | `smap`               | ⚪️      | device sharding                                  |
 | `pmap`               | ⚪️      | device sharding                                  |

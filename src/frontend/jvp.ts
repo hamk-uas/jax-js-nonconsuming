@@ -580,14 +580,9 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const [primalsOut, tangentsOut] = [outs.slice(0, n), outs.slice(n)];
     return [primalsOut, tangentsOut];
   },
-  [Primitive.DynamicUpdateSlice](
-    [_dst, _src],
-    [_ddst, _dsrc],
-    { offset: _offset, axis: _axis },
-  ) {
-    // JVP for dynamic update slice is not implemented. Throw to avoid silent errors.
-    throw new Error("JVP: dynamic_update_slice is not implemented");
-  },
+  [Primitive.DynamicUpdateSlice]: linearTangentsJvp(
+    Primitive.DynamicUpdateSlice,
+  ),
   [Primitive.Scan](
     primals,
     tangents,

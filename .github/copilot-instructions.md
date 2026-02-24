@@ -1354,8 +1354,11 @@ fusion correctness, dispatch count verification, and grad through multi-output k
 5. If copy-like (e.g., `DynamicUpdateSlice`), it emits a dedicated `dus` JitStep in `jitCompile()`
    and is classified as a non-kernel black node in `splitGraphDataflow()`. DUS carries a `Mutate`
    effect on its first input (dst), enabling `effectDrivenAllocate` to recycle the dst buffer
-   directly into the output slot (zero-copy when sizes match).
-6. If the primitive has **hand-written JVP/transpose rules** (not auto-derived from elementwise
+   directly into the output slot (zero-copy when sizes match). **DUS JIT step only supports axis=0**
+   (contiguous memory copy via `copyBufferToBuffer`). For axis≠0, the vmap rule decomposes into
+   `concatenate([shrink(left), src, shrink(right)])` — see DUS vmap below.
+6. Add vmap (batching) rule in `vmapRules` (`src/frontend/vmap.ts`).
+7. If the primitive has **hand-written JVP/transpose rules** (not auto-derived from elementwise
    ops), add transform tests verifying JVP and grad against finite differences. See the routine
    checklist's "Transform testing requirement" section for details.
 
@@ -1737,14 +1740,21 @@ exports `scatter_add(outPtr, idxPtr, updPtr)` which performs the triple-nested l
 `(outerSize × updatesLen × innerSize)` with bounds checking in native WASM. Module instances are
 cached via `getScatterAddModule()` in `routine-provider.ts`.
 
-### Autodiff rules
+### Transform rules
 
-| Rule      | Implementation                                                                |
-| --------- | ----------------------------------------------------------------------------- |
-| **JVP**   | Linear: tangent = `scatterAdd(dTarget, indices, dUpdates, axis)`              |
-| **Trans** | ∂target = cotangent (identity), ∂indices = null, ∂updates = `gather(ct, idx)` |
+| Rule      | Implementation                                                                                       |
+| --------- | ---------------------------------------------------------------------------------------------------- |
+| **JVP**   | Linear: tangent = `scatterAdd(dTarget, indices, dUpdates, axis)`                                     |
+| **Trans** | ∂target = cotangent (identity), ∂indices = null, ∂updates = `gather(ct, idx)`                        |
+| **Vmap**  | Shared (non-batched) indices only; moves target+updates to front, `axis + 1`. Batched indices throw. |
 
 The transpose rule for updates uses a `gather` operation to extract the relevant cotangent slices.
+
+**Vmap indices limitation:** ScatterAdd indices are always 1-D `[updatesLen]` — the same index
+positions apply to all outer/inner slices (the WASM loop reads `indices[j]`, not
+`indices[outer*updatesLen + j]`). This means per-batch indices cannot be represented, so the vmap
+rule only supports shared (non-batched) indices where `iBdim === null`. Batched indices throw with a
+descriptive error.
 
 ### Key files
 
@@ -1753,6 +1763,7 @@ The transpose rule for updates uses a `gather` operation to extract the relevant
 | `src/frontend/core.ts`                     | `Primitive.ScatterAdd` enum, `scatterAdd()` function   |
 | `src/frontend/jvp.ts`                      | JVP rule (linear in target + updates)                  |
 | `src/frontend/linearize.ts`                | Transpose rule (gather for updates cotangent)          |
+| `src/frontend/vmap.ts`                     | Vmap rule (shared indices, axis shift)                 |
 | `src/frontend/jit.ts`                      | `scatter_add` JitStep emission + execution             |
 | `src/frontend/jaxpr.ts`                    | `MemoryEffect.Mutate` on target input                  |
 | `src/backend/webgpu.ts`                    | `dispatchScatterAdd()` — native atomic / CAS shader    |
@@ -1760,6 +1771,7 @@ The transpose rule for updates uses a `gather` operation to extract the relevant
 | `src/backend/wasm/routines/scatter-add.ts` | Size-specialized wasmblr scatter-add module            |
 | `src/backend/wasm/routine-provider.ts`     | `getScatterAddModule()` — cached module getter         |
 | `test/scatter-add.test.ts`                 | ~13 tests: basic, multi-dim, grad, JIT, effect checker |
+| `test/ad-gaps.test.ts`                     | ScatterAdd vmap + DUS/Pool transform tests             |
 | `bench/scatter-add.bench.ts`               | Throughput benchmarks at 1K/10K/100K elements          |
 
 ## Common pitfalls
@@ -1770,6 +1782,14 @@ The transpose rule for updates uses a `gather` operation to extract the relevant
 - Changing WebGPU shaders without browser tests → silent breakage
 - **CPU backend GlobalView detection**: Collect both `AluOp.GlobalIndex` AND `AluOp.GlobalView`
   (internal ALU expression types) when finding used input buffers
+- **DUS JIT axis=0 only**: The `dus` JitStep uses `copyBufferToBuffer` — a single contiguous memory
+  copy that only works for axis=0. For axis≠0 the slice is strided (non-contiguous). The DUS vmap
+  rule works around this by decomposing axis≠0 into
+  `concatenate([shrink(left), src, shrink(right)])` which the JIT handles natively. If you encounter
+  a DUS axis≠0 error, check whether vmap shifted the axis.
+- **ScatterAdd vmap: batched indices not supported**: ScatterAdd indices are always 1-D
+  `[updatesLen]` with identical positions for all outer/inner slices. The vmap rule only supports
+  shared (non-batched) indices (`iBdim === null`). Batched indices throw.
 - **JIT pending ops before scan**: Flush pending ops before scan step execution
 - **Cross-device copy of non-contiguous arrays**: `_putSync()`/`_put()` must use
   `dataSync()`/`data()` (which call `#realize()`) instead of raw `readSync()`/`read()`. Raw reads
@@ -4769,22 +4789,26 @@ These details are frequently lost when conversation context is summarized:
 
 Decisions made during development that future agents should understand:
 
-| Decision                                        | Rationale                                                                                                                                                                                                            |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Non-consuming ownership model                   | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting                                                                                                                               |
-| Concrete compilation + symbolic cache           | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                                                                                                                                   |
-| `effectDrivenAllocate` over two-pass            | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect                                                                                                                              |
-| Direct LU→triSolve gradient path                | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                                                                                                                               |
-| `transposeJaxprCache` is cache-owned            | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`                                                                                                                                     |
-| `invariance` ≠ `strict` ESLint config           | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                                                                                                                 |
-| WASM `(start, end, ...ptrs)` signature          | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                                                                                                                           |
-| WASM compiled Kogge-Stone (assocScan)           | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan`                                                                                              |
-| M7.3 per-j indexed internal buffers             | Each worker sees `internal[idx] + j * internalSizes[idx]` — non-overlapping regions prevent races. Parallel path allocates `internalSize * N`, monolithic allocates `internalSize`                                   |
-| WASM compiled scan polymorphic length           | Length as runtime i32 param (arg 0); `NativeScanGeneralParams` no longer contains `length`; dispatch prepends length to args; `dimBindings` resolution uses `args[numConsts]`                                        |
-| Mega-module rejects pass-through                | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes                                                                                               |
-| `scatterAdd` exported from public API           | Exported from `src/index.ts` as of the tech debt audit.                                                                                                                                                              |
-| M6.2 extracted-functions design                 | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension.                                       |
-| Module Workers (`type: "module"`)               | Deno doesn't support classic blob-URL workers; module workers work in both Deno and Chromium. Applied to both `worker-pool.ts` and `orchestrator.ts`.                                                                |
-| SAB constructability over `crossOriginIsolated` | `try { new SharedArrayBuffer(1) }` works in Deno (native SAB) and browsers (with COOP/COEP); `crossOriginIsolated` is browser-only and false in Deno.                                                                |
-| Vitest SAB tests skipped, Deno covers           | Browser main threads can't spin-wait (blocks Worker message delivery). COOP/COEP headers enabled in vitest.config.ts, but orchestrator/pool skip via `Atomics.wait` probe. 8 Vitest tests skip, 17 Deno tests cover. |
-| M7.3 lazy registration + monolithic fallback    | First call with N ≥ PARALLEL_THRESHOLD (4096): `pool.registerModule()` async + monolithic fallback. Subsequent: `pool.isModuleReady()` → parallel. Same pattern as mega-module.                                      |
+| Decision                                        | Rationale                                                                                                                                                                                                                              |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Non-consuming ownership model                   | Eliminates `UseAfterFreeError` from `.ref` mistakes; trades for silent leaks + linting                                                                                                                                                 |
+| Concrete compilation + symbolic cache           | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                                                                                                                                                     |
+| `effectDrivenAllocate` over two-pass            | Single-pass liveness is cleaner; DUS zero-copy falls out naturally from `Mutate` effect                                                                                                                                                |
+| Direct LU→triSolve gradient path                | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                                                                                                                                                 |
+| `transposeJaxprCache` is cache-owned            | Prevents repeated transposition; callers must NOT dispose returned `ClosedJaxpr`                                                                                                                                                       |
+| `invariance` ≠ `strict` ESLint config           | `invariance` = ownership correctness; `strict` adds `no-array-chain` for peak memory                                                                                                                                                   |
+| WASM `(start, end, ...ptrs)` signature          | Enables work-splitting for `WasmWorkerPool`; `RANGE_PARAMS=2` prefix in all kernel codegen                                                                                                                                             |
+| WASM compiled Kogge-Stone (assocScan)           | N as runtime i32 enables polymorphic length; ping-pong by caller, not inside module; `AssocScanPlan` mirrors `ScanPlan`                                                                                                                |
+| M7.3 per-j indexed internal buffers             | Each worker sees `internal[idx] + j * internalSizes[idx]` — non-overlapping regions prevent races. Parallel path allocates `internalSize * N`, monolithic allocates `internalSize`                                                     |
+| WASM compiled scan polymorphic length           | Length as runtime i32 param (arg 0); `NativeScanGeneralParams` no longer contains `length`; dispatch prepends length to args; `dimBindings` resolution uses `args[numConsts]`                                                          |
+| Mega-module rejects pass-through                | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes                                                                                                                 |
+| `scatterAdd` exported from public API           | Exported from `src/index.ts` as of the tech debt audit.                                                                                                                                                                                |
+| M6.2 extracted-functions design                 | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension.                                                         |
+| Module Workers (`type: "module"`)               | Deno doesn't support classic blob-URL workers; module workers work in both Deno and Chromium. Applied to both `worker-pool.ts` and `orchestrator.ts`.                                                                                  |
+| SAB constructability over `crossOriginIsolated` | `try { new SharedArrayBuffer(1) }` works in Deno (native SAB) and browsers (with COOP/COEP); `crossOriginIsolated` is browser-only and false in Deno.                                                                                  |
+| Vitest SAB tests skipped, Deno covers           | Browser main threads can't spin-wait (blocks Worker message delivery). COOP/COEP headers enabled in vitest.config.ts, but orchestrator/pool skip via `Atomics.wait` probe. 8 Vitest tests skip, 17 Deno tests cover.                   |
+| M7.3 lazy registration + monolithic fallback    | First call with N ≥ PARALLEL_THRESHOLD (4096): `pool.registerModule()` async + monolithic fallback. Subsequent: `pool.isModuleReady()` → parallel. Same pattern as mega-module.                                                        |
+| DUS vmap shrink+concat decomposition            | JIT `dus` step uses `copyBufferToBuffer` (axis=0 only). Vmap shifts axis 0→1, breaking the contiguity assumption. Instead of extending the JIT, decompose into `concatenate([shrink(left), src, shrink(right)])` which fuses natively. |
+| ScatterAdd vmap: shared indices only            | Indices are 1-D `[updatesLen]`, same positions for all outer/inner. Per-batch indices can't be represented → vmap throws for `iBdim !== null`.                                                                                         |
+| DUS JVP via `linearTangentsJvp`                 | DUS is linear in both dst and src, so JVP is trivially `bind(Primitive.DUS, tangents, params)`. No hand-written rule needed.                                                                                                           |
+| All primitives have complete transform rules    | Pool, PoolTranspose, DUS, ScatterAdd all have JVP + transpose + vmap rules. No more stub `throw` in transform tables. `test/ad-gaps.test.ts` covers all 6 new rules.                                                                   |

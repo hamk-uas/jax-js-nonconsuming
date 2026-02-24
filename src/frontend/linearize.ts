@@ -42,6 +42,7 @@ import {
   concatenate,
   conv,
   currentTraceLevel,
+  dynamicUpdateSlice,
   flattenFun,
   flattenFunWithAux,
   flip,
@@ -1830,8 +1831,50 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     let i = 0;
     return undefPrimals.map((isUndef) => (isUndef ? outs[i++] : null));
   },
-  [Primitive.DynamicUpdateSlice]() {
-    throw new Error("DynamicUpdateSlice transpose: not yet implemented");
+  [Primitive.DynamicUpdateSlice]([ct], [dst, src], { offset, axis }) {
+    // DUS is linear in both dst and src:
+    //   output = dst everywhere except slice at [offset..offset+len] on axis, where output = src
+    // Transpose:
+    //   ct_dst = DUS(ct, zeros_like_src, offset, axis)  — zero out the slice region
+    //   ct_src = shrink(ct, slice_ranges)               — extract the slice region
+    let ctDst: Tracer | null = null;
+    let ctSrc: Tracer | null = null;
+
+    const srcShape = (
+      src instanceof UndefPrimal ? src.aval.shape : (src as Tracer).shape
+    ) as number[];
+    const dstShape = (
+      dst instanceof UndefPrimal ? dst.aval.shape : (dst as Tracer).shape
+    ) as number[];
+
+    if (dst instanceof UndefPrimal) {
+      using z = zeros(srcShape, { dtype: ct.dtype }) as Tracer;
+      ctDst = dynamicUpdateSlice(ct, z, offset, axis) as Tracer;
+    }
+
+    if (src instanceof UndefPrimal) {
+      if (srcShape.length === dstShape.length) {
+        // Same-rank case: extract the slice from ct
+        const slices = dstShape.map(
+          (s, i) =>
+            (i === axis ? [offset, offset + srcShape[i]] : [0, s]) as [
+              number,
+              number,
+            ],
+        );
+        ctSrc = shrink(ct, slices) as Tracer;
+      } else {
+        // Stacked case (axis=0, src.ndim = dst.ndim - 1): extract and reshape
+        const slices = dstShape.map(
+          (s, i) =>
+            (i === 0 ? [offset, offset + 1] : [0, s]) as [number, number],
+        );
+        using sliced = shrink(ct, slices) as Tracer;
+        ctSrc = reshape(sliced, srcShape) as Tracer;
+      }
+    }
+
+    return [ctDst, ctSrc];
   },
   [Primitive.Scan](
     cts,

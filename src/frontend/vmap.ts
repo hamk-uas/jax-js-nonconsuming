@@ -22,6 +22,7 @@ import {
   randomBits,
   reduce,
   reshape,
+  scatterAdd,
   ShapedArray,
   shrink,
   split,
@@ -324,7 +325,38 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     if (y !== origY) y[Symbol.dispose]();
     return [[z], [0]];
   },
-  // TODO: pool, pool_transpose
+  [Primitive.Pool](axisSize, [x], [xBdim], { window, strides }) {
+    assertNonNull(xBdim);
+    // Pool operates on the trailing window.length dimensions.
+    // Leading dimensions pass through unchanged.
+    if (xBdim < x.ndim - window.length) {
+      return [bind(Primitive.Pool, [x], { window, strides }), [xBdim]];
+    }
+    // Batch dim overlaps with pooled spatial dims — move to front
+    const origX = x;
+    x = moveBatchAxis(axisSize, xBdim, 0, x);
+    const result = bind(Primitive.Pool, [x], { window, strides });
+    if (x !== origX) x[Symbol.dispose]();
+    return [result, [0]];
+  },
+  [Primitive.PoolTranspose](
+    axisSize,
+    [x],
+    [xBdim],
+    { inShape, window, strides },
+  ) {
+    assertNonNull(xBdim);
+    // Move batch to front, prepend batch size to inShape
+    const origX = x;
+    x = moveBatchAxis(axisSize, xBdim, 0, x);
+    const result = bind(Primitive.PoolTranspose, [x], {
+      inShape: [axisSize, ...inShape],
+      window,
+      strides,
+    });
+    if (x !== origX) x[Symbol.dispose]();
+    return [result, [0]];
+  },
   [Primitive.Compare]: broadcastBatcher(Primitive.Compare),
   [Primitive.Where]: broadcastBatcher(Primitive.Where),
   [Primitive.Concatenate](axisSize, xs, xBdims, { axis }) {
@@ -497,11 +529,70 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     });
     return [outs, rep(outs.length, 0)];
   },
-  [Primitive.DynamicUpdateSlice]() {
-    throw new Error("DynamicUpdateSlice vmap: not yet implemented");
+  [Primitive.DynamicUpdateSlice](
+    axisSize,
+    [dst, src],
+    [dstBdim, srcBdim],
+    { offset, axis },
+  ) {
+    // Move both batch dims to front, shift DUS axis by 1
+    const origDst = dst,
+      origSrc = src;
+    dst = moveBatchAxis(axisSize, dstBdim, 0, dst);
+    src = moveBatchAxis(axisSize, srcBdim, 0, src);
+    const newAxis = axis + 1;
+    // JIT DUS only supports axis=0 (contiguous memory copy), so decompose
+    // axis≠0 into shrink+concatenate which the JIT handles natively.
+    let result;
+    if (newAxis === 0) {
+      result = bind1(Primitive.DynamicUpdateSlice, [dst, src], {
+        offset,
+        axis: 0,
+      });
+    } else {
+      const dstShape = dst.shape;
+      const srcLen = src.shape[newAxis];
+      const leftSlice = dstShape.map((s, i) =>
+        i === newAxis
+          ? ([0, offset] as [number, number])
+          : ([0, s] as [number, number]),
+      );
+      const rightSlice = dstShape.map((s, i) =>
+        i === newAxis
+          ? ([offset + srcLen, s] as [number, number])
+          : ([0, s] as [number, number]),
+      );
+      using left = shrink(dst, leftSlice);
+      using right = shrink(dst, rightSlice);
+      result = concatenate([left, src, right], newAxis);
+    }
+    if (dst !== origDst) dst[Symbol.dispose]();
+    if (src !== origSrc) src[Symbol.dispose]();
+    return [[result], [0]];
   },
-  [Primitive.ScatterAdd]() {
-    throw new Error("ScatterAdd vmap: not yet implemented");
+  [Primitive.ScatterAdd](
+    axisSize,
+    [target, indices, updates],
+    [tBdim, iBdim, uBdim],
+    { axis },
+  ) {
+    // scatterAdd indices are 1-D [updatesLen] — the same positions apply to
+    // all outer/inner slices.  When indices are not batched we can simply
+    // shift the scatter axis and leave indices as-is.
+    if (iBdim !== null) {
+      throw new Error(
+        "vmap(scatterAdd): batched indices not yet supported — " +
+          "use shared (non-batched) indices",
+      );
+    }
+    const origTarget = target,
+      origUpdates = updates;
+    target = moveBatchAxis(axisSize, tBdim, 0, target);
+    updates = moveBatchAxis(axisSize, uBdim, 0, updates);
+    const result = scatterAdd(target, indices, updates, axis + 1);
+    if (target !== origTarget) target[Symbol.dispose]();
+    if (updates !== origUpdates) updates[Symbol.dispose]();
+    return [[result], [0]];
   },
   [Primitive.Scan](
     axisSize,
