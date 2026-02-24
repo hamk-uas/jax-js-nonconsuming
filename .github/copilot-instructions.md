@@ -2066,42 +2066,14 @@ should work identically. To verify manually, run website demos in a WebGL-capabl
 preencoded-routine is used for WebGPU routines that can't be inlined into a shader. It transforms
 routine shaders to accept per-iteration offsets via uniforms, enabling fused dispatch.
 
-### Why wasmblr for WASM routines?
+### Why wasmblr / 3 routine implementations?
 
-**Problem:** Hand-writing WASM bytecode is error-prone and unmaintainable.
+See [Part 1 → Routine system](#routine-system) for full details on wasmblr, the 3-backend routine
+architecture (CPU/WASM/WebGPU), algorithm differences, SIMD helpers, and the new-routine checklist.
 
-**Solution:** wasmblr — a custom WASM bytecode assembler with a high-level helper layer (WasmHl).
-
-**Benefits:**
-
-- Runtime JIT compilation (no separate build step, no pre-compiled binaries)
-- Single TypeScript syntax throughout the codebase
-- Ergonomic helpers for control flow (`forLoop`, `whileLoop`, `ifElse`) and memory access
-- SIMD-ready (v128, i32x4, f32x4 types available)
-- Small output (~1KB per routine)
-- **Size specialization**: Matrix dimensions baked at compile time enable loop unrolling and
-  constant propagation
-- **LRU caching**: 64-entry cache amortizes compilation cost across calls
-
-See the [Routine System](#routine-system) section for implementation details and wasmblr patterns.
-
-### Why 3 routine implementations (CPU/WASM/WebGPU)?
-
-| Backend    | Implementation          | Location                         | Algorithm Style            |
-| ---------- | ----------------------- | -------------------------------- | -------------------------- |
-| **CPU**    | JavaScript (TypedArray) | `src/routine.ts`                 | Sequential (for debugging) |
-| **WASM**   | wasmblr (runtime gen)   | `src/backend/wasm/routines/*.ts` | Sequential (optimized)     |
-| **WebGPU** | Hand-written WGSL       | `src/backend/webgpu/routines.ts` | Parallel (GPU-optimized)   |
-
-1. **CPU backend assumes WASM unavailable** — exists for environments without WebAssembly
-2. **WebGPU uses different algorithms** — GPU parallelism requires fundamentally different
-   approaches:
-   - Sort: Bitonic sort (parallel) vs merge sort (sequential)
-   - Cholesky: Column-parallel Cholesky-Crout vs row-by-row Cholesky-Banachiewicz
-
-**Calling routines from scan loops:** Scan modules use WASM imports to call routines from separate
-wasmblr modules. This avoids code duplication (each routine is 1-3KB) while keeping the entire loop
-in native code (~1.5M iter/sec). See `codegenNativeScanGeneral()` in `src/backend/wasm.ts`.
+**Scan-specific:** Scan modules use WASM imports to call routines from separate wasmblr modules,
+keeping the entire loop in native code (~1.5M iter/sec). See `codegenNativeScanGeneral()` in
+`src/backend/wasm.ts`.
 
 ---
 
@@ -2793,15 +2765,15 @@ Handles: gidx loop, bounds check, reduction identity/accumulate/epilogue via
 
 ### Current limitations
 
-| Limitation                                           | Workaround                                                                                                             | Backend |
-| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ------- |
-| `numCarry ≠ numY` on WebGPU                          | Falls back to JS loop                                                                                                  | WebGPU  |
-| WebGPU internal buffer deps in scan                  | Falls back to JS loop (O(N) dispatches)                                                                                | WebGPU  |
-| Mixed kernel+routine bodies on WebGPU                | Falls back to JS loop                                                                                                  | WebGPU  |
-| **`grad(scan)` backward on WebGPU with linalg body** | **O(N) dispatches** — transposed body has intra-step deps; reformulate backward pass as `associativeScan`, or use WASM | WebGPU  |
-| `grad(scan)` ~2× compute overhead                    | Use `{ checkpoint: false }` for O(N)                                                                                   | All     |
-| Sort in scan body on WebGPU                          | Uses JS loop (uniforms)                                                                                                | WebGPU  |
-| Mixed-dtype carries on WebGPU                        | Use WASM backend or same-dtype carry                                                                                   | WebGPU  |
+| Limitation                                           | Workaround                                                                                                              | Backend |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------- |
+| `numCarry ≠ numY` on WebGPU                          | Falls back to JS loop                                                                                                   | WebGPU  |
+| WebGPU internal buffer deps in scan                  | Falls back to batched JS loop (O(N/256) submissions via `beginBatch`)                                                   | WebGPU  |
+| Mixed kernel+routine bodies on WebGPU                | Falls back to batched JS loop                                                                                           | WebGPU  |
+| **`grad(scan)` backward on WebGPU with linalg body** | **Batched fallback** — transposed body has intra-step deps; reformulate backward pass as `associativeScan`, or use WASM | WebGPU  |
+| `grad(scan)` ~2× compute overhead                    | Use `{ checkpoint: false }` for O(N)                                                                                    | All     |
+| Sort in scan body on WebGPU                          | Uses JS loop (uniforms)                                                                                                 | WebGPU  |
+| Mixed-dtype carries on WebGPU                        | Use WASM backend or same-dtype carry                                                                                    | WebGPU  |
 
 **WebGPU preencoded-routine requirements:** WebGPU can only use `preencoded-routine` for scan bodies
 that are:
@@ -2841,7 +2813,7 @@ sequential dependency chain. No matter how simple the forward body is, if it con
 operations that compose (output of one feeds input of next), the transposed body will have internal
 deps. This is not a fixable code path in the scan executor; it is a consequence of autodiff algebra.
 
-**Workarounds for the backward pass O(N) bottleneck:**
+**Workarounds for the backward pass bottleneck:**
 
 1. **Reformulate as `associativeScan`** — if the backward recursion can be expressed as a parallel
    prefix over associative affine maps (as in the Solin/Särkkä parallel Kalman smoother), it gets
@@ -2855,9 +2827,10 @@ deps. This is not a fixable code path in the scan executor; it is a consequence 
 **This limitation is significant** for any dynamical model using `grad(scan)` on WebGPU:
 
 1. WASM `compiled-loop` handles all these cases natively — WebGPU is the affected backend
-2. WebGPU fallback is **not** just command encoding overhead; it is a full JS↔GPU round-trip per
-   iteration
-3. O(N) dispatch cost dominates all other costs for N ≳ 100
+2. WebGPU fallback uses command batching (`SCAN_BATCH_SIZE = 256`) to reduce O(N) `queue.submit()`
+   calls to O(N/256) submissions, but each iteration still requires multiple sequential GPU
+   dispatches orchestrated from JS
+3. Dispatch cost still dominates for N ≳ 100, though batching reduces the constant factor
 
 **Note on Sort in scan body:** Sort already uses a uniform buffer for its configuration, which
 conflicts with the scan offset uniform.
@@ -2881,6 +2854,12 @@ contributors should be aware of:
   Shared-slot protection (`protectSharedSlots: true`) incRefs shared carry/Y backend slots before
   disposal. The preencoded scan path (`dispatchPreencodedScan`) also uses the WGSL copy shader for
   ys stacking when carry sizes are not 4-byte aligned.
+- **Fallback command batching (WebGPU):** `executeScanFallback()` wraps the iteration loop in
+  `backend.beginBatch()` / `backend.endBatch()` when available (WebGPU). Every `SCAN_BATCH_SIZE`
+  (256) iterations, the current batch is flushed and a new one started. This reduces O(N)
+  `queue.submit()` calls to O(N/256) submissions, significantly improving WebGPU fallback scan
+  performance. `beginBatch()` in `webgpu.ts` creates a shared `CommandEncoder`; `endBatch()` submits
+  once and processes deferred buffer frees.
 
 ### Future work
 
@@ -3216,19 +3195,26 @@ Pooled buffers are **not** tracked in `this.buffers` (the slot map). They're hel
 
 ### WASM backend comparison
 
-The WASM backend uses `WasmAllocator`, which manages a contiguous `WebAssembly.Memory` with a
-free-list allocator that coalesces adjacent freed blocks. This provides similar reuse semantics
-without an explicit pool. The JIT recycling step still benefits WASM by skipping the allocator's
-free-list search entirely.
+The WASM backend uses `WasmAllocator` (`src/backend/wasm/allocator.ts`), which manages a contiguous
+`WebAssembly.Memory` with a free-list allocator. Two optimizations prevent memory fragmentation:
 
-| Aspect                      | WebGPU Pool              | WASM Allocator                  |
-| --------------------------- | ------------------------ | ------------------------------- |
-| Data structure              | `Map<size, GPUBuffer[]>` | Free-list with coalescing       |
-| Allocation cost (pool hit)  | Array pop (~10 ns)       | Free-list search (~50 ns)       |
-| Allocation cost (pool miss) | `createBuffer` (~5 µs)   | Expand memory (~1 µs)           |
-| Deallocation cost           | Array push (~10 ns)      | Free-list insert (~50 ns)       |
-| Cross-size reuse            | No (exact size match)    | Yes (splitting/coalescing)      |
-| Zero on reuse               | **No** — stale data      | **Yes** — `.fill(0)` on realloc |
+- **Reset-on-empty:** When all allocations are freed, the bump pointer resets to the start,
+  reclaiming all memory. Critical for cross-shape workloads where each JIT call uses different
+  buffer sizes (old free-list entries are useless for new sizes).
+- **Top-of-heap compaction:** Freeing a block at the top of the heap moves the bump pointer backward
+  instead of adding to the free list, cascading to compact consecutive top-of-heap free blocks.
+
+The JIT recycling step still benefits WASM by skipping the allocator's free-list search entirely.
+
+| Aspect                      | WebGPU Pool              | WASM Allocator                                      |
+| --------------------------- | ------------------------ | --------------------------------------------------- |
+| Data structure              | `Map<size, GPUBuffer[]>` | Free-list + reset-on-empty + top-of-heap compaction |
+| Allocation cost (pool hit)  | Array pop (~10 ns)       | Free-list search (~50 ns)                           |
+| Allocation cost (pool miss) | `createBuffer` (~5 µs)   | Expand memory (~1 µs)                               |
+| Deallocation cost           | Array push (~10 ns)      | Free-list insert (~50 ns)                           |
+| Cross-size reuse            | No (exact size match)    | Yes (splitting/coalescing)                          |
+| Zero on reuse               | **No** — stale data      | **Yes** — `.fill(0)` on realloc                     |
+| Memory reclamation          | Pool eviction per budget | Reset-on-empty + top-of-heap compaction             |
 
 ### Memory zeroing guarantees
 
@@ -3307,30 +3293,29 @@ rebuild, and compare.
 
 ### Vitest benchmarks (M8.1)
 
-Four Vitest benchmark files in `bench/` measure key subsystems:
+Vitest benchmark files in `bench/` measure key subsystems:
 
 ```bash
-pnpm build && pnpm vitest bench bench/mega-module.bench.ts
-pnpm build && pnpm vitest bench bench/scatter-add.bench.ts
-pnpm build && pnpm vitest bench bench/associative-scan.bench.ts
-pnpm build && pnpm vitest bench bench/parallel-wasm.bench.ts
+pnpm build && pnpm vitest bench bench/<file>.bench.ts
 ```
 
-| File                              | Benchmarks | What it measures                                                        |
-| --------------------------------- | ---------- | ----------------------------------------------------------------------- |
-| `bench/mega-module.bench.ts`      | 7          | Mega-module vs step-by-step: chains, multi-output, reduce, grad, matmul |
-| `bench/scatter-add.bench.ts`      | 3          | `scatterAdd` throughput at 1K/10K/100K elements                         |
-| `bench/associative-scan.bench.ts` | 6          | `associativeScan` vs sequential `scan` for cumsum/cumprod               |
-| `bench/parallel-wasm.bench.ts`    | 7          | Large elementwise baseline + polymorphic JIT (`dynamic_axes`)           |
+| File                              | What it measures                                                        |
+| --------------------------------- | ----------------------------------------------------------------------- |
+| `bench/argreduce.bench.ts`        | Argmin/argmax reduction performance                                     |
+| `bench/associative-scan.bench.ts` | `associativeScan` vs sequential `scan` for cumsum/cumprod               |
+| `bench/matmul.bench.ts`           | Matrix multiplication throughput at various sizes                       |
+| `bench/mega-module.bench.ts`      | Mega-module vs step-by-step: chains, multi-output, reduce, grad, matmul |
+| `bench/parallel-wasm.bench.ts`    | Large elementwise baseline + polymorphic JIT (`dynamic_axes`)           |
+| `bench/scan.bench.ts`             | `lax.scan` throughput across backends and body types                    |
+| `bench/scatter-add.bench.ts`      | `scatterAdd` throughput at 1K/10K/100K elements                         |
+| `bench/sort.bench.ts`             | Sorting performance across backends                                     |
+| `bench/where-branching.bench.ts`  | WASM `AluOp.Where` branching vs branchless select                       |
 
 Results are saved to `docs/ULTIMATE-BENCHMARKS.md`.
 
 **Import notes:**
 
-- `bench/scatter-add.bench.ts` imports from `../src/frontend/core` (not the public API) because
-  `scatterAdd` is not exported from `src/index.ts`. Uses `type Array as JaxArray` to avoid global
-  `Array` collision.
-- Other bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`).
+- Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`).
 - All bench files use `DType.Float32` / `DType.Int32` enums, not string literals.
 
 ---
@@ -4434,15 +4419,7 @@ tracker.
 
 ---
 
-## ~~TODO~~ DONE: Newton Refinement Removed (Direct LU→TriSolve Path)
-
-Direct LU→triSolve gradient path is now the only implementation. Newton refinement and
-`stopGradient(luRaw)` have been removed. See
-[Current Design](#current-design-direct-lu-trisolve-gradient-path).
-
-**What was removed and why it's no longer needed:**
-
-### Primitive convention reference
+## Primitive Convention Reference
 
 The `Primitive.TriangularSolve` convention (important for understanding the JVP):
 
@@ -4629,8 +4606,8 @@ All milestones M0–M8 are complete. The ULTIMATE-ARCHITECTURE-PLAN is fully imp
 1. **Build first**: Run `pnpm build` before running tests — Vitest imports from `dist/`, not `src/`.
 2. **Check branch**: `git branch` to confirm you're on the right branch (currently
    `docs/ultimate-architecture-plan`).
-3. **Read the plan**: `ULTIMATE-ARCHITECTURE-PLAN.md` contains detailed specifications for each
-   milestone including code sketches, test plans, and acceptance criteria.
+3. **Read the plan**: `ULTIMATE-ARCHITECTURE-PLAN.md` documents the completed M0–M8 milestones (all
+   done). Useful for understanding design rationale and acceptance criteria.
 4. **Check git log**: `git log --oneline -10` to see recent commits and understand context.
 
 ## Key Implementation Patterns
@@ -4708,7 +4685,7 @@ Decisions made during development that future agents should understand:
 | M7.3 per-j indexed internal buffers             | Each worker sees `internal[idx] + j * internalSizes[idx]` — non-overlapping regions prevent races. Parallel path allocates `internalSize * N`, monolithic allocates `internalSize`                                   |
 | WASM compiled scan polymorphic length           | Length as runtime i32 param (arg 0); `NativeScanGeneralParams` no longer contains `length`; dispatch prepends length to args; `dimBindings` resolution uses `args[numConsts]`                                        |
 | Mega-module rejects pass-through                | Steps (free, recycle) can overwrite input WASM locals; conservatively bail to step-by-step rather than tracking writes                                                                                               |
-| `scatterAdd` exported from public API           | Exported from `src/index.ts` as of the tech debt audit. Bench files still import from `src/frontend/core` for `DType` enums.                                                                                         |
+| `scatterAdd` exported from public API           | Exported from `src/index.ts` as of the tech debt audit.                                                                                                                                                              |
 | M6.2 extracted-functions design                 | V8 inlines direct `call` at runtime → extracting kernels into separate WASM functions is perf-neutral serial, enables parallel. Resolves monolithic-vs-parallelizable tension.                                       |
 | Module Workers (`type: "module"`)               | Deno doesn't support classic blob-URL workers; module workers work in both Deno and Chromium. Applied to both `worker-pool.ts` and `orchestrator.ts`.                                                                |
 | SAB constructability over `crossOriginIsolated` | `try { new SharedArrayBuffer(1) }` works in Deno (native SAB) and browsers (with COOP/COEP); `crossOriginIsolated` is browser-only and false in Deno.                                                                |
