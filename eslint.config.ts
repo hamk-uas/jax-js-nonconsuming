@@ -91,6 +91,7 @@ export default defineConfig([
         },
       ],
       "jax-js/no-array-chain": "warn",
+      "jax-js/no-nested-array-leak": "off",
       "jax-js/no-dispose-then-reassign-param": "warn",
       "jax-js/no-make-disposable-alias": "warn",
       "jax-js/require-retained-release": "warn",

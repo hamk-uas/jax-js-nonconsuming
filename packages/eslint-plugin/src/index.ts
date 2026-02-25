@@ -3,6 +3,7 @@ import type { ESLint, Linter } from "eslint";
 import noArrayChain from "./rules/no-array-chain";
 import noDisposeThenReassignParam from "./rules/no-dispose-then-reassign-param";
 import noMakeDisposableAlias from "./rules/no-make-disposable-alias";
+import noNestedArrayLeak from "./rules/no-nested-array-leak";
 import noUnnecessaryRef from "./rules/no-unnecessary-ref";
 import noUseAfterDispose from "./rules/no-use-after-dispose";
 import requireRetainedRelease from "./rules/require-retained-release";
@@ -23,6 +24,7 @@ const plugin: ESLint.Plugin = {
     "no-make-disposable-alias": noMakeDisposableAlias,
     "no-unnecessary-ref": noUnnecessaryRef,
     "no-array-chain": noArrayChain,
+    "no-nested-array-leak": noNestedArrayLeak,
     "require-scan-result-dispose": requireScanResultDispose,
     "require-retained-release": requireRetainedRelease,
     "require-try-finally-symmetry": requireTryFinallySymmetry,
@@ -51,6 +53,7 @@ const recommended: Linter.Config = {
     "jax-js/no-make-disposable-alias": "warn",
     "jax-js/no-unnecessary-ref": "warn",
     "jax-js/no-array-chain": "off",
+    "jax-js/no-nested-array-leak": "warn",
     "jax-js/require-scan-result-dispose": "warn",
   },
 };
@@ -72,6 +75,7 @@ const strict: Linter.Config = {
     "jax-js/no-make-disposable-alias": "error",
     "jax-js/no-unnecessary-ref": "error",
     "jax-js/no-array-chain": "error",
+    "jax-js/no-nested-array-leak": "error",
     "jax-js/require-scan-result-dispose": "error",
   },
 };
