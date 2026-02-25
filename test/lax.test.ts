@@ -1,7 +1,9 @@
 import {
   defaultDevice,
   devices,
+  grad,
   init,
+  jit,
   lax,
   numpy as np,
 } from "@hamk-uas/jax-js-nonconsuming";
@@ -96,4 +98,100 @@ suite.each(devices)("device:%s", (device) => {
       });
     });
   }
+
+  suite("lax.sliceInDim()", () => {
+    test("basic slice", () => {
+      using x = np.array([10, 20, 30, 40, 50]);
+      using result = lax.sliceInDim(x, 1, 4);
+      expect(result.js()).toEqual([20, 30, 40]);
+    });
+
+    test("negative start", () => {
+      using x = np.array([10, 20, 30, 40, 50]);
+      using result = lax.sliceInDim(x, -2);
+      expect(result.js()).toEqual([40, 50]);
+    });
+
+    test("negative limit", () => {
+      using x = np.array([10, 20, 30, 40, 50]);
+      using result = lax.sliceInDim(x, 1, -1);
+      expect(result.js()).toEqual([20, 30, 40]);
+    });
+
+    test("limit defaults to axis size", () => {
+      using x = np.array([10, 20, 30]);
+      using result = lax.sliceInDim(x, 1);
+      expect(result.js()).toEqual([20, 30]);
+    });
+
+    test("axis parameter", () => {
+      using x = np.array([
+        [1, 2, 3],
+        [4, 5, 6],
+      ]);
+      using result = lax.sliceInDim(x, 1, 3, 1);
+      expect(result.shape).toEqual([2, 2]);
+      expect(result.js()).toEqual([
+        [2, 3],
+        [5, 6],
+      ]);
+    });
+
+    test("empty slice when start >= limit", () => {
+      using x = np.array([10, 20, 30]);
+      using result = lax.sliceInDim(x, 2, 2);
+      expect(result.shape).toEqual([0]);
+    });
+  });
+
+  suite("lax.dynamicIndexInDim()", () => {
+    test("indexes first element", () => {
+      using x = np.array([10, 20, 30]);
+      using result = lax.dynamicIndexInDim(x, 0);
+      expect(result.shape).toEqual([]);
+      expect(result.js()).toBe(10);
+    });
+
+    test("indexes last element with negative index", () => {
+      using x = np.array([10, 20, 30]);
+      using result = lax.dynamicIndexInDim(x, -1);
+      expect(result.shape).toEqual([]);
+      expect(result.js()).toBe(30);
+    });
+
+    test("keepdims=true preserves axis", () => {
+      using x = np.array([10, 20, 30]);
+      using result = lax.dynamicIndexInDim(x, 1, 0, true);
+      expect(result.shape).toEqual([1]);
+      expect(result.js()).toEqual([20]);
+    });
+
+    test("indexes along axis=1 in 2D", () => {
+      using x = np.array([
+        [1, 2, 3],
+        [4, 5, 6],
+      ]);
+      using result = lax.dynamicIndexInDim(x, 2, 1);
+      expect(result.shape).toEqual([2]);
+      expect(result.js()).toEqual([3, 6]);
+    });
+
+    test("grad through dynamicIndexInDim", () => {
+      const f = (x: np.Array) => {
+        using indexed = lax.dynamicIndexInDim(x, 1);
+        return indexed.mul(indexed);
+      };
+      using x = np.array([3.0, 5.0, 7.0]);
+      using g = grad(f)(x);
+      // d/dx[1] of x[1]^2 = 2*5 = 10; other elements are 0
+      expect(g.js()).toEqual([0, 10, 0]);
+    });
+
+    test("jit(dynamicIndexInDim) works", () => {
+      using f = jit((x: np.Array) => lax.dynamicIndexInDim(x, 0));
+      using x = np.array([42.0, 99.0]);
+      using result = f(x);
+      expect(result.js()).toBe(42);
+    });
+  });
 });

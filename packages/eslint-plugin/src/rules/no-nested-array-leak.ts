@@ -55,7 +55,7 @@ const noNestedArrayLeak: Rule.RuleModule = {
             const prop = getMemberName(callee.property);
             const obj =
               callee.object?.type === "Identifier" ? callee.object.name : null;
-            calleeName = obj && prop ? `${obj}.${prop}` : prop ?? "unknown";
+            calleeName = obj && prop ? `${obj}.${prop}` : (prop ?? "unknown");
           }
 
           context.report({

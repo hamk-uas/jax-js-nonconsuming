@@ -549,6 +549,8 @@ A few functions in `jax.lax` have been implemented:
 
 - `conv_general_dilated()` for convolutions
 - `dot()` for general tensor contractions
+- `dynamic_index_in_dim()` for scalar array indexing with full autodiff
+- `slice_in_dim()` for contiguous axis slicing (zero-copy view)
 - `scan()` for sequential loops with carry state (supports JIT, autodiff with √N checkpointing that
   auto-bypasses for small carries ≤4 MB, vmap, and native compilation on WASM/WebGPU)
 - `associativeScan()` for parallel prefix scans via any associative binary operator (Kogge-Stone

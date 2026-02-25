@@ -441,6 +441,80 @@ export function dynamicUpdateSlice(
 }
 
 /**
+ * Extracts a contiguous slice of size `limit - start` along `axis`.
+ *
+ * Equivalent to `np.take(x, range(start, limit), axis)`, but implemented
+ * as a zero-copy ShapeTracker view via `Primitive.Shrink`.
+ *
+ * Negative indices are supported (counted from end of axis).
+ * If `limit` is omitted it defaults to the axis size.
+ *
+ * @param x     - Input array.
+ * @param start - Start index (inclusive). Negative counts from end.
+ * @param limit - End index (exclusive). Negative counts from end. Defaults to axis size.
+ * @param axis  - Axis to slice along (default 0).
+ */
+export function sliceInDim(
+  x: ArrayLike,
+  start: number,
+  limit?: number,
+  axis: number = 0,
+): Array {
+  x = fudgeArray(x);
+  axis = checkAxis(axis, x.ndim);
+  const axisSize = x.shape[axis];
+
+  // Normalise negative indices
+  if (start < 0) start += axisSize;
+  if (limit === undefined) limit = axisSize;
+  else if (limit < 0) limit += axisSize;
+
+  // Clamp to valid range
+  start = Math.max(0, Math.min(start, axisSize));
+  limit = Math.max(start, Math.min(limit, axisSize));
+
+  const slices: Pair[] = x.shape.map((s, i) =>
+    i === axis ? [start, limit!] : [0, s],
+  );
+  return core.shrink(x, slices) as Array;
+}
+
+/**
+ * Extracts a single element (or size-1 slice) along `axis`.
+ *
+ * With `keepdims = false` (default), the indexed axis is removed from the
+ * result shape, mimicking scalar indexing (`arr[i]`). With `keepdims = true`,
+ * the axis is preserved with size 1.
+ *
+ * AD-safe: differentiable with respect to `operand` (gradient is a one-hot
+ * scatter back into a zeros array at `index`). Not differentiable with
+ * respect to `index`.
+ *
+ * @param operand  - Input array.
+ * @param index    - Index along `axis`. Negative counts from end.
+ * @param axis     - Axis to index along (default 0).
+ * @param keepdims - If true, keep the indexed axis with size 1 (default false).
+ */
+export function dynamicIndexInDim(
+  operand: ArrayLike,
+  index: number,
+  axis: number = 0,
+  keepdims: boolean = false,
+): Array {
+  operand = fudgeArray(operand);
+  axis = checkAxis(axis, operand.ndim);
+  const axisSize = operand.shape[axis];
+  if (index < 0) index += axisSize;
+  const result = sliceInDim(operand, index, index + 1, axis);
+  if (keepdims) return result;
+  // Squeeze the axis — reshape to remove the size-1 dimension
+  const newShape = result.shape.filter((_, i) => i !== axis);
+  const squeezed = core.reshape(result, newShape) as Array;
+  result.dispose();
+  return squeezed;
+}
+
+/**
  * Returns top `k` values and their indices along the specified axis of operand.
  *
  * This is a _stable_ algorithm: If two elements are equal, the lower-index
