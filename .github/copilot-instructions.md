@@ -3901,11 +3901,28 @@ cheap.
 | Optimization loop creating many closures | `clearCaches()` after the loop | Prevents unbounded metadata growth       |
 | Switching models in a long-running app   | `clearCaches()` between models | Reclaims all JIT metadata                |
 
-**Workaround signature (AEP §2):** If downstream code accumulates JIT closures in a loop (e.g.,
-`for (...) { const f = jit(...); ... }`) without disposal, GPU/WASM memory grows unboundedly.
-**Fix:** wrap in `using` or call `clearCaches()` after the loop. If the consumer has a custom "cache
-clearing" utility or periodic `init()`/`destroy()` cycle, replace it with `clearCaches()` — it
-handles all internal caches atomically.
+**Function-identity deduplication:** `jit()` deduplicates by function identity + opts via a
+`WeakMap<Function, Map<string, OwnedFunction>>` registry (`_jitRegistry` in `jaxpr.ts`). Calling
+`jit(fn)` multiple times with the same `fn` reference and equivalent `opts` returns the **same**
+`OwnedFunction` with a shared tracing cache. This prevents cache bloat from inline `jit(fn)(args)`
+patterns — 100 calls create 1 cache entry, not 100.
+
+- **Stable function refs** (named functions, module-scope arrows) are deduped automatically.
+- **Inline arrow functions** (`jit(x => x.add(1))`) create a new closure each call — NOT deduped.
+  Hoist the arrow to a stable binding: `const addOne = (x) => x.add(1); jit(addOne)(x)`.
+- **Opts equivalence:** `_serializeJitOpts()` normalizes `staticArgnums` (sorted) and `dynamic_axes`
+  (sorted by key). `jit(f, {staticArgnums: [1,0]})` and `jit(f, {staticArgnums: [0,1]})` share the
+  same cache.
+- **After `.dispose()`:** The registry entry persists — calling `jit(fn)` returns the same
+  `OwnedFunction` with an empty cache that re-traces on next invocation. This is intentional:
+  disposal clears GPU/WASM buffers, but the identity mapping remains valid until `fn` is GC'd.
+- **WeakMap GC:** When `fn` is garbage-collected, its registry entry is automatically removed.
+
+**Workaround signature (AEP §2):** If downstream code creates inline arrow functions in a loop
+(e.g., `for (...) { jit(x => x.add(c))(...) }`) without disposal, GPU/WASM memory grows unboundedly.
+**Fix:** hoist the function to a stable reference, or call `clearCaches()` after the loop. If the
+consumer has a custom "cache clearing" utility or periodic `init()`/`destroy()` cycle, replace it
+with `clearCaches()` — it handles all internal caches atomically.
 
 ### Migration guide from move semantics
 
@@ -4818,3 +4835,4 @@ Decisions made during development that future agents should understand:
 | ScatterAdd vmap: shared indices only            | Indices are 1-D `[updatesLen]`, same positions for all outer/inner. Per-batch indices can't be represented → vmap throws for `iBdim !== null`.                                                                                                                                                                                                                                                                                    |
 | DUS JVP via `linearTangentsJvp`                 | DUS is linear in both dst and src, so JVP is trivially `bind(Primitive.DUS, tangents, params)`. No hand-written rule needed.                                                                                                                                                                                                                                                                                                      |
 | All primitives have complete transform rules    | Pool, PoolTranspose, DUS, ScatterAdd all have JVP + transpose + vmap rules. No more stub `throw` in transform tables. `test/ad-gaps.test.ts` covers all 6 new rules.                                                                                                                                                                                                                                                              |
+| `jit()` function-identity dedup via WeakMap     | `_jitRegistry: WeakMap<Function, Map<string, OwnedFunction>>` prevents cache bloat from inline `jit(fn)(args)` patterns. Same `(fn, opts)` → same OwnedFunction + shared cache. WeakMap allows GC when `fn` is no longer referenced. Opts normalized via `_serializeJitOpts()`. Inline arrow functions NOT deduped (new closure identity each call).                                                                              |

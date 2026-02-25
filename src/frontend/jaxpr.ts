@@ -1544,12 +1544,50 @@ export function makeJaxpr(
   };
 }
 
+/**
+ * Function-identity registry for jit() deduplication.
+ *
+ * When `jit(fn)(args)` is called inline (no persistent reference to the
+ * wrapper), each call would create a new OwnedFunction with a new cache —
+ * accumulating GPU-backed ClosedJaxpr consts indefinitely. The registry
+ * deduplicates: same `(fn, opts)` → same OwnedFunction + shared cache.
+ *
+ * WeakMap allows GC of `fn` when it goes out of scope (though the dispose
+ * callback in `_jitFunctionDisposers` retains the cache until `clearCaches()`).
+ */
+// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+const _jitRegistry = new WeakMap<Function, Map<string, OwnedFunction<any>>>();
+
+function _serializeJitOpts(opts?: JitOpts): string {
+  if (!opts) return "";
+  const parts: string[] = [];
+  if (opts.staticArgnums?.length) {
+    parts.push("s:" + [...opts.staticArgnums].sort((a, b) => a - b).join(","));
+  }
+  if (opts.dynamic_axes) {
+    const entries = Object.entries(opts.dynamic_axes)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${k}=${v}`);
+    parts.push("d:" + entries.join(","));
+  }
+  return parts.join("|");
+}
+
 export function jit<F extends (...args: any[]) => any>(
   f: F,
   opts?: JitOpts,
 ): OwnedFunction<
   (...args: MapJsTree<Parameters<F>, Array, ArrayLike>) => ReturnType<F>
 > {
+  // Deduplicate by function identity + opts: inline jit(fn)(args) patterns
+  // reuse the same OwnedFunction and shared cache across calls.
+  const optsKey = _serializeJitOpts(opts);
+  const byOpts = _jitRegistry.get(f);
+  if (byOpts) {
+    const existing = byOpts.get(optsKey);
+    if (existing) return existing;
+  }
+
   const cache = new Map<string, ReturnType<ReturnType<typeof makeJaxpr>>>();
   const staticArgnums = new Set(opts?.staticArgnums ?? []);
 
@@ -1602,6 +1640,14 @@ export function jit<F extends (...args: any[]) => any>(
   // frees ClosedJaxpr consts and clears the cache — the next call will
   // re-trace and create fresh consts.
   _jitFunctionDisposers.add(result.dispose);
+
+  // Store in registry for dedup of subsequent jit(f, opts) calls.
+  let registry = byOpts;
+  if (!registry) {
+    registry = new Map();
+    _jitRegistry.set(f, registry);
+  }
+  registry.set(optsKey, result);
 
   return result;
 }
