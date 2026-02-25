@@ -1,8 +1,9 @@
 # Control-Flow Lowering & Scan Performance Plan
 
-**Status:** Draft v3 for review **Date:** 2026-02-25 **Supersedes:** v2 (extended fusion +
-pre-encoded), v1 (pre-encoded multi-kernel only) **Integrates:** Useful elements from
-`LOOP-PRIMITIVE-RESTRUCTURING-PLAN.md`
+**Status:** Draft v4 **Date:** 2026-02-25 **Supersedes:** v3 (review feedback integrated), v2
+(extended fusion + pre-encoded), v1 (pre-encoded multi-kernel only) **Integrates:** Useful elements
+from `LOOP-PRIMITIVE-RESTRUCTURING-PLAN.md`, review feedback from `UPDATED-PLAN-REVIEW.md` (formal
+fusion safety contract, nested-length compatibility matrix, benchmark protocol, scope trimming)
 
 ---
 
@@ -229,6 +230,37 @@ Uses `classifyBodySteps()` (Phase 4a) internally. For each internal dep:
 Conservative policy: reject if uncertain. A false negative just means fallback (safe). A false
 positive would produce wrong results.
 
+**Phase 1 Fusion Safety Contract (formal admission predicate):**
+
+A body step `j` that reads producer step `i`'s output is **same-gidx-safe** if and only if ALL of
+the following structural conditions hold:
+
+1. **Producer is a Kernel** — not a Routine, scan, or assoc_scan step.
+2. **Size equality** — `producer.kernel.size === consumer.kernel.size`. If the producer's output
+   count differs (e.g., scalar reduction), thread `gidx` in the consumer would read a value produced
+   by a different thread → cross-thread dep → reject.
+3. **Identity index mapping** — the consumer's `AluExp` tree references the producer's output via a
+   `GlobalView` or `GlobalIndex` that resolves to the same flat `gidx` as the producer's store. In
+   practice, this means no `ShapeTracker` transformations (transpose, reshape) between producer
+   output and consumer input. Verified by `AluExp.fold()` — the referenced buffer's access pattern
+   must be `buffer[gidx]` (stride-1, offset-0 on the fused axis).
+4. **No broadcast** — the consumer does not broadcast the producer's output to a larger size. A
+   broadcast means multiple consumer threads read the same producer cell → still safe for
+   correctness, but the `var<private>` pattern assumes one-to-one → reject to avoid subtle bugs.
+5. **Reduction producer constraint** — if step `i` has a reduction, the consumer must read the
+   reduction output (not the pre-reduction intermediate). The reduction output has size =
+   `kernel.size / reductionSize`. Same-gidx-safe requires the consumer operates at this reduced
+   size. **Reject if the consumer's size ≠ the producer's reduction output size.**
+
+**Proof obligation:** For any body admitted by `canFuseScanSteps()`, the deferred-write shader must
+produce bit-identical results to sequential execution of the body steps. This is guaranteed when
+each `var<private> step_i_val` holds the exact value that would be in `internal_buffer[gidx]` after
+step `i` completes — which follows from conditions 1–5 above ensuring no cross-thread data flow.
+
+**Reject-by-default:** Any pattern not explicitly matched by conditions 1–5 is rejected. The
+function returns `false` and the body falls through to Tier 2 (pre-encoded) or Tier 3 (fallback).
+New fusable patterns require adding explicit structural rules here, not relaxing the default.
+
 **Files changed:**
 
 | File                        | Changes                                                                      | LOC      |
@@ -321,7 +353,11 @@ case "assoc_scan": {
 | scan(scan(matmul chain))      | O(N_outer/256) submits        | N_outer × N_inner × S, **1 submit**        |
 | scan(assocScan(kernel))       | O(N_outer/256) submits        | N_outer × ⌈log₂M⌉ dispatches, **1 submit** |
 | grad(scan(kernel)) — backward | O(N/256) submits              | N × S_transposed, **1 submit**             |
-| Kalman smoother backward      | O(N/256) submits, ~1s @N=1600 | N×S, **1 submit**, ~20ms estimated         |
+| Kalman smoother backward      | O(N/256) submits, ~1s @N=1600 | N×S, **1 submit**, ~20ms (hypothesis\*)    |
+
+\* Performance estimates are hypotheses. Validate with:
+`pnpm build && pnpm vitest bench bench/scan.bench.ts` on target hardware. Success criterion for
+pre-encoded vs fallback: ≥5× speedup for N≥100 on a body with ≥2 sequential kernel steps.
 
 **Scan dispatch method:**
 
@@ -361,6 +397,28 @@ also wrap kernel shaders.
 Encoding N_outer × N_inner × S dispatches for deep nesting could produce very large command buffers.
 Mitigation: chunk encoding into blocks of ≤1024 iterations. Each block is one `encoder.finish()` +
 `queue.submit()`. Even 10 submits is 25× fewer than fallback's O(N/256).
+
+**Nested-length compatibility matrix:**
+
+| Outer length | Inner length | Pre-encoded? | Fallback behavior                                          |
+| ------------ | ------------ | ------------ | ---------------------------------------------------------- |
+| Concrete     | Concrete     | ✅ Yes       | Full encoding: outer×inner×S dispatches, 1 submit          |
+| Concrete     | Symbolic     | ❌ No        | Inner scan falls back to JS loop per outer iteration       |
+| Symbolic     | Concrete     | ❌ No        | Outer scan falls back (preencoded rejects symbolic length) |
+| Symbolic     | Symbolic     | ❌ No        | Both fall back to JS loops                                 |
+
+**Policy:** Pre-encoded encoding requires **concrete lengths at all nesting levels**. Any symbolic
+dimension at any level causes that loop (and all enclosing loops depending on it) to fall back to
+the JS loop path. This is enforced at planning time — `tryPreparePreencodedMultiStep()` checks
+`typeof length === "number"` for the outer scan length and recursively for any inner scan/assocScan
+JitSteps encountered during `encodeBodyStep()`. The recursive check is a guard, not a planning step
+— if an inner loop has symbolic length, `encodeBodyStep()` returns `null` and the outer scan falls
+back to Tier 3.
+
+**Why not encode outer-concrete + inner-symbolic?** The inner scan's length determines how many
+dispatches to encode. A symbolic length can't be resolved at encoding time (it's resolved at
+execution time from `dimBindings`). We'd need to encode for a maximum bound + predicated writes,
+which adds complexity for an uncommon case. Deferred until a concrete use case motivates it.
 
 **ScanPlan extension:**
 
@@ -546,119 +604,39 @@ motivates it. **Future work** (see Section 10).
 **Semantics:** `while_loop(cond_fn, body_fn, init_carry)` — iterate body while cond returns true.
 Equivalent to JAX's `lax.while_loop`.
 
-**Jaxpr representation:**
+**Interface constraints (for Phase 2 compatibility):**
 
-```
-Primitive.WhileLoop {
-  cond_jaxpr: Jaxpr,    // (...carry) → bool
-  body_jaxpr: Jaxpr,    // (...carry) → ...carry
-}
-```
+- Jaxpr params: `{ cond_jaxpr: Jaxpr, body_jaxpr: Jaxpr }`
+- JitStep type: `"while_loop"` with `condProgram`, `bodyProgram`, carry metadata
+- `encodeBodyStep()` case: bounded pre-encoded (requires `max_iter` user hint) with predicated
+  writes; JS loop fallback without `max_iter`
+- WASM: compiled `loop`/`br_if` in single module, dynamic termination
+- AD: JVP doubles carry (cond on primals only); transpose reuses `ScanPullbackArtifact` machinery
+  (√N checkpointing); vmap pads to max iterations with masking (GPU) or per-element (WASM/CPU)
 
-**JitStep:** `"while_loop"` with `condProgram`, `bodyProgram`, carry metadata.
-
-**Backend lowering:**
-
-| Backend                   | Strategy            | Notes                                                                                                   |
-| ------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------- |
-| WASM                      | Compiled while loop | WASM `loop`/`br_if`. Compile cond+body into single module. Dynamic termination. Zero JS boundary.       |
-| WebGPU (elementwise body) | Bounded GPU loop    | If user provides `max_iter`, WGSL: `for (var i=0u; i<MAX; i++) { if (!cond()) break; body(); }` .       |
-| WebGPU (complex body)     | JS loop             | JS dispatches cond shader, reads bool, dispatches body if true. Like scan fallback with dynamic length. |
-| WebGPU (with pre-encoded) | Bounded pre-encoded | Encode max_iter iterations. Predicated writes skip when cond is false. 1 submit.                        |
-
-**AD rules:**
-
-- **JVP:** Thread tangent carry alongside primal carry. Cond evaluated on primals only (bool is
-  non-differentiable). Body JVP doubles the carry:
-  `(primal_carry, tangent_carry) → (new_primal, new_tangent)`.
-- **Transpose:** Requires iteration count from forward pass. Options: (a) store all N carries (O(N)
-  memory), (b) √N checkpointing (same as scan). The scan backward machinery (`ScanPullbackArtifact`)
-  generalises directly — the key method is `runOneForwardStep` / `runOneBackwardStep` which don't
-  depend on scan-specific semantics.
-- **Vmap:** Each batch element may iterate different number of times. Two approaches: (a) pad to max
-  iterations with masking (JAX approach), (b) per-element sequential. Use (a) for GPU backends, (b)
-  for WASM/CPU.
-
-**Interaction with scan bodies:**
-
-A `while_loop` step inside a scan body creates a body with a `while_loop` JitStep. Tier 2
-(pre-encoded) handles this via bounded encoding: encode `max_iter` iterations of the inner
-while_loop's body, with predicated writes. The outer scan's N iterations × inner while_loop's
-max_iter iterations are all in one command buffer.
-
-WASM compiled-loop handles it via compiled module import (analogous to nested scan import):
-
-```
-outer_scan_module imports:
-  inner_while_fn(...carry, ...carryOut) → i32 (converged flag)
-```
-
-**Estimated implementation:** ~300 LOC (primitive + JitStep + WASM backend). WebGPU bounded loop:
-+100 LOC. AD rules: +200 LOC. Pre-encoded support: reuses Phase 2 `encodeBodyStep()`.
+**Estimated implementation:** ~600 LOC total. Detailed lowering and AD design deferred to a separate
+RFC when implementation begins.
 
 ### 8b. `Primitive.Cond`
 
 **Semantics:** `cond(pred, true_fn, false_fn, *operands)` — execute one branch based on pred.
 Equivalent to JAX's `lax.cond`.
 
-**Jaxpr representation:**
+**Interface constraints (for Phase 2 compatibility):**
 
-```
-Primitive.Cond {
-  branches: [true_jaxpr, false_jaxpr],
-}
-```
+- Jaxpr params: `{ branches: [true_jaxpr, false_jaxpr] }`
+- JitStep type: `"cond"` with `branchPrograms: JitProgram[]`, output metadata
+- `encodeBodyStep()` case: encode both branches + select dispatch (WebGPU can't branch per-element
+  efficiently; `mapAsync` round trip ~50 µs > executing both for small branches)
+- WASM: compile both branches, execute selected one (if/else)
+- AD: JVP through both branches, select on primal pred; transpose through selected branch
 
-**JitStep:** `"cond"` with `branchPrograms: JitProgram[]`, output metadata.
-
-**Backend lowering:**
-
-| Backend                   | Strategy                  | Notes                                                                     |
-| ------------------------- | ------------------------- | ------------------------------------------------------------------------- |
-| WASM                      | if/else                   | Compile both branches. Execute selected one. Zero waste.                  |
-| WebGPU                    | Execute both + select     | GPU can't branch efficiently. Execute both branches, `select` results.    |
-| WebGPU (inside scan body) | Pre-encoded both + select | Both branches' dispatches encoded. Select dispatch copies correct result. |
-
-**Why "execute both" on WebGPU:**
-
-Reading `pred` from GPU to conditionally encode only one branch requires a `mapAsync` round trip
-(~50 µs latency on typical hardware). For small branches this is far more expensive than executing
-both and selecting. For very large branches (e.g., one does a 1024×1024 matmul, the other doesn't),
-a future optimisation could batch cond evaluation or use indirect dispatch to skip work.
-
-**AD rules:**
-
-- **JVP:** JVP through both branches independently, select tangent output based on primal pred.
-- **Transpose:** Transpose through selected branch (pred is non-differentiable).
-- **Vmap:** Per-element cond → execute both branches on full batch, select per element.
-
-**Cond inside scan body — pre-encoded handling:**
-
-When a scan body contains a `cond` step, Phase 2's `encodeBodyStep()` encodes both branches:
-
-```
-for iter in 0..N:
-  encode kernel step 1
-  encode cond:
-    encode true_branch dispatches
-    encode false_branch dispatches
-    encode select dispatch (conditional copy based on pred)
-  encode kernel step 2
-```
-
-All in 1 submit. The select dispatch is a small shader that reads pred from a buffer and copies the
-correct branch's output to the cond's output buffer.
-
-**Estimated implementation:** ~200 LOC (primitive + JitStep + backend lowering). AD rules: +150 LOC.
-Pre-encoded support: reuses Phase 2 `encodeBodyStep()`.
+**Estimated implementation:** ~350 LOC total. Detailed lowering and AD design deferred to a separate
+RFC when implementation begins.
 
 ### 8c. `Primitive.Switch`
 
-**Semantics:** `switch(index, branches, *operands)` — execute one of N branches based on index.
-Generalisation of cond.
-
-Same lowering pattern as cond: WASM does switch/if-chain, WebGPU executes all branches + select.
-Deferred until cond is proven useful.
+Generalisation of cond to N branches. Same lowering pattern. Deferred until cond is proven useful.
 
 ### How new primitives interact with the plan
 
@@ -800,38 +778,40 @@ Future (not in scope):
 
 ## 13. Success Criteria
 
-| Criterion                                                                       | Phase   |
-| ------------------------------------------------------------------------------- | ------- |
-| Elementwise grad(scan) backward fuses to 1 dispatch (WebGPU)                    | 1       |
-| `acceptPath: "compiled-loop"` works for bodies with internal deps (elementwise) | 1       |
-| No dispatch regression for any currently compiled-loop body                     | 1       |
-| Bodies with carry passthrough and numCarry ≠ numY use extended fusion           | 1       |
-| grad(scan) with linalg body uses pre-encoded (1 submit)                         | 2       |
-| ≥5× speedup vs fallback for N≥100 on representative body                        | 2       |
-| Nested scan(scan(kernel)) uses pre-encoded, 1 submit                            | 2       |
-| Nested scan(assocScan(kernel)) correctly encodes ⌈log₂M⌉ rounds                 | 2       |
-| Mixed kernel+routine body uses pre-encoded                                      | 3       |
-| assocScan execution not inline in jit.ts                                        | 4       |
-| classifyBodySteps shared by ≥2 planning functions                               | 4       |
-| No GPU memory leaks (transient buffers destroyed)                               | 1,2     |
-| All existing tests pass                                                         | 1,2,3,4 |
+| Criterion                                                                       | Phase   | Validation                                                         |
+| ------------------------------------------------------------------------------- | ------- | ------------------------------------------------------------------ |
+| Elementwise grad(scan) backward fuses to 1 dispatch (WebGPU)                    | 1       | `acceptPath: "compiled-loop"` in test                              |
+| `acceptPath: "compiled-loop"` works for bodies with internal deps (elementwise) | 1       | New test case with step chain A→B                                  |
+| No dispatch regression for any currently compiled-loop body                     | 1       | Existing test suite passes                                         |
+| Bodies with carry passthrough and numCarry ≠ numY use extended fusion           | 1       | `acceptPath: "compiled-loop"` in test                              |
+| grad(scan) with linalg body uses pre-encoded (1 submit)                         | 2       | `acceptPath: "preencoded-multi-step"` in test                      |
+| ≥5× speedup vs fallback for N≥100 on representative body                        | 2       | `pnpm vitest bench bench/scan.bench.ts` — add pre-encoded vs fall. |
+| Nested scan(scan(kernel)) uses pre-encoded, 1 submit                            | 2       | New test case with nested scan bodies                              |
+| Nested scan(assocScan(kernel)) correctly encodes ⌈log₂M⌉ rounds                 | 2       | New test case                                                      |
+| Mixed kernel+routine body uses pre-encoded                                      | 3       | `acceptPath: "preencoded-multi-step"` in test                      |
+| assocScan execution not inline in jit.ts                                        | 4       | Code review: `jit.ts` assoc_scan case is ≤5 lines                  |
+| classifyBodySteps shared by ≥2 planning functions                               | 4       | grep: ≥2 call sites in `scan-plan.ts`                              |
+| No GPU memory leaks (transient buffers destroyed)                               | 1,2     | `checkLeaks` in all new tests                                      |
+| All existing tests pass                                                         | 1,2,3,4 | `pnpm vitest run` green                                            |
 
 ---
 
 ## 14. Comparison with v1 and v2 Plans
 
-| Aspect               | v1 (pre-encoded only)  | v2 (extended fusion + pre-encoded) | v3 (this plan)                               |
-| -------------------- | ---------------------- | ---------------------------------- | -------------------------------------------- |
-| Architecture         | New ScanPlan path only | Improve existing lowering          | Lowering + housekeeping + forward design     |
-| Dispatch reduction   | None (N×S dispatches)  | **1 dispatch** for eligible        | Same + nested loop planning                  |
-| Submit reduction     | 1 submit (kernel-only) | 1 submit for all encodable         | Same + nested scan encoding                  |
-| Nested loops         | Not addressed          | Not addressed                      | **Pre-encoded recursive encoding**           |
-| Routine support      | Excluded               | Phase 3                            | Phase 3                                      |
-| Body analysis        | Per-backend ad hoc     | Per-backend ad hoc                 | **Shared `classifyBodySteps()`**             |
-| assocScan execution  | Inline in jit.ts       | Inline in jit.ts                   | **Moved to scan-executor.ts**                |
-| Future primitives    | Not addressed          | Phase 4 sketch                     | **Detailed while_loop, cond, switch design** |
-| Structural evolution | Not addressed          | Not addressed                      | **Recorded LoopPlan design, clear trigger**  |
-| Scope                | ~730 LOC kernel-only   | ~1560 LOC concrete                 | ~1190 LOC concrete + future roadmap          |
+| Aspect               | v1 (pre-encoded only)  | v2 (extended fusion + pre-encoded) | v3/v4 (this plan)                                    |
+| -------------------- | ---------------------- | ---------------------------------- | ---------------------------------------------------- |
+| Architecture         | New ScanPlan path only | Improve existing lowering          | Lowering + housekeeping + forward design             |
+| Dispatch reduction   | None (N×S dispatches)  | **1 dispatch** for eligible        | Same + nested loop planning                          |
+| Submit reduction     | 1 submit (kernel-only) | 1 submit for all encodable         | Same + nested scan encoding                          |
+| Nested loops         | Not addressed          | Not addressed                      | **Pre-encoded recursive encoding**                   |
+| Routine support      | Excluded               | Phase 3                            | Phase 3                                              |
+| Body analysis        | Per-backend ad hoc     | Per-backend ad hoc                 | **Shared `classifyBodySteps()`**                     |
+| assocScan execution  | Inline in jit.ts       | Inline in jit.ts                   | **Moved to scan-executor.ts**                        |
+| Future primitives    | Not addressed          | Phase 4 sketch                     | **Interface sketches + separate RFC for detail**     |
+| Structural evolution | Not addressed          | Not addressed                      | **Recorded LoopPlan design, clear trigger**          |
+| Fusion safety        | Not formalized         | Not formalized                     | **Formal 5-condition admission predicate**           |
+| Nested lengths       | Not addressed          | Not addressed                      | **Explicit compatibility matrix, concrete required** |
+| Scope                | ~730 LOC kernel-only   | ~1560 LOC concrete                 | ~1190 LOC concrete + future roadmap                  |
 
 ---
 
