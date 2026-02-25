@@ -46,7 +46,6 @@ import {
   _registerAssociativeScanCoreImpl,
   bind,
   Primitive,
-  setScanBodyTraceActive,
   ShapedArray,
 } from "../frontend/core";
 import { evalJaxpr, makeJaxpr } from "../frontend/jaxpr";
@@ -331,8 +330,6 @@ export function associativeScan<T extends JsTree<Array>>(
     (e) => new ShapedArray(e.shape.slice(1) as number[], e.dtype, false),
   );
 
-  // Tag inline np.array() calls as anonymous builder-owned consts
-  setScanBodyTraceActive(true);
   let closedJaxpr;
   try {
     ({ jaxpr: closedJaxpr } = makeJaxpr((...args: any[]) => {
@@ -346,13 +343,10 @@ export function associativeScan<T extends JsTree<Array>>(
     // This unrolls the algorithm into the current trace (jit/grad), which
     // produces a larger graph but works with compose fns that explicitly
     // reference the batch dimension.
-    setScanBodyTraceActive(false);
     for (let i = 0; i < movedElems.length; i++) {
       if (movedOwned[i]) movedElems[i].dispose();
     }
     return associativeScanCore(fn, elems, { axis, reverse }) as T;
-  } finally {
-    setScanBodyTraceActive(false);
   }
 
   // 4b. Validate body output shapes match input shapes.

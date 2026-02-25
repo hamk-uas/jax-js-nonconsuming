@@ -7,13 +7,7 @@
 
 import type { Array } from "../frontend/array";
 import { zeros } from "../frontend/array";
-import {
-  bind,
-  getAval,
-  Primitive,
-  setScanBodyTraceActive,
-  ShapedArray,
-} from "../frontend/core";
+import { bind, getAval, Primitive, ShapedArray } from "../frontend/core";
 import { makeJaxpr } from "../frontend/jaxpr";
 import * as tree from "../tree";
 import type { JsTree } from "../tree";
@@ -423,17 +417,10 @@ export function scan<
   // Build abstract values for tracing
   const traceAvals = [...carryAvals, ...xSliceAvals];
 
-  // Trace to get jaxpr — set scan body trace flag so that np.array()
-  // calls inside the body tag their results as anonymous builder-owned consts.
-  setScanBodyTraceActive(true);
-  let closedJaxpr, _outTreedef;
-  try {
-    ({ jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr(traceFn)(
-      ...traceAvals,
-    ));
-  } finally {
-    setScanBodyTraceActive(false);
-  }
+  // Trace to get jaxpr.
+  const { jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr(traceFn)(
+    ...traceAvals,
+  );
   const jaxpr = closedJaxpr.jaxpr;
   const consts = closedJaxpr.consts;
 

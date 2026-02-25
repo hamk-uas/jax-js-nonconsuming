@@ -125,6 +125,28 @@ suite("depth-2 compositions", () => {
     expect(r).toBeAllclose(F1);
   });
 
+  // Regression: inline np.array() constant inside jit(grad(fn)) body.
+  // Without insideAbstractTrace marking, the inline constant leaks
+  // because getOrMakeConstTracer calls .ref but no one balances creation rc.
+  test("jit(grad(f)) with inline constant does not leak", () => {
+    const withConst = (x: np.Array) => x.mul(np.array([3])).sum();
+    using f = jit(grad(withConst));
+    using x = np.array([2.0]);
+    using r = f(x);
+    expect(r).toBeAllclose([3]);
+  });
+
+  test("jit(valueAndGrad(f)) with inline constant does not leak", () => {
+    const withConst = (x: np.Array) => x.mul(np.array([3])).sum();
+    using f = jit(valueAndGrad(withConst));
+    using x = np.array([2.0]);
+    const [v, g] = f(x);
+    using _v = v;
+    using _g = g;
+    expect(v).toBeAllclose(6);
+    expect(g).toBeAllclose([3]);
+  });
+
   test("jit(jit(f)) = f", () => {
     using f = jit(jit(fn));
     using x = np.array(X);

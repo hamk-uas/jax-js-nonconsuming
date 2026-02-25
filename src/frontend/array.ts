@@ -52,8 +52,7 @@ import {
   exp as coreExp,
   mul as coreMul,
   getAval,
-  insideNestedAbstractTrace,
-  isScanBodyTraceActive,
+  inMakeJaxprBody,
   ndim,
   newMain,
   Primitive,
@@ -1849,22 +1848,25 @@ function dataToJs(
 export const anonymousConstArrays = new WeakSet<Array>();
 
 /**
- * Tags an array as anonymous builder-owned when created inside a trace scope
- * where no external owner will dispose the creation ref:
- * - scan body traces (isScanBodyTraceActive)
- * - nested abstract traces (e.g. jit(valueAndGrad(fn))) where a PE scope
- *   creates arrays captured by an outer JIT — the outer JIT takes sole
- *   ownership via getOrMakeConstTracer's ownedByBuilder path
+ * Tags an array as anonymous builder-owned when created inside a makeJaxpr
+ * body execution.  Arrays created during tracing (e.g. inline `np.array([3])`
+ * inside a jit/grad/scan body) have no external owner — the enclosing
+ * ClosedJaxpr should be the sole owner via getOrMakeConstTracer's
+ * ownedByBuilder path.
+ *
+ * Only fires when inMakeJaxprBody() is true (during user function execution).
+ * NOT true during JaxprBuilder.build() / _inlineLiterals, which create
+ * internal arrays that must not be marked anonymous.
+ *
+ * Safe because arrays captured from OUTSIDE the body were created before
+ * makeJaxpr body execution started (inMakeJaxprBody() was false at their
+ * creation time) and are therefore not marked here.
  *
  * Marking MUST happen at creation time (before any getOrMakeConstTracer
- * call), not after PE tracing completes.
+ * call), not after tracing completes.
  */
 const markAnonymousIfTracing = (arr: Array): Array => {
-  if (
-    isScanBodyTraceActive() ||
-    (_peArrayCreationTracker && insideNestedAbstractTrace())
-  )
-    anonymousConstArrays.add(arr);
+  if (inMakeJaxprBody()) anonymousConstArrays.add(arr);
   return arr;
 };
 
@@ -1906,6 +1908,8 @@ export function fullInternal(
   fillValue: number | boolean,
   device?: Device,
 ) {
+  // Called by library internals (zerosLike, onesLike) during tracing;
+  // marking these would cause use-after-free. jax-js-lint: allow-unmarked
   return new Array({
     source: AluExp.const(aval.dtype, fillValue),
     st: ShapeTracker.fromShape(aval.shape as number[]),
@@ -2023,14 +2027,16 @@ export function eye(
     AluExp.mod(AluVar.idx, AluExp.i32(numCols + 1)),
     AluExp.i32(1),
   );
-  return new Array({
-    source: AluExp.cast(dtype, exp),
-    st: ShapeTracker.fromShape([numRows, numCols]),
-    dtype,
-    weakType,
-    backend: getBackend(device),
-    committed: device != undefined,
-  });
+  return markAnonymousIfTracing(
+    new Array({
+      source: AluExp.cast(dtype, exp),
+      st: ShapeTracker.fromShape([numRows, numCols]),
+      dtype,
+      weakType,
+      backend: getBackend(device),
+      committed: device != undefined,
+    }),
+  );
 }
 
 /** Return the identity matrix, with ones on the main diagonal. */
@@ -2082,14 +2088,16 @@ export function arange(
     AluExp.mul(AluExp.cast(dtype, AluVar.idx), AluExp.const(dtype, step)),
   );
   const st = ShapeTracker.fromShape([size]);
-  return new Array({
-    source: exp,
-    st,
-    dtype,
-    weakType: false,
-    backend: getBackend(device),
-    committed: device != undefined,
-  });
+  return markAnonymousIfTracing(
+    new Array({
+      source: exp,
+      st,
+      dtype,
+      weakType: false,
+      backend: getBackend(device),
+      committed: device != undefined,
+    }),
+  );
 }
 
 /**
@@ -2195,14 +2203,16 @@ export function linspace(
     ),
   );
   const st = ShapeTracker.fromShape([num]);
-  return new Array({
-    source: exp,
-    st,
-    dtype,
-    weakType: false,
-    backend: getBackend(device),
-    committed: device != undefined,
-  });
+  return markAnonymousIfTracing(
+    new Array({
+      source: exp,
+      st,
+      dtype,
+      weakType: false,
+      backend: getBackend(device),
+      committed: device != undefined,
+    }),
+  );
 }
 
 /**

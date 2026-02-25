@@ -2,7 +2,6 @@
 
 import { arange, Array, concatenate, cos, sin } from "./numpy";
 import { isFloatDtype } from "../alu";
-import { anonymousConstArrays } from "../frontend/array";
 import { jit } from "../frontend/jaxpr";
 import { checkAxis, deepEqual, invertPermutation, range, rep } from "../utils";
 
@@ -50,9 +49,6 @@ const fftUpdate = jit(
     imag = imag.reshape([-1, 2 * half]);
 
     const k = arange(0, half, 1, { dtype: real.dtype });
-    // k is anonymous: created inside jit body, nobody holds a reference.
-    // Mark so getOrMakeConstTracer skips .ref, preventing a slot leak.
-    anonymousConstArrays.add(k);
     using theta = k.mul(-Math.PI / half);
     const wr = cos(theta);
     const wi = sin(theta);

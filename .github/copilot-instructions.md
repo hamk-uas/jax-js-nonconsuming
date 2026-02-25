@@ -29,7 +29,8 @@ When you modify our public API, your task is to provide a "Migration Bundle" tha
 - **Deterministic Mapping:** Raw structural diffs (e.g.,
   `Class.oldMethod(x) -> NewModule.fetch(x)`).
 - **Workaround Signatures (The "Debt Collector"):** Explicitly identify patterns that consumers
-  likely used to bypass old limitations.
+  likely used to bypass old limitations. Provide migration guidance in the commit message. If you
+  create a new release version in GitHub, include these instructions in the version description.
   - _Example:_ "If the consumer has a local utility that manually merges X and Y because v1 didn't
     support it, delete that utility and use the new `nativeMerge` endpoint."
 

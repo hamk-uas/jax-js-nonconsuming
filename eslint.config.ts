@@ -129,6 +129,14 @@ export default defineConfig([
       "jax-js/require-using": "off",
     },
   },
+  // `new Array({source: ...})` in exported factory functions must be wrapped
+  // in `markAnonymousIfTracing()` to prevent leaks in jit/grad/scan bodies.
+  {
+    files: ["src/frontend/array.ts"],
+    rules: {
+      "jax-js/require-mark-anonymous": "error",
+    },
+  },
   {
     files: ["test/**/*.{js,mjs,cjs,ts}"],
     ...(jaxJsPlugin.configs!.invariance as any),

@@ -34,12 +34,14 @@ import { _jitFunctionDisposers } from "./check-leaks";
 import { checkConvShape, checkPoolShape } from "./convolution";
 import {
   _peArrayCreationTracker,
+  _setInMakeJaxprBody,
   _setPACT,
   AbstractValue,
   bind,
   flattenFun,
   fullRaise,
   getAval,
+  inMakeJaxprBody,
   ndim,
   newDynamic,
   newMain,
@@ -852,7 +854,15 @@ export class ClosedJaxpr {
 
   /** Dispose of the constants in this Jaxpr. */
   dispose() {
-    for (const c of this.consts) c.dispose();
+    for (const c of this.consts) {
+      c.dispose();
+      // Anonymous consts (inline np.array() inside jit/scan body) have an extra
+      // ref from creation that no external owner will balance.  If the const is
+      // still alive after the .ref-undo above, free the original allocation.
+      if (c instanceof Array && anonymousConstArrays.has(c) && c.refCount > 0) {
+        c.dispose();
+      }
+    }
   }
 }
 
@@ -910,12 +920,6 @@ class JaxprTrace extends Trace {
     if (!(val instanceof Tracer)) {
       val = pureArray(val);
       ownedByBuilder = true;
-    } else if (val instanceof Array && anonymousConstArrays.has(val)) {
-      // Array was created by pureArray/fudgeArray from a raw value inside a
-      // library function (e.g., subtract(1, x)). Nobody else holds a reference.
-      // Treat as builder-owned so disposal frees it completely.
-      ownedByBuilder = true;
-      anonymousConstArrays.delete(val);
     }
     let tracer = this.builder.constTracers.get(val);
     if (tracer === undefined) {
@@ -1040,6 +1044,12 @@ function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
       // (leaving the user's reference). For builder-owned consts (pureArray)
       // this frees the sole reference.
       ar.dispose();
+      // Anonymous consts (inline np.array() inside jit/scan body) have an
+      // extra ref from creation that no external owner will balance.
+      // eslint-disable-next-line jax-js/no-use-after-dispose -- intentional: ar may still have rc>0
+      if (anonymousConstArrays.has(ar) && ar.refCount > 0) {
+        ar.dispose();
+      }
     } else {
       constBinders.push(jaxpr.inBinders[i]);
       newConsts.push(consts[i]);
@@ -1512,10 +1522,13 @@ export function makeJaxpr(
     // be disposed by the outer PE's ResidualCollector.dispose().
     const prevTracker = _peArrayCreationTracker;
     _setPACT(null);
+    const prevBody = inMakeJaxprBody();
+    _setInMakeJaxprBody(true);
     let outs: any;
     try {
       outs = fFlat(...tracersIn);
     } finally {
+      _setInMakeJaxprBody(prevBody);
       _setPACT(prevTracker);
     }
     const tracersOut = outs.map(

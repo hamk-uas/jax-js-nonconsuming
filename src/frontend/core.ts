@@ -739,22 +739,6 @@ export function insideTrace(): boolean {
 }
 
 /**
- * Flag set only during scan body tracing. Arrays created while this is true
- * are tagged as anonymous builder-owned consts (via anonymousConstArrays).
- * Unlike insideTrace(), this doesn't fire during jit/vmap/other traces where
- * the ClosedJaxpr is cached and consts must survive beyond compilation.
- */
-let _scanBodyTraceActiveFlag = false;
-
-export function isScanBodyTraceActive(): boolean {
-  return _scanBodyTraceActiveFlag;
-}
-
-export function setScanBodyTraceActive(v: boolean): void {
-  _scanBodyTraceActiveFlag = v;
-}
-
-/**
  * Returns true if any abstract (graph-building) trace is on the stack.
  *
  * Unlike `insideTrace()`, this returns false when only concrete-value traces
@@ -773,19 +757,17 @@ export function insideAbstractTrace(): boolean {
 }
 
 /**
- * Returns true when there are ≥2 abstract traces on the stack.
- *
- * This detects nested tracing (e.g. jit(valueAndGrad(fn))) where an inner PE
- * trace creates arrays that are captured by an outer JIT trace.  Arrays created
- * in this situation have no external owner — the outer JIT must take sole
- * ownership via anonymousConstArrays.
+ * True while user body code is executing inside a makeJaxpr call.
+ * Set around the `fn(tracers)` call, NOT during JaxprBuilder.build().
+ * Used by markAnonymousIfTracing to detect inline np.array() constants
+ * that should be builder-owned (anonymous) in the resulting ClosedJaxpr.
  */
-export function insideNestedAbstractTrace(): boolean {
-  let count = 0;
-  for (let i = 1; i < traceStack.length; i++) {
-    if (traceStack[i].isAbstract && ++count >= 2) return true;
-  }
-  return false;
+let _inMakeJaxprBody = false;
+export function inMakeJaxprBody(): boolean {
+  return _inMakeJaxprBody;
+}
+export function _setInMakeJaxprBody(v: boolean): void {
+  _inMakeJaxprBody = v;
 }
 
 /**
