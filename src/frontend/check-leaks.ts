@@ -372,6 +372,10 @@ function safeRefCount(arr: object): string {
 export interface LeakReport {
   /** Number of unreleased backend slots (0 = no leaks). */
   leaked: number;
+  /** Tracked leaks originating from user code (not inside a library package). */
+  userLeaked: number;
+  /** Tracked leaks originating from inside @hamk-uas/jax-js-nonconsuming. */
+  internalLeaked: number;
   /** Array descriptions with creation locations (best-effort from tracking map). */
   details: string[];
   /** Human-readable summary with source-mapped file:line:col locations. */
@@ -460,7 +464,13 @@ export const checkLeaks = {
    */
   stop(): LeakReport {
     if (!_active) {
-      return { leaked: 0, details: [], summary: "No leaks detected." };
+      return {
+        leaked: 0,
+        userLeaked: 0,
+        internalLeaked: 0,
+        details: [],
+        summary: "No leaks detected.",
+      };
     }
 
     _leakTrackingEnabled = false;
@@ -487,7 +497,13 @@ export const checkLeaks = {
     if (leaked === 0) {
       _leakTrackingMap.clear();
       _lastRefMap.clear();
-      return { leaked: 0, details: [], summary: "No leaks detected." };
+      return {
+        leaked: 0,
+        userLeaked: 0,
+        internalLeaked: 0,
+        details: [],
+        summary: "No leaks detected.",
+      };
     }
 
     // ── Cold path: build leak report ──
@@ -610,7 +626,9 @@ export const checkLeaks = {
     lines.push("", ...tips);
 
     const summary = lines.join("\n");
-    return { leaked, details, summary };
+    const userLeaked = pkgCounts.get(null) ?? 0;
+    const internalLeaked = total - userLeaked;
+    return { leaked, userLeaked, internalLeaked, details, summary };
   },
 
   /** Whether leak tracking is currently active. */

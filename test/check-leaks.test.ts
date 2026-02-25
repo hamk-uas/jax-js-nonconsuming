@@ -23,6 +23,8 @@ describe("checkLeaks", () => {
     y.dispose();
     const report = checkLeaks.stop();
     expect(report.leaked).toBe(0);
+    expect(report.userLeaked).toBe(0);
+    expect(report.internalLeaked).toBe(0);
     expect(report.summary).toBe("No leaks detected.");
   });
 
@@ -32,6 +34,8 @@ describe("checkLeaks", () => {
     // deliberately do NOT dispose x
     const report = checkLeaks.stop();
     expect(report.leaked).toBe(1);
+    expect(report.userLeaked).toBe(1);
+    expect(report.internalLeaked).toBe(0);
     expect(report.details.length).toBeGreaterThanOrEqual(1);
     expect(report.summary).toContain("1 slot(s) leaked");
     // Clean up for next test
