@@ -2,6 +2,27 @@
 
 set -euo pipefail
 
+# --- AEP (Agentic Evolution Protocol) gate ---
+# Every commit must set AEP=1 to confirm the committer has reviewed the AEP
+# checklist: workaround hunt, test integrity, deprecated cleanup, ADR updates.
+# Usage: AEP=1 git commit -m "..."
+if [[ "${AEP:-}" != "1" ]]; then
+  echo ""
+  echo "╔══════════════════════════════════════════════════════════════╗"
+  echo "║  AEP GATE: Set AEP=1 to confirm you followed the protocol ║"
+  echo "║                                                            ║"
+  echo "║  Before committing, verify:                                ║"
+  echo "║    1. Workaround hunt — deleted obsolete helpers/polyfills ║"
+  echo "║    2. Test integrity — tests reflect the new reality       ║"
+  echo "║    3. Dead code cleanup — no deprecated paths left behind  ║"
+  echo "║    4. ADR updated — documented the 'why' for future agents ║"
+  echo "║                                                            ║"
+  echo "║  Then run: AEP=1 git commit -m \"your message\"              ║"
+  echo "╚══════════════════════════════════════════════════════════════╝"
+  echo ""
+  exit 1
+fi
+
 branch_name="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 
 if [[ -n "${JAX_PRECOMMIT_PROFILE:-}" ]]; then

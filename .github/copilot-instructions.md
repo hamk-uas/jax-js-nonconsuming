@@ -321,7 +321,7 @@ The repository supports two test policies:
 - **Architectural mode (opt-in):** failures are allowed only if listed in
   `.ci/expected-failures.json` with owner, reason, and expiry.
 
-Use `JAX_ARCH_MODE=1 git commit -m "..."` to run architectural mode from pre-commit. See
+Use `AEP=1 JAX_ARCH_MODE=1 git commit -m "..."` to run architectural mode from pre-commit. See
 `docs/testing-policy.md` for workflow and review guidance.
 
 ### Rebase to main
@@ -1875,21 +1875,30 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 
 **Before every commit**, AI agents MUST:
 
-1. Run pre-commit CI checks (see above)
-2. Ensure the **pre-commit hook** is installed (run `pnpm prepare` if needed). The repository will
+1. **AEP compliance gate**: All commits require `AEP=1` as an environment variable prefix (e.g.,
+   `AEP=1 git commit -m "..."`). The pre-commit hook will reject commits without it. Before setting
+   `AEP=1`, verify the AEP checklist:
+   - **Workaround hunt** — deleted obsolete helpers, polyfills, and workarounds replaced by your
+     changes
+   - **Test integrity** — tests reflect the new reality, not the old workarounds
+   - **Dead code cleanup** — no deprecated code paths, dead variables, or stale comments left behind
+   - **ADR updated** — documented the "why" in copilot-instructions.md or relevant docs for future
+     agents
+2. Run pre-commit CI checks (see above)
+3. Ensure the **pre-commit hook** is installed (run `pnpm prepare` if needed). The repository will
    run linting and the _full test suite_ automatically when you commit.
-3. Run the _full test suite_ locally (`pnpm vitest run`) after finishing code changes. Verify no NEW
+4. Run the _full test suite_ locally (`pnpm vitest run`) after finishing code changes. Verify no NEW
    failures beyond the known `KNOWN_BUG` tests (see
    [Known framework bugs](#known-framework-bugs-known_bug-tests)).
-4. Update documentation when adding new features or APIs
-5. Add/adjust tests exercising `.dispose()` for new behavior — add focused unit tests for any
+5. Update documentation when adding new features or APIs
+6. Add/adjust tests exercising `.dispose()` for new behavior — add focused unit tests for any
    bugfixes or edge cases
-6. Export new public symbols from `src/index.ts`
-7. Update `FEATURES.md` for user-visible changes
-8. If you **fix** a `KNOWN_BUG` test (it starts passing), celebrate — then remove the `KNOWN_BUG`
+7. Export new public symbols from `src/index.ts`
+8. Update `FEATURES.md` for user-visible changes
+9. If you **fix** a `KNOWN_BUG` test (it starts passing), celebrate — then remove the `KNOWN_BUG`
    tag and update the inventory in this file
-9. For **releases** (version bump + tag + push + GitHub release), follow the Maintainer Guide in
-   `README.md`
+10. For **releases** (version bump + tag + push + GitHub release), follow the Maintainer Guide in
+    `README.md`
 
 ## Documentation files
 
