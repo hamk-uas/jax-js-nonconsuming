@@ -33,6 +33,8 @@ When you modify our public API, your task is to provide a "Migration Bundle" tha
   create a new release version in GitHub, include these instructions in the version description.
   - _Example:_ "If the consumer has a local utility that manually merges X and Y because v1 didn't
     support it, delete that utility and use the new `nativeMerge` endpoint."
+- **Signal your compliance** If you were brought here by a failed command call, make sure you
+  actually have read and followed the protocol. Only then call the command again: `AEP=1 COMMAND`.
 
 ## 3. Consumer Mode: The Upgrade & Optimization Loop
 

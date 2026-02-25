@@ -3,21 +3,12 @@
 set -euo pipefail
 
 # --- AEP (Agentic Evolution Protocol) gate ---
-# Every commit must set AEP=1 to confirm the committer has reviewed the AEP
-# section in .github/copilot-instructions.md and followed the protocol.
-# Usage: AEP=1 git commit -m "..."
+# On every commit the committer must reviewed the AEP in order to commit.
+# DO NOT MISUSE! Read AEP first -- don't circumvent this check!
 if [[ "${AEP:-}" != "1" ]]; then
-  echo ""
-  echo "╔═══════════════════════════════════════════════════════════════╗"
-  echo "║  AEP GATE: commit rejected                                  ║"
-  echo "║                                                             ║"
-  echo "║  Read the Agentic Evolution Protocol (AEP) in               ║"
-  echo "║  .github/copilot-instructions.md, then follow it.           ║"
-  echo "║                                                             ║"
-  echo "║  Once you have, signal compliance:                          ║"
-  echo "║    AEP=1 git commit -m \"your message\"                       ║"
-  echo "╚═══════════════════════════════════════════════════════════════╝"
-  echo ""
+  echo "AEP GATE: commit rejected"
+  echo "Read the Agentic Evolution Protocol (AEP) in"
+  echo ".github/copilot-instructions.md, then follow it."
   exit 1
 fi
 
