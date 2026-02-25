@@ -12,8 +12,10 @@ import type {
   ResidualPack,
 } from "./frontend/artifacts";
 import {
+  type CacheSizes,
   checkLeaks,
   clearCaches,
+  getCacheSizes,
   type LeakReport,
   type SnapshotEntry,
 } from "./frontend/check-leaks";
@@ -51,6 +53,7 @@ export {
   type AotLinearizeOptions,
   type AotLinearizeResult,
   type BackendCapabilities,
+  type CacheSizes,
   type Dim,
   init,
   Array,
@@ -63,6 +66,7 @@ export {
   DType,
   type EffectVerificationResult,
   getBackend,
+  getCacheSizes,
   hasSymbolicDims,
   isSymbolicDim,
   Jaxpr,

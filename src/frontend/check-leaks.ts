@@ -67,6 +67,62 @@ export function _registerJitCacheDisposer(fn: () => void): void {
   _jitCacheDisposers.push(fn);
 }
 
+// ── Cache size getters ──
+// Each cache module registers a named size getter so `getCacheSizes()` can
+// report current cache occupancy without creating import cycles.
+const _cacheSizeGetters = new Map<string, () => number>();
+
+/** Register a named cache size getter. Called by jit.ts, jvp.ts, etc. */
+export function _registerCacheSizeGetter(
+  name: string,
+  getter: () => number,
+): void {
+  _cacheSizeGetters.set(name, getter);
+}
+
+/** Per-cache entry counts for diagnostics and testing. */
+export interface CacheSizes {
+  /** `jitCompileCache` — compiled JitPrograms keyed by jaxpr signature. */
+  jitCompile: number;
+  /** `jvpJaxprCache` — forward-mode differentiated body jaxprs. */
+  jvpJaxpr: number;
+  /** `transposeJaxprCache` — transposed body jaxprs (total entries across all inner maps). */
+  transposeJaxpr: number;
+  /** `vmapJaxprCache` — vectorized body jaxprs (total entries across all inner maps). */
+  vmapJaxpr: number;
+  /** Number of registered jit function disposers (≈ unique jit wrappers created). */
+  jitFunctions: number;
+}
+
+/**
+ * Return current cache sizes for all JIT-related caches.
+ *
+ * Useful for testing that caches grow and shrink as expected, and for
+ * verifying deduplication behaviour (e.g., calling `jit(fn)` twice with
+ * the same function reference should not increase `jitFunctions`).
+ *
+ * @example
+ * ```ts
+ * import { getCacheSizes, clearCaches } from "@hamk-uas/jax-js-nonconsuming";
+ *
+ * const before = getCacheSizes();
+ * // ... run some jit-compiled code ...
+ * const after = getCacheSizes();
+ * console.log("new JIT entries:", after.jitCompile - before.jitCompile);
+ * clearCaches();
+ * console.log("after clear:", getCacheSizes().jitCompile); // 0
+ * ```
+ */
+export function getCacheSizes(): CacheSizes {
+  return {
+    jitCompile: _cacheSizeGetters.get("jitCompile")?.() ?? 0,
+    jvpJaxpr: _cacheSizeGetters.get("jvpJaxpr")?.() ?? 0,
+    transposeJaxpr: _cacheSizeGetters.get("transposeJaxpr")?.() ?? 0,
+    vmapJaxpr: _cacheSizeGetters.get("vmapJaxpr")?.() ?? 0,
+    jitFunctions: _jitFunctionDisposers.size,
+  };
+}
+
 /**
  * Per-function jit() cache disposers. Each jit() call registers a callback
  * that disposes its ClosedJaxpr consts and clears its cache. This allows

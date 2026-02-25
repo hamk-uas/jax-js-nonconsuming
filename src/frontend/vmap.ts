@@ -37,7 +37,10 @@ import {
   flatten as treeFlatten,
   unflatten as treeUnflatten,
 } from "../tree";
-import { _registerJitCacheDisposer } from "./check-leaks";
+import {
+  _registerCacheSizeGetter,
+  _registerJitCacheDisposer,
+} from "./check-leaks";
 import { ClosedJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
 import { jvp } from "./jvp";
 
@@ -765,6 +768,11 @@ _registerJitCacheDisposer(() => {
     inner.clear();
   }
   vmapJaxprCache.clear();
+});
+_registerCacheSizeGetter("vmapJaxpr", () => {
+  let total = 0;
+  for (const inner of vmapJaxprCache.values()) total += inner.size;
+  return total;
 });
 
 function vmapJaxpr(

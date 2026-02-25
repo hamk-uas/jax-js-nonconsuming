@@ -30,7 +30,10 @@ import {
   zeros,
 } from "./array";
 import { aotLinearize } from "./artifacts";
-import { _registerJitCacheDisposer } from "./check-leaks";
+import {
+  _registerCacheSizeGetter,
+  _registerJitCacheDisposer,
+} from "./check-leaks";
 import {
   _peArrayCreationTracker,
   _setPACT,
@@ -2415,6 +2418,11 @@ _registerJitCacheDisposer(() => {
     }
   }
   transposeJaxprCache.clear();
+});
+_registerCacheSizeGetter("transposeJaxpr", () => {
+  let total = 0;
+  for (const inner of transposeJaxprCache.values()) total += inner.size;
+  return total;
 });
 
 function transposeJaxpr(jaxpr: Jaxpr, undefPrimals: boolean[]): ClosedJaxpr {

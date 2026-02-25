@@ -17,7 +17,10 @@ import {
   triu,
   zerosLike,
 } from "./array";
-import { _registerJitCacheDisposer } from "./check-leaks";
+import {
+  _registerCacheSizeGetter,
+  _registerJitCacheDisposer,
+} from "./check-leaks";
 import {
   _peArrayCreationTracker,
   AbstractValue,
@@ -888,6 +891,7 @@ _registerJitCacheDisposer(() => {
   }
   jvpJaxprCache.clear();
 });
+_registerCacheSizeGetter("jvpJaxpr", () => jvpJaxprCache.size);
 
 function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
   if (jvpJaxprCache.has(jaxpr)) {

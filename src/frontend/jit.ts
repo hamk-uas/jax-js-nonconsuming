@@ -46,7 +46,10 @@ import {
   rep,
 } from "../utils";
 import { aluCompare, Array as JaxArray, PendingExecute } from "./array";
-import { _registerJitCacheDisposer } from "./check-leaks";
+import {
+  _registerCacheSizeGetter,
+  _registerJitCacheDisposer,
+} from "./check-leaks";
 import { pool, poolTranspose, prepareConv } from "./convolution";
 import {
   _associativeScanCoreImpl,
@@ -983,6 +986,7 @@ export function _clearJitCompileCache(): void {
 
 // Register with jaxpr.ts so checkLeaks.stop() can flush this cache.
 _registerJitCacheDisposer(_clearJitCompileCache);
+_registerCacheSizeGetter("jitCompile", () => jitCompileCache.size);
 
 /**
  * Module-level dim bindings for jitRules to use when resolving symbolic shapes
