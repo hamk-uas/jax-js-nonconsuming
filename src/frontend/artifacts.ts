@@ -174,13 +174,12 @@ class PullbackArtifactImpl implements PullbackArtifact {
     // residualValues are the forward-pass concrete intermediate arrays.
     // cotangentValues are the gradient seeds from the caller.
     //
-    // All inputs are .ref'd because evalJaxpr disposes every input at its
-    // last use within the jaxpr.  Without .ref the caller's arrays would
-    // be freed, breaking both residual reuse and caller expectations.
+    // evalJaxpr is non-consuming: inputs stay alive, owned by their
+    // respective owners (backwardJaxpr, residuals, caller).
     return evalJaxpr(this.#backwardJaxpr.jaxpr, [
-      ...this.#backwardJaxpr.consts.map((c) => c.ref),
-      ...residuals.arrays.map((a) => a.ref),
-      ...cotangents.map((c) => c.ref),
+      ...this.#backwardJaxpr.consts,
+      ...residuals.arrays,
+      ...cotangents,
     ]);
   }
 

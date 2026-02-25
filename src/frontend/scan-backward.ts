@@ -110,22 +110,18 @@ export class ScanPullbackArtifact {
       xSlices.push(reshaped);
     }
 
-    const forwardInputs = [
-      ...this.constResiduals.map((c) => c.ref),
-      ...carry.map((c) => c.ref),
-      ...xSlices,
-    ];
+    // evalJaxpr is non-consuming — inputs stay alive.
+    const forwardInputs = [...this.constResiduals, ...carry, ...xSlices];
     const forwardOuts = evalJaxpr(primalForwardJaxpr.jaxpr, [
-      ...primalForwardJaxpr.consts.map((c) => c.ref),
+      ...primalForwardJaxpr.consts,
       ...forwardInputs,
     ]);
     const newCarry = forwardOuts.slice(0, numPrimalCarry);
     for (let i = numPrimalCarry; i < forwardOuts.length; i++) {
       forwardOuts[i].dispose();
     }
-    for (const x of xSlices) {
-      if (x.refCount > 0) x.dispose();
-    }
+    // Dispose temporaries (evalJaxpr doesn't consume them).
+    for (const x of xSlices) x.dispose();
     return newCarry;
   }
 
@@ -191,19 +187,23 @@ export class ScanPullbackArtifact {
 
     // Build cotangents for tangentBody outputs
     const bodyOutCotangents: Tracer[] = [];
-    bodyOutCotangents.push(...ctCarryRunning.map((c) => c.ref));
+    bodyOutCotangents.push(...ctCarryRunning);
     bodyOutCotangents.push(...ctYSlices);
 
-    // Run transposed body
+    // Run transposed body (evalJaxpr is non-consuming).
     const transposedInputs = [
-      ...transposedBody.consts.map((c) => c.ref),
-      ...this.constResiduals.map((c) => c.ref),
-      ...primalCarry.map((c) => c.ref),
+      ...transposedBody.consts,
+      ...this.constResiduals,
+      ...primalCarry,
       ...xSlices,
       ...bodyOutCotangents,
     ];
 
     const transposedOuts = evalJaxpr(transposedBody.jaxpr, transposedInputs);
+
+    // Dispose temporaries (evalJaxpr doesn't consume them).
+    for (const x of xSlices) x.dispose();
+    for (const c of ctYSlices) c.dispose();
 
     // Extract cotangents
     let outIdx = 0;

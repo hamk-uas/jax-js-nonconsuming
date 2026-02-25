@@ -840,10 +840,10 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
         // inputs ([N-stride, ...]). evalJaxpr inlines the equations into the
         // wrapper jaxpr, preserving shape-polymorphic evaluation.
         //
-        // Protect jvpBody.consts with .ref so evalJaxpr's auto-disposal
-        // decrements but doesn't free them (they're cache-owned via jvpJaxprCache).
+        // evalJaxpr is non-consuming — consts stay alive (cache-owned via
+        // jvpJaxprCache), no .ref needed.
         const jvpOutputs = evalJaxpr(jvpBody.jaxpr, [
-          ...jvpBody.consts.map((c) => (c as Tracer).ref), // jax-js-lint: allow-ref
+          ...jvpBody.consts,
           ...jvpOrderArgs,
         ]);
 

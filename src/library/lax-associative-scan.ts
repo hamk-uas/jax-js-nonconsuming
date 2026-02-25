@@ -425,11 +425,8 @@ function associativeScanFromJaxpr(
   const fn = (aLeaves: Array[], bLeaves: Array[]): Array[] => {
     // Vectorize the element-level body jaxpr over axis 0 (batch dim).
     const inner = (...args: Array[]): Array[] => {
-      const bodyArgs = [
-        ...consts.map((c) => c.ref), // jax-js-lint: allow-ref
-        ...args.map((a) => a.ref), // jax-js-lint: allow-ref
-      ];
-      return evalJaxpr(bodyJaxpr, bodyArgs) as Array[];
+      // evalJaxpr is non-consuming — consts and args stay alive.
+      return evalJaxpr(bodyJaxpr, [...consts, ...args]) as Array[];
     };
     const allArgs = [...aLeaves, ...bLeaves];
     const vmapped = vmap(inner, inAxes);

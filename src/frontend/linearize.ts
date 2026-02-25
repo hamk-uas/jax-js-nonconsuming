@@ -91,7 +91,7 @@ import { jvp, lowerAux } from "./jvp";
 import { ScanBackwardSpec, ScanPullbackArtifact } from "./scan-backward";
 import { jacfwd, moveaxis, vmap } from "./vmap";
 
-/** Internal zeros allocation that bypasses markAnonymousIfTracing. */
+/** Internal zeros allocation (marking handled by fullInternal). */
 const zerosInternal = (shape: Dim[] | number[], dtype: DType) =>
   fullInternal({ shape, dtype, weakType: false }, 0);
 
@@ -396,12 +396,10 @@ function linearizeFlat(
   const { primalsOut, residuals } = primal.run(primalsIn);
 
   // fLin evaluates the forward jaxpr with tangent inputs (same as before).
+  // evalJaxpr is non-consuming — consts stay alive, owned by forwardJaxpr.
   const forwardJaxpr = primal.forwardJaxpr;
   const fLin = (...tangents: Tracer[]) =>
-    evalJaxpr(forwardJaxpr.jaxpr, [
-      ...forwardJaxpr.consts.map((c) => c.ref),
-      ...tangents,
-    ]);
+    evalJaxpr(forwardJaxpr.jaxpr, [...forwardJaxpr.consts, ...tangents]);
 
   // Dispose residuals + primal artifact (which owns the forward jaxpr).
   const dispose = () => {
@@ -455,10 +453,13 @@ export function linearize(
     if (!inTree.equals(inTree2)) {
       throw new TreeMismatchError("linearize", inTree, inTree2);
     }
-    // pureArray wrappers for tangents are consumed by evalJaxpr inside
-    // fLinFlat (evalJaxpr auto-disposes input args at last use), so no
-    // explicit disposal is needed here.
-    const tangentsOutFlat = fLinFlat(...tangentsInFlat.map(pureArray));
+    // Wrap tangents as Arrays. evalJaxpr is non-consuming, so we must
+    // dispose the wrappers afterward. Pass-through outputs (where the
+    // wrapper IS the output) are protected by evalJaxpr's .ref on
+    // pass-through results.
+    const tangentWrappers = tangentsInFlat.map(pureArray);
+    const tangentsOutFlat = fLinFlat(...tangentWrappers);
+    for (const w of tangentWrappers) w.dispose();
     return treeUnflatten(outTree.value!, tangentsOutFlat);
   }) as OwnedFunction<(...tangents: any[]) => any>;
   fLin.dispose = dispose;
@@ -1985,7 +1986,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
             const aval = jaxpr.inBinders[i].aval;
             fullInputs.push(zerosInternal(aval.shape, aval.dtype));
           } else {
-            fullInputs.push(primalInputs[primalIdx++].ref);
+            fullInputs.push(primalInputs[primalIdx++]);
           }
         }
         const outs = evalJaxpr(jaxpr, fullInputs);
@@ -2029,9 +2030,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         let tangentIdx = 0;
         for (let i = 0; i < jaxpr.inBinders.length; i++) {
           if (bodyUndefPrimals[i]) {
-            fullInputs.push(tangentInputs[tangentIdx++].ref);
+            fullInputs.push(tangentInputs[tangentIdx++]);
           } else {
-            fullInputs.push(primalResiduals[primalIdx++].ref);
+            fullInputs.push(primalResiduals[primalIdx++]);
           }
         }
 
@@ -2167,41 +2168,43 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       return r;
     };
 
-    // Primal-only evaluation of body
+    // Primal-only evaluation of body (evalJaxpr is non-consuming).
     const evalPrimalBody = (aLeaves: Tracer[], bLeaves: Tracer[]): Tracer[] => {
       const bodyArgs: Tracer[] = [];
+      const disposables: Tracer[] = []; // temporary zeros to dispose after eval
       let cri = 0;
       for (let i = 0; i < numConsts; i++) {
         if (bodyUndefPrimals[i]) {
-          bodyArgs.push(
-            zerosInternal(
-              bodyJaxpr.inBinders[i].aval.shape,
-              bodyJaxpr.inBinders[i].aval.dtype,
-            ),
+          const z = zerosInternal(
+            bodyJaxpr.inBinders[i].aval.shape,
+            bodyJaxpr.inBinders[i].aval.dtype,
           );
+          bodyArgs.push(z);
+          disposables.push(z);
         } else {
-          bodyArgs.push(constResiduals[cri++].ref);
+          bodyArgs.push(constResiduals[cri++]);
         }
       }
-      for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(aLeaves[i].ref);
+      for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(aLeaves[i]);
       for (let i = numOrigLeaves; i < numLeaves; i++) {
-        bodyArgs.push(
-          zerosInternal(
-            bodyJaxpr.inBinders[numConsts + i].aval.shape,
-            bodyJaxpr.inBinders[numConsts + i].aval.dtype,
-          ),
+        const z = zerosInternal(
+          bodyJaxpr.inBinders[numConsts + i].aval.shape,
+          bodyJaxpr.inBinders[numConsts + i].aval.dtype,
         );
+        bodyArgs.push(z);
+        disposables.push(z);
       }
-      for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(bLeaves[i].ref);
+      for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(bLeaves[i]);
       for (let i = numOrigLeaves; i < numLeaves; i++) {
-        bodyArgs.push(
-          zerosInternal(
-            bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.shape,
-            bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.dtype,
-          ),
+        const z = zerosInternal(
+          bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.shape,
+          bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.dtype,
         );
+        bodyArgs.push(z);
+        disposables.push(z);
       }
       const outs = evalJaxpr(bodyJaxpr, bodyArgs);
+      for (const d of disposables) d.dispose();
       const pOuts = outs.slice(0, numOrigLeaves);
       for (let i = numOrigLeaves; i < outs.length; i++) outs[i].dispose();
       return pOuts;
@@ -2260,19 +2263,21 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       const yPrev = allYP[i - 1];
 
       // Build transposed body inputs: [consts, residuals, cotangents]
-      const tbInputs = [
-        ...transposedBody.consts.map((c) => c.ref),
-        ...constResiduals.map((c) => c.ref),
-      ];
-      for (const y of yPrev) tbInputs.push(y.ref);
-      for (const x of xPi) tbInputs.push(x.ref);
+      // evalJaxpr is non-consuming — no .ref needed.
+      const tbInputs: Tracer[] = [...transposedBody.consts, ...constResiduals];
+      const tbDisposables: Tracer[] = []; // temporary zeros
+      for (const y of yPrev) tbInputs.push(y);
+      for (const x of xPi) tbInputs.push(x);
       // Cotangents for body outputs: zero for primal, ctEff for tangent
       for (let j = 0; j < numOrigLeaves; j++) {
-        tbInputs.push(zerosInternal(allYP[0][j].shape, allYP[0][j].dtype));
+        const z = zerosInternal(allYP[0][j].shape, allYP[0][j].dtype);
+        tbInputs.push(z);
+        tbDisposables.push(z);
       }
-      for (const c of ctEff) tbInputs.push(c.ref);
+      for (const c of ctEff) tbInputs.push(c);
 
       const tbOuts = evalJaxpr(transposedBody.jaxpr, tbInputs);
+      for (const d of tbDisposables) d.dispose();
 
       // Extract: [ct_constT, ct_aT, ct_bT]
       // IMPORTANT: transposed body may return aliased outputs (e.g., add's

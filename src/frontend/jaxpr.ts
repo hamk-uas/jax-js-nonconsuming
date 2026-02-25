@@ -771,7 +771,15 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
     if (x instanceof Var) outputVars.add(x);
   }
 
+  // Input variables (consts + args) — don't dispose at last use.
+  // Non-consuming model: caller owns the inputs.  Only intermediates
+  // (equation outputs) are auto-disposed by evalJaxpr.
+  const inputVars = new Set<Var>(jaxpr.inBinders);
+
   const remainingRefs = new Map<Var, number>();
+
+  // Track arrays created from Lit values for disposal (they have no owning Var).
+  const litArrays: Tracer[] = [];
 
   const read = (x: Atom) => {
     if (x instanceof Var) {
@@ -784,6 +792,7 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
       // from getOrMakeConstTracer is never balanced, leaking the backend Slot.
       const arr = array(x.value, { dtype: x.dtype });
       if (arr instanceof Array) anonymousConstArrays.add(arr);
+      litArrays.push(arr);
       return arr;
     }
   };
@@ -791,7 +800,7 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
   const write = (v: Var, val: Tracer) => {
     if (env.has(v)) throw new Error(`Variable already bound: ${v}`);
     const refCount = usageCount.get(v) ?? 0;
-    if (refCount) {
+    if (refCount || inputVars.has(v)) {
       env.set(v, val);
       remainingRefs.set(v, refCount);
     } else {
@@ -799,12 +808,12 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
     }
   };
 
-  // Decrement remaining count for a variable; dispose if last use and not output.
+  // Decrement remaining count for a variable; dispose if last use and not output/input.
   const consumeRead = (x: Atom) => {
     if (x instanceof Var) {
       const left = remainingRefs.get(x)!;
       remainingRefs.set(x, left - 1);
-      if (left === 1 && !outputVars.has(x)) {
+      if (left === 1 && !outputVars.has(x) && !inputVars.has(x)) {
         env.get(x)?.dispose();
         env.delete(x);
       }
@@ -820,12 +829,27 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
       // Dispose variables after their last use in equations.
       for (const x of eqn.inputs) consumeRead(x);
     }
-    return jaxpr.outs.map(read);
-  } catch (error) {
-    // Clean up any remaining references on error, to avoid leaking memory.
-    for (const val of env.values()) {
-      val.dispose();
+    const results = jaxpr.outs.map(read);
+    // .ref pass-through outputs (outputs that ARE input arrays).
+    // Without this, when callers dispose their inputs after evalJaxpr,
+    // they'd also kill the output — since it's the same Array object.
+    const inputSet = new Set<Tracer>(args);
+    for (const r of results) {
+      if (inputSet.has(r)) r.ref; // jax-js-lint: allow-ref
     }
+    // Dispose Lit-created arrays that aren't in the output.
+    const resultSet = new Set(results);
+    for (const a of litArrays) {
+      if (!resultSet.has(a)) a.dispose();
+    }
+    return results;
+  } catch (error) {
+    // Clean up any remaining intermediates on error, to avoid leaking memory.
+    // Skip input vars — caller owns those.
+    for (const [v, val] of env.entries()) {
+      if (!inputVars.has(v)) val.dispose();
+    }
+    for (const a of litArrays) a.dispose();
     throw error;
   }
 }
@@ -835,12 +859,54 @@ export function jaxprAsFun(jaxpr: Jaxpr): (...args: Tracer[]) => Tracer[] {
   return (...args: Tracer[]) => evalJaxpr(jaxpr, args);
 }
 
+/**
+ * Queue of anonymous consts whose phantom creation ref needs balancing, but
+ * whose disposal was deferred because a makeJaxpr body was still active.
+ * Processed when the outermost makeJaxpr body completes — by that time,
+ * any outer builder that will capture the const has already done .ref,
+ * making refCount > 1 and safely skipping the extra dispose.
+ */
+const _deferredAnonymousDisposes: Array[] = [];
+
+/** Fire or defer the anonymous extra dispose for a const. */
+function _anonymousExtraDispose(c: Array): void {
+  if (inMakeJaxprBody()) {
+    _deferredAnonymousDisposes.push(c);
+  } else if (anonymousConstArrays.has(c) && c.refCount === 1) {
+    anonymousConstArrays.delete(c);
+    c.dispose();
+  }
+}
+
+/** Process all deferred anonymous disposals. Called when outermost makeJaxpr body completes. */
+function _processDeferredAnonymousDisposes(): void {
+  while (_deferredAnonymousDisposes.length > 0) {
+    const c = _deferredAnonymousDisposes.pop()!;
+    if (anonymousConstArrays.has(c) && c.refCount === 1) {
+      anonymousConstArrays.delete(c);
+      c.dispose();
+    }
+  }
+}
+
 /** Jaxpr with a collection of associated, traced constants. */
 export class ClosedJaxpr {
+  /**
+   * Anonymous scalar consts that _inlineLiterals removed from the consts list
+   * (inlined as Lit nodes) but whose phantom creation ref still needs balancing.
+   * Disposal is deferred here so that during nested makeJaxpr, the const
+   * remains alive until its ClosedJaxpr is disposed — giving outer builders a
+   * chance to capture it with their own .ref.
+   */
+  readonly #inlinedAnonymousConsts: Array[];
+
   constructor(
     readonly jaxpr: Jaxpr,
     readonly consts: Tracer[],
-  ) {}
+    inlinedAnonymousConsts?: Array[],
+  ) {
+    this.#inlinedAnonymousConsts = inlinedAnonymousConsts ?? [];
+  }
 
   /** String representation of this Jaxpr. */
   toString(): string {
@@ -849,7 +915,11 @@ export class ClosedJaxpr {
 
   /** Apply a function to the underlying Jaxpr. */
   mapJaxpr(f: (jaxpr: Jaxpr) => Jaxpr): ClosedJaxpr {
-    return new ClosedJaxpr(f(this.jaxpr), this.consts);
+    return new ClosedJaxpr(
+      f(this.jaxpr),
+      this.consts,
+      this.#inlinedAnonymousConsts,
+    );
   }
 
   /** Dispose of the constants in this Jaxpr. */
@@ -857,10 +927,24 @@ export class ClosedJaxpr {
     for (const c of this.consts) {
       c.dispose();
       // Anonymous consts (inline np.array() inside jit/scan body) have an extra
-      // ref from creation that no external owner will balance.  If the const is
-      // still alive after the .ref-undo above, free the original allocation.
-      if (c instanceof Array && anonymousConstArrays.has(c) && c.refCount > 0) {
-        c.dispose();
+      // ref from creation that no external owner will balance.  After the
+      // .ref-undo above, refCount===1 means only the phantom creation ref
+      // remains.  Fire or defer the extra dispose depending on whether we're
+      // still inside a makeJaxpr body (outer builder might capture it later).
+      if (
+        c instanceof Array &&
+        anonymousConstArrays.has(c) &&
+        c.refCount >= 1
+      ) {
+        _anonymousExtraDispose(c);
+      }
+    }
+    // Inlined anonymous consts were already .dispose()'d by _inlineLiterals
+    // (undoing the .ref from getOrMakeConstTracer).  Fire or defer the phantom
+    // creation ref.
+    for (const c of this.#inlinedAnonymousConsts) {
+      if (anonymousConstArrays.has(c) && c.refCount >= 1) {
+        _anonymousExtraDispose(c);
       }
     }
   }
@@ -914,22 +998,21 @@ class JaxprTrace extends Trace {
 
   /** Register a constant / literal in this Jaxpr. */
   getOrMakeConstTracer(val: TracerValue): JaxprTracer {
-    // If val is a raw value (number/boolean), pureArray creates a fresh Array that
-    // nobody else references — the builder becomes the sole owner (no .ref needed).
-    let ownedByBuilder = false;
+    // If val is a raw value (number/boolean), pureArray creates a fresh Array
+    // that nobody else references.
     if (!(val instanceof Tracer)) {
       val = pureArray(val);
-      ownedByBuilder = true;
     }
     let tracer = this.builder.constTracers.get(val);
     if (tracer === undefined) {
       tracer = this.builder.newTracer(this, ShapedArray.fromAval(getAval(val)));
-      if (!ownedByBuilder) {
-        // Take a ref so ClosedJaxpr owns the const independently of the caller.
-        // This protects the const from PETracer cascade in linearize transforms.
-        // jax-js-lint: allow-ref
-        val.ref;
-      }
+      // Always .ref so ClosedJaxpr owns the const independently.  For pureArray
+      // consts this means rc=2 (creation + ref); the anonymous extra in
+      // ClosedJaxpr.dispose() fires when refCount===1 to balance the phantom
+      // creation ref.  Uniform ref-counting lets the refCount===1 check work
+      // correctly even when the same const is shared across multiple builders.
+      // jax-js-lint: allow-ref
+      val.ref;
       this.builder.addConst(tracer, val);
     } else {
       tracer.trackLiftedConstant();
@@ -1034,21 +1117,22 @@ function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
   const literals = new Map<Atom, Lit>();
   const constBinders: Var[] = [];
   const newConsts: Tracer[] = [];
+  const inlinedAnonymous: Array[] = [];
 
   for (let i = 0; i < consts.length; i++) {
     if (ndim(consts[i]) === 0 && consts[i] instanceof Array) {
       const ar = consts[i] as Array;
       literals.set(jaxpr.inBinders[i], new Lit(ar.aval, ar.dataSync()[0]));
+      // Defer anonymous const disposal to ClosedJaxpr.dispose().  During nested
+      // makeJaxpr, an outer builder may capture the same const later — if we
+      // fired the anonymous extra here, the const would be freed too early.
+      const isAnonymous = anonymousConstArrays.has(ar);
       // Release this const — it was inlined as a Lit and is no longer needed.
       // For user-held consts this undoes the .ref from getOrMakeConstTracer
-      // (leaving the user's reference). For builder-owned consts (pureArray)
-      // this frees the sole reference.
+      // (leaving the user's reference).
       ar.dispose();
-      // Anonymous consts (inline np.array() inside jit/scan body) have an
-      // extra ref from creation that no external owner will balance.
-      // eslint-disable-next-line jax-js/no-use-after-dispose -- intentional: ar may still have rc>0
-      if (anonymousConstArrays.has(ar) && ar.refCount > 0) {
-        ar.dispose();
+      if (isAnonymous) {
+        inlinedAnonymous.push(ar); // eslint-disable-line jax-js/no-use-after-dispose -- track identity for deferred disposal
       }
     } else {
       constBinders.push(jaxpr.inBinders[i]);
@@ -1071,7 +1155,7 @@ function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
     newOuts,
   );
   typecheckJaxpr(newJaxpr); // Double-check for sanity.
-  return new ClosedJaxpr(newJaxpr, newConsts);
+  return new ClosedJaxpr(newJaxpr, newConsts, inlinedAnonymous);
 }
 
 type AbstractEvalRule<P extends Primitive> = (
@@ -1536,6 +1620,14 @@ export function makeJaxpr(
     );
 
     const jaxpr = builder.build(tracersIn, tracersOut);
+
+    // Process deferred anonymous disposals when leaving all makeJaxpr bodies.
+    // Inner CJ disposals during the body deferred their anonymous extras;
+    // by now the outer builder has captured any consts it needs (.ref'd them),
+    // so consts with refCount===1 can be safely freed.
+    if (!inMakeJaxprBody()) {
+      _processDeferredAnonymousDisposes();
+    }
 
     if (outTree.value === undefined) {
       throw new Error("outTree was not set in makeJaxpr");

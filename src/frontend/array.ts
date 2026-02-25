@@ -197,7 +197,6 @@ export class Array extends Tracer {
   #backend: Backend;
   #committed: boolean; // if array is committed to device (passed explicitly)
   #rc: number; // reference count for this specific Array object
-
   #pendingSet: Set<PendingExecute> | null; // only if source is `Slot`
 
   /**
@@ -1922,16 +1921,23 @@ export function fullInternal(
   fillValue: number | boolean,
   device?: Device,
 ) {
-  // Called by library internals (zerosLike, onesLike) during tracing;
-  // marking these would cause use-after-free. jax-js-lint: allow-unmarked
-  return new Array({
-    source: AluExp.const(aval.dtype, fillValue),
-    st: ShapeTracker.fromShape(aval.shape as number[]),
-    dtype: aval.dtype,
-    weakType: aval.weakType,
-    backend: getBackend(device),
-    committed: device != undefined,
-  });
+  // Mark anonymous so ClosedJaxpr.dispose() can balance the extra .ref from
+  // getOrMakeConstTracer.  Safe because:
+  //  1. All evalJaxpr call sites .ref consts → evalJaxpr never directly
+  //     disposes ClosedJaxpr.consts.
+  //  2. ClosedJaxpr.dispose() guards the anonymous extra with refCount > 0
+  //     → no UAF when the const was already freed.
+  //  3. !inMakeJaxprBody() guard defers the extra to the outermost level.
+  return markAnonymousIfTracing(
+    new Array({
+      source: AluExp.const(aval.dtype, fillValue),
+      st: ShapeTracker.fromShape(aval.shape as number[]),
+      dtype: aval.dtype,
+      weakType: aval.weakType,
+      backend: getBackend(device),
+      committed: device != undefined,
+    }),
+  );
 }
 
 export function zerosLike(val: TracerValue, opts?: DTypeShapeAndDevice): Array {
