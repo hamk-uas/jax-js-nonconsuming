@@ -137,6 +137,39 @@ export default defineConfig([
       "jax-js/require-mark-anonymous": "error",
     },
   },
+  // Internal framework code must not import zeros()/ones() — they call
+  // markAnonymousIfTracing() which causes over-disposal when called during
+  // tracing (e.g. linearize.ts creating tangent zeros). Use fullInternal()
+  // or a local zerosInternal() helper instead.
+  {
+    files: [
+      "src/frontend/**/*.ts",
+      "src/library/**/*.ts",
+      "src/backend/**/*.ts",
+    ],
+    ignores: ["**/*.test.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            {
+              name: "./array",
+              importNames: ["zeros", "ones"],
+              message:
+                "Use fullInternal() instead. zeros()/ones() call markAnonymousIfTracing() which causes over-disposal when called during tracing.",
+            },
+            {
+              name: "../frontend/array",
+              importNames: ["zeros", "ones"],
+              message:
+                "Use fullInternal() instead. zeros()/ones() call markAnonymousIfTracing() which causes over-disposal when called during tracing.",
+            },
+          ],
+        },
+      ],
+    },
+  },
   {
     files: ["test/**/*.{js,mjs,cjs,ts}"],
     ...(jaxJsPlugin.configs!.invariance as any),

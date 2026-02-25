@@ -306,9 +306,20 @@ export class Array extends Tracer {
    * We detect PE scope via _peArrayCreationTracker (non-null when inside PE).
    * JVP-only traces (no PE) still dispose normally — those intermediates have
    * real Slots that need cleanup.
+   *
+   * During makeJaxpr body tracing (e.g., scan body within jit), anonymous-const-
+   * marked Arrays (from np.eye, np.zeros, etc.) may be captured as ClosedJaxpr
+   * constants via getOrMakeConstTracer. Their lifecycle is managed by
+   * ClosedJaxpr.dispose()'s anonymous extra dispose. If `using` also fires
+   * during tracing, it reduces the refcount below what ClosedJaxpr.dispose()
+   * expects, causing UseAfterFreeError when nested ClosedJaxprs (scan body +
+   * outer jit) both try to dispose the same const. Non-anonymous arrays
+   * (e.g., JVP tangent zeros from fullInternal) must still be disposable.
    */
   [Symbol.dispose]() {
-    if (!_peArrayCreationTracker && this.#rc > 0) this.dispose();
+    if (_peArrayCreationTracker) return;
+    if (inMakeJaxprBody() && anonymousConstArrays.has(this)) return;
+    if (this.#rc > 0) this.dispose();
   }
 
   /** Get the pending executes as a list, trimming if already submitted. */
@@ -1171,7 +1182,10 @@ export class Array extends Tracer {
         const genShape = shape.slice(keyShape.length);
         // Arrays of size >2^32 won't fit into browser memory anyway, so it's
         // okay to take lazy iota this way for counters.
-        using c0 = zeros(genShape, { dtype: DType.Uint32, device: k0.device });
+        using c0 = full(genShape, 0, {
+          dtype: DType.Uint32,
+          device: k0.device,
+        });
         using c1 = arange(0, prod(genShape), 1, {
           dtype: DType.Uint32,
           device: k0.device,
@@ -1949,12 +1963,12 @@ export function fullLike(
 
 /** Return a new array of given shape and type, filled with zeros. */
 export function zeros(shape: number[], opts?: DTypeAndDevice): Array {
-  return full(shape, 0, opts);
+  return markAnonymousIfTracing(full(shape, 0, opts));
 }
 
 /** Return a new array of given shape and type, filled with ones. */
 export function ones(shape: number[], opts?: DTypeAndDevice): Array {
-  return full(shape, 1, opts);
+  return markAnonymousIfTracing(full(shape, 1, opts));
 }
 
 /** Return a new array of given shape and type, filled with `fill_value`. */
@@ -1976,6 +1990,10 @@ export function full(
   } else {
     throw new TypeError(`Invalid type for full: ${fillValue}`);
   }
+  // full() is NOT wrapped in markAnonymousIfTracing: it may be called by
+  // library internals during tracing (transitively via other APIs).  The
+  // user-facing wrappers zeros() and ones() apply the marking instead.
+  // jax-js-lint: allow-unmarked
   return fullInternal(
     new ShapedArray(shape, dtype, weakType),
     fillValue,

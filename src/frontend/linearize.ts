@@ -1,8 +1,8 @@
 /** @file Implementations of vjp() and partial evaluation. */
 // jax-js-lint: allow-ref — .ref is the core ownership mechanism in autodiff internals
 
-import { AluOp, isFloatDtype } from "../alu";
-import { concreteDim } from "../dim";
+import { AluOp, type DType, isFloatDtype } from "../alu";
+import { concreteDim, type Dim } from "../dim";
 import {
   dispose as treeDispose,
   flatten as treeFlatten,
@@ -24,10 +24,10 @@ import {
   anonymousConstArrays,
   array,
   eye,
+  fullInternal,
   Array as JaxArray,
   onesLike,
   pureArray,
-  zeros,
 } from "./array";
 import { aotLinearize } from "./artifacts";
 import {
@@ -90,6 +90,10 @@ import {
 import { jvp, lowerAux } from "./jvp";
 import { ScanBackwardSpec, ScanPullbackArtifact } from "./scan-backward";
 import { jacfwd, moveaxis, vmap } from "./vmap";
+
+/** Internal zeros allocation that bypasses markAnonymousIfTracing. */
+const zerosInternal = (shape: Dim[] | number[], dtype: DType) =>
+  fullInternal({ shape, dtype, weakType: false }, 0);
 
 /** Array value that can either be known or unknown. */
 class PartialVal {
@@ -809,9 +813,7 @@ class PartialEvalTrace extends Trace {
       if (t.pval.isKnown) {
         return (t.pval.val as Tracer).ref;
       } else {
-        const z = zeros(t.pval.aval.shape as number[], {
-          dtype: t.pval.aval.dtype,
-        });
+        const z = zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
         synthesizedZeroInputs.push(z);
         return z;
       }
@@ -952,9 +954,7 @@ class PartialEvalTrace extends Trace {
       if (t.pval.isKnown) {
         return (t.pval.val as Tracer).ref;
       } else {
-        const z = zeros(t.pval.aval.shape as number[], {
-          dtype: t.pval.aval.dtype,
-        });
+        const z = zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
         synthesizedZeroInputs.push(z);
         return z;
       }
@@ -1298,7 +1298,7 @@ function evalJaxprTransposed(
       ctStore.delete(v);
       return ct;
     } else {
-      const z = zeros(v.aval.shape as number[], { dtype: v.aval.dtype });
+      const z = zerosInternal(v.aval.shape, v.aval.dtype);
       // Mark as anonymous so getOrMakeConstTracer (when inside a makeJaxpr
       // trace like transposeJaxpr) skips .ref — the ClosedJaxpr becomes
       // the sole owner and dispose() fully frees the backing Slot.
@@ -1751,7 +1751,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     // Transpose of gather is scatter_add: accumulate cotangent back to
     // source positions.  Handles both permutation and duplicate indices.
     const idx = indices[0] as Tracer;
-    using z = zeros(x.aval.shape as number[], { dtype: ct.dtype }) as Tracer;
+    using z = zerosInternal(x.aval.shape, ct.dtype) as Tracer;
     const result = scatterAdd(z, idx, ct, axis[0]);
     return [result, null];
   },
@@ -1851,7 +1851,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     ) as number[];
 
     if (dst instanceof UndefPrimal) {
-      using z = zeros(srcShape, { dtype: ct.dtype }) as Tracer;
+      using z = zerosInternal(srcShape, ct.dtype) as Tracer;
       ctDst = dynamicUpdateSlice(ct, z, offset, axis) as Tracer;
     }
 
@@ -1983,9 +1983,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         for (let i = 0; i < jaxpr.inBinders.length; i++) {
           if (bodyUndefPrimals[i]) {
             const aval = jaxpr.inBinders[i].aval;
-            fullInputs.push(
-              zeros(aval.shape as number[], { dtype: aval.dtype }),
-            );
+            fullInputs.push(zerosInternal(aval.shape, aval.dtype));
           } else {
             fullInputs.push(primalInputs[primalIdx++].ref);
           }
@@ -2176,9 +2174,10 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       for (let i = 0; i < numConsts; i++) {
         if (bodyUndefPrimals[i]) {
           bodyArgs.push(
-            zeros(bodyJaxpr.inBinders[i].aval.shape as number[], {
-              dtype: bodyJaxpr.inBinders[i].aval.dtype,
-            }),
+            zerosInternal(
+              bodyJaxpr.inBinders[i].aval.shape,
+              bodyJaxpr.inBinders[i].aval.dtype,
+            ),
           );
         } else {
           bodyArgs.push(constResiduals[cri++].ref);
@@ -2187,20 +2186,18 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(aLeaves[i].ref);
       for (let i = numOrigLeaves; i < numLeaves; i++) {
         bodyArgs.push(
-          zeros(bodyJaxpr.inBinders[numConsts + i].aval.shape as number[], {
-            dtype: bodyJaxpr.inBinders[numConsts + i].aval.dtype,
-          }),
+          zerosInternal(
+            bodyJaxpr.inBinders[numConsts + i].aval.shape,
+            bodyJaxpr.inBinders[numConsts + i].aval.dtype,
+          ),
         );
       }
       for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(bLeaves[i].ref);
       for (let i = numOrigLeaves; i < numLeaves; i++) {
         bodyArgs.push(
-          zeros(
-            bodyJaxpr.inBinders[numConsts + numLeaves + i].aval
-              .shape as number[],
-            {
-              dtype: bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.dtype,
-            },
+          zerosInternal(
+            bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.shape,
+            bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.dtype,
           ),
         );
       }
@@ -2241,7 +2238,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
     // Initialize carry cotangent to zeros
     let ctCarry: Tracer[] = allYP[0].map((y) =>
-      zeros(y.shape as number[], { dtype: y.dtype }),
+      zerosInternal(y.shape, y.dtype),
     );
     let ctConstsAccum: Tracer[] | null = null;
     const ctXsPerLeaf: Tracer[][] = Array.from(
@@ -2271,11 +2268,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       for (const x of xPi) tbInputs.push(x.ref);
       // Cotangents for body outputs: zero for primal, ctEff for tangent
       for (let j = 0; j < numOrigLeaves; j++) {
-        tbInputs.push(
-          zeros(allYP[0][j].shape as number[], {
-            dtype: allYP[0][j].dtype,
-          }),
-        );
+        tbInputs.push(zerosInternal(allYP[0][j].shape, allYP[0][j].dtype));
       }
       for (const c of ctEff) tbInputs.push(c.ref);
 

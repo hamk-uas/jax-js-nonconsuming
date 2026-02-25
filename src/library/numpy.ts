@@ -15,11 +15,13 @@ import {
   identity,
   linspace,
   logspace,
+  // eslint-disable-next-line no-restricted-imports -- re-exported as np.ones/np.zeros public API, not called internally.
   ones,
   onesLike as onesLikeTracer,
   tri,
   tril,
   triu,
+  // eslint-disable-next-line no-restricted-imports -- re-exported as np.ones/np.zeros public API, not called internally.
   zeros,
   zerosLike as zerosLikeTracer,
 } from "../frontend/array";

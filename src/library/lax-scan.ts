@@ -6,6 +6,7 @@
 // This version uses the Scan primitive for efficient execution.
 
 import type { Array } from "../frontend/array";
+// eslint-disable-next-line no-restricted-imports -- zeros() is correct here: creates user-visible empty Y arrays for length-0 scan that need anonymous marking.
 import { zeros } from "../frontend/array";
 import { bind, getAval, Primitive, ShapedArray } from "../frontend/core";
 import { makeJaxpr } from "../frontend/jaxpr";
