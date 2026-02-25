@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # --- AEP (Agentic Evolution Protocol) gate ---
-# On every commit the committer must reviewed the AEP in order to commit.
+# On every commit the committer must first re-read the AEP in order to commit.
 # DO NOT MISUSE! Read AEP first -- don't circumvent this check!
 if [[ "${AEP:-}" != "1" ]]; then
   echo "AEP GATE: commit rejected"
