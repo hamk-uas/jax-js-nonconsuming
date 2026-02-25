@@ -52,6 +52,7 @@ import {
   exp as coreExp,
   mul as coreMul,
   getAval,
+  insideNestedAbstractTrace,
   isScanBodyTraceActive,
   ndim,
   newMain,
@@ -1848,12 +1849,22 @@ function dataToJs(
 export const anonymousConstArrays = new WeakSet<Array>();
 
 /**
- * Tags an array as anonymous builder-owned if we're inside a scan body trace.
- * This prevents getOrMakeConstTracer from calling .ref on inline np.array()
- * constants, which would leak when the ClosedJaxpr is disposed.
+ * Tags an array as anonymous builder-owned when created inside a trace scope
+ * where no external owner will dispose the creation ref:
+ * - scan body traces (isScanBodyTraceActive)
+ * - nested abstract traces (e.g. jit(valueAndGrad(fn))) where a PE scope
+ *   creates arrays captured by an outer JIT — the outer JIT takes sole
+ *   ownership via getOrMakeConstTracer's ownedByBuilder path
+ *
+ * Marking MUST happen at creation time (before any getOrMakeConstTracer
+ * call), not after PE tracing completes.
  */
 const markAnonymousIfTracing = (arr: Array): Array => {
-  if (isScanBodyTraceActive()) anonymousConstArrays.add(arr);
+  if (
+    isScanBodyTraceActive() ||
+    (_peArrayCreationTracker && insideNestedAbstractTrace())
+  )
+    anonymousConstArrays.add(arr);
   return arr;
 };
 

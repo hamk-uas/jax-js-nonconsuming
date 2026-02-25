@@ -773,6 +773,22 @@ export function insideAbstractTrace(): boolean {
 }
 
 /**
+ * Returns true when there are ≥2 abstract traces on the stack.
+ *
+ * This detects nested tracing (e.g. jit(valueAndGrad(fn))) where an inner PE
+ * trace creates arrays that are captured by an outer JIT trace.  Arrays created
+ * in this situation have no external owner — the outer JIT must take sole
+ * ownership via anonymousConstArrays.
+ */
+export function insideNestedAbstractTrace(): boolean {
+  let count = 0;
+  for (let i = 1; i < traceStack.length; i++) {
+    if (traceStack[i].isAbstract && ++count >= 2) return true;
+  }
+  return false;
+}
+
+/**
  * Returns true if any abstract trace exists below the given level on the stack.
  *
  * Used by jvpFlat to decide whether its own intermediate cleanup is safe.
