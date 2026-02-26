@@ -2,7 +2,7 @@
  * @file Scan plan construction — determines the execution strategy for a scan.
  */
 
-import { AluExp, AluOp, byteWidth, Kernel, Reduction } from "../alu";
+import { byteWidth, Kernel, Reduction } from "../alu";
 import type { Backend, Executable } from "../backend";
 import {
   getScanRoutineInfo,
@@ -476,11 +476,13 @@ function tryPrepareWasmNativeScan(
 /**
  * Try to prepare a WebGPU native scan.
  *
+ * Uses carry snapshot locals to avoid read-after-write hazards and
+ * local variables for internal intermediates — no extra storage bindings.
+ *
  * Constraints:
  * - numCarry === numY or numY === 0 (each carry maps 1:1 to a Y output)
  * - No routine steps (only kernel steps)
- * - No passthrough carry (each carry output must come from a kernel step)
- * - No internal buffer dependencies (step inputs reference jaxpr inputs only)
+ * - Total storage bindings ≤ maxStorageBuffersPerShaderStage
  */
 function tryPrepareWebGPUNativeScan(
   backend: Backend,
@@ -523,40 +525,57 @@ function tryPrepareWebGPUNativeScan(
     numX,
   );
 
-  // Map step output JitIds to the execute step that produced them
-  const outputToStep = new Map<JitId, ExecuteStep>();
-  for (const step of executeSteps) {
-    outputToStep.set(step.outputs[0], step);
+  // Check binding count: consts + xs + carry(rw) + ys(rw) ≤ limit
+  const totalBindings = numConsts + numX + numCarry + numY;
+  const maxBindings =
+    (backend as WebGPUBackend).device?.limits
+      ?.maxStorageBuffersPerShaderStage ?? 8;
+  if (totalBindings > maxBindings) {
+    if (DEBUG >= 1)
+      console.log(
+        `[webgpu-scan] skipped, ${totalBindings} bindings > limit ${maxBindings}`,
+      );
+    return null;
   }
 
-  // Check carry outputs: each must be produced by an execute step (no passthrough)
+  // Map ALL step output JitIds to their producing step and output index.
+  // Multi-output kernels may produce multiple outputs from one step.
+  const outputToStepInfo = new Map<
+    JitId,
+    { step: ExecuteStep; outputIdx: number }
+  >();
+  for (const step of executeSteps) {
+    for (let oi = 0; oi < step.outputs.length; oi++) {
+      outputToStepInfo.set(step.outputs[oi], { step, outputIdx: oi });
+    }
+  }
+
+  // Identify carry outputs and carry passthroughs
   const carryOutIds = bodyProgram.outputs.slice(0, numCarry);
   const carryInputIds = bodyProgram.inputs.slice(
     numConsts,
     numConsts + numCarry,
   );
 
-  const stepToCarryIdx = new Map<ExecuteStep, number>();
+  // Set of JitIds that are carry outputs (produced by steps, not passthroughs)
+  const carryOutputJitIds = new Set<JitId>();
   for (let ci = 0; ci < numCarry; ci++) {
     const outId = carryOutIds[ci];
-    // Check passthrough
-    if (carryInputIds.includes(outId)) {
-      if (DEBUG >= 1)
-        console.log(`[webgpu-scan] skipped, carry ${ci} is passthrough`);
-      return null;
+    if (!carryInputIds.includes(outId)) {
+      // Not a passthrough — must be produced by a step
+      if (!outputToStepInfo.has(outId)) {
+        if (DEBUG >= 1)
+          console.log(
+            `[webgpu-scan] skipped, carry ${ci} not produced by execute step`,
+          );
+        return null;
+      }
+      carryOutputJitIds.add(outId);
     }
-    const step = outputToStep.get(outId);
-    if (!step) {
-      if (DEBUG >= 1)
-        console.log(
-          `[webgpu-scan] skipped, carry ${ci} not produced by execute step`,
-        );
-      return null;
-    }
-    stepToCarryIdx.set(step, ci);
+    // Passthrough carries are fine — carry buffer retains its value
   }
 
-  // Check Y outputs: each must match the corresponding carry output (since numCarry === numY)
+  // Check Y outputs match carries (when numY > 0)
   if (numY > 0) {
     const yOutIds = bodyProgram.outputs.slice(numCarry);
     for (let yi = 0; yi < numY; yi++) {
@@ -570,102 +589,84 @@ function tryPrepareWebGPUNativeScan(
     }
   }
 
-  // Check all step inputs reference only body jaxpr inputs (no internal buffer deps)
+  // Map carry output JitIds → carry index
+  const jitIdToCarryIdx = new Map<JitId, number>();
+  for (let ci = 0; ci < numCarry; ci++) {
+    if (carryOutputJitIds.has(carryOutIds[ci])) {
+      jitIdToCarryIdx.set(carryOutIds[ci], ci);
+    }
+  }
+
+  // Assign internal indices to step outputs that aren't carry outputs.
+  // Internal intermediates become local WGSL variables (no storage bindings).
+  let nextInternalIdx = 0;
+  const jitIdToInternalIdx = new Map<JitId, number>();
   for (const step of executeSteps) {
-    for (const inputId of step.inputs) {
-      if (inputId >= numInputs) {
-        if (DEBUG >= 1)
-          console.log(
-            `[webgpu-scan] skipped, step has internal dep (input ${inputId} >= ${numInputs})`,
-          );
-        return null;
+    for (let oi = 0; oi < step.outputs.length; oi++) {
+      const outId = step.outputs[oi];
+      if (!carryOutputJitIds.has(outId)) {
+        jitIdToInternalIdx.set(outId, nextInternalIdx++);
       }
     }
   }
+  const numInternal = nextInternalIdx;
 
-  // Build NativeScanMultiStep[] — ordered by carry output index
-  const orderedSteps: { carryIdx: number; step: ExecuteStep }[] = [];
-  for (const [step, carryIdx] of stepToCarryIdx) {
-    orderedSteps.push({ carryIdx, step });
+  // Build scan gid mapping: body JitId → scan gid space.
+  // Gid space: [0..numConsts) const, [numConsts..+numCarry) carry,
+  // [+numCarry..+numX) xs, [+numX..+numInternal) internal
+  const jitIdToScanGid = new Map<JitId, number>();
+  // Body inputs map directly
+  for (let i = 0; i < numInputs; i++) {
+    jitIdToScanGid.set(bodyProgram.inputs[i], i);
   }
-  orderedSteps.sort((a, b) => a.carryIdx - b.carryIdx);
+  // Internal intermediates
+  for (const [jitId, internalIdx] of jitIdToInternalIdx) {
+    jitIdToScanGid.set(jitId, numInputs + internalIdx);
+  }
 
-  // Check for cross-step carry read-after-write hazards.
-  // If step i writes to carry[ci], no later step j may read carry[ci],
-  // because the WGSL shader writes carry[ci] immediately after step i
-  // (before step j runs), so step j would see NEW values instead of OLD.
-  // This catches JVP'd bilinear bodies where the tangent step reads the
-  // primal carry. WASM handles this via shadow buffers; WebGPU falls back.
-  for (let i = 0; i < orderedSteps.length; i++) {
-    const writtenCarryGid = numConsts + orderedSteps[i].carryIdx;
-    for (let j = i + 1; j < orderedSteps.length; j++) {
-      const laterStep = orderedSteps[j].step;
-      const laterSource = laterStep.source as Kernel;
-      const laterReindexMap = laterStep.inputs;
-      const laterExp = laterSource.outputs[0].exp.reindexGids(laterReindexMap);
-      const readsWrittenCarry = laterExp.some(
-        (e: AluExp) =>
-          (e.op === AluOp.GlobalIndex || e.op === AluOp.GlobalView) &&
-          e.arg[0] === writtenCarryGid,
+  // Build NativeScanMultiStep[] from ALL step outputs, in dependency order
+  const multiSteps: NativeScanMultiStep[] = [];
+
+  for (const step of executeSteps) {
+    const source = step.source as Kernel;
+
+    for (let oi = 0; oi < step.outputs.length; oi++) {
+      const outId = step.outputs[oi];
+      const carryIdx = jitIdToCarryIdx.get(outId) ?? -1;
+      const internalIdx =
+        carryIdx < 0 ? (jitIdToInternalIdx.get(outId) ?? -1) : -1;
+
+      // Build reindex map: local kernel arg → scan gid
+      const scanReindexMap = step.inputs.map(
+        (jitId) => jitIdToScanGid.get(jitId) ?? jitId,
       );
-      if (readsWrittenCarry) {
-        if (DEBUG >= 1)
-          console.log(
-            `[webgpu-scan] skipped, step ${j} reads carry[${orderedSteps[i].carryIdx}] written by step ${i}`,
-          );
-        return null;
-      }
-      // Also check reduction epilogue if present
-      if (laterSource.outputs[0].reduction) {
-        const laterReductionExp =
-          laterSource.outputs[0].reduction.epilogue.reindexGids(
-            laterReindexMap,
-          );
-        const readsInReduction = laterReductionExp.some(
-          (e: AluExp) =>
-            (e.op === AluOp.GlobalIndex || e.op === AluOp.GlobalView) &&
-            e.arg[0] === writtenCarryGid,
-        );
-        if (readsInReduction) {
-          if (DEBUG >= 1)
-            console.log(
-              `[webgpu-scan] skipped, step ${j} reduction reads carry[${orderedSteps[i].carryIdx}] written by step ${i}`,
-            );
-          return null;
-        }
-      }
-    }
-  }
 
-  const multiSteps: NativeScanMultiStep[] = orderedSteps.map(
-    ({ carryIdx, step }) => {
-      const source = step.source as Kernel;
-      // Reindex kernel expression gids from local args to scan buffer layout
-      const reindexMap = step.inputs;
-      const reindexedExp = source.outputs[0].exp.reindexGids(reindexMap);
-      const reindexedReduction = source.outputs[0].reduction
+      const kernelOutput = source.outputs[oi] ?? source.outputs[0];
+      const reindexedExp = kernelOutput.exp.reindexGids(scanReindexMap);
+      const reindexedReduction = kernelOutput.reduction
         ? new Reduction(
-            source.outputs[0].reduction.dtype,
-            source.outputs[0].reduction.op,
-            source.outputs[0].reduction.size,
-            source.outputs[0].reduction.epilogue.reindexGids(reindexMap),
+            kernelOutput.reduction.dtype,
+            kernelOutput.reduction.op,
+            kernelOutput.reduction.size,
+            kernelOutput.reduction.epilogue.reindexGids(scanReindexMap),
           )
         : undefined;
       const reindexedKernel = Kernel.single(
-        numInputs,
+        numInputs + numInternal,
         source.size,
         reindexedExp,
         reindexedReduction,
       );
 
-      return {
+      multiSteps.push({
         kernel: reindexedKernel,
-        inputs: reindexMap.slice(),
+        inputs: scanReindexMap.slice(),
         outputCarryIdx: carryIdx,
+        outputInternalIdx: internalIdx,
         outputSize: source.size as number,
-      };
-    },
-  );
+      });
+    }
+  }
 
   const params: NativeScanMultiParams = {
     length,
@@ -679,6 +680,7 @@ function tryPrepareWebGPUNativeScan(
     ysStrides,
     steps: multiSteps,
     reverse,
+    numInternal,
   };
 
   // Call backend
@@ -688,7 +690,11 @@ function tryPrepareWebGPUNativeScan(
 
   if (DEBUG >= 1) {
     console.log(
-      `[webgpu-scan] SUCCESS! Using WebGPU native scan with ${multiSteps.length} steps`,
+      `[webgpu-scan] SUCCESS! Using WebGPU native scan with ${multiSteps.length} steps` +
+        (numInternal > 0 ? ` (${numInternal} internal locals)` : "") +
+        (carryOutputJitIds.size < numCarry
+          ? ` (${numCarry - carryOutputJitIds.size} passthrough carries)`
+          : ""),
     );
   }
   return { executable: exe, params };

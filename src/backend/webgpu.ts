@@ -56,10 +56,12 @@ interface ShaderDispatch extends ShaderInfo {
 export interface NativeScanMultiStep {
   /** The kernel to execute. */
   kernel: Kernel;
-  /** Input mapping: indices into [consts, carry, xs] flattened. */
+  /** Input mapping: indices into [consts, carry, xs, internals] flattened. */
   inputs: number[];
-  /** Which carry slot this kernel writes to (0..numCarry-1). */
+  /** Which carry slot this kernel writes to (0..numCarry-1), or -1 for internal. */
   outputCarryIdx: number;
+  /** Which internal local this step defines (0..numInternal-1), or -1 for carry. */
+  outputInternalIdx: number;
   /** Size of output in elements (not bytes). */
   outputSize: number;
 }
@@ -77,6 +79,8 @@ export interface NativeScanMultiParams {
   ysStrides: number[];
   steps: NativeScanMultiStep[];
   reverse?: boolean;
+  /** Number of internal intermediate locals (from steps with internal deps). */
+  numInternal: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -634,26 +638,43 @@ export class WebGPUBackend implements Backend {
   /**
    * Dispatch a native scan shader.
    *
-   * Buffer binding order: [consts, initCarry, xs, carryOut, ysStacked]
+   * Copies initCarry → carryOut before dispatch (shader has no initCarry bindings).
+   * Buffer binding order: [consts, xs, carryOut, ysStacked]
    */
   dispatchNativeScanGeneral(
     exe: Executable<ShaderDispatch[]>,
-    _params: NativeScanMultiParams,
+    params: NativeScanMultiParams,
     consts: Slot[],
     initCarry: Slot[],
     xs: Slot[],
     carryOut: Slot[],
     ysStacked: Slot[],
   ): void {
+    const commandEncoder = this.device.createCommandEncoder();
+
+    // Pre-copy initCarry → carryOut (shader reads carry as pre-initialized)
+    for (let i = 0; i < initCarry.length; i++) {
+      const initBuf = this.#getBuffer(initCarry[i]).buffer;
+      const carryBuf = this.#getBuffer(carryOut[i]).buffer;
+      if (initBuf !== carryBuf) {
+        commandEncoder.copyBufferToBuffer(
+          initBuf,
+          0,
+          carryBuf,
+          0,
+          params.carrySizes[i],
+        );
+      }
+    }
+
+    // Binding order: [consts(read), xs(read), carry(read_write), ys(read_write)]
     const allBuffers = [
       ...consts.map((slot) => this.#getBuffer(slot).buffer),
-      ...initCarry.map((slot) => this.#getBuffer(slot).buffer),
       ...xs.map((slot) => this.#getBuffer(slot).buffer),
       ...carryOut.map((slot) => this.#getBuffer(slot).buffer),
       ...ysStacked.map((slot) => this.#getBuffer(slot).buffer),
     ];
 
-    const commandEncoder = this.device.createCommandEncoder();
     for (const { pipeline, ...shader } of exe.data) {
       const bindGroup = this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
@@ -2570,7 +2591,9 @@ function genScanExpressionWithRidx(
   numConsts: number,
   numCarry: number,
   xsElemStrides: number[],
+  carryElemCounts?: number[],
 ): string {
+  const numX = xsElemStrides.length;
   const gen = (e: AluExp): string => {
     const { op, src, dtype: eDtype, arg } = e;
 
@@ -2583,14 +2606,29 @@ function genScanExpressionWithRidx(
         const access = `const${gid}[${idxCode}]`;
         return eDtype === DType.Bool ? `(${access} != 0)` : access;
       } else if (gid < numConsts + numCarry) {
+        // Carry: use snapshot local when index is trivially gidx (elementwise)
+        // or carry has only 1 element (any index == gidx == 0).
+        // Otherwise fall back to buffer access (e.g., dot product with ridx-dep index)
         const carryIdx = gid - numConsts;
+        const isElementLocal =
+          idxCode === "gidx" ||
+          (carryElemCounts !== undefined && carryElemCounts[carryIdx] === 1);
+        if (isElementLocal) {
+          const varName = `c_${carryIdx}`;
+          return eDtype === DType.Bool ? `(${varName} != 0)` : varName;
+        }
         const access = `carry${carryIdx}[${idxCode}]`;
         return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else {
+      } else if (gid < numConsts + numCarry + numX) {
         const xIdx = gid - numConsts - numCarry;
         const stride = xsElemStrides[xIdx];
         const access = `xs${xIdx}[i32(dataIdx) * ${stride} + ${idxCode}]`;
         return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      } else {
+        // Internal intermediate: read from local variable
+        const internalIdx = gid - numConsts - numCarry - numX;
+        const varName = `internal_${internalIdx}`;
+        return eDtype === DType.Bool ? `(${varName} != 0)` : varName;
       }
     }
 
@@ -2682,15 +2720,19 @@ function genScanExpressionWithRidx(
 /**
  * Generate a WGSL shader for native scan with multiple kernel steps.
  *
- * Each step writes to a carry buffer and optionally to a stacked Y output.
- * The scan loop runs `length` iterations, executing all kernel steps per
- * iteration. Kernels may have reductions (inner loops).
+ * Uses carry snapshot locals to avoid read-after-write hazards: at each
+ * iteration start carries are loaded into `c_i` locals, all expressions
+ * read from those locals, and results are written back to carry buffers.
+ * Internal intermediates (step outputs consumed by later steps) are also
+ * kept as locals, eliminating the need for extra storage bindings.
+ *
+ * InitCarry values are copied to carry buffers externally (copyBufferToBuffer)
+ * before the shader dispatch, so no initCarry bindings are needed.
  *
  * Buffer layout:
  *   - binding 0..numConsts-1: constants (read)
- *   - binding numConsts..numConsts+numCarry-1: initCarry (read)
- *   - binding numConsts+numCarry..+numX: xs (read)
- *   - binding +numX..+numCarry: carryOut (read_write)
+ *   - binding numConsts..numConsts+numX-1: xs (read)
+ *   - binding +numX..+numCarry: carry (read_write, pre-initialized)
  *   - binding +numCarry..+numY: ysStacked (read_write)
  */
 function nativeScanMultiShaderSource(
@@ -2752,17 +2794,12 @@ function nativeScanMultiShaderSource(
 
   emit("");
 
-  // Buffer declarations
+  // Buffer declarations — no initCarry (copied externally)
   let bindingIdx = 0;
 
   for (let i = 0; i < numConsts; i++) {
     emit(
       `@group(0) @binding(${bindingIdx++}) var<storage, read> const${i}: array<${resultTy}>;`,
-    );
-  }
-  for (let i = 0; i < numCarry; i++) {
-    emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read> initCarry${i}: array<${resultTy}>;`,
     );
   }
   for (let i = 0; i < numX; i++) {
@@ -2781,6 +2818,9 @@ function nativeScanMultiShaderSource(
     );
   }
 
+  // Carry element counts for snapshot guards
+  const carryElemCounts = carrySizes.map((s) => s / elemSize);
+
   // Compute shader entry point
   const workgroupSize = Math.min(Math.max(maxKernelSize, 1), 256);
   const [gridX, gridY] = calculateGrid(
@@ -2797,19 +2837,7 @@ function nativeScanMultiShaderSource(
   emit(`let gidx = i32(id.x);`);
   emit("");
 
-  // Step 1: Copy initCarry to carryOut (working buffer)
-  emit("// Initialize carry from initCarry");
-  for (let i = 0; i < numCarry; i++) {
-    const carrySize = carrySizes[i] / elemSize;
-    emit(`if (gidx < ${carrySize}) {`);
-    emit(pushIndent);
-    emit(`carry${i}[gidx] = initCarry${i}[gidx];`);
-    emit(popIndent, "}");
-  }
-  emit("");
-
-  // Step 2: Main scan loop
-  emit(`// Main scan loop over ${length} iterations`);
+  // Main scan loop
   emit(`for (var iter: u32 = 0u; iter < ${length}u; iter++) {`, pushIndent);
 
   if (reverse) {
@@ -2818,17 +2846,40 @@ function nativeScanMultiShaderSource(
     emit(`let dataIdx = iter;`);
   }
 
-  // Execute each kernel step
+  // Snapshot carry into local variables (avoids RAW hazard across steps)
+  emit("");
+  emit("// Snapshot carry values for this iteration");
+  for (let i = 0; i < numCarry; i++) {
+    emit(`var c_${i}: ${resultTy} = ${resultTy}(0);`);
+    if (carryElemCounts[i] === maxKernelSize) {
+      // All valid threads can load — no guard needed
+      emit(`c_${i} = carry${i}[gidx];`);
+    } else {
+      emit(`if (gidx < ${carryElemCounts[i]}) { c_${i} = carry${i}[gidx]; }`);
+    }
+  }
+
+  // Execute each step
   for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
     const step = steps[stepIdx];
     const kernel = step.kernel;
     const tune = tuneNullopt(kernel);
-    const carryIdx = step.outputCarryIdx;
     const kernelSize = kernel.size;
-    const ysElemStride = ysStrides[carryIdx] / elemSize;
+
+    const isCarryStep = step.outputCarryIdx >= 0;
+    const targetLabel = isCarryStep
+      ? `carry${step.outputCarryIdx}`
+      : `internal_${step.outputInternalIdx}`;
 
     emit("");
-    emit(`// Step ${stepIdx}: kernel writes to carry${carryIdx}`);
+    emit(`// Step ${stepIdx}: writes to ${targetLabel}`);
+
+    // Declare result outside if-block so internal assignments can reference it
+    const needsOuterDecl = !isCarryStep;
+    if (needsOuterDecl) {
+      emit(`var result_val_${stepIdx}: ${resultTy} = ${resultTy}(0);`);
+    }
+
     emit(`if (gidx < ${kernelSize}) {`);
     emit(pushIndent);
 
@@ -2848,10 +2899,10 @@ function nativeScanMultiShaderSource(
         numConsts,
         numCarry,
         xsElemStrides,
+        carryElemCounts,
       );
       emit(`let val = ${expCode};`);
 
-      // Accumulate
       if (re.op === AluOp.Add) emit(`acc = acc + val;`);
       else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
       else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
@@ -2860,15 +2911,19 @@ function nativeScanMultiShaderSource(
 
       emit(popIndent, "}");
 
-      // Apply epilogue
       const epilogueCode = genScanExpressionWithRidx(
         tune.epilogue!,
         dtype,
         numConsts,
         numCarry,
         xsElemStrides,
+        carryElemCounts,
       );
-      emit(`let result_val_${stepIdx}: ${resultTy} = ${epilogueCode};`);
+      if (needsOuterDecl) {
+        emit(`result_val_${stepIdx} = ${epilogueCode};`);
+      } else {
+        emit(`let result_val_${stepIdx}: ${resultTy} = ${epilogueCode};`);
+      }
     } else {
       // Elementwise kernel
       const expCode = genScanExpressionWithRidx(
@@ -2877,27 +2932,48 @@ function nativeScanMultiShaderSource(
         numConsts,
         numCarry,
         xsElemStrides,
+        carryElemCounts,
       );
-      emit(`let result_val_${stepIdx}: ${resultTy} = ${expCode};`);
+      if (needsOuterDecl) {
+        emit(`result_val_${stepIdx} = ${expCode};`);
+      } else {
+        emit(`let result_val_${stepIdx}: ${resultTy} = ${expCode};`);
+      }
     }
 
-    // Write to ysStacked at dataIdx * stride + gidx
-    if (numY > 0 && carryIdx < numY) {
-      emit(
-        `ys${carryIdx}[i32(dataIdx) * ${ysElemStride} + gidx] = result_val_${stepIdx};`,
-      );
-    }
+    if (isCarryStep) {
+      const carryIdx = step.outputCarryIdx;
+      const ysElemStride = ysStrides[carryIdx]
+        ? ysStrides[carryIdx] / elemSize
+        : 0;
 
-    // Update carry for next iteration
-    emit(`carry${carryIdx}[gidx] = result_val_${stepIdx};`);
+      // Write to ysStacked at dataIdx * stride + gidx
+      if (numY > 0 && carryIdx < numY && ysElemStride > 0) {
+        emit(
+          `ys${carryIdx}[i32(dataIdx) * ${ysElemStride} + gidx] = result_val_${stepIdx};`,
+        );
+      }
+
+      // Update carry buffer for next iteration
+      emit(`carry${carryIdx}[gidx] = result_val_${stepIdx};`);
+    }
 
     emit(popIndent, "}");
+
+    // For internal steps, the var was declared before the if-block
+    // so it's now accessible to subsequent steps
+    if (!isCarryStep) {
+      // Alias to internal_N for readability in subsequent step expressions
+      emit(
+        `var internal_${step.outputInternalIdx}: ${resultTy} = result_val_${stepIdx};`,
+      );
+    }
   }
 
   emit(popIndent, "}");
   emit(popIndent, "}");
 
-  const numReadOnlyInputs = numConsts + numCarry + numX;
+  const numReadOnlyInputs = numConsts + numX;
   const numReadWriteOutputs = numCarry + numY;
 
   return {
