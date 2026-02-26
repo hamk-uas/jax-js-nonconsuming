@@ -228,7 +228,7 @@ Device coverage data from [web3dsurvey.com](https://web3dsurvey.com/webgpu) (Feb
 | `maxComputeWorkgroupsPerDimension` | 65535         | 100%            | —                        | Large arrays need 2D grid splitting via `calculateGrid()`                       |
 | `maxComputeWorkgroupSizeX`         | 256           | 100%            | 1024 (85%)               | Limits threads per workgroup (Sort workgroup size)                              |
 | `maxComputeWorkgroupStorageSize`   | 16384 (16 KB) | 100%            | 32 KB (99%), 49 KB (12%) | Shared memory budget for cooperative reductions, workgroup-local scan           |
-| `minUniformBufferOffsetAlignment`  | 32 bytes      | 100%            | 256 (89%)                | Dynamic uniform offsets; code uses 256 conservatively                           |
+| `minUniformBufferOffsetAlignment`  | 32 bytes      | 100%            | 256 (89%)                | Dynamic uniform offsets; code queries actual `device.limits` value              |
 | `minStorageBufferOffsetAlignment`  | 32 bytes      | 100%            | 256 (85%)                | Can't use buffer offsets for arbitrary strides → uniform-based offsets for scan |
 
 **Storage buffer limit handling:** `splitGraphDataflow()` P2 pass counts transitive fused

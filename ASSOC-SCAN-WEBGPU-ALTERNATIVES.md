@@ -52,8 +52,9 @@ WebGPU support: **78.29%** of surveyed browsers.
 - **Storage buffer limit of 8** is universal. The assoc scan shader uses 2 (ping, pong) + numConsts
   storage buffers, so numConsts ≤ 6. This is already enforced elsewhere.
 - **`minStorageBufferOffsetAlignment`**: 15% of devices have 32-byte alignment (not 256). The
-  current preencoded scan conservatively uses uniform buffers instead of storage buffer offsets —
-  this remains the right choice.
+  preencoded scan uses uniform buffers for offsets instead of storage buffer offsets (since typical
+  strides like 120 bytes fail alignment) — this remains the right choice. The code queries the
+  actual `device.limits.minUniformBufferOffsetAlignment` value at runtime.
 
 ## Current Architecture
 
