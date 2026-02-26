@@ -312,15 +312,15 @@ This is a standard GPU optimization that could provide 5-10× speedup for large 
 
 The "no global barrier" limitation creates scan-specific constraints:
 
-| Constraint                        | Why it exists                                                | Consequence                   |
-| --------------------------------- | ------------------------------------------------------------ | ----------------------------- |
-| Per-element independence required | No cross-workgroup sync between iterations                   | Complex bodies → JS fallback  |
-| numCarry ≠ numY unsupported       | compiled-loop shader assumes 1:1 carry↔output mapping       | Falls back to JS loop         |
-| Internal buffer deps unsupported  | Shader can't allocate scratch temporaries between statements | Mandelbrot pattern → fallback |
-| Sort in scan body                 | Sort already uses uniforms (conflict with scan offsets)      | Falls back to JS loop         |
+| Constraint                        | Why it exists                                           | Consequence                    |
+| --------------------------------- | ------------------------------------------------------- | ------------------------------ |
+| Per-element independence required | No cross-workgroup sync between iterations              | Complex bodies → JS fallback   |
+| numCarry ≠ numY unsupported       | compiled-loop shader assumes 1:1 carry↔output mapping  | Falls back to JS loop          |
+| ~~Internal buffer deps~~          | ~~Shader can't allocate scratch temporaries~~           | ✅ Handled via internal locals |
+| Sort in scan body                 | Sort already uses uniforms (conflict with scan offsets) | Falls back to JS loop          |
 
 WASM backend handles all these cases because it can allocate temporaries and has true sequential
-control flow. WebGPU is more restricted but faster when patterns fit.
+control flow. WebGPU now handles most kernel-only cases via carry snapshot + internal locals.
 
 ### Key WebGPU files
 
@@ -537,20 +537,20 @@ Scan bodies are classified by what operations they contain:
 
 **Execution path by body type and backend:**
 
-| Body Type               | WASM          | WebGPU                           |
-| ----------------------- | ------------- | -------------------------------- |
-| kernel-only (simple)    | compiled-loop | compiled-loop                    |
-| kernel-only (with deps) | compiled-loop | **fallback**                     |
-| routine body (single)   | compiled-loop | preencoded-routine (or fallback) |
-| mixed kernel+routine    | compiled-loop | **fallback**                     |
-| multiple routines       | compiled-loop | **fallback**                     |
+| Body Type               | WASM          | WebGPU                                  |
+| ----------------------- | ------------- | --------------------------------------- |
+| kernel-only (simple)    | compiled-loop | compiled-loop                           |
+| kernel-only (with deps) | compiled-loop | compiled-loop (carry snapshot + locals) |
+| routine body (single)   | compiled-loop | preencoded-routine (or fallback)        |
+| mixed kernel+routine    | compiled-loop | **fallback**                            |
+| multiple routines       | compiled-loop | **fallback**                            |
 
 **Internal buffer dependencies:** When one kernel step reads from another step's output within the
-same body. WASM handles this by allocating temporary buffers. WebGPU's shader codegen doesn't
-support it yet — Phase 1 of the scan plan addresses this via deferred-write pattern.
+same body. WASM handles this by allocating temporary buffers. WebGPU now handles same-gidx internal
+deps via carry snapshot locals + internal intermediate locals (commit 74ddb7e).
 
 ```ts
-// Body with internal deps (WebGPU falls back):
+// Body with internal deps (WebGPU compiled-loop handles this):
 const body = (carry, x) => {
   const Asq = carry.A.mul(carry.A); // Step 1: produces Asq
   const newA = Asq.sub(carry.B); // Step 2: reads Asq (internal dep!)
@@ -559,13 +559,14 @@ const body = (carry, x) => {
 ```
 
 **Carry passthrough:** When an output carry directly references the input carry without a kernel
-producing it. WebGPU multi-kernel scan requires every carry to be produced by a kernel step.
+producing it. WebGPU compiled-loop now handles passthrough carries — they are never written by the
+shader and retain their value from the previous iteration.
 
 ```ts
-// Carry passthrough (WebGPU multi-kernel falls back):
+// Carry passthrough (WebGPU compiled-loop handles this):
 const body = (carry, x) => {
   const newA = carry.A.add(x);
-  return [{ A: newA, B: carry.B }, newA]; // B is passthrough!
+  return [{ A: newA, B: carry.B }, newA]; // B is passthrough
 };
 ```
 
@@ -590,7 +591,9 @@ capabilities. Returns `ScanRoutineInfo` if eligible; `null` triggers fallback.
 Argsort). Any numCarry/numY combination. Internal buffer deps supported.
 
 **WebGPU single-kernel:** 1 Kernel, numCarry=1, numY=1. **WebGPU multi-kernel:** Multiple Kernels,
-numCarry=numY, no internal buffer deps, no carry passthrough.
+numCarry=numY. Internal buffer deps and carry passthrough supported via carry snapshot locals +
+internal intermediate locals (commit 74ddb7e). Cross-gidx deps (e.g., matmul output read at
+different index) still fall back to buffer access, which works correctly.
 
 **WebGPU preencoded-routine:** Exactly 1 Routine, numCarry=numY, routine doesn't use uniforms.
 
@@ -607,21 +610,30 @@ target carry. Provides 40-65% speedup for small bodies.
 
 ### WebGPU compiled-loop shader structure
 
-Current `nativeScanMultiShaderSource()` shader:
+Current `nativeScanMultiShaderSource()` shader uses carry snapshot locals to eliminate RAW hazards:
 
 ```wgsl
 for (var iter: u32 = 0; iter < length; iter++) {
-  var acc: f32 = 0.0;  // reduction identity
-  for (var ridx: u32 = 0; ridx < reductionSize; ridx++) {
-    acc = acc + /* expression using ridx */;
+  // Snapshot carry into thread-local vars
+  var c_0: f32 = carry0[gidx];
+
+  // Compute steps using snapshots + internal locals
+  var internal_0: f32 = 0.0;
+  if (gidx < size0) {
+    var result_val_0 = expr0(c_0, xs0[dataIdx * stride + gidx]);
+    internal_0 = result_val_0;
   }
-  carry[gidx] = /* epilogue using acc */;
-  ys[iter * carrySize + gidx] = carry[gidx];
+  if (gidx < size1) {
+    let result_val_1 = expr1(internal_0, c_0, ...);
+    carry0[gidx] = result_val_1;
+    ys0[iter * carrySize + gidx] = result_val_1;
+  }
 }
 ```
 
 Key insight: Thread `i` only reads/writes `carry[i]` and `xs[:,i]` — no `workgroupBarrier()` needed.
-Each step's computation is inlined per-thread.
+Carry snapshot locals eliminate RAW hazards. Internal locals handle inter-step dependencies. Each
+step's computation is inlined per-thread.
 
 ### WebGPU preencoded-routine architecture
 
