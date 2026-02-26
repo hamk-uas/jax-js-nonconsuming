@@ -76,6 +76,7 @@ import {
   where,
 } from "./core";
 import {
+  _incrementBuilderRef,
   abstractEvalRules,
   ClosedJaxpr,
   evalJaxpr,
@@ -888,8 +889,18 @@ class PartialEvalTrace extends Trace {
       retainedKnownOutputs.add(fullOuts[numCarry + i]);
     }
 
+    // Clean up explicitly .ref'd known inputs. Do NOT dispose synthesized
+    // zeros — bind() may have captured them via getOrMakeConstTracer at an
+    // outer JaxprTrace level, and disposing here would undo that builder's
+    // .ref, leaving the builder with a dangling reference. The zeros'
+    // lifecycle is managed by the ClosedJaxpr that captured them.
+    const synthesizedSet = new Set(synthesizedZeroInputs);
     for (const inp of fullInputs) {
-      if (!retainedKnownOutputs.has(inp) && inp.refCount > 0) {
+      if (
+        !retainedKnownOutputs.has(inp) &&
+        !synthesizedSet.has(inp) &&
+        inp.refCount > 0
+      ) {
         inp.dispose();
       }
     }
@@ -993,8 +1004,15 @@ class PartialEvalTrace extends Trace {
     const retainedKnownOutputs = new Set<Tracer>(
       fullOuts.slice(0, numOrigLeaves),
     );
+    // Same fix as #partialEvalScan: don't dispose synthesized zeros that
+    // may have been captured by an outer JaxprTrace builder.
+    const synthesizedSet = new Set(synthesizedZeroInputs);
     for (const inp of fullInputs) {
-      if (!retainedKnownOutputs.has(inp) && inp.refCount > 0) {
+      if (
+        !retainedKnownOutputs.has(inp) &&
+        !synthesizedSet.has(inp) &&
+        inp.refCount > 0
+      ) {
         inp.dispose();
       }
     }
@@ -1136,18 +1154,27 @@ function partialEvalGraphToJaxpr(
   // consumes the only ref from instantiateConst, leaving ClosedJaxpr with
   // a borrowed reference. When ClosedJaxpr.dispose() is called (e.g., from
   // fVjp.dispose() in grad), it would free user-owned arrays.
-  for (const c of consts) (c as Tracer).ref;
+  for (const c of consts) {
+    (c as Tracer).ref;
+    _incrementBuilderRef(c as Tracer);
+  }
 
   // Cleanup PETracer wrappers:
   // 1) Const PETracers: their recipe.val was .ref'd by instantiateConst,
   //    so cascade to recipe.val.dispose() just balances the .ref (safe).
   //    The extra .ref above ensures ClosedJaxpr retains its own ownership.
+  //    Multi-output equations (Scan, Jit) .ref input tracers once per
+  //    additional output in processPrimitive, inflating PETracer #rc above 1.
+  //    A single .dispose() won't reach #rc=0 to trigger the cascade.
+  //    Loop until fully disposed so the cascade fires exactly once.
   // 2) Unknown (non-Const) PETracers in tracersIn/tracersOut: no val to
   //    cascade to, so dispose() is effectively a no-op.
   // SKIP known PETracers — they hold borrowed references to caller-owned
   // Arrays (e.g., user inputs, forward pass results). Disposing would free
   // the caller's arrays prematurely.
-  for (const t of constPETracers) t.dispose();
+  for (const t of constPETracers) {
+    while (t.isAlive) t.dispose();
+  }
   for (const t of tracersIn) {
     if (!t.pval.isKnown) t.dispose();
   }

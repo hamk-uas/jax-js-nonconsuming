@@ -3,7 +3,8 @@ These notes help AI coding agents be immediately productive. The document has ni
 1. **Repository Overview** — General jax-js knowledge for any development work
 2. **Scan Feature Reference** — `lax.scan` implementation details and backend-specific behavior
 3. **Buffer Recycling & WebGPU Buffer Pool** — JIT `recycle` step and pool architecture
-4. **Ownership Friction Points, Debugging & Future Work** — edge cases, debugging strategies
+4. **Ownership Friction Points, Debugging & Internal Ref-Balancing Contracts** — edge cases,
+   debugging strategies, library-internal `.ref`/`.dispose()` contracts
 5. **Associative Scan** — `lax.associativeScan` Kogge-Stone parallel prefix scan
 6. **Linear Algebra Autodiff** — `solve`, `inv`, TriangularSolve JVP fix
 7. **Polymorphic Shapes** — `SymDim`, `dynamic_axes`, symbolic caching
@@ -439,7 +440,6 @@ target+updates (JVP rule). Transpose: ∂target=identity, ∂updates=gather. Vma
   blacks (outputs, multi-use vars)
 - Mega-module: `canCompileToMegaModule` must reject symbolic sizes; `i32.const()` has runtime guard
 - `no-unnecessary-ref` autofix unsafe for internal tracer `.ref` propagation (BatchTracer incident)
-  TODO: check if this information is stale.
 - **`evalJaxpr` is non-consuming** — callers must dispose temporaries (zerosInternal, xSlices) after
   calling `evalJaxpr`. Do NOT `.ref` inputs before passing to `evalJaxpr`; that's a move-semantics
   pattern that causes leaks.
@@ -739,12 +739,12 @@ by skipping free-list search.
 
 # Part 4: Ownership Friction Points & Debugging
 
-### Key fixes (all resolved)
+### Key fixes
 
 - **Anonymous constants in traced bodies:** `markAnonymousIfTracing(arr)` called by array factories
   during `makeJaxpr` body. Marks with `markAnonymous: true`. Flow: `inMakeJaxprBody` flag →
   `getOrMakeConstTracer` does `.ref` → `ClosedJaxpr.dispose()` does extra `.dispose()` for anonymous
-  consts. `fullInternal`/`full()` are exempt (ESLint `require-mark-anonymous` enforces).
+  consts. `fullInternal` also uses `markAnonymousIfTracing` (see Contract 2 for safety rationale).
 - **PETracer cascade:** Cascades to known values and Const recipe values but NOT
   `JaxprEqn.tracersIn`. Unreachable Const PETracers (from `hasAux` + `instantiateConst`) tracked in
   `PartialEvalTrace.allConstPETracers` (via `main.globalData`), disposed after
@@ -847,6 +847,236 @@ For code ported from the upstream `.ref` / move-semantics model:
 5. **Never use `using` on values that are returned** — `using` disposes at scope end
 6. **Destructure `tree` module** to avoid `no-use-after-dispose` false positive:
    `const { dispose: disposeTree } = tree`
+
+## Internal Ref-Balancing Contracts
+
+This section documents the contracts governing `.ref` / `.dispose()` balancing inside the library's
+transform and tracing infrastructure. These are **maintainer-only** rules — user code never calls
+`.ref` in the non-consuming model. But library internals must balance refs precisely to avoid both
+leaks and use-after-free.
+
+### The Central Invariant
+
+> **Every internal `.ref` must have exactly one matching `.dispose()` on every code path**,
+> including error paths. The `.ref` call site and the matching `.dispose()` call site are often in
+> different functions — the contract is implicit and must be documented per-site.
+
+### Contract 1: `getOrMakeConstTracer` → `ClosedJaxpr.dispose()`
+
+When a value is captured as a constant during `makeJaxpr` tracing, `getOrMakeConstTracer` does
+`val.ref` so the `ClosedJaxpr` owns the const independently of the caller. The matching `.dispose()`
+happens in `ClosedJaxpr.dispose()`.
+
+| Step                                                | What happens                 | RC effect |
+| --------------------------------------------------- | ---------------------------- | --------- |
+| Array created (by user or factory)                  | Initial allocation           | rc=1      |
+| `getOrMakeConstTracer`                              | `val.ref`                    | rc=2      |
+| `ClosedJaxpr.dispose()`                             | `c.dispose()` for each const | rc=1      |
+| Owner disposes (user `.dispose()` or cache cleanup) | Last ref freed               | rc=0      |
+
+**Key files:** `getOrMakeConstTracer` in `jaxpr.ts`, `ClosedJaxpr.dispose()` in `jaxpr.ts`.
+
+**Who calls `ClosedJaxpr.dispose()`:** The entity that owns the `ClosedJaxpr`:
+
+- `OwnedFunction.dispose()` — for `jit()` wrappers (user calls `f.dispose()` or
+  `using f = jit(...)`)
+- `_jitFunctionDisposers` — for module-level jit functions, called by `_disposeAllJitCaches()`
+  during `checkLeaks.stop()` and `clearCaches()`
+- `ScanPullbackArtifact.disposeResiduals()` — for `primalForwardJaxpr` and `tangentBody`
+  (locally-owned)
+- Direct call in `lax-scan.ts` — at scan body jaxpr end-of-life points
+
+### Contract 2: Anonymous Constants (phantom creation ref)
+
+Arrays created inside `makeJaxpr` bodies (e.g., `np.zeros(...)`, `np.eye(...)`) have no external
+owner — nobody holds the rc=1 creation ref. This "phantom" ref must be balanced by an extra
+`.dispose()` beyond what `ClosedJaxpr.dispose()` does.
+
+**Mechanism:**
+
+1. Factory calls `markAnonymousIfTracing(arr)` → adds to `anonymousConstArrays` WeakSet
+2. `Array[Symbol.dispose]()` is a **no-op** for anonymous consts during tracing (prevents `using`
+   from decrementing rc during trace phase)
+3. `getOrMakeConstTracer` does `.ref` (rc=2) and `_incrementBuilderRef(val)` (tracks builder count)
+4. `ClosedJaxpr.dispose()` does `.dispose()` (rc=1), `_decrementBuilderRef`, then
+   `_anonymousExtraDispose` (fires rc=1→0 if no other builders hold a ref)
+5. If `_inlineLiterals` inlines a scalar const as a `Lit` node, it does `.dispose()` +
+   `_decrementBuilderRef` immediately and defers the extra dispose to
+   `ClosedJaxpr.#inlinedAnonymousConsts`
+
+**The `_anonymousBuilderRefs` WeakMap** tracks how many `ClosedJaxpr` instances currently own a
+`.ref` on an anonymous const. This prevents premature disposal when the same const is captured by
+multiple nested builders (e.g., `jit(valueAndGrad(scan(...)))` creates JaxprTrace → JvpTrace →
+PartialEvalTrace, each with its own builder).
+
+| Scenario                              | rc                 | builderRefs | Extra dispose fires?                    |
+| ------------------------------------- | ------------------ | ----------- | --------------------------------------- |
+| 1 builder, no user ref                | 2→1→0              | 1→0         | Yes (last builder disposed)             |
+| 2 builders, no user ref               | 3→2→1→0            | 2→1→0       | Yes (after second CJ.dispose)           |
+| 1 builder, user disposed during trace | 1→0                | 1→0         | No (rc already 0 or array already gone) |
+| Inlined as Lit                        | 2→1, then deferred | 1→0         | Yes (via `#inlinedAnonymousConsts`)     |
+
+**Multi-output PETracer `.ref` inflation (fixed):** When a Const PETracer is input to a multi-output
+equation (e.g., Scan with N carry+Y outputs), `processPrimitive` calls
+`tracersIn.forEach(t => t.ref)` for each output beyond the first, inflating PETracer `#rc` to N. The
+cleanup in `partialEvalGraphToJaxpr` must loop `while (t.isAlive) t.dispose()` to fully drain `#rc`
+and trigger the cascade to `recipe.val.dispose()`, which balances `instantiateConst`'s `.ref` on the
+underlying array. A single `t.dispose()` call leaves `#rc > 0`, preventing the cascade and leaking
+the `instantiateConst` ref — which in turn blocks `_anonymousExtraDispose` from firing (rc > 1 when
+builderRefs reaches 0).
+
+**`fullInternal` marking:** `fullInternal()` now calls `markAnonymousIfTracing()` (since the
+`_anonymousBuilderRefs` mechanism was added). This is safe because:
+
+1. `evalJaxpr` call sites `.ref` consts before use — `evalJaxpr` never directly disposes
+   `ClosedJaxpr.consts`.
+2. `ClosedJaxpr.dispose()` guards the anonymous extra with `refCount > 0` — no UAF when the const
+   was already freed.
+3. The `!inMakeJaxprBody()` guard defers the extra dispose to the outermost level.
+
+Historically, marking `fullInternal` caused use-after-free because there was no builder-ref
+tracking. The `_anonymousBuilderRefs` WeakMap now prevents premature firing.
+
+**Key files:** `markAnonymousIfTracing` in `array.ts`, `_anonymousBuilderRefs` /
+`_incrementBuilderRef` / `_decrementBuilderRef` / `_anonymousExtraDispose` /
+`_processDeferredAnonymousDisposes` in `jaxpr.ts`, `ClosedJaxpr.dispose()` / `_inlineLiterals` in
+`jaxpr.ts`.
+
+### Contract 3: `partialEvalGraphToJaxpr` double `.ref`
+
+When `partialEvalGraphToJaxpr` builds the backward jaxpr for `grad`/`linearize`, it `.ref`s each
+const **again** to give the resulting `ClosedJaxpr` independent ownership. This is needed because
+the function also disposes Const PETracers (which cascade to `recipe.val.dispose()`), balancing the
+`.ref` from `instantiateConst`.
+
+| Step                             | What happens                                                         | RC effect           |
+| -------------------------------- | -------------------------------------------------------------------- | ------------------- |
+| `instantiateConst` (in PE trace) | `val.ref` via `getOrMakeConstTracer` on the PE trace's builder       | rc+1                |
+| `partialEvalGraphToJaxpr`        | `c.ref` + `_incrementBuilderRef` for each const                      | rc+1, builderRefs+1 |
+| Const PETracer cleanup           | `while (t.isAlive) t.dispose()` → cascades to `recipe.val.dispose()` | rc−1                |
+| Result `ClosedJaxpr.dispose()`   | balances the `.ref` from step 2                                      | rc−1                |
+
+**Without step 2:** The PETracer cleanup (step 3) would consume the const's only ref, leaving
+`ClosedJaxpr` with a dangling reference. When `ClosedJaxpr.dispose()` runs later, it would free
+user-owned arrays.
+
+**Key file:** `partialEvalGraphToJaxpr` in `linearize.ts` (~line 1150–1170).
+
+### Contract 4: `evalJaxpr` is non-consuming
+
+`evalJaxpr` never disposes input arrays. It auto-disposes **intermediates** (equation outputs) at
+their last use, but inputs (marked via `inputVars` set) are protected. Pass-through outputs (where
+an output IS an input array) get `.ref`'d so callers can safely dispose inputs without killing
+outputs.
+
+**Contract:** Callers of `evalJaxpr` own both their inputs and the returned outputs. Callers must
+dispose any temporaries they created before calling `evalJaxpr` (e.g., `zerosInternal` placeholders
+in scan executor). Lit-created arrays inside `evalJaxpr` are tracked and auto-disposed.
+
+**Key file:** `evalJaxpr` in `jaxpr.ts`.
+
+### Contract 5: `evalJaxprTransposed` internal array tracking
+
+The backward pass (`evalJaxprTransposed`) creates many internal arrays (zeros for missing
+cotangents, accumulated sums). These are tracked in an `internalArrays` set and batch-disposed at
+the end, EXCEPT:
+
+- **External cotangents** (seeds from caller) are in `externalCts` and never disposed
+- **Arg primals** are caller-owned and protected via `argPrimals` set
+- **Known primals** computed internally may need `.ref` protection if they escape as outputs along
+  with being consumed as intermediates
+
+The `markAnonymous` option controls whether zeros created by `readCotangent` are marked as anonymous
+consts. This is `true` when `evalJaxprTransposed` runs inside a `makeJaxpr` trace (e.g.,
+`transposeJaxpr`), ensuring the zeros become builder-owned rather than leaking.
+
+**Key file:** `evalJaxprTransposed` in `linearize.ts`.
+
+### Contract 6: Cache-owned jaxprs
+
+Several caches store `ClosedJaxpr` objects that **must not** be disposed by callers:
+
+| Cache                 | Type                          | Key                                         | Owns                    | Disposed by                         |
+| --------------------- | ----------------------------- | ------------------------------------------- | ----------------------- | ----------------------------------- |
+| `transposeJaxprCache` | `Map<Jaxpr, Map<string, CJ>>` | `(jaxpr, JSON.stringify(undefPrimals))`     | Transposed body jaxprs  | `_registerJitCacheDisposer` cleanup |
+| `jvpJaxprCache`       | `Map<Jaxpr, CJ>`              | jaxpr                                       | JVP'd body jaxprs       | `_registerJitCacheDisposer` cleanup |
+| `vmapJaxprCache`      | `Map<Jaxpr, Map<string, CJ>>` | `(jaxpr, JSON.stringify([axisSize, dims]))` | Vectorized body jaxprs  | `_registerJitCacheDisposer` cleanup |
+| `jitCompileCache`     | `Map<string, JitProgram>`     | jaxpr signature                             | `JitProgram` step lists | `_registerJitCacheDisposer` cleanup |
+
+**Critical rule:** Code that obtains a `ClosedJaxpr` from these caches must treat it as borrowed —
+read-only access, no `.dispose()`. All cache cleanup is centralized through `_disposeAllJitCaches()`
+which is called by `clearCaches()` and `checkLeaks.stop()`.
+
+### Contract 7: JIT cache disposal architecture
+
+Module-level `jit()` functions (like `fmod = jit(...)` in `numpy.ts`, `fftUpdate = jit(...)` in
+`numpy-fft.ts`) create cached `ClosedJaxpr` objects with const arrays. These must be freed between
+tests. Two mechanisms handle this:
+
+1. **`_registerJitCacheDisposer(fn)`** — called at module load by `jit.ts` to register the global
+   `_clearJitCompileCache` function. Also used by `jvp.ts`, `linearize.ts`, `vmap.ts` for their
+   caches. Clears the cache Maps.
+2. **`_jitFunctionDisposers`** — a `Set<() => void>` in `check-leaks.ts`. Each `jit()` call in
+   `jaxpr.ts` registers `result.dispose` (which disposes `ClosedJaxpr` consts + clears the
+   per-function tracing cache).
+
+Both are called by `_disposeAllJitCaches()` during `checkLeaks.stop()` and `clearCaches()`. The
+import direction is safe: `jit.ts → check-leaks.ts` and `jaxpr.ts → check-leaks.ts` (check-leaks
+only imports from `../backend`, no cycles).
+
+### Contract 8: Unreachable Const PETracer disposal
+
+When `hasAux` is used with `vjp`/`linearize`, aux computations may call `instantiateConst` on input
+arrays, creating Const PETracers. If the aux outputs aren't in the jaxpr graph (they're captured
+separately), these Const PETracers are unreachable from `tracersOut` and never processed by
+`partialEvalGraphToJaxpr`. The `.ref` from `instantiateConst` is never balanced by the normal
+cleanup path.
+
+**Fix:** All Const PETracers are tracked in `PartialEvalTrace.allConstPETracers` (via
+`main.globalData`). After `partialEvalGraphToJaxpr` returns, `partialEvalFlat` disposes any
+remaining PETracers whose recipe values are still alive — balancing the `.ref` from
+`instantiateConst`.
+
+### Contract 9: User-disposed constants protection
+
+When user code inside a `grad` body disposes an array that was also captured as a `ClosedJaxpr`
+constant, the array's rc drops to 1 (only the builder's `.ref` remains). Without protection,
+residual cleanup would take this last ref and free the const before the backward pass reads it.
+
+**Fix:** In `linearizeFlat` and `vjpFlat`, before residual cleanup, protect jaxpr consts whose
+`c.refCount <= 1` by skipping their disposal. Normal consts (rc ≥ 2) are safely disposed; only
+user-disposed consts need protection.
+
+### Debugging ref imbalances
+
+When investigating a leak (rc > 0 at test end) or use-after-free (rc = 0 too early):
+
+1. **Identify the array** — shape/dtype from error or `checkLeaks` report
+2. **Enable debug logging** — `_setDebugAnonymousConsts(true)` traces all anonymous const lifecycle
+   events: CAPTURE, incrementBuilderRef, decrementBuilderRef, extraDispose SKIP/DEFER/FIRE
+3. **Track the ref balance** — each `.ref` must pair with exactly one `.dispose()`:
+   - `getOrMakeConstTracer` `.ref` → `ClosedJaxpr.dispose()` `.dispose()`
+   - `partialEvalGraphToJaxpr` `.ref` → that `ClosedJaxpr.dispose()` `.dispose()`
+   - `instantiateConst` `.ref` → Const PETracer cleanup `.dispose()`
+   - `evalJaxpr` pass-through `.ref` → caller's `.dispose()` of the output
+4. **Check `_anonymousBuilderRefs`** — if a const has `builderRefs > 0` when its `ClosedJaxpr` is
+   disposed, the extra dispose is SKIPPED (another builder still holds it). The extra dispose fires
+   only when the last builder decrements to 0.
+5. **Check nested builder scenarios** — `jit(valueAndGrad(scan(...)))` creates 3+ nested builders.
+   An anonymous const may be captured by multiple builders, each adding a `.ref` +
+   `_incrementBuilderRef`. Each `ClosedJaxpr.dispose()` does `.dispose()` + `_decrementBuilderRef`.
+   The extra anonymous dispose fires only after the last builder's `ClosedJaxpr` is disposed.
+
+### Common ref-balancing mistakes
+
+| Mistake                                                          | Symptom                                                                       | Fix                                                                                                    |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Missing `_incrementBuilderRef` after `.ref` for anonymous const  | `builderRefs=0` but `rc>1`, extra dispose fires too early → UAF               | Add `_incrementBuilderRef` alongside `.ref`                                                            |
+| Missing `_decrementBuilderRef` in disposal path                  | Extra dispose never fires → leak (rc=1 forever)                               | Add `_decrementBuilderRef` in the matching disposal                                                    |
+| Disposing cache-owned jaxpr                                      | UAF in next cache hit                                                         | Never dispose results from `transposeJaxprCache` etc.                                                  |
+| `.ref` without matching `.dispose()` on error path               | Leak on exceptions                                                            | Use `try/finally` or ensure cleanup runs on all paths                                                  |
+| Removing `markAnonymousIfTracing` from `fullInternal`            | Leak — phantom creation ref never balanced for internally-created consts      | Keep `markAnonymousIfTracing` in `fullInternal`; safety guards in `_anonymousExtraDispose` prevent UAF |
+| Single `.dispose()` on Const PETracer with multi-output equation | `instantiateConst` `.ref` never balanced → leak (`rc>1` when `builderRefs=0`) | Use `while (t.isAlive) t.dispose()` to drain inflated `#rc` from `processPrimitive`                    |
 
 ---
 
@@ -1007,5 +1237,5 @@ multithreaded + WebGPU fused | M8: Benchmarks + dead code audit
 | DUS vmap shrink+concat decomposition            | JIT `dus` axis=0 only; vmap shifts axis → decompose to concat                                                                                                                                               |
 | ScatterAdd vmap: shared indices only            | 1-D indices, same positions for all slices                                                                                                                                                                  |
 | `jit()` function-identity dedup                 | WeakMap prevents cache bloat; inline arrows NOT deduped                                                                                                                                                     |
-| `markAnonymousIfTracing` + `inMakeJaxprBody`    | Array factories mark anonymous consts; `fullInternal` exempt                                                                                                                                                |
+| `markAnonymousIfTracing` + `inMakeJaxprBody`    | Array factories mark anonymous consts; `fullInternal` also uses `markAnonymousIfTracing` (safe with `_anonymousBuilderRefs`)                                                                                |
 | Non-consuming `evalJaxpr`                       | Inputs protected by `inputVars` set; callers dispose temporaries explicitly. `.ref` at call sites was move-semantics leftover causing leaks. Pass-through outputs `.ref`'d; Lit arrays tracked and disposed |

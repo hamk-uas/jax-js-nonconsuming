@@ -136,6 +136,22 @@ bodies with dynamic control flow or non-encodable patterns.
 
 ## 6. Implementation Phases
 
+### Phase 0: Ownership-Correctness Gate (prerequisite, complete)
+
+Before any scan-lowering work begins, the ownership / ref-balance layer must be stable for the
+compositions that scan lowering exercises: `jit(valueAndGrad(scan(...)))`, `grad(scan(linalg))`,
+nested `scan(assocScan(...))`, and cache cleanup paths (`clearCaches`, `checkLeaks.stop`).
+
+Key fix landed: `partialEvalGraphToJaxpr` Const PETracer cleanup now drains inflated `#rc`
+(`while (t.isAlive) t.dispose()`) so the cascade to `recipe.val.dispose()` fires exactly once.
+Without this, multi-output equations (Scan with N carry+Y outputs) inflated PETracer `#rc` via
+`processPrimitive`, leaving `instantiateConst`'s `.ref` unbalanced and blocking
+`_anonymousExtraDispose` (rc > 1 when builderRefs reached 0). See copilot-instructions.md Contract 2
+"Multi-output PETracer `.ref` inflation" and Contract 3.
+
+**Gate criterion:** `pnpm vitest run` passes with zero leak failures across all 60 test files,
+including `transform-compositions.test.ts`, `lax-scan.test.ts`, and `check-leaks.test.ts`.
+
 ### Phase 1: Extended Fused Shader — Dispatch Reduction (~320 LOC)
 
 Extend `nativeScanMultiShaderSource()` to accept bodies with same-gidx internal deps, carry RAW
@@ -773,6 +789,7 @@ Future (not in scope):
 | while_loop iteration bound unknown      | Can't pre-encode | Require `max_iter` hint for bounded path; JS loop otherwise                 |
 | cond "execute both" waste               | 2× compute       | Acceptable for small branches. Large branches get future optimisation       |
 | Recursive encoding stack depth          | Crash            | Cap recursion at 3 levels; deeper nesting uses fallback                     |
+| Transform-level ref-balance bugs        | Silent leaks     | Ownership gate (Phase 0); `checkLeaks` in all scan tests; see Contract 2-3  |
 
 ---
 
@@ -792,6 +809,7 @@ Future (not in scope):
 | assocScan execution not inline in jit.ts                                        | 4       | Code review: `jit.ts` assoc_scan case is ≤5 lines                  |
 | classifyBodySteps shared by ≥2 planning functions                               | 4       | grep: ≥2 call sites in `scan-plan.ts`                              |
 | No GPU memory leaks (transient buffers destroyed)                               | 1,2     | `checkLeaks` in all new tests                                      |
+| Ownership-correct under nested transforms (`jit(grad(scan(...)))`)              | 0,1,2   | `checkLeaks` + multi-output PETracer paths + cache cleanup         |
 | All existing tests pass                                                         | 1,2,3,4 | `pnpm vitest run` green                                            |
 
 ---
