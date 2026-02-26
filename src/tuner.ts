@@ -442,11 +442,16 @@ export function tuneWebgpu(
   // Skip local tiling when cooperative groups are active — the workgroup
   // is already dedicated to the shared-memory reduction.
   if (dim.groups === dim.reduce) {
+    const maxWg = caps?.maxComputeWorkgroupSizeX ?? 256;
     for (const ax of sorted(upcastedAxis)) {
+      // After applyLocal permutations, upcastedAxis indices may point at
+      // axes that are already in the local range. Skip them to avoid
+      // decrementing dim.local past global axes into the local range.
+      if (ax >= dim.local && ax < dim.groups) continue;
       const s = dim.st.shape[ax];
-      // TODO: These applyLocal() calls are a hack / bad heuristic, make this better.
+      const currentLocal = prod(dim.st.shape.slice(dim.local, dim.groups));
       for (const amount of [8, 4]) {
-        if (s % amount === 0) {
+        if (s % amount === 0 && currentLocal * amount <= maxWg) {
           dim.applyLocal(ax, amount);
           break;
         }

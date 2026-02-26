@@ -879,13 +879,7 @@ export class WebGPUBackend implements Backend {
         size: uniformSize,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
-      this.device.queue.writeBuffer(
-        uniformBuf,
-        0,
-        uniformData.buffer,
-        0,
-        uniformData.byteLength,
-      );
+      this.device.queue.writeBuffer(uniformBuf, 0, uniformData);
 
       // Create bind groups
       const storageEntries: GPUBindGroupEntry[] = [
@@ -2142,12 +2136,13 @@ function pipelineSource(
     const threadCount = tune.threadCount as number;
     const tuneLocal = tune.size.local ?? 1;
     const tuneGroups = (tune as WebGPUTuneResult).size.groups ?? 1;
+    const maxWgSize = device.limits.maxComputeWorkgroupSizeX;
     if (tuneGroups > 1) {
-      workgroupSize = tuneGroups;
+      workgroupSize = Math.min(tuneGroups, maxWgSize);
     } else if (tuneLocal > 1) {
-      workgroupSize = tuneLocal;
+      workgroupSize = Math.min(tuneLocal, maxWgSize);
     } else {
-      workgroupSize = findPow2(threadCount, 256);
+      workgroupSize = findPow2(threadCount, Math.min(256, maxWgSize));
     }
     const gridSize = Math.ceil(threadCount / workgroupSize);
     [gridX, gridY] = calculateGrid(gridSize);
