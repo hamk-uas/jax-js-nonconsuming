@@ -55,7 +55,7 @@ const recommended: Linter.Config = {
     "jax-js/no-make-disposable-alias": "warn",
     "jax-js/no-unnecessary-ref": "warn",
     "jax-js/no-array-chain": "off",
-    "jax-js/no-nested-array-leak": "warn",
+    "jax-js/no-nested-array-leak": "error",
     "jax-js/require-scan-result-dispose": "warn",
   },
 };
@@ -98,6 +98,7 @@ const invariance: Linter.Config = {
     "jax-js/no-dispose-then-reassign-param": "error",
     "jax-js/no-make-disposable-alias": "error",
     "jax-js/no-unnecessary-ref": "error",
+    "jax-js/no-nested-array-leak": "error",
     "jax-js/require-scan-result-dispose": "error",
   },
 };

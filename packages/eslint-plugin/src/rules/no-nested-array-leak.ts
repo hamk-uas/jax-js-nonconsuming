@@ -1,6 +1,7 @@
 import type { Rule } from "eslint";
 
 import { isArrayProducingCall } from "../array-detection";
+import { isInsideTracedBody } from "../tracing-detection";
 import { getMemberName, hasAllowComment } from "../types";
 
 /**
@@ -15,6 +16,9 @@ import { getMemberName, hasAllowComment } from "../types";
  * Fix: extract to a `using` binding:
  *   using G_3d = np.reshape(G, [1, m, m]);
  *   np.tile(G_3d, [n, 1, 1]);
+ *
+ * Suppressed inside tracing transform bodies (jit, grad, vmap, scan, etc.)
+ * where intermediates are automatically managed by the JIT compiler.
  *
  * NOTE: This rule uses heuristics (method name matching) and may produce
  * false positives on non-array objects whose methods share names with
@@ -41,6 +45,7 @@ const noNestedArrayLeak: Rule.RuleModule = {
         if (!isArrayProducingCall(node)) return;
         if (hasAllowComment(context, node, "jax-js-lint: allow-non-using"))
           return;
+        if (isInsideTracedBody(node, context)) return;
 
         for (const arg of node.arguments as any[]) {
           if (!isArrayProducingCall(arg)) continue;

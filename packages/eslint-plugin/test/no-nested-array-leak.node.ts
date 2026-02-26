@@ -119,6 +119,80 @@ function f(G) {
   assert.equal(messages.length, 0);
 });
 
+// ── Tracing suppression: should NOT report inside traced bodies ──────────
+
+test("no-nested-array-leak: suppressed inside inline jit body", async () => {
+  const code = `
+const f = jit((x) => np.tile(np.reshape(x, [1, 2, 2]), [10, 1, 1]));
+`;
+  const messages = await lint(code);
+  assert.equal(messages.length, 0);
+});
+
+test("no-nested-array-leak: suppressed inside inline grad body", async () => {
+  const code = `
+const g = grad((x) => np.add(np.square(x), np.eye(2)).sum());
+`;
+  const messages = await lint(code);
+  assert.equal(messages.length, 0);
+});
+
+test("no-nested-array-leak: suppressed inside inline vmap body", async () => {
+  const code = `
+const h = vmap((x) => np.tile(np.reshape(x, [1, 3]), [2, 1]));
+`;
+  const messages = await lint(code);
+  assert.equal(messages.length, 0);
+});
+
+test("no-nested-array-leak: suppressed inside lax.scan step function", async () => {
+  const code = `
+const [carry, ys] = lax.scan(
+  (c, x) => [np.add(c, np.reshape(x, [1, 2])), c],
+  init,
+  xs,
+);
+`;
+  const messages = await lint(code);
+  assert.equal(messages.length, 0);
+});
+
+test("no-nested-array-leak: suppressed for named function passed to grad", async () => {
+  const code = `
+const f = (x) => np.tile(np.reshape(x, [1, 2]), [3, 1]).sum();
+const df = grad(f);
+`;
+  const messages = await lint(code);
+  assert.equal(messages.length, 0);
+});
+
+test("no-nested-array-leak: suppressed for named function passed to jit", async () => {
+  const code = `
+const f = (x) => np.add(np.square(x), np.eye(2));
+const jf = jit(f);
+`;
+  const messages = await lint(code);
+  assert.equal(messages.length, 0);
+});
+
+test("no-nested-array-leak: suppressed inside hessian composition", async () => {
+  const code = `
+const h = hessian((x) => np.add(np.square(x), np.eye(2)).sum());
+`;
+  const messages = await lint(code);
+  assert.equal(messages.length, 0);
+});
+
+test("no-nested-array-leak: NOT suppressed outside tracing context", async () => {
+  const code = `
+function f(x) {
+  return np.tile(np.reshape(x, [1, 2, 2]), [10, 1, 1]);
+}
+`;
+  const messages = await lint(code);
+  assert.equal(messages.length, 1);
+});
+
 test("no-nested-array-leak: lax factory nested in np call flags inner", async () => {
   const code = `
 function f(x) {

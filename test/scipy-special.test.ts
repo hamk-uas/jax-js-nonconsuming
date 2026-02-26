@@ -46,7 +46,8 @@ suite.each(devices)("device:%s", (device) => {
     test("erf derivative", () => {
       using x = np.linspace(-3, 3, 10);
       using dy = vmap(grad(special.erf))(x);
-      using negSq = np.negative(np.square(x));
+      using xSq = np.square(x);
+      using negSq = np.negative(xSq);
       using expNegSq = np.exp(negSq);
       using expected = np.multiply(2 / Math.sqrt(Math.PI), expNegSq);
       expect(dy).toBeAllclose(expected);
@@ -55,7 +56,8 @@ suite.each(devices)("device:%s", (device) => {
     test("erfc derivative", () => {
       using x = np.linspace(-3, 3, 10);
       using dy = vmap(grad(special.erfc))(x);
-      using negSq = np.negative(np.square(x));
+      using xSq = np.square(x);
+      using negSq = np.negative(xSq);
       using expNegSq = np.exp(negSq);
       using expected = np.multiply(-2 / Math.sqrt(Math.PI), expNegSq);
       expect(dy).toBeAllclose(expected);

@@ -85,9 +85,8 @@ suite.each(devices)("device:%s", (device) => {
     // Without Kahan, naive summation of many small terms loses precision.
     // Sum 10000 copies of 1e-8: exact answer is 1e-4.
     const n = 10000;
-    using a = np
-      .ones([n], { dtype: np.float64 })
-      .mul(np.array([1e-8], { dtype: np.float64 }));
+    using scale = np.array([1e-8], { dtype: np.float64 });
+    using a = np.ones([n], { dtype: np.float64 }).mul(scale);
     using s = np.sum(a);
     const result: number = await s.jsAsync();
     // Kahan gives ~1e-16 relative error; naive gives ~1e-12 for n=10000.
@@ -98,12 +97,9 @@ suite.each(devices)("device:%s", (device) => {
     // Dot product of 50000 small values where naive summation loses precision.
     // Each product is 1e-8, so exact dot = 50000 * 1e-8 = 5e-4.
     const n = 50000;
-    using a = np
-      .ones([n], { dtype: np.float64 })
-      .mul(np.array([1e-4], { dtype: np.float64 }));
-    using b = np
-      .ones([n], { dtype: np.float64 })
-      .mul(np.array([1e-4], { dtype: np.float64 }));
+    using scale = np.array([1e-4], { dtype: np.float64 });
+    using a = np.ones([n], { dtype: np.float64 }).mul(scale);
+    using b = np.ones([n], { dtype: np.float64 }).mul(scale);
     using result = np.dot(a, b);
     const val: number = await result.jsAsync();
     // Each a[i]*b[i] = 1e-8, dot = 50000 * 1e-8 = 5e-4.
@@ -115,9 +111,8 @@ suite.each(devices)("device:%s", (device) => {
     // Verify compensated summation works under JIT too.
     using f = jit((x: np.Array, y: np.Array) => np.dot(x, y));
     const n = 5000;
-    using a = np
-      .ones([n], { dtype: np.float64 })
-      .mul(np.array([1e-8], { dtype: np.float64 }));
+    using scale = np.array([1e-8], { dtype: np.float64 });
+    using a = np.ones([n], { dtype: np.float64 }).mul(scale);
     using b = np.ones([n], { dtype: np.float64 });
     using result = f(a, b);
     const val: number = await result.jsAsync();

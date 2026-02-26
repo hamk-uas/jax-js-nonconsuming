@@ -30,7 +30,9 @@ suite("tree.dispose", () => {
   });
 
   test("handles aliased leaves without double-dispose", () => {
-    using base = np.add(np.array([1.0]), np.array([2.0]));
+    using a = np.array([1.0]);
+    using b = np.array([2.0]);
+    using base = np.add(a, b);
     const aliased = { xf_0: base, yhat: base };
 
     expect(() => tree.dispose(aliased)).not.toThrow();
@@ -78,7 +80,9 @@ suite("tree.makeDisposable", () => {
   });
 
   test("works with aliased object result", () => {
-    using base = np.add(np.array([1.0]), np.array([2.0]));
+    using a = np.array([1.0]);
+    using b = np.array([2.0]);
+    using base = np.add(a, b);
     // eslint-disable-next-line jax-js/no-make-disposable-alias
     const result = tree.makeDisposable({ xf_0: base, yhat: base });
 

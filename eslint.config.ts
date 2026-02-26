@@ -108,18 +108,19 @@ export default defineConfig([
     ...(jaxJsPlugin.configs!.invariance as any),
   },
   // Internal framework code manipulates Slots, shapes, Jaxprs — not np.Arrays.
-  // Disable require-using there to avoid pervasive false positives.
+  // Disable require-using and no-nested-array-leak (AluExp false positives).
   {
     files: [
       "src/frontend/**/*.ts",
       "src/library/**/*.ts",
       "src/backend/**/*.ts",
       "src/tuner.ts",
-      "src/*.test.ts",
+      "src/*.ts",
     ],
     ignores: ["**/*.test.ts"],
     rules: {
       "jax-js/require-using": "off",
+      "jax-js/no-nested-array-leak": "off",
     },
   },
   // Also disable for .test.ts files inside src/ (they test internals)
@@ -127,6 +128,14 @@ export default defineConfig([
     files: ["src/**/*.test.ts"],
     rules: {
       "jax-js/require-using": "off",
+    },
+  },
+  // ONNX operators always run in compiled context; intermediates are
+  // managed by the JIT compiler.
+  {
+    files: ["packages/onnx/**/*.ts"],
+    rules: {
+      "jax-js/no-nested-array-leak": "off",
     },
   },
   // `new Array({source: ...})` in exported factory functions must be wrapped
