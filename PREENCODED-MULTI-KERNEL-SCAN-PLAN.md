@@ -449,7 +449,9 @@ export type ScanPlan =
 **Storage buffer limit check:**
 
 Each step's pipeline binds: consts + 1 carry-read + xs + internal reads + output. Must fit within
-`maxStorageBuffersPerShaderStage - 1` (typically 7–9). Checked at preparation time; fall back if
+`maxStorageBuffersPerShaderStage - 1` (7 at minimum spec of 8; 9 on 99.6% of devices with limit 10;
+see copilot-instructions.md WebGPU hard limits table for full coverage data from
+[web3dsurvey.com](https://web3dsurvey.com/webgpu)). Checked at preparation time; fall back if
 exceeded.
 
 **Files changed:**
@@ -776,20 +778,20 @@ Future (not in scope):
 
 ## 12. Risks & Mitigations
 
-| Risk                                    | Impact           | Mitigation                                                                  |
-| --------------------------------------- | ---------------- | --------------------------------------------------------------------------- |
-| Same-gidx analysis false positive       | Wrong results    | Conservative reject; false negative = fallback                              |
-| Command buffer size limits              | Driver error     | Chunk into ≤1024-iteration blocks. 10 submits still 25× fewer than fallback |
-| Nested loop command buffer explosion    | Driver error     | Product N_outer×N_inner×S guard; chunk or fall back above threshold         |
-| Storage buffer limit (8–10)             | Can't bind       | Admission control at preparation time. Fall back                            |
-| Shader compilation cost (S pipelines)   | ~50–100 ms       | Pipeline cache amortizes. Bodies are deterministic                          |
-| Routine bind group complexity           | Impl effort      | Phase 3 deferred. Phase 2 covers kernel-only + nested loops                 |
-| `var<private>` register pressure        | GPU occupancy    | Monitor. Fallback if step count > 16                                        |
-| Deferred-write changes shader structure | Regression       | Existing tests cover; Phase 1 extends, does not restructure working paths   |
-| while_loop iteration bound unknown      | Can't pre-encode | Require `max_iter` hint for bounded path; JS loop otherwise                 |
-| cond "execute both" waste               | 2× compute       | Acceptable for small branches. Large branches get future optimisation       |
-| Recursive encoding stack depth          | Crash            | Cap recursion at 3 levels; deeper nesting uses fallback                     |
-| Transform-level ref-balance bugs        | Silent leaks     | Ownership gate (Phase 0); `checkLeaks` in all scan tests; see Contract 2-3  |
+| Risk                                            | Impact           | Mitigation                                                                  |
+| ----------------------------------------------- | ---------------- | --------------------------------------------------------------------------- |
+| Same-gidx analysis false positive               | Wrong results    | Conservative reject; false negative = fallback                              |
+| Command buffer size limits                      | Driver error     | Chunk into ≤1024-iteration blocks. 10 submits still 25× fewer than fallback |
+| Nested loop command buffer explosion            | Driver error     | Product N_outer×N_inner×S guard; chunk or fall back above threshold         |
+| Storage buffer limit (8 min, 100%; 10 on 99.6%) | Can't bind       | Admission control at preparation time. Fall back                            |
+| Shader compilation cost (S pipelines)           | ~50–100 ms       | Pipeline cache amortizes. Bodies are deterministic                          |
+| Routine bind group complexity                   | Impl effort      | Phase 3 deferred. Phase 2 covers kernel-only + nested loops                 |
+| `var<private>` register pressure                | GPU occupancy    | Monitor. Fallback if step count > 16                                        |
+| Deferred-write changes shader structure         | Regression       | Existing tests cover; Phase 1 extends, does not restructure working paths   |
+| while_loop iteration bound unknown              | Can't pre-encode | Require `max_iter` hint for bounded path; JS loop otherwise                 |
+| cond "execute both" waste                       | 2× compute       | Acceptable for small branches. Large branches get future optimisation       |
+| Recursive encoding stack depth                  | Crash            | Cap recursion at 3 levels; deeper nesting uses fallback                     |
+| Transform-level ref-balance bugs                | Silent leaks     | Ownership gate (Phase 0); `checkLeaks` in all scan tests; see Contract 2-3  |
 
 ---
 

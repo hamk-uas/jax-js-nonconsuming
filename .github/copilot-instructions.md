@@ -220,13 +220,16 @@ all algorithm choices.
 
 ### Hard limits and how jax-js handles them
 
-| Limit                              | Typical Value | Impact on jax-js                                                                |
-| ---------------------------------- | ------------- | ------------------------------------------------------------------------------- |
-| `maxStorageBuffersPerShaderStage`  | 8-10          | Limits kernel inputs; `splitGraphDataflow` P2 prevents overflow                 |
-| `maxComputeWorkgroupsPerDimension` | 65535         | Large arrays need 2D grid splitting via `calculateGrid()`                       |
-| `maxComputeWorkgroupSizeX`         | 256           | Limits threads per workgroup (Sort workgroup size)                              |
-| `minUniformBufferOffsetAlignment`  | 256 bytes     | Dynamic uniform offsets must be 256-byte aligned                                |
-| `minStorageBufferOffsetAlignment`  | 256 bytes     | Can't use buffer offsets for arbitrary strides → uniform-based offsets for scan |
+Device coverage data from [web3dsurvey.com](https://web3dsurvey.com/webgpu) (Feb 2026).
+
+| Limit                              | Minimum Value | Coverage at min | Higher tiers             | Impact on jax-js                                                                |
+| ---------------------------------- | ------------- | --------------- | ------------------------ | ------------------------------------------------------------------------------- |
+| `maxStorageBuffersPerShaderStage`  | 8             | 100%            | 10 (99.6%), 16 (16%)     | Limits kernel inputs; `splitGraphDataflow` P2 prevents overflow                 |
+| `maxComputeWorkgroupsPerDimension` | 65535         | 100%            | —                        | Large arrays need 2D grid splitting via `calculateGrid()`                       |
+| `maxComputeWorkgroupSizeX`         | 256           | 100%            | 1024 (85%)               | Limits threads per workgroup (Sort workgroup size)                              |
+| `maxComputeWorkgroupStorageSize`   | 16384 (16 KB) | 100%            | 32 KB (99%), 49 KB (12%) | Shared memory budget for cooperative reductions, workgroup-local scan           |
+| `minUniformBufferOffsetAlignment`  | 32 bytes      | 100%            | 256 (89%)                | Dynamic uniform offsets; code uses 256 conservatively                           |
+| `minStorageBufferOffsetAlignment`  | 32 bytes      | 100%            | 256 (85%)                | Can't use buffer offsets for arbitrary strides → uniform-based offsets for scan |
 
 **Storage buffer limit handling:** `splitGraphDataflow()` P2 pass counts transitive fused
 dependencies for every kernel-dispatched equation and backtracks (splitting the fusion boundary)
@@ -264,17 +267,19 @@ performance.
 
 ### Features NOT exploited (opportunities)
 
-| Feature                   | What it enables                                     | Why not used yet                         |
-| ------------------------- | --------------------------------------------------- | ---------------------------------------- |
-| **Subgroups**             | SIMD-width operations (shuffle, reduce within wave) | Requires `subgroups` feature; not stable |
-| **Indirect dispatch**     | GPU-driven workgroup counts                         | No dynamic control flow needs it yet     |
-| **Texture sampling**      | Hardware-accelerated interpolation                  | All ops use storage buffers currently    |
-| **Tiled matrix multiply** | Shared memory blocking for large matmuls            | Matmul uses simple row×col accumulation  |
-| **Atomic operations**     | Lock-free reductions, histograms                    | Reductions done via shader accumulation  |
-| **timestamp-query**       | GPU-side profiling                                  | Requested but not wired up for profiling |
-| **Render pipelines**      | Visualization without readback                      | Would need separate rendering path       |
+| Feature                   | What it enables                                     | Device coverage | Why not used yet                           |
+| ------------------------- | --------------------------------------------------- | --------------- | ------------------------------------------ |
+| **Subgroups**             | SIMD-width operations (shuffle, reduce within wave) | **65.7%**       | Viable as fast path; needs fallback shader |
+| **Indirect dispatch**     | GPU-driven workgroup counts                         | 99.97%          | No dynamic control flow needs it yet       |
+| **Texture sampling**      | Hardware-accelerated interpolation                  | N/A             | All ops use storage buffers currently      |
+| **Tiled matrix multiply** | Shared memory blocking for large matmuls            | 100%            | Matmul uses simple row×col accumulation    |
+| **Atomic operations**     | Lock-free reductions, histograms                    | N/A             | Reductions done via shader accumulation    |
+| **timestamp-query**       | GPU-side profiling                                  | **99.2%**       | Requested but not wired up for profiling   |
+| **Render pipelines**      | Visualization without readback                      | N/A             | Would need separate rendering path         |
 
-**Subgroups opportunity:**
+Device coverage data from [web3dsurvey.com](https://web3dsurvey.com/webgpu) (Feb 2026).
+
+**Subgroups opportunity (65.7% device coverage):**
 
 Subgroups enable operations like `subgroupAdd()` that sum across a SIMD lane (typically 32-64
 threads) without explicit barriers. This would accelerate reductions significantly:
@@ -1184,14 +1189,14 @@ multithreaded + WebGPU fused | M8: Benchmarks + dead code audit
 
 ## Future performance work
 
-| ID  | Title                 | Priority | Notes                                                                                                                                                                                     |
-| --- | --------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P6  | Benchmark validation  | Medium   | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD, reductions. Extend `bench/matmul.bench.ts`                                                                                           |
-| P1  | Tiled matmul (WebGPU) | **High** | Shared-memory blocking (`var<workgroup>`) for 5-10× matmul speedup. `TILE=16`, 2 KB shared mem. Conv2d benefits automatically via Dot. Acceptance: 2048×2048 f32 ≥40% theoretical GFLOP/s |
-| P3  | i64 in wasmblr        | Medium   | Native i64 support (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins. Zero browser risk                                                                                          |
-| P2  | Relaxed SIMD FMA      | Medium   | `f32x4.relaxed_madd` for 2× dot-product throughput. Peephole: `Add(Mul(a,b),c) → relaxed_madd` in `translateExpCoreSimd()`. Needs runtime detection — Safari unsupported                  |
-| P4  | Conv2d tuning         | Medium   | Phase 1: benchmark after P1 (tiled matmul gives free improvement). Phase 2 (conditional): specialized WGSL for small kernels (3×3, 5×5)                                                   |
-| P5  | WebGPU subgroups      | Low      | `subgroupAdd()` for 2-4× faster reductions. **Blocked:** spec not stable, Chrome Canary only (Feb 2026). Implement when ≥2 browsers ship                                                  |
+| ID  | Title                 | Priority | Notes                                                                                                                                                                                                               |
+| --- | --------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P6  | Benchmark validation  | Medium   | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD, reductions. Extend `bench/matmul.bench.ts`                                                                                                                     |
+| P1  | Tiled matmul (WebGPU) | **High** | Shared-memory blocking (`var<workgroup>`) for 5-10× matmul speedup. `TILE=16`, 2 KB shared mem. Conv2d benefits automatically via Dot. Acceptance: 2048×2048 f32 ≥40% theoretical GFLOP/s                           |
+| P3  | i64 in wasmblr        | Medium   | Native i64 support (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins. Zero browser risk                                                                                                                    |
+| P2  | Relaxed SIMD FMA      | Medium   | `f32x4.relaxed_madd` for 2× dot-product throughput. Peephole: `Add(Mul(a,b),c) → relaxed_madd` in `translateExpCoreSimd()`. Needs runtime detection — Safari unsupported                                            |
+| P4  | Conv2d tuning         | Medium   | Phase 1: benchmark after P1 (tiled matmul gives free improvement). Phase 2 (conditional): specialized WGSL for small kernels (3×3, 5×5)                                                                             |
+| P5  | WebGPU subgroups      | Medium   | `subgroupAdd()` for 2-4× faster reductions. **65.7% device coverage** (web3dsurvey.com, Feb 2026). Viable as fast path with fallback. Primary targets: associative scan (barrier reduction), cooperative reductions |
 
 ---
 
