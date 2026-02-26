@@ -66,20 +66,8 @@ export async function playTTS(
       flowLMState = newFlowLMState;
       stepKey.dispose();
 
-      const isEosData = await isEos.data();
-      isEos.dispose();
-      if (isEosData[0] && eosStep === null) {
-        console.log(`🛑 EOS at step ${step}!`);
-        eosStep = step;
-      }
-      if (eosStep !== null && step >= eosStep + framesAfterEos) {
-        console.log(
-          `Generation ended at step ${step}, ${framesAfterEos} frames after EOS.`,
-        );
-        latent.dispose();
-        break;
-      }
-
+      // Concatenate latent to sequence before Mimi decode so all GPU work
+      // (FlowLM + Mimi) can pipeline without an intermediate sync point.
       {
         const oldSeq = sequence;
         sequence = np.concatenate([oldSeq, latent]);
@@ -87,12 +75,9 @@ export async function playTTS(
       }
       latent.dispose();
 
-      const timestamp = performance.now();
-      console.log(
-        `Generated step ${step} in ${(timestamp - lastTimestamp).toFixed(1)} ms`,
-      );
-      lastTimestamp = timestamp;
-
+      // Run Mimi decode before awaiting EOS — this lets FlowLM and Mimi GPU
+      // dispatches overlap in the same command batch, eliminating the fence
+      // between them (~3ms savings per step).
       using mimiInputSlice = sequence.slice([-1]);
       using mimiInputScaled = mimiInputSlice.mul(model.flowLM.embStd);
       using mimiInput = mimiInputScaled.add(model.flowLM.embMean);
@@ -104,6 +89,28 @@ export async function playTTS(
         step,
       );
       mimiState = newMimiState;
+
+      // Single GPU sync covers both FlowLM and Mimi work.
+      const isEosData = await isEos.data();
+      isEos.dispose();
+
+      const timestamp = performance.now();
+      console.log(
+        `Generated step ${step} in ${(timestamp - lastTimestamp).toFixed(1)} ms`,
+      );
+      lastTimestamp = timestamp;
+
+      if (isEosData[0] && eosStep === null) {
+        console.log(`EOS at step ${step}!`);
+        eosStep = step;
+      }
+      if (eosStep !== null && step >= eosStep + framesAfterEos) {
+        console.log(
+          `Generation ended at step ${step}, ${framesAfterEos} frames after EOS.`,
+        );
+        audio.dispose();
+        break;
+      }
 
       const lastAudioPromise = audioPromise;
       audioPromise = (async () => {
@@ -126,7 +133,7 @@ export async function playTTS(
     sequence.dispose();
     tree.dispose(flowLMState);
     tree.dispose(mimiState);
-    tree.dispose([model, embeds]);
+    embeds.dispose();
     await audioPromise;
   }
 }

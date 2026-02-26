@@ -1233,6 +1233,18 @@ function einsumFastPath(subscripts: string, args: any[]): Array | null {
         using result = matmul(a, bCol);
         return squeeze(result, [-1]);
       }
+      // Attention score: Q[B,L,N,H] @ K[B,S,N,H]^T -> [B,N,L,S]
+      case "BLNH,BSNH->BNLS": {
+        using at = transpose(a, [0, 2, 1, 3]); // [B,N,L,H]
+        using bt = transpose(b, [0, 2, 3, 1]); // [B,N,H,S]
+        return matmul(at, bt);
+      }
+      // Attention weighted values: attn[B,N,L,S] @ V[B,S,N,H] -> [B,L,N,H]
+      case "BNLS,BSNH->BLNH": {
+        using bt = transpose(b, [0, 2, 1, 3]); // [B,N,S,H]
+        using result = matmul(a, bt); // [B,N,L,H]
+        return transpose(result, [0, 2, 1, 3]); // [B,L,N,H]
+      }
     }
     return null;
   }

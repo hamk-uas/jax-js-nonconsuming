@@ -1250,14 +1250,23 @@ export class Array extends Tracer {
         // Realize all input slots upfront.
         const slots = args.map((x) => x._realizeSource());
 
-        // Flush all input pending ops to ensure data is materialized
-        // before JIT execution. This is critical for scan's fallback loop
-        // which reads slots synchronously within the JIT program.
-        for (const ar of args) {
-          for (const exe of ar.#pending) {
-            exe.prepareSync();
-            exe.submit();
+        // Batch input pending ops into one queue.submit() instead of
+        // submitting each dispatch individually. This eliminates per-dispatch
+        // GPU submission overhead when chaining jit calls (e.g., 6
+        // transformer layers go from ~50 submissions down to ~12).
+        backend.beginBatch?.();
+        try {
+          // Flush all input pending ops to ensure data is materialized
+          // before JIT execution. This is critical for scan's fallback loop
+          // which reads slots synchronously within the JIT program.
+          for (const ar of args) {
+            for (const exe of ar.#pending) {
+              exe.prepareSync();
+              exe.submit();
+            }
           }
+        } finally {
+          backend.endBatch?.();
         }
 
         // Build dimension bindings from concrete input shapes if the Jaxpr
@@ -1277,6 +1286,19 @@ export class Array extends Tracer {
 
         const jp = jitCompile(backend, jaxpr, dimBindings);
         const { outputs, pending } = jp.execute(slots, dimBindings);
+
+        // Batch output pending ops into one submit so the next jit call
+        // finds no unflushed ops (#pending getter filters submitted ops).
+        backend.beginBatch?.();
+        try {
+          for (const exe of pending) {
+            exe.prepareSync();
+            exe.submit();
+          }
+        } finally {
+          backend.endBatch?.();
+        }
+
         for (const exe of pending) exe.updateRc(+outputs.length - 1);
 
         return outputs.map((source, i) => {

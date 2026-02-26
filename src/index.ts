@@ -387,6 +387,27 @@ export async function blockUntilReady<T extends JsTree<any>>(x: T): Promise<T> {
 }
 
 /**
+ * Batch GPU dispatches across multiple jit calls into a single
+ * `queue.submit()`. Reduces per-submission driver overhead when
+ * chaining many jit calls (e.g., multi-layer transformer inference).
+ *
+ * All jit calls within the callback share one command encoder.
+ * The batched commands are submitted when the callback returns.
+ * Call `blockUntilReady` **after** `withBatch` to wait for results.
+ *
+ * No-op on backends that don't support batching (CPU, WebGL).
+ */
+export function withBatch<T>(fn: () => T): T {
+  const backend = getBackend();
+  backend.beginBatch?.();
+  try {
+    return fn();
+  } finally {
+    backend.endBatch?.();
+  }
+}
+
+/**
  * Transfer `x` to `device`.
  *
  * `x` may be a nested container of arrays or scalars. The resulting structure

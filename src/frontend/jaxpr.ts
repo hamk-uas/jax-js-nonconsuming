@@ -1237,7 +1237,17 @@ function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
   for (let i = 0; i < consts.length; i++) {
     if (ndim(consts[i]) === 0 && consts[i] instanceof Array) {
       const ar = consts[i] as Array;
-      literals.set(jaxpr.inBinders[i], new Lit(ar.aval, ar.dataSync()[0]));
+      let data: number[] | { [index: number]: number };
+      try {
+        data = ar.dataSync();
+      } catch {
+        // Sync readback not available (e.g., Deno WebGPU without OffscreenCanvas)
+        // — keep as const instead of inlining as Lit
+        constBinders.push(jaxpr.inBinders[i]);
+        newConsts.push(consts[i]);
+        continue;
+      }
+      literals.set(jaxpr.inBinders[i], new Lit(ar.aval, data[0]));
       // Defer anonymous const disposal to ClosedJaxpr.dispose().  During nested
       // makeJaxpr, an outer builder may capture the same const later — if we
       // fired the anonymous extra here, the const would be freed too early.
