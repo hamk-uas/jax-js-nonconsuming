@@ -351,23 +351,24 @@ async function _runProgram(
       }
     }
 
-    const slotsAfter = getSlotCount();
-    if (
-      slotsBefore !== null &&
-      slotsAfter !== null &&
-      slotsAfter > slotsBefore
-    ) {
-      const leaked = slotsAfter - slotsBefore;
+    // Use checkLeaks report as the authoritative leak count when available —
+    // its baseline is captured at start() (after init), so it's reliable
+    // across repeated runs. The slot-count diff (slotsBefore vs slotsAfter)
+    // is unreliable because slotsBefore is captured before init() and
+    // _disposeAllJitCaches() in stop() can free slots from prior runs.
+    if (detailedLeakCount > 0 && detailedLeakSummary) {
+      mockConsole.warn(
+        `REPL note: ${detailedLeakCount} array slot(s) still live after this run. Detailed leak diagnostics:`,
+      );
+      mockConsole.warn(detailedLeakSummary);
+    } else if (!detailedLeakTrackingStarted) {
+      const slotsAfter = getSlotCount();
       if (
-        detailedLeakDiagnostics &&
-        detailedLeakCount > 0 &&
-        detailedLeakSummary
+        slotsBefore !== null &&
+        slotsAfter !== null &&
+        slotsAfter > slotsBefore
       ) {
-        mockConsole.warn(
-          `REPL note: ${leaked} array slot(s) still live after this run. Detailed leak diagnostics:`,
-        );
-        mockConsole.warn(detailedLeakSummary);
-      } else {
+        const leaked = slotsAfter - slotsBefore;
         mockConsole.warn(
           `REPL note: ${leaked} array slot(s) still live after this run. Use using declarations or .dispose() for arrays you create. Enable Detailed leak diagnostics and run again to see leak origins.`,
         );
@@ -396,23 +397,19 @@ async function _runProgram(
       }
     }
 
-    const slotsAfter = getSlotCount();
-    if (
-      slotsBefore !== null &&
-      slotsAfter !== null &&
-      slotsAfter > slotsBefore
-    ) {
-      const leaked = slotsAfter - slotsBefore;
+    if (detailedLeakCount > 0 && detailedLeakSummary) {
+      mockConsole.warn(
+        `REPL note: ${detailedLeakCount} array slot(s) still live after this run. Detailed leak diagnostics:`,
+      );
+      mockConsole.warn(detailedLeakSummary);
+    } else if (!detailedLeakTrackingStarted) {
+      const slotsAfter = getSlotCount();
       if (
-        detailedLeakDiagnostics &&
-        detailedLeakCount > 0 &&
-        detailedLeakSummary
+        slotsBefore !== null &&
+        slotsAfter !== null &&
+        slotsAfter > slotsBefore
       ) {
-        mockConsole.warn(
-          `REPL note: ${leaked} array slot(s) still live after this run. Detailed leak diagnostics:`,
-        );
-        mockConsole.warn(detailedLeakSummary);
-      } else {
+        const leaked = slotsAfter - slotsBefore;
         mockConsole.warn(
           `REPL note: ${leaked} array slot(s) still live after this run. Use using declarations or .dispose() for arrays you create. Enable Detailed leak diagnostics and run again to see leak origins.`,
         );
