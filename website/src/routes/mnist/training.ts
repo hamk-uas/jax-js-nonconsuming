@@ -1,5 +1,6 @@
 import {
   blockUntilReady,
+  jit,
   numpy as np,
   random,
   tree,
@@ -36,6 +37,8 @@ export interface TrainingOptions {
   batchSize: number;
 }
 
+type StepResult = { params: Params; optState: any; loss: np.Array };
+
 export async function train(
   opts: TrainingOptions,
   callbacks: TrainingCallbacks,
@@ -46,6 +49,19 @@ export async function train(
   await blockUntilReady(params);
 
   const loss = lossFn(model.predict);
+  const solver = adam(learningRate);
+
+  // Jit the FULL training step: loss + gradient + optimizer update + apply.
+  // All optax operations are pure array math, fully traceable by jit.
+  const trainStep = jit(
+    (params: Params, optState: any, X: np.Array, y: np.Array) => {
+      const [lossVal, grad] = valueAndGrad(loss)(params, X, y);
+      const [updates, newOptState] = solver.update(grad, optState);
+      const newParams = applyUpdates(params, updates);
+      return { params: newParams, optState: newOptState, loss: lossVal };
+    },
+  );
+
   callbacks.onParamsUpdate(params);
 
   callbacks.log(`=> Loading MNIST database from CDN or cache...`);
@@ -54,7 +70,6 @@ export async function train(
   const duration = performance.now() - startTime;
   callbacks.log(`=> Data loaded in ${duration.toFixed(1)} ms`);
 
-  const solver = adam(learningRate);
   let optState = solver.init(params);
 
   try {
@@ -75,23 +90,22 @@ export async function train(
         const batchStart = performance.now();
         using X = X_train.slice(indices);
         using y = y_train.slice(indices);
-        const [lossVal, lossGrad] = valueAndGrad(loss)(params, X, y);
-        const [updates, newOptState] = solver.update(lossGrad, optState);
-        tree.dispose(lossGrad);
-        // Note: solver.update() already disposes old optState internally
-        const newParams = applyUpdates(params, updates);
-        tree.dispose(updates);
-        // Only dispose params if we still own them (not handed to callback)
+        const result = trainStep(params, optState, X, y) as StepResult;
+
+        // Dispose old state
         if (!paramsOwnedByCallback) tree.dispose(params);
         paramsOwnedByCallback = false;
-        params = newParams;
-        optState = newOptState;
+        tree.dispose(optState);
+
+        // Adopt new state
+        params = result.params;
+        optState = result.optState;
         paramsUpdatedThisEpoch = true;
 
         await blockUntilReady(params);
         const batchDuration = performance.now() - batchStart;
-        const lossNumber = (await lossVal.jsAsync()) as number;
-        lossVal.dispose();
+        const lossNumber = (await result.loss.jsAsync()) as number;
+        result.loss.dispose();
         callbacks.log(
           `batch ${i}/${numBatches} completed in ${batchDuration.toFixed(1)} ms, loss: ${lossNumber.toFixed(4)}`,
         );
@@ -141,6 +155,7 @@ export async function train(
     X_test.dispose();
     y_test.dispose();
     tree.dispose(optState);
+    trainStep.dispose();
     // params ownership was transferred to caller via onParamsUpdate
   }
 }

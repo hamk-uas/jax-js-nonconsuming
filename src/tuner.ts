@@ -102,7 +102,7 @@ class TuneDims {
 
   // Place the axis at the end of the shape, so it is part of each workgroup.
   applyLocal(axis: number, amount: number) {
-    if (axis >= this.local) throw new Error("Cannot localize non-global axis");
+    if (axis >= this.groups) throw new Error("Cannot localize non-global axis");
     const length = this.st.shape[axis];
     if (length % amount !== 0)
       throw new Error(`Localize by ${amount} on axis length ${length}`);
