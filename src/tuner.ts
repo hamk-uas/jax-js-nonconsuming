@@ -390,9 +390,14 @@ export function tuneWebgpu(
   // Apply cooperative groups for large parallel reductions.
   // When the sequential reduction is large enough, split it into
   // groupSize parallel threads that combine via shared memory.
+  // Threshold must be high: cooperative groups trade throughput for latency
+  // by multiplying thread count by groupSize. For matmul-like kernels with
+  // many output elements, each thread is better off doing its own sequential
+  // reduction in registers than sharing work via expensive barriers+shmem.
+  // Only beneficial for very large single-output reductions (e.g., sum(huge)).
   if (dim.reduce < dim.unroll) {
     const seqReduce = prod(dim.st.shape.slice(dim.reduce, dim.unroll));
-    if (seqReduce >= 256) {
+    if (seqReduce >= 2048) {
       const maxWg = Math.min(caps?.maxComputeWorkgroupSizeX ?? 256, 256);
       let groupSize = maxWg;
       while (

@@ -2180,21 +2180,26 @@ function pipelineSource(
   } else {
     const threadCount = tune.threadCount as number;
     if (gridY === 1) {
-      emit(`if (id.x >= ${threadCount}u) { return; }`);
       if (useSharedMem) {
+        // Use a validity flag instead of early return so all threads
+        // reach workgroupBarrier() (WGSL uniform control flow requirement).
         emit(
+          `let _valid: bool = id.x < ${threadCount}u;`,
           `let gidx: i32 = i32(id.x / ${groupSize}u);`,
           `let group: i32 = i32(id.x % ${groupSize}u);`,
         );
       } else {
+        emit(`if (id.x >= ${threadCount}u) { return; }`);
         emit("let gidx: i32 = i32(id.x);");
       }
     } else {
       const sizeX = gridX * workgroupSize;
       if (useSharedMem) {
+        // Use a validity flag instead of early return so all threads
+        // reach workgroupBarrier() (WGSL uniform control flow requirement).
         emit(
           `let _tid: u32 = ${sizeX}u * id.y + id.x;`,
-          `if (_tid >= ${threadCount}u) { return; }`,
+          `let _valid: bool = _tid < ${threadCount}u;`,
           `let gidx: i32 = i32(_tid / ${groupSize}u);`,
           `let group: i32 = i32(_tid % ${groupSize}u);`,
         );
@@ -2379,6 +2384,9 @@ function pipelineSource(
       `for (var ridx: i32 = 0; ridx < ${reduceBound}; ridx++) {`,
       pushIndent,
     );
+    // Guard loop body so out-of-bounds threads keep identity accumulators
+    // but still reach workgroupBarrier() after the loop.
+    if (useSharedMem) emit("if (_valid) {", pushIndent);
 
     // Now generate (shared) expressions for each accumulator and unroll value.
     const exps: AluExp[][] = [];
@@ -2428,6 +2436,7 @@ function pipelineSource(
         else emit(`${acc[i]} = max(${acc[i]}, ${rhs});`);
       } else throw new Error(`Unsupported reduction op: ${re.op}`);
     }
+    if (useSharedMem) emit(popIndent, "}"); // close _valid guard
     emit(popIndent, "}");
 
     // Shared-memory tree reduction: each thread wrote its partial into acc[i],
