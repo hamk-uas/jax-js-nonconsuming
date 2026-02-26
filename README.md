@@ -311,6 +311,32 @@ export const hypot = jit(function hypot(x1: np.Array, x2: np.Array) {
 Without JIT, the `hypot()` function would require four kernel dispatches: two multiplies, one add,
 and one sqrt. JIT fuses these together into a single kernel that does it all at once.
 
+**Nested `jit` is transparent.** If a jitted function calls another jitted function, the inner `jit`
+is structurally inlined — the compiler flattens nested `jit` boundaries and fuses everything into a
+single compiled program. This means you can safely `jit` a model's `predict` method for fast
+standalone inference, then also use it inside a larger `jit(grad(...))` training step without any
+overhead or conflict:
+
+```ts
+const model = {
+  predict: jit((params, x) => {
+    // ... model forward pass ...
+  }),
+};
+
+// Inference: calls the jitted predict directly — compiled kernel
+const logits = model.predict(params, x);
+
+// Training: outer jit flattens the inner jit — single fused program
+const trainStep = jit((params, x, y) => {
+  const [loss, grads] = valueAndGrad(lossFn)(params, x, y);
+  return [loss, updateParams(params, grads)];
+});
+```
+
+This also works through `scan`, `grad`, `vmap`, and all other transformations — inner `jit`
+boundaries are always dissolved during compilation.
+
 All functional transformations can take typed `JsTree` of inputs and outputs. These are similar to
 [JAX's pytrees](https://docs.jax.dev/en/latest/pytrees.html), and it's basically just a structure of
 nested JavaScript objects and arrays. For instance:
