@@ -83,4 +83,75 @@ suite.each(devices)("device:%s", (device) => {
     expect(y2.dtype).toBe(np.float16);
     expect(y2.dataSync()).toEqual(new Float16Array([16008]));
   });
+
+  test("isnan detects NaN in f16 (IEEE 754 bitcast path)", () => {
+    // np.isnan uses Cmpne (x != x) which on WebGPU uses bitcast for f16.
+    using x = np.array([NaN, 1.0, NaN, Infinity, -Infinity, 0.0], {
+      dtype: np.float16,
+    });
+    using r = np.isnan(x);
+    expect(r.js()).toEqual([true, false, true, false, false, false]);
+  });
+
+  test("isnan under jit with where for f16", () => {
+    using nanToZero = jit((x: np.Array) => np.where(np.isnan(x), 0, x));
+    using a = np.array([NaN, 1.0, NaN, 2.0], { dtype: np.float16 });
+    using result = nanToZero(a);
+    expect(result.js()).toEqual([0, 1, 0, 2]);
+  });
+
+  test("isinf and isfinite for f16", () => {
+    using x = np.array([NaN, Infinity, -Infinity, 1.0], { dtype: np.float16 });
+    {
+      using r = np.isinf(x);
+      expect(r.js()).toEqual([false, true, true, false]);
+    }
+    {
+      using r = np.isfinite(x);
+      expect(r.js()).toEqual([false, false, false, true]);
+    }
+  });
+
+  test("elementwise ops preserve f16 dtype", () => {
+    using a = np.array([1.0, 2.0, 3.0], { dtype: np.float16 });
+    using b = np.array([0.5, 1.5, 2.5], { dtype: np.float16 });
+    {
+      using r = np.add(a, b);
+      expect(r.dtype).toBe(np.float16);
+      expect(r).toBeAllclose([1.5, 3.5, 5.5]);
+    }
+    {
+      using r = np.multiply(a, b);
+      expect(r.dtype).toBe(np.float16);
+      expect(r).toBeAllclose([0.5, 3.0, 7.5]);
+    }
+    {
+      using r = np.maximum(a, b);
+      expect(r.dtype).toBe(np.float16);
+      expect(r).toBeAllclose([1.0, 2.0, 3.0]);
+    }
+  });
+
+  test("matmul produces correct f16 result", () => {
+    using a = np.array(
+      [
+        [1, 2],
+        [3, 4],
+      ],
+      { dtype: np.float16 },
+    );
+    using b = np.array(
+      [
+        [5, 6],
+        [7, 8],
+      ],
+      { dtype: np.float16 },
+    );
+    using r = np.matmul(a, b);
+    expect(r.dtype).toBe(np.float16);
+    expect(r).toBeAllclose([
+      [19, 22],
+      [43, 50],
+    ]);
+  });
 });

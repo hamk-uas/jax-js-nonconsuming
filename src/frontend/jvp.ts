@@ -67,7 +67,7 @@ import {
   Tracer,
   TracerValue,
   TreeMismatchError,
-  triangularSolve,
+  triSolve,
   where,
 } from "./core";
 import { ClosedJaxpr, evalJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
@@ -429,7 +429,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     // JVP: dA @ X.T + A @ dX.T = dB.T
     //   => A @ dX.T = dB.T - triu(dA) @ X.T
     //   => dX.T = A^-1 @ (dB.T - triu(dA) @ X.T)
-    const x = triangularSolve(a, b, { unitDiagonal }); // (A^-1 @ B.T).T
+    const x = triSolve(a, b, { unitDiagonal }); // (A^-1 @ B.T).T
     // Mask dA to the triangle actually read by the solver.
     // unitDiagonal means the diagonal is forced to 1 (not read from A).
     using maskedDa = (
@@ -438,7 +438,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     using dax = batchMatmulT(maskedDa, x); // triu(dA) @ X.T
     using mTdax = mT(dax);
     using rhsT = db.sub(mTdax); // (dB.T - triu(dA) @ X.T).T
-    const dx = triangularSolve(a, rhsT, { unitDiagonal });
+    const dx = triSolve(a, rhsT, { unitDiagonal });
     return [[x], [dx]];
   },
   [Primitive.QR]([a], [da]) {
@@ -454,9 +454,9 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
         "qr jvp: m < n (wide matrices) not yet supported, got " + `${m}x${n}`,
       );
     // B = dA R⁻¹  [m × n]
-    // core.triangularSolve(Rᵀ, x, {lower:true}) = x R⁻¹
+    // core.triSolve(Rᵀ, x, {lower:true}) = x R⁻¹
     using Rt = mT(R);
-    using B = triangularSolve(Rt, da, { lower: true }) as Tracer;
+    using B = triSolve(Rt, da, { lower: true }) as Tracer;
     // E = Qᵀ B  [n × n]
     using Qt = mT(Q);
     using Bt = mT(B);
@@ -485,9 +485,9 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     using mTda = mT(da);
     using daSymm = da.add(mTda);
     using da2 = daSymm.mul(0.5); // Symmetrize dA for grad
-    using W = triangularSolve(L, da2, { lower: true }); // (L^-1 @ dA.T).T = dA @ L^-T
+    using W = triSolve(L, da2, { lower: true }); // (L^-1 @ dA.T).T = dA @ L^-T
     using mTW = mT(W);
-    using ST = triangularSolve(L, mTW, { lower: true });
+    using ST = triSolve(L, mTW, { lower: true });
     using triuST1 = triu(ST as any, 1);
     using triuST0 = triu(ST as any);
     using triuSum = triuST1.add(triuST0);
@@ -543,14 +543,14 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     using pda = batchMatmulT(P, mTda);
     // Solve L @ la = P @ da for la (la = L^{-1} @ P @ da)
     using mTpda = mT(pda);
-    using solvedPda = triangularSolve(L, mTpda, {
+    using solvedPda = triSolve(L, mTpda, {
       lower: true,
       unitDiagonal: true,
     });
     using la = mT(solvedPda);
     // Solve lau @ U = la for lau (lau = la @ U^{-1})
     using mTU = mT(U);
-    using lau = triangularSolve(mTU, la, { lower: true });
+    using lau = triSolve(mTU, la, { lower: true });
     using trilLau = tril(lau as any, -1);
     using mTtrilLau = mT(trilLau);
     using lDot = batchMatmulT(L, mTtrilLau); // L' = L @ tril(lau)

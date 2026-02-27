@@ -599,7 +599,17 @@ export function scatterAdd(
   return bind1(Primitive.ScatterAdd, [target, indices, updates], { axis });
 }
 
-export function triangularSolve(
+/**
+ * Internal triangular solve. Dispatches `Primitive.TriangularSolve` which
+ * always operates on an **upper-triangular** A using the convention
+ * `A @ X^T = B^T` (returns X = B @ A^{-T}).
+ *
+ * When `lower` is true, A is flipped to upper form before dispatching.
+ *
+ * This is NOT the public API — see `lax.linalg.triangularSolve` for the
+ * user-facing function with `leftSide`/`transposeA` parameters.
+ */
+export function triSolve(
   a: TracerValue,
   b: TracerValue,
   {
@@ -607,7 +617,6 @@ export function triangularSolve(
     unitDiagonal = false,
   }: { lower?: boolean; unitDiagonal?: boolean } = {},
 ) {
-  // Solve a triangular linear system `A @ X.T = B.T`, transposed for speed.
   const as = getShape(a);
   const bs = getShape(b);
   if (as.length < 2 || bs.length < 2)

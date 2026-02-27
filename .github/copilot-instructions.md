@@ -4439,12 +4439,12 @@ propagate tangents from `triu(dA)` — perturbations below the diagonal have zer
 In `solve(A, b)`, the packed LU matrix stores L in the lower triangle and U in the upper triangle.
 When `triangularSolve(luMatrix, ...)` is called:
 
-- **Lower solve (L):** `core.triangularSolve(luMatrix, ..., {lower: true})` flips the matrix so L's
-  lower triangle becomes the upper triangle of the flipped matrix. The primitive reads this upper
+- **Lower solve (L):** `core.triSolve(luMatrix, ..., {lower: true})` flips the matrix so L's lower
+  triangle becomes the upper triangle of the flipped matrix. The primitive reads this upper
   triangle. With the fix, `triu(d_flipped)` correctly masks to only L's entries.
-- **Upper solve (U):** `core.triangularSolve(luMatrix, ..., {lower: false})` passes the packed
-  matrix directly. The primitive reads the upper triangle (U). Without the mask, `dA @ X^T` uses the
-  L entries in the lower triangle — gradient leaks from L's entries into U's solve.
+- **Upper solve (U):** `core.triSolve(luMatrix, ..., {lower: false})` passes the packed matrix
+  directly. The primitive reads the upper triangle (U). Without the mask, `dA @ X^T` uses the L
+  entries in the lower triangle — gradient leaks from L's entries into U's solve.
 
 This gradient leak caused `grad(solve)` and `grad(inv)` to produce incorrect results (errors of
 0.15–0.44 in 2×2–3×3 tests, not a precision issue).
@@ -4575,8 +4575,8 @@ The `Primitive.TriangularSolve` convention (important for understanding the JVP)
 
 - `A @ X^T = B^T` where A is **upper triangular**
 - Returns $X = B @ A^{-T}$ (NOT $A^{-1} @ B$)
-- `core.triangularSolve(a, b, {lower: true})` converts to upper by flipping both axes of `a` and
-  last axis of `b`, solves, flips result back
+- `core.triSolve(a, b, {lower: true})` converts to upper by flipping both axes of `a` and last axis
+  of `b`, solves, flips result back
 - `lax.linalg.triangularSolve(A, b, {leftSide: true})` transforms to right-side convention by
   transposing both arguments and flipping `lower`
 

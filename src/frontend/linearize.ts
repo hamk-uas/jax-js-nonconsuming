@@ -71,7 +71,7 @@ import {
   TracerValue,
   transpose,
   TreeMismatchError,
-  triangularSolve,
+  triSolve,
   UseAfterFreeError,
   where,
 } from "./core";
@@ -1836,7 +1836,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     //   Then adjoint is: ct_b.T = a^{-T} @ ct_x.T, so we just transpose A
     // Note: The primitive always operates on upper triangular a, so a^T is lower.
     using aT = moveaxis(a, -2, -1) as Tracer;
-    const ctB = triangularSolve(aT, ct, {
+    const ctB = triSolve(aT, ct, {
       lower: true,
       unitDiagonal,
     });

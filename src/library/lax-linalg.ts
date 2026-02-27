@@ -156,7 +156,7 @@ export function triangularSolve(
       d.push(a);
       lower = !lower;
     }
-    let x = core.triangularSolve(a, b, { lower, unitDiagonal }) as Array;
+    let x = core.triSolve(a, b, { lower, unitDiagonal }) as Array;
     if (leftSide) {
       d.push(x);
       x = moveaxis(x, -2, -1);
