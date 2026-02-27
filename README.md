@@ -99,7 +99,7 @@ workload- and hardware-dependent.
 | **Overview**                             |                     |               |                 |                    |
 | API style                                | JAX/NumPy           | JAX/NumPy     | TensorFlow-like | Static ONNX graphs |
 | Speed                                    | Very fast           | Very fast     | Fast            | Very fast          |
-| Bundle size (gzip)                       | 108 KB              | 80 KB         | 269 KB          | 90 KB + 24 MB Wasm |
+| Bundle size (gzip)                       | 137 KB              | 80 KB         | 269 KB          | 90 KB + 24 MB Wasm |
 | **Autodiff & JIT**                       |                     |               |                 |                    |
 | Gradients                                | ✅                  | ✅            | ✅              | ❌                 |
 | Jacobian and Hessian                     | ✅                  | ✅            | ❌              | ❌                 |
@@ -377,7 +377,8 @@ and determines how to execute compiled operations on them.
 There are currently 4 devices in jax-js:
 
 - `cpu`: Slow, interpreted JS, only meant for debugging.
-- `wasm`: [WebAssembly](https://webassembly.org/), currently single-threaded and blocking.
+- `wasm`: [WebAssembly](https://webassembly.org/), with optional multi-threaded parallel dispatch
+  via `WasmWorkerPool` (requires SharedArrayBuffer).
 - `webgpu`: [WebGPU](https://developer.mozilla.org/en-US/docs/Web/API/WebGPU_API), available on
   [supported browsers](https://caniuse.com/webgpu) (Chrome, Firefox, Safari, iOS).
 - `webgl`: [WebGL2](https://developer.mozilla.org/en-US/docs/Web/API/WebGL2RenderingContext), via

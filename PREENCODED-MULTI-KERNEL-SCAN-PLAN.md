@@ -502,7 +502,7 @@ construction).
 
 Two concrete cleanup items adopted from the `LOOP-PRIMITIVE-RESTRUCTURING-PLAN.md`:
 
-#### 4a. Extract `classifyBodySteps()` utility
+#### 4a. Extract `classifyBodySteps()` utility _(not yet implemented)_
 
 Both Phase 1 (`canFuseScanSteps`) and Phase 2 (`tryPreparePreencodedMultiStep`) need to analyze the
 body program's step structure. Currently, `tryPrepareWasmNativeScan` and
@@ -537,9 +537,9 @@ receives the classification and applies backend-specific constraints on top.
 **Note:** This classification also detects `scan` and `assoc_scan` steps in the body — making nested
 loops visible to the planner. Phase 2's pre-encoded path can then decide to encode them recursively.
 
-#### 4b. Move assocScan execution out of `jit.ts`
+#### 4b. Move assocScan execution out of `jit.ts` _(not yet implemented)_
 
-The `"assoc_scan"` case in `JitProgram.execute()` contains ~120 lines of loop orchestration
+The `"assoc_scan"` case in `JitProgram.execute()` contains ~124 lines of loop orchestration
 (Kogge-Stone round dispatch, buffer allocation, slot management). This belongs alongside
 `executeScan()` in `scan-executor.ts`, not in the JIT execution engine.
 
@@ -859,10 +859,10 @@ Phase 0: Ownership-correctness gate ✅ (complete)
 Phase 1: Extended fusion (carry snapshot + internal locals) ✅ (commit 74ddb7e)
   ↓ largest user-visible impact: internal deps + passthrough → 1 dispatch
 
-Phase 4a: classifyBodySteps() extraction
+Phase 4a: classifyBodySteps() extraction  ⏳ (not yet implemented)
   ↓ enables cleaner Phase 2 implementation (Phase 1 was done without it)
 
-Phase 4b: Move assocScan execution to scan-executor.ts
+Phase 4b: Move assocScan execution to scan-executor.ts  ⏳ (not yet implemented)
   ↓ housekeeping, independent of Phase 2
 
 Phase 2: Pre-encoded multi-step scan

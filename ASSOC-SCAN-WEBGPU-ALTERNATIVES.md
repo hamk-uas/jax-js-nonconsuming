@@ -63,57 +63,50 @@ The Kogge-Stone parallel prefix scan runs `ceil(log₂ N)` rounds. Each round:
 - Thread `j` computes `fn(data[j - stride], data[j])` where `stride = 2^round`
 - Threads with `j < stride` copy their value unchanged
 
-**Current dispatch pattern:**
+**Current dispatch pattern (Alternative 0 — implemented):**
+
+All rounds are encoded into a single `GPUCommandEncoder` and submitted with one `queue.submit()`. A
+single uniform buffer with dynamic offsets provides per-round `{stride, N}` values.
 
 ```
-copy-in submit                          1 submit
-[optional reverse submit]               0-1 submit
-round 0: encoder → dispatch → submit    1 submit + 1 uniform create/destroy
-round 1: encoder → dispatch → submit    1 submit + 1 uniform create/destroy
-...
-round K: encoder → dispatch → submit    1 submit + 1 uniform create/destroy
-[optional reverse submit]               0-1 submit
-copy-out submit                         1 submit
-─────────────────────────────────────────────────
-Total: K + 2 submits (K + 4 with reverse)
-For N=65536: 18-20 submits, 16 uniform buffer create/destroy cycles
+┌─ Single GPUCommandEncoder ───────────────────────┐
+│ copy-in (copyBufferToBuffer per leaf)             │
+│ [optional reverse via copy commands]              │
+│ round 0: beginComputePass → dispatch → end        │
+│ round 1: beginComputePass → dispatch → end        │
+│ ...                                               │
+│ round K: beginComputePass → dispatch → end        │
+│ [optional reverse via copy commands]              │
+│ copy-out (copyBufferToBuffer per leaf)            │
+└──────────────────────────────────────────────────┘
+→ 1 queue.submit(), 1 uniform buffer (dynamic offsets)
+For N=65536: K=16 dispatches, 1 submit, 1 uniform buffer
 ```
 
-Each `queue.submit()` has JS↔GPU round-trip overhead. Each `createCommandEncoder()` allocates a
-command buffer. Each round creates and destroys a uniform buffer for `{stride, N}`.
+WebGPU guarantees sequential execution of dispatches within a command buffer. The ping→pong→ping
+data dependencies are automatically respected by implicit storage barriers between compute passes.
 
 The scan compiled-loop shader (`nativeScanMultiShaderSource`) is the existence proof that a native
 on-GPU loop works: it runs `for (var iter = 0; iter < length; iter++)` in a single dispatch. But
 that works because each thread only reads/writes its own `carry[gidx]` — no cross-thread
 communication. The associative scan has cross-thread dependencies (`data[j - stride]`), which is the
-fundamental challenge.
+fundamental challenge for further optimization beyond single-submit.
 
 ---
 
-## Alternative 0: Single Command Encoder (Batch Submits)
+## Alternative 0: Single Command Encoder (Batch Submits) ✅ IMPLEMENTED
 
 **Idea:** Encode all rounds into one `GPUCommandEncoder`, submit once.
 
-**Changes:** ~30 lines in `dispatchAssocScan`. Pre-allocate all uniform buffers (or use one buffer
-with dynamic offsets like `dispatchPreencodedScan` already does), encode all round dispatches into
-one encoder, single `queue.submit()`.
-
-**Dispatch count:** Still K dispatches, but **1 submit** instead of K.
-
-**Why it works:** WebGPU guarantees sequential execution of dispatches within a command buffer. The
-ping→pong→ping data dependencies are automatically respected by implicit storage barriers between
-compute passes.
+**Status:** Implemented in `dispatchAssocScan` (commit `e3b88ab`). This is the current architecture
+(see above). Single uniform buffer with dynamic offsets, pre-created bind groups, single submit.
 
 **Performance gain:** Eliminates K-1 JS↔GPU round-trips. For N=65536 (K=16): 16 dispatches × 1
-submit vs 16 × 16 submits. The GPU can pipeline work from the command buffer without waiting for JS.
+submit vs 16 × 16 submits.
 
 **Limitations:** Still K separate dispatches with implicit memory barriers between them. GPU must
 drain the previous dispatch's workgroups before starting the next. Each dispatch has scheduling
 overhead (workgroup launch, barrier).
-
-**Risk:** Near zero — `dispatchPreencodedScan` already uses this exact pattern successfully.
-
-**Effort:** Small (1-2 hours).
 
 ---
 
