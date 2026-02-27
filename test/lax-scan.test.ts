@@ -1877,3 +1877,223 @@ describe("native scan paths (P2+)", () => {
     _.dispose();
   });
 });
+
+// ============================================================================
+// Preencoded multi-step scan tests (WebGPU Phase 2)
+// ============================================================================
+
+describe("preencoded multi-step scan (WebGPU)", () => {
+  const hasWebGPU = devicesAvailable.includes("webgpu");
+
+  beforeEach(({ skip }) => {
+    if (!hasWebGPU) skip();
+    defaultDevice("webgpu");
+  });
+
+  test("numCarry ≠ numY: two carries, one Y output", () => {
+    // Tier 1 rejects because numCarry=2 ≠ numY=1.
+    // Two independent kernels (different input sets: [a,x] vs [b,x]) → 2 execute steps.
+    const step = (
+      carry: [np.Array, np.Array],
+      x: np.Array,
+    ): [[np.Array, np.Array], np.Array] => {
+      const [a, b] = carry;
+      const newA = np.add(a, x);
+      const newB = np.multiply(b, x);
+      return [[newA, newB], newA];
+    };
+
+    using initA = np.array([0.0, 0.0]);
+    using initB = np.array([1.0, 1.0]);
+    using xs = np.array([
+      [1.0, 2.0],
+      [3.0, 4.0],
+      [5.0, 6.0],
+    ]);
+
+    const [[finalA, finalB], ys] = lax.scan(step, [initA, initB], xs, {
+      acceptPath: "preencoded-multi-step",
+    });
+
+    // a accumulates: [0,0]+[1,2]=[1,2], +[3,4]=[4,6], +[5,6]=[9,12]
+    expect(finalA).toBeAllclose([9, 12]);
+    // b multiplies: [1,1]*[1,2]=[1,2], *[3,4]=[3,8], *[5,6]=[15,48]
+    expect(finalB).toBeAllclose([15, 48]);
+    // ys is the running sum (= newA at each step)
+    expect(ys).toBeAllclose([
+      [1, 2],
+      [4, 6],
+      [9, 12],
+    ]);
+    finalA.dispose();
+    finalB.dispose();
+    ys.dispose();
+  });
+
+  test("Y ≠ carry: same numCarry=numY but different computations", () => {
+    // Tier 1 rejects because yOutIds[0] ≠ carryOutIds[0].
+    // Two independent kernels: carry+x vs x*x (different input sets) → 2 execute steps.
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      const y = np.multiply(x, x);
+      return [newCarry, y];
+    };
+
+    using initCarry = np.array([0.0]);
+    using xs = np.array([[1.0], [2.0], [3.0], [4.0]]);
+
+    const [finalCarry, ys] = lax.scan(step, initCarry, xs, {
+      acceptPath: "preencoded-multi-step",
+    });
+
+    // carry: 0+1=1, 1+2=3, 3+3=6, 6+4=10
+    expect(finalCarry).toBeAllclose([10]);
+    // y: 1²=1, 2²=4, 3²=9, 4²=16
+    expect(ys).toBeAllclose([[1], [4], [9], [16]]);
+    finalCarry.dispose();
+    ys.dispose();
+  });
+
+  test("reverse scan with numCarry ≠ numY", () => {
+    const step = (
+      carry: [np.Array, np.Array],
+      x: np.Array,
+    ): [[np.Array, np.Array], np.Array] => {
+      const [a, b] = carry;
+      const newA = np.add(a, x);
+      const newB = np.multiply(b, x);
+      return [[newA, newB], newA];
+    };
+
+    using initA = np.array([0.0]);
+    using initB = np.array([1.0]);
+    using xs = np.array([[1.0], [2.0], [3.0]]);
+
+    const [[finalA, finalB], ys] = lax.scan(step, [initA, initB], xs, {
+      reverse: true,
+      acceptPath: "preencoded-multi-step",
+    });
+
+    // reverse order: x=[3],[2],[1]
+    // a: 0+3=3, 3+2=5, 5+1=6
+    expect(finalA).toBeAllclose([6]);
+    // b: 1*3=3, 3*2=6, 6*1=6
+    expect(finalB).toBeAllclose([6]);
+    // ys (in reverse iteration order, stacked as original axis order):
+    // iter 0 (x=[3]): newA=[3] → ys[2]
+    // iter 1 (x=[2]): newA=[5] → ys[1]
+    // iter 2 (x=[1]): newA=[6] → ys[0]
+    expect(ys).toBeAllclose([[6], [5], [3]]);
+    finalA.dispose();
+    finalB.dispose();
+    ys.dispose();
+  });
+
+  test("Y ≠ carry with larger arrays", () => {
+    const size = 64;
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      const y = np.multiply(x, x);
+      return [newCarry, y];
+    };
+
+    using initCarry = np.zeros([size]);
+    using xs = np.ones([100, size]);
+
+    const [finalCarry, ys] = lax.scan(step, initCarry, xs, {
+      acceptPath: "preencoded-multi-step",
+    });
+
+    using expected = np.full([size], 100);
+    expect(finalCarry).toBeAllclose(expected);
+    // ys[i] = 1*1 = 1 for all i (xs are all ones)
+    using _sumYs = np.sum(ys);
+    expect(_sumYs.js()).toBeCloseTo(100 * size, 0);
+    finalCarry.dispose();
+    ys.dispose();
+  });
+
+  test("jit-wrapped preencoded-multi-step scan", () => {
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      const y = np.multiply(x, x);
+      return [newCarry, y];
+    };
+
+    using initCarry = np.array([0.0, 0.0]);
+    using xs = np.array([
+      [1.0, 2.0],
+      [3.0, 4.0],
+    ]);
+
+    using f = jit((init: np.Array, data: np.Array) =>
+      lax.scan(step, init, data, {
+        acceptPath: "preencoded-multi-step",
+      }),
+    );
+
+    const [finalCarry, ys] = f(initCarry, xs);
+
+    expect(finalCarry).toBeAllclose([4, 6]);
+    expect(ys).toBeAllclose([
+      [1, 4],
+      [9, 16],
+    ]);
+    finalCarry.dispose();
+    ys.dispose();
+  });
+
+  test("numCarry ≠ numY with pytree carry", () => {
+    // Pytree carry with 2 leaves, 1 Y output → numCarry=2, numY=1
+    const step = (
+      carry: { sum: np.Array; count: np.Array },
+      x: np.Array,
+    ): [{ sum: np.Array; count: np.Array }, np.Array] => {
+      const newSum = np.add(carry.sum, x);
+      const newCount = np.add(carry.count, np.ones([]));
+      return [{ sum: newSum, count: newCount }, newSum];
+    };
+
+    using initSum = np.array([0.0]);
+    using initCount = np.array([0.0]);
+    using xs = np.array([[10.0], [20.0], [30.0]]);
+
+    const [finalCarry, ys] = lax.scan(
+      step,
+      { sum: initSum, count: initCount },
+      xs,
+      { acceptPath: "preencoded-multi-step" },
+    );
+
+    expect(finalCarry.sum).toBeAllclose([60]);
+    expect(finalCarry.count).toBeAllclose([3]);
+    expect(ys).toBeAllclose([[10], [30], [60]]);
+    tree.dispose(finalCarry);
+    ys.dispose();
+  });
+
+  test("grad through preencoded-multi-step scan (Y ≠ carry)", () => {
+    // grad(scan) with Y ≠ carry: backward pass should correctly propagate
+    const loss = (xs: np.Array): np.Array => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const newCarry = np.add(carry, x);
+        const y = np.multiply(x, x);
+        return [newCarry, y];
+      };
+      using initCarry = np.zeros([1]);
+      const [finalCarry, ys] = lax.scan(step, initCarry, xs);
+      // loss = sum(carry) + sum(ys) = sum(xs) + sum(xs²)
+      using sumCarry = np.sum(finalCarry);
+      using sumYs = np.sum(ys);
+      finalCarry.dispose();
+      ys.dispose();
+      return np.add(sumCarry, sumYs);
+    };
+
+    using xs = np.array([[1.0], [2.0], [3.0]]);
+    using dxs = grad(loss)(xs);
+
+    // d/dx_i [sum(xs) + sum(xs²)] = 1 + 2*x_i
+    expect(dxs).toBeAllclose([[3], [5], [7]]);
+  });
+});

@@ -869,7 +869,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "scan: DLM-like matrix carry currently falls back on WebGPU",
+  name: "scan: DLM-like matrix carry uses preencoded-multi-step on WebGPU",
   ignore: !hasWebGPU,
   fn: withLeakCheck(async () => {
     await initWebGPU();
@@ -892,7 +892,7 @@ Deno.test({
 
     using f = jit(() =>
       lax.scan(step, { A: initA, b: initB }, xs, {
-        acceptPath: "fallback",
+        acceptPath: "preencoded-multi-step",
       }),
     );
 
