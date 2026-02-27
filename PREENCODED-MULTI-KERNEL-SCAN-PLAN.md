@@ -1,8 +1,8 @@
 # Control-Flow Lowering & Scan Performance Plan
 
-**Status:** Phase 0+1 complete, Phases 2–4 draft **Date:** 2026-02-26 **Supersedes:** v3 (review
-feedback integrated), v2 (extended fusion + pre-encoded), v1 (pre-encoded multi-kernel only)
-**Integrates:** Useful elements from `LOOP-PRIMITIVE-RESTRUCTURING-PLAN.md`, review feedback from
+**Status:** Phase 0+1+2+3+4a+4b complete **Date:** 2026-02-26 **Supersedes:** v3 (review feedback
+integrated), v2 (extended fusion + pre-encoded), v1 (pre-encoded multi-kernel only) **Integrates:**
+Useful elements from `LOOP-PRIMITIVE-RESTRUCTURING-PLAN.md`, review feedback from
 `UPDATED-PLAN-REVIEW.md` (formal fusion safety contract, nested-length compatibility matrix,
 benchmark protocol, scope trimming)
 
@@ -859,17 +859,17 @@ Phase 0: Ownership-correctness gate ✅ (complete)
 Phase 1: Extended fusion (carry snapshot + internal locals) ✅ (commit 74ddb7e)
   ↓ largest user-visible impact: internal deps + passthrough → 1 dispatch
 
-Phase 4a: classifyBodySteps() extraction  ⏳ (not yet implemented)
-  ↓ enables cleaner Phase 2 implementation (Phase 1 was done without it)
+Phase 4a: classifyBodySteps() extraction  ✅ (complete)
+  ↓ enables cleaner Phase 2 implementation
 
-Phase 4b: Move assocScan execution to scan-executor.ts  ⏳ (not yet implemented)
+Phase 4b: Move assocScan execution to scan-executor.ts  ✅ (complete)
   ↓ housekeeping, independent of Phase 2
 
-Phase 2: Pre-encoded multi-step scan
-  ↓ handles routines, nested loops, everything Phase 1 can't fuse
+Phase 2: Pre-encoded multi-step scan  ✅ (complete — commit e2c3905, 17d3f26)
+  ↓ handles cross-gidx deps, everything Phase 1 can't fuse
 
-Phase 3: Routine bind groups in pre-encoded path
-  ↓ completes pre-encoded coverage
+Phase 3: Routine bind groups in pre-encoded path  ✅ (complete)
+  ↓ completes pre-encoded coverage for non-Sort routines
 
 ── Future (triggered by 3rd primitive or concrete nested-loop demand) ──
 

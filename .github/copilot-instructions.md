@@ -1956,12 +1956,15 @@ const [finalCarry, stackedOutputs] = await lax.scan(f, initCarry, xs, options);
 
 - `"compiled-loop"` — Entire scan loop compiled to native code (WASM module or WebGPU shader)
 - `"preencoded-routine"` — Pre-encoded GPU command dispatches with uniform offsets per iteration
-  (WebGPU only)
+  (WebGPU only, single-routine bodies)
+- `"preencoded-multi-step"` — Pre-encoded N×S GPU dispatches in 1 `queue.submit()` for multi-step
+  bodies (WebGPU only). Handles kernel-only bodies with cross-element deps, mixed kernel+routine
+  bodies, and nested scan/assocScan steps.
 - `"fallback"` — JS loop calling body program per iteration (one or more JS↔backend boundary
   crossings)
 
-Use `acceptPath: ["compiled-loop", "preencoded-routine"]` in tests to ensure native compilation
-doesn't regress.
+Use `acceptPath: ["compiled-loop", "preencoded-routine", "preencoded-multi-step"]` in tests to
+ensure native compilation doesn't regress.
 
 **xs=null and Y=null (jax-js extensions):**
 
@@ -2073,29 +2076,33 @@ copies within the loop use `memory.copy` (bulk memory) for efficient carry/outpu
 ### WebGPU Backend
 
 The WebGPU backend keeps data on GPU between iterations. Supports **compiled-loop** for elementwise
-kernels, **multi-kernel scan** for bodies with multiple independent kernels, and
-**preencoded-routine** for single-routine bodies meeting specific requirements (currently Cholesky).
+kernels (including bodies with internal deps and carry passthrough via Phase 1 extended fusion),
+**preencoded-routine** for single-routine bodies, and **preencoded-multi-step** for multi-step
+bodies (multi-kernel with cross-element deps, mixed kernel+routine).
 
-| Feature / Test                     | Status      | Notes                                        |
-| ---------------------------------- | ----------- | -------------------------------------------- |
-| `scan basic`                       | ✅ Pass     | uses compiled-loop on WebGPU                 |
-| `scan with pytree carry`           | ✅ Pass     |                                              |
-| `reverse scan`                     | ✅ Pass     | uses compiled-loop with dataIdx              |
-| `jit + scan`                       | ✅ Pass     |                                              |
-| `JVP (forward-mode)`               | ✅ Pass     |                                              |
-| `VJP (reverse-mode)`               | ✅ Pass     |                                              |
-| `vmap`                             | ✅ Pass     |                                              |
-| `vmap` > `jit(vmap(scan))`         | ✅ Pass     |                                              |
-| `scan over views`                  | ✅ Pass     | sliced/transposed xs                         |
-| `compiled-loop`                    | ✅ Pass     | kernel gids reindexed to scan layout         |
-| `compiled-loop` > `with reduction` | ✅ Pass     | e.g., `carry += sum(x)` or matmul            |
-| `compiled-loop` > `with reverse`   | ✅ Pass     | uses dataIdx like WASM                       |
-| `compiled-loop` > `with constants` | ✅ Pass     | captured constants bound as storage          |
-| `multi-kernel scan`                | ✅ Pass     | derives output mapping from body outputs     |
-| `preencoded-routine` (Cholesky)    | ✅ Pass     | requires passthrough pattern (numCarry=numY) |
-| Mixed kernel+routine bodies        | ⚠️ Fallback | e.g., Kalman filter, lstsq                   |
-| Multi-routine bodies               | ⚠️ Fallback | e.g., Cholesky→TriSolve→TriSolve             |
-| Sort in scan body                  | ⚠️ Fallback | Sort already uses uniforms (conflict)        |
+| Feature / Test                          | Status      | Notes                                        |
+| --------------------------------------- | ----------- | -------------------------------------------- |
+| `scan basic`                            | ✅ Pass     | uses compiled-loop on WebGPU                 |
+| `scan with pytree carry`                | ✅ Pass     |                                              |
+| `reverse scan`                          | ✅ Pass     | uses compiled-loop with dataIdx              |
+| `jit + scan`                            | ✅ Pass     |                                              |
+| `JVP (forward-mode)`                    | ✅ Pass     |                                              |
+| `VJP (reverse-mode)`                    | ✅ Pass     |                                              |
+| `vmap`                                  | ✅ Pass     |                                              |
+| `vmap` > `jit(vmap(scan))`              | ✅ Pass     |                                              |
+| `scan over views`                       | ✅ Pass     | sliced/transposed xs                         |
+| `compiled-loop`                         | ✅ Pass     | kernel gids reindexed to scan layout         |
+| `compiled-loop` > `with reduction`      | ✅ Pass     | e.g., `carry += sum(x)` or matmul            |
+| `compiled-loop` > `with reverse`        | ✅ Pass     | uses dataIdx like WASM                       |
+| `compiled-loop` > `with constants`      | ✅ Pass     | captured constants bound as storage          |
+| `compiled-loop` > `with internal deps`  | ✅ Pass     | carry snapshot + internal locals (Phase 1)   |
+| `compiled-loop` > `carry passthrough`   | ✅ Pass     | passthrough carries skip writes (Phase 1)    |
+| `multi-kernel scan`                     | ✅ Pass     | derives output mapping from body outputs     |
+| `preencoded-routine` (Cholesky)         | ✅ Pass     | requires passthrough pattern (numCarry=numY) |
+| `preencoded-multi-step` (multi-kernel)  | ✅ Pass     | N×S dispatches in 1 submit (Phase 2)         |
+| `preencoded-multi-step` (grad backward) | ✅ Pass     | transposed body with internal deps (Phase 2) |
+| `preencoded-multi-step` (mixed k+r)     | ✅ Pass     | kernel+routine bodies in 1 submit (Phase 3)  |
+| Sort in scan body                       | ⚠️ Fallback | Sort already uses uniforms (conflict)        |
 
 **Note on numCarry ≠ numY:** WebGPU compiled-loop requires `numCarry === numY`. When they differ,
 WebGPU falls back to JS loop. WASM compiled-loop handles this case.
@@ -2136,13 +2143,14 @@ should work identically. To verify manually, run website demos in a WebGL-capabl
 
 ## Design Choices & Rationales
 
-### Why compiled-loop vs preencoded-routine vs fallback?
+### Why compiled-loop vs preencoded-multi-step vs preencoded-routine vs fallback?
 
-| Approach               | How it works                                  | When used                                        |
-| ---------------------- | --------------------------------------------- | ------------------------------------------------ |
-| **compiled-loop**      | Entire scan loop in native code (WASM/shader) | Elementwise kernels (WASM+WebGPU), WASM routines |
-| **preencoded-routine** | Pre-encode dispatches with uniform offsets    | WebGPU single-routine bodies (e.g., Cholesky)    |
-| **fallback**           | JS loop calling body program per iteration    | Unsupported patterns, mixed bodies, Sort         |
+| Approach                  | How it works                                     | When used                                                   |
+| ------------------------- | ------------------------------------------------ | ----------------------------------------------------------- |
+| **compiled-loop**         | Entire scan loop in native code (WASM/shader)    | Elementwise kernels (WASM+WebGPU), WASM routines            |
+| **preencoded-multi-step** | N×S dispatches pre-encoded in 1 `queue.submit()` | WebGPU multi-step bodies: cross-element deps, mixed, nested |
+| **preencoded-routine**    | Pre-encode dispatches with uniform offsets       | WebGPU single-routine bodies (e.g., Cholesky); legacy path  |
+| **fallback**              | JS loop calling body program per iteration       | Non-encodable patterns, symbolic length, Sort               |
 
 **Rationale:** compiled-loop is preferred because:
 
@@ -2150,8 +2158,12 @@ should work identically. To verify manually, run website demos in a WebGL-capabl
 2. Enables compiler optimizations across iterations
 3. Single WASM module instantiation vs N calls
 
-preencoded-routine is used for WebGPU routines that can't be inlined into a shader. It transforms
-routine shaders to accept per-iteration offsets via uniforms, enabling fused dispatch.
+preencoded-multi-step is used for WebGPU multi-step bodies that can't be fused into a single shader
+(routines, cross-element deps, nested loops). It encodes all N×S dispatches into one command buffer
+and submits once — eliminating the O(N/256) submit overhead of the fallback path.
+
+preencoded-routine is a legacy path for single-routine bodies with passthrough carry pattern
+(numCarry=numY). preencoded-multi-step now handles routine steps too (Phase 3).
 
 ### Why wasmblr / 3 routine implementations?
 
@@ -2238,9 +2250,10 @@ lax.scan(f, init, xs, { reverse })
   → Trace f → bodyJaxpr (once)
   → Primitive.Scan(jaxpr, numCarry, numConsts, length, reverse)
   → planScan(backend, bodyProgram, bodyJaxpr, ...) → ScanPlan
-      ├─ { path: "compiled-loop" }       ← WASM module or WebGPU multi-kernel shader
-      ├─ { path: "preencoded-routine" }  ← WebGPU uniform-offset routine scan
-      └─ { path: "fallback" }            ← JS loop calling bodyProgram.execute()
+      ├─ { path: "compiled-loop" }          ← WASM module or WebGPU fused shader (1 dispatch)
+      ├─ { path: "preencoded-multi-step" }  ← WebGPU N×S dispatches, 1 submit
+      ├─ { path: "preencoded-routine" }     ← WebGPU single-routine, uniform offsets
+      └─ { path: "fallback" }               ← JS loop calling bodyProgram.execute()
   → executeScan(backend, step)
       ├─ flush pending ops on all inputs (ONE policy)
       ├─ preallocate Y stacked buffers if direct-write eligible
@@ -2392,7 +2405,8 @@ type ScanPlan =
       params?: NativeScanGeneralParams | NativeScanMultiParams;
       internalSizes?: number[];
     }
-  | { path: "preencoded-routine"; preencodedParams: PreparedPreencodedScan };
+  | { path: "preencoded-routine"; preencodedParams: PreparedPreencodedScan }
+  | { path: "preencoded-multi-step"; prepared: PreparedPreencodedMultiStep };
 ```
 
 The `executeScan()` function in `scan-executor.ts` dispatches based on `plan.path`.
@@ -2414,17 +2428,18 @@ Scan bodies are classified by what operations they contain:
 
 **Execution path by body type and backend:**
 
-| Body Type                | WASM          | WebGPU                            |
-| ------------------------ | ------------- | --------------------------------- |
-| kernel-only (simple)     | compiled-loop | compiled-loop                     |
-| kernel-only (with deps¹) | compiled-loop | **fallback**                      |
-| routine body (single)    | compiled-loop | preencoded-routine (or fallback²) |
-| mixed kernel+routine     | compiled-loop | **fallback** (common in practice) |
-| multiple routines        | compiled-loop | **fallback** (e.g., lstsq)        |
+| Body Type                     | WASM          | WebGPU                                    |
+| ----------------------------- | ------------- | ----------------------------------------- |
+| kernel-only (simple)          | compiled-loop | compiled-loop                             |
+| kernel-only (same-gidx deps)  | compiled-loop | compiled-loop (Phase 1 extended fusion)   |
+| kernel-only (cross-gidx deps) | compiled-loop | preencoded-multi-step (Phase 2)           |
+| carry passthrough             | compiled-loop | compiled-loop (Phase 1)                   |
+| routine body (single)         | compiled-loop | preencoded-routine (or fallback¹)         |
+| mixed kernel+routine          | compiled-loop | preencoded-multi-step (Phase 3)           |
+| multiple routines             | compiled-loop | preencoded-multi-step (Phase 3, non-Sort) |
 
-¹ "With deps" = internal buffer dependencies between steps, or carry passthrough pattern. ² Sort
-uses fallback due to uniform buffer conflict; LU uses fallback due to multi-output (numCarry ≠
-numY).
+¹ Sort uses fallback due to uniform buffer conflict; LU uses fallback due to multi-output (numCarry
+≠ numY).
 
 **Why `lax.linalg.triangularSolve` creates a mixed body:**
 
@@ -2447,7 +2462,7 @@ handles it. If performance is critical, consider using WASM backend for linalg-h
 When one kernel step reads from another step's output within the same body:
 
 ```ts
-// Body with internal deps (WebGPU falls back):
+// Body with internal deps:
 const body = (carry, x) => {
   const Asq = carry.A.mul(carry.A); // Step 1: produces Asq
   const newA = Asq.sub(carry.B); // Step 2: reads Asq (internal dep!)
@@ -2455,44 +2470,49 @@ const body = (carry, x) => {
 };
 ```
 
-WASM handles this by allocating temporary buffers. WebGPU's shader codegen doesn't support it yet.
+WASM handles this by allocating temporary buffers. WebGPU supports **same-gidx** internal deps via
+Phase 1 extended fusion (carry snapshot + internal locals in the fused shader). **Cross-element**
+internal deps (e.g., reduction output broadcast to all elements) are handled by
+preencoded-multi-step (Phase 2), which encodes each body step as a separate GPU dispatch.
 
 **Definition: Carry passthrough**
 
 When an output carry slot directly references the input carry without a kernel producing it:
 
 ```ts
-// Carry passthrough (WebGPU multi-kernel falls back):
+// Carry passthrough:
 const body = (carry, x) => {
   const newA = carry.A.add(x);
   return [{ A: newA, B: carry.B }, newA]; // B is passthrough!
 };
 ```
 
-WebGPU multi-kernel scan requires every carry output to be produced by a kernel step.
-
-WASM's unified `codegenNativeScanGeneral` handles all body types via compiled-loop. WebGPU has more
-constraints and falls back to JS loop for complex patterns.
+WebGPU compiled-loop (Phase 1 extended fusion) supports carry passthrough — passthrough carries skip
+writes and retain their value across iterations. Previously this caused fallback.
 
 ### Terminology glossary
 
 The documentation uses descriptive terms that map to code constructs:
 
-| Doc Term               | Code Step Type       | Backend      | Description                                |
-| ---------------------- | -------------------- | ------------ | ------------------------------------------ |
-| **compiled-loop**      | `compiled-loop`      | WASM, WebGPU | Entire scan loop compiled to native code   |
-| **preencoded-routine** | `preencoded-routine` | WebGPU       | Routine body with uniform offsets per iter |
-| **fallback**           | `scan`               | All          | JS loop calling body program per iteration |
+| Doc Term                  | Code Step Type          | Backend      | Description                                       |
+| ------------------------- | ----------------------- | ------------ | ------------------------------------------------- |
+| **compiled-loop**         | `compiled-loop`         | WASM, WebGPU | Entire scan loop compiled to native code          |
+| **preencoded-multi-step** | `preencoded-multi-step` | WebGPU       | N×S dispatches pre-encoded in 1 submit            |
+| **preencoded-routine**    | `preencoded-routine`    | WebGPU       | Single-routine body with uniform offsets per iter |
+| **fallback**              | `scan`                  | All          | JS loop calling body program per iteration        |
 
 Note: `preencoded-routine` transforms routine shaders to use uniform-based offsets for xs buffers,
-then dispatches all iterations with pre-encoded commands. Both `compiled-loop` and
-`preencoded-routine` implement the "fast" scan path.
+then dispatches all iterations with pre-encoded commands. `preencoded-multi-step` wraps each body
+step's kernel shader for scan offsets and encodes all N iterations × S steps into one command
+buffer. All three non-fallback paths implement the "fast" scan path.
 
 ### Compiled-loop routing
 
 The `tryPrepareNativeScan()` dispatcher routes to backend-specific implementations:
 
 - **WebGPU kernel-only** → `tryPrepareWebGPUNativeScan()` → uses `prepareNativeScanMulti()`
+- **WebGPU multi-step (cross-elem deps)** → `tryPreparePreencodedMultiStep()` → uses
+  `preparePreencodedMultiStep()`
 - **WebGPU routine body** → `tryPreparePreencodedScan()` → uses `preparePreencodedScan()`
 - **WASM (kernels + routines)** → `tryPrepareWasmNativeScan()` → uses `prepareNativeScanGeneral()`
 
@@ -2525,12 +2545,23 @@ the backend capabilities via `getScanRoutineInfo(routineName, routine)`.
 - `numCarry === 1` and `numY === 1`
 - Constants supported, reverse supported
 
-**WebGPU compiled-loop (multi-kernel)** (via `prepareNativeScanMulti`):
+**WebGPU compiled-loop (multi-kernel, extended)** (via `prepareNativeScanMulti`):
 
 - Multiple Kernel steps (kernel-only body)
 - `numCarry === numY` (or `numY === 0`)
-- **No internal buffer dependencies** between steps (falls back otherwise)
-- **No carry passthrough** (every carry must be produced by a kernel)
+- **Internal buffer dependencies supported** (Phase 1) — carry snapshot locals + internal
+  intermediate locals enable same-gidx deps
+- **Carry passthrough supported** (Phase 1) — passthrough carries skip writes, retain value
+- Cross-element deps (e.g., reduction output broadcast) still reject → falls to
+  preencoded-multi-step
+
+**WebGPU preencoded-multi-step** (via `tryPreparePreencodedMultiStep`):
+
+- Multi-step bodies with cross-element deps that can't be fused
+- Supports both kernel and routine steps (non-Sort routines with single ShaderInfo)
+- Each body step's shader is wrapped with scan offset uniforms
+- N×S dispatches pre-encoded into 1 `queue.submit()` — no JS involvement after submit
+- Requires concrete (non-symbolic) scan length
 
 **WebGPU preencoded-routine** (via `tryPreparePreencodedScan`):
 
@@ -2857,15 +2888,13 @@ Handles: gidx loop, bounds check, reduction identity/accumulate/epilogue via
 
 ### Current limitations
 
-| Limitation                                           | Workaround                                                                                                              | Backend |
-| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------- |
-| `numCarry ≠ numY` on WebGPU                          | Falls back to JS loop                                                                                                   | WebGPU  |
-| WebGPU internal buffer deps in scan                  | Falls back to batched JS loop (O(N/256) submissions via `beginBatch`)                                                   | WebGPU  |
-| Mixed kernel+routine bodies on WebGPU                | Falls back to batched JS loop                                                                                           | WebGPU  |
-| **`grad(scan)` backward on WebGPU with linalg body** | **Batched fallback** — transposed body has intra-step deps; reformulate backward pass as `associativeScan`, or use WASM | WebGPU  |
-| `grad(scan)` ~2× compute overhead                    | Auto-bypassed for small carries (≤4 MB total); use `{ checkpoint: false }` for O(N) memory on large carries             | All     |
-| Sort in scan body on WebGPU                          | Uses JS loop (uniforms)                                                                                                 | WebGPU  |
-| Mixed-dtype carries on WebGPU                        | Use WASM backend or same-dtype carry                                                                                    | WebGPU  |
+| Limitation                                            | Workaround                                                                                                                        | Backend |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `numCarry ≠ numY` on WebGPU                           | Falls back to JS loop                                                                                                             | WebGPU  |
+| **`grad(scan)` backward on WebGPU with routine body** | **Batched fallback** if transposed body contains Sort routine steps; non-Sort routine transposed bodies use preencoded-multi-step | WebGPU  |
+| `grad(scan)` ~2× compute overhead                     | Auto-bypassed for small carries (≤4 MB total); use `{ checkpoint: false }` for O(N) memory on large carries                       | All     |
+| Sort in scan body on WebGPU                           | Uses JS loop (uniforms)                                                                                                           | WebGPU  |
+| Mixed-dtype carries on WebGPU                         | Use WASM backend or same-dtype carry                                                                                              | WebGPU  |
 
 **WebGPU preencoded-routine requirements:** WebGPU can only use `preencoded-routine` for scan bodies
 that are:
@@ -2890,22 +2919,24 @@ const step = (carry, x) => {
 - **LU**: Returns `[lu, pivots, permutation]` — three outputs, so numCarry ≠ numY.
 - **lstsq/solve**: Combines Cholesky + TriangularSolve + TriangularSolve — multiple routines.
 - **Kalman filter forward pass**: Mixes matmul (kernel) + routines in one body → mixed
-  kernel+routine → fallback.
+  kernel+routine → preencoded-multi-step (Phase 3).
 - **Kalman/DLM backward pass (RTS smoother)**: The autodiff-transposed body produced by
   `jit(grad(scan))` contains sequential matmul→matmul→add chains where each step reads from the
-  previous step's output. This is **internal buffer dependency** — the defining condition that
-  triggers WebGPU fallback. Each of the N scan iterations requires multiple sequential GPU
-  dispatches orchestrated from JS, giving **O(N) total dispatch calls**. For N=1600 this causes ~1 s
-  latency per call on typical hardware. **This is the dominant performance bottleneck for any
-  `grad(scan)` over a linalg-heavy body on WebGPU.**
+  previous step's output. This is **internal buffer dependency**. For kernel-only transposed bodies,
+  Phase 2 preencoded-multi-step handles this efficiently — all N×S dispatches are pre-encoded into 1
+  `queue.submit()`. For transposed bodies containing non-Sort routine steps (e.g., from
+  Cholesky/TriSolve in the forward body), preencoded-multi-step handles these too (Phase 3). Sort
+  routine steps still fall back to batched JS loop due to uniform buffer conflict.
 
 **Why autodiff-transposed bodies predictably produce internal buffer deps:** The chain rule for a
 multi-step forward body `B = f(A); C = g(B, x)` transposes to `dA = f_T(dB); dB = dB + g_T(dC)` — a
 sequential dependency chain. No matter how simple the forward body is, if it contains two or more
 operations that compose (output of one feeds input of next), the transposed body will have internal
-deps. This is not a fixable code path in the scan executor; it is a consequence of autodiff algebra.
+deps. Phase 1 extended fusion resolves same-gidx deps within a single shader. Phase 2
+preencoded-multi-step resolves cross-element deps by encoding each step as a separate GPU dispatch
+within a single command buffer submission.
 
-**Workarounds for the backward pass bottleneck:**
+**Workarounds for routine bodies in backward pass:**
 
 1. **Reformulate as `associativeScan`** — if the backward recursion can be expressed as a parallel
    prefix over associative affine maps (as in the Solin/Särkkä parallel Kalman smoother), it gets
@@ -2916,13 +2947,18 @@ deps. This is not a fixable code path in the scan executor; it is a consequence 
 2. **Use WASM backend** — WASM compiled-loop handles internal buffer deps by allocating temporaries
    inside the module, running the entire N-iteration backward pass in a single WASM invocation.
 
-**This limitation is significant** for any dynamical model using `grad(scan)` on WebGPU:
+**Remaining limitation for routine bodies:** Dynamical models using `grad(scan)` on WebGPU where the
+forward body contains Sort routines produce transposed bodies with Sort steps that can't be encoded
+(Sort uses its own uniform buffer, conflicting with scan offset uniforms). These still use batched
+fallback (O(N/256) submissions). Non-Sort routines (Cholesky, TriangularSolve, LU) are fully
+supported via preencoded-multi-step (Phase 3).
 
 1. WASM `compiled-loop` handles all these cases natively — WebGPU is the affected backend
-2. WebGPU fallback uses command batching (`SCAN_BATCH_SIZE = 256`) to reduce O(N) `queue.submit()`
-   calls to O(N/256) submissions, but each iteration still requires multiple sequential GPU
-   dispatches orchestrated from JS
-3. Dispatch cost still dominates for N ≳ 100, though batching reduces the constant factor
+2. Kernel-only transposed bodies (e.g., from matmul-only forward bodies) use preencoded-multi-step
+   with 1 `queue.submit()` — fully resolved
+3. Non-Sort routine transposed bodies now also use preencoded-multi-step (Phase 3)
+4. WebGPU fallback uses command batching (`SCAN_BATCH_SIZE = 256`) to reduce O(N) `queue.submit()`
+   calls to O(N/256) submissions for remaining routine-containing bodies
 
 **Note on Sort in scan body:** Sort already uses a uniform buffer for its configuration, which
 conflicts with the scan offset uniform.
@@ -4713,6 +4749,21 @@ All architecture milestones from the original ULTIMATE-ARCHITECTURE-PLAN are com
   fused shader (M7.1–M7.4)
 - **M8:** Benchmark suite, dead code audit, final regression
 
+**Preencoded Multi-Kernel Scan (Phase 1–2):**
+
+- **Phase 1 (extended fusion):** WebGPU `nativeScanMultiShaderSource()` extended with carry snapshot
+  locals, internal intermediate locals, and passthrough carry detection. Bodies with same-gidx
+  internal deps and carry passthrough now compile to a single fused shader instead of falling back.
+- **Phase 2 (preencoded-multi-step):** New scan path for multi-step bodies with cross-element deps.
+  `tryPreparePreencodedMultiStep()` wraps each body step's kernel shader with scan offset uniforms,
+  pre-encodes all N×S dispatches into a single `GPUCommandBuffer`, and submits once. Handles
+  kernel-only bodies rejected by Phase 1 fusion, and will support routine + nested steps in Phase 3.
+- **Phase 3 (routine support):** Extended preencoded-multi-step to handle non-Sort routine steps
+  (Cholesky, TriangularSolve, LU). `preparePreencodedMultiStepScan()` acquires routine shaders via
+  `createRoutineShader()`, wraps them with scan offset uniforms via `wrapRoutineForScan()`, and
+  encodes all dispatches (including multi-pass routines) into the command buffer. Sort routines are
+  rejected (uniform buffer conflict).
+
 Supporting plans (AOT-LINEARIZATION-PLAN, EFFECT-TYPED-IR-PLAN) are also fully implemented —
 artifact types in `src/frontend/artifacts.ts`, `MemoryEffect` enum in `src/frontend/jaxpr.ts`,
 `effectDrivenAllocate` in `src/frontend/jit.ts`.
@@ -4843,3 +4894,6 @@ Decisions made during development that future agents should understand:
 | DUS JVP via `linearTangentsJvp`                 | DUS is linear in both dst and src, so JVP is trivially `bind(Primitive.DUS, tangents, params)`. No hand-written rule needed.                                                                                                                                                                                                                                                                                                      |
 | All primitives have complete transform rules    | Pool, PoolTranspose, DUS, ScatterAdd all have JVP + transpose + vmap rules. No more stub `throw` in transform tables. `test/ad-gaps.test.ts` covers all 6 new rules.                                                                                                                                                                                                                                                              |
 | `jit()` function-identity dedup via WeakMap     | `_jitRegistry: WeakMap<Function, Map<string, OwnedFunction>>` prevents cache bloat from inline `jit(fn)(args)` patterns. Same `(fn, opts)` → same OwnedFunction + shared cache. WeakMap allows GC when `fn` is no longer referenced. Opts normalized via `_serializeJitOpts()`. Inline arrow functions NOT deduped (new closure identity each call).                                                                              |
+| Phase 1 extended fusion (carry snapshot)        | Same-gidx internal deps resolved inside a single fused shader via carry snapshot locals and internal intermediate locals. Passthrough carries skip writes. This avoids the N×S dispatch overhead of preencoded-multi-step for the common case where all deps are same-element.                                                                                                                                                    |
+| Phase 2 preencoded-multi-step                   | Cross-element internal deps (e.g., reduction output broadcast) encoded as N×S dispatches in 1 `queue.submit()`. Each kernel shader wrapped with scan offset uniforms via `encodeBodyStep()`. Ping-pong carry buffers + stacked-ys copy dispatches. Falls through from Phase 1 fusion rejection. Kernel steps only; routine encoding deferred to Phase 3.                                                                          |
+| Phase 3 preencoded routine support              | Extended preencoded-multi-step to handle non-Sort routine steps. `preparePreencodedMultiStepScan()` acquires routine shaders via `createRoutineShader()`, wraps them with `wrapRoutineForScan()`, and encodes all dispatches into the command buffer. Sort rejected (uniform conflict). Multi-shader routines rejected (future extension).                                                                                        |

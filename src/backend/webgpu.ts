@@ -1546,14 +1546,30 @@ export class WebGPUBackend implements Backend {
     const stepEntries: PreencodedMultiStepEntry[] = [];
 
     for (const step of executeSteps) {
-      const kernel = step.source as Kernel;
-      const shaderInfo = this.#cachedShader(kernel);
+      // Obtain shader info: kernels use the cached shader, routines use
+      // createRoutineShader which returns ShaderInfo[] (one per sub-shader).
+      // All current non-sort routines produce exactly 1 ShaderInfo.
+      let shaderInfo: ShaderInfo;
+      if (step.source instanceof Kernel) {
+        shaderInfo = this.#cachedShader(step.source);
+      } else {
+        const routine = step.source as Routine;
+        const shaderInfos = createRoutineShader(this.device, routine);
+        if (shaderInfos.length !== 1) {
+          if (DEBUG >= 2)
+            console.log(
+              "preparePreencodedMultiStepScan: multi-shader routine not supported",
+            );
+          return null;
+        }
+        shaderInfo = shaderInfos[0];
+      }
 
-      // Reject kernels that already use uniforms (symbolic dims)
+      // Reject steps that already use uniforms (symbolic dims or Sort)
       if (shaderInfo.hasUniform) {
         if (DEBUG >= 2)
           console.log(
-            "preparePreencodedMultiStepScan: kernel already has uniform",
+            "preparePreencodedMultiStepScan: step already has uniform",
           );
         return null;
       }
@@ -1826,22 +1842,24 @@ export class WebGPUBackend implements Backend {
       const carryRead = readPing ? carryPing : carryPong;
       const carryWrite = readPing ? carryPong : carryPing;
 
-      // Dispatch each kernel step
+      // Dispatch each body step (kernel or routine)
       for (let si = 0; si < stepEntries.length; si++) {
         const entry = stepEntries[si];
         const storageBG = readPing ? pingBindGroups[si] : pongBindGroups[si];
         const ubg = uniformBindGroups[si];
 
-        for (const { grid } of entry.dispatches[0].passes) {
-          if (grid[0] === 0 || grid[1] === 0) continue;
-          const pass = commandEncoder.beginComputePass();
-          pass.setPipeline(entry.dispatches[0].pipeline);
-          pass.setBindGroup(0, storageBG);
-          if (ubg) {
-            pass.setBindGroup(1, ubg, [iter * entry.offsetAlignment]);
+        for (const dispatch of entry.dispatches) {
+          for (const { grid } of dispatch.passes) {
+            if (grid[0] === 0 || grid[1] === 0) continue;
+            const pass = commandEncoder.beginComputePass();
+            pass.setPipeline(dispatch.pipeline);
+            pass.setBindGroup(0, storageBG);
+            if (ubg) {
+              pass.setBindGroup(1, ubg, [iter * entry.offsetAlignment]);
+            }
+            pass.dispatchWorkgroups(grid[0], grid[1]);
+            pass.end();
           }
-          pass.dispatchWorkgroups(grid[0], grid[1]);
-          pass.end();
         }
       }
 

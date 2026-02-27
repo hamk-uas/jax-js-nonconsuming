@@ -1064,12 +1064,6 @@ function tryPreparePreencodedMultiStep(
     numX,
   );
 
-  // Phase 2: kernel-only bodies (Phase 3 adds routine support)
-  if (classification.hasRoutines) {
-    if (DEBUG >= 2) console.log("Preencoded multi-step: skipped, has routines");
-    return null;
-  }
-
   if (classification.hasLoops) {
     if (DEBUG >= 2) console.log("Preencoded multi-step: skipped, has loops");
     return null;
@@ -1133,10 +1127,10 @@ function tryPreparePreencodedMultiStep(
     }
   }
 
-  // Check all kernels have concrete sizes and no pre-existing uniforms
+  // Check all steps have concrete sizes and no pre-existing uniforms
   for (const step of executeSteps) {
-    const kernel = step.source as Kernel;
-    if (kernel.isSymbolic) {
+    // Only kernels can be symbolic — routines always have concrete sizes
+    if (step.source instanceof Kernel && step.source.isSymbolic) {
       if (DEBUG >= 2)
         console.log("Preencoded multi-step: skipped, symbolic kernel size");
       return null;

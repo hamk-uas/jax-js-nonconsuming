@@ -2097,3 +2097,110 @@ describe("preencoded multi-step scan (WebGPU)", () => {
     expect(dxs).toBeAllclose([[3], [5], [7]]);
   });
 });
+
+// ============================================================================
+// Preencoded multi-step with routines (WebGPU Phase 3)
+// ============================================================================
+
+describe("preencoded multi-step with routines (WebGPU)", () => {
+  const hasWebGPU = devicesAvailable.includes("webgpu");
+
+  beforeEach(({ skip }) => {
+    if (!hasWebGPU) skip();
+    defaultDevice("webgpu");
+  });
+
+  test("mixed kernel + Cholesky routine body", () => {
+    // Body: scale → Cholesky = kernel + routine → 2 execute steps
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const scaled = np.multiply(carry, x);
+      const L = lax.linalg.cholesky(scaled);
+      return [L, L];
+    };
+
+    using initVal = np.array([
+      [4.0, 2.0],
+      [2.0, 5.0],
+    ]);
+    // xs must preserve positive-definiteness when multiplied into carry.
+    // Using 1.0 keeps the matrix unchanged each iteration.
+    using xs = np.array([[1.0], [1.0], [1.0]]);
+
+    const [finalCarry, ys] = lax.scan(step, initVal, xs, {
+      acceptPath: "preencoded-multi-step",
+    });
+
+    // Cholesky of [[4,2],[2,5]]:
+    // L[0,0]=2, L[1,0]=1, L[1,1]=2  →  [[2,0],[1,2]]
+    const carryData = finalCarry.dataSync();
+    expect(carryData[0]).toBeCloseTo(2.0, 4);
+    expect(carryData[1]).toBeCloseTo(0.0, 4);
+    expect(carryData[2]).toBeCloseTo(1.0, 4);
+    expect(carryData[3]).toBeCloseTo(2.0, 4);
+
+    // 3 iterations, each producing a 2×2 L
+    const ysData = ys.dataSync();
+    expect(ysData.length).toBe(3 * 4);
+    finalCarry.dispose();
+    ys.dispose();
+  });
+
+  test("Cholesky routine + downstream kernel body", () => {
+    // Body: Cholesky → matmul(L, L^T) = routine + kernel → 2 execute steps
+    const step = (carry: np.Array, _x: np.Array): [np.Array, np.Array] => {
+      const L = lax.linalg.cholesky(carry);
+      const reconstructed = np.matmul(L, L.transpose());
+      return [reconstructed, L];
+    };
+
+    using initVal = np.array([
+      [4.0, 2.0],
+      [2.0, 5.0],
+    ]);
+    using xs = np.array([[1.0], [1.0]]);
+
+    const [finalCarry, ys] = lax.scan(step, initVal, xs, {
+      acceptPath: "preencoded-multi-step",
+    });
+
+    // L·L^T should reconstruct the original matrix (idempotent)
+    const carryData = finalCarry.dataSync();
+    expect(carryData[0]).toBeCloseTo(4.0, 3);
+    expect(carryData[1]).toBeCloseTo(2.0, 3);
+    expect(carryData[2]).toBeCloseTo(2.0, 3);
+    expect(carryData[3]).toBeCloseTo(5.0, 3);
+
+    expect(ys.dataSync().length).toBe(2 * 4);
+    finalCarry.dispose();
+    ys.dispose();
+  });
+
+  test("jit-wrapped mixed kernel+routine scan", () => {
+    const f = jit(() => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const scaled = np.multiply(carry, x);
+        const L = lax.linalg.cholesky(scaled);
+        return [L, L];
+      };
+
+      using initVal = np.array([
+        [4.0, 2.0],
+        [2.0, 5.0],
+      ]);
+      using xs = np.array([[1.0], [1.0]]);
+
+      return lax.scan(step, initVal, xs, {
+        acceptPath: "preencoded-multi-step",
+      });
+    });
+
+    const [finalCarry, ys] = f();
+    const carryData = finalCarry.dataSync();
+    expect(carryData[0]).toBeCloseTo(2.0, 4);
+    expect(carryData[3]).toBeCloseTo(2.0, 4);
+
+    finalCarry.dispose();
+    ys.dispose();
+    f.dispose();
+  });
+});
