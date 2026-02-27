@@ -48,6 +48,26 @@
       href: resolve("/mnist"),
       description: "Demo of training a neural network on MNIST.",
     },
+    {
+      title: "DETR ResNet-50",
+      href: resolve("/detr-resnet-50"),
+      description: "Object detection with DETR via ONNX, running in-browser.",
+    },
+    {
+      title: "Mandelbrot Set",
+      href: resolve("/mandelbrot"),
+      description: "GPU-accelerated fractal rendering with JIT-compiled scan.",
+    },
+    {
+      title: "Matmul Benchmark",
+      href: resolve("/bench/matmul"),
+      description: "Measure matrix multiplication GFLOP/s on your device.",
+    },
+    {
+      title: "Conv2d Benchmark",
+      href: resolve("/bench/conv2d"),
+      description: "Measure convolution throughput on your device.",
+    },
   ];
 </script>
 
