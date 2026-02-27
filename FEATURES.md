@@ -75,6 +75,9 @@ functions.
 | `Array`              | 🟢      |                                                  |
 | `checkLeaks`         | 🟢      | leak diagnostic (slot count delta + stack trace) |
 | `clearCaches`        | 🟢      | flush JIT caches to free GPU/WASM memory         |
+| `getCacheSizes`      | 🟢      | inspect JIT cache entry counts                   |
+| `scatterAdd`         | 🟢      | scatter-add with autodiff (JVP, transpose, vmap) |
+| `withBatch`          | 🟢      | batch GPU dispatches into single queue.submit()  |
 
 Array primitives need to be called with methods like `a.add(b)` / `a.mul(b)` instead of `a + b` and
 `a * b` as in Python, which has overloading.
