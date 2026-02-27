@@ -752,7 +752,11 @@ export class WebGPUBackend implements Backend {
           {
             binding: 0,
             visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "uniform" },
+            buffer: {
+              type: "uniform",
+              hasDynamicOffset: true,
+              minBindingSize: 8,
+            },
           },
         ],
       });
@@ -824,28 +828,69 @@ export class WebGPUBackend implements Backend {
     // Create const GPU buffers array
     const constBuffers = constSlots.map((slot) => this.#getBuffer(slot).buffer);
 
-    // Copy input elems into ping buffer (interleaved layout)
-    // For each leaf k, copy elemSlots[k] → ping at offset leafStarts[k]*N*bytesPerElem
-    // Each elemSlot[k] has shape [N, ...leafShape], stored contiguously as
-    // N * leafElemCounts[k] typed elements — this matches our interleaved layout
-    // [leaf0: N*ec0 | leaf1: N*ec1 | ...]
-    const commandEncoder = this.device.createCommandEncoder();
+    // --- Kogge-Stone round count ---
+    const numRounds = Math.ceil(Math.log2(N));
+
+    // --- Pre-allocate single uniform buffer for all rounds (dynamic offsets) ---
+    const minAlign = this.device.limits.minUniformBufferOffsetAlignment;
+    const uniformEntrySize = Math.max(8, minAlign);
+    const uniformBufSize = Math.max(
+      numRounds * uniformEntrySize,
+      uniformEntrySize,
+    );
+    const uniformBuf = this.device.createBuffer({
+      size: uniformBufSize,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    const uniformMapped = new DataView(uniformBuf.getMappedRange());
+    for (let r = 0; r < numRounds; r++) {
+      uniformMapped.setUint32(r * uniformEntrySize, 1 << r, true); // stride
+      uniformMapped.setUint32(r * uniformEntrySize + 4, N, true); // N
+    }
+    uniformBuf.unmap();
+
+    // --- Pre-create bind groups ---
+    // 2 storage bind groups: even rounds (ping→pong), odd rounds (pong→ping)
+    const constEntries: GPUBindGroupEntry[] = constBuffers.map((b, i) => ({
+      binding: i + 2,
+      resource: { buffer: b },
+    }));
+    const storagePingPong = this.device.createBindGroup({
+      layout: prepared.storageLayout,
+      entries: [
+        { binding: 0, resource: { buffer: pingBuf } },
+        { binding: 1, resource: { buffer: pongBuf } },
+        ...constEntries,
+      ],
+    });
+    const storagePongPing = this.device.createBindGroup({
+      layout: prepared.storageLayout,
+      entries: [
+        { binding: 0, resource: { buffer: pongBuf } },
+        { binding: 1, resource: { buffer: pingBuf } },
+        ...constEntries,
+      ],
+    });
+    // 1 uniform bind group with dynamic offset
+    const uniformBindGroup = this.device.createBindGroup({
+      layout: prepared.uniformLayout,
+      entries: [{ binding: 0, resource: { buffer: uniformBuf, size: 8 } }],
+    });
+
+    // --- Single command encoder for entire operation ---
+    const enc = this.device.createCommandEncoder();
+
+    // 1. Copy input elems into ping buffer (interleaved layout)
     for (let k = 0; k < numLeaves; k++) {
       const srcBuf = this.#getBuffer(elemSlots[k]).buffer;
       const dstOffset = leafStarts[k] * N * bytesPerElem;
       const copySize = leafElemCounts[k] * N * bytesPerElem;
       if (copySize > 0 && copySize % 4 === 0) {
-        commandEncoder.copyBufferToBuffer(
-          srcBuf,
-          0,
-          pingBuf,
-          dstOffset,
-          copySize,
-        );
+        enc.copyBufferToBuffer(srcBuf, 0, pingBuf, dstOffset, copySize);
       } else if (copySize > 0) {
-        // Unaligned copy — use the WGSL copy shader
         this.#encodeCopyWithShader(
-          commandEncoder,
+          enc,
           srcBuf,
           0,
           pingBuf,
@@ -855,121 +900,86 @@ export class WebGPUBackend implements Backend {
       }
     }
 
-    // If reverse, we need to reverse the input data along the scan axis.
-    // Approach: reverse at copy-in by writing position j as (N-1-j) in the output,
-    // but that would require a shader. Simpler: reverse the output at the end.
-    // For now we reverse at copy-in/copy-out with dedicated reversal dispatches.
-    // Actually, since the scan body fn is associative, we can just reverse
-    // input, scan forward, reverse output. But that adds 2 extra dispatches.
-    // Better approach: modify the shader to swap a_pos logic.
-    // For simple implementation, handle reverse by reversing copy-in and copy-out.
-    // TODO: For better perf, generate a reverse-aware shader variant.
-
-    this.device.queue.submit([commandEncoder.finish()]);
-
-    // If reverse, we need to flip the data in the ping buffer
+    // 2. Reverse input if needed (inline reversal into same encoder)
+    let reverseTempBuf: GPUBuffer | null = null;
     if (reverse && N > 1) {
-      this.#reverseAssocScanBuffer(
-        pingBuf,
-        N,
-        numLeaves,
-        leafElemCounts,
-        leafStarts,
-        bytesPerElem,
-      );
+      reverseTempBuf = this.#createBuffer(paddedBytes);
+      for (let k = 0; k < numLeaves; k++) {
+        const ec = leafElemCounts[k];
+        const leafOffset = leafStarts[k] * N * bytesPerElem;
+        const elemBytes = ec * bytesPerElem;
+        for (let j = 0; j < N; j++) {
+          const srcOff = leafOffset + j * elemBytes;
+          const dstOff = leafOffset + (N - 1 - j) * elemBytes;
+          if (elemBytes % 4 === 0) {
+            enc.copyBufferToBuffer(
+              pingBuf,
+              srcOff,
+              reverseTempBuf,
+              dstOff,
+              elemBytes,
+            );
+          }
+        }
+      }
+      enc.copyBufferToBuffer(reverseTempBuf, 0, pingBuf, 0, paddedBytes);
     }
 
-    // Kogge-Stone: ceil(log₂ N) rounds
-    const numRounds = Math.ceil(Math.log2(N));
-
-    // Alternate which buffer is ping (read) and which is pong (write)
-    let curPing = pingBuf;
-    let curPong = pongBuf;
+    // 3. Encode all Kogge-Stone rounds into same command buffer (1 submit)
+    const wgSize = prepared.workgroupSize;
+    const numWorkgroups = Math.ceil(N / wgSize);
+    const [gridX, gridY] = calculateGrid(numWorkgroups);
 
     for (let round = 0; round < numRounds; round++) {
-      const stride = 1 << round;
+      const storageGroup = round % 2 === 0 ? storagePingPong : storagePongPing;
+      const dynamicOffset = round * uniformEntrySize;
 
-      // Create uniform buffer with stride and N
-      const uniformData = new Uint32Array([stride, N]);
-      const minAlign = this.device.limits.minUniformBufferOffsetAlignment;
-      const uniformSize = Math.max(
-        Math.ceil(uniformData.byteLength / minAlign) * minAlign,
-        uniformData.byteLength,
-      );
-      const uniformBuf = this.device.createBuffer({
-        size: uniformSize,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      });
-      this.device.queue.writeBuffer(uniformBuf, 0, uniformData);
-
-      // Create bind groups
-      const storageEntries: GPUBindGroupEntry[] = [
-        { binding: 0, resource: { buffer: curPing } },
-        { binding: 1, resource: { buffer: curPong } },
-      ];
-      for (let i = 0; i < constBuffers.length; i++) {
-        storageEntries.push({
-          binding: i + 2,
-          resource: { buffer: constBuffers[i] },
-        });
-      }
-      const storageBindGroup = this.device.createBindGroup({
-        layout: prepared.storageLayout,
-        entries: storageEntries,
-      });
-      const uniformBindGroup = this.device.createBindGroup({
-        layout: prepared.uniformLayout,
-        entries: [{ binding: 0, resource: { buffer: uniformBuf } }],
-      });
-
-      // Dispatch
-      const wgSize = prepared.workgroupSize;
-      const numWorkgroups = Math.ceil(N / wgSize);
-      const [gridX, gridY] = calculateGrid(numWorkgroups);
-
-      const enc = this.device.createCommandEncoder();
       const pass = enc.beginComputePass();
       pass.setPipeline(prepared.pipeline);
-      pass.setBindGroup(0, storageBindGroup);
-      pass.setBindGroup(1, uniformBindGroup);
+      pass.setBindGroup(0, storageGroup);
+      pass.setBindGroup(1, uniformBindGroup, [dynamicOffset]);
       pass.dispatchWorkgroups(gridX, gridY);
       pass.end();
-      this.device.queue.submit([enc.finish()]);
-
-      uniformBuf.destroy();
-
-      // Swap ping/pong
-      const tmp = curPing;
-      curPing = curPong;
-      curPong = tmp;
     }
 
-    // After all rounds, result is in curPing (last write target became ping after swap)
+    // After all rounds: even rounds write to pong, odd rounds write to ping.
+    // Last round = numRounds-1. Result in pong if last round even, ping if odd.
+    const resultBuf = (numRounds - 1) % 2 === 0 ? pongBuf : pingBuf;
 
-    // If reverse, flip the result data back
+    // 4. Reverse result if needed (reuse temp buffer)
     if (reverse && N > 1) {
-      this.#reverseAssocScanBuffer(
-        curPing,
-        N,
-        numLeaves,
-        leafElemCounts,
-        leafStarts,
-        bytesPerElem,
-      );
+      for (let k = 0; k < numLeaves; k++) {
+        const ec = leafElemCounts[k];
+        const leafOffset = leafStarts[k] * N * bytesPerElem;
+        const elemBytes = ec * bytesPerElem;
+        for (let j = 0; j < N; j++) {
+          const srcOff = leafOffset + j * elemBytes;
+          const dstOff = leafOffset + (N - 1 - j) * elemBytes;
+          if (elemBytes % 4 === 0) {
+            enc.copyBufferToBuffer(
+              resultBuf,
+              srcOff,
+              reverseTempBuf!,
+              dstOff,
+              elemBytes,
+            );
+          }
+        }
+      }
+      enc.copyBufferToBuffer(reverseTempBuf!, 0, resultBuf, 0, paddedBytes);
     }
 
-    // Copy results from ping buffer (interleaved) to output slots
-    const outEncoder = this.device.createCommandEncoder();
+    // 5. Copy results from result buffer to output slots
     for (let k = 0; k < numLeaves; k++) {
       const dstBuf = this.#getBuffer(outputSlots[k]).buffer;
       const srcOffset = leafStarts[k] * N * bytesPerElem;
       const copySize = leafElemCounts[k] * N * bytesPerElem;
       if (copySize > 0 && copySize % 4 === 0) {
-        outEncoder.copyBufferToBuffer(curPing, srcOffset, dstBuf, 0, copySize);
+        enc.copyBufferToBuffer(resultBuf, srcOffset, dstBuf, 0, copySize);
       } else if (copySize > 0) {
         this.#encodeCopyWithShader(
-          outEncoder,
-          curPing,
+          enc,
+          resultBuf,
           srcOffset,
           dstBuf,
           0,
@@ -977,50 +987,19 @@ export class WebGPUBackend implements Backend {
         );
       }
     }
-    this.device.queue.submit([outEncoder.finish()]);
 
-    // Destroy transient buffers
+    // 6. Single submit for everything
+    this.device.queue.submit([enc.finish()]);
+
+    // 7. Cleanup transient buffers
+    uniformBuf.destroy();
+    if (reverseTempBuf) {
+      reverseTempBuf.destroy();
+      this.#gpuAllocatedBytes -= paddedBytes;
+    }
     pingBuf.destroy();
     pongBuf.destroy();
     this.#gpuAllocatedBytes -= paddedBytes * 2;
-  }
-
-  /**
-   * Reverse elements along the scan axis (position 0..N-1) in an interleaved
-   * buffer. Uses a simple GPU copy shader: position j ↔ position (N-1-j).
-   */
-  #reverseAssocScanBuffer(
-    buffer: GPUBuffer,
-    N: number,
-    numLeaves: number,
-    leafElemCounts: number[],
-    leafStarts: number[],
-    bytesPerElem: number,
-  ): void {
-    // Create a temp buffer, copy reversed, copy back
-    const totalElemsPerPos = leafElemCounts.reduce((a, b) => a + b, 0);
-    const totalBytes = totalElemsPerPos * N * bytesPerElem;
-    const paddedBytes = Math.max(Math.ceil(totalBytes / 4) * 4, 4);
-    const tempBuf = this.#createBuffer(paddedBytes);
-
-    const enc = this.device.createCommandEncoder();
-    for (let k = 0; k < numLeaves; k++) {
-      const ec = leafElemCounts[k];
-      const leafOffset = leafStarts[k] * N * bytesPerElem;
-      const elemBytes = ec * bytesPerElem;
-      for (let j = 0; j < N; j++) {
-        const srcOff = leafOffset + j * elemBytes;
-        const dstOff = leafOffset + (N - 1 - j) * elemBytes;
-        if (elemBytes % 4 === 0) {
-          enc.copyBufferToBuffer(buffer, srcOff, tempBuf, dstOff, elemBytes);
-        }
-      }
-    }
-    // Copy temp back to buffer
-    enc.copyBufferToBuffer(tempBuf, 0, buffer, 0, paddedBytes);
-    this.device.queue.submit([enc.finish()]);
-    tempBuf.destroy();
-    this.#gpuAllocatedBytes -= paddedBytes;
   }
 
   // ---------------------------------------------------------------------------
