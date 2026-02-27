@@ -19,12 +19,9 @@ import {
 import { PPrint } from "../pprint";
 import { Routine } from "../routine";
 import {
-  concreteDim,
-  concreteShape,
   type Dim,
   dimProduct,
   hasSymbolicDims,
-  isSymbolicDim,
   isSymbolicSize,
   Pair,
   resolveDim,
@@ -45,14 +42,13 @@ import {
   range,
   rep,
 } from "../utils";
-import { aluCompare, Array as JaxArray, PendingExecute } from "./array";
+import { aluCompare, PendingExecute } from "./array";
 import {
   _registerCacheSizeGetter,
   _registerJitCacheDisposer,
 } from "./check-leaks";
 import { pool, poolTranspose, prepareConv } from "./convolution";
 import {
-  _associativeScanCoreImpl,
   Primitive,
   PrimitiveParams,
   promoteAvals,
@@ -60,10 +56,9 @@ import {
   ShapedArray,
 } from "./core";
 import { Jaxpr, Lit, Var } from "./jaxpr";
-import { executeScan } from "./scan-executor";
+import { executeAssociativeScan, executeScan } from "./scan-executor";
 import type { AssocScanPlan, ScanPlan } from "./scan-plan";
 import { planAssociativeScan, planScan } from "./scan-plan";
-import type { WebGPUBackend } from "../backend/webgpu";
 import type { ScanPath } from "../utils";
 
 export type JitId = number;
@@ -598,124 +593,32 @@ export class JitProgram {
           // Flush pending ops — assoc_scan needs materialized inputs
           flushPendingBatched(pending, this.backend);
 
-          if (step.plan.path === "compiled-loop") {
-            // Native WASM compiled-loop path: entire Kogge-Stone loop runs
-            // in a single WASM invocation. N is a runtime parameter,
-            // enabling polymorphic shapes (same compiled module for any N).
-            const nDim = step.elemAvals[0].shape[step.axis];
-            const N = isSymbolicDim(nDim)
-              ? concreteDim(
-                  resolveShape([nDim], dimBindings!)[0],
-                  "assoc_scan N",
-                )
-              : (nDim as number);
+          const constSlots = step.consts.map((id) => scope.get(id)!);
+          const elemSlots = step.elems.map((id) => scope.get(id)!);
+          const outputSlots = step.outputs.map((id) => scope.get(id)!);
 
-            const constSlots = step.consts.map((id) => scope.get(id)!);
-            const elemSlots = step.elems.map((id) => scope.get(id)!);
-            const outputSlots = step.outputs.map((id) => scope.get(id)!);
+          const assocResult = executeAssociativeScan({
+            backend: this.backend,
+            plan: step.plan,
+            bodyJaxpr: step.bodyJaxpr,
+            numLeaves: step.numLeaves,
+            numConsts: step.numConsts,
+            axis: step.axis,
+            reverse: step.reverse,
+            constSlots,
+            elemSlots,
+            constAvals: step.constAvals,
+            elemAvals: step.elemAvals,
+            outputSlots,
+            dimBindings,
+          });
 
-            (this.backend as WasmBackend).dispatchNativeAssociativeScan(
-              step.plan.executable,
-              step.plan.params,
-              N,
-              constSlots,
-              elemSlots,
-              outputSlots,
-            );
-          } else if (step.plan.path === "webgpu-fused") {
-            // WebGPU fused path: entire Kogge-Stone ladder runs with
-            // one GPU dispatch per round (all body steps fused into
-            // a single WGSL shader). Ping-pong buffers swap each round.
-            const nDim = step.elemAvals[0].shape[step.axis];
-            const N = isSymbolicDim(nDim)
-              ? concreteDim(
-                  resolveShape([nDim], dimBindings!)[0],
-                  "assoc_scan N",
-                )
-              : (nDim as number);
-
-            const constSlots = step.consts.map((id) => scope.get(id)!);
-            const elemSlots = step.elems.map((id) => scope.get(id)!);
-            const outputSlots = step.outputs.map((id) => scope.get(id)!);
-
-            (this.backend as WebGPUBackend).dispatchAssocScan(
-              step.plan.prepared,
-              step.plan.params,
-              constSlots,
-              elemSlots,
-              outputSlots,
-              N,
-              step.reverse,
-            );
-          } else {
-            // Fallback: JS Kogge-Stone loop via vmap + evalJaxpr
-            // Create Array wrappers from input slots.
-            // Resolve symbolic shapes at execution time via dimBindings.
-            const resolveAvalShape = (shape: Dim[]): number[] =>
-              hasSymbolicDims(shape)
-                ? concreteShape(resolveShape(shape, dimBindings!))
-                : (shape as number[]);
-
-            const constSlots = step.consts.map((id) => scope.get(id)!);
-            const constArrays = constSlots.map((slot, i) => {
-              this.backend.incRef(slot);
-              const aval = step.constAvals[i];
-              return new JaxArray({
-                source: slot,
-                st: ShapeTracker.fromShape(resolveAvalShape(aval.shape)),
-                dtype: aval.dtype,
-                weakType: aval.weakType,
-                backend: this.backend,
-                committed: false,
-              });
-            });
-
-            const elemSlots = step.elems.map((id) => scope.get(id)!);
-            const elemArrays = elemSlots.map((slot, i) => {
-              this.backend.incRef(slot);
-              const aval = step.elemAvals[i];
-              return new JaxArray({
-                source: slot,
-                st: ShapeTracker.fromShape(resolveAvalShape(aval.shape)),
-                dtype: aval.dtype,
-                weakType: aval.weakType,
-                backend: this.backend,
-                committed: false,
-              });
-            });
-
-            // Call Kogge-Stone core impl with body jaxpr + consts.
-            // The core impl uses vmap internally to vectorize the element-level
-            // body jaxpr over the batch dimension.
-            const results = _associativeScanCoreImpl!(
-              step.bodyJaxpr,
-              constArrays,
-              elemArrays,
-              step.numLeaves,
-              step.axis,
-              step.reverse,
-            );
-
-            // Extract slots from results and store in output scope.
-            // Must flush pending ops first — result arrays from associativeScanCore
-            // have PendingExecute items (from concat/kernels) that haven't been
-            // submitted yet. Without flushing, the slot buffer contains zeros.
-            for (let i = 0; i < step.numLeaves; i++) {
-              const resultArr = results[i] as JaxArray;
-              resultArr._flushPendingSync();
-              const slot = resultArr._realizeSource();
-              this.backend.incRef(slot);
-              // Free the pre-allocated output buffer before overwriting scope
-              const oldSlot = scope.get(step.outputs[i]);
-              if (oldSlot !== undefined) this.backend.decRef(oldSlot);
-              scope.set(step.outputs[i], slot);
-              resultArr.dispose();
-            }
-
-            // Dispose input Array wrappers
-            for (const a of constArrays) a.dispose();
-            for (const a of elemArrays) a.dispose();
+          // Update scope with result slots (may differ from pre-allocated
+          // output slots when the fallback path replaces them).
+          for (let i = 0; i < step.numLeaves; i++) {
+            scope.set(step.outputs[i], assocResult.outputs[i]);
           }
+          pending.push(...assocResult.pending);
           break;
         }
         default:

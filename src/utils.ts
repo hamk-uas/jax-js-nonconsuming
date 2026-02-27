@@ -21,7 +21,11 @@ export function setDebug(level: number) {
 }
 
 /** The execution strategy chosen for a scan loop. */
-export type ScanPath = "compiled-loop" | "preencoded-routine" | "fallback";
+export type ScanPath =
+  | "compiled-loop"
+  | "preencoded-routine"
+  | "preencoded-multi-step"
+  | "fallback";
 
 export function assertNonNull<T>(value: T): asserts value is NonNullable<T> {}
 

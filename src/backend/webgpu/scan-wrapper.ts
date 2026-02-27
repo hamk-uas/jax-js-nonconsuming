@@ -39,6 +39,14 @@ export interface ScanBindingInfo {
   numConsts: number;
   numCarry: number;
   /**
+   * Number of xs inputs in the body. When provided, input JitIds in
+   * [numConsts+numCarry, numConsts+numCarry+numX) are classified as xs;
+   * higher JitIds (e.g. internal buffers) are excluded.
+   * When omitted, all JitIds >= numConsts+numCarry are treated as xs
+   * (backward-compatible with the single-routine path).
+   */
+  numX?: number;
+  /**
    * For each routine input binding i, routineInputJitIds[i] gives the body jaxpr JitId.
    * This allows determining if binding i is const/carry/xs.
    */
@@ -93,12 +101,13 @@ function getOffsetBindings(
   const ysBindings: BufferBinding[] = [];
 
   const xsStart = scanInfo.numConsts + scanInfo.numCarry;
+  const xsEnd = scanInfo.numX != null ? xsStart + scanInfo.numX : Infinity;
 
-  // Check each input binding - if its JitId >= xsStart, it's an xs input (needs offset)
+  // Check each input binding - if its JitId is in [xsStart, xsEnd), it's an xs input (needs offset)
   for (let i = 0; i < inputs.length; i++) {
     if (i < scanInfo.routineInputJitIds.length) {
       const jitId = scanInfo.routineInputJitIds[i];
-      if (jitId >= xsStart) {
+      if (jitId >= xsStart && jitId < xsEnd) {
         xsBindings.push(inputs[i]);
       }
     }

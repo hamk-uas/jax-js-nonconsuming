@@ -9,12 +9,22 @@
 import { byteWidth } from "../alu";
 import type { Backend, Slot } from "../backend";
 import type { PendingExecute } from "./array";
-import { ShapedArray } from "./core";
+import { Array as JaxArray } from "./array";
+import { _associativeScanCoreImpl, ShapedArray } from "./core";
 import type { Jaxpr } from "./jaxpr";
 import type { JitProgram } from "./jit";
-import type { ScanPlan } from "./scan-plan";
+import type { AssocScanPlan, ScanPlan } from "./scan-plan";
 import type { WasmBackend } from "../backend/wasm";
 import type { NativeScanMultiParams, WebGPUBackend } from "../backend/webgpu";
+import {
+  concreteDim,
+  concreteShape,
+  type Dim,
+  hasSymbolicDims,
+  isSymbolicDim,
+  resolveShape,
+  ShapeTracker,
+} from "../shape";
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -61,6 +71,8 @@ export function executeScan(params: ExecuteScanParams): ExecuteScanResult {
       return executeScanCompiledLoop(params);
     case "preencoded-routine":
       return executeScanPreencodedRoutine(params);
+    case "preencoded-multi-step":
+      return executeScanPreencodedMultiStep(params);
   }
 }
 
@@ -312,8 +324,197 @@ function executeScanPreencodedRoutine(
 }
 
 // ---------------------------------------------------------------------------
+// Preencoded multi-step: WebGPU multi-kernel scan with per-step offsets (P2c)
+// ---------------------------------------------------------------------------
+
+function executeScanPreencodedMultiStep(
+  params: ExecuteScanParams,
+): ExecuteScanResult {
+  const {
+    backend,
+    plan,
+    numCarry,
+    numY,
+    constSlots,
+    initCarrySlots,
+    xsSlots,
+    outputSlots,
+  } = params;
+
+  if (plan.path !== "preencoded-multi-step") throw new Error("unreachable");
+
+  const carryOutSlots = outputSlots.slice(0, numCarry);
+  const ysStackedSlots = outputSlots.slice(numCarry, numCarry + numY);
+
+  const webgpuBackend = backend as WebGPUBackend;
+  webgpuBackend.dispatchPreencodedMultiStepScan(
+    plan.prepared,
+    constSlots,
+    initCarrySlots,
+    xsSlots,
+    carryOutSlots,
+    ysStackedSlots,
+  );
+
+  return { outputs: outputSlots, pending: [] };
+}
+
+// ---------------------------------------------------------------------------
+// Associative scan executor (Kogge-Stone)
+// ---------------------------------------------------------------------------
+
+export interface ExecuteAssocScanParams {
+  backend: Backend;
+  plan: AssocScanPlan;
+  bodyJaxpr: Jaxpr;
+  numLeaves: number;
+  numConsts: number;
+  axis: number;
+  reverse: boolean;
+  constSlots: Slot[];
+  elemSlots: Slot[];
+  constAvals: ShapedArray[];
+  elemAvals: ShapedArray[];
+  /** Preallocated output slots (may be replaced in fallback path). */
+  outputSlots: Slot[];
+  /** Dimension bindings for symbolic shape resolution. */
+  dimBindings?: ReadonlyMap<string, number>;
+}
+
+export interface ExecuteAssocScanResult {
+  /** Final output slots — same as input for native paths, replaced for fallback. */
+  outputs: Slot[];
+  pending: PendingExecute[];
+}
+
+/**
+ * Execute an associative scan. Dispatches based on plan path:
+ * - compiled-loop: WASM-compiled Kogge-Stone ladder
+ * - webgpu-fused: fused WGSL shader per round
+ * - fallback: JS Kogge-Stone loop via vmap + evalJaxpr
+ */
+export function executeAssociativeScan(
+  params: ExecuteAssocScanParams,
+): ExecuteAssocScanResult {
+  const {
+    backend,
+    plan,
+    bodyJaxpr,
+    numLeaves,
+    numConsts: _numConsts,
+    axis,
+    reverse,
+    constSlots,
+    elemSlots,
+    constAvals,
+    elemAvals,
+    outputSlots,
+    dimBindings,
+  } = params;
+
+  if (plan.path === "compiled-loop") {
+    const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
+    (backend as WasmBackend).dispatchNativeAssociativeScan(
+      plan.executable,
+      plan.params,
+      N,
+      constSlots,
+      elemSlots,
+      outputSlots,
+    );
+    return { outputs: outputSlots, pending: [] };
+  }
+
+  if (plan.path === "webgpu-fused") {
+    const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
+    (backend as WebGPUBackend).dispatchAssocScan(
+      plan.prepared,
+      plan.params,
+      constSlots,
+      elemSlots,
+      outputSlots,
+      N,
+      reverse,
+    );
+    return { outputs: outputSlots, pending: [] };
+  }
+
+  // Fallback: JS Kogge-Stone loop
+  const resolveAvalShape = (shape: Dim[]): number[] =>
+    hasSymbolicDims(shape)
+      ? concreteShape(resolveShape(shape, dimBindings!))
+      : (shape as number[]);
+
+  const constArrays = constSlots.map((slot, i) => {
+    backend.incRef(slot);
+    const aval = constAvals[i];
+    return new JaxArray({
+      source: slot,
+      st: ShapeTracker.fromShape(resolveAvalShape(aval.shape)),
+      dtype: aval.dtype,
+      weakType: aval.weakType,
+      backend,
+      committed: false,
+    });
+  });
+
+  const elemArrays = elemSlots.map((slot, i) => {
+    backend.incRef(slot);
+    const aval = elemAvals[i];
+    return new JaxArray({
+      source: slot,
+      st: ShapeTracker.fromShape(resolveAvalShape(aval.shape)),
+      dtype: aval.dtype,
+      weakType: aval.weakType,
+      backend,
+      committed: false,
+    });
+  });
+
+  const results = _associativeScanCoreImpl!(
+    bodyJaxpr,
+    constArrays,
+    elemArrays,
+    numLeaves,
+    axis,
+    reverse,
+  );
+
+  // Extract slots from results, replacing pre-allocated output buffers.
+  const finalOutputs: Slot[] = [];
+  for (let i = 0; i < numLeaves; i++) {
+    const resultArr = results[i] as JaxArray;
+    resultArr._flushPendingSync();
+    const slot = resultArr._realizeSource();
+    backend.incRef(slot);
+    // Free the pre-allocated output buffer
+    backend.decRef(outputSlots[i]);
+    finalOutputs.push(slot);
+    resultArr.dispose();
+  }
+
+  // Dispose input Array wrappers
+  for (const a of constArrays) a.dispose();
+  for (const a of elemArrays) a.dispose();
+
+  return { outputs: finalOutputs, pending: [] };
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Resolve the scan axis dimension N, handling symbolic dims. */
+function resolveAxisN(
+  shape: Dim[],
+  axis: number,
+  dimBindings?: ReadonlyMap<string, number>,
+): number {
+  const nDim = shape[axis];
+  return isSymbolicDim(nDim)
+    ? concreteDim(resolveShape([nDim], dimBindings!)[0], "assoc_scan N")
+    : (nDim as number);
+}
 
 /** Flush all pending GPU/WASM operations, batching dispatches when possible. */
 function flushPending(pending: PendingExecute[]): void {

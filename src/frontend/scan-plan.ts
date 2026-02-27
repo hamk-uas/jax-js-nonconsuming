@@ -14,6 +14,7 @@ import {
 import type {
   NativeScanMultiParams,
   NativeScanMultiStep,
+  PreparedPreencodedMultiStep,
   PreparedPreencodedScan,
   PreparedWebGPUAssocScan,
   WebGPUAssocScanParams,
@@ -38,7 +39,11 @@ export type ScanPlan =
       params?: NativeScanGeneralParams | NativeScanMultiParams;
       internalSizes?: number[];
     }
-  | { path: "preencoded-routine"; preencodedParams: PreparedPreencodedScan };
+  | { path: "preencoded-routine"; preencodedParams: PreparedPreencodedScan }
+  | {
+      path: "preencoded-multi-step";
+      prepared: PreparedPreencodedMultiStep;
+    };
 
 /**
  * Execution plan for `lax.associativeScan` (Kogge-Stone parallel prefix scan).
@@ -127,6 +132,135 @@ export function getScanBufferSizes(
 }
 
 // ---------------------------------------------------------------------------
+// Body step classification (shared structural analysis)
+// ---------------------------------------------------------------------------
+
+/** Classification of a scan body program's steps for planner use. */
+export interface BodyStepClassification {
+  /** Execute steps that produce Kernel outputs, with execute-step-relative index. */
+  kernelSteps: { index: number; step: ExecuteStep }[];
+  /** Execute steps that produce Routine outputs. */
+  routineSteps: { index: number; step: ExecuteStep }[];
+  /** Non-execute loop steps (scan / assoc_scan) in the body program. */
+  loopSteps: { index: number; step: JitStep; kind: "scan" | "assoc_scan" }[];
+  /** Internal dependency edges between execute steps. */
+  internalDeps: { consumer: number; producer: number; slot: JitId }[];
+  /** Carry output indices that are passthroughs (carry_out[i] === some carry_in[j]). */
+  carryPassthroughs: number[];
+  /** Map from output JitId → producing execute step index and output index. */
+  outputToProducer: Map<JitId, { execIdx: number; outputIdx: number }>;
+  /** All execute steps in body-program order. */
+  executeSteps: ExecuteStep[];
+  hasRoutines: boolean;
+  hasLoops: boolean;
+  hasInternalDeps: boolean;
+  /** True when an internal dep has producer and consumer with different kernel sizes. */
+  hasCrossGidxDeps: boolean;
+}
+
+/**
+ * Classify a scan body program's steps for planner consumption.
+ *
+ * Extracts shared structural facts that both WASM and WebGPU planners need:
+ * step type classification, output-to-producer mapping, internal dependencies,
+ * carry passthroughs, and nested loop detection.
+ */
+export function classifyBodySteps(
+  bodyProgram: JitProgram,
+  numCarry: number,
+  numConsts: number,
+  _numX: number,
+): BodyStepClassification {
+  const executeSteps: ExecuteStep[] = [];
+  const kernelSteps: BodyStepClassification["kernelSteps"] = [];
+  const routineSteps: BodyStepClassification["routineSteps"] = [];
+  const loopSteps: BodyStepClassification["loopSteps"] = [];
+
+  let execIdx = 0;
+  for (let i = 0; i < bodyProgram.steps.length; i++) {
+    const step = bodyProgram.steps[i];
+    if (step.type === "execute") {
+      const es = step as ExecuteStep;
+      executeSteps.push(es);
+      if (es.source instanceof Kernel) {
+        kernelSteps.push({ index: execIdx, step: es });
+      } else if (es.source instanceof Routine) {
+        routineSteps.push({ index: execIdx, step: es });
+      }
+      execIdx++;
+    } else if (step.type === "scan") {
+      loopSteps.push({ index: i, step, kind: "scan" });
+    } else if (step.type === "assoc_scan") {
+      loopSteps.push({ index: i, step, kind: "assoc_scan" });
+    }
+  }
+
+  // Output-to-producer mapping
+  const outputToProducer = new Map<
+    JitId,
+    { execIdx: number; outputIdx: number }
+  >();
+  for (let ei = 0; ei < executeSteps.length; ei++) {
+    const step = executeSteps[ei];
+    for (let oi = 0; oi < step.outputs.length; oi++) {
+      outputToProducer.set(step.outputs[oi], { execIdx: ei, outputIdx: oi });
+    }
+  }
+
+  // Internal dependencies
+  const internalDeps: BodyStepClassification["internalDeps"] = [];
+  let hasCrossGidxDeps = false;
+  for (let ei = 0; ei < executeSteps.length; ei++) {
+    const step = executeSteps[ei];
+    for (const inputId of step.inputs) {
+      const producer = outputToProducer.get(inputId);
+      if (producer && producer.execIdx !== ei) {
+        internalDeps.push({
+          consumer: ei,
+          producer: producer.execIdx,
+          slot: inputId,
+        });
+        const prodStep = executeSteps[producer.execIdx];
+        if (
+          prodStep.source instanceof Kernel &&
+          step.source instanceof Kernel &&
+          prodStep.source.size !== step.source.size
+        ) {
+          hasCrossGidxDeps = true;
+        }
+      }
+    }
+  }
+
+  // Carry passthroughs
+  const carryPassthroughs: number[] = [];
+  const carryInputIds = bodyProgram.inputs.slice(
+    numConsts,
+    numConsts + numCarry,
+  );
+  const carryOutIds = bodyProgram.outputs.slice(0, numCarry);
+  for (let ci = 0; ci < numCarry; ci++) {
+    if (carryInputIds.includes(carryOutIds[ci])) {
+      carryPassthroughs.push(ci);
+    }
+  }
+
+  return {
+    kernelSteps,
+    routineSteps,
+    loopSteps,
+    internalDeps,
+    carryPassthroughs,
+    outputToProducer,
+    executeSteps,
+    hasRoutines: routineSteps.length > 0,
+    hasLoops: loopSteps.length > 0,
+    hasInternalDeps: internalDeps.length > 0,
+    hasCrossGidxDeps,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // planScan: decide which execution strategy to use
 // ---------------------------------------------------------------------------
 
@@ -144,7 +278,7 @@ function tryPrepareWasmNativeScan(
   backend: Backend,
   bodyProgram: JitProgram,
   bodyJaxpr: Jaxpr,
-  executeSteps: ExecuteStep[],
+  classification: BodyStepClassification,
   numCarry: number,
   numConsts: number,
   numX: number,
@@ -157,23 +291,21 @@ function tryPrepareWasmNativeScan(
 } | null {
   if (DEBUG >= 2) {
     console.log(
-      `[wasm-scan] trying with numCarry=${numCarry}, numY=${numY}, steps=${executeSteps.length}`,
+      `[wasm-scan] trying with numCarry=${numCarry}, numY=${numY}, steps=${classification.executeSteps.length}`,
     );
   }
 
-  // Check for unsupported routines.
-  // We delegate the check to getScanRoutineInfo in the WASM backend, which
-  // knows which routines it supports bindings for.
-  for (const step of executeSteps) {
-    if (step.source instanceof Routine) {
-      if (!getScanRoutineInfo(step.source)) {
-        if (DEBUG >= 1) {
-          console.log(
-            `[wasm-scan] skipped, unsupported routine: ${step.source.name}`,
-          );
-        }
-        return null;
+  const executeSteps = classification.executeSteps;
+
+  // Check for unsupported routines via the classification's routine steps.
+  for (const { step } of classification.routineSteps) {
+    if (!getScanRoutineInfo(step.source as Routine)) {
+      if (DEBUG >= 1) {
+        console.log(
+          `[wasm-scan] skipped, unsupported routine: ${(step.source as Routine).name}`,
+        );
       }
+      return null;
     }
   }
 
@@ -488,7 +620,7 @@ function tryPrepareWebGPUNativeScan(
   backend: Backend,
   bodyProgram: JitProgram,
   bodyJaxpr: Jaxpr,
-  executeSteps: ExecuteStep[],
+  classification: BodyStepClassification,
   length: number,
   numCarry: number,
   numConsts: number,
@@ -509,14 +641,12 @@ function tryPrepareWebGPUNativeScan(
   }
 
   // No routine steps
-  for (const step of executeSteps) {
-    if (step.source instanceof Routine) {
-      if (DEBUG >= 1)
-        console.log(`[webgpu-scan] skipped, routine in scan body`);
-      return null;
-    }
+  if (classification.hasRoutines) {
+    if (DEBUG >= 1) console.log(`[webgpu-scan] skipped, routine in scan body`);
+    return null;
   }
 
+  const executeSteps = classification.executeSteps;
   const numInputs = numConsts + numCarry + numX;
   const { constSizes, carrySizes, xsStrides, ysStrides } = getScanBufferSizes(
     bodyJaxpr,
@@ -718,10 +848,13 @@ function tryPrepareNativeScan(
   internalSizes?: number[];
   params?: NativeScanGeneralParams | NativeScanMultiParams;
 } | null {
-  const executeSteps = bodyProgram.steps.filter(
-    (s) => s.type === "execute",
-  ) as ExecuteStep[];
-  if (executeSteps.length === 0) {
+  const classification = classifyBodySteps(
+    bodyProgram,
+    numCarry,
+    numConsts,
+    numX,
+  );
+  if (classification.executeSteps.length === 0) {
     if (DEBUG >= 1) console.log("[compiled-loop] skipped, no execute steps");
     return null;
   }
@@ -731,7 +864,7 @@ function tryPrepareNativeScan(
       backend,
       bodyProgram,
       bodyJaxpr,
-      executeSteps,
+      classification,
       numCarry,
       numConsts,
       numX,
@@ -752,7 +885,7 @@ function tryPrepareNativeScan(
       backend,
       bodyProgram,
       bodyJaxpr,
-      executeSteps,
+      classification,
       length,
       numCarry,
       numConsts,
@@ -892,10 +1025,195 @@ function tryPreparePreencodedScan(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Preencoded multi-step scan (Phase 2: multi-kernel bodies)
+// ---------------------------------------------------------------------------
+
+/**
+ * Try to prepare a preencoded multi-step scan for kernel-only bodies.
+ *
+ * Requirements:
+ * - WebGPU backend
+ * - Concrete length (no symbolic dims)
+ * - All execute steps are Kernels (no Routines — Phase 3 adds routine support)
+ * - No nested loop steps (scan/assoc_scan in body)
+ * - No cross-gidx internal dependencies
+ * - Each step's bindings fit within storage buffer limits
+ * - No symbolic kernel sizes
+ */
+function tryPreparePreencodedMultiStep(
+  backend: Backend,
+  bodyProgram: JitProgram,
+  bodyJaxpr: Jaxpr,
+  length: number,
+  numCarry: number,
+  numConsts: number,
+  numX: number,
+  numY: number,
+  reverse: boolean,
+): PreparedPreencodedMultiStep | null {
+  if (backend.type !== "webgpu") {
+    if (DEBUG >= 2) console.log("Preencoded multi-step: not WebGPU");
+    return null;
+  }
+
+  const classification = classifyBodySteps(
+    bodyProgram,
+    numCarry,
+    numConsts,
+    numX,
+  );
+
+  // Phase 2: kernel-only bodies (Phase 3 adds routine support)
+  if (classification.hasRoutines) {
+    if (DEBUG >= 2) console.log("Preencoded multi-step: skipped, has routines");
+    return null;
+  }
+
+  if (classification.hasLoops) {
+    if (DEBUG >= 2) console.log("Preencoded multi-step: skipped, has loops");
+    return null;
+  }
+
+  if (classification.hasCrossGidxDeps) {
+    if (DEBUG >= 2)
+      console.log("Preencoded multi-step: skipped, cross-gidx deps");
+    return null;
+  }
+
+  const { executeSteps } = classification;
+  if (executeSteps.length < 2) {
+    // Single-step bodies are handled by compiled-loop or preencoded-routine
+    if (DEBUG >= 2)
+      console.log("Preencoded multi-step: skipped, < 2 execute steps");
+    return null;
+  }
+
+  const webgpuBackend = backend as WebGPUBackend;
+  const maxBindings = webgpuBackend.maxArgs + 1; // +1 for output
+
+  // Collect malloc/recycle/free steps for pre-allocation
+  const mallocSteps: { jitId: number; size: number }[] = [];
+  const recycleSteps: { from: number; to: number }[] = [];
+  const freeStepIds: number[] = [];
+
+  for (const step of bodyProgram.steps) {
+    if (step.type === "malloc") {
+      if (typeof step.size !== "number") {
+        if (DEBUG >= 2)
+          console.log("Preencoded multi-step: skipped, symbolic malloc size");
+        return null;
+      }
+      mallocSteps.push({ jitId: step.output, size: step.size });
+    } else if (step.type === "recycle") {
+      recycleSteps.push({ from: step.input, to: step.output });
+    } else if (step.type === "free") {
+      freeStepIds.push(step.input);
+    } else if (step.type !== "execute" && step.type !== "incref") {
+      if (DEBUG >= 2)
+        console.log(
+          `Preencoded multi-step: skipped, unsupported step type "${step.type}"`,
+        );
+      return null;
+    }
+  }
+
+  // Build internal buffer map: JitId → internal index + size
+  const internalMap = new Map<number, number>();
+  const internalSizes: number[] = [];
+  for (const { jitId, size } of mallocSteps) {
+    internalMap.set(jitId, internalSizes.length);
+    internalSizes.push(size);
+  }
+  // Recycle targets map to the same internal index as their source
+  for (const { from, to } of recycleSteps) {
+    const idx = internalMap.get(from);
+    if (idx !== undefined) {
+      internalMap.set(to, idx);
+    }
+  }
+
+  // Check all kernels have concrete sizes and no pre-existing uniforms
+  for (const step of executeSteps) {
+    const kernel = step.source as Kernel;
+    if (kernel.isSymbolic) {
+      if (DEBUG >= 2)
+        console.log("Preencoded multi-step: skipped, symbolic kernel size");
+      return null;
+    }
+
+    // Count bindings: inputs + outputs must fit in storage limit
+    const totalBindings = step.inputs.length + step.outputs.length;
+    if (totalBindings > maxBindings) {
+      if (DEBUG >= 2)
+        console.log(
+          `Preencoded multi-step: skipped, step needs ${totalBindings} bindings (max ${maxBindings})`,
+        );
+      return null;
+    }
+  }
+
+  // Compute buffer sizes and strides
+  const { carrySizes } = getScanBufferSizes(
+    bodyJaxpr,
+    numConsts,
+    numCarry,
+    numX,
+  );
+
+  // Element strides for xs offset computation
+  const xAvals = bodyJaxpr.inBinders
+    .slice(numConsts + numCarry, numConsts + numCarry + numX)
+    .map((v) => v.aval);
+  const xsElemStrides = xAvals.map((a) => a.size);
+
+  // Element strides for ys offset computation
+  const yAvals = bodyJaxpr.outs.slice(numCarry).map((v) => v.aval);
+  const ysElemStrides = yAvals.map((a) => a.size);
+  const ysSizes = yAvals.map((a) => a.size * byteWidth(a.dtype));
+
+  if (!webgpuBackend.preparePreencodedMultiStepScan) {
+    if (DEBUG >= 2)
+      console.log("Preencoded multi-step: backend missing method");
+    return null;
+  }
+
+  try {
+    const prepared = webgpuBackend.preparePreencodedMultiStepScan({
+      length,
+      executeSteps,
+      carrySizes,
+      internalSizes,
+      internalMap,
+      numCarry,
+      numConsts,
+      numX,
+      numY,
+      reverse,
+      xsElemStrides,
+      ysElemStrides,
+      ysSizes,
+      carryOutJitIds: bodyProgram.outputs.slice(0, numCarry),
+      yOutJitIds: bodyProgram.outputs.slice(numCarry, numCarry + numY),
+    });
+    if (prepared && DEBUG >= 1) {
+      console.log(
+        `Preencoded multi-step: SUCCESS! ${executeSteps.length} steps, ${length} iterations`,
+      );
+    }
+    return prepared;
+  } catch (e) {
+    if (DEBUG >= 2) {
+      console.warn("Preencoded multi-step preparation failed:", e);
+    }
+    return null;
+  }
+}
+
 /**
  * Choose a scan execution strategy.
  *
- * Priority: compiled-loop > preencoded-routine > fallback.
+ * Priority: compiled-loop > preencoded-routine > preencoded-multi-step > fallback.
  */
 export function planScan(
   backend: Backend,
@@ -956,6 +1274,28 @@ export function planScan(
         preencodedParams: preencodedResult,
       };
     }
+
+    // Phase 2: preencoded multi-step for WebGPU multi-kernel bodies
+    const multiStepResult = tryPreparePreencodedMultiStep(
+      backend,
+      bodyProgram,
+      bodyJaxpr,
+      length,
+      numCarry,
+      numConsts,
+      numX,
+      numY,
+      reverse,
+    );
+
+    if (multiStepResult) {
+      const pathError = checkAcceptedPath("preencoded-multi-step", acceptPath);
+      if (pathError) throw new Error(pathError);
+      return {
+        path: "preencoded-multi-step",
+        prepared: multiStepResult,
+      };
+    }
   }
 
   // Fallback: JS loop
@@ -1004,12 +1344,15 @@ export function planAssociativeScan(
     return { path: "fallback" };
   }
 
-  // Extract execute steps from body program
-  const executeSteps = bodyProgram.steps.filter(
-    (s): s is ExecuteStep => s.type === "execute",
+  // Classify body steps (shared analysis)
+  const classification = classifyBodySteps(
+    bodyProgram,
+    numLeaves,
+    numConsts,
+    numLeaves,
   );
 
-  if (executeSteps.length === 0) {
+  if (classification.executeSteps.length === 0) {
     if (DEBUG >= 1) {
       console.log("[assoc-scan] skipping compiled-loop: no execute steps");
     }
@@ -1017,15 +1360,25 @@ export function planAssociativeScan(
   }
 
   // Check that all steps are kernel-only (no routines for now)
-  for (const step of executeSteps) {
-    if (step.source instanceof Routine) {
-      if (DEBUG >= 1) {
-        console.log(
-          `[assoc-scan] skipping compiled-loop: routine ${step.source.name} in body`,
-        );
-      }
-      return { path: "fallback" };
+  if (classification.hasRoutines) {
+    if (DEBUG >= 1) {
+      const rName = (classification.routineSteps[0].step.source as Routine)
+        .name;
+      console.log(
+        `[assoc-scan] skipping compiled-loop: routine ${rName} in body`,
+      );
     }
+    return { path: "fallback" };
+  }
+
+  // Check for nested loop steps
+  if (classification.hasLoops) {
+    if (DEBUG >= 1) {
+      console.log(
+        `[assoc-scan] skipping compiled-loop: unsupported step type "${classification.loopSteps[0].kind}"`,
+      );
+    }
+    return { path: "fallback" };
   }
 
   // Check for non-execute steps that would make compilation impossible
@@ -1045,6 +1398,8 @@ export function planAssociativeScan(
       return { path: "fallback" };
     }
   }
+
+  const executeSteps = classification.executeSteps;
 
   const numInputs = numConsts + 2 * numLeaves;
 

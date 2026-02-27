@@ -187,6 +187,55 @@ export interface PreparedPreencodedScan {
   uniformLayout: GPUBindGroupLayout;
 }
 
+// ---------------------------------------------------------------------------
+// Types for WebGPU preencoded multi-step scan (Phase 2)
+// ---------------------------------------------------------------------------
+
+/** A single prepared step in a multi-step preencoded scan body. */
+export interface PreencodedMultiStepEntry {
+  /** The compiled pipeline(s) for this execute step. */
+  dispatches: ShaderDispatch[];
+  /** Input JitIds for this step (used to build bind groups). */
+  inputJitIds: number[];
+  /** Output JitIds for this step. */
+  outputJitIds: number[];
+  /** Per-step offset buffer for xs offsets (null if step has no xs inputs). */
+  offsetBuffer: GPUBuffer | null;
+  /** Alignment between iterations in the offset buffer (0 if no offsets). */
+  offsetAlignment: number;
+}
+
+/** Prepared preencoded multi-step scan with per-step pipelines and layout. */
+export interface PreparedPreencodedMultiStep {
+  /** Scan iteration count. */
+  length: number;
+  /** One entry per execute step in the body program. */
+  stepEntries: PreencodedMultiStepEntry[];
+  /** Sizes of each carry buffer in bytes. */
+  carrySizes: number[];
+  /** Sizes of each internal buffer in bytes (pre-allocated scratch). */
+  internalSizes: number[];
+  /** Map from body JitId to internal buffer index. */
+  internalMap: Map<number, number>;
+  /** Number of carry, const, xs, ys arrays. */
+  numCarry: number;
+  numConsts: number;
+  numX: number;
+  numY: number;
+  /** Whether to scan in reverse order. */
+  reverse: boolean;
+  /** Per-ys copy strategy for ys stacking (true = use shader copy for non-4b-aligned). */
+  copyUsesShader: boolean[];
+  /** Bind group layout for the uniform offset group (with dynamic offset). */
+  uniformLayout: GPUBindGroupLayout;
+  /** Body program output JitIds for carry outputs [0..numCarry). */
+  carryOutJitIds: number[];
+  /** Body program output JitIds for ys outputs [numCarry..numCarry+numY). */
+  yOutJitIds: number[];
+  /** Per-ys byte sizes for ys stacking. */
+  ysSizes: number[];
+}
+
 const COPY_WORKGROUP_SIZE = 64;
 
 const COPY_SHADER_CODE = String.raw`
@@ -1431,6 +1480,456 @@ export class WebGPUBackend implements Backend {
       buf.destroy();
     }
     // offsetBuffer is NOT destroyed — owned by PreparedPreencodedScan for reuse
+  }
+
+  // -------------------------------------------------------------------------
+  // Preencoded multi-step scan (Phase 2c)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Prepare a preencoded multi-step scan: wrap each kernel's shader with
+   * per-iteration xs offsets, compile pipelines, and create offset buffers.
+   */
+  preparePreencodedMultiStepScan(params: {
+    length: number;
+    executeSteps: {
+      source: Kernel | Routine;
+      inputs: number[];
+      outputs: number[];
+    }[];
+    carrySizes: number[];
+    internalSizes: number[];
+    internalMap: Map<number, number>;
+    numCarry: number;
+    numConsts: number;
+    numX: number;
+    numY: number;
+    reverse: boolean;
+    xsElemStrides: number[];
+    ysElemStrides: number[];
+    ysSizes: number[];
+    carryOutJitIds: number[];
+    yOutJitIds: number[];
+  }): PreparedPreencodedMultiStep | null {
+    const {
+      length,
+      executeSteps,
+      carrySizes,
+      internalSizes,
+      internalMap,
+      numCarry,
+      numConsts,
+      numX,
+      numY,
+      reverse,
+      xsElemStrides,
+      ysSizes,
+      carryOutJitIds,
+      yOutJitIds,
+    } = params;
+
+    if (length === 0) return null;
+
+    // Shared layout for group(1) with dynamic offset support
+    const uniformLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "uniform", hasDynamicOffset: true },
+        },
+      ],
+    });
+
+    const minAlignment = this.getPreencodedScanAlignment();
+    const xsStart = numConsts + numCarry;
+    const stepEntries: PreencodedMultiStepEntry[] = [];
+
+    for (const step of executeSteps) {
+      const kernel = step.source as Kernel;
+      const shaderInfo = this.#cachedShader(kernel);
+
+      // Reject kernels that already use uniforms (symbolic dims)
+      if (shaderInfo.hasUniform) {
+        if (DEBUG >= 2)
+          console.log(
+            "preparePreencodedMultiStepScan: kernel already has uniform",
+          );
+        return null;
+      }
+
+      // Build ScanBindingInfo for this step — only count this step's
+      // actual xs inputs, excluding internal buffer JitIds.
+      const scanInfo: ScanBindingInfo = {
+        numConsts,
+        numCarry,
+        numX,
+        routineInputJitIds: step.inputs,
+        routineOutputJitIds: step.outputs,
+      };
+
+      // Wrap the shader with xs offset support
+      const wrapped = wrapRoutineForScan(shaderInfo, scanInfo);
+
+      let dispatches: ShaderDispatch[];
+      let offsetBuffer: GPUBuffer | null = null;
+      let offsetAlignment = 0;
+
+      if (wrapped.hasUniform) {
+        // Step has xs inputs — needs offset uniform at group(1)
+        // Compile pipeline with explicit layout: [group(0)=auto, group(1)=uniform]
+        const module = this.device.createShaderModule({
+          code: wrapped.code,
+        });
+        const autoPipeline = this.device.createComputePipeline({
+          layout: "auto",
+          compute: { module, entryPoint: "main" },
+        });
+        const group0Layout = autoPipeline.getBindGroupLayout(0);
+        const pipelineLayout = this.device.createPipelineLayout({
+          bindGroupLayouts: [group0Layout, uniformLayout],
+        });
+        const pipeline = this.device.createComputePipeline({
+          layout: pipelineLayout,
+          compute: { module, entryPoint: "main" },
+        });
+
+        dispatches = [{ ...wrapped, pipeline }];
+
+        // Compute per-step xs element strides (in order of binding appearance)
+        const stepXsStrides: number[] = [];
+        for (const jitId of step.inputs) {
+          if (jitId >= xsStart && jitId < xsStart + numX) {
+            stepXsStrides.push(xsElemStrides[jitId - xsStart]);
+          }
+        }
+
+        // Create per-step offset buffer
+        const { buffer: offsetData, alignment } =
+          createAllIterationsOffsetsBuffer(
+            stepXsStrides.length,
+            0, // no ys offsets in shader — ys stacked via copy
+            length,
+            stepXsStrides,
+            [],
+            minAlignment,
+            reverse,
+          );
+
+        offsetBuffer = this.device.createBuffer({
+          size: Math.max(offsetData.length, 4),
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true,
+        });
+        new Uint8Array(offsetBuffer.getMappedRange()).set(offsetData);
+        offsetBuffer.unmap();
+        offsetAlignment = alignment;
+      } else {
+        // Step has no xs inputs — use normal pipeline without group(1)
+        const pipeline = this.pipelines.prepareSync(shaderInfo);
+        dispatches = [{ ...shaderInfo, pipeline }];
+      }
+
+      stepEntries.push({
+        dispatches,
+        inputJitIds: step.inputs,
+        outputJitIds: step.outputs,
+        offsetBuffer,
+        offsetAlignment,
+      });
+    }
+
+    const copyUsesShader = ysSizes.map((size) => size % 4 !== 0);
+
+    if (DEBUG >= 1) {
+      const wrappedCount = stepEntries.filter(
+        (e) => e.offsetBuffer !== null,
+      ).length;
+      console.log(
+        `Preencoded multi-step scan: prepared ${stepEntries.length} steps ` +
+          `(${wrappedCount} with xs offsets), ${length} iterations`,
+      );
+    }
+
+    return {
+      length,
+      stepEntries,
+      carrySizes,
+      internalSizes,
+      internalMap,
+      numCarry,
+      numConsts,
+      numX,
+      numY,
+      reverse,
+      copyUsesShader,
+      uniformLayout,
+      carryOutJitIds,
+      yOutJitIds,
+      ysSizes,
+    };
+  }
+
+  /**
+   * Dispatch a preencoded multi-step scan.
+   *
+   * Encodes ALL iterations into a single command buffer: for each iteration,
+   * dispatches all kernel steps, then copies carry outputs and stacks ys.
+   */
+  dispatchPreencodedMultiStepScan(
+    prepared: PreparedPreencodedMultiStep,
+    constSlots: Slot[],
+    initCarrySlots: Slot[],
+    xsSlots: Slot[],
+    carryOutSlots: Slot[],
+    ysStackedSlots: Slot[],
+  ): void {
+    const {
+      length,
+      stepEntries,
+      carrySizes,
+      internalSizes,
+      internalMap,
+      numCarry,
+      numConsts,
+      numX,
+      reverse: _reverse,
+      numY,
+      copyUsesShader,
+      uniformLayout,
+      carryOutJitIds,
+      yOutJitIds,
+      ysSizes,
+    } = prepared;
+
+    // Resolve slots to GPU buffers
+    const constBuffers = constSlots.map((s) => this.#getBuffer(s).buffer);
+    const initCarryBuffers = initCarrySlots.map(
+      (s) => this.#getBuffer(s).buffer,
+    );
+    const xsBuffers = xsSlots.map((s) => this.#getBuffer(s).buffer);
+    const carryOutBuffers = carryOutSlots.map((s) => this.#getBuffer(s).buffer);
+    const ysStackedBuffers = ysStackedSlots.map(
+      (s) => this.#getBuffer(s).buffer,
+    );
+
+    // Create transient ping-pong carry buffers
+    const carryPing = carrySizes.map((sz) =>
+      this.#createBuffer(Math.max(sz, 4)),
+    );
+    const carryPong = carrySizes.map((sz) =>
+      this.#createBuffer(Math.max(sz, 4)),
+    );
+
+    // Create transient internal scratch buffers
+    const internalBuffers = internalSizes.map((sz) =>
+      this.#createBuffer(Math.max(sz, 4)),
+    );
+
+    const commandEncoder = this.device.createCommandEncoder();
+    const copyUniformBuffers: GPUBuffer[] = [];
+
+    // Copy initCarry → carryPing
+    for (let i = 0; i < numCarry; i++) {
+      if (carrySizes[i] > 0) {
+        commandEncoder.copyBufferToBuffer(
+          initCarryBuffers[i],
+          0,
+          carryPing[i],
+          0,
+          carrySizes[i],
+        );
+      }
+    }
+
+    const xsStart = numConsts + numCarry;
+
+    // Helper: resolve a body JitId to a GPU buffer.
+    // carryRead is the current iteration's carry read side (ping or pong).
+    const resolveBuffer = (
+      jitId: number,
+      carryRead: GPUBuffer[],
+    ): GPUBuffer => {
+      if (jitId < numConsts) return constBuffers[jitId];
+      if (jitId < xsStart) return carryRead[jitId - numConsts];
+      if (jitId < xsStart + numX) return xsBuffers[jitId - xsStart];
+      const internalIdx = internalMap.get(jitId);
+      if (internalIdx !== undefined) return internalBuffers[internalIdx];
+      throw new Error(
+        `dispatchPreencodedMultiStepScan: unknown JitId ${jitId}`,
+      );
+    };
+
+    // Build per-step bind groups (two per step: ping=carry-read-from-ping,
+    // pong=carry-read-from-pong). Uniform bind groups are created separately.
+    const pingBindGroups: GPUBindGroup[] = [];
+    const pongBindGroups: GPUBindGroup[] = [];
+    const uniformBindGroups: (GPUBindGroup | null)[] = [];
+
+    for (const entry of stepEntries) {
+      const pipeline = entry.dispatches[0].pipeline;
+      const layout0 = pipeline.getBindGroupLayout(0);
+
+      const buildStorageBG = (carryRead: GPUBuffer[]): GPUBindGroup => {
+        const entries: GPUBindGroupEntry[] = [];
+        let binding = 0;
+        for (const jitId of entry.inputJitIds) {
+          entries.push({
+            binding: binding++,
+            resource: { buffer: resolveBuffer(jitId, carryRead) },
+          });
+        }
+        for (const jitId of entry.outputJitIds) {
+          // Outputs always go to internal buffers
+          const internalIdx = internalMap.get(jitId);
+          if (internalIdx === undefined) {
+            throw new Error(
+              `dispatchPreencodedMultiStepScan: output JitId ${jitId} not in internalMap`,
+            );
+          }
+          entries.push({
+            binding: binding++,
+            resource: { buffer: internalBuffers[internalIdx] },
+          });
+        }
+        return this.device.createBindGroup({ layout: layout0, entries });
+      };
+
+      pingBindGroups.push(buildStorageBG(carryPing));
+      pongBindGroups.push(buildStorageBG(carryPong));
+
+      // Uniform bind group for xs offsets (if this step has offset data)
+      if (entry.offsetBuffer) {
+        uniformBindGroups.push(
+          this.device.createBindGroup({
+            layout: uniformLayout,
+            entries: [
+              {
+                binding: 0,
+                resource: {
+                  buffer: entry.offsetBuffer,
+                  offset: 0,
+                  size: Math.max(entry.offsetAlignment, 4),
+                },
+              },
+            ],
+          }),
+        );
+      } else {
+        uniformBindGroups.push(null);
+      }
+    }
+
+    // Encode all iterations
+    for (let iter = 0; iter < length; iter++) {
+      const readPing = iter % 2 === 0;
+      const carryRead = readPing ? carryPing : carryPong;
+      const carryWrite = readPing ? carryPong : carryPing;
+
+      // Dispatch each kernel step
+      for (let si = 0; si < stepEntries.length; si++) {
+        const entry = stepEntries[si];
+        const storageBG = readPing ? pingBindGroups[si] : pongBindGroups[si];
+        const ubg = uniformBindGroups[si];
+
+        for (const { grid } of entry.dispatches[0].passes) {
+          if (grid[0] === 0 || grid[1] === 0) continue;
+          const pass = commandEncoder.beginComputePass();
+          pass.setPipeline(entry.dispatches[0].pipeline);
+          pass.setBindGroup(0, storageBG);
+          if (ubg) {
+            pass.setBindGroup(1, ubg, [iter * entry.offsetAlignment]);
+          }
+          pass.dispatchWorkgroups(grid[0], grid[1]);
+          pass.end();
+        }
+      }
+
+      // Copy carry outputs: resolve body output JitIds → carry write buffers
+      for (let ci = 0; ci < numCarry; ci++) {
+        const jitId = carryOutJitIds[ci];
+        const srcBuf = resolveBuffer(jitId, carryRead);
+        const sz = carrySizes[ci];
+        if (sz <= 0) continue;
+        if (sz % 4 === 0) {
+          commandEncoder.copyBufferToBuffer(srcBuf, 0, carryWrite[ci], 0, sz);
+        } else {
+          const ub = this.#encodeCopyWithShader(
+            commandEncoder,
+            srcBuf,
+            0,
+            carryWrite[ci],
+            0,
+            sz,
+          );
+          if (ub) copyUniformBuffers.push(ub);
+        }
+      }
+
+      // Stack ys: copy each ys source → ysStacked at iteration offset
+      for (let yi = 0; yi < numY; yi++) {
+        const jitId = yOutJitIds[yi];
+        const srcBuf = resolveBuffer(jitId, carryRead);
+        const sz = ysSizes[yi];
+        if (sz <= 0) continue;
+        const yOffset = iter * sz;
+        if (!copyUsesShader[yi]) {
+          commandEncoder.copyBufferToBuffer(
+            srcBuf,
+            0,
+            ysStackedBuffers[yi],
+            yOffset,
+            sz,
+          );
+        } else {
+          const ub = this.#encodeCopyWithShader(
+            commandEncoder,
+            srcBuf,
+            0,
+            ysStackedBuffers[yi],
+            yOffset,
+            sz,
+          );
+          if (ub) copyUniformBuffers.push(ub);
+        }
+      }
+    }
+
+    // Copy final carry → carryOut
+    const finalCarry = length % 2 === 0 ? carryPing : carryPong;
+    for (let i = 0; i < numCarry; i++) {
+      const sz = carrySizes[i];
+      if (sz <= 0) continue;
+      if (sz % 4 === 0) {
+        commandEncoder.copyBufferToBuffer(
+          finalCarry[i],
+          0,
+          carryOutBuffers[i],
+          0,
+          sz,
+        );
+      } else {
+        const ub = this.#encodeCopyWithShader(
+          commandEncoder,
+          finalCarry[i],
+          0,
+          carryOutBuffers[i],
+          0,
+          sz,
+        );
+        if (ub) copyUniformBuffers.push(ub);
+      }
+    }
+
+    this.device.queue.submit([commandEncoder.finish()]);
+
+    // Clean up transient buffers
+    for (const buf of copyUniformBuffers) buf.destroy();
+    for (const buf of [...carryPing, ...carryPong, ...internalBuffers]) {
+      this.#gpuAllocatedBytes -= buf.size;
+      buf.destroy();
+    }
+    // Per-step offset buffers are NOT destroyed — owned by prepared for reuse
   }
 
   #getBuffer(slot: Slot): { buffer: GPUBuffer; size: number } {
