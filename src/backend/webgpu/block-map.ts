@@ -125,6 +125,29 @@ export function blockMapFusedShaderSource(
   /** Per-step reduction info (null if the step is elementwise). */
   const stepReductions: (Reduction | null)[] = [];
 
+  /** Analyzed fori_loop steps. */
+  interface ForiLoopInfo {
+    foriStep: Extract<JitStep, { type: "fori_loop" }>;
+    bodyKernels: {
+      step: Extract<JitStep, { type: "execute" }>;
+      kernel: Kernel;
+    }[];
+    bodyBarriers: Set<number>;
+    bodyShmemMap: Map<JitId, { name: string; dtype: DType; elemCount: number }>;
+    bodyShmemIds: Set<JitId>;
+    bodyInputIds: JitId[];
+    bodyOutputIds: JitId[];
+    numConsts: number;
+    loopVar: string;
+  }
+  const foriLoops: ForiLoopInfo[] = [];
+
+  /** Combined codegen entries in step order. */
+  type CodegenEntry =
+    | { type: "kernel"; kernelIdx: number }
+    | { type: "fori_loop"; flIdx: number };
+  const codegenEntries: CodegenEntry[] = [];
+
   let totalShmemBytes = 0;
 
   for (const step of steps) {
@@ -149,6 +172,7 @@ export function blockMapFusedShaderSource(
           return null;
         }
         const re = kernel.outputs[0]?.reduction ?? null;
+        codegenEntries.push({ type: "kernel", kernelIdx: kernelSteps.length });
         kernelSteps.push({ step, kernel });
         stepReductions.push(re);
         break;
@@ -160,12 +184,10 @@ export function blockMapFusedShaderSource(
           return null;
         }
         const sizeBytes = step.size as number;
-        // Determine dtype and element count from consumers.
-        // We'll figure this out from the first kernel that reads this buffer.
         shmemMap.set(step.output, {
           sizeBytes,
-          dtype: DType.Float32, // placeholder, refined below
-          elemCount: sizeBytes / 4, // placeholder, refined below
+          dtype: DType.Float32,
+          elemCount: sizeBytes / 4,
         });
         totalShmemBytes += sizeBytes;
         break;
@@ -173,8 +195,141 @@ export function blockMapFusedShaderSource(
       case "free":
       case "recycle":
       case "incref":
-        // These don't affect codegen
         break;
+      case "fori_loop": {
+        // Analyze fori_loop body: must be kernel-only, elementwise-only
+        const flIdx = foriLoops.length;
+        const bodyProg = step.bodyProgram;
+        const bodySteps = bodyProg.steps;
+        const bodyKernels: ForiLoopInfo["bodyKernels"] = [];
+        const bodyShmemMap = new Map<
+          JitId,
+          { name: string; dtype: DType; elemCount: number }
+        >();
+        const bodyShmemIds = new Set<JitId>();
+
+        let valid = true;
+        for (const bs of bodySteps) {
+          switch (bs.type) {
+            case "execute": {
+              if (bs.source instanceof Routine) {
+                if (DEBUG >= 1)
+                  console.info(
+                    "block_map fused: routine in fori_loop body, fallback",
+                  );
+                return null;
+              }
+              const bk = bs.source as Kernel;
+              if (bk.isSymbolic) {
+                valid = false;
+                break;
+              }
+              // Reductions inside fori_loop not yet supported
+              if (bk.hasReduction) {
+                if (DEBUG >= 1)
+                  console.info(
+                    "block_map fused: reduction in fori_loop body, fallback",
+                  );
+                return null;
+              }
+              bodyKernels.push({
+                step: bs as Extract<JitStep, { type: "execute" }>,
+                kernel: bk,
+              });
+              break;
+            }
+            case "malloc": {
+              if (isSymbolicSize(bs.size)) {
+                valid = false;
+                break;
+              }
+              const sz = bs.size as number;
+              const sname = `fl${flIdx}_s${bs.output}`;
+              bodyShmemMap.set(bs.output, {
+                name: sname,
+                dtype: DType.Float32,
+                elemCount: sz / 4,
+              });
+              bodyShmemIds.add(bs.output);
+              totalShmemBytes += sz;
+              break;
+            }
+            case "free":
+            case "recycle":
+            case "incref":
+              break;
+            default:
+              if (DEBUG >= 1)
+                console.info(
+                  `block_map fused: unsupported step in fori_loop body "${(bs as JitStep).type}", fallback`,
+                );
+              return null;
+          }
+          if (!valid) break;
+        }
+        if (!valid) {
+          if (DEBUG >= 1)
+            console.info("block_map fused: invalid fori_loop body, fallback");
+          return null;
+        }
+
+        // Refine body shmem dtypes from body kernel outputs
+        for (const { step: bs, kernel: bk } of bodyKernels) {
+          for (let oi = 0; oi < bk.numOutputs; oi++) {
+            const entry = bodyShmemMap.get(bs.outputs[oi]);
+            if (entry) {
+              entry.dtype = bk.outputs[oi].dtype;
+              entry.elemCount = (entry.elemCount * 4) / byteWidth(entry.dtype);
+            }
+          }
+        }
+
+        // Barrier analysis for body kernel steps
+        const bStepWrites = new Map<number, Set<JitId>>();
+        const bStepReads = new Map<number, Set<JitId>>();
+        for (let bsi = 0; bsi < bodyKernels.length; bsi++) {
+          const { step: bs } = bodyKernels[bsi];
+          const w = new Set<JitId>();
+          const r = new Set<JitId>();
+          for (const oid of bs.outputs) {
+            if (bodyShmemIds.has(oid)) w.add(oid);
+          }
+          for (const iid of bs.inputs) {
+            if (bodyShmemIds.has(iid)) r.add(iid);
+          }
+          bStepWrites.set(bsi, w);
+          bStepReads.set(bsi, r);
+        }
+        const bodyBarriers = new Set<number>();
+        for (let bsi = 1; bsi < bodyKernels.length; bsi++) {
+          const reads = bStepReads.get(bsi)!;
+          if (reads.size === 0) continue;
+          for (let prev = 0; prev < bsi; prev++) {
+            const writes = bStepWrites.get(prev)!;
+            for (const id of reads) {
+              if (writes.has(id)) {
+                bodyBarriers.add(bsi);
+                break;
+              }
+            }
+            if (bodyBarriers.has(bsi)) break;
+          }
+        }
+
+        foriLoops.push({
+          foriStep: step as Extract<JitStep, { type: "fori_loop" }>,
+          bodyKernels,
+          bodyBarriers,
+          bodyShmemMap,
+          bodyShmemIds,
+          bodyInputIds: bodyProg.inputs,
+          bodyOutputIds: bodyProg.outputs,
+          numConsts: step.numConsts,
+          loopVar: `fl${flIdx}_i`,
+        });
+        codegenEntries.push({ type: "fori_loop", flIdx });
+        break;
+      }
       default:
         // Unsupported step type (scan, dus, scatter_add, etc.)
         if (DEBUG >= 1)
@@ -367,7 +522,7 @@ export function blockMapFusedShaderSource(
   // Collect all distinct ops across all kernel steps for global functions
   let allOps: Map<AluOp, Set<DType>> = new Map();
   let needsF16 = false;
-  for (const { kernel } of kernelSteps) {
+  const collectKernelOps = (kernel: Kernel) => {
     for (const output of kernel.outputs) {
       const ops = output.exp.distinctOps();
       allOps = mapSetUnion(allOps, ops);
@@ -375,6 +530,10 @@ export function blockMapFusedShaderSource(
         if (exp.dtype === DType.Float16) needsF16 = true;
       });
     }
+  };
+  for (const { kernel } of kernelSteps) collectKernelOps(kernel);
+  for (const fl of foriLoops) {
+    for (const { kernel } of fl.bodyKernels) collectKernelOps(kernel);
   }
 
   if (needsF16) {
@@ -454,6 +613,14 @@ export function blockMapFusedShaderSource(
     emit(
       `var<workgroup> reduce_ws_${ws.stepIdx}: array<${ty}, ${ws.elemCount}>;`,
     );
+  }
+
+  // Fori_loop body intermediate shmem arrays
+  for (const fl of foriLoops) {
+    for (const [, info] of fl.bodyShmemMap) {
+      const ty = dtypeToWgsl(info.dtype, false);
+      emit(`var<workgroup> ${info.name}: array<${ty}, ${info.elemCount}>;`);
+    }
   }
 
   // --- Workgroup size and grid ---
@@ -599,47 +766,25 @@ export function blockMapFusedShaderSource(
     );
   }
 
-  // --- Generate kernel step code ---
-  // For each kernel step, inline its WGSL expression.
-  // The gen() function is local to each step but shares CSE state for
-  // multi-output steps.
-  for (let si = 0; si < kernelSteps.length; si++) {
-    if (needsBarrierBefore.has(si)) {
-      emit("workgroupBarrier();");
-    }
-
-    const { step, kernel } = kernelSteps[si];
-
-    // Build the input name mapping for this step.
-    // step.inputs[j] → the JitId of the j-th buffer argument.
-    // We need to translate GlobalIndex(arg=[j, len], src=[indexExpr]) into
-    // the appropriate WGSL expression.
-    const stepInputNames: string[] = [];
-    const stepInputIsGlobal: boolean[] = [];
-    const stepInputBodyIdx: number[] = []; // index into body inputs (for offset computation)
-
-    for (let j = 0; j < step.inputs.length; j++) {
-      const jitId = step.inputs[j];
-      const name = idToReadName.get(jitId) ?? inputIdToName.get(jitId);
-      if (name) {
-        stepInputNames.push(name);
-        const isGlobalInput = inputIdToName.has(jitId);
-        stepInputIsGlobal.push(isGlobalInput);
-        // Is it a non-const body input?
-        const bodyIdx = bodyInputIds.indexOf(jitId);
-        stepInputBodyIdx.push(bodyIdx >= numConsts ? bodyIdx - numConsts : -1);
-      } else {
-        // This shouldn't happen in a well-formed body program
-        stepInputNames.push(`__unknown_${jitId}`);
-        stepInputIsGlobal.push(false);
-        stepInputBodyIdx.push(-1);
-      }
-    }
-
-    // CSE infrastructure for this step
+  // --- Helper: create gen() function for a kernel step ---
+  // The gen() function translates AluExp trees into WGSL expressions.
+  // It is parameterized by a resolveGlobalIndex callback that maps
+  // GlobalIndex reads to the correct WGSL (different for parent vs body steps).
+  function createGen(
+    kernel: Kernel,
+    prefix: string,
+    resolveGlobalIndex: (
+      bufIdx: number,
+      indexExpr: string,
+      dtype: DType,
+    ) => string,
+    variableOverrides?: Map<string, string>,
+  ): (exp: AluExp) => string {
     let gensymCount = 0;
-    const gensym = () => `s${si}_alu${gensymCount++}`;
-    const isGensym = (text: string) => /^s\d+_alu\d+$/.test(text);
+    const gensym = () => `${prefix}_alu${gensymCount++}`;
+    const isGensym = (text: string) =>
+      text.startsWith(prefix + "_alu") &&
+      /^\d+$/.test(text.slice(prefix.length + 4));
 
     const references = new Map<AluExp, number>();
     const seen = new Set<AluExp>();
@@ -650,11 +795,7 @@ export function blockMapFusedShaderSource(
         for (const src of exp.src) countReferences(src);
       }
     };
-
-    // Count references for all outputs of this kernel
-    for (const output of kernel.outputs) {
-      countReferences(output.exp);
-    }
+    for (const output of kernel.outputs) countReferences(output.exp);
 
     const expContext = new Map<AluExp, string>();
     const gen = (exp: AluExp): string => {
@@ -735,39 +876,17 @@ export function blockMapFusedShaderSource(
       } else if (op === AluOp.Special) {
         return arg[0] as string;
       } else if (op === AluOp.Variable) {
-        return arg as string;
+        return variableOverrides?.get(arg as string) ?? (arg as string);
       } else if (op === AluOp.GlobalIndex) {
-        // This is the critical remapping:
-        // arg[0] = buffer index within this kernel step's inputs
-        // src[0] = index expression (e.g., gidx)
         const bufIdx = arg[0] as number;
         const indexExpr = strip1(gen(src[0]));
-
-        if (stepInputIsGlobal[bufIdx]) {
-          // Global buffer read — add base offset for block position
-          const inputIdx = stepInputBodyIdx[bufIdx];
-          if (inputIdx >= 0) {
-            // Non-const input: apply block offset
-            const readExpr = `${stepInputNames[bufIdx]}[i32(in_base_${inputIdx}) + ${indexExpr}]`;
-            // Guard: invalid threads read 0 (matching zero-pad semantics)
-            source = hasBoundary
-              ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
-              : readExpr;
-          } else {
-            // Const input: no block offset (constants are shared, always valid)
-            source = `${stepInputNames[bufIdx]}[${indexExpr}]`;
-          }
-        } else {
-          // Shared memory read — direct indexing within block
-          source = `${stepInputNames[bufIdx]}[${indexExpr}]`;
-        }
+        source = resolveGlobalIndex(bufIdx, indexExpr, dtype);
         if (dtype === DType.Bool) source = `(${source} != 0)`;
       }
 
       if (!source) {
         if (DEBUG >= 1)
           console.info(`block_map fused: unsupported AluOp ${op}, fallback`);
-        // Return a placeholder that will cause a compile error if used
         source = `/* unsupported op ${op} */`;
       }
 
@@ -782,112 +901,354 @@ export function blockMapFusedShaderSource(
         return source;
       }
     };
+    return gen;
+  }
 
-    // Generate the WGSL for each kernel output
-    const re = stepReductions[si];
-
-    if (re) {
-      // --- Reduction kernel: tree reduction in shared memory ---
-      // This kernel has exactly 1 output (multi-output reductions rejected above).
-      const outId = step.outputs[0];
-      const rhs = strip1(gen(kernel.outputs[0].exp));
-      const reDtype = re.dtype;
-      const reTy = dtypeToWgsl(reDtype, false);
-      const wsName = `reduce_ws_${si}`;
-
-      // 1. Each thread stores its per-element value into the workspace
-      emit(`${wsName}[tidx] = ${reTy}(${rhs});`);
-      emit("workgroupBarrier();");
-
-      // 2. Tree reduction with halving stride (handles non-power-of-2)
-      let startStride = 1;
-      while (startStride * 2 < blockSize) startStride *= 2;
-
-      for (let stride = startStride; stride >= 1; stride >>= 1) {
-        emit(
-          `if (tidx < ${stride}u && tidx + ${stride}u < ${blockSize}u) {`,
-          pushIndent,
-        );
-        const thisSlot = `${wsName}[tidx]`;
-        const otherSlot = `${wsName}[tidx + ${stride}u]`;
-        if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
-        else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
-        else if (re.op === AluOp.Min) {
-          if (reDtype === DType.Bool)
-            emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
-          else emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
-        } else if (re.op === AluOp.Max) {
-          if (reDtype === DType.Bool)
-            emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
-          else emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
-        }
-        emit(popIndent, "}");
+  // --- Generate codegen entries ---
+  for (const entry of codegenEntries) {
+    if (entry.type === "kernel") {
+      const si = entry.kernelIdx;
+      if (needsBarrierBefore.has(si)) {
         emit("workgroupBarrier();");
       }
 
-      // 3. Thread 0 applies the epilogue and writes the result
-      emit("if (tidx == 0u) {", pushIndent);
+      const { step, kernel } = kernelSteps[si];
 
-      // Apply reduction epilogue (e.g., acc/size for mean)
-      // The epilogue is an AluExp that references the "acc" variable.
-      const accVar = `${wsName}[0u]`;
-      let finalValue: string;
-      // Check if epilogue is identity (just acc variable)
-      const isIdentityEpilogue =
-        re.epilogue.op === AluOp.Variable && re.epilogue.arg === "acc";
-      if (isIdentityEpilogue) {
-        finalValue = accVar;
-      } else {
-        // Generate the epilogue expression with acc substituted
-        // Use a fresh gensym context for the epilogue
-        expContext.set(AluExp.variable(reDtype, "acc"), accVar);
-        finalValue = strip1(gen(re.epilogue));
+      // Build input name mapping for this step
+      const stepInputNames: string[] = [];
+      const stepInputIsGlobal: boolean[] = [];
+      const stepInputBodyIdx: number[] = [];
+      for (let j = 0; j < step.inputs.length; j++) {
+        const jitId = step.inputs[j];
+        const name = idToReadName.get(jitId) ?? inputIdToName.get(jitId);
+        if (name) {
+          stepInputNames.push(name);
+          const isGlobalInput = inputIdToName.has(jitId);
+          stepInputIsGlobal.push(isGlobalInput);
+          const bodyIdx = bodyInputIds.indexOf(jitId);
+          stepInputBodyIdx.push(
+            bodyIdx >= numConsts ? bodyIdx - numConsts : -1,
+          );
+        } else {
+          stepInputNames.push(`__unknown_${jitId}`);
+          stepInputIsGlobal.push(false);
+          stepInputBodyIdx.push(-1);
+        }
       }
 
-      const resultIdx = bodyOutputIds.indexOf(outId);
-      if (resultIdx >= 0 && !passThroughOutputs.has(resultIdx)) {
-        // Write scalar to global output — reduction produces 1 element per block
-        const resultTy = dtypeToWgsl(outputDtypes[resultIdx], true);
-        const castFinal =
-          resultTy !== reTy ? `${resultTy}(${finalValue})` : finalValue;
-        emit(`result${resultIdx}[i32(out_base_${resultIdx})] = ${castFinal};`);
-      } else if (idIsShmem.has(outId)) {
-        // Write reduced scalar to shmem[0] for subsequent steps
-        const shmemName = idToReadName.get(outId)!;
-        emit(`${shmemName}[0u] = ${finalValue};`);
-      }
-      emit(popIndent, "}");
-      // Barrier so all threads can read the reduced scalar in subsequent steps
-      emit("workgroupBarrier();");
-    } else {
-      // --- Elementwise kernel: each thread writes its own element ---
-      for (let oi = 0; oi < kernel.numOutputs; oi++) {
-        const outId = step.outputs[oi];
-        const rhs = strip1(gen(kernel.outputs[oi].exp));
+      const gen = createGen(kernel, `s${si}`, (bufIdx, indexExpr, dtype) => {
+        if (stepInputIsGlobal[bufIdx]) {
+          const inputIdx = stepInputBodyIdx[bufIdx];
+          if (inputIdx >= 0) {
+            const readExpr = `${stepInputNames[bufIdx]}[i32(in_base_${inputIdx}) + ${indexExpr}]`;
+            return hasBoundary
+              ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
+              : readExpr;
+          } else {
+            return `${stepInputNames[bufIdx]}[${indexExpr}]`;
+          }
+        } else {
+          return `${stepInputNames[bufIdx]}[${indexExpr}]`;
+        }
+      });
+
+      // Generate WGSL for each kernel output
+      const re = stepReductions[si];
+
+      if (re) {
+        // --- Reduction kernel: tree reduction in shared memory ---
+        const outId = step.outputs[0];
+        const rhs = strip1(gen(kernel.outputs[0].exp));
+        const reDtype = re.dtype;
+        const reTy = dtypeToWgsl(reDtype, false);
+        const wsName = `reduce_ws_${si}`;
+
+        emit(`${wsName}[tidx] = ${reTy}(${rhs});`);
+        emit("workgroupBarrier();");
+
+        let startStride = 1;
+        while (startStride * 2 < blockSize) startStride *= 2;
+
+        for (let stride = startStride; stride >= 1; stride >>= 1) {
+          emit(
+            `if (tidx < ${stride}u && tidx + ${stride}u < ${blockSize}u) {`,
+            pushIndent,
+          );
+          const thisSlot = `${wsName}[tidx]`;
+          const otherSlot = `${wsName}[tidx + ${stride}u]`;
+          if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
+          else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
+          else if (re.op === AluOp.Min) {
+            if (reDtype === DType.Bool)
+              emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
+            else emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
+          } else if (re.op === AluOp.Max) {
+            if (reDtype === DType.Bool)
+              emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
+            else emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
+          }
+          emit(popIndent, "}");
+          emit("workgroupBarrier();");
+        }
+
+        emit("if (tidx == 0u) {", pushIndent);
+
+        const accVar = `${wsName}[0u]`;
+        let finalValue: string;
+        const isIdentityEpilogue =
+          re.epilogue.op === AluOp.Variable && re.epilogue.arg === "acc";
+        if (isIdentityEpilogue) {
+          finalValue = accVar;
+        } else {
+          const epilogueGen = createGen(
+            kernel,
+            `s${si}_ep`,
+            () => accVar,
+            new Map([["acc", accVar]]),
+          );
+          finalValue = strip1(epilogueGen(re.epilogue));
+        }
 
         const resultIdx = bodyOutputIds.indexOf(outId);
         if (resultIdx >= 0 && !passThroughOutputs.has(resultIdx)) {
-          // Write to global output buffer with block offset
           const resultTy = dtypeToWgsl(outputDtypes[resultIdx], true);
-          const castRhs =
-            resultTy !== dtypeToWgsl(kernel.outputs[oi].exp.dtype)
-              ? `${resultTy}(${rhs})`
-              : rhs;
+          const castFinal =
+            resultTy !== reTy ? `${resultTy}(${finalValue})` : finalValue;
+          emit(
+            `result${resultIdx}[i32(out_base_${resultIdx})] = ${castFinal};`,
+          );
+        } else if (idIsShmem.has(outId)) {
+          const shmemName = idToReadName.get(outId)!;
+          emit(`${shmemName}[0u] = ${finalValue};`);
+        }
+        emit(popIndent, "}");
+        emit("workgroupBarrier();");
+      } else {
+        // --- Elementwise kernel: each thread writes its own element ---
+        for (let oi = 0; oi < kernel.numOutputs; oi++) {
+          const outId = step.outputs[oi];
+          const rhs = strip1(gen(kernel.outputs[oi].exp));
+
+          const resultIdx = bodyOutputIds.indexOf(outId);
+          if (resultIdx >= 0 && !passThroughOutputs.has(resultIdx)) {
+            const resultTy = dtypeToWgsl(outputDtypes[resultIdx], true);
+            const castRhs =
+              resultTy !== dtypeToWgsl(kernel.outputs[oi].exp.dtype)
+                ? `${resultTy}(${rhs})`
+                : rhs;
+            if (hasBoundary) {
+              emit(`if (valid) {`, pushIndent);
+              emit(
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${castRhs};`,
+              );
+              emit(popIndent, "}");
+            } else {
+              emit(
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${castRhs};`,
+              );
+            }
+          } else if (idIsShmem.has(outId)) {
+            const shmemName = idToReadName.get(outId)!;
+            emit(`${shmemName}[tidx] = ${rhs};`);
+          }
+        }
+      }
+    } else {
+      // --- fori_loop step ---
+      const fl = foriLoops[entry.flIdx];
+      const fs = fl.foriStep;
+      const numBodyConsts = fl.numConsts;
+      const numCarries = fs.initCarries.length;
+
+      // Build mapping from body input JitIds to WGSL names + properties
+      // Body inputs: [const0..constN, idx, carry0..carryM]
+      const bodyInputInfo: {
+        name: string;
+        isGlobal: boolean;
+        parentInputIdx: number; // for block offset
+        isIndex: boolean;
+      }[] = [];
+
+      for (let bi = 0; bi < fl.bodyInputIds.length; bi++) {
+        if (bi < numBodyConsts) {
+          // Const input — maps to a parent JitId
+          const parentJitId = fs.consts[bi];
+          const parentName =
+            idToReadName.get(parentJitId) ??
+            inputIdToName.get(parentJitId) ??
+            `__fl_unknown_${parentJitId}`;
+          const isGlobalInput = inputIdToName.has(parentJitId);
+          const parentBodyIdx = bodyInputIds.indexOf(parentJitId);
+          bodyInputInfo.push({
+            name: parentName,
+            isGlobal: isGlobalInput && !idIsShmem.has(parentJitId),
+            parentInputIdx:
+              parentBodyIdx >= numConsts ? parentBodyIdx - numConsts : -1,
+            isIndex: false,
+          });
+        } else if (bi === numBodyConsts) {
+          // Loop index — scalar i32
+          bodyInputInfo.push({
+            name: fl.loopVar,
+            isGlobal: false,
+            parentInputIdx: -1,
+            isIndex: true,
+          });
+        } else {
+          // Carry input — maps to the parent output shmem
+          const carryIdx = bi - numBodyConsts - 1;
+          const parentOutId = fs.outputs[carryIdx];
+          const carryShmemName = idToReadName.get(parentOutId)!;
+          bodyInputInfo.push({
+            name: carryShmemName,
+            isGlobal: false,
+            parentInputIdx: -1,
+            isIndex: false,
+          });
+        }
+      }
+
+      // Build mapping from body JitIds to WGSL read names
+      const bodyIdToName = new Map<JitId, string>();
+      for (let bi = 0; bi < fl.bodyInputIds.length; bi++) {
+        bodyIdToName.set(fl.bodyInputIds[bi], bodyInputInfo[bi].name);
+      }
+      for (const [bodyJitId, info] of fl.bodyShmemMap) {
+        bodyIdToName.set(bodyJitId, info.name);
+      }
+      // Map body output JitIds to carry output shmem names
+      // (body outputs that are also body shmem intermediates already mapped)
+      // For outputs that map to parent output shmem, add the mapping
+      for (let ci = 0; ci < numCarries; ci++) {
+        const bodyOutId = fl.bodyOutputIds[ci];
+        const parentOutId = fs.outputs[ci];
+        const carryShmemName = idToReadName.get(parentOutId)!;
+        // If the body output is a body shmem intermediate, it already has
+        // a body shmem name. We want it to write to the carry shmem instead.
+        // Override the mapping:
+        bodyIdToName.set(bodyOutId, carryShmemName);
+      }
+
+      // Initialize carry shmem from init carry values
+      for (let ci = 0; ci < numCarries; ci++) {
+        const parentInitId = fs.initCarries[ci];
+        const parentOutId = fs.outputs[ci];
+        const initName =
+          idToReadName.get(parentInitId) ?? inputIdToName.get(parentInitId);
+        const carryName = idToReadName.get(parentOutId)!;
+        if (initName && initName !== carryName) {
+          // Copy init value to carry shmem
+          if (inputIdToName.has(parentInitId) && !idIsShmem.has(parentInitId)) {
+            // Init is a global input — apply block offset
+            const parentBodyIdx = bodyInputIds.indexOf(parentInitId);
+            const inIdx =
+              parentBodyIdx >= numConsts ? parentBodyIdx - numConsts : -1;
+            if (inIdx >= 0) {
+              const readExpr = `${initName}[i32(in_base_${inIdx}) + i32(tidx)]`;
+              emit(
+                `${carryName}[tidx] = ${hasBoundary ? `select(${dtypeToWgsl(shmemMap.get(parentOutId)?.dtype ?? DType.Float32)}(0), ${readExpr}, valid)` : readExpr};`,
+              );
+            } else {
+              emit(`${carryName}[tidx] = ${initName}[i32(tidx)];`);
+            }
+          } else {
+            // Init is shmem — direct copy
+            emit(`${carryName}[tidx] = ${initName}[tidx];`);
+          }
+        }
+        // If initName === carryName, they're the same shmem (recycled) — no copy needed
+      }
+      emit("workgroupBarrier();");
+
+      // Emit WGSL for loop
+      emit(
+        `for (var ${fl.loopVar}: i32 = ${fs.lower}; ${fl.loopVar} < ${fs.upper}; ${fl.loopVar}++) {`,
+        pushIndent,
+      );
+
+      // Generate body kernel steps
+      for (let bsi = 0; bsi < fl.bodyKernels.length; bsi++) {
+        if (fl.bodyBarriers.has(bsi)) {
+          emit("workgroupBarrier();");
+        }
+
+        const { step: bStep, kernel: bKernel } = fl.bodyKernels[bsi];
+
+        // Build per-step input mapping
+        const bStepInputInfo: typeof bodyInputInfo = [];
+        for (let j = 0; j < bStep.inputs.length; j++) {
+          const jitId = bStep.inputs[j];
+          const biIdx = fl.bodyInputIds.indexOf(jitId);
+          if (biIdx >= 0) {
+            bStepInputInfo.push(bodyInputInfo[biIdx]);
+          } else {
+            // Body shmem intermediate or carry output
+            const sname = bodyIdToName.get(jitId);
+            bStepInputInfo.push({
+              name: sname ?? `__fl_unknown_${jitId}`,
+              isGlobal: false,
+              parentInputIdx: -1,
+              isIndex: false,
+            });
+          }
+        }
+
+        const gen = createGen(
+          bKernel,
+          `fl${entry.flIdx}_s${bsi}`,
+          (bufIdx, indexExpr, dtype) => {
+            const info = bStepInputInfo[bufIdx];
+            if (info.isIndex) {
+              // Loop variable — scalar, cast to read dtype
+              return `${dtypeToWgsl(dtype)}(${info.name})`;
+            }
+            if (info.isGlobal) {
+              const inputIdx = info.parentInputIdx;
+              if (inputIdx >= 0) {
+                const readExpr = `${info.name}[i32(in_base_${inputIdx}) + ${indexExpr}]`;
+                return hasBoundary
+                  ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
+                  : readExpr;
+              } else {
+                return `${info.name}[${indexExpr}]`;
+              }
+            }
+            // Shmem (body intermediate or carry) — direct index
+            return `${info.name}[${indexExpr}]`;
+          },
+        );
+
+        // Elementwise output writes
+        for (let oi = 0; oi < bKernel.numOutputs; oi++) {
+          const outId = bStep.outputs[oi];
+          const rhs = strip1(gen(bKernel.outputs[oi].exp));
+          const targetName = bodyIdToName.get(outId);
+          if (targetName) {
+            emit(`${targetName}[tidx] = ${rhs};`);
+          }
+        }
+      }
+
+      emit(popIndent, "}"); // end for loop
+
+      // Write final carries to parent output (global result buffers)
+      for (let ci = 0; ci < numCarries; ci++) {
+        const parentOutId = fs.outputs[ci];
+        const resultIdx = bodyOutputIds.indexOf(parentOutId);
+        if (resultIdx >= 0 && !passThroughOutputs.has(resultIdx)) {
+          const carryName = idToReadName.get(parentOutId)!;
+          const resultTy = dtypeToWgsl(outputDtypes[resultIdx], true);
           if (hasBoundary) {
             emit(`if (valid) {`, pushIndent);
             emit(
-              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${castRhs};`,
+              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${resultTy}(${carryName}[tidx]);`,
             );
             emit(popIndent, "}");
           } else {
             emit(
-              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${castRhs};`,
+              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${resultTy}(${carryName}[tidx]);`,
             );
           }
-        } else if (idIsShmem.has(outId)) {
-          // Write to shared memory (all threads, including invalid — pads with 0)
-          const shmemName = idToReadName.get(outId)!;
-          emit(`${shmemName}[tidx] = ${rhs};`);
         }
       }
     }

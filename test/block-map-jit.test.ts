@@ -560,4 +560,100 @@ describe("lax.blockMap — boundary blocks", () => {
     expect(g).toBeAllclose([2, 4, 6, 8, 10]);
     f_jit.dispose();
   });
+
+  // =========================================================================
+  // fori_loop inside block_map
+  // =========================================================================
+
+  test("jit(blockMap(foriLoop)) simple accumulation", () => {
+    // Each block accumulates block + block + block = 3 * block via 3 iterations
+    const f = (xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          lax.foriLoop(
+            0,
+            3,
+            (_i: np.Array, acc: np.Array) => np.add(acc, block),
+            np.zerosLike(block),
+          ),
+        xs,
+        { blockShape: [4] },
+      );
+
+    const f_jit = jit(f);
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([3, 6, 9, 12, 15, 18, 21, 24]);
+    f_jit.dispose();
+  });
+
+  test("jit(blockMap(foriLoop)) uses loop index", () => {
+    // Computes block * sum(0..4) = block * (0+1+2+3) = block * 6
+    const f = (xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          lax.foriLoop(
+            0,
+            4,
+            (i: np.Array, acc: np.Array) => np.add(acc, np.multiply(block, i)),
+            np.zerosLike(block),
+          ),
+        xs,
+        { blockShape: [4] },
+      );
+
+    const f_jit = jit(f);
+    using xs = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    // [1,2,3,4] * 6 = [6,12,18,24]
+    expect(result).toBeAllclose([6, 12, 18, 24]);
+    f_jit.dispose();
+  });
+
+  test("jit(blockMap(foriLoop)) with boundary block", () => {
+    // N=5, blockShape=4 → 1 full block + 1 boundary block
+    const f = (xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          lax.foriLoop(
+            0,
+            2,
+            (_i: np.Array, acc: np.Array) => np.add(acc, block),
+            np.zerosLike(block),
+          ),
+        xs,
+        { blockShape: [4] },
+      );
+
+    const f_jit = jit(f);
+    using xs = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([2, 4, 6, 8, 10]);
+    f_jit.dispose();
+  });
+
+  test("jit(blockMap) foriLoop + elementwise chain", () => {
+    // foriLoop does accumulation, then multiply result by 2
+    const f = (xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) => {
+          using acc = lax.foriLoop(
+            0,
+            3,
+            (_i: np.Array, acc: np.Array) => np.add(acc, block),
+            np.zerosLike(block),
+          );
+          return np.multiply(acc, np.array(2, { dtype: DType.Float32 }));
+        },
+        xs,
+        { blockShape: [4] },
+      );
+
+    const f_jit = jit(f);
+    using xs = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    // [3,6,9,12] * 2 = [6,12,18,24]
+    expect(result).toBeAllclose([6, 12, 18, 24]);
+    f_jit.dispose();
+  });
 });

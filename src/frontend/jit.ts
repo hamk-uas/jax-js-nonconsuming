@@ -156,6 +156,19 @@ export type JitStep =
       consts: JitId[];
       inputs: JitId[];
       outputs: JitId[];
+    }
+  | {
+      type: "fori_loop";
+      bodyProgram: JitProgram;
+      bodyJaxpr: Jaxpr;
+      lower: number;
+      upper: number;
+      numConsts: number;
+      consts: JitId[];
+      initCarries: JitId[];
+      outputs: JitId[];
+      /** Byte size of each carry buffer (for copy at end of loop). */
+      carrySizeBytes: number[];
     };
 
 /** Per-type step counts from {@link JitProgram.stepCounts}. */
@@ -170,6 +183,7 @@ export interface JitStepCounts {
   scatter_add: number;
   assoc_scan: number;
   block_map: number;
+  fori_loop: number;
 }
 
 /**
@@ -308,6 +322,10 @@ export class JitProgram {
           return PPrint.pp(
             `block_map grid=[${step.gridShape}] blockShape=[${step.blockShape}] numConsts=${step.numConsts} numInputs=${step.numInputs}`,
           );
+        case "fori_loop":
+          return PPrint.pp(
+            `fori_loop lower=${step.lower} upper=${step.upper} numConsts=${step.numConsts}`,
+          );
       }
     });
     const display = PPrint.prototype.concat(
@@ -345,6 +363,7 @@ export class JitProgram {
       scatter_add: 0,
       assoc_scan: 0,
       block_map: 0,
+      fori_loop: 0,
     };
     for (const step of this.steps) {
       counts[step.type]++;
@@ -675,6 +694,56 @@ export class JitProgram {
           pending.push(...bmResult.pending);
           break;
         }
+        case "fori_loop": {
+          // Flush pending ops — fori_loop needs materialized inputs
+          flushPendingBatched(pending, this.backend);
+
+          const constSlots = step.consts.map((id) => scope.get(id)!);
+          let carrySlots = step.initCarries.map((id) => scope.get(id)!);
+          let ownsCarry = false; // first iteration uses parent-owned init carries
+
+          for (let i = step.lower; i < step.upper; i++) {
+            // Create scalar int32 index slot
+            const idxData = new Int32Array([i]);
+            const idxSlot = this.backend.malloc(
+              4,
+              new Uint8Array(idxData.buffer),
+            );
+
+            // IncRef consts (body borrows them)
+            for (const s of constSlots) this.backend.incRef(s);
+
+            const bodyInputs = [...constSlots, idxSlot, ...carrySlots];
+            const bodyResult = step.bodyProgram.execute(bodyInputs);
+            flushPendingBatched(bodyResult.pending, this.backend);
+
+            // DecRef consts and index
+            for (const s of constSlots) this.backend.decRef(s);
+            this.backend.decRef(idxSlot);
+
+            // Release previous carry if we own it (body outputs from prior iterations)
+            if (ownsCarry) {
+              for (const s of carrySlots) this.backend.decRef(s);
+            }
+            carrySlots = bodyResult.outputs;
+            ownsCarry = true;
+          }
+
+          // Write final carries to output slots
+          for (let k = 0; k < step.outputs.length; k++) {
+            const outSlot = scope.get(step.outputs[k])!;
+            const carrySlot = carrySlots[k];
+            this.backend.copyBufferToBuffer(
+              carrySlot,
+              0,
+              outSlot,
+              0,
+              step.carrySizeBytes[k],
+            );
+            if (ownsCarry) this.backend.decRef(carrySlot);
+          }
+          break;
+        }
         default:
           step satisfies never;
       }
@@ -738,6 +807,12 @@ function stepUsesId(step: JitStep, id: JitId): boolean {
         step.outputs.includes(id) ||
         step.consts.includes(id) ||
         step.inputs.includes(id)
+      );
+    case "fori_loop":
+      return (
+        step.outputs.includes(id) ||
+        step.consts.includes(id) ||
+        step.initCarries.includes(id)
       );
     default:
       return false;
@@ -1483,6 +1558,62 @@ export function jitCompile(
         continue;
       }
 
+      // Handle Primitive.ForiLoop — compile the body jaxpr and emit a
+      // "fori_loop" JitStep that iterates from lower to upper.
+      if (eqn.primitive === Primitive.ForiLoop) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<typeof Primitive.ForiLoop>;
+        const { jaxpr: bodyJaxpr, numConsts, lower, upper } = params;
+
+        // Resolve input JitIds: [consts..., initCarries...]
+        const allInputIds: JitId[] = [];
+        for (const input of eqn.inputs) {
+          if (input instanceof Var) {
+            const jv = ctx.get(input)!;
+            if (jv.type !== "imm") {
+              throw new Error("jit: ForiLoop primitive input is not imm");
+            }
+            allInputIds.push(jv.arg);
+          } else if (input instanceof Lit) {
+            allInputIds.push(builder.pushLit(input));
+          }
+        }
+
+        const constsIds = allInputIds.slice(0, numConsts);
+        const initCarryIds = allInputIds.slice(numConsts);
+
+        // Allocate output buffers (same shape/dtype as carries)
+        const outputIds: JitId[] = [];
+        for (const outVar of eqn.outBinders) {
+          const outId = builder.pushBuffer(
+            sizeExprMul(outVar.aval.sizeExpr, byteWidth(outVar.aval.dtype)),
+          );
+          outputIds.push(outId);
+          ctx.set(outVar, { type: "imm", arg: outId });
+        }
+
+        // Compile body jaxpr
+        const bodyProgram = jitCompile(backend, bodyJaxpr);
+
+        const carrySizeBytes = eqn.outBinders.map(
+          (v) => (v.aval.size as number) * byteWidth(v.aval.dtype),
+        );
+
+        builder.steps.push({
+          type: "fori_loop",
+          bodyProgram,
+          bodyJaxpr,
+          lower,
+          upper,
+          numConsts,
+          consts: constsIds,
+          initCarries: initCarryIds,
+          outputs: outputIds,
+          carrySizeBytes,
+        });
+        continue;
+      }
+
       // If this is a routine, construct and dispatch the routine.
       if (routinePrimitives.has(eqn.primitive)) {
         flushPendingKernels();
@@ -2063,7 +2194,7 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     throw new Error("internal: BlockMap is handled specially in jitCompile");
   },
   [Primitive.ForiLoop]() {
-    throw new Error("jit: ForiLoop is not yet supported outside BlockMap/Scan");
+    throw new Error("internal: ForiLoop is handled specially in jitCompile");
   },
   [Primitive.DynamicSlice]() {
     throw new Error(
@@ -2237,6 +2368,7 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     Primitive.ScatterAdd,
     Primitive.AssociativeScan,
     Primitive.BlockMap,
+    Primitive.ForiLoop,
   ];
   for (let i = jaxpr.eqns.length - 1; i >= 0; i--) {
     const eqn = jaxpr.eqns[i];
