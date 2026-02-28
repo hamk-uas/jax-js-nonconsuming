@@ -1895,6 +1895,28 @@ export class Array extends Tracer {
         // jax-js-lint: allow-ref
         return carry.map((c) => (args.includes(c) ? c.ref : c));
       },
+      [Primitive.WorkgroupAssociativeScan](args, { jaxpr, numConsts }) {
+        // Eager impl: delegate to the Kogge-Stone core algorithm
+        // registered by lax-associative-scan.ts, same as AssociativeScan.
+        const consts = args.slice(0, numConsts);
+        const elemsLeaves = args.slice(numConsts);
+
+        if (!_associativeScanCoreImpl) {
+          throw new Error(
+            "WorkgroupAssociativeScan: core implementation not registered. " +
+              "Import lax-associative-scan.ts first.",
+          );
+        }
+
+        return _associativeScanCoreImpl(
+          jaxpr,
+          consts,
+          elemsLeaves,
+          elemsLeaves.length,
+          0,
+          false,
+        );
+      },
       [Primitive.DynamicSlice](args, { sliceSizes }) {
         const operand = args[0];
         const indices = args.slice(1);

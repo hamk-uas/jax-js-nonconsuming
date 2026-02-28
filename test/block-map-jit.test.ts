@@ -268,6 +268,137 @@ describe("lax.blockMap — fused shader path", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Guard / fallback tests (T5a.3, T5a.4)
+// ---------------------------------------------------------------------------
+describe("lax.blockMap — fused shader guards", () => {
+  const isWebGPU = defaultDevice() === "webgpu";
+
+  test("blockSize exceeding maxComputeInvocationsPerWorkgroup falls back correctly", () => {
+    // T5a.4: blockShape=[512] exceeds typical maxInvocations=256.
+    // The fused path should detect this and fall back to the JS loop,
+    // still producing the correct result.
+    using two = np.array(2, { dtype: DType.Float32 });
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap((block: np.Array) => np.multiply(block, two), xs, {
+        blockShape: [512],
+      }),
+    );
+    using xs = np.arange(1024).astype(DType.Float32);
+    using expected = np.multiply(xs, two);
+    using result = f_jit(xs);
+    expect(result).toBeAllclose(expected);
+    f_jit.dispose();
+  });
+
+  test("blockSize exceeding maxInvocations logs fallback on WebGPU", () => {
+    if (!isWebGPU) return;
+
+    const logs: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+
+    try {
+      setDebug(1);
+      const f_jit = jit((xs: np.Array) =>
+        lax.blockMap(
+          (block: np.Array) =>
+            np.multiply(block, np.array(2, { dtype: DType.Float32 })),
+          xs,
+          { blockShape: [512] },
+        ),
+      );
+      using xs = np.arange(1024).astype(DType.Float32);
+      using result = f_jit(xs);
+      using two = np.array(2, { dtype: DType.Float32 });
+      expect(result).toBeAllclose(np.multiply(xs, two));
+
+      // Should NOT have taken the fused path
+      const fusedLog = logs.find((l) => l.includes("fused WebGPU shader path"));
+      expect(fusedLog).toBeUndefined();
+
+      // Should log the fallback reason
+      const fallbackLog = logs.find(
+        (l) => l.includes("blockSize") && l.includes("maxInvocations"),
+      );
+      expect(fallbackLog).toBeDefined();
+
+      f_jit.dispose();
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
+  });
+
+  test("body exceeding shmem budget falls back correctly", () => {
+    // T5a.3: Create a body with many sequential reductions. Each reduction
+    // adds a blockSize*4 workspace to shmem. With blockSize=256 and 17
+    // reductions: 17 * 1024 = 17408 bytes > 16384 byte budget.
+    const body = (block: np.Array) => {
+      let acc = block;
+      for (let i = 0; i < 17; i++) {
+        using s = np.sum(acc);
+        acc = np.subtract(acc, s);
+      }
+      return acc;
+    };
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(body, xs, { blockShape: [256] }),
+    );
+    // Compute expected result eagerly
+    using xs = np.arange(256).astype(DType.Float32);
+    using expected = lax.blockMap(body, xs, { blockShape: [256] });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose(expected, { atol: 1e-3 });
+    f_jit.dispose();
+  });
+
+  test("shmem budget exceeded logs fallback on WebGPU", () => {
+    if (!isWebGPU) return;
+
+    const logs: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+
+    try {
+      setDebug(1);
+      const body = (block: np.Array) => {
+        let acc = block;
+        for (let i = 0; i < 17; i++) {
+          using s = np.sum(acc);
+          acc = np.subtract(acc, s);
+        }
+        return acc;
+      };
+      const f_jit = jit((xs: np.Array) =>
+        lax.blockMap(body, xs, { blockShape: [256] }),
+      );
+      using xs = np.arange(256).astype(DType.Float32);
+      using result = f_jit(xs);
+      void result; // consume
+
+      // Should NOT have taken the fused path
+      const fusedLog = logs.find((l) => l.includes("fused WebGPU shader path"));
+      expect(fusedLog).toBeUndefined();
+
+      // Should log the shmem fallback reason
+      const shmemLog = logs.find(
+        (l) => l.includes("shmem") && l.includes("fallback"),
+      );
+      expect(shmemLog).toBeDefined();
+
+      f_jit.dispose();
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // In-block reduction tests (Phase 3.1)
 // ---------------------------------------------------------------------------
 describe("lax.blockMap — in-block reductions", () => {
@@ -1049,5 +1180,109 @@ describe("lax.tiledMatmul", () => {
     using g_tiled = grad(f_tiled)(A);
     using g_ref = grad(f_ref)(A);
     expect(g_tiled).toBeAllclose(g_ref, { atol: 1e-3 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T5b: WorkgroupAssociativeScan primitive
+// ---------------------------------------------------------------------------
+describe("lax.workgroupAssociativeScan", () => {
+  // T5b.1: workgroupAssociativeScan(add, elems) inside block_map
+  test("cumsum inside block_map via fused Kogge-Stone", () => {
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          lax.workgroupAssociativeScan(
+            (a: np.Array, b: np.Array) => np.add(a, b),
+            block,
+          ),
+        xs,
+        { blockShape: [8] },
+      ),
+    );
+    // Input: [1,2,3,4, 5,6,7,8] → two blocks of 4
+    using xs = np.array(
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+      { dtype: DType.Float32 },
+    );
+    // expected: cumsum within each block of size 8
+    // block0: [1,3,6,10,15,21,28,36]
+    // block1: [9,19,30,42,55,69,84,100]
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([
+      1, 3, 6, 10, 15, 21, 28, 36, 9, 19, 30, 42, 55, 69, 84, 100,
+    ]);
+    f_jit.dispose();
+  });
+
+  // T5b.2: workgroupAssociativeScan outside block_map — JIT fallback
+  test("outside block_map runs via sequential fallback", () => {
+    const f_jit = jit((xs: np.Array) =>
+      lax.workgroupAssociativeScan(
+        (a: np.Array, b: np.Array) => np.add(a, b),
+        xs,
+      ),
+    );
+    using xs = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    // cumsum [1,2,3,4] → [1,3,6,10]
+    expect(result).toBeAllclose([1, 3, 6, 10]);
+    f_jit.dispose();
+  });
+
+  // T5b.3: eager impl matches associativeScan
+  test("eager impl matches associativeScan", () => {
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    const fn = (a: np.Array, b: np.Array) => np.add(a, b);
+
+    using expected = lax.associativeScan(fn, xs);
+    using result = lax.workgroupAssociativeScan(fn, xs);
+    expect(result).toBeAllclose(expected);
+  });
+
+  // T5b.4: non-power-of-2 block size
+  test("non-power-of-2 block size", () => {
+    // blockSize=6 (not power of 2) — tests masking in Kogge-Stone
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          lax.workgroupAssociativeScan(
+            (a: np.Array, b: np.Array) => np.add(a, b),
+            block,
+          ),
+        xs,
+        { blockShape: [6] },
+      ),
+    );
+    // 12 elements → 2 blocks of 6
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], {
+      dtype: DType.Float32,
+    });
+    using result = f_jit(xs);
+    // block0: cumsum [1,2,3,4,5,6] → [1,3,6,10,15,21]
+    // block1: cumsum [7,8,9,10,11,12] → [7,15,24,34,45,57]
+    expect(result).toBeAllclose([1, 3, 6, 10, 15, 21, 7, 15, 24, 34, 45, 57]);
+    f_jit.dispose();
+  });
+
+  // T5b.5: non-add operator (mul)
+  test("cumulative product via mul operator", () => {
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          lax.workgroupAssociativeScan(
+            (a: np.Array, b: np.Array) => np.multiply(a, b),
+            block,
+          ),
+        xs,
+        { blockShape: [4] },
+      ),
+    );
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    // block0: cumprod [1,2,3,4] → [1,2,6,24]
+    // block1: cumprod [5,6,7,8] → [5,30,210,1680]
+    expect(result).toBeAllclose([1, 2, 6, 24, 5, 30, 210, 1680]);
+    f_jit.dispose();
   });
 });

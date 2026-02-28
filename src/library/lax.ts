@@ -664,6 +664,69 @@ export function foriLoop<C extends tree.JsTree<Array>>(
 }
 
 /**
+ * Workgroup-local associative prefix scan (Kogge-Stone).
+ *
+ * Computes an inclusive prefix scan using an associative binary operator.
+ * Designed for use inside {@link blockMap} bodies where each workgroup runs
+ * the scan entirely in shared memory.
+ *
+ * In eager mode / inside `block_map` fallback, delegates to the
+ * `associativeScan` Kogge-Stone implementation (correct result, just not
+ * shared-memory-accelerated).
+ *
+ * In JIT mode inside a `block_map` body, the fused shader compiler emits
+ * Kogge-Stone rounds in WGSL with `workgroupBarrier()` between rounds and
+ * ping-pong shared-memory arrays.
+ *
+ * @param fn - Associative binary operator: `(a, b) => c`. Must not close
+ *   over mutable state. Must dispose any internally-created Arrays.
+ * @param elems - 1D input array.
+ * @returns Prefix scan result with the same shape as `elems`.
+ *
+ * @example Cumulative sum inside a block_map body
+ * ```ts
+ * const result = lax.blockMap(
+ *   (block) => lax.workgroupAssociativeScan((a, b) => np.add(a, b), block),
+ *   xs,
+ *   { blockShape: [256] },
+ * );
+ * ```
+ */
+export function workgroupAssociativeScan(
+  fn: (a: Array, b: Array) => Array,
+  elems: Array,
+): Array {
+  const elemAval = core.getAval(elems);
+
+  // Trace the binary operator with scalar avals (scan-axis-removed shapes)
+  const scalarAval = new ShapedArray(
+    elemAval.shape.slice(1),
+    elemAval.dtype,
+    elemAval.weakType,
+  );
+  const traceFn = (a: Array, b: Array): Array[] => {
+    const result = fn(a, b);
+    return [result];
+  };
+  const { jaxpr: closedJaxpr } = jaxpr.makeJaxpr(traceFn)(
+    scalarAval,
+    scalarAval,
+  );
+
+  const results = core.bind(
+    Primitive.WorkgroupAssociativeScan,
+    [...closedJaxpr.consts, elems],
+    {
+      jaxpr: closedJaxpr.jaxpr,
+      numConsts: closedJaxpr.consts.length,
+    },
+  ) as Array[];
+
+  closedJaxpr.dispose();
+  return results[0];
+}
+
+/**
  * Options for {@link tiledMatmul}.
  */
 export interface TiledMatmulOptions {

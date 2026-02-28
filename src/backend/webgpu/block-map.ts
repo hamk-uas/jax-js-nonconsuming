@@ -142,10 +142,35 @@ export function blockMapFusedShaderSource(
   }
   const foriLoops: ForiLoopInfo[] = [];
 
+  /** Analyzed workgroup_assoc_scan steps. */
+  interface WorkgroupAssocScanInfo {
+    wasStep: Extract<JitStep, { type: "workgroup_assoc_scan" }>;
+    /** Body kernels (the binary operator fn). */
+    bodyKernels: {
+      step: Extract<JitStep, { type: "execute" }>;
+      kernel: Kernel;
+    }[];
+    /** Body shmem intermediates. */
+    bodyShmemMap: Map<JitId, { name: string; dtype: DType; elemCount: number }>;
+    bodyShmemIds: Set<JitId>;
+    bodyInputIds: JitId[];
+    bodyOutputIds: JitId[];
+    numConsts: number;
+    numElems: number;
+    /** Per-element dtype and count. */
+    elemDtypes: DType[];
+    elemCounts: number[];
+    /** Ping/pong shmem names per elem: [pingName, pongName]. */
+    pingPongNames: [string, string][];
+    numRounds: number;
+  }
+  const workgroupAssocScans: WorkgroupAssocScanInfo[] = [];
+
   /** Combined codegen entries in step order. */
   type CodegenEntry =
     | { type: "kernel"; kernelIdx: number }
-    | { type: "fori_loop"; flIdx: number };
+    | { type: "fori_loop"; flIdx: number }
+    | { type: "workgroup_assoc_scan"; wasIdx: number };
   const codegenEntries: CodegenEntry[] = [];
 
   let totalShmemBytes = 0;
@@ -345,6 +370,124 @@ export function blockMapFusedShaderSource(
           loopVar: `fl${flIdx}_i`,
         });
         codegenEntries.push({ type: "fori_loop", flIdx });
+        break;
+      }
+      case "workgroup_assoc_scan": {
+        // Analyze scan body: must be kernel-only, elementwise-only
+        const wasIdx = workgroupAssocScans.length;
+        const bodyProg = step.bodyProgram;
+        const bodySteps = bodyProg.steps;
+        const bodyKernels: WorkgroupAssocScanInfo["bodyKernels"] = [];
+        const bodyShmemMap = new Map<
+          JitId,
+          { name: string; dtype: DType; elemCount: number }
+        >();
+        const bodyShmemIds = new Set<JitId>();
+
+        let valid = true;
+        for (const bs of bodySteps) {
+          switch (bs.type) {
+            case "execute": {
+              if (bs.source instanceof Routine) {
+                if (DEBUG >= 1)
+                  console.info(
+                    "block_map fused: routine in workgroup_assoc_scan body, fallback",
+                  );
+                return null;
+              }
+              const bk = bs.source as Kernel;
+              if (bk.isSymbolic || bk.hasReduction) {
+                valid = false;
+                break;
+              }
+              bodyKernels.push({
+                step: bs as Extract<JitStep, { type: "execute" }>,
+                kernel: bk,
+              });
+              break;
+            }
+            case "malloc": {
+              if (isSymbolicSize(bs.size)) {
+                valid = false;
+                break;
+              }
+              const sz = bs.size as number;
+              const sname = `was${wasIdx}_s${bs.output}`;
+              bodyShmemMap.set(bs.output, {
+                name: sname,
+                dtype: DType.Float32,
+                elemCount: sz / 4,
+              });
+              bodyShmemIds.add(bs.output);
+              totalShmemBytes += sz;
+              break;
+            }
+            case "free":
+            case "recycle":
+            case "incref":
+              break;
+            default:
+              valid = false;
+              break;
+          }
+          if (!valid) break;
+        }
+        if (!valid) {
+          if (DEBUG >= 1)
+            console.info(
+              "block_map fused: invalid workgroup_assoc_scan body, fallback",
+            );
+          return null;
+        }
+
+        // Refine body shmem dtypes from body kernel outputs
+        for (const { step: bs, kernel: bk } of bodyKernels) {
+          for (let oi = 0; oi < bk.numOutputs; oi++) {
+            const entry = bodyShmemMap.get(bs.outputs[oi]);
+            if (entry) {
+              entry.dtype = bk.outputs[oi].dtype;
+              entry.elemCount = (entry.elemCount * 4) / byteWidth(entry.dtype);
+            }
+          }
+        }
+
+        const numElems = step.numElems;
+        const numConsts = step.numConsts;
+
+        // Determine elem dtypes from elemAvals
+        const elemDtypes: DType[] = step.elemAvals.map((a) => a.dtype);
+        const elemCounts: number[] = step.elemAvals.map(
+          (a) => a.size / (a.shape[0] as number),
+        );
+
+        // Allocate ping-pong shmem per elem (each: blockSize * elemCount elements)
+        const pingPongNames: [string, string][] = [];
+        for (let e = 0; e < numElems; e++) {
+          const count = blockSize * elemCounts[e];
+          const bytes = count * byteWidth(elemDtypes[e]);
+          const pingName = `was${wasIdx}_ping_${e}`;
+          const pongName = `was${wasIdx}_pong_${e}`;
+          pingPongNames.push([pingName, pongName]);
+          totalShmemBytes += bytes * 2; // ping + pong
+        }
+
+        const numRounds = Math.ceil(Math.log2(blockSize));
+
+        workgroupAssocScans.push({
+          wasStep: step as Extract<JitStep, { type: "workgroup_assoc_scan" }>,
+          bodyKernels,
+          bodyShmemMap,
+          bodyShmemIds,
+          bodyInputIds: bodyProg.inputs,
+          bodyOutputIds: bodyProg.outputs,
+          numConsts,
+          numElems,
+          elemDtypes,
+          elemCounts,
+          pingPongNames,
+          numRounds,
+        });
+        codegenEntries.push({ type: "workgroup_assoc_scan", wasIdx });
         break;
       }
       default:
@@ -552,6 +695,9 @@ export function blockMapFusedShaderSource(
   for (const fl of foriLoops) {
     for (const { kernel } of fl.bodyKernels) collectKernelOps(kernel);
   }
+  for (const was of workgroupAssocScans) {
+    for (const { kernel } of was.bodyKernels) collectKernelOps(kernel);
+  }
 
   if (needsF16) {
     if (!device.features.has("shader-f16"))
@@ -635,6 +781,21 @@ export function blockMapFusedShaderSource(
   // Fori_loop body intermediate shmem arrays
   for (const fl of foriLoops) {
     for (const [, info] of fl.bodyShmemMap) {
+      const ty = dtypeToWgsl(info.dtype, false);
+      emit(`var<workgroup> ${info.name}: array<${ty}, ${info.elemCount}>;`);
+    }
+  }
+
+  // WorkgroupAssociativeScan ping-pong shmem arrays + body intermediates
+  for (const was of workgroupAssocScans) {
+    for (let e = 0; e < was.numElems; e++) {
+      const ty = dtypeToWgsl(was.elemDtypes[e], false);
+      const count = blockSize * was.elemCounts[e];
+      const [pingName, pongName] = was.pingPongNames[e];
+      emit(`var<workgroup> ${pingName}: array<${ty}, ${count}>;`);
+      emit(`var<workgroup> ${pongName}: array<${ty}, ${count}>;`);
+    }
+    for (const [, info] of was.bodyShmemMap) {
       const ty = dtypeToWgsl(info.dtype, false);
       emit(`var<workgroup> ${info.name}: array<${ty}, ${info.elemCount}>;`);
     }
@@ -902,9 +1063,7 @@ export function blockMapFusedShaderSource(
       }
 
       if (!source) {
-        if (DEBUG >= 1)
-          console.info(`block_map fused: unsupported AluOp ${op}, fallback`);
-        source = `/* unsupported op ${op} */`;
+        throw new Error(`block_map fused: unsupported AluOp ${op}`);
       }
 
       const typeName = dtypeToWgsl(dtype);
@@ -1070,7 +1229,7 @@ export function blockMapFusedShaderSource(
           }
         }
       }
-    } else {
+    } else if (entry.type === "fori_loop") {
       // --- fori_loop step ---
       const fl = foriLoops[entry.flIdx];
       const fs = fl.foriStep;
@@ -1317,6 +1476,343 @@ export function blockMapFusedShaderSource(
             emit(
               `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${resultTy}(${carryName}[tidx]);`,
             );
+          }
+        }
+      }
+    } else if (entry.type === "workgroup_assoc_scan") {
+      // --- Workgroup associative scan step (Kogge-Stone) ---
+      const was = workgroupAssocScans[entry.wasIdx];
+      const ws = was.wasStep;
+      const numBodyConsts = was.numConsts;
+
+      // Build mapping from body input JitIds to WGSL read info
+      const bodyInputInfo: {
+        name: string;
+        isGlobal: boolean;
+        parentInputIdx: number;
+      }[] = [];
+
+      for (let bi = 0; bi < was.bodyInputIds.length; bi++) {
+        if (bi < numBodyConsts) {
+          // Const input — maps to a parent JitId
+          const parentJitId = ws.consts[bi];
+          const parentName =
+            idToReadName.get(parentJitId) ??
+            inputIdToName.get(parentJitId) ??
+            `__was_unknown_${parentJitId}`;
+          const isGlobalInput =
+            inputIdToName.has(parentJitId) && !idIsShmem.has(parentJitId);
+          const parentBodyIdx = bodyInputIds.indexOf(parentJitId);
+          bodyInputInfo.push({
+            name: parentName,
+            isGlobal: isGlobalInput,
+            parentInputIdx:
+              parentBodyIdx >= numConsts ? parentBodyIdx - numConsts : -1,
+          });
+        } else {
+          // a_elem or b_elem — will be resolved dynamically per round
+          // placeholder (overridden per-kernel by custom resolveGlobalIndex)
+          bodyInputInfo.push({
+            name: "__placeholder",
+            isGlobal: false,
+            parentInputIdx: -1,
+          });
+        }
+      }
+
+      // Build mapping from body JitIds to WGSL read names (for intermediates)
+      const bodyIdToName = new Map<JitId, string>();
+      for (let bi = 0; bi < numBodyConsts; bi++) {
+        bodyIdToName.set(was.bodyInputIds[bi], bodyInputInfo[bi].name);
+      }
+      for (const [bodyJitId, info] of was.bodyShmemMap) {
+        bodyIdToName.set(bodyJitId, info.name);
+      }
+
+      // Load input elements into ping shmem arrays
+      for (let e = 0; e < was.numElems; e++) {
+        const parentElemId = ws.elems[e];
+        const [pingName] = was.pingPongNames[e];
+        const elemCount = was.elemCounts[e];
+        const parentName =
+          idToReadName.get(parentElemId) ?? inputIdToName.get(parentElemId);
+        const isGlobalInput =
+          inputIdToName.has(parentElemId) && !idIsShmem.has(parentElemId);
+        const parentBodyIdx = bodyInputIds.indexOf(parentElemId);
+        const inIdx =
+          parentBodyIdx >= numConsts ? parentBodyIdx - numConsts : -1;
+
+        if (elemCount > 1) {
+          emit(
+            `for (var _was_ei: u32 = 0u; _was_ei < ${elemCount}u; _was_ei++) {`,
+            pushIndent,
+          );
+          const idx = `tidx * ${elemCount}u + _was_ei`;
+          if (isGlobalInput && inIdx >= 0) {
+            const readExpr = `${parentName}[i32(in_base_${inIdx}) + i32(${idx})]`;
+            emit(
+              `${pingName}[${idx}] = ${hasBoundary ? `select(${dtypeToWgsl(was.elemDtypes[e])}(0), ${readExpr}, valid)` : readExpr};`,
+            );
+          } else if (parentName) {
+            emit(`${pingName}[${idx}] = ${parentName}[${idx}];`);
+          }
+          emit(popIndent, "}");
+        } else {
+          if (isGlobalInput && inIdx >= 0) {
+            const readExpr = `${parentName}[i32(in_base_${inIdx}) + i32(tidx)]`;
+            emit(
+              `${pingName}[tidx] = ${hasBoundary ? `select(${dtypeToWgsl(was.elemDtypes[e])}(0), ${readExpr}, valid)` : readExpr};`,
+            );
+          } else if (parentName) {
+            emit(`${pingName}[tidx] = ${parentName}[tidx];`);
+          }
+        }
+      }
+      emit("workgroupBarrier();");
+
+      // Unrolled Kogge-Stone rounds
+      // Even rounds: read from ping, write to pong
+      // Odd rounds: read from pong, write to ping
+      for (let r = 0; r < was.numRounds; r++) {
+        const stride = 1 << r;
+        const readNames = was.pingPongNames.map(([ping, pong]) =>
+          r % 2 === 0 ? ping : pong,
+        );
+        const writeNames = was.pingPongNames.map(([ping, pong]) =>
+          r % 2 === 0 ? pong : ping,
+        );
+
+        emit(`if (tidx >= ${stride}u) {`, pushIndent);
+
+        // Evaluate body kernels: fn(a, b) where
+        //   a = readBuf[(tidx - stride) * elemCount + ei]
+        //   b = readBuf[tidx * elemCount + ei]
+        // Map body output JitIds to writeBuf[tidx * elemCount + ei]
+        for (let bsi = 0; bsi < was.bodyKernels.length; bsi++) {
+          const { step: bStep, kernel: bKernel } = was.bodyKernels[bsi];
+
+          // Build per-step input resolution
+          const bStepInputNames: string[] = [];
+          const bStepInputKind: ("const" | "a" | "b" | "shmem")[] = [];
+          const bStepInputElemIdx: number[] = []; // which elem in the pytree
+          for (let j = 0; j < bStep.inputs.length; j++) {
+            const jitId = bStep.inputs[j];
+            const biIdx = was.bodyInputIds.indexOf(jitId);
+            if (biIdx >= 0 && biIdx < numBodyConsts) {
+              // Const
+              bStepInputNames.push(bodyInputInfo[biIdx].name);
+              bStepInputKind.push("const");
+              bStepInputElemIdx.push(-1);
+            } else if (
+              biIdx >= numBodyConsts &&
+              biIdx < numBodyConsts + was.numElems
+            ) {
+              // a_elem
+              const e = biIdx - numBodyConsts;
+              bStepInputNames.push(readNames[e]);
+              bStepInputKind.push("a");
+              bStepInputElemIdx.push(e);
+            } else if (biIdx >= numBodyConsts + was.numElems) {
+              // b_elem
+              const e = biIdx - numBodyConsts - was.numElems;
+              bStepInputNames.push(readNames[e]);
+              bStepInputKind.push("b");
+              bStepInputElemIdx.push(e);
+            } else {
+              // Body shmem intermediate
+              const sname = bodyIdToName.get(jitId);
+              bStepInputNames.push(sname ?? `__was_unknown_${jitId}`);
+              bStepInputKind.push("shmem");
+              bStepInputElemIdx.push(-1);
+            }
+          }
+
+          const gen = createGen(
+            bKernel,
+            `was${entry.wasIdx}_r${r}_s${bsi}`,
+            (bufIdx, indexExpr, dtype) => {
+              const kind = bStepInputKind[bufIdx];
+              const name = bStepInputNames[bufIdx];
+              if (kind === "const") {
+                const inf =
+                  bodyInputInfo[was.bodyInputIds.indexOf(bStep.inputs[bufIdx])];
+                if (inf.isGlobal) {
+                  if (inf.parentInputIdx >= 0) {
+                    const readExpr = `${name}[i32(in_base_${inf.parentInputIdx}) + ${indexExpr}]`;
+                    return hasBoundary
+                      ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
+                      : readExpr;
+                  }
+                  return `${name}[${indexExpr}]`;
+                }
+                return `${name}[${indexExpr}]`;
+              } else if (kind === "a") {
+                const e = bStepInputElemIdx[bufIdx];
+                const ec = was.elemCounts[e];
+                if (ec > 1) {
+                  return `${name}[(tidx - ${stride}u) * ${ec}u + u32(${indexExpr})]`;
+                }
+                return `${name}[tidx - ${stride}u]`;
+              } else if (kind === "b") {
+                const e = bStepInputElemIdx[bufIdx];
+                const ec = was.elemCounts[e];
+                if (ec > 1) {
+                  return `${name}[tidx * ${ec}u + u32(${indexExpr})]`;
+                }
+                return `${name}[tidx]`;
+              }
+              // shmem intermediate
+              return `${name}[${indexExpr}]`;
+            },
+          );
+
+          for (let oi = 0; oi < bKernel.numOutputs; oi++) {
+            const outId = bStep.outputs[oi];
+            const rhs = strip1(gen(bKernel.outputs[oi].exp));
+            // Map body output to the correct write buffer
+            const bodyOutIdx = was.bodyOutputIds.indexOf(outId);
+            if (bodyOutIdx >= 0) {
+              const e = bodyOutIdx;
+              const ec = was.elemCounts[e];
+              if (ec > 1) {
+                // Need to emit for each sub-element — but gen already uses gidx
+                // which maps to a single element. For multi-element outputs the
+                // kernel iterates gidx over elemCount, so we wrap in a loop.
+                emit(
+                  `for (var _was_oi: u32 = 0u; _was_oi < ${ec}u; _was_oi++) {`,
+                  pushIndent,
+                );
+                // Re-generate with explicit eidx
+                const genEi = createGen(
+                  bKernel,
+                  `was${entry.wasIdx}_r${r}_s${bsi}_ei`,
+                  (bufIdx2, _indexExpr, dtype2) => {
+                    const kind2 = bStepInputKind[bufIdx2];
+                    const name2 = bStepInputNames[bufIdx2];
+                    if (kind2 === "const") {
+                      const inf2 =
+                        bodyInputInfo[
+                          was.bodyInputIds.indexOf(bStep.inputs[bufIdx2])
+                        ];
+                      if (inf2.isGlobal && inf2.parentInputIdx >= 0) {
+                        const readExpr2 = `${name2}[i32(in_base_${inf2.parentInputIdx}) + i32(_was_oi)]`;
+                        return hasBoundary
+                          ? `select(${dtypeToWgsl(dtype2)}(0), ${readExpr2}, valid)`
+                          : readExpr2;
+                      }
+                      return `${name2}[i32(_was_oi)]`;
+                    } else if (kind2 === "a") {
+                      const e2 = bStepInputElemIdx[bufIdx2];
+                      return `${name2}[(tidx - ${stride}u) * ${was.elemCounts[e2]}u + _was_oi]`;
+                    } else if (kind2 === "b") {
+                      const e2 = bStepInputElemIdx[bufIdx2];
+                      return `${name2}[tidx * ${was.elemCounts[e2]}u + _was_oi]`;
+                    }
+                    return `${name2}[i32(_was_oi)]`;
+                  },
+                );
+                const rhsEi = strip1(genEi(bKernel.outputs[oi].exp));
+                emit(`${writeNames[e]}[tidx * ${ec}u + _was_oi] = ${rhsEi};`);
+                emit(popIndent, "}");
+              } else {
+                emit(`${writeNames[e]}[tidx] = ${rhs};`);
+              }
+            } else {
+              // Body intermediate → write to body shmem
+              const sname = bodyIdToName.get(outId);
+              if (sname) {
+                emit(
+                  `${sname}[${bKernel.numOutputs > 1 ? `i32(tidx) * ${bKernel.numOutputs} + ${oi}` : "tidx"}] = ${rhs};`,
+                );
+              }
+            }
+          }
+        }
+
+        emit(popIndent, "} else {", pushIndent);
+
+        // Copy: writeBuf[tidx] = readBuf[tidx]
+        for (let e = 0; e < was.numElems; e++) {
+          const ec = was.elemCounts[e];
+          if (ec > 1) {
+            emit(
+              `for (var _was_ci: u32 = 0u; _was_ci < ${ec}u; _was_ci++) {`,
+              pushIndent,
+            );
+            emit(
+              `${writeNames[e]}[tidx * ${ec}u + _was_ci] = ${readNames[e]}[tidx * ${ec}u + _was_ci];`,
+            );
+            emit(popIndent, "}");
+          } else {
+            emit(`${writeNames[e]}[tidx] = ${readNames[e]}[tidx];`);
+          }
+        }
+
+        emit(popIndent, "}");
+        emit("workgroupBarrier();");
+      }
+
+      // Write output from final buffer to parent output shmem / result buffers
+      // After numRounds rounds, final data is in:
+      //   numRounds even → ping; numRounds odd → pong
+      const finalNames = was.pingPongNames.map(([ping, pong]) =>
+        was.numRounds % 2 === 0 ? ping : pong,
+      );
+
+      for (let e = 0; e < was.numElems; e++) {
+        const parentOutId = ws.outputs[e];
+        const resultIdx = bodyOutputIds.indexOf(parentOutId);
+        const ec = was.elemCounts[e];
+
+        if (resultIdx >= 0 && !passThroughOutputs.has(resultIdx)) {
+          // Output goes to global result buffer
+          const resultTy = dtypeToWgsl(outputDtypes[resultIdx], true);
+          if (ec > 1) {
+            emit(
+              `for (var _was_wi: u32 = 0u; _was_wi < ${ec}u; _was_wi++) {`,
+              pushIndent,
+            );
+            if (hasBoundary) {
+              emit(`if (valid) {`, pushIndent);
+              emit(
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx * ${ec}u + _was_wi)] = ${resultTy}(${finalNames[e]}[tidx * ${ec}u + _was_wi]);`,
+              );
+              emit(popIndent, "}");
+            } else {
+              emit(
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx * ${ec}u + _was_wi)] = ${resultTy}(${finalNames[e]}[tidx * ${ec}u + _was_wi]);`,
+              );
+            }
+            emit(popIndent, "}");
+          } else {
+            if (hasBoundary) {
+              emit(`if (valid) {`, pushIndent);
+              emit(
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${resultTy}(${finalNames[e]}[tidx]);`,
+              );
+              emit(popIndent, "}");
+            } else {
+              emit(
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${resultTy}(${finalNames[e]}[tidx]);`,
+              );
+            }
+          }
+        } else {
+          // Output goes to a parent shmem buffer (another step reads it)
+          const shmemName = idToReadName.get(parentOutId);
+          if (shmemName) {
+            if (ec > 1) {
+              emit(
+                `for (var _was_wi: u32 = 0u; _was_wi < ${ec}u; _was_wi++) {`,
+                pushIndent,
+              );
+              emit(
+                `${shmemName}[tidx * ${ec}u + _was_wi] = ${finalNames[e]}[tidx * ${ec}u + _was_wi];`,
+              );
+              emit(popIndent, "}");
+            } else {
+              emit(`${shmemName}[tidx] = ${finalNames[e]}[tidx];`);
+            }
           }
         }
       }

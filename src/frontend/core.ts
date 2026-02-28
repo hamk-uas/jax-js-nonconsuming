@@ -116,6 +116,7 @@ export enum Primitive {
   AssociativeScan = "associative_scan",
   BlockMap = "block_map",
   ForiLoop = "fori_loop",
+  WorkgroupAssociativeScan = "workgroup_associative_scan",
 }
 
 interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
@@ -193,6 +194,10 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     upper: number;
     /** Set by JVP rule when this fori_loop was produced by differentiating. */
     isJvpTransformed?: boolean;
+  };
+  [Primitive.WorkgroupAssociativeScan]: {
+    jaxpr: Jaxpr;
+    numConsts: number;
   };
 }
 

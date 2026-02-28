@@ -147,6 +147,7 @@ export function canCompileToMegaModule(steps: JitStep[]): boolean {
       case "assoc_scan":
       case "block_map":
       case "fori_loop":
+      case "workgroup_assoc_scan":
         return false;
       default:
         return false;

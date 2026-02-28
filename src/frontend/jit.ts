@@ -169,6 +169,17 @@ export type JitStep =
       outputs: JitId[];
       /** Byte size of each carry buffer (for copy at end of loop). */
       carrySizeBytes: number[];
+    }
+  | {
+      type: "workgroup_assoc_scan";
+      bodyProgram: JitProgram;
+      bodyJaxpr: Jaxpr;
+      numConsts: number;
+      numElems: number;
+      consts: JitId[];
+      elems: JitId[];
+      outputs: JitId[];
+      elemAvals: ShapedArray[];
     };
 
 /** Per-type step counts from {@link JitProgram.stepCounts}. */
@@ -184,6 +195,7 @@ export interface JitStepCounts {
   assoc_scan: number;
   block_map: number;
   fori_loop: number;
+  workgroup_assoc_scan: number;
 }
 
 /**
@@ -326,6 +338,10 @@ export class JitProgram {
           return PPrint.pp(
             `fori_loop lower=${step.lower} upper=${step.upper} numConsts=${step.numConsts}`,
           );
+        case "workgroup_assoc_scan":
+          return PPrint.pp(
+            `workgroup_assoc_scan numElems=${step.numElems} numConsts=${step.numConsts}`,
+          );
       }
     });
     const display = PPrint.prototype.concat(
@@ -364,6 +380,7 @@ export class JitProgram {
       assoc_scan: 0,
       block_map: 0,
       fori_loop: 0,
+      workgroup_assoc_scan: 0,
     };
     for (const step of this.steps) {
       counts[step.type]++;
@@ -744,6 +761,99 @@ export class JitProgram {
           }
           break;
         }
+        case "workgroup_assoc_scan": {
+          // Fallback: run as sequential associative scan on the block data.
+          // Flush pending ops first.
+          flushPendingBatched(pending, this.backend);
+
+          const constSlots = step.consts.map((id) => scope.get(id)!);
+          const elemSlots = step.elems.map((id) => scope.get(id)!);
+          const outputSlots = step.outputs.map((id) => scope.get(id)!);
+
+          const N = step.elemAvals[0].shape[0] as number;
+          const numElems = step.numElems;
+
+          // Sequential prefix scan: y[0] = x[0], y[i] = body(y[i-1], x[i])
+          // We run evalJaxpr for each position, slicing/concatenating.
+          // For the fallback path inside block_map, N = blockSize (small).
+          const elemBytes = step.elemAvals.map(
+            (a) => (a.size / (a.shape[0] as number)) * byteWidth(a.dtype),
+          );
+
+          // Read initial elements at position 0 → carry
+          let carrySlots: Slot[] = [];
+          for (let e = 0; e < numElems; e++) {
+            const slotBytes = elemBytes[e];
+            const carry = this.backend.malloc(slotBytes);
+            this.backend.copyBufferToBuffer(
+              elemSlots[e],
+              0,
+              carry,
+              0,
+              slotBytes,
+            );
+            carrySlots.push(carry);
+            // Write to output position 0
+            this.backend.copyBufferToBuffer(
+              carry,
+              0,
+              outputSlots[e],
+              0,
+              slotBytes,
+            );
+          }
+
+          for (let i = 1; i < N; i++) {
+            // Slice element at position i
+            const bSlots: Slot[] = [];
+            for (let e = 0; e < numElems; e++) {
+              const slotBytes = elemBytes[e];
+              const b = this.backend.malloc(slotBytes);
+              this.backend.copyBufferToBuffer(
+                elemSlots[e],
+                i * slotBytes,
+                b,
+                0,
+                slotBytes,
+              );
+              bSlots.push(b);
+            }
+
+            // IncRef consts for body
+            for (const s of constSlots) this.backend.incRef(s);
+
+            // Body inputs: [consts, a (carry), b (current)]
+            const bodyInputs = [...constSlots, ...carrySlots, ...bSlots];
+            const bodyResult = step.bodyProgram.execute(bodyInputs);
+            flushPendingBatched(bodyResult.pending, this.backend);
+
+            // DecRef consts
+            for (const s of constSlots) this.backend.decRef(s);
+
+            // Release old carry and b slots
+            for (const s of carrySlots) this.backend.decRef(s);
+            for (const s of bSlots) this.backend.decRef(s);
+
+            // New carry = body outputs
+            carrySlots = bodyResult.outputs;
+
+            // Write carry to output position i
+            for (let e = 0; e < numElems; e++) {
+              const slotBytes = elemBytes[e];
+              this.backend.copyBufferToBuffer(
+                carrySlots[e],
+                0,
+                outputSlots[e],
+                i * slotBytes,
+                slotBytes,
+              );
+            }
+          }
+
+          // Release final carry
+          for (const s of carrySlots) this.backend.decRef(s);
+          break;
+        }
         default:
           step satisfies never;
       }
@@ -813,6 +923,12 @@ function stepUsesId(step: JitStep, id: JitId): boolean {
         step.outputs.includes(id) ||
         step.consts.includes(id) ||
         step.initCarries.includes(id)
+      );
+    case "workgroup_assoc_scan":
+      return (
+        step.outputs.includes(id) ||
+        step.consts.includes(id) ||
+        step.elems.includes(id)
       );
     default:
       return false;
@@ -1558,6 +1674,64 @@ export function jitCompile(
         continue;
       }
 
+      // Handle Primitive.WorkgroupAssociativeScan — compile the scan body
+      // and emit a "workgroup_assoc_scan" JitStep. Inside a block_map body,
+      // the fused shader compiler emits inlined Kogge-Stone WGSL. In the
+      // fallback path, the executor runs the body program sequentially.
+      if (eqn.primitive === Primitive.WorkgroupAssociativeScan) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<
+          typeof Primitive.WorkgroupAssociativeScan
+        >;
+        const { jaxpr: bodyJaxpr, numConsts } = params;
+        const numElems = eqn.inputs.length - numConsts;
+
+        const allInputIds: JitId[] = [];
+        for (const input of eqn.inputs) {
+          if (input instanceof Var) {
+            const jv = ctx.get(input)!;
+            if (jv.type !== "imm") {
+              throw new Error(
+                "jit: WorkgroupAssociativeScan primitive input is not imm",
+              );
+            }
+            allInputIds.push(jv.arg);
+          } else if (input instanceof Lit) {
+            allInputIds.push(builder.pushLit(input));
+          }
+        }
+
+        const constsIds = allInputIds.slice(0, numConsts);
+        const elemsIds = allInputIds.slice(numConsts);
+        const elemAvals = eqn.inputs
+          .slice(numConsts)
+          .map((v) => v.aval as ShapedArray);
+
+        const outputIds: JitId[] = [];
+        for (const outVar of eqn.outBinders) {
+          const outId = builder.pushBuffer(
+            sizeExprMul(outVar.aval.sizeExpr, byteWidth(outVar.aval.dtype)),
+          );
+          outputIds.push(outId);
+          ctx.set(outVar, { type: "imm", arg: outId });
+        }
+
+        const bodyProgram = jitCompile(backend, bodyJaxpr);
+
+        builder.steps.push({
+          type: "workgroup_assoc_scan",
+          bodyProgram,
+          bodyJaxpr,
+          numConsts,
+          numElems,
+          consts: constsIds,
+          elems: elemsIds,
+          outputs: outputIds,
+          elemAvals,
+        });
+        continue;
+      }
+
       // Handle Primitive.ForiLoop — compile the body jaxpr and emit a
       // "fori_loop" JitStep that iterates from lower to upper.
       if (eqn.primitive === Primitive.ForiLoop) {
@@ -2195,6 +2369,11 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   },
   [Primitive.ForiLoop]() {
     throw new Error("internal: ForiLoop is handled specially in jitCompile");
+  },
+  [Primitive.WorkgroupAssociativeScan]() {
+    throw new Error(
+      "internal: WorkgroupAssociativeScan is handled specially in jitCompile",
+    );
   },
   [Primitive.DynamicSlice](exps, avals, { sliceSizes }) {
     const operandExp = exps[0];

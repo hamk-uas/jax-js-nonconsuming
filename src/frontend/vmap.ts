@@ -793,6 +793,9 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.ForiLoop](_axisSize, _args, _bdims, _params) {
     throw new Error("vmap for foriLoop not implemented");
   },
+  [Primitive.WorkgroupAssociativeScan]() {
+    throw new Error("vmap for WorkgroupAssociativeScan not implemented");
+  },
 };
 
 const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();

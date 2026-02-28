@@ -1742,6 +1742,25 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     return args.slice(numConsts);
   },
 
+  [Primitive.WorkgroupAssociativeScan](args, { jaxpr, numConsts }) {
+    // Args: [...consts, elem]
+    // Body jaxpr: (consts..., a_scalar, b_scalar) => result_scalar
+    // Output: same shape as elem (prefix scan preserves shape)
+    const { outTypes } = typecheckJaxpr(jaxpr);
+    const numElems = args.length - numConsts;
+    if (jaxpr.inBinders.length !== numConsts + numElems * 2) {
+      throw new TypeError(
+        `WorkgroupAssociativeScan body expects ${jaxpr.inBinders.length} inputs, got ${numConsts + numElems * 2}`,
+      );
+    }
+    if (outTypes.length !== numElems) {
+      throw new TypeError(
+        `WorkgroupAssociativeScan body returns ${outTypes.length} outputs, expected ${numElems}`,
+      );
+    }
+    return args.slice(numConsts);
+  },
+
   [Primitive.DynamicSlice](args, { sliceSizes }) {
     const operand = args[0];
     const numIndices = args.length - 1;

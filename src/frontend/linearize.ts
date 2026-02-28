@@ -2711,6 +2711,242 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
     return result;
   },
+  [Primitive.WorkgroupAssociativeScan](cts, args, params) {
+    // WorkgroupAssociativeScan transpose: same reverse sequential recurrence
+    // as AssociativeScan but simpler (no axis/reverse, single-leaf groups).
+    // This runs inside a BlockMap body during grad.
+    //
+    // Forward:  y[0] = x[0],  y[i] = body(y[i-1], x[i])  for i=1..N-1
+    // Backward: iterate N-1..1, transposing body at each position.
+
+    const { jaxpr: bodyJaxpr, numConsts } =
+      params as PrimitiveParams<Primitive.WorkgroupAssociativeScan>;
+    const numElems = (args.length - numConsts) / 2;
+    const numOrigElems = numElems; // numElems is already halved after JVP doubling
+
+    const undefMask = args.map((x) => x instanceof UndefPrimal);
+    const bodyUndefPrimals = bodyJaxpr.inBinders.map((_, i) => undefMask[i]);
+
+    const numTangentConsts = bodyUndefPrimals
+      .slice(0, numConsts)
+      .filter((x) => x).length;
+
+    const transposedBody = transposeJaxpr(bodyJaxpr, bodyUndefPrimals);
+
+    const constResiduals = args
+      .slice(0, numConsts)
+      .filter((_, i) => !undefMask[i]) as Tracer[];
+    const primalElems = args.slice(
+      numConsts,
+      numConsts + numOrigElems,
+    ) as Tracer[];
+
+    const N = primalElems[0].shape[0]; // axis always 0
+
+    const sliceAt = (arr: Tracer, idx: number): Tracer => {
+      const ranges: [number, number][] = [[idx, idx + 1]];
+      for (let d = 1; d < arr.ndim; d++) ranges.push([0, arr.shape[d]]);
+      const sl = shrink(arr, ranges);
+      const r = reshape(sl, arr.shape.slice(1));
+      sl.dispose();
+      return r;
+    };
+
+    // Primal-only evaluation of body
+    const evalPrimalBody = (aLeaves: Tracer[], bLeaves: Tracer[]): Tracer[] => {
+      const bodyArgs: Tracer[] = [];
+      const disposables: Tracer[] = [];
+      let cri = 0;
+      for (let i = 0; i < numConsts; i++) {
+        if (bodyUndefPrimals[i]) {
+          const z = zerosInternal(
+            bodyJaxpr.inBinders[i].aval.shape,
+            bodyJaxpr.inBinders[i].aval.dtype,
+          );
+          bodyArgs.push(z);
+          disposables.push(z);
+        } else {
+          bodyArgs.push(constResiduals[cri++]);
+        }
+      }
+      for (const a of aLeaves) bodyArgs.push(a);
+      // Zero tangent "a" slots
+      for (let i = numOrigElems; i < numElems * 2; i++) {
+        const z = zerosInternal(
+          bodyJaxpr.inBinders[numConsts + i].aval.shape,
+          bodyJaxpr.inBinders[numConsts + i].aval.dtype,
+        );
+        bodyArgs.push(z);
+        disposables.push(z);
+      }
+      for (const b of bLeaves) bodyArgs.push(b);
+      // Zero tangent "b" slots
+      for (let i = numOrigElems; i < numElems * 2; i++) {
+        const z = zerosInternal(
+          bodyJaxpr.inBinders[numConsts + numElems * 2 + i].aval.shape,
+          bodyJaxpr.inBinders[numConsts + numElems * 2 + i].aval.dtype,
+        );
+        bodyArgs.push(z);
+        disposables.push(z);
+      }
+      const outs = evalJaxpr(bodyJaxpr, bodyArgs);
+      for (const d of disposables) d.dispose();
+      const pOuts = outs.slice(0, numOrigElems);
+      for (let i = numOrigElems; i < outs.length; i++) outs[i].dispose();
+      return pOuts;
+    };
+
+    // Recompute forward primals
+    const allYP: Tracer[][] = [];
+    allYP.push(primalElems.map((e) => sliceAt(e, 0)));
+    for (let i = 1; i < N; i++) {
+      const xi = primalElems.map((e) => sliceAt(e, i));
+      const newY = evalPrimalBody(allYP[i - 1], xi);
+      for (const x of xi) x.dispose();
+      allYP.push(newY);
+    }
+
+    // Backward loop
+    const ctPrimal = cts.slice(0, numOrigElems);
+    const ctTangent = cts.slice(numOrigElems);
+    const disposedCts = new Set<Tracer>();
+    for (const c of ctPrimal) {
+      if (!disposedCts.has(c)) {
+        disposedCts.add(c);
+        c.dispose();
+      }
+    }
+
+    let ctCarry: Tracer[] = allYP[0].map((y) =>
+      zerosInternal(y.shape, y.dtype),
+    );
+    let ctConstsAccum: Tracer[] | null = null;
+    const ctXsPerLeaf: Tracer[][] = Array.from(
+      { length: numOrigElems },
+      () => [],
+    );
+
+    for (let i = N - 1; i >= 1; i--) {
+      const ctYi = ctTangent.map((c) => sliceAt(c, i));
+      const ctEff = ctCarry.map((c, j) => add(c, ctYi[j]));
+      for (const c of ctCarry) c.dispose();
+      for (const c of ctYi) c.dispose();
+
+      const xPi = primalElems.map((e) => sliceAt(e, i));
+      const yPrev = allYP[i - 1];
+
+      const tbInputs: Tracer[] = [...transposedBody.consts, ...constResiduals];
+      const tbDisposables: Tracer[] = [];
+      for (const y of yPrev) tbInputs.push(y);
+      for (const x of xPi) tbInputs.push(x);
+      // Zero cotangents for primal outputs
+      for (let j = 0; j < numOrigElems; j++) {
+        const z = zerosInternal(allYP[0][j].shape, allYP[0][j].dtype);
+        tbInputs.push(z);
+        tbDisposables.push(z);
+      }
+      for (const c of ctEff) tbInputs.push(c);
+
+      const tbOuts = evalJaxpr(transposedBody.jaxpr, tbInputs);
+      for (const d of tbDisposables) d.dispose();
+
+      let oi = 0;
+      const ctConstsI: Tracer[] = [];
+      for (let j = 0; j < numTangentConsts; j++) ctConstsI.push(tbOuts[oi++]);
+      const ctANew: Tracer[] = [];
+      for (let j = 0; j < numOrigElems; j++) ctANew.push(tbOuts[oi++]);
+      const ctBIter: Tracer[] = [];
+      for (let j = 0; j < numOrigElems; j++) {
+        const ct = tbOuts[oi++];
+        if (ctANew.includes(ct)) ct.ref; // jax-js-lint: allow-ref
+        ctBIter.push(ct);
+      }
+
+      ctCarry = ctANew;
+
+      if (ctConstsAccum === null) {
+        ctConstsAccum = ctConstsI;
+      } else {
+        for (let j = 0; j < ctConstsAccum.length; j++) {
+          const s = add(ctConstsAccum[j], ctConstsI[j]);
+          ctConstsAccum[j].dispose();
+          ctConstsI[j].dispose();
+          ctConstsAccum[j] = s;
+        }
+      }
+
+      for (let j = 0; j < numOrigElems; j++) ctXsPerLeaf[j].push(ctBIter[j]);
+      for (const x of xPi) x.dispose();
+      for (const c of ctEff) c.dispose();
+    }
+
+    // Position 0
+    const ctY0 = ctTangent.map((c) => sliceAt(c, 0));
+    const ctX0 = ctCarry.map((c, j) => {
+      const s = add(c, ctY0[j]);
+      c.dispose();
+      ctY0[j].dispose();
+      return s;
+    });
+    for (let j = 0; j < numOrigElems; j++) ctXsPerLeaf[j].push(ctX0[j]);
+
+    // Cleanup
+    for (const yp of allYP) for (const y of yp) y.dispose();
+    for (const ct of ctTangent) {
+      if (!disposedCts.has(ct)) {
+        disposedCts.add(ct);
+        ct.dispose();
+      }
+    }
+
+    // Stack per-position cotangents
+    const ctXsStacked: Tracer[] = [];
+    for (let j = 0; j < numOrigElems; j++) {
+      const perPos = ctXsPerLeaf[j].reverse();
+      const expanded = perPos.map((ct) => broadcast(ct, [1, ...ct.shape], [0]));
+      const stacked = concatenate(expanded, 0);
+      const disposed = new Set<Tracer>();
+      for (const ct of expanded) {
+        if (!disposed.has(ct)) {
+          disposed.add(ct);
+          ct.dispose();
+        }
+      }
+      for (const ct of perPos) {
+        if (!disposed.has(ct)) {
+          disposed.add(ct);
+          ct.dispose();
+        }
+      }
+      ctXsStacked.push(stacked);
+    }
+
+    // Assemble output
+    const result: (Tracer | null)[] = [];
+    let ctCI = 0;
+    for (let i = 0; i < args.length; i++) {
+      if (!(args[i] instanceof UndefPrimal)) {
+        result.push(null);
+      } else if (i < numConsts) {
+        result.push(ctConstsAccum![ctCI++]);
+      } else {
+        const tangentLeafIdx = i - numConsts - numOrigElems;
+        result.push(ctXsStacked[tangentLeafIdx]);
+      }
+    }
+
+    const consumedIdxs = new Set<number>();
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] instanceof UndefPrimal && i >= numConsts) {
+        consumedIdxs.add(i - numConsts - numOrigElems);
+      }
+    }
+    for (let j = 0; j < ctXsStacked.length; j++) {
+      if (!consumedIdxs.has(j)) ctXsStacked[j].dispose();
+    }
+
+    return result;
+  },
   [Primitive.DynamicSlice]([ct], primals, { sliceSizes }) {
     const origShape = (
       primals[0] instanceof UndefPrimal

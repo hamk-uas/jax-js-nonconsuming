@@ -946,6 +946,89 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const numOutP = doubledOut.length / 2;
     return [doubledOut.slice(0, numOutP), doubledOut.slice(numOutP)];
   },
+  [Primitive.WorkgroupAssociativeScan](
+    primals,
+    tangents,
+    { jaxpr, numConsts },
+  ) {
+    // JVP of WorkgroupAssociativeScan: double the body like AssociativeScan.
+    // Original body: (consts, a, b) -> result
+    // JVP body expects: [constsP, aP, bP, constsT, aT, bT] -> [resultP, resultT]
+    // Doubled scan feeds: [constsP, constsT, aP, aT, bP, bT]
+    // Wrapper reorders scan order -> jvp order.
+
+    const numElems = primals.length - numConsts;
+    const jvpBody = jvpJaxpr(jaxpr);
+    const numJvpConsts = jvpBody.consts.length;
+    const numBodyInputs = numConsts + numElems * 2; // consts + a + b
+
+    const jvpOrderAvals = jvpBody.jaxpr.inBinders
+      .slice(numJvpConsts)
+      .map((v) => v.aval);
+
+    const constsP_avals = jvpOrderAvals.slice(0, numConsts);
+    const aP_avals = jvpOrderAvals.slice(numConsts, numConsts + numElems);
+    const bP_avals = jvpOrderAvals.slice(numConsts + numElems, numBodyInputs);
+    const constsT_avals = jvpOrderAvals.slice(
+      numBodyInputs,
+      numBodyInputs + numConsts,
+    );
+    const aT_avals = jvpOrderAvals.slice(
+      numBodyInputs + numConsts,
+      numBodyInputs + numConsts + numElems,
+    );
+    const bT_avals = jvpOrderAvals.slice(numBodyInputs + numConsts + numElems);
+
+    const wrapperInAvals = [
+      ...constsP_avals,
+      ...constsT_avals,
+      ...aP_avals,
+      ...aT_avals,
+      ...bP_avals,
+      ...bT_avals,
+    ];
+
+    const { jaxpr: wrapperJaxpr } = makeJaxpr(
+      (...scanOrderArgs: Tracer[]): Tracer[] => {
+        // scanOrderArgs: [constsP, constsT, aP, aT, bP, bT]
+        const cP = scanOrderArgs.slice(0, numConsts);
+        const cT = scanOrderArgs.slice(numConsts, numConsts * 2);
+        const aP = scanOrderArgs.slice(numConsts * 2, numConsts * 2 + numElems);
+        const aT = scanOrderArgs.slice(
+          numConsts * 2 + numElems,
+          numConsts * 2 + numElems * 2,
+        );
+        const bP = scanOrderArgs.slice(
+          numConsts * 2 + numElems * 2,
+          numConsts * 2 + numElems * 2 + numElems,
+        );
+        const bT = scanOrderArgs.slice(numConsts * 2 + numElems * 2 + numElems);
+
+        const jvpOrderArgs = [...cP, ...aP, ...bP, ...cT, ...aT, ...bT];
+        return evalJaxpr(jvpBody.jaxpr, [...jvpBody.consts, ...jvpOrderArgs]);
+      },
+    )(...wrapperInAvals);
+
+    const constsP = primals.slice(0, numConsts);
+    const elemsP = primals.slice(numConsts);
+    const constsT = tangents.slice(0, numConsts);
+    const elemsT = tangents.slice(numConsts);
+
+    const results = bind(
+      Primitive.WorkgroupAssociativeScan,
+      [...wrapperJaxpr.consts, ...constsP, ...constsT, ...elemsP, ...elemsT],
+      {
+        jaxpr: wrapperJaxpr.jaxpr,
+        numConsts: wrapperJaxpr.consts.length + numConsts * 2,
+      },
+    );
+
+    wrapperJaxpr.dispose();
+
+    const primalsOut = results.slice(0, numElems);
+    const tangentsOut = results.slice(numElems);
+    return [primalsOut, tangentsOut];
+  },
   [Primitive.DynamicSlice](primals, tangents, { sliceSizes }) {
     const operandT = tangents[0];
     const startsP = primals.slice(1);

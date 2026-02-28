@@ -614,7 +614,7 @@ The Kogge-Stone prefix scan is special: at each round, thread `i` reads from thr
 This is a **cross-thread** data dependency within the workgroup, not just a write-then-read
 dependency.
 
-**Design decision: explicit `lax.workgroup_scan` primitive, not pattern matching.**
+**Design decision: explicit `lax.workgroupAssociativeScan` primitive, not pattern matching.**
 
 The v1 approach of detecting `shrink` + `fn` + `concatenate` in the body jaxpr is rejected. IR
 pattern matching is fragile — simplification passes, constant folding, or reordering can change the
@@ -623,28 +623,30 @@ Instead, we introduce an explicit low-level primitive:
 
 ```ts
 // Only valid inside a block_map body
-lax.workgroup_scan(fn, elems);
+lax.workgroupAssociativeScan(fn, elems);
 ```
 
 **Why this is better:**
 
-1. **Deterministic tracing.** The body jaxpr contains an explicit `Primitive.WorkgroupScan` equation
-   with the scan operator as a sub-jaxpr. No guessing. No pattern fragility.
-2. **Clear compiler contract.** The fused shader compiler sees `WorkgroupScan` and emits the
-   multi-round Kogge-Stone loop with `workgroupBarrier()` between rounds, ping-pong shared-memory
-   arrays, and per-thread `shmem[tidx - stride]` indexed reads. This is exactly the code structure
-   from M7.4's `assocScanFusedShaderSource()` — but triggered by the primitive, not hand-coded.
-3. **Error detection.** If `lax.workgroup_scan()` appears outside a `block_map` body, it throws
-   immediately — no silent fallback to broken global-dispatch code.
+1. **Deterministic tracing.** The body jaxpr contains an explicit
+   `Primitive.WorkgroupAssociativeScan` equation with the scan operator as a sub-jaxpr. No guessing.
+   No pattern fragility.
+2. **Clear compiler contract.** The fused shader compiler sees `WorkgroupAssociativeScan` and emits
+   the multi-round Kogge-Stone loop with `workgroupBarrier()` between rounds, ping-pong
+   shared-memory arrays, and per-thread `shmem[tidx - stride]` indexed reads. This is exactly the
+   code structure from M7.4's `assocScanFusedShaderSource()` — but triggered by the primitive, not
+   hand-coded.
+3. **Error detection.** If `lax.workgroupAssociativeScan()` appears outside a `block_map` body, it
+   throws immediately — no silent fallback to broken global-dispatch code.
 4. **Composability.** Users who write `lax.associativeScan` get the Phase 5 decomposition
    (block_map + inter-block carry) automatically. Users who need explicit control write
-   `lax.workgroup_scan` directly inside a `block_map` body.
+   `lax.workgroupAssociativeScan` directly inside a `block_map` body.
 
 **Primitive registration:**
 
 ```ts
 // In Primitive enum:
-WorkgroupScan = "workgroup_scan",
+WorkgroupAssociativeScan = "workgroup_associative_scan",
 
 // Params:
 { jaxpr: Jaxpr; numConsts: number }
@@ -652,36 +654,38 @@ WorkgroupScan = "workgroup_scan",
 
 **Compiler behavior:**
 
-| Context                           | What happens                                                                                            |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| Inside `block_map` fused shader   | Emits Kogge-Stone loop in WGSL with barriers and ping-pong shmem                                        |
-| Inside `block_map` eager fallback | Evaluates using `Primitive.WorkgroupScan` eager rule (delegates to `associativeScanCore` for the block) |
-| Outside `block_map` (eager)       | Eager impl rule runs `associativeScanCore` — correct result, useful for testing                         |
-| Outside `block_map` (JIT)         | JIT compiler asserts `WorkgroupScan` is inside a `BlockMap` body; throws compile-time error if not      |
+| Context                           | What happens                                                                                                       |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Inside `block_map` fused shader   | Emits Kogge-Stone loop in WGSL with barriers and ping-pong shmem                                                   |
+| Inside `block_map` eager fallback | Evaluates using `Primitive.WorkgroupAssociativeScan` eager rule (delegates to `associativeScanCore` for the block) |
+| Outside `block_map` (eager)       | Eager impl rule runs `associativeScanCore` — correct result, useful for testing                                    |
+| Outside `block_map` (JIT)         | JIT compiler asserts `WorkgroupAssociativeScan` is inside a `BlockMap` body; throws compile-time error if not      |
 
 To prevent escaping into standard global dispatches, the JIT compiler (`splitGraphDataflow` and
-`jit.ts`) simply asserts that no `Primitive.WorkgroupScan` ever reaches the standard dispatch queue;
-if it isn't claimed by a `blockMapFusedShaderSource` path, it throws a compile-time error. This
-avoids fragile module-level tracing flags entirely.
+`jit.ts`) simply asserts that no `Primitive.WorkgroupAssociativeScan` ever reaches the standard
+dispatch queue; if it isn't claimed by a `blockMapFusedShaderSource` path, it throws a compile-time
+error. This avoids fragile module-level tracing flags entirely.
 
-**Note on eager evaluation:** `workgroup_scan` must have an eager implementation in
+**Note on eager evaluation:** `workgroupAssociativeScan` must have an eager implementation in
 `src/frontend/array.ts` (delegating to `associativeScanCore`) so that `block_map`'s eager-mode
 slice/concat loop can successfully evaluate the compiled body Jaxpr for each block.
 
-**Public API guard:** The public `lax.workgroup_scan()` always traces to `Primitive.WorkgroupScan` —
-there is no module-level tracing flag. The safety net is purely at compile time: if the JIT
-encounters `WorkgroupScan` outside a `BlockMap` body, it throws. In eager mode, the impl rule runs
-`associativeScanCore` directly (correct result, just not shared-memory-accelerated). This design
-means calling `lax.workgroup_scan()` outside `block_map` works in eager mode (useful for testing)
-but fails at JIT compile time — the desired behavior.
+**Public API guard:** The public `lax.workgroupAssociativeScan()` always traces to
+`Primitive.WorkgroupAssociativeScan` — there is no module-level tracing flag. The safety net is
+purely at compile time: if the JIT encounters `WorkgroupAssociativeScan` outside a `BlockMap` body,
+it throws. In eager mode, the impl rule runs `associativeScanCore` directly (correct result, just
+not shared-memory-accelerated). This design means calling `lax.workgroupAssociativeScan()` outside
+`block_map` works in eager mode (useful for testing) but fails at JIT compile time — the desired
+behavior.
 
-**Impact on Phase 5:** The `associativeScan` decomposition in Phase 5 uses `lax.workgroup_scan` for
-the per-block local scans, making the lowering explicit and testable:
+**Impact on Phase 5:** The `associativeScan` decomposition in Phase 5 uses
+`lax.workgroupAssociativeScan` for the per-block local scans, making the lowering explicit and
+testable:
 
 ```ts
 // Phase 5 decomposition (updated):
 const localScans = lax.block_map(
-  (block) => lax.workgroup_scan(fn, block), // explicit primitive
+  (block) => lax.workgroupAssociativeScan(fn, block), // explicit primitive
   xs,
   { blockShape: [256], inAxes: [0], outAxes: [0] },
 );
@@ -749,17 +753,17 @@ direct-write — just a block offset loop.
 
 ### Deliverables
 
-| File                                    | Change                                                                                                               | LOC est  |
-| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------- |
-| `src/backend/webgpu/block-map.ts` (new) | Fused shader compiler: shmem map, barriers, inline Dot/Reduce, WorkgroupScan codegen, ForiLoop/DynamicSlice lowering | ~420     |
-| `src/backend/webgpu.ts`                 | `prepareBlockMap()`, `dispatchBlockMap()`                                                                            | ~100     |
-| `src/frontend/core.ts`                  | `Primitive.WorkgroupScan` enum, params, abstract eval                                                                | ~15      |
-| `src/frontend/array.ts`                 | `WorkgroupScan` eager impl (delegates to `associativeScanCore`)                                                      | ~15      |
-| `src/frontend/jit.ts`                   | `block_map` JitStep types + compilation + execution                                                                  | ~80      |
-| `src/frontend/scan-plan.ts`             | `BlockMapPlan` type                                                                                                  | ~30      |
-| `src/backend/wasm.ts`                   | `codegenBlockMapLoop()`                                                                                              | ~120     |
-| `test/block-map.test.ts`                | WebGPU + WASM fused shader tests + WorkgroupScan tests                                                               | ~140     |
-| **Total**                               |                                                                                                                      | **~920** |
+| File                                    | Change                                                                                                                          | LOC est  |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| `src/backend/webgpu/block-map.ts` (new) | Fused shader compiler: shmem map, barriers, inline Dot/Reduce, WorkgroupAssociativeScan codegen, ForiLoop/DynamicSlice lowering | ~420     |
+| `src/backend/webgpu.ts`                 | `prepareBlockMap()`, `dispatchBlockMap()`                                                                                       | ~100     |
+| `src/frontend/core.ts`                  | `Primitive.WorkgroupAssociativeScan` enum, params, abstract eval                                                                | ~15      |
+| `src/frontend/array.ts`                 | `WorkgroupAssociativeScan` eager impl (delegates to `associativeScanCore`)                                                      | ~15      |
+| `src/frontend/jit.ts`                   | `block_map` JitStep types + compilation + execution                                                                             | ~80      |
+| `src/frontend/scan-plan.ts`             | `BlockMapPlan` type                                                                                                             | ~30      |
+| `src/backend/wasm.ts`                   | `codegenBlockMapLoop()`                                                                                                         | ~120     |
+| `test/block-map.test.ts`                | WebGPU + WASM fused shader tests + WorkgroupAssociativeScan tests                                                               | ~140     |
+| **Total**                               |                                                                                                                                 | **~920** |
 
 ---
 
@@ -888,14 +892,14 @@ Phase 3 compiler handles this through a dispatch table of primitives with inline
 4. **Generalization — block-local built-ins:** The compiler maintains a map of primitives that have
    inline WGSL lowerings when operating on block-local (shared-memory) operands:
 
-   | Primitive          | Inline WGSL                                                      | Notes                         |
-   | ------------------ | ---------------------------------------------------------------- | ----------------------------- |
-   | `Dot` (matmul)     | Per-thread contraction loop                                      | As above                      |
-   | `Reduce` (sum/max) | Workgroup tree reduction                                         | Already in `pipelineSource()` |
-   | `ForiLoop`         | WGSL `for` loop with carry in `var<private>` or `var<workgroup>` | Phase 1b primitive            |
-   | `DynamicSlice`     | Offset arithmetic into shmem array                               | Phase 1b primitive            |
-   | `WorkgroupScan`    | Kogge-Stone loop with barriers                                   | Phase 3.5 primitive           |
-   | Future: `Conv`     | Sliding window in shmem                                          | Not Phase 4                   |
+   | Primitive                  | Inline WGSL                                                      | Notes                         |
+   | -------------------------- | ---------------------------------------------------------------- | ----------------------------- |
+   | `Dot` (matmul)             | Per-thread contraction loop                                      | As above                      |
+   | `Reduce` (sum/max)         | Workgroup tree reduction                                         | Already in `pipelineSource()` |
+   | `ForiLoop`                 | WGSL `for` loop with carry in `var<private>` or `var<workgroup>` | Phase 1b primitive            |
+   | `DynamicSlice`             | Offset arithmetic into shmem array                               | Phase 1b primitive            |
+   | `WorkgroupAssociativeScan` | Kogge-Stone loop with barriers                                   | Phase 3.5 primitive           |
+   | Future: `Conv`             | Sliding window in shmem                                          | Not Phase 4                   |
 
    Primitives without an inline lowering that appear in a fused block_map body cause a fallback to
    per-block dispatch — the correct behavior. The set of inline-lowerable primitives grows over
@@ -941,7 +945,7 @@ standard parallel prefix scan decomposition (Blelloch 1990).
 ### 5.1: Decomposition
 
 ```
-Step 1: Local prefix scans — M blocks, each scanned via block_map + workgroup_scan
+Step 1: Local prefix scans — M blocks, each scanned via block_map + workgroupAssociativeScan
 Step 2: Extract block summaries — last element of each block
 Step 3: Scan summaries — dynamic dispatch on M elements
 Step 4: Apply summaries — block_map to add summary[i-1] to block[i]
@@ -953,7 +957,8 @@ Section 5.4 for details)._
 
 ### 5.2: Base case
 
-When `N ≤ blockShape[0]`, a single `block_map` call runs the `workgroup_scan` body on one block.
+When `N ≤ blockShape[0]`, a single `block_map` call runs the `workgroupAssociativeScan` body on one
+block.
 
 ### 5.3: Dispatch count comparison
 
@@ -963,7 +968,7 @@ If `block_map` executes as a single WebGPU dispatch over `M=ceil(N/B)` workgroup
 - Step 2 (gather): 1 dispatch — extract last element per block into summary buffer.
 - Step 3 (scan summaries): ⌈log₂ M⌉ Kogge-Stone rounds, each a separate dispatch (reuses existing
   per-round `dispatchKoggeStoneRound` pattern). Future optimization: when M ≤ B, fuse all rounds
-  into a single workgroup dispatch via `workgroup_scan` on the summary buffer.
+  into a single workgroup dispatch via `workgroupAssociativeScan` on the summary buffer.
 - Step 4 (apply): 1 dispatch (M−1 workgroups, adding prefix sums to each block).
 
 Total for $N \le B^2$ (e.g., $N \le 65536$ for $B=256$): ~5 dispatches (1 local + 1 gather + summary
@@ -1091,7 +1096,7 @@ function dispatchBlockedAssocScan(prepared, params, N, B, constSlots, elemSlots,
   //   M workgroups → 1 GPU dispatch.
   //   Internally: ceil(log₂ B) compute passes within the single shader
   //   using workgroupBarrier() between Kogge-Stone rounds.
-  //   This is the Phase 3 fused shader with WorkgroupScan body.
+  //   This is the Phase 3 fused shader with WorkgroupAssociativeScan body.
   dispatchBlockMapFused(enc, localScanPipeline, elemSlots, M);
 
   // Step 2: Extract last element per block → summary buffer (1 dispatch)
@@ -1099,7 +1104,7 @@ function dispatchBlockedAssocScan(prepared, params, N, B, constSlots, elemSlots,
 
   // Step 3: Scan M summaries — one dispatch per Kogge-Stone round.
   //   Reuses the existing per-round dispatch pattern.
-  //   Future optimization: when M <= B, fuse into single workgroup_scan dispatch.
+  //   Future optimization: when M <= B, fuse into single workgroupAssociativeScan dispatch.
   const summaryRounds = Math.ceil(Math.log2(M));
   for (let r = 0; r < summaryRounds; r++) {
     dispatchKoggeStoneRound(enc, summaryPingPong, r, M);
@@ -1355,15 +1360,15 @@ against.
 | T5a.7 | Non-divisible N with fused shader (padding correctness)                | G        | Edge-block masking             |
 | T5a.8 | `jit(block_map(f, xs))` matches eager result                           | G        | JIT vs eager agreement         |
 
-#### T5b: WorkgroupScan primitive
+#### T5b: WorkgroupAssociativeScan primitive
 
-| #     | Test                                                  | Backends | Validates                      |
-| ----- | ----------------------------------------------------- | -------- | ------------------------------ |
-| T5b.1 | `workgroup_scan(add, elems)` inside block_map         | G        | Kogge-Stone codegen + barriers |
-| T5b.2 | `workgroup_scan` outside block_map → throws           | A        | Guard against misuse           |
-| T5b.3 | `workgroup_scan` eager impl matches `associativeScan` | A        | Eager fallback correctness     |
-| T5b.4 | `workgroup_scan` with non-power-of-2 block size       | G        | Masking in Kogge-Stone rounds  |
-| T5b.5 | `workgroup_scan(mul, elems)` — non-add operator       | G        | Operator generality            |
+| #     | Test                                                            | Backends | Validates                      |
+| ----- | --------------------------------------------------------------- | -------- | ------------------------------ |
+| T5b.1 | `workgroupAssociativeScan(add, elems)` inside block_map         | G        | Kogge-Stone codegen + barriers |
+| T5b.2 | `workgroupAssociativeScan` outside block_map → throws           | A        | Guard against misuse           |
+| T5b.3 | `workgroupAssociativeScan` eager impl matches `associativeScan` | A        | Eager fallback correctness     |
+| T5b.4 | `workgroupAssociativeScan` with non-power-of-2 block size       | G        | Masking in Kogge-Stone rounds  |
+| T5b.5 | `workgroupAssociativeScan(mul, elems)` — non-add operator       | G        | Operator generality            |
 
 #### T5c: WASM compiled block-loop
 
@@ -1441,7 +1446,7 @@ against.
 | Risk                                                    | Impact       | Mitigation                                                                                                                                                                                                                                                 |
 | ------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Phase 3 compiler more complex than estimated            | High         | Start with scalar elementwise chain; add complexity incrementally. Per-block dispatch as permanent fallback.                                                                                                                                               |
-| Kogge-Stone pattern detection unreliable                | **Resolved** | Explicit `lax.workgroup_scan` primitive replaces fragile `shrink`+`concat` pattern matching. See Phase 3.5.                                                                                                                                                |
+| Kogge-Stone pattern detection unreliable                | **Resolved** | Explicit `lax.workgroupAssociativeScan` primitive replaces fragile `shrink`+`concat` pattern matching. See Phase 3.5.                                                                                                                                      |
 | Sequential loop inside block_map body has no fused path | **Resolved** | `fori_loop` primitive (Phase 1b) compiles to WGSL `for` loop inside fused shader. `lax.scan` inside block_map remains unsupported in fused context; use `fori_loop` for carry-only loops. See Phase 1b.                                                    |
 | Tiled matmul lowering inside block_map                  | High         | `fori_loop` + `dynamic_slice` + inline `Dot` dispatch table. Deterministic: primitive-type check, not pattern matching. See Phase 4.3.                                                                                                                     |
 | `maxComputeInvocationsPerWorkgroup` caps 2D tile size   | Medium       | Typically 256 threads. 16×16 fits; 32×32 does not. Per-thread work-tiling (1 thread computes multiple output elements) can increase tile size without exceeding the thread limit — but adds compiler complexity. Phase 4 starts with 16×16. See Phase 3.1. |
@@ -1470,19 +1475,19 @@ against.
 
 ## Total Effort Estimate
 
-| Phase                  | Description                                                     | LOC est    | Dependencies |
-| ---------------------- | --------------------------------------------------------------- | ---------- | ------------ |
-| Phase 0                | Prototype (validate tracing)                                    | ~60        | None         |
-| Phase 1                | Core IR + eager fallback                                        | ~252       | Phase 0      |
-| Phase 1b               | Loop primitives (fori_loop + dynamic_slice)                     | ~177       | Phase 1      |
-| Phase 2                | AD rules                                                        | ~170       | Phase 1      |
-| Phase 3                | WebGPU shared-memory compiler + WASM block-loop + WorkgroupScan | ~920       | Phase 1      |
-| Phase 4                | Tiled matmul                                                    | ~200       | Phase 3, 1b  |
-| Phase 5                | AssociativeScan lowering (late lowering)                        | ~360       | Phase 3      |
-| Phase 6                | Flash attention, LayerNorm, SSM, routines                       | Future     | Phase 3      |
-| Phase 7                | Code deletion (conditional)                                     | -1,074+    | Phase 4/5    |
-| **Total (Phases 0–5)** |                                                                 | **~2,139** |              |
-| **Net after Phase 7**  |                                                                 | **~1,065** |              |
+| Phase                  | Description                                                                | LOC est    | Dependencies |
+| ---------------------- | -------------------------------------------------------------------------- | ---------- | ------------ |
+| Phase 0                | Prototype (validate tracing)                                               | ~60        | None         |
+| Phase 1                | Core IR + eager fallback                                                   | ~252       | Phase 0      |
+| Phase 1b               | Loop primitives (fori_loop + dynamic_slice)                                | ~177       | Phase 1      |
+| Phase 2                | AD rules                                                                   | ~170       | Phase 1      |
+| Phase 3                | WebGPU shared-memory compiler + WASM block-loop + WorkgroupAssociativeScan | ~920       | Phase 1      |
+| Phase 4                | Tiled matmul                                                               | ~200       | Phase 3, 1b  |
+| Phase 5                | AssociativeScan lowering (late lowering)                                   | ~360       | Phase 3      |
+| Phase 6                | Flash attention, LayerNorm, SSM, routines                                  | Future     | Phase 3      |
+| Phase 7                | Code deletion (conditional)                                                | -1,074+    | Phase 4/5    |
+| **Total (Phases 0–5)** |                                                                            | **~2,139** |              |
+| **Net after Phase 7**  |                                                                            | **~1,065** |              |
 
 **Critical path:** Phase 0 → Phase 1 → Phase 1b → Phase 3 → Phase 4 (tiled matmul) and Phase 5
 (assocScan). Phase 2 can run in parallel with Phase 1b/3.
@@ -1515,17 +1520,17 @@ against.
 
 ## Comparison with v1 Plan
 
-| Aspect             | v1                                    | v2 (this plan)                                                                                                 |
-| ------------------ | ------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Framing            | AssocScan optimization                | General-purpose shared-memory compute primitive                                                                |
-| `blockSize`        | `number` (1D only)                    | `blockShape: number[]` (N-D from day one)                                                                      |
-| Tiled matmul       | Not considered                        | Phase 4 (P1 performance goal)                                                                                  |
-| Flash attention    | Not considered                        | Phase 6 (future consumer)                                                                                      |
-| Fused norms        | Not considered                        | Phase 6 (future consumer)                                                                                      |
-| State-space models | Not considered                        | Phase 6 (future consumer)                                                                                      |
-| LOC estimate       | ~1,430                                | ~2,139 (broader scope, 2D tiling, WorkgroupScan + ForiLoop + DynamicSlice primitives, late-lowering assocScan) |
-| Strategic value    | Low (1 consumer)                      | High (5+ consumers, solves P1)                                                                                 |
-| Decision threshold | "Is it worth it for assocScan alone?" | "Does it unlock the next tier of GPU performance?"                                                             |
+| Aspect             | v1                                    | v2 (this plan)                                                                                                            |
+| ------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Framing            | AssocScan optimization                | General-purpose shared-memory compute primitive                                                                           |
+| `blockSize`        | `number` (1D only)                    | `blockShape: number[]` (N-D from day one)                                                                                 |
+| Tiled matmul       | Not considered                        | Phase 4 (P1 performance goal)                                                                                             |
+| Flash attention    | Not considered                        | Phase 6 (future consumer)                                                                                                 |
+| Fused norms        | Not considered                        | Phase 6 (future consumer)                                                                                                 |
+| State-space models | Not considered                        | Phase 6 (future consumer)                                                                                                 |
+| LOC estimate       | ~1,430                                | ~2,139 (broader scope, 2D tiling, WorkgroupAssociativeScan + ForiLoop + DynamicSlice primitives, late-lowering assocScan) |
+| Strategic value    | Low (1 consumer)                      | High (5+ consumers, solves P1)                                                                                            |
+| Decision threshold | "Is it worth it for assocScan alone?" | "Does it unlock the next tier of GPU performance?"                                                                        |
 
 ---
 
@@ -1542,19 +1547,19 @@ against.
 
 ### Modified files
 
-| File                                  | Phase    | Change                                                                                                                  |
-| ------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `src/frontend/core.ts`                | 1, 1b, 3 | `BlockMap` + `ForiLoop` + `DynamicSlice` + `WorkgroupScan` primitives, params, abstract eval                            |
-| `src/library/lax.ts`                  | 1, 1b, 3 | `block_map()` + `fori_loop()` + `dynamic_slice()` + `workgroup_scan()` public API                                       |
-| `src/frontend/array.ts`               | 1, 1b, 3 | Eager impl rules (BlockMap loop, ForiLoop JS loop, DynamicSlice TypedArray offset, WorkgroupScan → associativeScanCore) |
-| `src/frontend/jaxpr.ts`               | 1        | Abstract eval rule                                                                                                      |
-| `src/index.ts`                        | 1        | Export                                                                                                                  |
-| `src/frontend/jvp.ts`                 | 1b, 2    | JVP rules (BlockMap, ForiLoop, DynamicSlice)                                                                            |
-| `src/frontend/linearize.ts`           | 1b, 2    | PE + transpose rules (BlockMap, ForiLoop, DynamicSlice)                                                                 |
-| `src/frontend/vmap.ts`                | 1b, 2    | Vmap rules (BlockMap, ForiLoop, DynamicSlice)                                                                           |
-| `src/frontend/jit.ts`                 | 3        | BlockMap JitStep types + compilation + execution                                                                        |
-| `src/frontend/scan-plan.ts`           | 3        | `BlockMapPlan` type                                                                                                     |
-| `src/backend/webgpu.ts`               | 3        | `prepareBlockMap()`, `dispatchBlockMap()`                                                                               |
-| `src/backend/wasm.ts`                 | 3        | `codegenBlockMapLoop()`                                                                                                 |
-| `src/library/lax-associative-scan.ts` | 5        | Decomposition lowering                                                                                                  |
-| `.github/copilot-instructions.md`     | 5        | Document block_map                                                                                                      |
+| File                                  | Phase    | Change                                                                                                                             |
+| ------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `src/frontend/core.ts`                | 1, 1b, 3 | `BlockMap` + `ForiLoop` + `DynamicSlice` + `WorkgroupAssociativeScan` primitives, params, abstract eval                            |
+| `src/library/lax.ts`                  | 1, 1b, 3 | `block_map()` + `fori_loop()` + `dynamic_slice()` + `workgroupAssociativeScan()` public API                                        |
+| `src/frontend/array.ts`               | 1, 1b, 3 | Eager impl rules (BlockMap loop, ForiLoop JS loop, DynamicSlice TypedArray offset, WorkgroupAssociativeScan → associativeScanCore) |
+| `src/frontend/jaxpr.ts`               | 1        | Abstract eval rule                                                                                                                 |
+| `src/index.ts`                        | 1        | Export                                                                                                                             |
+| `src/frontend/jvp.ts`                 | 1b, 2    | JVP rules (BlockMap, ForiLoop, DynamicSlice)                                                                                       |
+| `src/frontend/linearize.ts`           | 1b, 2    | PE + transpose rules (BlockMap, ForiLoop, DynamicSlice)                                                                            |
+| `src/frontend/vmap.ts`                | 1b, 2    | Vmap rules (BlockMap, ForiLoop, DynamicSlice)                                                                                      |
+| `src/frontend/jit.ts`                 | 3        | BlockMap JitStep types + compilation + execution                                                                                   |
+| `src/frontend/scan-plan.ts`           | 3        | `BlockMapPlan` type                                                                                                                |
+| `src/backend/webgpu.ts`               | 3        | `prepareBlockMap()`, `dispatchBlockMap()`                                                                                          |
+| `src/backend/wasm.ts`                 | 3        | `codegenBlockMapLoop()`                                                                                                            |
+| `src/library/lax-associative-scan.ts` | 5        | Decomposition lowering                                                                                                             |
+| `.github/copilot-instructions.md`     | 5        | Document block_map                                                                                                                 |
