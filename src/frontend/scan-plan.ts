@@ -6,6 +6,7 @@ import { byteWidth, Kernel, Reduction } from "../alu";
 import type { Backend, Executable } from "../backend";
 import {
   getScanRoutineInfo,
+  NativeAssocScanBlockedParams,
   NativeAssocScanParams,
   NativeScanGeneralParams,
   ScanRoutineInfo,
@@ -50,6 +51,8 @@ export type ScanPlan =
  *
  * - `compiled-loop`: Entire Kogge-Stone ladder compiled to a single WASM module.
  *   N is a runtime parameter — the same compiled module supports any input length.
+ * - `compiled-loop-blocked`: Three-level blocked Kogge-Stone in a single WASM module.
+ *   Reduces total work from O(N log N) to O(N log B) for large N.
  * - `fallback`: JS-driven Kogge-Stone loop calling body program per round.
  */
 export type AssocScanPlan =
@@ -57,6 +60,11 @@ export type AssocScanPlan =
       path: "compiled-loop";
       executable: Executable;
       params: NativeAssocScanParams;
+    }
+  | {
+      path: "compiled-loop-blocked";
+      executable: Executable;
+      params: NativeAssocScanBlockedParams;
     }
   | {
       path: "webgpu-fused";
@@ -1566,7 +1574,7 @@ export function planAssociativeScan(
     return { path: "fallback" };
   }
 
-  // --- WASM compiled-loop path ---
+  // --- WASM path: try blocked, then flat compiled-loop ---
   const params: NativeAssocScanParams = {
     numConsts,
     constSizes,
@@ -1578,8 +1586,35 @@ export function planAssociativeScan(
     leafToInternalIdx,
   };
 
+  const wasmBackend = backend as WasmBackend;
+
+  // Blocked Kogge-Stone: O(N log B) work instead of O(N log N).
+  // Handles small N correctly (M=1 skips levels 2-3).
+  const BLOCK_SIZE = 256;
   try {
-    const wasmBackend = backend as WasmBackend;
+    const blockedParams: NativeAssocScanBlockedParams = {
+      ...params,
+      blockSize: BLOCK_SIZE,
+    };
+    const exe = wasmBackend.prepareBlockedAssociativeScan(blockedParams);
+    if (DEBUG >= 1) {
+      console.log(
+        `[assoc-scan] SUCCESS! Using WASM compiled-loop-blocked (B=${BLOCK_SIZE}) with ${steps.length} step(s)`,
+      );
+    }
+    return {
+      path: "compiled-loop-blocked",
+      executable: exe,
+      params: blockedParams,
+    };
+  } catch (e) {
+    if (DEBUG >= 2) {
+      console.warn("[assoc-scan] blocked compilation failed:", e);
+    }
+  }
+
+  // Flat fallback
+  try {
     const exe = wasmBackend.prepareNativeAssociativeScan(params);
     if (DEBUG >= 1) {
       console.log(

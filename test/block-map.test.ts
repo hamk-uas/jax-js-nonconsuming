@@ -18,6 +18,7 @@ import {
   DType,
   grad,
   init,
+  jit,
   jvp,
   lax,
   numpy as np,
@@ -366,5 +367,108 @@ describe("lax.dynamicSlice — Phase 1b", () => {
     // slice[0:2] = [1,2] sum=3, slice[2:4] = [3,4] sum=7, slice[4:6] = [5,6] sum=11
     // total = 3 + 7 + 11 = 21
     expect(result).toBeAllclose(21);
+  });
+});
+
+// ============================================================================
+// Phase 5 — Blocked AssociativeScan (T7)
+// ============================================================================
+
+describe("Phase 5 — blocked associativeScan", () => {
+  // T7.1: Small N (single block, N < blockSize=256)
+  test("T7.1: cumsum N=64 single block", () => {
+    const f = jit((xs: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), xs),
+    );
+    using xs = np.arange(64).astype(DType.Float32);
+    using result = f(xs);
+    const vals = Array.from({ length: 64 }, (_, i) => (i * (i + 1)) / 2);
+    using expected = np.array(vals, { dtype: DType.Float32 });
+    expect(result).toBeAllclose(expected);
+    f.dispose();
+  });
+
+  // T7.2: Multi-block N=1024
+  test("T7.2: cumsum N=1024 multi-block", () => {
+    const f = jit((xs: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), xs),
+    );
+    using xs = np.ones([1024]).astype(DType.Float32);
+    using result = f(xs);
+    const vals = Array.from({ length: 1024 }, (_, i) => i + 1);
+    using expected = np.array(vals, { dtype: DType.Float32 });
+    expect(result).toBeAllclose(expected);
+    f.dispose();
+  });
+
+  // T7.3: Large N=4096
+  test("T7.3: cumsum N=4096", () => {
+    const f = jit((xs: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), xs),
+    );
+    using xs = np.ones([4096]).astype(DType.Float32);
+    using result = f(xs);
+    expect(result.dataSync()[4095]).toBe(4096);
+    f.dispose();
+  });
+
+  // T7.4: Non-power-of-2 N=10 (irregular block)
+  test("T7.4: cumsum N=10 non-power-of-2", () => {
+    const f = jit((xs: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), xs),
+    );
+    using xs = np.arange(1, 11).astype(DType.Float32);
+    using result = f(xs);
+    using expected = np.array([1, 3, 6, 10, 15, 21, 28, 36, 45, 55], {
+      dtype: DType.Float32,
+    });
+    expect(result).toBeAllclose(expected);
+    f.dispose();
+  });
+
+  // T7.5: Non-add operator (multiply → cumprod)
+  test("T7.5: cumprod via multiply", () => {
+    const f = jit((xs: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.multiply(a, b), xs),
+    );
+    using xs = np.array([2, 3, 4, 5], { dtype: DType.Float32 });
+    using result = f(xs);
+    using expected = np.array([2, 6, 24, 120], { dtype: DType.Float32 });
+    expect(result).toBeAllclose(expected);
+    f.dispose();
+  });
+
+  // T7.6: Reverse scan
+  test("T7.6: reverse cumsum N=300", () => {
+    const f = jit((xs: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), xs, {
+        reverse: true,
+      }),
+    );
+    using xs = np.ones([300]).astype(DType.Float32);
+    using result = f(xs);
+    const vals = Array.from({ length: 300 }, (_, i) => 300 - i);
+    using expected = np.array(vals, { dtype: DType.Float32 });
+    expect(result).toBeAllclose(expected);
+    f.dispose();
+  });
+
+  // T7.7: grad through blocked associativeScan
+  // Note: jit(grad(f)) not grad(jit(f)) — see copilot-instructions
+  test("T7.7: jit(grad(associativeScan)) cumsum", () => {
+    const f = (xs: np.Array) => {
+      using scanned = lax.associativeScan(
+        (a: np.Array, b: np.Array) => np.add(a, b),
+        xs,
+      );
+      return np.sum(scanned);
+    };
+    const gf = jit(grad(f));
+    using xs = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+    using g = gf(xs);
+    // d(sum(cumsum(x)))/dx_i = N - i
+    using expected = np.array([5, 4, 3, 2, 1], { dtype: DType.Float32 });
+    expect(g).toBeAllclose(expected);
+    gf.dispose();
   });
 });

@@ -1190,6 +1190,70 @@ export class WasmBackend implements Backend {
   }
 
   // ---------------------------------------------------------------------------
+  // Blocked associative scan (Phase 5)
+  // ---------------------------------------------------------------------------
+
+  prepareBlockedAssociativeScan(
+    params: NativeAssocScanBlockedParams,
+  ): Executable<WasmProgram> {
+    const bytes = codegenBlockedAssociativeScan(params);
+    const module = new WebAssembly.Module(bytes);
+    return new Executable(null as any, { module });
+  }
+
+  dispatchBlockedAssociativeScan(
+    exe: Executable<WasmProgram>,
+    params: NativeAssocScanBlockedParams,
+    N: number,
+    constSlots: Slot[],
+    inputLeafSlots: Slot[],
+    outputLeafSlots: Slot[],
+  ): void {
+    if (N === 0) return;
+
+    const { leafElemSizes, internalSizes, blockSize: B } = params;
+    const totalLeafElemSize = leafElemSizes.reduce((a, b) => a + b, 0);
+    const M = Math.ceil(N / B);
+    const pingPongSize = totalLeafElemSize * N;
+    const summarySize = totalLeafElemSize * M;
+
+    const pingPtr = this.#allocator.malloc(pingPongSize);
+    const pongPtr = this.#allocator.malloc(pingPongSize);
+    const sPingPtr = this.#allocator.malloc(summarySize);
+    const sPongPtr = this.#allocator.malloc(summarySize);
+
+    const internalPtrs: number[] = [];
+    for (const size of internalSizes) {
+      internalPtrs.push(this.#allocator.malloc(size));
+    }
+
+    let instance = this.#instanceCache.get(exe.data.module);
+    if (!instance) {
+      const imports: WebAssembly.Imports = { env: { memory: this.#memory } };
+      instance = new WebAssembly.Instance(exe.data.module, imports);
+      this.#instanceCache.set(exe.data.module, instance);
+    }
+
+    const args: number[] = [N];
+    for (const slot of constSlots) args.push(this.#getPtr(slot));
+    for (const slot of inputLeafSlots) args.push(this.#getPtr(slot));
+    for (const slot of outputLeafSlots) args.push(this.#getPtr(slot));
+    args.push(pingPtr, pongPtr, sPingPtr, sPongPtr);
+    args.push(...internalPtrs);
+
+    const scanFunc = instance.exports.blocked_assoc_scan as (
+      ...args: number[]
+    ) => void;
+    scanFunc(...args);
+
+    for (const ptr of internalPtrs) this.#allocator.free(ptr);
+    this.#allocator.free(sPongPtr);
+    this.#allocator.free(sPingPtr);
+    this.#allocator.free(pongPtr);
+    this.#allocator.free(pingPtr);
+  }
+
+  // ---------------------------------------------------------------------------
   // Mega-Module dispatch (M6.1)
   // ---------------------------------------------------------------------------
 
@@ -4224,6 +4288,783 @@ function codegenNativeAssociativeScan(
 
   cg.export(kernelFunc, "kernel");
 
+  return cg.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Blocked associative scan (Phase 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Params for the blocked associative scan WASM module.
+ * Same body kernel steps as the flat version, plus a block size.
+ */
+export interface NativeAssocScanBlockedParams extends NativeAssocScanParams {
+  /** Block size for the blocked Kogge-Stone decomposition. */
+  blockSize: number;
+}
+
+/**
+ * Generate a WASM module for a blocked associative scan.
+ *
+ * Three-level algorithm:
+ *   Level 1: Per-block prefix scans (Kogge-Stone with stride < B)
+ *   Level 2: Flat Kogge-Stone on M block summaries
+ *   Level 3: Apply scanned summaries to blocks 1..M-1
+ *
+ * Function signature:
+ *   (N: i32, ...constPtrs, ...inputLeafPtrs, ...outputLeafPtrs,
+ *    pingPtr, pongPtr, summaryPingPtr, summaryPongPtr, ...internalPtrs) -> ()
+ */
+function codegenBlockedAssociativeScan(
+  params: NativeAssocScanBlockedParams,
+): Uint8Array<ArrayBuffer> {
+  const {
+    numConsts,
+    numLeaves,
+    leafElemSizes,
+    steps,
+    internalSizes,
+    reverse,
+    blockSize: B,
+  } = params;
+  const numInternal = internalSizes.length;
+  const numInputs = numConsts + 2 * numLeaves;
+
+  // Precompute leaf byte offsets within ping/pong buffers
+  const leafElemOffsets: number[] = [];
+  let offset = 0;
+  for (let k = 0; k < numLeaves; k++) {
+    leafElemOffsets.push(offset);
+    offset += leafElemSizes[k];
+  }
+
+  // Collect all ops for helper function imports
+  const allOps = new Set<AluOp>();
+  for (const step of steps) {
+    if (step.source instanceof Kernel) {
+      const tune = tuneNullopt(step.source);
+      for (const op of tune.exp.distinctOps().keys()) allOps.add(op);
+      if (tune.epilogue) {
+        for (const op of tune.epilogue.distinctOps().keys()) allOps.add(op);
+      }
+    }
+  }
+
+  const cg = new CodeGenerator();
+  configureMemoryImport(cg);
+  const funcs = importWasmHelperFuncs(cg, allOps);
+
+  // Arguments: (N, ...consts, ...inputs, ...outputs, ping, pong, sPing, sPong, ...internals)
+  const NArg = 0;
+  const constsBase = 1;
+  const inputsBase = 1 + numConsts;
+  const outputsBase = 1 + numConsts + numLeaves;
+  const pingArg = 1 + numConsts + numLeaves + numLeaves;
+  const pongArg = pingArg + 1;
+  const sPingArg = pongArg + 1;
+  const sPongArg = sPingArg + 1;
+  const internalsBase = sPongArg + 1;
+  const numArgs = internalsBase + numInternal;
+
+  // Helper: emit the body kernel steps for a single element combine.
+  // `emitAAddr(leafIdx)` pushes the base address of the a-operand for leaf k.
+  // `emitBAddr(leafIdx)` pushes the base address of the b-operand for leaf k.
+  // `emitOutAddr(leafIdx)` pushes the base address of the output for leaf k.
+  // After calling, internal buffers hold intermediate results too.
+  function emitCombineAndCopy(
+    gidx: number,
+    emitALeafAddr: (k: number) => void,
+    emitBLeafAddr: (k: number) => void,
+    emitCopyDstAddr: (k: number) => void,
+  ) {
+    for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+      const step = steps[stepIdx];
+      if (!(step.source instanceof Kernel)) {
+        throw new Error("blocked assoc_scan: only Kernel steps supported");
+      }
+      const kernel = step.source;
+      const internalIdx = step.outputInternalIdx;
+      const bw = byteWidth(kernel.outputs[0].dtype);
+
+      emitKernelBody({
+        cg,
+        funcs,
+        kernel,
+        gidx,
+        emitOutputAddr: () => {
+          cg.local.get(internalsBase + internalIdx);
+          cg.local.get(gidx);
+          cg.i32.const(bw);
+          cg.i32.mul();
+          cg.i32.add();
+        },
+        emitExp: (exp, extra) => {
+          translateExpCore(cg, funcs, exp, {
+            getVariable: (name) => {
+              if (name === "gidx") return gidx;
+              if (name === "ridx" && extra.ridx !== undefined)
+                return extra.ridx;
+              if (name === "acc" && extra.acc !== undefined) return extra.acc;
+              return undefined;
+            },
+            handleGlobalIndex: (cg, gen, gid, _len, indexExp, dtype) => {
+              const elemBw = byteWidth(dtype);
+              if (gid < numConsts) {
+                cg.local.get(constsBase + gid);
+              } else if (gid < numConsts + numLeaves) {
+                // a-leaf
+                emitALeafAddr(gid - numConsts);
+              } else if (gid < numInputs) {
+                // b-leaf
+                emitBLeafAddr(gid - numConsts - numLeaves);
+              } else {
+                // internal buffer
+                cg.local.get(internalsBase + (gid - numInputs));
+              }
+              gen(indexExp);
+              cg.i32.const(elemBw);
+              cg.i32.mul();
+              cg.i32.add();
+              dty(cg, AluOp.GlobalIndex, dtype).load(Math.log2(elemBw));
+            },
+          });
+        },
+      });
+    }
+    // Copy from internal buffers to output
+    for (let k = 0; k < numLeaves; k++) {
+      const size = leafElemSizes[k];
+      emitCopyDstAddr(k);
+      cg.local.get(internalsBase + params.leafToInternalIdx[k]);
+      cg.i32.const(size);
+      cg.memory.copy();
+    }
+  }
+
+  const mainFunc = cg.function(rep(numArgs, cg.i32), [], () => {
+    const stride = cg.local.declare(cg.i32);
+    const i = cg.local.declare(cg.i32);
+    const gidx = cg.local.declare(cg.i32);
+    const curPing = cg.local.declare(cg.i32);
+    const curPong = cg.local.declare(cg.i32);
+    const curSPing = cg.local.declare(cg.i32);
+    const curSPong = cg.local.declare(cg.i32);
+    const tmp = cg.local.declare(cg.i32);
+    const M = cg.local.declare(cg.i32); // number of blocks
+    const posInBlock = cg.local.declare(cg.i32);
+
+    // Initialize pointers
+    cg.local.get(pingArg);
+    cg.local.set(curPing);
+    cg.local.get(pongArg);
+    cg.local.set(curPong);
+    cg.local.get(sPingArg);
+    cg.local.set(curSPing);
+    cg.local.get(sPongArg);
+    cg.local.set(curSPong);
+
+    // M = ceil(N / B) = (N + B - 1) / B
+    cg.local.get(NArg);
+    cg.i32.const(B - 1);
+    cg.i32.add();
+    cg.i32.const(B);
+    cg.i32.div_u();
+    cg.local.set(M);
+
+    // ---- Copy inputs → ping ----
+    for (let k = 0; k < numLeaves; k++) {
+      cg.local.get(curPing);
+      cg.i32.const(leafElemOffsets[k]);
+      cg.local.get(NArg);
+      cg.i32.mul();
+      cg.i32.add();
+      cg.local.get(inputsBase + k);
+      cg.local.get(NArg);
+      cg.i32.const(leafElemSizes[k]);
+      cg.i32.mul();
+      cg.memory.copy();
+    }
+
+    // ---- If reverse: reverse each leaf in ping ----
+    if (reverse) {
+      const j = cg.local.declare(cg.i32);
+      const halfN = cg.local.declare(cg.i32);
+      cg.local.get(NArg);
+      cg.i32.const(1);
+      cg.i32.shr_u();
+      cg.local.set(halfN);
+      for (let k = 0; k < numLeaves; k++) {
+        const bw = leafElemSizes[k];
+        cg.i32.const(0);
+        cg.local.set(j);
+        cg.loop(cg.void);
+        {
+          cg.block(cg.void);
+          cg.local.get(j);
+          cg.local.get(halfN);
+          cg.i32.ge_u();
+          cg.br_if(0);
+          // addr_left = curPing + leafOffset*N + j*bw
+          cg.local.get(curPing);
+          cg.i32.const(leafElemOffsets[k]);
+          cg.local.get(NArg);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.get(j);
+          cg.i32.const(bw);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.set(tmp);
+          // addr_right = curPing + leafOffset*N + (N-1-j)*bw
+          cg.local.get(curPing);
+          cg.i32.const(leafElemOffsets[k]);
+          cg.local.get(NArg);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.get(NArg);
+          cg.i32.const(1);
+          cg.i32.sub();
+          cg.local.get(j);
+          cg.i32.sub();
+          cg.i32.const(bw);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.set(posInBlock); // reuse as temp
+          // swap via pong temp
+          cg.local.get(curPong);
+          cg.local.get(tmp);
+          cg.i32.const(bw);
+          cg.memory.copy();
+          cg.local.get(tmp);
+          cg.local.get(posInBlock);
+          cg.i32.const(bw);
+          cg.memory.copy();
+          cg.local.get(posInBlock);
+          cg.local.get(curPong);
+          cg.i32.const(bw);
+          cg.memory.copy();
+          cg.local.get(j);
+          cg.i32.const(1);
+          cg.i32.add();
+          cg.local.set(j);
+          cg.br(1);
+          cg.end();
+        }
+        cg.end();
+      }
+    }
+
+    // ==== LEVEL 1: Block-local Kogge-Stone (stride < B) ====
+    cg.i32.const(1);
+    cg.local.set(stride);
+
+    cg.loop(cg.void);
+    {
+      cg.block(cg.void);
+      cg.local.get(stride);
+      cg.i32.const(B);
+      cg.i32.ge_u();
+      cg.br_if(0); // break if stride >= B
+
+      // Inner loop: for i = 0..N-1
+      cg.i32.const(0);
+      cg.local.set(i);
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(i);
+        cg.local.get(NArg);
+        cg.i32.ge_u();
+        cg.br_if(0);
+
+        // posInBlock = i % B
+        cg.local.get(i);
+        cg.i32.const(B);
+        cg.i32.rem_u();
+        cg.local.set(posInBlock);
+
+        // if posInBlock >= stride → combine; else → copy
+        cg.local.get(posInBlock);
+        cg.local.get(stride);
+        cg.i32.ge_u();
+        cg.if(cg.void);
+        {
+          // Combine: fn(ping[i-stride], ping[i]) → internal → pong[i]
+          emitCombineAndCopy(
+            gidx,
+            (k) => {
+              // a-leaf addr: curPing + leafOffset*N + (i-stride)*leafElemSize
+              cg.local.get(curPing);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(NArg);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.local.get(stride);
+              cg.i32.sub();
+              cg.i32.const(leafElemSizes[k]);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+            (k) => {
+              // b-leaf addr: curPing + leafOffset*N + i*leafElemSize
+              cg.local.get(curPing);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(NArg);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.i32.const(leafElemSizes[k]);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+            (k) => {
+              // output addr: curPong + leafOffset*N + i*leafElemSize
+              cg.local.get(curPong);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(NArg);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.i32.const(leafElemSizes[k]);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+          );
+        }
+        cg.else();
+        {
+          // Copy: pong[i] = ping[i] for all leaves
+          for (let k = 0; k < numLeaves; k++) {
+            const size = leafElemSizes[k];
+            cg.local.get(curPong);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(NArg);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(size);
+            cg.i32.mul();
+            cg.i32.add();
+            // src
+            cg.local.get(curPing);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(NArg);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(size);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.i32.const(size);
+            cg.memory.copy();
+          }
+        }
+        cg.end();
+
+        cg.local.get(i);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(i);
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+
+      // Swap ping/pong
+      cg.local.get(curPing);
+      cg.local.set(tmp);
+      cg.local.get(curPong);
+      cg.local.set(curPing);
+      cg.local.get(tmp);
+      cg.local.set(curPong);
+
+      // stride *= 2
+      cg.local.get(stride);
+      cg.i32.const(1);
+      cg.i32.shl();
+      cg.local.set(stride);
+      cg.br(1);
+      cg.end();
+    }
+    cg.end();
+
+    // After Level 1, curPing has per-block prefix sums.
+    // Skip Levels 2-3 if M <= 1.
+    cg.local.get(M);
+    cg.i32.const(1);
+    cg.i32.gt_u();
+    cg.if(cg.void);
+    {
+      // ==== LEVEL 2: Extract summaries + flat Kogge-Stone on M elements ====
+
+      // Extract: for b = 0..M-1, summary[b] = ping[last element of block b]
+      // last element of block b = min((b+1)*B, N) - 1
+      cg.i32.const(0);
+      cg.local.set(i); // reuse i as b
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(i);
+        cg.local.get(M);
+        cg.i32.ge_u();
+        cg.br_if(0);
+
+        for (let k = 0; k < numLeaves; k++) {
+          const size = leafElemSizes[k];
+          // dst = curSPing + leafOffset*M + b*size
+          cg.local.get(curSPing);
+          cg.i32.const(leafElemOffsets[k]);
+          cg.local.get(M);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.get(i);
+          cg.i32.const(size);
+          cg.i32.mul();
+          cg.i32.add();
+          // src = curPing + leafOffset*N + (min((b+1)*B, N) - 1)*size
+          // Compute min((b+1)*B, N): (b+1)*B
+          cg.local.get(curPing);
+          cg.i32.const(leafElemOffsets[k]);
+          cg.local.get(NArg);
+          cg.i32.mul();
+          cg.i32.add();
+          // index = min((i+1)*B, N) - 1
+          cg.local.get(i);
+          cg.i32.const(1);
+          cg.i32.add();
+          cg.i32.const(B);
+          cg.i32.mul();
+          cg.local.set(tmp); // tmp = (b+1)*B
+          // min with N
+          cg.local.get(tmp);
+          cg.local.get(NArg);
+          cg.i32.gt_u();
+          cg.if(cg.void);
+          cg.local.get(NArg);
+          cg.local.set(tmp);
+          cg.end();
+          // index = tmp - 1
+          cg.local.get(tmp);
+          cg.i32.const(1);
+          cg.i32.sub();
+          cg.i32.const(size);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.i32.const(size);
+          cg.memory.copy();
+        }
+
+        cg.local.get(i);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(i);
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+
+      // Flat Kogge-Stone on summaries: stride = 1..M-1
+      cg.i32.const(1);
+      cg.local.set(stride);
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(stride);
+        cg.local.get(M);
+        cg.i32.ge_u();
+        cg.br_if(0);
+
+        // Combine: for b = stride..M-1
+        cg.local.get(stride);
+        cg.local.set(i);
+        cg.loop(cg.void);
+        {
+          cg.block(cg.void);
+          cg.local.get(i);
+          cg.local.get(M);
+          cg.i32.ge_u();
+          cg.br_if(0);
+
+          emitCombineAndCopy(
+            gidx,
+            (k) => {
+              // a-leaf: curSPing + leafOffset*M + (b-stride)*size
+              cg.local.get(curSPing);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(M);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.local.get(stride);
+              cg.i32.sub();
+              cg.i32.const(leafElemSizes[k]);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+            (k) => {
+              // b-leaf: curSPing + leafOffset*M + b*size
+              cg.local.get(curSPing);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(M);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.i32.const(leafElemSizes[k]);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+            (k) => {
+              // output: curSPong + leafOffset*M + b*size
+              cg.local.get(curSPong);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(M);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.i32.const(leafElemSizes[k]);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+          );
+
+          cg.local.get(i);
+          cg.i32.const(1);
+          cg.i32.add();
+          cg.local.set(i);
+          cg.br(1);
+          cg.end();
+        }
+        cg.end();
+
+        // Copy prefix: for b = 0..stride-1
+        cg.i32.const(0);
+        cg.local.set(i);
+        cg.loop(cg.void);
+        {
+          cg.block(cg.void);
+          cg.local.get(i);
+          cg.local.get(stride);
+          cg.i32.ge_u();
+          cg.br_if(0);
+          for (let k = 0; k < numLeaves; k++) {
+            const size = leafElemSizes[k];
+            cg.local.get(curSPong);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(M);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(size);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(curSPing);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(M);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(size);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.i32.const(size);
+            cg.memory.copy();
+          }
+          cg.local.get(i);
+          cg.i32.const(1);
+          cg.i32.add();
+          cg.local.set(i);
+          cg.br(1);
+          cg.end();
+        }
+        cg.end();
+
+        // Swap summary ping/pong
+        cg.local.get(curSPing);
+        cg.local.set(tmp);
+        cg.local.get(curSPong);
+        cg.local.set(curSPing);
+        cg.local.get(tmp);
+        cg.local.set(curSPong);
+
+        cg.local.get(stride);
+        cg.i32.const(1);
+        cg.i32.shl();
+        cg.local.set(stride);
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+
+      // ==== LEVEL 3: Apply scanned summaries to blocks 1..M-1 ====
+      // For i = B..N-1: pong[i] = fn(summary[(i/B)-1], ping[i])
+      // For i = 0..B-1: pong[i] = ping[i]
+
+      // Copy block 0 as-is
+      for (let k = 0; k < numLeaves; k++) {
+        const size = leafElemSizes[k];
+        // dst = curPong + leafOffset*N
+        cg.local.get(curPong);
+        cg.i32.const(leafElemOffsets[k]);
+        cg.local.get(NArg);
+        cg.i32.mul();
+        cg.i32.add();
+        // src = curPing + leafOffset*N
+        cg.local.get(curPing);
+        cg.i32.const(leafElemOffsets[k]);
+        cg.local.get(NArg);
+        cg.i32.mul();
+        cg.i32.add();
+        // min(B, N) * size
+        cg.i32.const(B);
+        cg.local.get(NArg);
+        cg.i32.gt_u();
+        cg.if(cg.i32);
+        cg.local.get(NArg);
+        cg.else();
+        cg.i32.const(B);
+        cg.end();
+        cg.i32.const(size);
+        cg.i32.mul();
+        cg.memory.copy();
+      }
+
+      // Apply summaries to remaining elements
+      cg.i32.const(B);
+      cg.local.set(i);
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(i);
+        cg.local.get(NArg);
+        cg.i32.ge_u();
+        cg.br_if(0);
+
+        // block_idx = i / B; summary index = block_idx - 1
+        emitCombineAndCopy(
+          gidx,
+          (k) => {
+            // a-leaf: curSPing + leafOffset*M + (i/B - 1)*size
+            cg.local.get(curSPing);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(M);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(B);
+            cg.i32.div_u();
+            cg.i32.const(1);
+            cg.i32.sub();
+            cg.i32.const(leafElemSizes[k]);
+            cg.i32.mul();
+            cg.i32.add();
+          },
+          (k) => {
+            // b-leaf: curPing + leafOffset*N + i*size
+            cg.local.get(curPing);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(NArg);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(leafElemSizes[k]);
+            cg.i32.mul();
+            cg.i32.add();
+          },
+          (k) => {
+            // output: curPong + leafOffset*N + i*size
+            cg.local.get(curPong);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(NArg);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(leafElemSizes[k]);
+            cg.i32.mul();
+            cg.i32.add();
+          },
+        );
+
+        cg.local.get(i);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(i);
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+
+      // Swap ping/pong so curPing has the final result
+      cg.local.get(curPing);
+      cg.local.set(tmp);
+      cg.local.get(curPong);
+      cg.local.set(curPing);
+      cg.local.get(tmp);
+      cg.local.set(curPong);
+    }
+    cg.end(); // end if M > 1
+
+    // ---- Copy results to output ----
+    if (reverse) {
+      const j = cg.local.declare(cg.i32);
+      for (let k = 0; k < numLeaves; k++) {
+        const bw = leafElemSizes[k];
+        cg.i32.const(0);
+        cg.local.set(j);
+        cg.loop(cg.void);
+        {
+          cg.block(cg.void);
+          cg.local.get(j);
+          cg.local.get(NArg);
+          cg.i32.ge_u();
+          cg.br_if(0);
+          cg.local.get(outputsBase + k);
+          cg.local.get(j);
+          cg.i32.const(bw);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.get(curPing);
+          cg.i32.const(leafElemOffsets[k]);
+          cg.local.get(NArg);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.get(NArg);
+          cg.i32.const(1);
+          cg.i32.sub();
+          cg.local.get(j);
+          cg.i32.sub();
+          cg.i32.const(bw);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.i32.const(bw);
+          cg.memory.copy();
+          cg.local.get(j);
+          cg.i32.const(1);
+          cg.i32.add();
+          cg.local.set(j);
+          cg.br(1);
+          cg.end();
+        }
+        cg.end();
+      }
+    } else {
+      for (let k = 0; k < numLeaves; k++) {
+        cg.local.get(outputsBase + k);
+        cg.local.get(curPing);
+        cg.i32.const(leafElemOffsets[k]);
+        cg.local.get(NArg);
+        cg.i32.mul();
+        cg.i32.add();
+        cg.local.get(NArg);
+        cg.i32.const(leafElemSizes[k]);
+        cg.i32.mul();
+        cg.memory.copy();
+      }
+    }
+  });
+
+  cg.export(mainFunc, "blocked_assoc_scan");
   return cg.finish();
 }
 

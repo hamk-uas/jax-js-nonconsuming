@@ -425,6 +425,19 @@ export function executeAssociativeScan(
     return { outputs: outputSlots, pending: [] };
   }
 
+  if (plan.path === "compiled-loop-blocked") {
+    const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
+    (backend as WasmBackend).dispatchBlockedAssociativeScan(
+      plan.executable,
+      plan.params,
+      N,
+      constSlots,
+      elemSlots,
+      outputSlots,
+    );
+    return { outputs: outputSlots, pending: [] };
+  }
+
   if (plan.path === "webgpu-fused") {
     const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
     (backend as WebGPUBackend).dispatchAssocScan(
