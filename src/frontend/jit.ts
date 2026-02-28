@@ -2196,10 +2196,30 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   [Primitive.ForiLoop]() {
     throw new Error("internal: ForiLoop is handled specially in jitCompile");
   },
-  [Primitive.DynamicSlice]() {
-    throw new Error(
-      "jit: DynamicSlice is not yet supported outside BlockMap/Scan",
-    );
+  [Primitive.DynamicSlice](exps, avals, { sliceSizes }) {
+    const operandExp = exps[0];
+    const startExps = exps.slice(1);
+    const operandShape = avals[0].shape as number[];
+    const ndim = operandShape.length;
+
+    // Build multi-dim output indices by unraveling gidx over sliceSizes
+    const outIndices = unravelAlu(sliceSizes, AluVar.gidx);
+
+    // Clamp each start index to [0, dim_k - sliceSize_k] and add output coord
+    const readIndices: AluExp[] = [];
+    for (let k = 0; k < ndim; k++) {
+      const maxStart = (operandShape[k] as number) - sliceSizes[k];
+      let start = AluExp.cast(DType.Int32, startExps[k]);
+      start = AluExp.max(start, AluExp.i32(0));
+      start = AluExp.min(start, AluExp.i32(maxStart));
+      readIndices.push(AluExp.add(start, outIndices[k]));
+    }
+
+    // Convert multi-dim read indices to flat index into operand
+    const [index] = ShapeTracker.fromShape(operandShape).toAluExp(readIndices);
+
+    // Substitute gidx in operand expression with computed flat index
+    return { exp: [operandExp.substitute({ gidx: index })] };
   },
 };
 
@@ -2350,6 +2370,7 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     // multiple views in the expression with different indexing.
     Primitive.RandomBits,
     Primitive.Gather,
+    Primitive.DynamicSlice,
   ];
   const needsCleanShapePrimitives = [
     // Concatenate is based on Pad internally.

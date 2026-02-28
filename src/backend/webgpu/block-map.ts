@@ -232,6 +232,14 @@ export function blockMapFusedShaderSource(
                   );
                 return null;
               }
+              // Body kernels larger than blockSize can't be processed 1:1
+              if ((bk.size as number) > blockSize) {
+                if (DEBUG >= 1)
+                  console.info(
+                    `block_map fused: fori_loop body kernel size ${bk.size} > blockSize ${blockSize}, fallback`,
+                  );
+                return null;
+              }
               bodyKernels.push({
                 step: bs as Extract<JitStep, { type: "execute" }>,
                 kernel: bk,
@@ -1218,7 +1226,10 @@ export function blockMapFusedShaderSource(
           },
         );
 
-        // Elementwise output writes
+        // Elementwise output writes — guard if kernel size < blockSize
+        const bKernelSize = bKernel.size as number;
+        const needSizeGuard = bKernelSize < blockSize;
+        if (needSizeGuard) emit(`if (tidx < ${bKernelSize}u) {`, pushIndent);
         for (let oi = 0; oi < bKernel.numOutputs; oi++) {
           const outId = bStep.outputs[oi];
           const rhs = strip1(gen(bKernel.outputs[oi].exp));
@@ -1227,6 +1238,7 @@ export function blockMapFusedShaderSource(
             emit(`${targetName}[tidx] = ${rhs};`);
           }
         }
+        if (needSizeGuard) emit(popIndent, "}");
       }
 
       emit(popIndent, "}"); // end for loop

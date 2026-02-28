@@ -656,4 +656,143 @@ describe("lax.blockMap — boundary blocks", () => {
     expect(result).toBeAllclose([6, 12, 18, 24]);
     f_jit.dispose();
   });
+
+  // =========================================================================
+  // dynamic_slice inside block_map
+  // =========================================================================
+
+  test("jit(blockMap(dynamicSlice)) extracts sub-block", () => {
+    // dynamicSlice with start=0 and sliceSize=blockShape is identity + mul
+    const f = (xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) => {
+          using sliced = lax.dynamicSlice(
+            block,
+            [np.array(0, { dtype: DType.Int32 })],
+            [4],
+          );
+          return np.multiply(sliced, np.array(3, { dtype: DType.Float32 }));
+        },
+        xs,
+        { blockShape: [4] },
+      );
+
+    const f_jit = jit(f);
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([3, 6, 9, 12, 15, 18, 21, 24]);
+    f_jit.dispose();
+  });
+
+  test("jit(blockMap(foriLoop+dynamicSlice)) tiled accumulation", () => {
+    // fori_loop 2 iterations: acc += dynamicSlice(block, [0], [4])
+    // Result: 2 * block
+    const f = (xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          lax.foriLoop(
+            0,
+            2,
+            (_k: np.Array, acc: np.Array) => {
+              using slice = lax.dynamicSlice(
+                block,
+                [np.array(0, { dtype: DType.Int32 })],
+                [4],
+              );
+              return np.add(acc, slice);
+            },
+            np.zerosLike(block),
+          ),
+        xs,
+        { blockShape: [4] },
+      );
+
+    const f_jit = jit(f);
+    using xs = np.array([10, 20, 30, 40, 50, 60, 70, 80], {
+      dtype: DType.Float32,
+    });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([20, 40, 60, 80, 100, 120, 140, 160]);
+    f_jit.dispose();
+  });
+
+  test("jit(blockMap(foriLoop+dynamicSlice)) with loop-index offset", () => {
+    // blockShape=2. fori_loop 1 iteration: acc += dynamicSlice(block, [0], [2])
+    const f = (xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          lax.foriLoop(
+            0,
+            1,
+            (_k: np.Array, acc: np.Array) => {
+              using slice = lax.dynamicSlice(
+                block,
+                [np.array(0, { dtype: DType.Int32 })],
+                [2],
+              );
+              return np.add(acc, slice);
+            },
+            np.zerosLike(block),
+          ),
+        xs,
+        { blockShape: [2] },
+      );
+
+    const f_jit = jit(f);
+    using xs = np.array([1, 2, 3, 4, 5, 6], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([1, 2, 3, 4, 5, 6]);
+    f_jit.dispose();
+  });
+
+  // =========================================================================
+  // standalone jit(dynamicSlice) tests
+  // =========================================================================
+
+  test("jit(dynamicSlice) standalone 1D", () => {
+    const f = (x: np.Array, start: np.Array) =>
+      lax.dynamicSlice(x, [start], [3]);
+
+    const f_jit = jit(f);
+    using x = np.array([10, 20, 30, 40, 50], { dtype: DType.Float32 });
+    using start = np.array(1, { dtype: DType.Int32 });
+    using result = f_jit(x, start);
+    expect(result).toBeAllclose([20, 30, 40]);
+    f_jit.dispose();
+  });
+
+  test("jit(dynamicSlice) clamps out-of-bounds start", () => {
+    const f = (x: np.Array, start: np.Array) =>
+      lax.dynamicSlice(x, [start], [3]);
+
+    const f_jit = jit(f);
+    using x = np.array([10, 20, 30, 40, 50], { dtype: DType.Float32 });
+    using start = np.array(10, { dtype: DType.Int32 });
+    using result = f_jit(x, start);
+    expect(result).toBeAllclose([30, 40, 50]);
+    f_jit.dispose();
+  });
+
+  test("jit(dynamicSlice) 2D slice", () => {
+    const f = (x: np.Array, s0: np.Array, s1: np.Array) =>
+      lax.dynamicSlice(x, [s0, s1], [2, 2]);
+
+    const f_jit = jit(f);
+    using x = np.array(
+      [
+        [1, 2, 3, 4],
+        [5, 6, 7, 8],
+        [9, 10, 11, 12],
+      ],
+      { dtype: DType.Float32 },
+    );
+    using s0 = np.array(1, { dtype: DType.Int32 });
+    using s1 = np.array(1, { dtype: DType.Int32 });
+    using result = f_jit(x, s0, s1);
+    expect(result).toBeAllclose([
+      [6, 7],
+      [10, 11],
+    ]);
+    f_jit.dispose();
+  });
 });
