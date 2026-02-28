@@ -83,8 +83,27 @@ describe("lax.blockMap - Phase 2 AD", () => {
     expect(g).toBeAllclose([6, 6, 14, 14]);
   });
 
-  // grad(blockMap) with foriLoop: blocked on foriLoop backward pass (needs scan)
-  // grad(tiledMatmul): blocked on same (tiledMatmul uses foriLoop internally)
+  // grad(blockMap) with foriLoop: now supported via unrolled backward pass
+  test("grad(blockMap) with foriLoop inside body", () => {
+    // body: foriLoop adds block to acc 3 times → 3*block
+    // grad of sum(3x) = 3
+    const body = (block: np.Array) => {
+      using zero = np.zeros([2], { dtype: DType.Float32 });
+      return lax.foriLoop(
+        0,
+        3,
+        (_i: np.Array, acc: np.Array) => np.add(acc, block),
+        zero,
+      );
+    };
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(body, xs, { blockShape: [2] });
+      return np.sum(mapped);
+    };
+    using x = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
+    using g = grad(f)(x);
+    expect(g).toBeAllclose([3, 3, 3, 3]);
+  });
 
   test("jvp(blockMap) tangent shapes match primal shapes", () => {
     const body = (block: np.Array) => np.multiply(block, block);

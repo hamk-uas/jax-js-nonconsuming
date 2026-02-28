@@ -894,13 +894,42 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const jvpInAxes = doubleAxes(inAxes);
     const jvpOutAxes = doubleAxes(outAxes);
 
-    const doubledConsts = [...jvpBody.consts, ...constsP, ...constsT];
+    // jvpBody expects [jvpConsts, allPrimals, allTangents] where
+    // allPrimals = [constsP, inputsP] and allTangents = [constsT, inputsT].
+    // BlockMap groups as [consts (not tiled), inputs (tiled)], so we must
+    // wrap the jvpBody to remap [constsP, constsT, inputsP, inputsT] →
+    // [constsP, inputsP, constsT, inputsT] before calling jvpBody.
+    const nJvp = jvpBody.consts.length;
+    const nC = numConsts;
+    const nI = numInputs;
+    const wrapperInAvals = [
+      ...jvpBody.jaxpr.inBinders.slice(0, nJvp).map((v) => v.aval),
+      ...constsP.map((_, i) => jaxpr.inBinders[i].aval),
+      ...constsT.map((_, i) => jaxpr.inBinders[i].aval),
+      ...inputsP.map((_, i) => jaxpr.inBinders[numConsts + i].aval),
+      ...inputsT.map((_, i) => jaxpr.inBinders[numConsts + i].aval),
+    ];
+    const { jaxpr: wrappedBody } = makeJaxpr(
+      (...args: Tracer[]): Tracer[] => {
+        // args order: [jvpConsts, constsP, constsT, inputsP, inputsT]
+        const jc = args.slice(0, nJvp);
+        const cP = args.slice(nJvp, nJvp + nC);
+        const cT = args.slice(nJvp + nC, nJvp + nC * 2);
+        const iP = args.slice(nJvp + nC * 2, nJvp + nC * 2 + nI);
+        const iT = args.slice(nJvp + nC * 2 + nI);
+        // jvpBody expects: [jvpConsts, constsP, inputsP, constsT, inputsT]
+        return evalJaxpr(jvpBody.jaxpr, [...jc, ...cP, ...iP, ...cT, ...iT]);
+      },
+      { validateRefs: false },
+    )(...wrapperInAvals);
+
+    const doubledConsts = [...wrappedBody.consts, ...constsP, ...constsT];
 
     const doubledOut = bind(
       Primitive.BlockMap,
       [...doubledConsts, ...inputsP, ...inputsT],
       {
-        jaxpr: jvpBody.jaxpr,
+        jaxpr: wrappedBody.jaxpr,
         numConsts: doubledConsts.length,
         numInputs: numInputs * 2,
         blockShape,
@@ -909,6 +938,10 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
         isJvpTransformed: true,
       },
     );
+
+    // wrappedBody.jaxpr is stored in the BlockMap params and may be used as
+    // a transposeJaxprCache key by the transpose rule. Do NOT dispose — let
+    // the cache cleanup handle it when the Jaxpr becomes unreachable.
 
     const numOutP = doubledOut.length / 2;
     return [doubledOut.slice(0, numOutP), doubledOut.slice(numOutP)];

@@ -2759,13 +2759,251 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     return [curr, ...starts.map(() => null)];
   },
   [Primitive.ForiLoop](
-    _cts,
-    _args,
-    { jaxpr: _jaxpr, numConsts: _numConsts2, lower: _lower, upper: _upper },
+    cts,
+    args,
+    { jaxpr, numConsts, lower, upper, isJvpTransformed },
   ) {
-    throw new Error(
-      "Fori loop backwards pass needs Scan or checkpointed history",
+    // ForiLoop backward pass: unrolled forward + backward.
+    //
+    // After JVP+PE the fori_loop carries both primal and tangent halves.
+    // The backward pass builds compile-time jaxprs (primal forward, tangent
+    // body, transposed tangent body), then:
+    //   1. Runs primal forward N times to collect intermediate primal carries
+    //   2. Runs transposed tangent body N times in reverse via evalJaxpr
+    //
+    // This mirrors the scan backward approach: evalJaxpr returns fresh arrays,
+    // avoiding aliasing complications from evalJaxprTransposed.
+
+    if (!isJvpTransformed) {
+      throw new Error(
+        "ForiLoop backward pass requires isJvpTransformed (from JVP rule). " +
+          "Use jit(grad(f)) instead of grad(jit(f)).",
+      );
+    }
+
+    const N = upper - lower;
+    const numCarryTotal = args.length - numConsts;
+    const numCarryHalf = numCarryTotal / 2;
+
+    // Body invars: [consts(numConsts), i, carry(numCarryTotal)]
+    const iDtype = jaxpr.inBinders[numConsts].aval.dtype;
+
+    // ---- Identify unknown (tangent) positions ----
+    const bodyUndefPrimals: boolean[] = [];
+    for (let i = 0; i < jaxpr.inBinders.length; i++) {
+      if (i < numConsts) {
+        bodyUndefPrimals.push(args[i] instanceof UndefPrimal);
+      } else if (i === numConsts) {
+        bodyUndefPrimals.push(false); // i: always known
+      } else {
+        const carryIdx = i - numConsts - 1;
+        bodyUndefPrimals.push(carryIdx >= numCarryHalf);
+      }
+    }
+
+    const numTangentConsts = args
+      .slice(0, numConsts)
+      .filter((a) => a instanceof UndefPrimal).length;
+
+    // ---- Build primal forward jaxpr ----
+    const primalForwardInTypes = jaxpr.inBinders
+      .filter((_, i) => !bodyUndefPrimals[i])
+      .map((v) => v.aval);
+
+    const { jaxpr: primalForwardJaxpr } = makeJaxpr(
+      (...primalInputs: Tracer[]): Tracer[] => {
+        const fullInputs: Tracer[] = [];
+        let primalIdx = 0;
+        for (let i = 0; i < jaxpr.inBinders.length; i++) {
+          if (bodyUndefPrimals[i]) {
+            fullInputs.push(
+              zerosInternal(
+                jaxpr.inBinders[i].aval.shape,
+                jaxpr.inBinders[i].aval.dtype,
+              ),
+            );
+          } else {
+            fullInputs.push(primalInputs[primalIdx++]);
+          }
+        }
+        const outs = evalJaxpr(jaxpr, fullInputs);
+        const primalOuts = outs.slice(0, numCarryHalf);
+        for (let i = numCarryHalf; i < outs.length; i++) outs[i].dispose();
+        return primalOuts;
+      },
+      { validateRefs: false },
+    )(...primalForwardInTypes);
+
+    // ---- Build tangent body jaxpr ----
+    const tangentBodyInAvals = [
+      ...jaxpr.inBinders
+        .filter((_, i) => !bodyUndefPrimals[i])
+        .map((v) => v.aval),
+      ...jaxpr.inBinders
+        .filter((_, i) => bodyUndefPrimals[i])
+        .map((v) => v.aval),
+    ];
+
+    const numTangentCarry = numCarryHalf;
+
+    const { jaxpr: tangentBody } = makeJaxpr(
+      (...tangentBodyArgs: Tracer[]): Tracer[] => {
+        const numPrimalInputs = jaxpr.inBinders.filter(
+          (_, i) => !bodyUndefPrimals[i],
+        ).length;
+        const primalResiduals = tangentBodyArgs.slice(0, numPrimalInputs);
+        const tangentInputs = tangentBodyArgs.slice(numPrimalInputs);
+
+        const fullInputs: Tracer[] = [];
+        let primalIdx = 0;
+        let tangentIdx = 0;
+        for (let i = 0; i < jaxpr.inBinders.length; i++) {
+          if (bodyUndefPrimals[i]) {
+            fullInputs.push(tangentInputs[tangentIdx++]);
+          } else {
+            fullInputs.push(primalResiduals[primalIdx++]);
+          }
+        }
+
+        const fullOuts = evalJaxpr(jaxpr, fullInputs);
+        // Extract tangent carry outputs (second half)
+        const tangentOuts = fullOuts.slice(numCarryHalf);
+        for (let i = 0; i < numCarryHalf; i++) fullOuts[i].dispose();
+        return tangentOuts;
+      },
+      { validateRefs: false },
+    )(...tangentBodyInAvals);
+
+    // ---- Transpose the tangent body (cache-owned) ----
+    const tangentBodyUndefPrimals = [
+      ...Array(
+        tangentBody.jaxpr.inBinders.length -
+          (numTangentConsts + numTangentCarry),
+      ).fill(false),
+      ...Array(numTangentConsts + numTangentCarry).fill(true),
+    ];
+
+    const transposedBody = transposeJaxpr(
+      tangentBody.jaxpr,
+      tangentBodyUndefPrimals,
     );
+
+    // ---- Forward pass: collect primal carry at each step ----
+    const constResiduals = args
+      .slice(0, numConsts)
+      .filter((_, i) => !bodyUndefPrimals[i]) as Tracer[];
+    const primalCarryInit = args.slice(
+      numConsts,
+      numConsts + numCarryHalf,
+    ) as Tracer[];
+
+    const primalHistory: Tracer[][] = [];
+    let fwdCarry = primalCarryInit.map((c) => c.ref);
+    primalHistory.push(fwdCarry.map((c) => c.ref));
+
+    for (let step = lower; step < upper; step++) {
+      const iArr = array(step, { dtype: iDtype });
+      const forwardInputs = [...constResiduals, iArr, ...fwdCarry];
+      const forwardOuts = evalJaxpr(primalForwardJaxpr.jaxpr, [
+        ...primalForwardJaxpr.consts,
+        ...forwardInputs,
+      ]);
+      for (const c of fwdCarry) c.dispose();
+      fwdCarry = forwardOuts;
+      primalHistory.push(fwdCarry.map((c) => c.ref));
+      iArr.dispose();
+    }
+    for (const c of fwdCarry) c.dispose();
+
+    // ---- Backward pass ----
+    let ctCarry = cts.slice(numCarryHalf).map((c) => c.ref);
+    for (let i = 0; i < numCarryHalf; i++) cts[i]?.dispose?.();
+
+    let ctConstsAccum: Tracer[] | null = null;
+
+    for (let step = upper - 1; step >= lower; step--) {
+      const k = step - lower;
+      const iArr = array(step, { dtype: iDtype });
+      const primals_k = primalHistory[k];
+
+      // Transposed body takes: [transposed consts, primal residuals, cotangents]
+      // Primal residuals = [const residuals, i, primal carry at step k]
+      const transposedInputs = [
+        ...transposedBody.consts,
+        ...constResiduals,
+        iArr,
+        ...primals_k,
+        ...ctCarry,
+      ];
+
+      const transposedOuts = evalJaxpr(transposedBody.jaxpr, transposedInputs);
+
+      // Extract: [ct tangent consts, ct tangent carry]
+      let outIdx = 0;
+      const ctConstsStep: Tracer[] = [];
+      for (let i = 0; i < numTangentConsts; i++) {
+        ctConstsStep.push(transposedOuts[outIdx++]);
+      }
+      const ctCarryNew: Tracer[] = [];
+      for (let i = 0; i < numTangentCarry; i++) {
+        ctCarryNew.push(transposedOuts[outIdx++]);
+      }
+
+      // Accumulate const cotangents
+      if (ctConstsAccum === null) {
+        ctConstsAccum = ctConstsStep;
+      } else {
+        const next: Tracer[] = [];
+        for (let i = 0; i < ctConstsStep.length; i++) {
+          const summed = add(ctConstsAccum[i], ctConstsStep[i]);
+          ctConstsAccum[i].dispose();
+          ctConstsStep[i].dispose();
+          next.push(summed);
+        }
+        ctConstsAccum = next;
+      }
+
+      // Dispose old carry ct and step intermediates
+      for (const c of ctCarry) c.dispose();
+      for (const c of primals_k) c.dispose();
+      iArr.dispose();
+
+      ctCarry = ctCarryNew;
+    }
+    // Dispose unused final primal history entry
+    for (const c of primalHistory[N]) c.dispose();
+
+    // Dispose the primal forward jaxpr (consumed).
+    // transposedBody is cache-owned — do NOT dispose.
+    // tangentBody.jaxpr is the cache key for transposedBody — disposing its
+    // Literal-originated consts would invalidate the cache entry. Let GC
+    // reclaim it once the Jaxpr key is unreachable.
+    primalForwardJaxpr.dispose();
+
+    // ---- Build result ----
+    const result: (Tracer | null)[] = [];
+    let constCtIdx = 0;
+    for (let i = 0; i < numConsts; i++) {
+      if (args[i] instanceof UndefPrimal) {
+        result.push(ctConstsAccum ? ctConstsAccum[constCtIdx++] : null);
+      } else {
+        result.push(null);
+      }
+    }
+    for (let i = 0; i < numCarryHalf; i++) {
+      result.push(null); // primal carry: known
+    }
+    for (let i = 0; i < numCarryHalf; i++) {
+      const argIdx = numConsts + numCarryHalf + i;
+      if (args[argIdx] instanceof UndefPrimal) {
+        result.push(ctCarry[i]);
+      } else {
+        result.push(null);
+        ctCarry[i].dispose();
+      }
+    }
+
+    return result;
   },
 };
 
@@ -2776,7 +3014,14 @@ const transposeJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
 _registerJitCacheDisposer(() => {
   for (const inner of transposeJaxprCache.values()) {
     for (const cj of inner.values()) {
-      cj.dispose();
+      // Guard against consts already disposed by earlier cache cleaners
+      // (e.g., jvpJaxprCache cleaned first, sharing underlying Literal
+      // arrays with transposed body consts).
+      try {
+        cj.dispose();
+      } catch {
+        // Already disposed — tolerate during bulk cleanup.
+      }
     }
   }
   transposeJaxprCache.clear();
