@@ -326,14 +326,16 @@ function isSliceContiguous(
   sizes: number[],
   fullShape: number[],
 ): boolean {
-  // A slice is contiguous if, from the first axis that doesn't take the
-  // full extent, all subsequent axes take the full extent from offset 0.
-  let foundPartial = false;
-  for (let d = 0; d < starts.length; d++) {
-    if (sizes[d] !== fullShape[d] || starts[d] !== 0) {
-      if (foundPartial) return false;
-      foundPartial = true;
+  // In row-major layout, a slice is contiguous iff for every dimension d
+  // where sizes[d] > 1, ALL inner dimensions d' > d have
+  // sizes[d'] == fullShape[d']. This ensures the stride matches.
+  const nd = starts.length;
+  for (let d = 0; d < nd; d++) {
+    if (sizes[d] <= 1) continue;
+    for (let d2 = d + 1; d2 < nd; d2++) {
+      if (sizes[d2] !== fullShape[d2]) return false;
     }
+    break; // Only need to check the outermost non-trivial dim
   }
   return true;
 }

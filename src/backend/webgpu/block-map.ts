@@ -224,13 +224,22 @@ export function blockMapFusedShaderSource(
                 valid = false;
                 break;
               }
-              // Reductions inside fori_loop not yet supported
+              // Reductions: allow per-thread contractions (kernel.size == blockSize)
+              // but reject workgroup-level reductions (different thread counts).
               if (bk.hasReduction) {
-                if (DEBUG >= 1)
-                  console.info(
-                    "block_map fused: reduction in fori_loop body, fallback",
-                  );
-                return null;
+                const re = bk.outputs[0]?.reduction;
+                if (
+                  !re ||
+                  bk.numOutputs > 1 ||
+                  (bk.size as number) !== blockSize
+                ) {
+                  if (DEBUG >= 1)
+                    console.info(
+                      "block_map fused: unsupported reduction in fori_loop body, fallback",
+                    );
+                  return null;
+                }
+                // Per-thread contraction: OK — each thread accumulates privately
               }
               // Body kernels larger than blockSize can't be processed 1:1
               if ((bk.size as number) > blockSize) {
@@ -1226,19 +1235,67 @@ export function blockMapFusedShaderSource(
           },
         );
 
-        // Elementwise output writes — guard if kernel size < blockSize
-        const bKernelSize = bKernel.size as number;
-        const needSizeGuard = bKernelSize < blockSize;
-        if (needSizeGuard) emit(`if (tidx < ${bKernelSize}u) {`, pushIndent);
-        for (let oi = 0; oi < bKernel.numOutputs; oi++) {
-          const outId = bStep.outputs[oi];
-          const rhs = strip1(gen(bKernel.outputs[oi].exp));
+        // Check for per-thread contraction (reduction kernel)
+        const bRe = bKernel.outputs[0]?.reduction ?? null;
+        if (bRe && (bKernel.size as number) === blockSize) {
+          // Per-thread accumulate loop: each thread computes its own
+          // output by iterating over the reduction axis sequentially.
+          const outId = bStep.outputs[0];
+          const reDtype = bRe.dtype;
+          const reTy = dtypeToWgsl(reDtype, false);
+          const reSize = bRe.size as number;
+          const prefix = `fl${entry.flIdx}_s${bsi}`;
+          const accName = `${prefix}_acc`;
+          emit(`{`);
+          emit(
+            `  var ${accName}: ${reTy} = ${constToWgsl(reDtype, bRe.identity)};`,
+          );
+          emit(
+            `  for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
+            pushIndent,
+          );
+          // gen() references gidx (→ tidx) and ridx (→ loop var) in the expression
+          const rhs = strip1(gen(bKernel.outputs[0].exp));
+          if (bRe.op === AluOp.Add) emit(`  ${accName} += ${rhs};`);
+          else if (bRe.op === AluOp.Mul) emit(`  ${accName} *= ${rhs};`);
+          else if (bRe.op === AluOp.Min)
+            emit(`  ${accName} = min(${accName}, ${rhs});`);
+          else if (bRe.op === AluOp.Max)
+            emit(`  ${accName} = max(${accName}, ${rhs});`);
+          emit(popIndent, `  }`);
+          // Apply epilogue if non-identity
+          const isIdentityEpilogue =
+            bRe.epilogue.op === AluOp.Variable && bRe.epilogue.arg === "acc";
+          let finalValue = accName;
+          if (!isIdentityEpilogue) {
+            const epilogueGen = createGen(
+              bKernel,
+              `${prefix}_ep`,
+              () => accName,
+              new Map([["acc", accName]]),
+            );
+            finalValue = strip1(epilogueGen(bRe.epilogue));
+          }
           const targetName = bodyIdToName.get(outId);
           if (targetName) {
-            emit(`${targetName}[tidx] = ${rhs};`);
+            emit(`  ${targetName}[tidx] = ${finalValue};`);
           }
+          emit(`}`);
+        } else {
+          // Elementwise output writes — guard if kernel size < blockSize
+          const bKernelSize = bKernel.size as number;
+          const needSizeGuard = bKernelSize < blockSize;
+          if (needSizeGuard) emit(`if (tidx < ${bKernelSize}u) {`, pushIndent);
+          for (let oi = 0; oi < bKernel.numOutputs; oi++) {
+            const outId = bStep.outputs[oi];
+            const rhs = strip1(gen(bKernel.outputs[oi].exp));
+            const targetName = bodyIdToName.get(outId);
+            if (targetName) {
+              emit(`${targetName}[tidx] = ${rhs};`);
+            }
+          }
+          if (needSizeGuard) emit(popIndent, "}");
         }
-        if (needSizeGuard) emit(popIndent, "}");
       }
 
       emit(popIndent, "}"); // end for loop

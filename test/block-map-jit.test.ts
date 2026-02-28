@@ -795,4 +795,163 @@ describe("lax.blockMap — boundary blocks", () => {
     ]);
     f_jit.dispose();
   });
+
+  // =========================================================================
+  // Phase 4: Per-thread contraction (Dot in fori_loop body)
+  // =========================================================================
+
+  test("jit(blockMap(foriLoop+matmul)) per-thread contraction 4x4", () => {
+    // Tiled matmul: C = A @ B with Br=Bc=Bk=2 for simplicity
+    // A: [4,4], B: [4,4], blockShape: [2,2], K/Bk = 2 iterations
+    const Br = 2,
+      Bc = 2,
+      Bk = 2;
+
+    const tiledMatmul = (A: np.Array, B: np.Array) => {
+      const K = (A.shape[1] as number) / Bk;
+      return lax.blockMap(
+        ({ A: aTile, B: bTile }: { A: np.Array; B: np.Array }) =>
+          lax.foriLoop(
+            0,
+            K,
+            (k: np.Array, acc: np.Array) => {
+              using kIdx = np.multiply(k, np.array(Bk, { dtype: DType.Int32 }));
+              using z0 = np.array(0, { dtype: DType.Int32 });
+              using a = lax.dynamicSlice(aTile, [z0, kIdx], [Br, Bk]);
+              using b = lax.dynamicSlice(bTile, [kIdx, z0], [Bk, Bc]);
+              using prod = np.matmul(a, b);
+              return np.add(acc, prod);
+            },
+            np.zeros([Br, Bc], { dtype: DType.Float32 }),
+          ),
+        { A, B },
+        {
+          blockShape: [Br, Bc],
+          inAxes: [
+            [0, null],
+            [null, 1],
+          ],
+          outAxes: [[0, 1]],
+        },
+      );
+    };
+
+    const f_jit = jit(tiledMatmul);
+    using A = np.array(
+      [
+        [1, 2, 3, 4],
+        [5, 6, 7, 8],
+        [9, 10, 11, 12],
+        [13, 14, 15, 16],
+      ],
+      { dtype: DType.Float32 },
+    );
+    using B = np.array(
+      [
+        [1, 0, 0, 1],
+        [0, 1, 1, 0],
+        [1, 1, 0, 0],
+        [0, 0, 1, 1],
+      ],
+      { dtype: DType.Float32 },
+    );
+    // Expected: A @ B
+    // Hand-compute: row0 = [1*1+2*0+3*1+4*0, 1*0+2*1+3*1+4*0, 1*0+2*1+3*0+4*1, 1*1+2*0+3*0+4*1]
+    //            = [4, 5, 6, 5]
+    using expected = np.matmul(A, B);
+    using result = f_jit(A, B);
+    expect(result).toBeAllclose(expected);
+    f_jit.dispose();
+  });
+
+  test("jit(blockMap(foriLoop+matmul)) tiled matmul 8x8", () => {
+    const Br = 4,
+      Bc = 4,
+      Bk = 4;
+
+    const tiledMatmul = (A: np.Array, B: np.Array) => {
+      const K = (A.shape[1] as number) / Bk;
+      return lax.blockMap(
+        ({ A: aTile, B: bTile }: { A: np.Array; B: np.Array }) =>
+          lax.foriLoop(
+            0,
+            K,
+            (k: np.Array, acc: np.Array) => {
+              using kIdx = np.multiply(k, np.array(Bk, { dtype: DType.Int32 }));
+              using z0 = np.array(0, { dtype: DType.Int32 });
+              using a = lax.dynamicSlice(aTile, [z0, kIdx], [Br, Bk]);
+              using b = lax.dynamicSlice(bTile, [kIdx, z0], [Bk, Bc]);
+              using prod = np.matmul(a, b);
+              return np.add(acc, prod);
+            },
+            np.zeros([Br, Bc], { dtype: DType.Float32 }),
+          ),
+        { A, B },
+        {
+          blockShape: [Br, Bc],
+          inAxes: [
+            [0, null],
+            [null, 1],
+          ],
+          outAxes: [[0, 1]],
+        },
+      );
+    };
+
+    const f_jit = jit(tiledMatmul);
+
+    // Create 8x8 matrices with known values
+    using A_flat = np.arange(64).astype(DType.Float32);
+    using A = A_flat.reshape([8, 8]);
+    using B = np.eye(8, { dtype: DType.Float32 }); // identity → result should be A
+    using result = f_jit(A, B);
+    expect(result).toBeAllclose(A);
+    f_jit.dispose();
+  });
+
+  test("jit(blockMap(foriLoop+matmul)) tiled matmul 16x16 Br=Bc=Bk=4", () => {
+    const Br = 4,
+      Bc = 4,
+      Bk = 4;
+
+    const tiledMatmul = (A: np.Array, B: np.Array) => {
+      const K = (A.shape[1] as number) / Bk;
+      return lax.blockMap(
+        ({ A: aTile, B: bTile }: { A: np.Array; B: np.Array }) =>
+          lax.foriLoop(
+            0,
+            K,
+            (k: np.Array, acc: np.Array) => {
+              using kIdx = np.multiply(k, np.array(Bk, { dtype: DType.Int32 }));
+              using z0 = np.array(0, { dtype: DType.Int32 });
+              using a = lax.dynamicSlice(aTile, [z0, kIdx], [Br, Bk]);
+              using b = lax.dynamicSlice(bTile, [kIdx, z0], [Bk, Bc]);
+              using prod = np.matmul(a, b);
+              return np.add(acc, prod);
+            },
+            np.zeros([Br, Bc], { dtype: DType.Float32 }),
+          ),
+        { A, B },
+        {
+          blockShape: [Br, Bc],
+          inAxes: [
+            [0, null],
+            [null, 1],
+          ],
+          outAxes: [[0, 1]],
+        },
+      );
+    };
+
+    const f_jit = jit(tiledMatmul);
+    using A_flat = np.arange(256).astype(DType.Float32);
+    using A = A_flat.reshape([16, 16]);
+    using B_flat = np.arange(256).astype(DType.Float32);
+    using B_sq = B_flat.reshape([16, 16]);
+    using B = np.transpose(B_sq);
+    using expected = np.matmul(A, B);
+    using result = f_jit(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1e-3 });
+    f_jit.dispose();
+  });
 });
