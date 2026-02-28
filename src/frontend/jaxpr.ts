@@ -1707,6 +1707,40 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
       );
     });
   },
+
+  [Primitive.ForiLoop](args, { jaxpr, numConsts, lower, upper }) {
+    const { outTypes } = typecheckJaxpr(jaxpr);
+    // Body signature: (i: int32, carry...) => carry...
+    const numCarry = args.length - numConsts;
+    if (jaxpr.inBinders.length !== numConsts + 1 + numCarry) {
+      throw new TypeError(
+        `ForiLoop body expects ${jaxpr.inBinders.length} inputs, got ${numConsts + 1 + numCarry}`,
+      );
+    }
+    if (outTypes.length !== numCarry) {
+      throw new TypeError(
+        `ForiLoop body returns ${outTypes.length} outputs, expected ${numCarry} carry outputs`,
+      );
+    }
+    // Output is the final carry
+    return args.slice(numConsts);
+  },
+
+  [Primitive.DynamicSlice](args, { sliceSizes }) {
+    const operand = args[0];
+    const numIndices = args.length - 1;
+    if (numIndices !== operand.shape.length) {
+      throw new TypeError(
+        `DynamicSlice expected ${operand.shape.length} start indices, got ${numIndices}`,
+      );
+    }
+    for (let i = 1; i < args.length; i++) {
+        if (args[i].shape.length !== 0) {
+            throw new TypeError(`DynamicSlice start indices must be scalars, got shape ${args[i].shape}`);
+        }
+    }
+    return [new ShapedArray(sliceSizes, operand.dtype, operand.weakType)];
+  },
 };
 
 function splitIdx(values: any[], argnums: Set<number>): [any[], any[]] {

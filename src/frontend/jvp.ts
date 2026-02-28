@@ -1,3 +1,5 @@
+import { ShapedArray } from "./core";
+import { DType } from '../alu';
 import { AluOp, isFloatDtype } from "../alu";
 import { Pair } from "../shape";
 import {
@@ -15,7 +17,7 @@ import {
   pureArray,
   tril,
   triu,
-  zerosLike,
+  zerosLike, array,
 } from "./array";
 import {
   _registerCacheSizeGetter,
@@ -881,6 +883,74 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   },
   [Primitive.BlockMap]() {
     throw new Error("jvp: BlockMap is not yet supported");
+  },
+  [Primitive.DynamicSlice](primals, tangents, { sliceSizes }) {
+    const operandT = tangents[0];
+    const startsP = primals.slice(1);
+    const outP = bind1(Primitive.DynamicSlice, primals, { sliceSizes });
+    const outT = bind1(Primitive.DynamicSlice, [operandT, ...startsP], { sliceSizes });
+    return [[outP], [outT]];
+  },
+  [Primitive.ForiLoop](
+    primals,
+    tangents,
+    { jaxpr, numConsts, lower, upper },
+  ) {
+    const numCarry = primals.length - numConsts;
+    const jvpBody = jvpJaxpr(jaxpr);
+    
+    // Original jaxpr expects [consts, i, carry]
+    const dummyI = new ShapedArray([], DType.Int32);
+    
+    
+    const { jaxpr: wrapperClosedJaxpr } = makeJaxpr((...args: Tracer[]) => {
+      // args: [constsP, constsT, i, carryP, carryT]
+      const constsP = args.slice(0, numConsts);
+      const constsT = args.slice(numConsts, numConsts * 2);
+      const i = args[numConsts * 2];
+      const carryP = args.slice(numConsts * 2 + 1, numConsts * 2 + 1 + numCarry);
+      const carryT = args.slice(numConsts * 2 + 1 + numCarry);
+
+      // jvpBody expects: [...jvpConsts, constsP, iP, carryP, constsT, iT, carryT]
+      const jvpConsts = jvpBody.consts.map(c => getOrMakeConstTracer(c));
+      const iP = i;
+      const iT = zerosLike(i);
+
+      const callArgs = [
+        ...jvpConsts,
+        ...constsP, iP, ...carryP,
+        ...constsT, iT, ...carryT
+      ];
+      return evalJaxpr(jvpBody.jaxpr, callArgs);
+    })(
+      ...primals.slice(0, numConsts), 
+      ...tangents.slice(0, numConsts), 
+      dummyI, 
+      ...primals.slice(numConsts), 
+      ...tangents.slice(numConsts)
+    );
+
+    const scanArgs = [
+      ...wrapperClosedJaxpr.consts,
+      ...primals.slice(0, numConsts),
+      ...tangents.slice(0, numConsts),
+      ...primals.slice(numConsts),
+      ...tangents.slice(numConsts)
+    ];
+
+    const results = bind(Primitive.ForiLoop, scanArgs, {
+      jaxpr: wrapperClosedJaxpr.jaxpr,
+      numConsts: wrapperClosedJaxpr.consts.length + numConsts * 2,
+      lower,
+      upper,
+      isJvpTransformed: true
+    });
+    
+    
+    // We created an anonymous jaxpr, its consts are bound as primals to the outer trace/eager. We must dispose the wrapper to balance refcounts.
+    wrapperClosedJaxpr.dispose();
+
+    return [results.slice(0, numCarry), results.slice(numCarry)];
   },
 };
 

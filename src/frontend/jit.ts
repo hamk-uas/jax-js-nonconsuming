@@ -1918,6 +1918,12 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   [Primitive.BlockMap]() {
     throw new Error("jit: BlockMap is not yet supported in JIT compilation");
   },
+  [Primitive.ForiLoop]() {
+    throw new Error("jit: ForiLoop is not yet supported outside BlockMap/Scan");
+  },
+  [Primitive.DynamicSlice]() {
+    throw new Error("jit: DynamicSlice is not yet supported outside BlockMap/Scan");
+  },
 };
 
 /** Determines how to split the Jaxpr into kernels via dataflow analysis. */

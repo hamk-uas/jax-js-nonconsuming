@@ -1853,6 +1853,36 @@ export class Array extends Tracer {
 
         return results;
       },
+      [Primitive.ForiLoop](args, { jaxpr, numConsts, lower, upper }) {
+        const consts = args.slice(0, numConsts);
+        let carry = args.slice(numConsts);
+        for (let i = lower; i < upper; i++) {
+          using idx = array(i, { dtype: DType.Int32 }) as Array;
+          // non-consuming
+          const nextCarry = evalJaxpr(jaxpr, [...consts, idx, ...carry]) as Array[];
+          for (const c of carry) { // only dispose intermediate carries, not original inputs
+              if (!args.includes(c)) c.dispose();
+          }
+          carry = nextCarry;
+        }
+        // The outputs of a primitive MUST be freshly-owned references.
+        // If an output is just an input passed through, we must .ref it.
+        return carry.map(c => args.includes(c) ? c.ref : c);
+      },
+      [Primitive.DynamicSlice](args, { sliceSizes }) {
+        const operand = args[0] as Array;
+        const indices = args.slice(1) as Array[];
+        const ndim = operand.ndim;
+        const startIndicesVal: number[] = new JsArray(ndim);
+        for (let i = 0; i < ndim; i++) {
+          // Unconditionally clamped to [0, dimSize - sliceSize]
+          const maxStart = (operand.shape[i] as number) - sliceSizes[i];
+          const rawStart = indices[i].dataSync()[0] as number;
+          startIndicesVal[i] = Math.max(0, Math.min(rawStart, maxStart));
+        }
+        const slicePair = startIndicesVal.map((start, i) => [start, start + sliceSizes[i]] as Pair);
+        return [coreShrink(operand, slicePair)];
+      },
     };
   }
 

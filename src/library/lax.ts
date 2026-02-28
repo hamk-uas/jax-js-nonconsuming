@@ -6,7 +6,8 @@
 const JsArray = globalThis.Array;
 
 import { DType } from "../alu";
-import { Array, ArrayLike, fudgeArray, zerosLike } from "../frontend/array";
+import { Array, ArrayLike, array as arrayFn, fudgeArray, zerosLike } from "../frontend/array";
+import * as jaxpr from "../frontend/jaxpr";
 import * as core from "../frontend/core";
 import { bind1, Primitive } from "../frontend/core";
 import { moveaxis, vmap } from "../frontend/vmap";
@@ -14,7 +15,8 @@ import { Pair } from "../shape";
 import { checkAxis, deepEqual, prod, range, rep, zipn } from "../utils";
 
 export * as linalg from "./lax-linalg";
-export { scan } from "./lax-scan";
+import { scan } from "./lax-scan";
+export { scan };
 export type { ScanOptions } from "./lax-scan";
 export { associativeScan } from "./lax-associative-scan";
 export type { AssociativeScanOptions } from "./lax-associative-scan";
@@ -569,4 +571,74 @@ export function topK(
   if (moved !== flipped) (moved as Array).dispose();
   flipped.dispose();
   return result;
+}
+
+import * as tree from "../tree";
+
+/**
+ * Extract a slice of `operand` at runtime-computed `startIndices` with
+ * compile-time-constant `sliceSizes`. Out-of-bounds start indices are
+ * clamped to `[0, dimSize - sliceSize]`.
+ */
+export function dynamicSlice(
+  operand: ArrayLike,
+  startIndices: ArrayLike[],
+  sliceSizes: number[],
+): Array {
+  const x = fudgeArray(operand);
+  const starts = startIndices.map(fudgeArray);
+  if (starts.length !== x.ndim) {
+    throw new Error(`lax.dynamicSlice: expected ${x.ndim} start indices, got ${starts.length}`);
+  }
+  if (sliceSizes.length !== x.ndim) {
+    throw new Error(`lax.dynamicSlice: expected ${x.ndim} slice sizes, got ${sliceSizes.length}`);
+  }
+  for (const start of starts) {
+    if (start.ndim !== 0) {
+      throw new Error(`lax.dynamicSlice: start indices must be scalars, got shape ${start.shape}`);
+    }
+  }
+  const result = bind1(Primitive.DynamicSlice, [x, ...starts], { sliceSizes }) as Array;
+  return result;
+}
+
+/**
+ * Sequential loop with a carried state.
+ */
+export function foriLoop<C extends tree.JsTree<Array>>(
+  lower: number, // TODO should be array type ideally
+  upper: number,
+  body: (i: Array, carry: C) => C,
+  init: C,
+): C {
+  lower = Math.floor(lower);
+  upper = Math.floor(upper);
+  if (upper - lower <= 0) return init;
+
+  const [initFlat, initTree] = tree.flatten(init);
+
+  const dummyIArr = arrayFn(0, {dtype: DType.Int32});
+  const dummyI = core.getAval(dummyIArr);
+  dummyIArr.dispose();
+  
+  const traceAvals = [dummyI, ...initFlat.map(a => core.getAval(a as Array))];
+
+  const traceFn = (i: Array, ...args: Array[]) => {
+      const initTracers = tree.unflatten(initTree, args);
+      const out = body(i, initTracers as C);
+      const [outFlat] = tree.flatten(out);
+      return outFlat;
+  };
+
+  const { jaxpr: closedJaxpr } = jaxpr.makeJaxpr(traceFn)(...traceAvals);
+
+  const outFlat = core.bind(
+    Primitive.ForiLoop,
+    [...closedJaxpr.consts, ...initFlat as Array[]],
+    { jaxpr: closedJaxpr.jaxpr, numConsts: closedJaxpr.consts.length, lower, upper }
+  ) as Array[];
+
+  closedJaxpr.dispose();
+  
+  return tree.unflatten(initTree, outFlat) as C;
 }

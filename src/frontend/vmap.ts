@@ -758,6 +758,8 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     // Results have batch at axis 0
     return [results, rep(numLeaves, 0)];
   },
+  [Primitive.DynamicSlice]() { throw new Error("vmap for dynamic slice not implemented"); },
+  [Primitive.ForiLoop](axisSize, args, bdims, params) { throw new Error("vmap for foriLoop not implemented"); },
 };
 
 const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();

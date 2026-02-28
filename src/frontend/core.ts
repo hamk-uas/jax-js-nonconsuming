@@ -95,6 +95,8 @@ export enum Primitive {
   Pad = "pad",
   // Update a contiguous slice along an axis: dst[axis=offset:offset+len] = src
   DynamicUpdateSlice = "dynamic_update_slice",
+  // Extract a contiguous slice using dynamic start indices
+  DynamicSlice = "dynamic_slice",
   // Atomic scatter-add: target[indices[i]] += updates[i]
   ScatterAdd = "scatter_add",
 
@@ -113,6 +115,7 @@ export enum Primitive {
   Scan = "scan",
   AssociativeScan = "associative_scan",
   BlockMap = "block_map",
+  ForiLoop = "fori_loop",
 }
 
 interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
@@ -139,6 +142,7 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.Pad]: { width: Pair[] };
   // Update a contiguous slice along a single axis: dst[axis=offset:offset+src.shape[axis]] = src
   [Primitive.DynamicUpdateSlice]: { offset: number; axis: number };
+  [Primitive.DynamicSlice]: { sliceSizes: number[] };
   // Scatter-add: target[indices[i]] += updates[i] along axis
   [Primitive.ScatterAdd]: { axis: number };
   [Primitive.TriangularSolve]: { unitDiagonal: boolean };
@@ -179,6 +183,12 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     outAxes: (number | null)[][];
     numConsts: number;
     numInputs: number;
+  };
+  [Primitive.ForiLoop]: {
+    jaxpr: Jaxpr;
+    numConsts: number;
+    lower: number;
+    upper: number;
   };
 }
 
