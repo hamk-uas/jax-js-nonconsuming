@@ -1032,4 +1032,6 @@ describe("lax.tiledMatmul", () => {
     expect(result).toBeAllclose(expected, { atol: 1e-2 });
     f.dispose();
   });
+
+  // grad(tiledMatmul): blocked on foriLoop backward pass (needs scan)
 });
