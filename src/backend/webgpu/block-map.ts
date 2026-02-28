@@ -13,11 +13,11 @@
  *
  * Returns null (→ fallback) if:
  *   - Body contains routine steps (Sort, Cholesky, etc.)
- *   - Body has reductions (tree reduction in shmem — Phase 3.1)
  *   - Shared memory exceeds device.limits.maxComputeWorkgroupStorageSize
  *   - prod(blockShape) exceeds device.limits.maxComputeInvocationsPerWorkgroup
  *   - Symbolic malloc sizes
  *   - More storage bindings than maxStorageBuffersPerShaderStage
+ *   - Non-divisible dimensions (boundary blocks)
  */
 
 import { erfSrc, threefrySrc } from "./builtins";
@@ -36,6 +36,7 @@ import {
   DType,
   isFloatDtype,
   Kernel,
+  Reduction,
 } from "../../alu";
 import type { JitId, JitProgram, JitStep } from "../../frontend/jit";
 import { Routine } from "../../routine";
@@ -90,10 +91,10 @@ export function blockMapFusedShaderSource(
     return null;
   }
 
-  // --- Guard: evenly divisible dimensions only (Phase 3.0) ---
-  // Boundary blocks where some threads would access out-of-bounds require
-  // per-thread guards. For now, fall back to the JS executor which handles
-  // boundary padding.
+  // --- Guard: evenly divisible dimensions ---
+  // Boundary blocks require per-thread validity guards on every read/write.
+  // For now, fall back to the JS executor which handles boundary padding.
+  // Future: emit per-thread `_valid` flag and guard all memory accesses.
   const gridRank = blockShape.length;
   for (let g = 0; g < gridRank; g++) {
     for (let i = 0; i < numInputs; i++) {
@@ -127,7 +128,6 @@ export function blockMapFusedShaderSource(
   }
 
   // --- Guard: all execute steps must use Kernel (no Routines) ---
-  // --- Guard: no reductions (Phase 3.0) ---
   // --- Classify steps and compute shared memory budget ---
 
   /** Map from JitId → shared memory info for intermediates. */
@@ -140,6 +140,8 @@ export function blockMapFusedShaderSource(
     step: Extract<JitStep, { type: "execute" }>;
     kernel: Kernel;
   }[] = [];
+  /** Per-step reduction info (null if the step is elementwise). */
+  const stepReductions: (Reduction | null)[] = [];
 
   let totalShmemBytes = 0;
 
@@ -152,19 +154,21 @@ export function blockMapFusedShaderSource(
           return null;
         }
         const kernel = step.source as Kernel;
-        // Phase 3.0: reject reductions
-        if (kernel.hasReduction) {
-          if (DEBUG >= 1)
-            console.info("block_map fused: reduction in body, fallback");
-          return null;
-        }
         // Reject symbolic kernel sizes
         if (kernel.isSymbolic) {
           if (DEBUG >= 1)
             console.info("block_map fused: symbolic kernel size, fallback");
           return null;
         }
+        // Multi-output reductions not supported in fused shader
+        if (kernel.hasReduction && kernel.numOutputs > 1) {
+          if (DEBUG >= 1)
+            console.info("block_map fused: multi-output reduction, fallback");
+          return null;
+        }
+        const re = kernel.outputs[0]?.reduction ?? null;
         kernelSteps.push({ step, kernel });
+        stepReductions.push(re);
         break;
       }
       case "malloc": {
@@ -196,6 +200,27 @@ export function blockMapFusedShaderSource(
             `block_map fused: unsupported step type "${(step as JitStep).type}", fallback`,
           );
         return null;
+    }
+  }
+
+  // --- Account for reduction workspace shmem ---
+  // Each reduction step needs a workspace array of blockSize elements for
+  // the tree reduction. This is separate from the malloc-based shmem.
+  const reduceWorkspaces: {
+    stepIdx: number;
+    dtype: DType;
+    elemCount: number;
+  }[] = [];
+  for (let si = 0; si < kernelSteps.length; si++) {
+    const re = stepReductions[si];
+    if (re) {
+      const wsBytes = blockSize * byteWidth(re.dtype);
+      reduceWorkspaces.push({
+        stepIdx: si,
+        dtype: re.dtype,
+        elemCount: blockSize,
+      });
+      totalShmemBytes += wsBytes;
     }
   }
 
@@ -439,6 +464,14 @@ export function blockMapFusedShaderSource(
     const ty = dtypeToWgsl(info.dtype, false);
     const name = idToReadName.get(id)!;
     emit(`var<workgroup> ${name}: array<${ty}, ${info.elemCount}>;`);
+  }
+
+  // Reduction workspace shmem arrays (one per reduction step)
+  for (const ws of reduceWorkspaces) {
+    const ty = dtypeToWgsl(ws.dtype, false);
+    emit(
+      `var<workgroup> reduce_ws_${ws.stepIdx}: array<${ty}, ${ws.elemCount}>;`,
+    );
   }
 
   // --- Workgroup size and grid ---
@@ -748,25 +781,103 @@ export function blockMapFusedShaderSource(
     };
 
     // Generate the WGSL for each kernel output
-    for (let oi = 0; oi < kernel.numOutputs; oi++) {
-      const outId = step.outputs[oi];
-      const rhs = strip1(gen(kernel.outputs[oi].exp));
+    const re = stepReductions[si];
+
+    if (re) {
+      // --- Reduction kernel: tree reduction in shared memory ---
+      // This kernel has exactly 1 output (multi-output reductions rejected above).
+      const outId = step.outputs[0];
+      const rhs = strip1(gen(kernel.outputs[0].exp));
+      const reDtype = re.dtype;
+      const reTy = dtypeToWgsl(reDtype, false);
+      const wsName = `reduce_ws_${si}`;
+
+      // 1. Each thread stores its per-element value into the workspace
+      emit(`${wsName}[tidx] = ${reTy}(${rhs});`);
+      emit("workgroupBarrier();");
+
+      // 2. Tree reduction with halving stride (handles non-power-of-2)
+      let startStride = 1;
+      while (startStride * 2 < blockSize) startStride *= 2;
+
+      for (let stride = startStride; stride >= 1; stride >>= 1) {
+        emit(
+          `if (tidx < ${stride}u && tidx + ${stride}u < ${blockSize}u) {`,
+          pushIndent,
+        );
+        const thisSlot = `${wsName}[tidx]`;
+        const otherSlot = `${wsName}[tidx + ${stride}u]`;
+        if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
+        else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
+        else if (re.op === AluOp.Min) {
+          if (reDtype === DType.Bool)
+            emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
+          else emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
+        } else if (re.op === AluOp.Max) {
+          if (reDtype === DType.Bool)
+            emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
+          else emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
+        }
+        emit(popIndent, "}");
+        emit("workgroupBarrier();");
+      }
+
+      // 3. Thread 0 applies the epilogue and writes the result
+      emit("if (tidx == 0u) {", pushIndent);
+
+      // Apply reduction epilogue (e.g., acc/size for mean)
+      // The epilogue is an AluExp that references the "acc" variable.
+      const accVar = `${wsName}[0u]`;
+      let finalValue: string;
+      // Check if epilogue is identity (just acc variable)
+      const isIdentityEpilogue =
+        re.epilogue.op === AluOp.Variable && re.epilogue.arg === "acc";
+      if (isIdentityEpilogue) {
+        finalValue = accVar;
+      } else {
+        // Generate the epilogue expression with acc substituted
+        // Use a fresh gensym context for the epilogue
+        expContext.set(AluExp.variable(reDtype, "acc"), accVar);
+        finalValue = strip1(gen(re.epilogue));
+      }
 
       const resultIdx = bodyOutputIds.indexOf(outId);
       if (resultIdx >= 0 && !passThroughOutputs.has(resultIdx)) {
-        // Write to global output buffer with block offset
+        // Write scalar to global output — reduction produces 1 element per block
         const resultTy = dtypeToWgsl(outputDtypes[resultIdx], true);
-        const castRhs =
-          resultTy !== dtypeToWgsl(kernel.outputs[oi].exp.dtype)
-            ? `${resultTy}(${rhs})`
-            : rhs;
-        emit(
-          `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${castRhs};`,
-        );
+        const castFinal =
+          resultTy !== reTy ? `${resultTy}(${finalValue})` : finalValue;
+        emit(`result${resultIdx}[i32(out_base_${resultIdx})] = ${castFinal};`);
       } else if (idIsShmem.has(outId)) {
-        // Write to shared memory
+        // Write reduced scalar to shmem[0] for subsequent steps
         const shmemName = idToReadName.get(outId)!;
-        emit(`${shmemName}[tidx] = ${rhs};`);
+        emit(`${shmemName}[0u] = ${finalValue};`);
+      }
+      emit(popIndent, "}");
+      // Barrier so all threads can read the reduced scalar in subsequent steps
+      emit("workgroupBarrier();");
+    } else {
+      // --- Elementwise kernel: each thread writes its own element ---
+      for (let oi = 0; oi < kernel.numOutputs; oi++) {
+        const outId = step.outputs[oi];
+        const rhs = strip1(gen(kernel.outputs[oi].exp));
+
+        const resultIdx = bodyOutputIds.indexOf(outId);
+        if (resultIdx >= 0 && !passThroughOutputs.has(resultIdx)) {
+          // Write to global output buffer with block offset
+          const resultTy = dtypeToWgsl(outputDtypes[resultIdx], true);
+          const castRhs =
+            resultTy !== dtypeToWgsl(kernel.outputs[oi].exp.dtype)
+              ? `${resultTy}(${rhs})`
+              : rhs;
+          emit(
+            `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${castRhs};`,
+          );
+        } else if (idIsShmem.has(outId)) {
+          // Write to shared memory
+          const shmemName = idToReadName.get(outId)!;
+          emit(`${shmemName}[tidx] = ${rhs};`);
+        }
       }
     }
   }

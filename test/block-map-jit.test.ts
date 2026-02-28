@@ -270,3 +270,156 @@ describe("lax.blockMap — fused shader path", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// In-block reduction tests (Phase 3.1)
+// ---------------------------------------------------------------------------
+describe("lax.blockMap — in-block reductions", () => {
+  const isWebGPU = defaultDevice() === "webgpu";
+
+  test("block - max(block) centers correctly", () => {
+    // Reduce-then-elementwise: max is intermediate, output same shape as input
+    const body = (block: np.Array) => {
+      using m = np.max(block);
+      return np.subtract(block, m);
+    };
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(body, xs, { blockShape: [4] }),
+    );
+    using xs = np.array([1, 3, 2, 4, 10, 6, 8, 7], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    // Block 0: [1,3,2,4] - 4 = [-3,-1,-2,0]
+    // Block 1: [10,6,8,7] - 10 = [0,-4,-2,-3]
+    expect(result).toBeAllclose([-3, -1, -2, 0, 0, -4, -2, -3]);
+    f_jit.dispose();
+  });
+
+  test("block - mean(block) centers with epilogue", () => {
+    // Mean reduction has epilogue: acc / size. Tests non-identity epilogue.
+    const body = (block: np.Array) => {
+      using m = np.mean(block);
+      return np.subtract(block, m);
+    };
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(body, xs, { blockShape: [4] }),
+    );
+    using xs = np.array([2, 4, 6, 8, 1, 3, 5, 7], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    // Block 0: mean([2,4,6,8]) = 5, [2,4,6,8] - 5 = [-3,-1,1,3]
+    // Block 1: mean([1,3,5,7]) = 4, [1,3,5,7] - 4 = [-3,-1,1,3]
+    expect(result).toBeAllclose([-3, -1, 1, 3, -3, -1, 1, 3]);
+    f_jit.dispose();
+  });
+
+  test("exp(block - max(block)) softmax numerator", () => {
+    // Two-step: reduce (max), elementwise (subtract + exp). Core of softmax.
+    const body = (block: np.Array) => {
+      using m = np.max(block);
+      using shifted = np.subtract(block, m);
+      return np.exp(shifted);
+    };
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(body, xs, { blockShape: [4] }),
+    );
+    using xs = np.array([0, 1, 2, 3, 1, 1, 1, 1], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    // Block 0: max=3, exp([-3,-2,-1,0]) = [0.0498, 0.1353, 0.3679, 1.0]
+    // Block 1: max=1, exp([0,0,0,0]) = [1,1,1,1]
+    expect(result).toBeAllclose(
+      [Math.exp(-3), Math.exp(-2), Math.exp(-1), Math.exp(0), 1, 1, 1, 1],
+      { atol: 1e-5 },
+    );
+    f_jit.dispose();
+  });
+
+  test("sum reduction as intermediate followed by divide", () => {
+    // block / sum(block) — normalize to sum=1
+    const body = (block: np.Array) => {
+      using s = np.sum(block);
+      return np.divide(block, s);
+    };
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(body, xs, { blockShape: [4] }),
+    );
+    using xs = np.array([1, 2, 3, 4, 2, 2, 2, 2], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    // Block 0: sum=10, [1/10, 2/10, 3/10, 4/10] = [0.1, 0.2, 0.3, 0.4]
+    // Block 1: sum=8, [2/8, 2/8, 2/8, 2/8] = [0.25, 0.25, 0.25, 0.25]
+    expect(result).toBeAllclose([0.1, 0.2, 0.3, 0.4, 0.25, 0.25, 0.25, 0.25]);
+    f_jit.dispose();
+  });
+
+  test("fused path is taken for reduce-then-elementwise body", () => {
+    if (!isWebGPU) return;
+
+    const logs: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+
+    try {
+      setDebug(1);
+      const f_jit = jit((xs: np.Array) =>
+        lax.blockMap(
+          (block: np.Array) => {
+            using m = np.max(block);
+            return np.subtract(block, m);
+          },
+          xs,
+          { blockShape: [4] },
+        ),
+      );
+      using xs = np.array([1, 3, 2, 4, 10, 6, 8, 7], {
+        dtype: DType.Float32,
+      });
+      using result = f_jit(xs);
+      expect(result).toBeAllclose([-3, -1, -2, 0, 0, -4, -2, -3]);
+
+      const fusedLog = logs.find((l) => l.includes("fused WebGPU shader path"));
+      expect(fusedLog).toBeDefined();
+
+      f_jit.dispose();
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
+  });
+
+  test("block * 2 then sum as intermediate then broadcast", () => {
+    // Multi-step: elementwise → reduce → elementwise
+    // block * 2, then divide by sum(block*2)
+    const body = (block: np.Array) => {
+      using two = np.array(2, { dtype: DType.Float32 });
+      using doubled = np.multiply(block, two);
+      using s = np.sum(doubled);
+      return np.divide(doubled, s);
+    };
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(body, xs, { blockShape: [4] }),
+    );
+    using xs = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    // doubled = [2,4,6,8], sum = 20
+    // [2/20, 4/20, 6/20, 8/20] = [0.1, 0.2, 0.3, 0.4]
+    expect(result).toBeAllclose([0.1, 0.2, 0.3, 0.4]);
+    f_jit.dispose();
+  });
+
+  test("non-power-of-2 block size reduction", () => {
+    // blockSize=3 tests the non-power-of-2 tree reduction logic
+    const body = (block: np.Array) => {
+      using m = np.max(block);
+      return np.subtract(block, m);
+    };
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(body, xs, { blockShape: [3] }),
+    );
+    using xs = np.array([1, 5, 3, 7, 2, 9], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    // Block 0: max([1,5,3])=5, [1-5, 5-5, 3-5] = [-4,0,-2]
+    // Block 1: max([7,2,9])=9, [7-9, 2-9, 9-9] = [-2,-7,0]
+    expect(result).toBeAllclose([-4, 0, -2, -2, -7, 0]);
+    f_jit.dispose();
+  });
+});
