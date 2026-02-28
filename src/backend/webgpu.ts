@@ -28,6 +28,10 @@ import {
   range,
   strip1,
 } from "../utils";
+import {
+  blockMapFusedShaderSource,
+  type BlockMapShaderParams,
+} from "./webgpu/block-map";
 import { erfSrc, threefrySrc } from "./webgpu/builtins";
 import {
   calculateGrid,
@@ -2037,6 +2041,56 @@ export class WebGPUBackend implements Backend {
       }
       if (!evicted) break;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // BlockMap fused shader (Phase 3: single-dispatch shared-memory compiler)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compile a block_map body into a fused WGSL compute shader.
+   * Returns a reusable Executable, or null if the body is not eligible.
+   */
+  prepareBlockMapFused(
+    params: BlockMapShaderParams,
+  ): Executable<ShaderDispatch[]> | null {
+    try {
+      const shader = blockMapFusedShaderSource(
+        this.device,
+        params,
+        this.capabilities,
+      );
+      if (!shader) return null;
+      const pipeline = this.pipelines.prepareSync(shader);
+      return new Executable(null as any, [{ ...shader, pipeline }]);
+    } catch (e) {
+      if (DEBUG >= 2) {
+        console.warn("WebGPU block_map fused shader codegen failed:", e);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Dispatch a fused block_map shader.
+   * Buffer binding order: [bodyInputs (consts + block inputs), outputs]
+   */
+  dispatchBlockMapFused(
+    exe: Executable<ShaderDispatch[]>,
+    inputs: Slot[],
+    outputs: Slot[],
+  ): void {
+    const inputBuffers = inputs.map((slot) => this.#getBuffer(slot).buffer);
+    const outputBuffers = outputs.map((slot) => this.#getBuffer(slot).buffer);
+    pipelineSubmit(
+      this.device,
+      exe.data,
+      inputBuffers,
+      outputBuffers,
+      undefined,
+      this.#batchEncoder ?? undefined,
+      this.#batchEncoder ? this.#batchUniformsToDestroy : undefined,
+    );
   }
 
   // ---------------------------------------------------------------------------

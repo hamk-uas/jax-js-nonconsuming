@@ -3,11 +3,13 @@
  * of blocks, slicing inputs and assembling outputs.
  *
  * The fallback path iterates in JS, calling bodyProgram.execute() per block.
- * Future paths: WASM compiled block-loop, WebGPU fused shared-memory shader.
+ * The fused path (WebGPU only) compiles the body into a single WGSL shader
+ * where each workgroup processes one block using shared memory.
  */
 
 import { byteWidth } from "../alu";
 import type { Backend, Slot } from "../backend";
+import { DEBUG } from "../utils";
 import type { PendingExecute } from "./array";
 import type { Jaxpr } from "./jaxpr";
 import type { JitProgram } from "./jit";
@@ -42,13 +44,55 @@ export interface ExecuteBlockMapResult {
 }
 
 /**
- * Execute a block_map. Currently uses the JS fallback path that calls
- * bodyProgram.execute() per block.
+ * Execute a block_map. Tries the fused WebGPU path first (single dispatch,
+ * shared-memory intermediates), then falls back to the JS loop executor.
  */
 export function executeBlockMap(
   params: ExecuteBlockMapParams,
 ): ExecuteBlockMapResult {
+  // Try fused WebGPU shader path
+  if (params.backend.type === "webgpu") {
+    const result = tryExecuteBlockMapFused(params);
+    if (result) return result;
+  }
   return executeBlockMapFallback(params);
+}
+
+// ---------------------------------------------------------------------------
+// Fused WebGPU path: single-dispatch shared-memory shader
+// ---------------------------------------------------------------------------
+
+function tryExecuteBlockMapFused(
+  params: ExecuteBlockMapParams,
+): ExecuteBlockMapResult | null {
+  // Lazy import to avoid circular dependency at module load time.
+  // The scan-executor uses the same pattern (type import + cast).
+  const webgpuBackend =
+    params.backend as import("../backend/webgpu").WebGPUBackend;
+
+  const exe = webgpuBackend.prepareBlockMapFused({
+    bodyProgram: params.bodyProgram,
+    blockShape: params.blockShape,
+    gridShape: params.gridShape,
+    inAxes: params.inAxes,
+    outAxes: params.outAxes,
+    numConsts: params.numConsts,
+    numInputs: params.numInputs,
+    inputShapes: params.inputShapes,
+    outputShapes: params.outputShapes,
+  });
+
+  if (!exe) return null;
+
+  if (DEBUG >= 1) {
+    console.info("block_map: using fused WebGPU shader path");
+  }
+
+  // Dispatch: inputs = [consts, blockInputs], outputs = [outputSlots]
+  const inputs = [...params.constSlots, ...params.inputSlots];
+  webgpuBackend.dispatchBlockMapFused(exe, inputs, params.outputSlots);
+
+  return { outputs: params.outputSlots, pending: [] };
 }
 
 // ---------------------------------------------------------------------------

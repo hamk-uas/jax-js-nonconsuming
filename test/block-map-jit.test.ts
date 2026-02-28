@@ -2,16 +2,18 @@
  * Phase 3 tests for lax.blockMap — JIT compilation path.
  *
  * Verifies that jit(blockMap(...)) produces block_map JitSteps and
- * executes correctly via the fallback executor.
+ * executes correctly via both fused WebGPU shader and fallback paths.
  */
 
 import {
+  defaultDevice,
   DType,
   grad,
   init,
   jit,
   lax,
   numpy as np,
+  setDebug,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, test } from "vitest";
 
@@ -162,5 +164,109 @@ describe("lax.blockMap — Phase 3 JIT", () => {
     using result = f_jit(xs);
     expect(result).toBeAllclose([84]);
     f_jit.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fused path verification
+// ---------------------------------------------------------------------------
+describe("lax.blockMap — fused shader path", () => {
+  const isWebGPU = defaultDevice() === "webgpu";
+
+  test("fused path is taken for divisible elementwise body", () => {
+    if (!isWebGPU) return; // Only WebGPU has the fused path
+
+    const logs: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+
+    try {
+      setDebug(1);
+      const f_jit = jit((xs: np.Array) =>
+        lax.blockMap(
+          (block: np.Array) =>
+            np.multiply(block, np.array(2, { dtype: DType.Float32 })),
+          xs,
+          { blockShape: [4] },
+        ),
+      );
+      using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+      using result = f_jit(xs);
+      expect(result).toBeAllclose([2, 4, 6, 8, 10, 12, 14, 16]);
+
+      const fusedLog = logs.find((l) => l.includes("fused WebGPU shader path"));
+      expect(fusedLog).toBeDefined();
+
+      f_jit.dispose();
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
+  });
+
+  test("fused path handles identity pass-through body", () => {
+    if (!isWebGPU) return;
+
+    const logs: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+
+    try {
+      setDebug(1);
+      const f_jit = jit((xs: np.Array) =>
+        lax.blockMap((block: np.Array) => block, xs, { blockShape: [4] }),
+      );
+      using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+      using result = f_jit(xs);
+      expect(result).toBeAllclose([1, 2, 3, 4, 5, 6, 7, 8]);
+
+      const fusedLog = logs.find((l) => l.includes("fused WebGPU shader path"));
+      expect(fusedLog).toBeDefined();
+
+      f_jit.dispose();
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
+  });
+
+  test("fallback for non-divisible dimensions", () => {
+    if (!isWebGPU) return;
+
+    const logs: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+
+    try {
+      setDebug(1);
+      const f_jit = jit((xs: np.Array) =>
+        lax.blockMap((block: np.Array) => block, xs, { blockShape: [4] }),
+      );
+      using xs = np.array(
+        Array.from({ length: 10 }, (_, i) => i + 1),
+        { dtype: DType.Float32 },
+      );
+      using result = f_jit(xs);
+      expect(result).toBeAllclose(Array.from({ length: 10 }, (_, i) => i + 1));
+
+      // Should NOT have taken the fused path
+      const fusedLog = logs.find((l) => l.includes("fused WebGPU shader path"));
+      expect(fusedLog).toBeUndefined();
+
+      // Should have logged the fallback reason
+      const fallbackLog = logs.find((l) => l.includes("not divisible"));
+      expect(fallbackLog).toBeDefined();
+
+      f_jit.dispose();
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
   });
 });
