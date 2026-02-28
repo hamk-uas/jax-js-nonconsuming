@@ -1033,12 +1033,7 @@ describe("lax.tiledMatmul", () => {
     f.dispose();
   });
 
-  // grad(tiledMatmul): ForiLoop backward pass + BlockMap JVP work correctly,
-  // but the blockMap transpose output reassembly has a bug with mixed
-  // mapped/unmapped outAxes (e.g., [0, null]) — tiles differing only in the
-  // unmapped grid axis are concatenated instead of summed. This produces
-  // block-diagonal gradients instead of full gradients.
-  test.skip("grad(tiledMatmul) matches grad(np.matmul)", () => {
+  test("grad(tiledMatmul) matches grad(np.matmul)", () => {
     using B = np.eye(16, { dtype: DType.Float32 });
     const f_tiled = (A: np.Array) => {
       using result = lax.tiledMatmul(A, B, { Br: 4, Bc: 4, Bk: 4 });

@@ -229,7 +229,7 @@ describe("lax.foriLoop — Phase 1b", () => {
   });
 
   // T3.5: grad through foriLoop
-  test.skip("grad through foriLoop", () => {
+  test("grad through foriLoop", () => {
     // f(x) = fori_loop(0, 3, (i, carry) => carry * x, 1.0)
     // = x^3, grad = 3*x^2
     const f = (x: np.Array) => {

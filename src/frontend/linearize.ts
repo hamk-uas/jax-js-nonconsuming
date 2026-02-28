@@ -1833,12 +1833,8 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     transposedBody.dispose();
 
     const numUndefConsts = constOutAxes.length;
-    let constCts = transposedOut.slice(0, numUndefConsts);
+    const constCts = transposedOut.slice(0, numUndefConsts);
     const argCts = transposedOut.slice(numUndefConsts);
-
-    constCts = constCts.map((ct) => {
-      return ct.sum([0]);
-    });
 
     const outVals = [];
     let constIdx = 0,

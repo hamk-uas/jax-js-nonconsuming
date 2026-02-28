@@ -49,6 +49,7 @@ import {
   _peArrayCreationTracker,
   AbstractValue,
   CompareOp,
+  add as coreAdd,
   concatenate as coreConcatenate,
   exp as coreExp,
   mul as coreMul,
@@ -1786,14 +1787,33 @@ export class Array extends Tracer {
             continue;
           }
 
-          // Hierarchical concatenation: from last grid axis to first.
+          // Hierarchical concatenation/reduction: from last grid axis to first.
           // blocks[o] are in row-major order over the grid.
-          // For each grid axis (from innermost), group and concat.
+          // For each grid axis (from innermost): concat mapped axes, sum null axes.
           let current = outputBlocks[o] as Array[];
           for (let g = gridRank - 1; g >= 0; g--) {
-            if (axes[g] === null) continue;
+            const stride = gridShape[g];
+            if (axes[g] === null) {
+              // Null outAxis: reduce (sum) blocks along this grid dimension.
+              // This handles backward-pass accumulation for unmapped input axes.
+              if (stride <= 1) continue;
+              const reduced: Array[] = [];
+              for (let start = 0; start < current.length; start += stride) {
+                let acc = coreAdd(current[start], current[start + 1]) as Array;
+                for (let d = 2; d < stride; d++) {
+                  const next = coreAdd(acc, current[start + d]) as Array;
+                  acc.dispose();
+                  acc = next;
+                }
+                reduced.push(acc);
+              }
+              if (current !== outputBlocks[o]) {
+                for (const c of current) c.dispose();
+              }
+              current = reduced;
+              continue;
+            }
             const concatAxis = axes[g]!;
-            const stride = gridShape[g]; // number of items to group
             const grouped: Array[] = [];
             for (let start = 0; start < current.length; start += stride) {
               const group = current.slice(start, start + stride);
