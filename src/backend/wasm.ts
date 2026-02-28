@@ -121,6 +121,38 @@ export interface NativeScanGeneralParams {
   routineInfos?: ScanRoutineInfo[];
 }
 
+/** Parameters for the compiled block-map WASM codegen. */
+export interface BlockMapWasmParams {
+  numConsts: number;
+  numInputs: number;
+  numOutputs: number;
+  gridRank: number;
+  gridShape: number[];
+  blockShape: number[];
+  /** [numInputs][gridRank] — which input dim maps to each grid dim, or null. */
+  inAxes: (number | null)[][];
+  /** [numOutputs][gridRank] — which output dim maps to each grid dim, or null. */
+  outAxes: (number | null)[][];
+  inputShapes: number[][];
+  outputShapes: number[][];
+  /** Byte sizes of each constant buffer. */
+  constSizes: number[];
+  /** Byte sizes of each body-input block buffer (block-shaped). */
+  blockInputSizes: number[];
+  /** Byte sizes of each body-output block buffer (block-shaped). */
+  blockOutputSizes: number[];
+  /** Internal scratch buffer sizes produced by body kernel steps. */
+  internalSizes: number[];
+  /** Reindexed body kernel steps. */
+  steps: GeneralScanStep[];
+  /** Map from body output index to the producing internal buffer index. */
+  outputSources: number[];
+  /** Strides (in bytes) per dimension for each input. */
+  inputStrides: number[][];
+  /** Strides (in bytes) per dimension for each output. */
+  outputStrides: number[][];
+}
+
 const moduleCache = new Map<string, WebAssembly.Module>();
 
 // ---------------------------------------------------------------------------
@@ -1372,6 +1404,88 @@ export class WasmBackend implements Backend {
     return megaModule.stepInfos.some(
       (s) => s.type === "kernel" && s.kernelSize >= PARALLEL_THRESHOLD,
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // Compiled block-map loop
+  // -------------------------------------------------------------------------
+
+  /**
+   * Compile a block-map loop into a single WASM module.
+   * Returns an Executable whose data is a WasmProgram, or null if the body
+   * cannot be compiled (e.g. contains routines or unsupported steps).
+   */
+  prepareBlockMapWasm(
+    params: BlockMapWasmParams,
+  ): Executable<WasmProgram> | null {
+    try {
+      const bytes = codegenBlockMapLoop(params);
+      const module = new WebAssembly.Module(bytes);
+      return new Executable(null as any, { module });
+    } catch (e) {
+      if (DEBUG >= 2) console.warn("[wasm-block-map] codegen failed:", e);
+      return null;
+    }
+  }
+
+  /**
+   * Dispatch a compiled block-map WASM module.
+   *
+   * Allocates internal scratch buffers and block-input/output scratch buffers,
+   * runs the compiled loop, then frees scratch.
+   */
+  dispatchBlockMapWasm(
+    exe: Executable<WasmProgram>,
+    params: BlockMapWasmParams,
+    constSlots: Slot[],
+    inputSlots: Slot[],
+    outputSlots: Slot[],
+  ): void {
+    const { blockInputSizes, blockOutputSizes, internalSizes } = params;
+
+    // Allocate scratch buffers for block inputs (body reads from these)
+    const scratchInputPtrs: number[] = [];
+    for (const size of blockInputSizes) {
+      scratchInputPtrs.push(this.#allocator.malloc(size));
+    }
+
+    // Allocate scratch buffers for block outputs (body writes to these)
+    const scratchOutputPtrs: number[] = [];
+    for (const size of blockOutputSizes) {
+      scratchOutputPtrs.push(this.#allocator.malloc(size));
+    }
+
+    // Allocate internal scratch buffers (kernel intermediates)
+    const internalPtrs: number[] = [];
+    for (const size of internalSizes) {
+      internalPtrs.push(this.#allocator.malloc(size));
+    }
+
+    // Build args: [consts, inputs, outputs, scratchInputs, scratchOutputs, internals]
+    const args: number[] = [];
+    for (const slot of constSlots) args.push(this.#getPtr(slot));
+    for (const slot of inputSlots) args.push(this.#getPtr(slot));
+    for (const slot of outputSlots) args.push(this.#getPtr(slot));
+    args.push(...scratchInputPtrs);
+    args.push(...scratchOutputPtrs);
+    args.push(...internalPtrs);
+
+    // Instantiate and run
+    let instance = this.#instanceCache.get(exe.data.module);
+    if (!instance) {
+      const imports: WebAssembly.Imports = { env: { memory: this.#memory } };
+      instance = new WebAssembly.Instance(exe.data.module, imports);
+      this.#instanceCache.set(exe.data.module, instance);
+    }
+    const blockMapFunc = instance.exports.block_map_loop as (
+      ...args: number[]
+    ) => void;
+    blockMapFunc(...args);
+
+    // Free scratch
+    for (const ptr of scratchInputPtrs) this.#allocator.free(ptr);
+    for (const ptr of scratchOutputPtrs) this.#allocator.free(ptr);
+    for (const ptr of internalPtrs) this.#allocator.free(ptr);
   }
 }
 
@@ -3005,6 +3119,351 @@ function codegenNativeScanGeneral(
   });
 
   cg.export(scanFunc, "scan");
+  return cg.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Compiled block-map loop codegen (WASM)
+// ---------------------------------------------------------------------------
+
+/** Context for block-map WASM expression translation. */
+interface BlockMapContext {
+  gidx: number;
+  ridx: number;
+  acc?: number;
+  constsBase: number;
+  numConsts: number;
+  scratchInputsBase: number;
+  numInputs: number;
+  internalsBase: number;
+  numInternal: number;
+}
+
+/**
+ * Translate an AluExp to WASM code within a block-map context.
+ * Body kernels have GIDs mapped as:
+ *   [0..numConsts) → constants
+ *   [numConsts..numConsts+numInputs) → scratch block-input buffers
+ *   [numConsts+numInputs..) → internal buffers
+ */
+function translateExpWithBlockMapContext(
+  cg: CodeGenerator,
+  funcs: Record<string, number>,
+  exp: AluExp,
+  ctx: BlockMapContext,
+) {
+  translateExpCore(cg, funcs, exp, {
+    getVariable: (name) => {
+      if (name === "gidx") return ctx.gidx;
+      if (name === "ridx") {
+        if (ctx.ridx < 0)
+          throw new Error("ridx used but not in reduction context");
+        return ctx.ridx;
+      }
+      if (name === "acc") {
+        if (ctx.acc === undefined)
+          throw new Error("acc used but not in epilogue context");
+        return ctx.acc;
+      }
+      return undefined;
+    },
+    handleGlobalIndex: (cg, gen, gid, _len, indexExp, dtype) => {
+      const bw = byteWidth(dtype);
+
+      if (gid < ctx.numConsts) {
+        // Constant input
+        cg.local.get(ctx.constsBase + gid);
+      } else if (gid < ctx.numConsts + ctx.numInputs) {
+        // Block input (scratch buffer — already sliced)
+        cg.local.get(ctx.scratchInputsBase + (gid - ctx.numConsts));
+      } else {
+        // Internal buffer
+        const intIdx = gid - ctx.numConsts - ctx.numInputs;
+        cg.local.get(ctx.internalsBase + intIdx);
+      }
+
+      // Add element index offset
+      gen(indexExp);
+      cg.i32.const(bw);
+      cg.i32.mul();
+      cg.i32.add();
+
+      // Load the value
+      dty(cg, AluOp.GlobalIndex, dtype).load(Math.log2(bw));
+    },
+  });
+}
+
+/**
+ * Generate a WASM module for a compiled block-map loop.
+ *
+ * The generated module exports a single `block_map_loop` function that
+ * iterates over all blocks, copies input slices into scratch buffers,
+ * executes inlined body kernels, and copies outputs into the result buffers.
+ *
+ * Function arguments:
+ *   [...constPtrs, ...inputPtrs, ...outputPtrs,
+ *    ...scratchInputPtrs, ...scratchOutputPtrs, ...internalPtrs]
+ */
+function codegenBlockMapLoop(
+  params: BlockMapWasmParams,
+): Uint8Array<ArrayBuffer> {
+  const {
+    numConsts,
+    numInputs,
+    numOutputs,
+    gridRank,
+    gridShape,
+    blockShape,
+    inAxes,
+    outAxes,
+    inputShapes,
+    outputShapes,
+    blockInputSizes,
+    blockOutputSizes,
+    internalSizes,
+    steps,
+    outputSources,
+    inputStrides,
+    outputStrides,
+  } = params;
+  const numInternal = internalSizes.length;
+  const numBlocks = gridShape.reduce((a, b) => a * b, 1);
+
+  // ---- Code generation ----
+  const cg = new CodeGenerator();
+  configureMemoryImport(cg);
+
+  // Collect all helper functions needed by body kernels
+  const allOps = new Set<AluOp>();
+  for (const step of steps) {
+    if (step.source instanceof Kernel) {
+      const tune = tuneNullopt(step.source);
+      for (const op of tune.exp.distinctOps().keys()) allOps.add(op);
+      if (tune.epilogue) {
+        for (const op of tune.epilogue.distinctOps().keys()) allOps.add(op);
+      }
+    }
+  }
+  const funcs = importWasmHelperFuncs(cg, allOps);
+
+  // Function arguments layout:
+  //   [consts(numConsts), inputs(numInputs), outputs(numOutputs),
+  //    scratchInputs(numInputs), scratchOutputs(numOutputs), internals(numInternal)]
+  const numArgs =
+    numConsts + numInputs + numOutputs + numInputs + numOutputs + numInternal;
+
+  const constsBase = 0;
+  const inputsBase = numConsts;
+  const outputsBase = numConsts + numInputs;
+  const scratchInputsBase = numConsts + numInputs + numOutputs;
+  const _scratchOutputsBase = numConsts + numInputs + numOutputs + numInputs;
+  const internalsBase =
+    numConsts + numInputs + numOutputs + numInputs + numOutputs;
+
+  const mainFunc = cg.function(rep(numArgs, cg.i32), [], () => {
+    // Local variables
+    const flatIdx = cg.local.declare(cg.i32);
+    const gidx = cg.local.declare(cg.i32);
+    // Block coordinates (one per grid rank)
+    const blockCoords: number[] = [];
+    for (let g = 0; g < gridRank; g++) {
+      blockCoords.push(cg.local.declare(cg.i32));
+    }
+    const remaining = cg.local.declare(cg.i32);
+    // Temp locals for byte offsets
+    const srcOffset = cg.local.declare(cg.i32);
+    const dstOffset = cg.local.declare(cg.i32);
+    const copySize = cg.local.declare(cg.i32);
+
+    // Main loop: for flatIdx = 0 to numBlocks - 1
+    cg.i32.const(0);
+    cg.local.set(flatIdx);
+
+    cg.loop(cg.void);
+    {
+      cg.block(cg.void);
+      cg.local.get(flatIdx);
+      cg.i32.const(numBlocks);
+      cg.i32.ge_u();
+      cg.br_if(0);
+
+      // Decompose flatIdx to grid coordinates (row-major: last dim fastest)
+      cg.local.get(flatIdx);
+      cg.local.set(remaining);
+      for (let g = gridRank - 1; g >= 0; g--) {
+        cg.local.get(remaining);
+        cg.i32.const(gridShape[g]);
+        cg.i32.rem_u();
+        cg.local.set(blockCoords[g]);
+        cg.local.get(remaining);
+        cg.i32.const(gridShape[g]);
+        cg.i32.div_u();
+        cg.local.set(remaining);
+      }
+
+      // ---- Step 1: Copy input slices into scratch buffers ----
+      for (let i = 0; i < numInputs; i++) {
+        const axes = inAxes[i];
+        const inputShape = inputShapes[i];
+        const iStrides = inputStrides[i];
+
+        // Zero the scratch buffer (handles boundary padding)
+        cg.local.get(scratchInputsBase + i);
+        cg.i32.const(0);
+        cg.i32.const(blockInputSizes[i]);
+        cg.memory.fill();
+
+        // Compute source byte offset: sum over grid dims
+        // offset = sum_g(blockCoord[g] * blockShape[g] * stride[axes[g]])
+        cg.i32.const(0);
+        cg.local.set(srcOffset);
+        for (let g = 0; g < gridRank; g++) {
+          if (axes[g] !== null) {
+            const ax = axes[g]!;
+            cg.local.get(srcOffset);
+            cg.local.get(blockCoords[g]);
+            cg.i32.const(blockShape[g] * iStrides[ax]);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.set(srcOffset);
+          }
+        }
+
+        // Compute valid copy size. For interior blocks, it's blockInputSizes[i].
+        // For boundary blocks (last on any mapped axis), clamp to available data.
+        // We emit a conservative loop: copy min(blockDim, available) on each
+        // mapped axis. For 1D (gridRank=1): copySize = min(blockShape*bw, (inputDim - start)*bw).
+        // For multi-dim we need row-by-row copy unless contiguous.
+        //
+        // Simplification: we only handle the contiguous case (1D or leading-axis).
+        // The contiguity is checked at prepare time so we can just do a single memory.copy.
+        // The copy length is min(blockInputSizes[i], totalInputBytes - srcOffset).
+        cg.local.get(scratchInputsBase + i); // dst
+        cg.local.get(inputsBase + i); // src base
+        cg.local.get(srcOffset);
+        cg.i32.add(); // src = inputPtr + srcOffset
+
+        // copySize = min(blockInputSizes[i], inputTotalBytes - srcOffset)
+        const inputTotalBytes = inputShape.reduce((a, b) => a * b, 1);
+        const elemBytes = iStrides[inputShape.length - 1]; // innermost stride = elemBytes
+        const totalBytes = inputTotalBytes * elemBytes;
+        cg.i32.const(totalBytes);
+        cg.local.get(srcOffset);
+        cg.i32.sub(); // available = totalBytes - srcOffset
+        // clamp to blockInputSizes[i]
+        cg.local.tee(copySize);
+        cg.i32.const(blockInputSizes[i]);
+        cg.i32.gt_u();
+        cg.if(cg.void);
+        cg.i32.const(blockInputSizes[i]);
+        cg.local.set(copySize);
+        cg.end();
+
+        cg.local.get(copySize);
+        cg.memory.copy(); // memory.copy(dst, src, len) — but WASM memory.copy is (dst, src, len)
+      }
+
+      // ---- Step 2: Execute body kernel steps ----
+      for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+        const step = steps[stepIdx];
+        if (step.source instanceof Kernel) {
+          const kernel = step.source;
+          const internalIdx = step.outputInternalIdx;
+          const bw = byteWidth(kernel.outputs[0].dtype);
+
+          emitKernelBody({
+            cg,
+            funcs,
+            kernel,
+            gidx,
+            emitOutputAddr: () => {
+              cg.local.get(internalsBase + internalIdx);
+              cg.local.get(gidx);
+              cg.i32.const(bw);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+            emitExp: (exp, extra) => {
+              const ctx: BlockMapContext = {
+                gidx,
+                ridx: -1,
+                constsBase,
+                numConsts,
+                scratchInputsBase,
+                numInputs,
+                internalsBase,
+                numInternal,
+              };
+              if (extra.ridx !== undefined) ctx.ridx = extra.ridx;
+              if (extra.acc !== undefined) ctx.acc = extra.acc;
+              translateExpWithBlockMapContext(cg, funcs, exp, ctx);
+            },
+          });
+        }
+      }
+
+      // ---- Step 3: Copy body outputs to the result buffers ----
+      for (let o = 0; o < numOutputs; o++) {
+        const axes = outAxes[o];
+        const outputShape = outputShapes[o];
+        const oStrides = outputStrides[o];
+        const srcInternalIdx = outputSources[o];
+
+        // Compute destination byte offset
+        cg.i32.const(0);
+        cg.local.set(dstOffset);
+        for (let g = 0; g < gridRank; g++) {
+          if (axes[g] !== null) {
+            const ax = axes[g]!;
+            cg.local.get(dstOffset);
+            cg.local.get(blockCoords[g]);
+            cg.i32.const(blockShape[g] * oStrides[ax]);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.set(dstOffset);
+          }
+        }
+
+        // Copy from internal buffer to output, clamping at boundary
+        cg.local.get(outputsBase + o); // dst base
+        cg.local.get(dstOffset);
+        cg.i32.add(); // dst = outputPtr + dstOffset
+
+        cg.local.get(internalsBase + srcInternalIdx); // src = internal buffer
+
+        // copySize = min(blockOutputSizes[o], outputTotalBytes - dstOffset)
+        const outElemBytes = oStrides[outputShape.length - 1];
+        const outTotalBytes =
+          outputShape.reduce((a, b) => a * b, 1) * outElemBytes;
+        cg.i32.const(outTotalBytes);
+        cg.local.get(dstOffset);
+        cg.i32.sub(); // available
+        cg.local.tee(copySize);
+        cg.i32.const(blockOutputSizes[o]);
+        cg.i32.gt_u();
+        cg.if(cg.void);
+        cg.i32.const(blockOutputSizes[o]);
+        cg.local.set(copySize);
+        cg.end();
+
+        cg.local.get(copySize);
+        cg.memory.copy();
+      }
+
+      // flatIdx++
+      cg.local.get(flatIdx);
+      cg.i32.const(1);
+      cg.i32.add();
+      cg.local.set(flatIdx);
+
+      cg.br(1); // continue loop
+      cg.end();
+    }
+    cg.end();
+  });
+
+  cg.export(mainFunc, "block_map_loop");
   return cg.finish();
 }
 

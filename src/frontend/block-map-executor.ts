@@ -7,12 +7,13 @@
  * where each workgroup processes one block using shared memory.
  */
 
-import { byteWidth } from "../alu";
+import { byteWidth, Kernel, Reduction } from "../alu";
 import type { Backend, Slot } from "../backend";
+import type { BlockMapWasmParams, GeneralScanStep } from "../backend/wasm";
 import { DEBUG } from "../utils";
 import type { PendingExecute } from "./array";
 import type { Jaxpr } from "./jaxpr";
-import type { JitProgram } from "./jit";
+import type { JitProgram, JitStep } from "./jit";
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -55,6 +56,11 @@ export function executeBlockMap(
     const result = tryExecuteBlockMapFused(params);
     if (result) return result;
   }
+  // Try compiled WASM loop path
+  if (params.backend.type === "wasm") {
+    const result = tryExecuteBlockMapWasm(params);
+    if (result) return result;
+  }
   return executeBlockMapFallback(params);
 }
 
@@ -93,6 +99,293 @@ function tryExecuteBlockMapFused(
   webgpuBackend.dispatchBlockMapFused(exe, inputs, params.outputSlots);
 
   return { outputs: params.outputSlots, pending: [] };
+}
+
+// ---------------------------------------------------------------------------
+// Compiled WASM block-loop path
+// ---------------------------------------------------------------------------
+
+function tryExecuteBlockMapWasm(
+  params: ExecuteBlockMapParams,
+): ExecuteBlockMapResult | null {
+  const wasmBackend = params.backend as import("../backend/wasm").WasmBackend;
+
+  const wasmParams = buildBlockMapWasmParams(params);
+  if (!wasmParams) return null;
+
+  const exe = wasmBackend.prepareBlockMapWasm(wasmParams);
+  if (!exe) return null;
+
+  if (DEBUG >= 1) {
+    console.info("block_map: using compiled WASM loop path");
+  }
+
+  wasmBackend.dispatchBlockMapWasm(
+    exe,
+    wasmParams,
+    params.constSlots,
+    params.inputSlots,
+    params.outputSlots,
+  );
+
+  return { outputs: params.outputSlots, pending: [] };
+}
+
+/**
+ * Build BlockMapWasmParams from the body program, or return null if the body
+ * can't be compiled to WASM (routines, loops, non-contiguous slices, etc.).
+ */
+function buildBlockMapWasmParams(
+  params: ExecuteBlockMapParams,
+): BlockMapWasmParams | null {
+  const {
+    bodyProgram,
+    bodyJaxpr,
+    blockShape,
+    inAxes,
+    outAxes,
+    numConsts,
+    numInputs,
+    gridShape,
+    inputShapes,
+    outputShapes,
+  } = params;
+  const gridRank = blockShape.length;
+  const numOutputs = bodyJaxpr.outs.length;
+
+  // Only support kernel-only bodies (no routines, nested scans, etc.)
+  type ExecuteStep = Extract<JitStep, { type: "execute" }>;
+  const executeSteps: ExecuteStep[] = [];
+  for (const step of bodyProgram.steps) {
+    if (step.type === "execute") {
+      if (!(step.source instanceof Kernel)) {
+        if (DEBUG >= 2)
+          console.log("[wasm-block-map] rejected: non-kernel execute step");
+        return null;
+      }
+      executeSteps.push(step as ExecuteStep);
+    } else if (
+      step.type === "malloc" ||
+      step.type === "free" ||
+      step.type === "recycle" ||
+      step.type === "incref"
+    ) {
+      // These are fine — they're resource management
+    } else {
+      // scan, assoc_scan, block_map, fori_loop, etc. — can't inline
+      if (DEBUG >= 2)
+        console.log(
+          `[wasm-block-map] rejected: unsupported step type ${step.type}`,
+        );
+      return null;
+    }
+  }
+
+  if (executeSteps.length === 0) {
+    if (DEBUG >= 2) console.log("[wasm-block-map] rejected: no execute steps");
+    return null;
+  }
+
+  // Check contiguity: for each input with axis mapping, the slice must be contiguous.
+  // A slice is contiguous if all mapped axes are "leading" — i.e., for mapped axis `ax`,
+  // all dimensions d > ax match the full input shape (not sub-sliced by a different grid dim).
+  for (let i = 0; i < numInputs; i++) {
+    const axes = inAxes[i];
+    const shape = inputShapes[i];
+    // Collect mapped dims
+    const mappedDims = new Set<number>();
+    for (let g = 0; g < gridRank; g++) {
+      if (axes[g] !== null) mappedDims.add(axes[g]!);
+    }
+    // For contiguity: if dim `d` is mapped, then all dims d+1..nd-1 must also
+    // be mapped (so the block is a contiguous chunk of memory).
+    // Actually, for a single mapped dim, the slice is contiguous as long as
+    // it slices a contiguous inner extent. This is true when the mapped dim
+    // is the outermost non-trivial dim: all inner dims are fully included.
+    // For simplicity: require that mapped dims form a prefix {0} or {0,1} etc.
+    // OR that there's only one mapped dim and blockShape matches inner dims
+    // after that dim.
+
+    // Simple check: for each mapped dim ax, all dims (ax+1..nd-1) must NOT
+    // be differently sliced. Since the body expects blockShape dimensions on
+    // mapped axes and full input dims on unmapped axes, this is satisfied when
+    // the inner dimensions match.
+    for (const ax of mappedDims) {
+      for (let d = ax + 1; d < shape.length; d++) {
+        if (!mappedDims.has(d)) {
+          // Inner dim `d` is unmapped — the body reads it at full size.
+          // The slice includes the full extent in this dim — contiguous.
+          continue;
+        }
+        // If inner dim is also mapped, then the slice is a 2D sub-block
+        // of a 2D array. This is NOT contiguous in general for row-major.
+        // Exception: if it's the last (innermost) dim, the contiguous
+        // row covers blockShape[g] elements, and we'd need row-by-row copy.
+        // For now, reject multi-dim sub-blocking.
+        if (DEBUG >= 2)
+          console.log(
+            "[wasm-block-map] rejected: non-contiguous multi-dim slicing",
+          );
+        return null;
+      }
+    }
+  }
+
+  // Same check for outputs
+  for (let o = 0; o < numOutputs; o++) {
+    const axes = outAxes[o];
+    const shape = outputShapes[o];
+    const mappedDims = new Set<number>();
+    for (let g = 0; g < gridRank; g++) {
+      if (axes[g] !== null) mappedDims.add(axes[g]!);
+    }
+    for (const ax of mappedDims) {
+      for (let d = ax + 1; d < shape.length; d++) {
+        if (mappedDims.has(d)) {
+          if (DEBUG >= 2)
+            console.log(
+              "[wasm-block-map] rejected: non-contiguous multi-dim output slicing",
+            );
+          return null;
+        }
+      }
+    }
+  }
+
+  // Build slot-to-internal mapping
+  const numBodyInputs = numConsts + numInputs;
+  const slotToInternal = new Map<number, number>();
+  const internalSizes: number[] = [];
+
+  for (const step of executeSteps) {
+    const kernel = step.source as Kernel;
+    const internalIdx = internalSizes.length;
+    slotToInternal.set(step.outputs[0], internalIdx);
+    internalSizes.push(
+      (kernel.size as number) * byteWidth(kernel.outputs[0].dtype),
+    );
+  }
+
+  // Build reindexed kernel steps
+  const reindexedSteps: GeneralScanStep[] = [];
+  for (const step of executeSteps) {
+    const kernel = step.source as Kernel;
+
+    // Map each input JitId to a body-local index
+    const inputSlots: number[] = [];
+    for (const inputId of step.inputs) {
+      if (inputId < numBodyInputs) {
+        inputSlots.push(inputId);
+      } else {
+        const intIdx = slotToInternal.get(inputId);
+        if (intIdx === undefined) {
+          if (DEBUG >= 2)
+            console.log(`[wasm-block-map] rejected: unmapped input ${inputId}`);
+          return null;
+        }
+        inputSlots.push(numBodyInputs + intIdx);
+      }
+    }
+
+    // Reindex kernel expressions
+    const reindexMap = inputSlots;
+    const reindexedExp = kernel.outputs[0].exp.reindexGids(reindexMap);
+    const reindexedReduction = kernel.outputs[0].reduction
+      ? new Reduction(
+          kernel.outputs[0].reduction.dtype,
+          kernel.outputs[0].reduction.op,
+          kernel.outputs[0].reduction.size,
+          kernel.outputs[0].reduction.epilogue.reindexGids(reindexMap),
+        )
+      : undefined;
+    const reindexedKernel = Kernel.single(
+      numBodyInputs + internalSizes.length,
+      kernel.size,
+      reindexedExp,
+      reindexedReduction,
+    );
+
+    reindexedSteps.push({
+      source: reindexedKernel,
+      inputSlots,
+      outputInternalIdx: slotToInternal.get(step.outputs[0])!,
+    });
+  }
+
+  // Determine which internal buffer each output comes from
+  const outputSources: number[] = [];
+  for (const outSlot of bodyProgram.outputs) {
+    const intIdx = slotToInternal.get(outSlot);
+    if (intIdx !== undefined) {
+      outputSources.push(intIdx);
+    } else {
+      // Output is a passthrough from input — not supported in compiled path
+      if (DEBUG >= 2)
+        console.log("[wasm-block-map] rejected: passthrough output");
+      return null;
+    }
+  }
+
+  // Compute byte sizes and strides
+  const bodyInputAvals = bodyJaxpr.inBinders
+    .slice(numConsts)
+    .map((v) => v.aval);
+  const bodyOutAvals = bodyJaxpr.outs.map((v) => v.aval);
+
+  const constSizes: number[] = [];
+  for (let c = 0; c < numConsts; c++) {
+    const aval = bodyJaxpr.inBinders[c].aval;
+    constSizes.push((aval.size as number) * byteWidth(aval.dtype));
+  }
+
+  const blockInputSizes: number[] = [];
+  for (let i = 0; i < numInputs; i++) {
+    blockInputSizes.push(
+      (bodyInputAvals[i].size as number) * byteWidth(bodyInputAvals[i].dtype),
+    );
+  }
+
+  const blockOutputSizes: number[] = [];
+  for (let o = 0; o < numOutputs; o++) {
+    blockOutputSizes.push(
+      (bodyOutAvals[o].size as number) * byteWidth(bodyOutAvals[o].dtype),
+    );
+  }
+
+  const inputStridesArr: number[][] = [];
+  for (let i = 0; i < numInputs; i++) {
+    const shape = inputShapes[i];
+    const elemBytes = byteWidth(bodyInputAvals[i].dtype);
+    inputStridesArr.push(computeStrides(shape, elemBytes));
+  }
+
+  const outputStridesArr: number[][] = [];
+  for (let o = 0; o < numOutputs; o++) {
+    const shape = outputShapes[o];
+    const elemBytes = byteWidth(bodyOutAvals[o].dtype);
+    outputStridesArr.push(computeStrides(shape, elemBytes));
+  }
+
+  return {
+    numConsts,
+    numInputs,
+    numOutputs,
+    gridRank,
+    gridShape,
+    blockShape,
+    inAxes,
+    outAxes,
+    inputShapes,
+    outputShapes,
+    constSizes,
+    blockInputSizes,
+    blockOutputSizes,
+    internalSizes,
+    steps: reindexedSteps,
+    outputSources,
+    inputStrides: inputStridesArr,
+    outputStrides: outputStridesArr,
+  };
 }
 
 // ---------------------------------------------------------------------------

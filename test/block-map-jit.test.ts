@@ -1286,3 +1286,82 @@ describe("lax.workgroupAssociativeScan", () => {
     f_jit.dispose();
   });
 });
+
+// ---------------------------------------------------------------------------
+// T5c: WASM compiled block-loop tests
+// ---------------------------------------------------------------------------
+
+describe("lax.blockMap — WASM compiled block-loop", () => {
+  // T5c.1: Elementwise body compiled into single WASM module
+  test("T5c.1: elementwise body compiled into WASM loop", () => {
+    const f = (xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          np.multiply(block, np.array(3, { dtype: DType.Float32 })),
+        xs,
+        { blockShape: [4] },
+      );
+    const f_jit = jit(f);
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([3, 6, 9, 12, 15, 18, 21, 24]);
+    f_jit.dispose();
+  });
+
+  // T5c.2: Reduction kernel inside body (sum + broadcast add)
+  test("T5c.2: reduction body compiled in WASM loop", () => {
+    // Body: sum(block) + block → tests reduction kernel + internal dependency.
+    // Block0 [1,2,3,4] → sum=10, add(10,[1,2,3,4])=[11,12,13,14]
+    // Block1 [5,6,7,8] → sum=26, add(26,[5,6,7,8])=[31,32,33,34]
+    const f = (xs: np.Array) =>
+      lax.blockMap((block: np.Array) => np.add(np.sum(block), block), xs, {
+        blockShape: [4],
+      });
+    const f_jit = jit(f);
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([11, 12, 13, 14, 31, 32, 33, 34]);
+    f_jit.dispose();
+  });
+
+  // T5c.3: jit(block_map(f, xs)) matches eager on WASM
+  test("T5c.3: JIT matches eager on WASM", () => {
+    const body = (block: np.Array) => {
+      using two = np.array(2, { dtype: DType.Float32 });
+      using one = np.array(1, { dtype: DType.Float32 });
+      using scaled = np.multiply(block, two);
+      return np.add(scaled, one);
+    };
+    const f = (xs: np.Array) => lax.blockMap(body, xs, { blockShape: [3] });
+
+    // Eager
+    using xs = np.array([10, 20, 30, 40, 50, 60], { dtype: DType.Float32 });
+    using eager = f(xs);
+
+    // JIT
+    const f_jit = jit(f);
+    using jitted = f_jit(xs);
+    f_jit.dispose();
+
+    // Both should produce [21, 41, 61, 81, 101, 121]
+    expect(eager).toBeAllclose([21, 41, 61, 81, 101, 121]);
+    expect(jitted).toBeAllclose([21, 41, 61, 81, 101, 121]);
+  });
+
+  // T5c.4: Block-loop with non-divisible N
+  test("T5c.4: non-divisible N with boundary padding", () => {
+    const f = (xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          np.multiply(block, np.array(2, { dtype: DType.Float32 })),
+        xs,
+        { blockShape: [4] },
+      );
+    const f_jit = jit(f);
+    // N=5, blockShape=4 → 2 blocks. Last block has 1 real + 3 padded elements.
+    using xs = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([2, 4, 6, 8, 10]);
+    f_jit.dispose();
+  });
+});
