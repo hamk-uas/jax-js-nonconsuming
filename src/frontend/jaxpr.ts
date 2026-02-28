@@ -1708,7 +1708,10 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     });
   },
 
-  [Primitive.ForiLoop](args, { jaxpr, numConsts, lower, upper }) {
+  [Primitive.ForiLoop](
+    args,
+    { jaxpr, numConsts, lower: _lower, upper: _upper },
+  ) {
     const { outTypes } = typecheckJaxpr(jaxpr);
     // Body signature: (i: int32, carry...) => carry...
     const numCarry = args.length - numConsts;
@@ -1735,9 +1738,11 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
       );
     }
     for (let i = 1; i < args.length; i++) {
-        if (args[i].shape.length !== 0) {
-            throw new TypeError(`DynamicSlice start indices must be scalars, got shape ${args[i].shape}`);
-        }
+      if (args[i].shape.length !== 0) {
+        throw new TypeError(
+          `DynamicSlice start indices must be scalars, got shape ${args[i].shape}`,
+        );
+      }
     }
     return [new ShapedArray(sliceSizes, operand.dtype, operand.weakType)];
   },

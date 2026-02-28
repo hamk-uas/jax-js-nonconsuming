@@ -21,7 +21,6 @@ import {
   jvp,
   lax,
   numpy as np,
-  vmap,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, test } from "vitest";
 
@@ -299,7 +298,9 @@ describe("lax.dynamicSlice — Phase 1b", () => {
 
   // T4.4: 2D dynamic slice
   test("2D slice", () => {
-    using x = np.arange(12).reshape([3, 4]).astype(DType.Float32);
+    using xInt = np.arange(12);
+    using xReshaped = xInt.reshape([3, 4]);
+    using x = xReshaped.astype(DType.Float32);
     using s0 = np.array(1, { dtype: DType.Int32 });
     using s1 = np.array(2, { dtype: DType.Int32 });
     using result = lax.dynamicSlice(x, [s0, s1], [2, 2]);
@@ -354,7 +355,8 @@ describe("lax.dynamicSlice — Phase 1b", () => {
       0,
       3,
       (i: np.Array, acc: np.Array) => {
-        using start = np.multiply(i, np.array(2, { dtype: DType.Int32 }));
+        using two = np.array(2, { dtype: DType.Int32 });
+        using start = np.multiply(i, two);
         using slice = lax.dynamicSlice(x, [start], [2]);
         using sliceSum = np.sum(slice);
         return np.add(acc, sliceSum);

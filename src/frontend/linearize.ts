@@ -35,8 +35,6 @@ import {
   _registerJitCacheDisposer,
 } from "./check-leaks";
 import {
-  max,
-  min,
   _peArrayCreationTracker,
   _setPACT,
   AbstractValue,
@@ -54,6 +52,8 @@ import {
   fullRaise,
   gather,
   insideAbstractTrace,
+  max,
+  min,
   mul,
   ndim,
   neg,
@@ -658,10 +658,7 @@ class PartialEvalTrace extends Trace {
       return this.#partialEvalJaxpr(name, jaxpr, numConsts, tracers);
     }
     if (primitive === Primitive.ForiLoop) {
-      return this.#partialEvalForiLoop(
-        params as PrimitiveParams<any>,
-        tracers
-      );
+      return this.#partialEvalForiLoop(params as PrimitiveParams<any>, tracers);
     }
     if (primitive === Primitive.Scan) {
       // Special case for JVP'd scan: primal outputs depend only on primal inputs
@@ -673,6 +670,12 @@ class PartialEvalTrace extends Trace {
     if (primitive === Primitive.AssociativeScan) {
       return this.#partialEvalAssociativeScan(
         params as PrimitiveParams<Primitive.AssociativeScan>,
+        tracers,
+      );
+    }
+    if (primitive === Primitive.BlockMap) {
+      return this.#partialEvalBlockMap(
+        params as PrimitiveParams<Primitive.BlockMap>,
         tracers,
       );
     }
@@ -766,10 +769,7 @@ class PartialEvalTrace extends Trace {
    *   from tangent (unknown) outputs
    * - Otherwise, mark all outputs as unknown
    */
-  #partialEvalForiLoop(
-    params: any,
-    tracers: PartialEvalTracer[]
-  ): Tracer[] {
+  #partialEvalForiLoop(params: any, tracers: PartialEvalTracer[]): Tracer[] {
     const isKnown = tracers.map((t) => t.pval.isKnown);
     const hasUnknown = isKnown.some((k) => !k);
 
@@ -778,9 +778,11 @@ class PartialEvalTrace extends Trace {
       return bind(Primitive.ForiLoop, inputs, params);
     }
 
-    const { isJvpTransformed, numConsts } = params;
+    const { isJvpTransformed, numConsts: _numConsts } = params;
     if (!isJvpTransformed) {
-      throw new Error("Backward pass or partial eval of ForiLoop with unknown inputs requires isJvpTransformed flag");
+      throw new Error(
+        "Backward pass or partial eval of ForiLoop with unknown inputs requires isJvpTransformed flag",
+      );
     }
 
     // Evaluate full loop with zeros for tangents
@@ -798,7 +800,7 @@ class PartialEvalTrace extends Trace {
     const fullOuts = bind(Primitive.ForiLoop, fullInputs, params);
 
     const tracersIn = tracers.map((t) => this.instantiateConst(t));
-    const avalsIn = tracersIn.map(t => t.pval.aval);
+    const avalsIn = tracersIn.map((t) => t.pval.aval);
     const avalsOut = abstractEvalRules[Primitive.ForiLoop](avalsIn, params);
 
     const recipe: JaxprRecipe = {
@@ -812,24 +814,28 @@ class PartialEvalTrace extends Trace {
 
     const tracersOut: PartialEvalTracer[] = [];
     const numCarry = avalsOut.length / 2; // isJvpTransformed means numCarry is doubled
-    
+
     // Primals out (first half) are known from full execution
     for (let i = 0; i < numCarry; i++) {
-        tracersOut.push(new PartialEvalTracer(this, PartialVal.known(fullOuts[i]), recipe));
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.known(fullOuts[i]), recipe),
+      );
     }
-    
+
     // Tangents out (second half) are unknown
     for (let i = numCarry; i < 2 * numCarry; i++) {
-        fullOuts[i].dispose(); // Tangents evaluated with zeros are garbage - dispose them
-        tracersIn.forEach(t => t.ref);
-        tracersOut.push(new PartialEvalTracer(this, PartialVal.unknown(avalsOut[i]), recipe));
+      fullOuts[i].dispose(); // Tangents evaluated with zeros are garbage - dispose them
+      tracersIn.forEach((t) => t.ref);
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.unknown(avalsOut[i]), recipe),
+      );
     }
-    
-    recipe.tracerRefsOut = tracersOut.map(t => new WeakRef(t));
-    
+
+    recipe.tracerRefsOut = tracersOut.map((t) => new WeakRef(t));
+
     const retainedKnownOutputs = new Set<Tracer>();
     for (let i = 0; i < numCarry; i++) {
-        retainedKnownOutputs.add(fullOuts[i]);
+      retainedKnownOutputs.add(fullOuts[i]);
     }
 
     const synthesizedSet = new Set(synthesizedZeroInputs);
@@ -842,7 +848,7 @@ class PartialEvalTrace extends Trace {
         inp.dispose();
       }
     }
-    
+
     return tracersOut;
   }
 
@@ -1094,6 +1100,129 @@ class PartialEvalTrace extends Trace {
     );
     // Same fix as #partialEvalScan: don't dispose synthesized zeros that
     // may have been captured by an outer JaxprTrace builder.
+    const synthesizedSet = new Set(synthesizedZeroInputs);
+    for (const inp of fullInputs) {
+      if (
+        !retainedKnownOutputs.has(inp) &&
+        !synthesizedSet.has(inp) &&
+        inp.refCount > 0
+      ) {
+        inp.dispose();
+      }
+    }
+
+    recipe.tracerRefsOut = tracersOut.map((t) =>
+      t.pval.isKnown ? (null as any) : new WeakRef(t),
+    );
+
+    return tracersOut;
+  }
+
+  /**
+   * Partial eval for BlockMap primitive.
+   *
+   * Same approach as scan/fori PE: if JVP-doubled, run the full block_map
+   * concretely (zeros for unknowns), mark primal outputs as known and
+   * tangent outputs as unknown for the residual jaxpr.
+   */
+  #partialEvalBlockMap(
+    params: PrimitiveParams<Primitive.BlockMap>,
+    tracers: PartialEvalTracer[],
+  ): Tracer[] {
+    const isKnown = tracers.map((t) => t.pval.isKnown);
+    const hasUnknown = isKnown.some((k) => !k);
+
+    if (!hasUnknown) {
+      const inputs = tracers.map((t) => t.fullLower());
+      const results = bind(Primitive.BlockMap, inputs, params);
+      for (const r of results) this.knownIntermediates.push(r);
+      return results;
+    }
+
+    const isJvp = params.isJvpTransformed ?? false;
+    if (!isJvp) {
+      // Non-JVP BlockMap with some unknown inputs: all outputs unknown.
+      const tracersIn = tracers.map((t) => this.instantiateConst(t));
+      const avalsIn = tracersIn.map((t) => t.pval.aval);
+      const avalsOut = abstractEvalRules[Primitive.BlockMap](avalsIn, params);
+      const recipe: JaxprRecipe = {
+        type: "JaxprEqn",
+        prim: Primitive.BlockMap,
+        tracersIn,
+        params,
+        avalsOut,
+        tracerRefsOut: [],
+      };
+      const tracersOut = avalsOut.map((aval, i) => {
+        if (i > 0) tracersIn.forEach((t) => t.ref);
+        return new PartialEvalTracer(this, PartialVal.unknown(aval), recipe);
+      });
+      recipe.tracerRefsOut = tracersOut.map((t) => new WeakRef(t));
+      return tracersOut;
+    }
+
+    // JVP-doubled BlockMap: outputs = [primalOuts..., tangentOuts...]
+    // Primal outputs are known, tangent outputs are unknown.
+    const numOutputs = abstractEvalRules[Primitive.BlockMap](
+      tracers.map((t) => t.pval.aval),
+      params,
+    ).length;
+    const numPrimalOuts = numOutputs / 2;
+
+    // Run full block_map with zeros substituted for unknown inputs.
+    const synthesizedZeroInputs: Tracer[] = [];
+    const fullInputs = tracers.map((t) => {
+      if (t.pval.isKnown) {
+        return (t.pval.val as Tracer).ref;
+      } else {
+        const z = zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
+        synthesizedZeroInputs.push(z);
+        return z;
+      }
+    });
+
+    const fullOuts = bind(Primitive.BlockMap, fullInputs, params);
+
+    // Build residual jaxpr recipe for tangent computation.
+    const tracersIn = tracers.map((t) => this.instantiateConst(t));
+    const avalsOut = abstractEvalRules[Primitive.BlockMap](
+      tracersIn.map((t) => t.pval.aval),
+      params,
+    );
+
+    const recipe: JaxprRecipe = {
+      type: "JaxprEqn",
+      prim: Primitive.BlockMap,
+      tracersIn,
+      params,
+      avalsOut,
+      tracerRefsOut: [],
+    };
+
+    const tracersOut: PartialEvalTracer[] = [];
+
+    // Primal outputs are known from the concrete execution.
+    for (let i = 0; i < numPrimalOuts; i++) {
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.known(fullOuts[i]), null),
+      );
+    }
+
+    // Tangent outputs are unknown — part of the residual jaxpr.
+    let isFirstUnknown = true;
+    for (let i = numPrimalOuts; i < numOutputs; i++) {
+      fullOuts[i].dispose();
+      if (!isFirstUnknown) tracersIn.forEach((t) => t.ref);
+      isFirstUnknown = false;
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.unknown(avalsOut[i]), recipe),
+      );
+    }
+
+    // Clean up: dispose .ref'd inputs that aren't retained as known outputs.
+    const retainedKnownOutputs = new Set<Tracer>(
+      fullOuts.slice(0, numPrimalOuts),
+    );
     const synthesizedSet = new Set(synthesizedZeroInputs);
     for (const inp of fullInputs) {
       if (
@@ -1653,6 +1782,74 @@ type TransposeRule<P extends Primitive> = (
 // This computes a backward pass, so it pulls back cotangents to the inputs of p
 // that are UndefPrimal (i.e., tangents that weren't sent forward).
 const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
+  [Primitive.BlockMap](cts, args, params) {
+    const {
+      jaxpr,
+      numConsts,
+      blockShape,
+      inAxes,
+      outAxes,
+      numInputs: _numInputs,
+    } = params;
+    const undefMask = args.map((x) => x instanceof UndefPrimal);
+    const bodyUndefPrimals = jaxpr.inBinders.map((_, i) => undefMask[i]);
+    const transposedBody = transposeJaxpr(jaxpr, bodyUndefPrimals);
+
+    const constResiduals = args
+      .slice(0, numConsts)
+      .filter((_, i) => !undefMask[i]) as Tracer[];
+    const argResiduals = args
+      .slice(numConsts)
+      .filter((_, i) => !undefMask[numConsts + i]) as Tracer[];
+
+    const residualAxes = inAxes.filter((_, i) => !undefMask[numConsts + i]);
+    const transposeInAxes = [...residualAxes, ...outAxes];
+
+    const nullOutAxis = Array(blockShape.length).fill(null);
+    const constOutAxes = args
+      .slice(0, numConsts)
+      .filter((_, i) => undefMask[i])
+      .map(() => nullOutAxis);
+
+    const argOutAxes = inAxes.filter((_, i) => undefMask[numConsts + i]);
+    const transposeOutAxes = [...constOutAxes, ...argOutAxes];
+
+    const jaxprConsts = transposedBody.consts;
+    const allConsts = [...jaxprConsts, ...constResiduals];
+
+    const transposedOut = bind(
+      Primitive.BlockMap,
+      [...allConsts, ...argResiduals, ...(cts as Tracer[])],
+      {
+        jaxpr: transposedBody.jaxpr,
+        blockShape,
+        inAxes: transposeInAxes,
+        outAxes: transposeOutAxes,
+        numConsts: allConsts.length,
+        numInputs: argResiduals.length + cts.length,
+      },
+    );
+
+    transposedBody.dispose();
+
+    const numUndefConsts = constOutAxes.length;
+    let constCts = transposedOut.slice(0, numUndefConsts);
+    const argCts = transposedOut.slice(numUndefConsts);
+
+    constCts = constCts.map((ct) => {
+      return ct.sum([0]);
+    });
+
+    const outVals = [];
+    let constIdx = 0,
+      argIdx = 0;
+    for (let i = 0; i < args.length; i++) {
+      if (!undefMask[i]) outVals.push(null);
+      else if (i < numConsts) outVals.push(constCts[constIdx++]);
+      else outVals.push(argCts[argIdx++]);
+    }
+    return outVals;
+  },
   [Primitive.Mul]([ct], [x, y]) {
     // TODO: For transpose rules on operations that have type promotion rules,
     // make sure the gradient is cast back to the correct dtype.
@@ -2519,41 +2716,56 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     return result;
   },
   [Primitive.DynamicSlice]([ct], primals, { sliceSizes }) {
-    const origShape = (primals[0] instanceof UndefPrimal ? primals[0].aval.shape : (primals[0] as Tracer).shape);
-    const starts = primals.slice(1);
-    
+    const origShape = (
+      primals[0] instanceof UndefPrimal
+        ? primals[0].aval.shape
+        : (primals[0] as Tracer).shape
+    ) as number[];
+    const starts = primals.slice(1) as Tracer[];
+
     let curr = ct;
-    let currShape = [...sliceSizes];
+    const currShape = [...sliceSizes];
     for (let ax = starts.length - 1; ax >= 0; ax--) {
       if (sliceSizes[ax] === origShape[ax]) continue;
-      
+
       currShape[ax] = origShape[ax];
       // Note: fullInternal from array.ts takes (shape, fillValue, dtype)
-      using target = fullInternal(new ShapedArray(currShape, (ct as Tracer).dtype), 0);
-      
-      const maxStart = origShape[ax] - sliceSizes[ax];
-      using zeroArr = array(0, { dtype: (starts[ax] as Tracer).dtype });
-      using maxArr = array(maxStart, { dtype: (starts[ax] as Tracer).dtype });
-      
+      using target = fullInternal(
+        new ShapedArray(currShape, (ct as Tracer).dtype, false),
+        0,
+      );
+
+      const maxStart = (origShape[ax] as number) - sliceSizes[ax];
+      using zeroArr = array(0, { dtype: starts[ax].dtype });
+      using maxArr = array(maxStart, { dtype: starts[ax].dtype });
+
       const clampedStart1 = min(starts[ax], maxArr) as Tracer;
       const start = max(zeroArr, clampedStart1) as Tracer;
 
-      using indicesBase = array(new Int32Array(range(sliceSizes[ax])), { dtype: (starts[ax] as Tracer).dtype });
+      using indicesBase = array(new Int32Array(range(sliceSizes[ax])), {
+        dtype: starts[ax].dtype,
+      });
       const indices = add(indicesBase, start);
-      
+
       const nextCurr = scatterAdd(target, indices, curr, ax) as Tracer;
-      
+
       clampedStart1.dispose();
       start.dispose();
       indices.dispose();
       if (curr !== ct) curr.dispose();
       curr = nextCurr;
     }
-    
+
     return [curr, ...starts.map(() => null)];
   },
-  [Primitive.ForiLoop](cts, args, { jaxpr, numConsts, lower, upper }) {
-    throw new Error("Fori loop backwards pass needs Scan or checkpointed history");
+  [Primitive.ForiLoop](
+    _cts,
+    _args,
+    { jaxpr: _jaxpr, numConsts: _numConsts2, lower: _lower, upper: _upper },
+  ) {
+    throw new Error(
+      "Fori loop backwards pass needs Scan or checkpointed history",
+    );
   },
 };
 

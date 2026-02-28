@@ -1922,7 +1922,9 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     throw new Error("jit: ForiLoop is not yet supported outside BlockMap/Scan");
   },
   [Primitive.DynamicSlice]() {
-    throw new Error("jit: DynamicSlice is not yet supported outside BlockMap/Scan");
+    throw new Error(
+      "jit: DynamicSlice is not yet supported outside BlockMap/Scan",
+    );
   },
 };
 

@@ -6,16 +6,23 @@
 const JsArray = globalThis.Array;
 
 import { DType } from "../alu";
-import { Array, ArrayLike, array as arrayFn, fudgeArray, zerosLike } from "../frontend/array";
-import * as jaxpr from "../frontend/jaxpr";
+import {
+  Array,
+  array as arrayFn,
+  ArrayLike,
+  fudgeArray,
+  zerosLike,
+} from "../frontend/array";
 import * as core from "../frontend/core";
 import { bind1, Primitive } from "../frontend/core";
+import * as jaxpr from "../frontend/jaxpr";
 import { moveaxis, vmap } from "../frontend/vmap";
 import { Pair } from "../shape";
+import * as tree from "../tree";
 import { checkAxis, deepEqual, prod, range, rep, zipn } from "../utils";
+import { scan } from "./lax-scan";
 
 export * as linalg from "./lax-linalg";
-import { scan } from "./lax-scan";
 export { scan };
 export type { ScanOptions } from "./lax-scan";
 export { associativeScan } from "./lax-associative-scan";
@@ -573,8 +580,6 @@ export function topK(
   return result;
 }
 
-import * as tree from "../tree";
-
 /**
  * Extract a slice of `operand` at runtime-computed `startIndices` with
  * compile-time-constant `sliceSizes`. Out-of-bounds start indices are
@@ -588,17 +593,25 @@ export function dynamicSlice(
   const x = fudgeArray(operand);
   const starts = startIndices.map(fudgeArray);
   if (starts.length !== x.ndim) {
-    throw new Error(`lax.dynamicSlice: expected ${x.ndim} start indices, got ${starts.length}`);
+    throw new Error(
+      `lax.dynamicSlice: expected ${x.ndim} start indices, got ${starts.length}`,
+    );
   }
   if (sliceSizes.length !== x.ndim) {
-    throw new Error(`lax.dynamicSlice: expected ${x.ndim} slice sizes, got ${sliceSizes.length}`);
+    throw new Error(
+      `lax.dynamicSlice: expected ${x.ndim} slice sizes, got ${sliceSizes.length}`,
+    );
   }
   for (const start of starts) {
     if (start.ndim !== 0) {
-      throw new Error(`lax.dynamicSlice: start indices must be scalars, got shape ${start.shape}`);
+      throw new Error(
+        `lax.dynamicSlice: start indices must be scalars, got shape ${start.shape}`,
+      );
     }
   }
-  const result = bind1(Primitive.DynamicSlice, [x, ...starts], { sliceSizes }) as Array;
+  const result = bind1(Primitive.DynamicSlice, [x, ...starts], {
+    sliceSizes,
+  }) as Array;
   return result;
 }
 
@@ -617,28 +630,33 @@ export function foriLoop<C extends tree.JsTree<Array>>(
 
   const [initFlat, initTree] = tree.flatten(init);
 
-  const dummyIArr = arrayFn(0, {dtype: DType.Int32});
+  const dummyIArr = arrayFn(0, { dtype: DType.Int32 });
   const dummyI = core.getAval(dummyIArr);
   dummyIArr.dispose();
-  
-  const traceAvals = [dummyI, ...initFlat.map(a => core.getAval(a as Array))];
+
+  const traceAvals = [dummyI, ...initFlat.map((a) => core.getAval(a as Array))];
 
   const traceFn = (i: Array, ...args: Array[]) => {
-      const initTracers = tree.unflatten(initTree, args);
-      const out = body(i, initTracers as C);
-      const [outFlat] = tree.flatten(out);
-      return outFlat;
+    const initTracers = tree.unflatten(initTree, args);
+    const out = body(i, initTracers as C);
+    const [outFlat] = tree.flatten(out);
+    return outFlat;
   };
 
   const { jaxpr: closedJaxpr } = jaxpr.makeJaxpr(traceFn)(...traceAvals);
 
   const outFlat = core.bind(
     Primitive.ForiLoop,
-    [...closedJaxpr.consts, ...initFlat as Array[]],
-    { jaxpr: closedJaxpr.jaxpr, numConsts: closedJaxpr.consts.length, lower, upper }
+    [...closedJaxpr.consts, ...(initFlat as Array[])],
+    {
+      jaxpr: closedJaxpr.jaxpr,
+      numConsts: closedJaxpr.consts.length,
+      lower,
+      upper,
+    },
   ) as Array[];
 
   closedJaxpr.dispose();
-  
+
   return tree.unflatten(initTree, outFlat) as C;
 }

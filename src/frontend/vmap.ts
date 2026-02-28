@@ -278,6 +278,35 @@ function lastDimsBatcher<P extends Primitive>(
 }
 
 const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
+  [Primitive.BlockMap](axisSize, args, dims, params) {
+    const { jaxpr, numConsts, blockShape, inAxes, outAxes, numInputs } = params;
+
+    const newInAxes = inAxes.map((axes, i) => {
+      const bdim = dims[numConsts + i];
+      return axes.map((axis) =>
+        axis === null ? null : bdim !== null && bdim <= axis ? axis + 1 : axis,
+      );
+    });
+
+    const newOutAxes = outAxes.map((axes) =>
+      axes.map((axis) => (axis === null ? null : axis >= 0 ? axis + 1 : axis)),
+    );
+
+    const outBdims = [];
+    const bdim = dims.find((d) => d !== null) ?? 0;
+    for (let i = 0; i < outAxes.length; i++) outBdims.push(bdim);
+
+    const res = bind(Primitive.BlockMap, args, {
+      jaxpr,
+      numConsts,
+      numInputs,
+      blockShape,
+      inAxes: newInAxes,
+      outAxes: newOutAxes,
+    });
+
+    return [res, outBdims];
+  },
   [Primitive.Add]: broadcastBatcher(Primitive.Add),
   [Primitive.Mul]: broadcastBatcher(Primitive.Mul),
   [Primitive.Idiv]: broadcastBatcher(Primitive.Idiv),
@@ -758,8 +787,12 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     // Results have batch at axis 0
     return [results, rep(numLeaves, 0)];
   },
-  [Primitive.DynamicSlice]() { throw new Error("vmap for dynamic slice not implemented"); },
-  [Primitive.ForiLoop](axisSize, args, bdims, params) { throw new Error("vmap for foriLoop not implemented"); },
+  [Primitive.DynamicSlice]() {
+    throw new Error("vmap for dynamic slice not implemented");
+  },
+  [Primitive.ForiLoop](_axisSize, _args, _bdims, _params) {
+    throw new Error("vmap for foriLoop not implemented");
+  },
 };
 
 const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();

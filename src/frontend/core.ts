@@ -183,12 +183,16 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     outAxes: (number | null)[][];
     numConsts: number;
     numInputs: number;
+    /** Set by JVP rule when this block_map was produced by differentiating an outer block_map. */
+    isJvpTransformed?: boolean;
   };
   [Primitive.ForiLoop]: {
     jaxpr: Jaxpr;
     numConsts: number;
     lower: number;
     upper: number;
+    /** Set by JVP rule when this fori_loop was produced by differentiating. */
+    isJvpTransformed?: boolean;
   };
 }
 
