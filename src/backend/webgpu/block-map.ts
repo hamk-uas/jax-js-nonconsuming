@@ -17,7 +17,6 @@
  *   - prod(blockShape) exceeds device.limits.maxComputeInvocationsPerWorkgroup
  *   - Symbolic malloc sizes
  *   - More storage bindings than maxStorageBuffersPerShaderStage
- *   - Non-divisible dimensions (boundary blocks)
  */
 
 import { erfSrc, threefrySrc } from "./builtins";
@@ -91,38 +90,21 @@ export function blockMapFusedShaderSource(
     return null;
   }
 
-  // --- Guard: evenly divisible dimensions ---
-  // Boundary blocks require per-thread validity guards on every read/write.
-  // For now, fall back to the JS executor which handles boundary padding.
-  // Future: emit per-thread `_valid` flag and guard all memory accesses.
+  // --- Detect boundary blocks (non-divisible dimensions) ---
+  // When dimensions are not evenly divisible by blockShape, the last block
+  // along each axis has some invalid (out-of-bounds) threads. We emit a
+  // per-thread `valid` flag and guard all global reads/writes.
   const gridRank = blockShape.length;
+  // Per-axis: the original dimension along each grid axis (for validity checks)
+  const axisDims: (number | null)[] = new Array(gridRank).fill(null);
+  let hasBoundary = false;
   for (let g = 0; g < gridRank; g++) {
     for (let i = 0; i < numInputs; i++) {
       const axes = params.inAxes[i];
       if (axes[g] !== null) {
-        const ax = axes[g]!;
-        const dim = params.inputShapes[i][ax];
-        if (dim % blockShape[g] !== 0) {
-          if (DEBUG >= 1)
-            console.info(
-              `block_map fused: input ${i} axis ${ax} dim ${dim} not divisible by block ${blockShape[g]}, fallback`,
-            );
-          return null;
-        }
-      }
-    }
-    for (let o = 0; o < params.outputShapes.length; o++) {
-      const axes = params.outAxes[o];
-      if (axes[g] !== null) {
-        const ax = axes[g]!;
-        const dim = params.outputShapes[o][ax];
-        if (dim % blockShape[g] !== 0) {
-          if (DEBUG >= 1)
-            console.info(
-              `block_map fused: output ${o} axis ${ax} dim ${dim} not divisible by block ${blockShape[g]}, fallback`,
-            );
-          return null;
-        }
+        const dim = params.inputShapes[i][axes[g]!];
+        axisDims[g] = dim;
+        if (dim % blockShape[g] !== 0) hasBoundary = true;
       }
     }
   }
@@ -538,6 +520,23 @@ export function blockMapFusedShaderSource(
     emit(`let tidx_2: u32 = tidx % ${blockShape[2]}u;`);
   }
 
+  // --- Per-thread validity (boundary blocks) ---
+  // For the last block along each axis, some threads may be out-of-bounds.
+  // `valid` is true iff this thread maps to a real element for ALL axes.
+  // Invalid threads read 0 from global inputs and don't write to global outputs,
+  // matching the zero-pad semantics of the eagerness fallback.
+  if (hasBoundary) {
+    const terms: string[] = [];
+    for (let g = 0; g < gridRank; g++) {
+      if (axisDims[g] !== null) {
+        terms.push(
+          `(block_i${g} * ${blockShape[g]}u + tidx_${g} < ${axisDims[g]}u)`,
+        );
+      }
+    }
+    emit(`let valid: bool = ${terms.join(" && ")};`);
+  }
+
   // Build global offset for each input and output.
   // For input i, axis g: globalOffset = block_i{g} * blockShape[g]
   // The kernel indexes with gidx (0..blockSize-1), but in the fused shader
@@ -749,9 +748,13 @@ export function blockMapFusedShaderSource(
           const inputIdx = stepInputBodyIdx[bufIdx];
           if (inputIdx >= 0) {
             // Non-const input: apply block offset
-            source = `${stepInputNames[bufIdx]}[i32(in_base_${inputIdx}) + ${indexExpr}]`;
+            const readExpr = `${stepInputNames[bufIdx]}[i32(in_base_${inputIdx}) + ${indexExpr}]`;
+            // Guard: invalid threads read 0 (matching zero-pad semantics)
+            source = hasBoundary
+              ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
+              : readExpr;
           } else {
-            // Const input: no block offset (constants are shared)
+            // Const input: no block offset (constants are shared, always valid)
             source = `${stepInputNames[bufIdx]}[${indexExpr}]`;
           }
         } else {
@@ -870,11 +873,19 @@ export function blockMapFusedShaderSource(
             resultTy !== dtypeToWgsl(kernel.outputs[oi].exp.dtype)
               ? `${resultTy}(${rhs})`
               : rhs;
-          emit(
-            `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${castRhs};`,
-          );
+          if (hasBoundary) {
+            emit(`if (valid) {`, pushIndent);
+            emit(
+              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${castRhs};`,
+            );
+            emit(popIndent, "}");
+          } else {
+            emit(
+              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${castRhs};`,
+            );
+          }
         } else if (idIsShmem.has(outId)) {
-          // Write to shared memory
+          // Write to shared memory (all threads, including invalid — pads with 0)
           const shmemName = idToReadName.get(outId)!;
           emit(`${shmemName}[tidx] = ${rhs};`);
         }
@@ -883,6 +894,9 @@ export function blockMapFusedShaderSource(
   }
 
   // --- Pass-through outputs: copy input → output ---
+  if (passThroughOutputs.size > 0 && hasBoundary) {
+    emit("if (valid) {", pushIndent);
+  }
   for (const [resultIdx, info] of passThroughOutputs) {
     if (info.inputIdx >= 0) {
       // Non-const input: apply block offset
@@ -895,6 +909,9 @@ export function blockMapFusedShaderSource(
         `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${info.inputName}[i32(tidx)];`,
       );
     }
+  }
+  if (passThroughOutputs.size > 0 && hasBoundary) {
+    emit(popIndent, "}");
   }
 
   emit(popIndent, "}");

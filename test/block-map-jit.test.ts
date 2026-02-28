@@ -234,7 +234,7 @@ describe("lax.blockMap — fused shader path", () => {
     }
   });
 
-  test("fallback for non-divisible dimensions", () => {
+  test("fused path handles non-divisible dimensions (boundary blocks)", () => {
     if (!isWebGPU) return;
 
     const logs: string[] = [];
@@ -255,13 +255,9 @@ describe("lax.blockMap — fused shader path", () => {
       using result = f_jit(xs);
       expect(result).toBeAllclose(Array.from({ length: 10 }, (_, i) => i + 1));
 
-      // Should NOT have taken the fused path
+      // Should have taken the fused path (boundary blocks now supported)
       const fusedLog = logs.find((l) => l.includes("fused WebGPU shader path"));
-      expect(fusedLog).toBeUndefined();
-
-      // Should have logged the fallback reason
-      const fallbackLog = logs.find((l) => l.includes("not divisible"));
-      expect(fallbackLog).toBeDefined();
+      expect(fusedLog).toBeDefined();
 
       f_jit.dispose();
     } finally {
@@ -420,6 +416,148 @@ describe("lax.blockMap — in-block reductions", () => {
     // Block 0: max([1,5,3])=5, [1-5, 5-5, 3-5] = [-4,0,-2]
     // Block 1: max([7,2,9])=9, [7-9, 2-9, 9-9] = [-2,-7,0]
     expect(result).toBeAllclose([-4, 0, -2, -2, -7, 0]);
+    f_jit.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Boundary block tests (non-divisible dimensions)
+// ---------------------------------------------------------------------------
+describe("lax.blockMap — boundary blocks", () => {
+  const isWebGPU = defaultDevice() === "webgpu";
+
+  test("elementwise with non-divisible N uses fused path", () => {
+    if (!isWebGPU) return;
+
+    const logs: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+
+    try {
+      setDebug(1);
+      const f_jit = jit((xs: np.Array) =>
+        lax.blockMap(
+          (block: np.Array) => {
+            using two = np.array(2, { dtype: DType.Float32 });
+            return np.multiply(block, two);
+          },
+          xs,
+          { blockShape: [4] },
+        ),
+      );
+      // N=10, blockShape=4 → 3 blocks, last block has 2 valid elements
+      using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], {
+        dtype: DType.Float32,
+      });
+      using result = f_jit(xs);
+      expect(result).toBeAllclose([2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
+
+      // Should use fused path despite non-divisible dimensions
+      const fusedLog = logs.find((l) => l.includes("fused WebGPU shader path"));
+      expect(fusedLog).toBeDefined();
+
+      f_jit.dispose();
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
+  });
+
+  test("identity with non-divisible N", () => {
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap((block: np.Array) => block, xs, { blockShape: [4] }),
+    );
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([1, 2, 3, 4, 5, 6, 7]);
+    f_jit.dispose();
+  });
+
+  test("elementwise double with boundary (N=5, block=3)", () => {
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) => {
+          using two = np.array(2, { dtype: DType.Float32 });
+          return np.multiply(block, two);
+        },
+        xs,
+        { blockShape: [3] },
+      ),
+    );
+    using xs = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([2, 4, 6, 8, 10]);
+    f_jit.dispose();
+  });
+
+  test("reduce-then-elementwise with boundary", () => {
+    // block - max(block) with N=10, block=4 → 3 blocks, last has 2 elements
+    const body = (block: np.Array) => {
+      using m = np.max(block);
+      return np.subtract(block, m);
+    };
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(body, xs, { blockShape: [4] }),
+    );
+    using xs = np.array([1, 3, 2, 4, 10, 6, 8, 7, 5, 9], {
+      dtype: DType.Float32,
+    });
+    using result = f_jit(xs);
+    // Block 0: [1,3,2,4], max=4, result=[-3,-1,-2,0]
+    // Block 1: [10,6,8,7], max=10, result=[0,-4,-2,-3]
+    // Block 2: [5,9,0,0] (zero-padded), max=9, result=[-4,0,-9,-9] → only [-4,0] written
+    expect(result).toBeAllclose([-3, -1, -2, 0, 0, -4, -2, -3, -4, 0]);
+    f_jit.dispose();
+  });
+
+  test("mean reduction with boundary", () => {
+    // block - mean(block) with N=6, block=4
+    const body = (block: np.Array) => {
+      using m = np.mean(block);
+      return np.subtract(block, m);
+    };
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(body, xs, { blockShape: [4] }),
+    );
+    using xs = np.array([2, 4, 6, 8, 3, 7], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    // Block 0: [2,4,6,8], mean=5, result=[-3,-1,1,3]
+    // Block 1: [3,7,0,0] (zero-padded), mean=2.5, result=[0.5,4.5,-2.5,-2.5] → only [0.5,4.5]
+    expect(result).toBeAllclose([-3, -1, 1, 3, 0.5, 4.5]);
+    f_jit.dispose();
+  });
+
+  test("single element in last block (N=5, block=4)", () => {
+    const f_jit = jit((xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) => {
+          using ten = np.array(10, { dtype: DType.Float32 });
+          return np.add(block, ten);
+        },
+        xs,
+        { blockShape: [4] },
+      ),
+    );
+    using xs = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+    using result = f_jit(xs);
+    expect(result).toBeAllclose([11, 12, 13, 14, 15]);
+    f_jit.dispose();
+  });
+
+  test("grad through boundary block_map", () => {
+    const body = (x: np.Array) => np.multiply(x, x);
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(body, xs, { blockShape: [3] });
+      return np.sum(mapped);
+    };
+    // N=5, blockShape=3 → boundary
+    const f_jit = jit(grad(f));
+    using x = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+    using g = f_jit(x);
+    // grad of x^2 is 2x
+    expect(g).toBeAllclose([2, 4, 6, 8, 10]);
     f_jit.dispose();
   });
 });
