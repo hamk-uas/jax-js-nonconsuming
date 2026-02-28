@@ -26,17 +26,17 @@ describe("lax.blockMap - Phase 2 AD", () => {
     expect(g).toBeAllclose([2, 4, 6, 8]);
   });
 
-  test("jit(grad(block_map(f, xs))) - no leaks", () => {
+  test("jit(grad(block_map(f, xs))) computes correct gradient", () => {
     const body = (x: np.Array) => np.multiply(x, x);
     const f = (xs: np.Array) => {
       using mapped = lax.blockMap(body, xs, { blockShape: [2] });
       return np.sum(mapped);
     };
 
-    // BlockMap JIT compilation is Phase 3 — this test verifies the error is clear.
     const f_jit = jit(grad(f));
     using x = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
-    expect(() => f_jit(x)).toThrow("BlockMap is not yet supported in JIT");
+    using g = f_jit(x);
+    expect(g).toBeAllclose([2, 4, 6, 8]);
     f_jit.dispose();
   });
 

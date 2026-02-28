@@ -43,6 +43,7 @@ import {
   rep,
 } from "../utils";
 import { aluCompare, PendingExecute } from "./array";
+import { executeBlockMap } from "./block-map-executor";
 import {
   _registerCacheSizeGetter,
   _registerJitCacheDisposer,
@@ -139,6 +140,22 @@ export type JitStep =
       constAvals: ShapedArray[];
       elemAvals: ShapedArray[];
       outputs: JitId[];
+    }
+  | {
+      type: "block_map";
+      bodyProgram: JitProgram;
+      bodyJaxpr: Jaxpr;
+      blockShape: number[];
+      inAxes: (number | null)[][];
+      outAxes: (number | null)[][];
+      numConsts: number;
+      numInputs: number;
+      gridShape: number[];
+      inputShapes: number[][];
+      outputShapes: number[][];
+      consts: JitId[];
+      inputs: JitId[];
+      outputs: JitId[];
     };
 
 /** Per-type step counts from {@link JitProgram.stepCounts}. */
@@ -152,6 +169,7 @@ export interface JitStepCounts {
   dus: number;
   scatter_add: number;
   assoc_scan: number;
+  block_map: number;
 }
 
 /**
@@ -286,6 +304,10 @@ export class JitProgram {
             `assoc_scan [${step.plan.path}] numLeaves=${step.numLeaves} numConsts=${step.numConsts} axis=${step.axis}` +
               (step.reverse ? " reverse" : ""),
           );
+        case "block_map":
+          return PPrint.pp(
+            `block_map grid=[${step.gridShape}] blockShape=[${step.blockShape}] numConsts=${step.numConsts} numInputs=${step.numInputs}`,
+          );
       }
     });
     const display = PPrint.prototype.concat(
@@ -322,6 +344,7 @@ export class JitProgram {
       dus: 0,
       scatter_add: 0,
       assoc_scan: 0,
+      block_map: 0,
     };
     for (const step of this.steps) {
       counts[step.type]++;
@@ -621,6 +644,37 @@ export class JitProgram {
           pending.push(...assocResult.pending);
           break;
         }
+        case "block_map": {
+          // Flush pending ops — block_map needs materialized inputs
+          flushPendingBatched(pending, this.backend);
+
+          const constSlots = step.consts.map((id) => scope.get(id)!);
+          const inputSlots = step.inputs.map((id) => scope.get(id)!);
+          const outputSlots = step.outputs.map((id) => scope.get(id)!);
+
+          const bmResult = executeBlockMap({
+            backend: this.backend,
+            bodyProgram: step.bodyProgram,
+            bodyJaxpr: step.bodyJaxpr,
+            blockShape: step.blockShape,
+            inAxes: step.inAxes,
+            outAxes: step.outAxes,
+            numConsts: step.numConsts,
+            numInputs: step.numInputs,
+            gridShape: step.gridShape,
+            inputShapes: step.inputShapes,
+            outputShapes: step.outputShapes,
+            constSlots,
+            inputSlots,
+            outputSlots,
+          });
+
+          for (let i = 0; i < step.outputs.length; i++) {
+            scope.set(step.outputs[i], bmResult.outputs[i]);
+          }
+          pending.push(...bmResult.pending);
+          break;
+        }
         default:
           step satisfies never;
       }
@@ -678,6 +732,12 @@ function stepUsesId(step: JitStep, id: JitId): boolean {
         step.outputs.includes(id) ||
         step.consts.includes(id) ||
         step.elems.includes(id)
+      );
+    case "block_map":
+      return (
+        step.outputs.includes(id) ||
+        step.consts.includes(id) ||
+        step.inputs.includes(id)
       );
     default:
       return false;
@@ -1339,6 +1399,90 @@ export function jitCompile(
         continue;
       }
 
+      // Handle Primitive.BlockMap — compile the body jaxpr and emit a
+      // "block_map" JitStep that iterates over the grid of blocks.
+      if (eqn.primitive === Primitive.BlockMap) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<typeof Primitive.BlockMap>;
+        const {
+          jaxpr: bodyJaxpr,
+          blockShape,
+          inAxes,
+          outAxes,
+          numConsts,
+          numInputs,
+        } = params;
+
+        // Resolve input JitIds
+        const allInputIds: JitId[] = [];
+        for (const input of eqn.inputs) {
+          if (input instanceof Var) {
+            const jv = ctx.get(input)!;
+            if (jv.type !== "imm") {
+              throw new Error("jit: BlockMap primitive input is not imm");
+            }
+            allInputIds.push(jv.arg);
+          } else if (input instanceof Lit) {
+            allInputIds.push(builder.pushLit(input));
+          }
+        }
+
+        const constsIds = allInputIds.slice(0, numConsts);
+        const inputIds = allInputIds.slice(numConsts, numConsts + numInputs);
+
+        // Compute grid shape from input shapes and inAxes
+        const gridRank = blockShape.length;
+        const gridShape: number[] = new globalThis.Array(gridRank).fill(0);
+        const inputAvals = eqn.inputs
+          .slice(numConsts, numConsts + numInputs)
+          .map((v) => v.aval);
+        for (let ii = 0; ii < numInputs; ii++) {
+          const axes = inAxes[ii];
+          for (let g = 0; g < gridRank; g++) {
+            if (axes[g] !== null) {
+              const dim = inputAvals[ii].shape[axes[g]!] as number;
+              gridShape[g] = Math.ceil(dim / blockShape[g]);
+            }
+          }
+        }
+
+        // Allocate output buffers
+        const outputIds: JitId[] = [];
+        for (const outVar of eqn.outBinders) {
+          const outId = builder.pushBuffer(
+            sizeExprMul(outVar.aval.sizeExpr, byteWidth(outVar.aval.dtype)),
+          );
+          outputIds.push(outId);
+          ctx.set(outVar, { type: "imm", arg: outId });
+        }
+
+        // Compile body jaxpr
+        const bodyProgram = jitCompile(backend, bodyJaxpr);
+
+        const inputShapes = inputAvals.map((a) => a.shape as number[]);
+        const outputShapes = eqn.outBinders.map(
+          (v) => v.aval.shape as number[],
+        );
+
+        builder.steps.push({
+          type: "block_map",
+          bodyProgram,
+          bodyJaxpr,
+          blockShape,
+          inAxes,
+          outAxes,
+          numConsts,
+          numInputs,
+          gridShape,
+          inputShapes,
+          outputShapes,
+          consts: constsIds,
+          inputs: inputIds,
+          outputs: outputIds,
+        });
+        continue;
+      }
+
       // If this is a routine, construct and dispatch the routine.
       if (routinePrimitives.has(eqn.primitive)) {
         flushPendingKernels();
@@ -1916,7 +2060,7 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     );
   },
   [Primitive.BlockMap]() {
-    throw new Error("jit: BlockMap is not yet supported in JIT compilation");
+    throw new Error("internal: BlockMap is handled specially in jitCompile");
   },
   [Primitive.ForiLoop]() {
     throw new Error("jit: ForiLoop is not yet supported outside BlockMap/Scan");
@@ -2092,6 +2236,7 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     Primitive.DynamicUpdateSlice,
     Primitive.ScatterAdd,
     Primitive.AssociativeScan,
+    Primitive.BlockMap,
   ];
   for (let i = jaxpr.eqns.length - 1; i >= 0; i--) {
     const eqn = jaxpr.eqns[i];

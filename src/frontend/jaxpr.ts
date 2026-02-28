@@ -1691,13 +1691,26 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
       }
     }
 
-    // Output shapes: body output shapes with block dims expanded to full dims
+    // Output shapes: body output shapes with mapped dims set to original
+    // input dimensions (not padded). The last block may be partial — the
+    // executor handles this by only copying the valid portion.
+    // Build a map from grid axis → original input dimension.
+    const origDims: number[] = new globalThis.Array(blockShape.length).fill(0);
+    for (let i = 0; i < inputs.length; i++) {
+      const axes = inAxes[i];
+      for (let g = 0; g < blockShape.length; g++) {
+        if (axes[g] !== null) {
+          origDims[g] = inputs[i].shape[axes[g]!] as number;
+        }
+      }
+    }
+
     return outTypes.map((bodyOutAval, oi) => {
       const axes = outAxes[oi];
       const fullShape = [...bodyOutAval.shape];
       for (let g = 0; g < blockShape.length; g++) {
         if (axes[g] !== null) {
-          fullShape[axes[g]!] = gridShape[g] * blockShape[g];
+          fullShape[axes[g]!] = origDims[g];
         }
       }
       return new ShapedArray(
