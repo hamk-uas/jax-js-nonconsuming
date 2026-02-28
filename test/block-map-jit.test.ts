@@ -955,3 +955,81 @@ describe("lax.blockMap — boundary blocks", () => {
     f_jit.dispose();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 4: lax.tiledMatmul library function
+// ---------------------------------------------------------------------------
+describe("lax.tiledMatmul", () => {
+  test("64x64 matches np.matmul", () => {
+    using A_flat = np.arange(4096).astype(DType.Float32);
+    using A = A_flat.reshape([64, 64]);
+    using B = np.eye(64, { dtype: DType.Float32 });
+    using expected = np.matmul(A, B);
+    using result = lax.tiledMatmul(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1e-3 });
+  });
+
+  test("64x64 jit(tiledMatmul) matches np.matmul", () => {
+    const f = jit((A: np.Array, B: np.Array) => lax.tiledMatmul(A, B));
+    using A_flat = np.arange(4096).astype(DType.Float32);
+    using A = A_flat.reshape([64, 64]);
+    using B = np.eye(64, { dtype: DType.Float32 });
+    using expected = np.matmul(A, B);
+    using result = f(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1e-3 });
+    f.dispose();
+  });
+
+  test("non-square 128x64 @ 64x256 matches np.matmul", () => {
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
+    );
+    using A_flat = np.arange(128 * 64).astype(DType.Float32);
+    using A = A_flat.reshape([128, 64]);
+    using B_flat = np.arange(64 * 256).astype(DType.Float32);
+    using B = B_flat.reshape([64, 256]);
+    using expected = np.matmul(A, B);
+    using result = f(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1 });
+    f.dispose();
+  });
+
+  test("K not divisible by Bk — padding handles K=48 with Bk=16", () => {
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
+    );
+    using A_flat = np.arange(16 * 48).astype(DType.Float32);
+    using A = A_flat.reshape([16, 48]);
+    using B_flat = np.arange(48 * 16).astype(DType.Float32);
+    using B = B_flat.reshape([48, 16]);
+    using expected = np.matmul(A, B);
+    using result = f(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1 });
+    f.dispose();
+  });
+
+  test("K not divisible — K=50 with Bk=16 pads to K=64", () => {
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
+    );
+    using A_flat = np.arange(32 * 50).astype(DType.Float32);
+    using A = A_flat.reshape([32, 50]);
+    using B_flat = np.arange(50 * 32).astype(DType.Float32);
+    using B = B_flat.reshape([50, 32]);
+    using expected = np.matmul(A, B);
+    using result = f(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1 });
+    f.dispose();
+  });
+
+  test("256x256 matches np.matmul", () => {
+    const f = jit((A: np.Array, B: np.Array) => lax.tiledMatmul(A, B));
+    using A_flat = np.arange(256 * 256).astype(DType.Float32);
+    using A = A_flat.reshape([256, 256]);
+    using B = np.eye(256, { dtype: DType.Float32 });
+    using expected = np.matmul(A, B);
+    using result = f(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1e-2 });
+    f.dispose();
+  });
+});

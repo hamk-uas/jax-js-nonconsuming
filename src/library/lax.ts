@@ -11,15 +11,17 @@ import {
   array as arrayFn,
   ArrayLike,
   fudgeArray,
+  fullInternal,
   zerosLike,
 } from "../frontend/array";
 import * as core from "../frontend/core";
-import { bind1, Primitive } from "../frontend/core";
+import { bind1, Primitive, ShapedArray } from "../frontend/core";
 import * as jaxpr from "../frontend/jaxpr";
 import { moveaxis, vmap } from "../frontend/vmap";
 import { Pair } from "../shape";
 import * as tree from "../tree";
 import { checkAxis, deepEqual, prod, range, rep, zipn } from "../utils";
+import { blockMap } from "./lax-block-map";
 import { scan } from "./lax-scan";
 
 export * as linalg from "./lax-linalg";
@@ -27,7 +29,7 @@ export { scan };
 export type { ScanOptions } from "./lax-scan";
 export { associativeScan } from "./lax-associative-scan";
 export type { AssociativeScanOptions } from "./lax-associative-scan";
-export { blockMap } from "./lax-block-map";
+export { blockMap };
 export type { BlockMapOptions } from "./lax-block-map";
 
 /**
@@ -659,4 +661,108 @@ export function foriLoop<C extends tree.JsTree<Array>>(
   closedJaxpr.dispose();
 
   return tree.unflatten(initTree, outFlat) as C;
+}
+
+/**
+ * Options for {@link tiledMatmul}.
+ */
+export interface TiledMatmulOptions {
+  /** Block size for the output tile rows (default 16). */
+  Br?: number;
+  /** Block size for the output tile columns (default 16). */
+  Bc?: number;
+  /** Block size for the contraction dimension (default 16). */
+  Bk?: number;
+}
+
+/**
+ * Tiled matrix multiplication via {@link blockMap} + {@link foriLoop}.
+ *
+ * Computes `A @ B` for 2D matrices by decomposing the multiplication into
+ * block tiles processed in shared memory on WebGPU. Falls back to the standard
+ * matmul kernel on WASM/CPU.
+ *
+ * Both M and N must be divisible by Br and Bc respectively. K is padded with
+ * zeros if not divisible by Bk.
+ *
+ * @param A - Left matrix of shape `[M, K]`.
+ * @param B - Right matrix of shape `[K, N]`.
+ * @param options - Optional tile size configuration.
+ * @returns Result matrix of shape `[M, N]`.
+ */
+export function tiledMatmul(
+  A: Array,
+  B: Array,
+  options?: TiledMatmulOptions,
+): Array {
+  const { Br = 16, Bc = 16, Bk = 16 } = options ?? {};
+
+  if (A.ndim !== 2 || B.ndim !== 2) {
+    throw new Error(
+      `tiledMatmul: expected 2D inputs, got ${A.ndim}D and ${B.ndim}D`,
+    );
+  }
+  const [M, K] = A.shape as [number, number];
+  const [K2, N] = B.shape as [number, number];
+  if (K !== K2) {
+    throw new Error(
+      `tiledMatmul: contraction dims must match, got ${K} and ${K2}`,
+    );
+  }
+  if (M % Br !== 0) {
+    throw new Error(`tiledMatmul: M=${M} must be divisible by Br=${Br}`);
+  }
+  if (N % Bc !== 0) {
+    throw new Error(`tiledMatmul: N=${N} must be divisible by Bc=${Bc}`);
+  }
+
+  // Pad K to a multiple of Bk if needed
+  const Kpad = Math.ceil(K / Bk) * Bk;
+  let aInput = A;
+  let bInput = B;
+  if (Kpad !== K) {
+    const padK = Kpad - K;
+    aInput = core.pad(A, { 1: [0, padK] }) as Array;
+    bInput = core.pad(B, { 0: [0, padK] }) as Array;
+  }
+
+  try {
+    const numKTiles = Kpad / Bk;
+    return blockMap(
+      ({ A: aTile, B: bTile }: { A: Array; B: Array }) =>
+        foriLoop(
+          0,
+          numKTiles,
+          (k: Array, acc: Array) => {
+            using kIdx = core.mul(
+              k,
+              arrayFn(Bk, { dtype: DType.Int32 }),
+            ) as Array;
+            using z0 = arrayFn(0, { dtype: DType.Int32 });
+            using a = dynamicSlice(aTile, [z0, kIdx], [Br, Bk]);
+            using b = dynamicSlice(bTile, [kIdx, z0], [Bk, Bc]);
+            using prod = dot(a, b, {
+              lhsContractingDims: [1],
+              rhsContractingDims: [0],
+            });
+            return core.add(acc, prod) as Array;
+          },
+          fullInternal(new ShapedArray([Br, Bc], A.dtype, false), 0),
+        ),
+      { A: aInput, B: bInput },
+      {
+        blockShape: [Br, Bc],
+        inAxes: [
+          [0, null],
+          [null, 1],
+        ],
+        outAxes: [[0, 1]],
+      },
+    );
+  } finally {
+    if (Kpad !== K) {
+      aInput.dispose();
+      bInput.dispose();
+    }
+  }
 }
