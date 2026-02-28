@@ -112,6 +112,7 @@ export enum Primitive {
   // Control flow
   Scan = "scan",
   AssociativeScan = "associative_scan",
+  BlockMap = "block_map",
 }
 
 interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
@@ -170,6 +171,14 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     numLeaves: number;
     axis: number;
     reverse: boolean;
+  };
+  [Primitive.BlockMap]: {
+    jaxpr: Jaxpr;
+    blockShape: number[];
+    inAxes: (number | null)[][];
+    outAxes: (number | null)[][];
+    numConsts: number;
+    numInputs: number;
   };
 }
 

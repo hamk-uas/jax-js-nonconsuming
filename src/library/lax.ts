@@ -18,6 +18,8 @@ export { scan } from "./lax-scan";
 export type { ScanOptions } from "./lax-scan";
 export { associativeScan } from "./lax-associative-scan";
 export type { AssociativeScanOptions } from "./lax-associative-scan";
+export { blockMap } from "./lax-block-map";
+export type { BlockMapOptions } from "./lax-block-map";
 
 /**
  * Dimension numbers for general `dot()` primitive.

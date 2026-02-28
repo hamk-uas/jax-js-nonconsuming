@@ -1915,6 +1915,9 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
       "internal: AssociativeScan is handled specially in jitCompile",
     );
   },
+  [Primitive.BlockMap]() {
+    throw new Error("jit: BlockMap is not yet supported in JIT compilation");
+  },
 };
 
 /** Determines how to split the Jaxpr into kernels via dataflow analysis. */

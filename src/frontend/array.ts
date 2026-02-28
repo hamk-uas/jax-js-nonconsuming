@@ -49,8 +49,11 @@ import {
   _peArrayCreationTracker,
   AbstractValue,
   CompareOp,
+  concatenate as coreConcatenate,
   exp as coreExp,
   mul as coreMul,
+  pad as corePad,
+  shrink as coreShrink,
   getAval,
   inMakeJaxprBody,
   ndim,
@@ -66,7 +69,7 @@ import {
   UseAfterFreeError,
   where,
 } from "./core";
-import { abstractEvalRules } from "./jaxpr";
+import { abstractEvalRules, evalJaxpr } from "./jaxpr";
 import { jitCompile } from "./jit";
 import { executeScan } from "./scan-executor";
 import { planScan } from "./scan-plan";
@@ -1663,6 +1666,192 @@ export class Array extends Tracer {
           axis,
           reverse,
         );
+      },
+      [Primitive.BlockMap](
+        args,
+        { jaxpr: bodyJaxpr, blockShape, inAxes, outAxes, numConsts, numInputs },
+      ) {
+        // Eager impl: slice/pad/concat loop over the grid of blocks.
+        const consts = args.slice(0, numConsts);
+        const inputs = args.slice(numConsts, numConsts + numInputs);
+
+        // Compute grid shape from inputs + inAxes
+        const gridRank = blockShape.length;
+        const gridShape: number[] = new JsArray(gridRank).fill(0);
+        for (let i = 0; i < inputs.length; i++) {
+          const axes = inAxes[i];
+          for (let g = 0; g < gridRank; g++) {
+            if (axes[g] !== null) {
+              const dim = inputs[i].shape[axes[g]!] as number;
+              gridShape[g] = Math.ceil(dim / blockShape[g]);
+            }
+          }
+        }
+
+        // Total number of blocks
+        const numBlocks = gridShape.reduce((a, b) => a * b, 1);
+
+        // Collect block outputs per output index
+        const numOutputs = bodyJaxpr.outs.length;
+        const outputBlocks: Array[][] = JsArray.from(
+          { length: numOutputs },
+          () => [],
+        );
+
+        // Iterate over all block index tuples (row-major order)
+        for (let flatIdx = 0; flatIdx < numBlocks; flatIdx++) {
+          // Convert flat index to grid coordinates
+          const blockIdx: number[] = new JsArray(gridRank);
+          let remaining = flatIdx;
+          for (let g = gridRank - 1; g >= 0; g--) {
+            blockIdx[g] = remaining % gridShape[g];
+            remaining = Math.floor(remaining / gridShape[g]);
+          }
+
+          // Slice each input along its mapped axes, pad if non-divisible
+          const blockInputs: Array[] = [];
+          for (let i = 0; i < inputs.length; i++) {
+            const inputArr = inputs[i];
+            const axes = inAxes[i];
+            const nd = inputArr.ndim;
+
+            // Build the shrink slice for all dims at once
+            const slice: Pair[] = range(nd).map((d) => [
+              0,
+              inputArr.shape[d] as number,
+            ]);
+            for (let g = 0; g < gridRank; g++) {
+              if (axes[g] !== null) {
+                const ax = axes[g]!;
+                const start = blockIdx[g] * blockShape[g];
+                const fullDim = inputArr.shape[ax] as number;
+                const end = Math.min(start + blockShape[g], fullDim);
+                slice[ax] = [start, end];
+              }
+            }
+
+            let current = coreShrink(inputArr, slice) as Array;
+
+            // Pad to blockShape if this is the last block and non-divisible
+            const padWidth: Pair[] = range(current.ndim).map(
+              () => [0, 0] as Pair,
+            );
+            let anyPad = false;
+            for (let g = 0; g < gridRank; g++) {
+              if (axes[g] !== null) {
+                const ax = axes[g]!;
+                const actual = current.shape[ax] as number;
+                if (actual < blockShape[g]) {
+                  padWidth[ax] = [0, blockShape[g] - actual];
+                  anyPad = true;
+                }
+              }
+            }
+            if (anyPad) {
+              const padded = corePad(current, padWidth) as Array;
+              current.dispose();
+              current = padded;
+            }
+
+            blockInputs.push(current);
+          }
+
+          // Execute body jaxpr on this block
+          // evalJaxpr is non-consuming — consts and blockInputs stay alive.
+          const bodyOuts = evalJaxpr(bodyJaxpr, [...consts, ...blockInputs]);
+
+          // Dispose sliced block inputs
+          for (const bi of blockInputs) bi.dispose();
+
+          // Collect outputs
+          for (let o = 0; o < numOutputs; o++) {
+            outputBlocks[o].push(bodyOuts[o] as Array);
+          }
+        }
+
+        // Concatenate block outputs and trim padding
+        const results: Array[] = [];
+        for (let o = 0; o < numOutputs; o++) {
+          const axes = outAxes[o];
+
+          if (numBlocks === 0) {
+            const bodyOutAval = bodyJaxpr.outs[o].aval;
+            const fullShape = [...bodyOutAval.shape] as number[];
+            for (let g = 0; g < gridRank; g++) {
+              if (axes[g] !== null) fullShape[axes[g]!] = 0;
+            }
+            results.push(
+              zeros(fullShape, { dtype: bodyOutAval.dtype }) as Array,
+            );
+            continue;
+          }
+
+          // Hierarchical concatenation: from last grid axis to first.
+          // blocks[o] are in row-major order over the grid.
+          // For each grid axis (from innermost), group and concat.
+          let current = outputBlocks[o] as Array[];
+          for (let g = gridRank - 1; g >= 0; g--) {
+            if (axes[g] === null) continue;
+            const concatAxis = axes[g]!;
+            const stride = gridShape[g]; // number of items to group
+            const grouped: Array[] = [];
+            for (let start = 0; start < current.length; start += stride) {
+              const group = current.slice(start, start + stride);
+              const merged = coreConcatenate(group, concatAxis) as Array;
+              grouped.push(merged);
+            }
+            // Dispose intermediates from previous level (not original blocks)
+            if (current !== outputBlocks[o]) {
+              for (const c of current) c.dispose();
+            }
+            current = grouped;
+          }
+
+          let result =
+            current.length === 1
+              ? current[0]
+              : (coreConcatenate(current, 0) as Array);
+
+          // Dispose intermediate concat results (but not if result is one of them)
+          if (current !== outputBlocks[o] && current.length > 1) {
+            for (const c of current) {
+              if (c !== result) c.dispose();
+            }
+          }
+
+          // Trim padding if input dimension wasn't evenly divisible
+          const resultShape = result.shape as number[];
+          let needsTrim = false;
+          const trimSlice: Pair[] = resultShape.map((s) => [0, s] as Pair);
+          for (let g = 0; g < gridRank; g++) {
+            if (axes[g] !== null) {
+              const ax = axes[g]!;
+              for (let i = 0; i < inputs.length; i++) {
+                if (inAxes[i][g] !== null) {
+                  const origDim = inputs[i].shape[inAxes[i][g]!] as number;
+                  if (origDim < resultShape[ax]) {
+                    trimSlice[ax] = [0, origDim];
+                    needsTrim = true;
+                  }
+                  break;
+                }
+              }
+            }
+          }
+
+          if (needsTrim) {
+            const trimmed = coreShrink(result, trimSlice) as Array;
+            result.dispose();
+            result = trimmed;
+          }
+
+          // Dispose original block outputs
+          for (const b of outputBlocks[o]) b.dispose();
+
+          results.push(result);
+        }
+
+        return results;
       },
     };
   }

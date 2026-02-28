@@ -879,6 +879,9 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
 
     return [primalsOut, tangentsOut];
   },
+  [Primitive.BlockMap]() {
+    throw new Error("jvp: BlockMap is not yet supported");
+  },
 };
 
 const jvpJaxprCache = new Map<Jaxpr, ClosedJaxpr>();

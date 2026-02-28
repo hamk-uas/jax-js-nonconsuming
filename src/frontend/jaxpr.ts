@@ -1662,6 +1662,51 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     // Output shapes = input elem shapes (prefix scan preserves shape)
     return args.slice(numConsts);
   },
+
+  [Primitive.BlockMap](
+    args,
+    { jaxpr: bodyJaxpr, blockShape, inAxes, outAxes, numConsts, numInputs },
+  ) {
+    // Args layout: [...consts, ...inputs]
+    // bodyJaxpr operates on block-shaped slices; outputs are block-shaped.
+    // Full output shapes: restore the original array dimensions along outAxes.
+    const { outTypes } = typecheckJaxpr(bodyJaxpr);
+
+    if (bodyJaxpr.inBinders.length !== numConsts + numInputs) {
+      throw new TypeError(
+        `BlockMap body jaxpr expects ${bodyJaxpr.inBinders.length} inputs, got ${numConsts + numInputs}`,
+      );
+    }
+
+    // Compute grid shape from inputs + inAxes
+    const inputs = args.slice(numConsts);
+    const gridShape: number[] = new globalThis.Array(blockShape.length).fill(0);
+    for (let i = 0; i < inputs.length; i++) {
+      const axes = inAxes[i];
+      for (let g = 0; g < blockShape.length; g++) {
+        if (axes[g] !== null) {
+          const dim = inputs[i].shape[axes[g]!] as number;
+          gridShape[g] = Math.ceil(dim / blockShape[g]);
+        }
+      }
+    }
+
+    // Output shapes: body output shapes with block dims expanded to full dims
+    return outTypes.map((bodyOutAval, oi) => {
+      const axes = outAxes[oi];
+      const fullShape = [...bodyOutAval.shape];
+      for (let g = 0; g < blockShape.length; g++) {
+        if (axes[g] !== null) {
+          fullShape[axes[g]!] = gridShape[g] * blockShape[g];
+        }
+      }
+      return new ShapedArray(
+        fullShape,
+        bodyOutAval.dtype,
+        bodyOutAval.weakType,
+      );
+    });
+  },
 };
 
 function splitIdx(values: any[], argnums: Set<number>): [any[], any[]] {
