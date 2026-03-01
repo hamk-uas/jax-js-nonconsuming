@@ -1,6 +1,6 @@
 import { DType } from "../alu";
 import { assertNonNull, checkAxis, range, rep, unzip2, zip } from "../utils";
-import { arange, eye, pureArray, zeros } from "./array";
+import { arange, eye, fullInternal, pureArray } from "./array";
 import {
   AbstractValue,
   bind,
@@ -799,7 +799,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     const origX = args[0];
     const x = moveBatchAxis(axisSize, xBdim, 0, origX);
     // Zero index for the inserted batch dimension — always in-bounds
-    using zero = zeros([], { dtype: DType.Int32 });
+    using zero = fullInternal(new ShapedArray([], DType.Int32, false), 0);
     const result = bind1(Primitive.DynamicSlice, [x, zero, ...args.slice(1)], {
       sliceSizes: [axisSize, ...sliceSizes],
     });
@@ -817,7 +817,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     const origX = args[0];
     const x = moveBatchAxis(axisSize, xBdim, 0, origX);
     // Zero index for the batch dimension — in-bounds by construction (0 + B == B)
-    using zero = zeros([], { dtype: DType.Int32 });
+    using zero = fullInternal(new ShapedArray([], DType.Int32, false), 0);
     const result = bind1(
       Primitive.UncheckedDynamicSlice,
       [x, zero, ...args.slice(1)],

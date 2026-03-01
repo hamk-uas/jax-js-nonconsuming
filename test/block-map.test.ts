@@ -22,6 +22,7 @@ import {
   jvp,
   lax,
   numpy as np,
+  setDebug,
   vmap,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, test } from "vitest";
@@ -410,6 +411,25 @@ describe("lax.dynamicSlice — Phase 1b", () => {
       [12, 13, 14, 15],
     ]);
     f.dispose();
+  });
+
+  // T4.11: DEBUG>=2 assertion fires when sliceSize > operandShape (at trace time)
+  test("uncheckedDynamicSlice throws at DEBUG>=2 when slice exceeds shape", () => {
+    setDebug(2);
+    try {
+      using start = np.array(0, { dtype: DType.Int32 });
+      // sliceSize=10 > operandSize=4 — should throw during JIT tracing (abstractEval)
+      const f = jit((x: np.Array) =>
+        lax.uncheckedDynamicSlice(x, [start], [10]),
+      );
+      using x = np.arange(4).astype(DType.Float32);
+      expect(() => f(x)).toThrow(
+        /UncheckedDynamicSlice.*slice\[0\]=10.*>.*shape\[0\]=4/,
+      );
+      f.dispose();
+    } finally {
+      setDebug(0);
+    }
   });
 });
 

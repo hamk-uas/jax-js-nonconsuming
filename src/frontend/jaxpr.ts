@@ -1,6 +1,5 @@
 import { byteWidth, DType, isFloatDtype } from "../alu";
 import { PPrint } from "../pprint";
-import { DEBUG } from "../utils";
 import {
   concreteDim,
   type Dim,
@@ -16,6 +15,7 @@ import {
   unflatten as treeUnflatten,
 } from "../tree";
 import {
+  DEBUG,
   deepEqual,
   FpHash,
   FpHashable,
