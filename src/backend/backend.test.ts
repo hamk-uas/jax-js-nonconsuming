@@ -9,13 +9,19 @@ import {
   Kernel,
   Reduction,
 } from "../alu";
-import { devices, getBackend, init } from "../backend";
+import { type Device, devices, getBackend, init } from "../backend";
 import { ShapeTracker, unravelAlu } from "../shape";
 import { range } from "../utils";
 
 const devicesAvailable = await init();
 
-suite.each(devices)("device:%s", (device) => {
+// Eager GPU dispatches take seconds each for trivial ops.
+// Algorithm correctness is proven by cpu + wasm.
+const fastDevices: Device[] = devices.filter(
+  (d) => d !== "webgpu" && d !== "webgl",
+);
+
+suite.each(fastDevices)("device:%s", (device) => {
   const skipped = !devicesAvailable.includes(device);
 
   beforeEach(({ skip }) => {

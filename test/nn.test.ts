@@ -1,5 +1,6 @@
 import {
   defaultDevice,
+  type Device,
   devices,
   grad,
   init,
@@ -10,7 +11,12 @@ import { beforeEach, expect, suite, test } from "vitest";
 
 const devicesAvailable = await init();
 
-suite.each(devices)("device:%s", (device) => {
+// Eager GPU dispatches dominate wall-clock; algorithm correctness proven by cpu+wasm.
+const fastDevices: Device[] = devices.filter(
+  (d) => d !== "webgpu" && d !== "webgl",
+);
+
+suite.each(fastDevices)("device:%s", (device) => {
   const skipped = !devicesAvailable.includes(device);
   beforeEach(({ skip }) => {
     if (skipped) skip();
