@@ -136,6 +136,8 @@ export function blockMapFusedShaderSource(
     bodyBarriers: Set<number>;
     bodyShmemMap: Map<JitId, { name: string; dtype: DType; elemCount: number }>;
     bodyShmemIds: Set<JitId>;
+    /** P0a: size-1 kernels promoted from shmem to `let` bindings. */
+    promotedScalars: Map<JitId, { name: string; dtype: DType }>;
     bodyInputIds: JitId[];
     bodyOutputIds: JitId[];
     numConsts: number;
@@ -327,6 +329,35 @@ export function blockMapFusedShaderSource(
           }
         }
 
+        // P0a: Scalar promotion — detect size-1 kernels that can be promoted
+        // from shmem to `let` bindings. This eliminates the shmem allocation,
+        // the `if (tidx < 1u)` guard, and the barrier.
+        const promotedScalars = new Map<
+          JitId,
+          { name: string; dtype: DType }
+        >();
+        const bodyOutputSet = new Set(bodyProg.outputs);
+        for (const { step: bs, kernel: bk } of bodyKernels) {
+          if ((bk.size as number) !== 1 || bk.numOutputs !== 1) continue;
+          if (bk.hasReduction) continue;
+          const outId = bs.outputs[0];
+          // Don't promote carry outputs — they must persist across iterations
+          if (bodyOutputSet.has(outId)) continue;
+          const shmemEntry = bodyShmemMap.get(outId);
+          if (!shmemEntry) continue;
+          const dtype = bk.outputs[0].dtype;
+          promotedScalars.set(outId, {
+            name: `fl${flIdx}_let_${outId}`,
+            dtype,
+          });
+          // Remove from shmem tracking
+          const removedBytes =
+            shmemEntry.elemCount * byteWidth(shmemEntry.dtype);
+          totalShmemBytes -= removedBytes;
+          bodyShmemMap.delete(outId);
+          bodyShmemIds.delete(outId);
+        }
+
         // Barrier analysis for body kernel steps
         const bStepWrites = new Map<number, Set<JitId>>();
         const bStepReads = new Map<number, Set<JitId>>();
@@ -365,6 +396,7 @@ export function blockMapFusedShaderSource(
           bodyBarriers,
           bodyShmemMap,
           bodyShmemIds,
+          promotedScalars,
           bodyInputIds: bodyProg.inputs,
           bodyOutputIds: bodyProg.outputs,
           numConsts: step.numConsts,
@@ -1390,6 +1422,7 @@ export function blockMapFusedShaderSource(
         isGlobal: boolean;
         parentInputIdx: number; // for block offset
         isIndex: boolean;
+        isScalar: boolean; // P0a: promoted scalar — use name directly, no indexing
       }[] = [];
 
       for (let bi = 0; bi < fl.bodyInputIds.length; bi++) {
@@ -1408,6 +1441,7 @@ export function blockMapFusedShaderSource(
             parentInputIdx:
               parentBodyIdx >= numConsts ? parentBodyIdx - numConsts : -1,
             isIndex: false,
+            isScalar: false,
           });
         } else if (bi === numBodyConsts) {
           // Loop index — scalar i32
@@ -1416,6 +1450,7 @@ export function blockMapFusedShaderSource(
             isGlobal: false,
             parentInputIdx: -1,
             isIndex: true,
+            isScalar: false,
           });
         } else {
           // Carry input — maps to the parent output shmem
@@ -1427,6 +1462,7 @@ export function blockMapFusedShaderSource(
             isGlobal: false,
             parentInputIdx: -1,
             isIndex: false,
+            isScalar: false,
           });
         }
       }
@@ -1437,6 +1473,10 @@ export function blockMapFusedShaderSource(
         bodyIdToName.set(fl.bodyInputIds[bi], bodyInputInfo[bi].name);
       }
       for (const [bodyJitId, info] of fl.bodyShmemMap) {
+        bodyIdToName.set(bodyJitId, info.name);
+      }
+      // P0a: add promoted scalar `let` names
+      for (const [bodyJitId, info] of fl.promotedScalars) {
         bodyIdToName.set(bodyJitId, info.name);
       }
       // Map body output JitIds to carry output shmem names
@@ -1519,13 +1559,15 @@ export function blockMapFusedShaderSource(
           if (biIdx >= 0) {
             bStepInputInfo.push(bodyInputInfo[biIdx]);
           } else {
-            // Body shmem intermediate or carry output
+            // Body shmem intermediate, carry output, or promoted scalar
             const sname = bodyIdToName.get(jitId);
+            const isPromotedScalar = fl.promotedScalars.has(jitId);
             bStepInputInfo.push({
               name: sname ?? `__fl_unknown_${jitId}`,
               isGlobal: false,
               parentInputIdx: -1,
               isIndex: false,
+              isScalar: isPromotedScalar,
             });
           }
         }
@@ -1537,6 +1579,10 @@ export function blockMapFusedShaderSource(
             const info = bStepInputInfo[bufIdx];
             if (info.isIndex) {
               // Loop variable — scalar, cast to read dtype
+              return `${dtypeToWgsl(dtype)}(${info.name})`;
+            }
+            if (info.isScalar) {
+              // P0a: promoted scalar — use let binding directly, no indexing
               return `${dtypeToWgsl(dtype)}(${info.name})`;
             }
             if (info.isGlobal) {
@@ -1599,6 +1645,9 @@ export function blockMapFusedShaderSource(
                 if (info.isIndex) {
                   return `${dtypeToWgsl(dtype)}(${info.name})`;
                 }
+                if (info.isScalar) {
+                  return `${dtypeToWgsl(dtype)}(${info.name})`;
+                }
                 if (info.isGlobal) {
                   const inputIdx = info.parentInputIdx;
                   if (inputIdx >= 0) {
@@ -1630,24 +1679,40 @@ export function blockMapFusedShaderSource(
         } else {
           // Elementwise output writes — guard if kernel size < blockSize
           const bKernelSize = bKernel.size as number;
-          const needSizeGuard = bKernelSize < blockSize;
-          if (needSizeGuard) emit(`if (tidx < ${bKernelSize}u) {`, pushIndent);
-          for (let oi = 0; oi < bKernel.numOutputs; oi++) {
-            const outId = bStep.outputs[oi];
-            const rhs = strip1(gen(bKernel.outputs[oi].exp));
-            const targetName = bodyIdToName.get(outId);
-            if (targetName) {
-              const targetDtype = bodyOutShmemDtype(outId);
-              const targetTy = targetDtype ? dtypeToWgsl(targetDtype) : null;
-              const expDtype = bKernel.outputs[oi].exp.dtype;
-              const castRhs =
-                targetTy && targetDtype !== expDtype
-                  ? `${targetTy}(${rhs})`
-                  : rhs;
-              emit(`${targetName}[tidx] = ${castRhs};`);
+
+          // P0a: check if this is a promoted scalar (size-1 → let binding)
+          const isPromoted =
+            bKernel.numOutputs === 1 &&
+            fl.promotedScalars.has(bStep.outputs[0]);
+
+          if (isPromoted) {
+            // Emit a `let` binding instead of shmem write — no guard, no barrier
+            const outId = bStep.outputs[0];
+            const rhs = strip1(gen(bKernel.outputs[0].exp));
+            const promoted = fl.promotedScalars.get(outId)!;
+            const ty = dtypeToWgsl(promoted.dtype);
+            emit(`let ${promoted.name}: ${ty} = ${ty}(${rhs});`);
+          } else {
+            const needSizeGuard = bKernelSize < blockSize;
+            if (needSizeGuard)
+              emit(`if (tidx < ${bKernelSize}u) {`, pushIndent);
+            for (let oi = 0; oi < bKernel.numOutputs; oi++) {
+              const outId = bStep.outputs[oi];
+              const rhs = strip1(gen(bKernel.outputs[oi].exp));
+              const targetName = bodyIdToName.get(outId);
+              if (targetName) {
+                const targetDtype = bodyOutShmemDtype(outId);
+                const targetTy = targetDtype ? dtypeToWgsl(targetDtype) : null;
+                const expDtype = bKernel.outputs[oi].exp.dtype;
+                const castRhs =
+                  targetTy && targetDtype !== expDtype
+                    ? `${targetTy}(${rhs})`
+                    : rhs;
+                emit(`${targetName}[tidx] = ${castRhs};`);
+              }
             }
+            if (needSizeGuard) emit(popIndent, "}");
           }
-          if (needSizeGuard) emit(popIndent, "}");
         }
       }
 

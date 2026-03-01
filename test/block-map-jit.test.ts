@@ -1455,4 +1455,47 @@ describe("shader quality gates", () => {
 
     f.dispose();
   });
+
+  test("P0a: scalar intermediates promoted to let bindings (no tidx < 1u guard)", () => {
+    if (!isWebGPU) return;
+
+    // Two reductions whose results are combined by a size-1 non-reduction
+    // kernel. That kernel cannot be a reduction epilogue (depends on both),
+    // so without scalar promotion it would get an `if (tidx < 1u)` shmem
+    // write + barrier. With promotion it becomes a `let` binding.
+    const body = (block: np.Array) => {
+      using m = np.max(block);
+      using s = np.sum(block);
+      using ratio = np.divide(m, s);
+      return np.multiply(block, ratio);
+    };
+    const f = jit((xs: np.Array) =>
+      lax.blockMap(body, xs, { blockShape: [4] }),
+    );
+    using xs = np.array([1, 2, 3, 4, 2, 2, 2, 2], { dtype: DType.Float32 });
+
+    const shaders = captureShaders(() => {
+      using _result = f(xs);
+    });
+    // Verify correctness
+    using result = f(xs);
+    // Block 0: max=4, sum=10, ratio=0.4, [0.4, 0.8, 1.2, 1.6]
+    // Block 1: max=2, sum=8, ratio=0.25, [0.5, 0.5, 0.5, 0.5]
+    expect(result).toBeAllclose([0.4, 0.8, 1.2, 1.6, 0.5, 0.5, 0.5, 0.5]);
+
+    const fusedShaders = shaders.filter(
+      (s) => s.includes("var<workgroup>") || s.includes("workgroupBarrier"),
+    );
+    expect(fusedShaders.length).toBeGreaterThan(0);
+    for (const shader of fusedShaders) {
+      // The size-1 kernel should be promoted to a let binding, not a guarded
+      // shmem write. "tidx < 1u" is the signature of an un-promoted size-1 step.
+      expect(
+        shader,
+        "promoted scalar should use let binding, not tidx < 1u guard",
+      ).not.toContain("tidx < 1u");
+    }
+
+    f.dispose();
+  });
 });
