@@ -1200,6 +1200,35 @@ export function blockMapFusedShaderSource(
       text.startsWith(prefix + "_alu") &&
       /^\d+$/.test(text.slice(prefix.length + 4));
 
+    // O2: Simplify kernel expressions with bounded gidx range.
+    // gidx ∈ [0, blockSize-1] lets the simplifier eliminate redundant
+    // mod/div from unravelAlu() (e.g. (gidx / 16) % 16 → gidx / 16).
+    const gidxBound = AluExp.special(DType.Int32, "gidx", blockSize);
+    const simplifiedMap = new Map<AluExp, AluExp>();
+    for (const output of kernel.outputs) {
+      const vars: Record<string, AluExp> = { gidx: gidxBound };
+      if (output.reduction && !isSymbolicSize(output.reduction.size)) {
+        vars.ridx = AluExp.special(
+          DType.Int32,
+          "ridx",
+          output.reduction.size as number,
+        );
+      }
+      simplifiedMap.set(
+        output.exp,
+        output.exp.substitute(vars).rewriteGlobalViews().simplify(),
+      );
+      if (output.reduction) {
+        simplifiedMap.set(
+          output.reduction.epilogue,
+          output.reduction.epilogue
+            .substitute({ gidx: gidxBound })
+            .rewriteGlobalViews()
+            .simplify(),
+        );
+      }
+    }
+
     const references = new Map<AluExp, number>();
     const seen = new Set<AluExp>();
     const countReferences = (exp: AluExp) => {
@@ -1209,10 +1238,12 @@ export function blockMapFusedShaderSource(
         for (const src of exp.src) countReferences(src);
       }
     };
-    for (const output of kernel.outputs) countReferences(output.exp);
+    for (const sExp of simplifiedMap.values()) countReferences(sExp);
 
     const expContext = new Map<AluExp, string>();
     const gen = (exp: AluExp): string => {
+      // O2: resolve original expressions to their simplified counterparts
+      exp = simplifiedMap.get(exp) ?? exp;
       if (expContext.has(exp)) return expContext.get(exp)!;
       const { op, src, dtype, arg } = exp;
 
