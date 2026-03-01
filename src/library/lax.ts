@@ -745,8 +745,7 @@ export interface TiledMatmulOptions {
  * block tiles processed in shared memory on WebGPU. Falls back to the standard
  * matmul kernel on WASM/CPU.
  *
- * Both M and N must be divisible by Br and Bc respectively. K is padded with
- * zeros if not divisible by Bk.
+ * M, N, and K are padded with zeros if not divisible by the tile sizes.
  *
  * @param A - Left matrix of shape `[M, K]`.
  * @param B - Right matrix of shape `[K, N]`.
@@ -772,26 +771,35 @@ export function tiledMatmul(
       `tiledMatmul: contraction dims must match, got ${K} and ${K2}`,
     );
   }
-  if (M % Br !== 0) {
-    throw new Error(`tiledMatmul: M=${M} must be divisible by Br=${Br}`);
-  }
-  if (N % Bc !== 0) {
-    throw new Error(`tiledMatmul: N=${N} must be divisible by Bc=${Bc}`);
-  }
 
-  // Pad K to a multiple of Bk if needed
+  // Pad M, N, K to multiples of tile sizes if needed
+  const Mpad = Math.ceil(M / Br) * Br;
+  const Npad = Math.ceil(N / Bc) * Bc;
   const Kpad = Math.ceil(K / Bk) * Bk;
   let aInput = A;
   let bInput = B;
-  if (Kpad !== K) {
+  const needsPad = Mpad !== M || Npad !== N || Kpad !== K;
+  if (needsPad) {
+    const padM = Mpad - M;
+    const padN = Npad - N;
     const padK = Kpad - K;
-    aInput = core.pad(A, { 1: [0, padK] }) as Array;
-    bInput = core.pad(B, { 0: [0, padK] }) as Array;
+    if (padM > 0 || padK > 0) {
+      const aPad: Record<number, [number, number]> = {};
+      if (padM > 0) aPad[0] = [0, padM];
+      if (padK > 0) aPad[1] = [0, padK];
+      aInput = core.pad(A, aPad) as Array;
+    }
+    if (padN > 0 || padK > 0) {
+      const bPad: Record<number, [number, number]> = {};
+      if (padK > 0) bPad[0] = [0, padK];
+      if (padN > 0) bPad[1] = [0, padN];
+      bInput = core.pad(B, bPad) as Array;
+    }
   }
 
   try {
     const numKTiles = Kpad / Bk;
-    return blockMap(
+    const fullResult = blockMap(
       ({ A: aTile, B: bTile }: { A: Array; B: Array }) =>
         foriLoop(
           0,
@@ -822,8 +830,15 @@ export function tiledMatmul(
         outAxes: [[0, 1]],
       },
     );
+    // Slice off padding if M or N were padded (dynamicSlice produces contiguous output, unlike shrink)
+    if (Mpad !== M || Npad !== N) {
+      using fullPadded = fullResult;
+      using z0 = arrayFn(0, { dtype: DType.Int32 });
+      return dynamicSlice(fullPadded, [z0, z0], [M, N]);
+    }
+    return fullResult;
   } finally {
-    if (Kpad !== K) {
+    if (needsPad) {
       aInput.dispose();
       bInput.dispose();
     }

@@ -26,16 +26,31 @@
 
   // Bar chart configuration
   const barWidth = 80;
-  const barGap = 24;
+  const barGap = 16;
   const paddingX = 16;
   const paddingTop = 24;
   const paddingBottom = 28;
 
-  const allBackends = ["Wasm", "WebGPU", "WebGPU-fp16"] as const;
+  const allBackends = [
+    "Wasm",
+    "WebGPU",
+    "WebGPU-fp16",
+    "WebGPU-tiled",
+    "WebGPU-tiled-fp16",
+  ] as const;
   const barColors: Record<(typeof allBackends)[number], string> = {
     Wasm: "#6366f1",
     WebGPU: "#8b5cf6",
     "WebGPU-fp16": "#a855f7",
+    "WebGPU-tiled": "#0891b2",
+    "WebGPU-tiled-fp16": "#06b6d4",
+  };
+  const barLabels: Record<(typeof allBackends)[number], string> = {
+    Wasm: "Wasm",
+    WebGPU: "WebGPU",
+    "WebGPU-fp16": "fp16",
+    "WebGPU-tiled": "Tiled",
+    "WebGPU-tiled-fp16": "Tiled fp16",
   };
 
   // Always render all backends for smooth transitions
@@ -149,7 +164,7 @@
           class="text-xs"
           fill="#64748b"
         >
-          {backend}
+          {barLabels[backend]}
         </text>
       </g>
     {/each}

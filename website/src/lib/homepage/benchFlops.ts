@@ -1,10 +1,63 @@
 import type { Device, DType } from "@hamk-uas/jax-js-nonconsuming";
 
+export async function benchTiledFlops(
+  n: number,
+  dtype: DType,
+): Promise<number | undefined> {
+  try {
+    const jax = await import("@hamk-uas/jax-js-nonconsuming");
+    await jax.init("webgpu");
+    jax.defaultDevice("webgpu");
+
+    const tiledFn = jax.jit((a: any, b: any) => jax.lax.tiledMatmul(a, b));
+
+    const measurements: number[] = [];
+
+    // 1 warmup + 2 timed runs
+    for (let i = 0; i < 3; i++) {
+      using key = jax.random.key(0);
+      const [k1, k2] = jax.random.split(key, 2);
+
+      using A = jax.random.uniform(k1, [n, n]).astype(dtype);
+      using B = jax.random.uniform(k2, [n, n]).astype(dtype);
+      k1.dispose();
+      k2.dispose();
+      await jax.blockUntilReady([A, B]);
+
+      const start = performance.now();
+      using C = tiledFn(A, B);
+      await jax.blockUntilReady(C);
+      const end = performance.now();
+
+      // Validate the result is finite (catches GPU errors that produce garbage)
+      const sample = (await C.data())[0];
+      if (!Number.isFinite(sample))
+        throw new Error("GPU produced non-finite result");
+
+      if (i > 0) {
+        measurements.push((end - start) / 1000);
+      }
+    }
+
+    tiledFn.dispose();
+
+    const gflops = (2 * n * n * n) / 1e9;
+    const seconds =
+      measurements.reduce((a, b) => a + b, 0) / measurements.length;
+    const result = gflops / seconds;
+
+    return Number.isFinite(result) && result > 0 ? result : undefined;
+  } catch (error: any) {
+    console.error("Tiled benchmark error:", error);
+    return undefined;
+  }
+}
+
 export async function benchFlops(
   n: number,
   device: Device,
   dtype: DType,
-): Promise<number> {
+): Promise<number | undefined> {
   try {
     const jax = await import("@hamk-uas/jax-js-nonconsuming");
     await jax.init(device);
@@ -30,6 +83,11 @@ export async function benchFlops(
       await jax.blockUntilReady(C);
       const end = performance.now();
 
+      // Validate the result is finite (catches GPU errors that produce garbage)
+      const sample = (await C.data())[0];
+      if (!Number.isFinite(sample))
+        throw new Error("GPU produced non-finite result");
+
       if (i > 0) {
         measurements.push((end - start) / 1000);
       }
@@ -38,19 +96,22 @@ export async function benchFlops(
     const gflops = (2 * n * n * n) / 1e9;
     const seconds =
       measurements.reduce((a, b) => a + b, 0) / measurements.length;
+    const result = gflops / seconds;
 
-    return gflops / seconds;
+    return Number.isFinite(result) && result > 0 ? result : undefined;
   } catch (error: any) {
     console.error("Benchmark error:", error);
-    return 0;
+    return undefined;
   }
 }
 
 export interface PerfResults {
   flops: {
-    Wasm: number;
-    WebGPU: number;
+    Wasm: number | undefined;
+    WebGPU: number | undefined;
     "WebGPU-fp16": number | undefined;
+    "WebGPU-tiled": number | undefined;
+    "WebGPU-tiled-fp16": number | undefined;
   };
   browser: string;
   live: boolean;
@@ -62,6 +123,8 @@ export const fallbackResults: PerfResults = {
     Wasm: 2.72,
     WebGPU: 2071,
     "WebGPU-fp16": 3343,
+    "WebGPU-tiled": undefined,
+    "WebGPU-tiled-fp16": undefined,
   },
   browser: "Chrome on Apple M3 Pro",
   live: false,
@@ -99,6 +162,10 @@ export async function measurePerf(): Promise<PerfResults> {
       WebGPU: await benchFlops(gpuDim, "webgpu", "float32" as DType),
       "WebGPU-fp16": hasF16
         ? await benchFlops(gpuDim, "webgpu", "float16" as DType)
+        : undefined,
+      "WebGPU-tiled": await benchTiledFlops(gpuDim, "float32" as DType),
+      "WebGPU-tiled-fp16": hasF16
+        ? await benchTiledFlops(gpuDim, "float16" as DType)
         : undefined,
     },
     browser: "Your browser (live)",

@@ -568,6 +568,25 @@ export function blockMapFusedShaderSource(
     }
   }
 
+  // Also refine carry shmem dtypes from fori_loop body outputs.
+  // The carry output shmem (fs.outputs[ci]) is only written by the fori_loop
+  // body, not by any top-level kernel, so the above loop misses it.
+  for (const fl of foriLoops) {
+    const numCarries = fl.foriStep.initCarries.length;
+    for (let ci = 0; ci < numCarries; ci++) {
+      const parentOutId = fl.foriStep.outputs[ci];
+      const entry = shmemMap.get(parentOutId);
+      if (!entry) continue;
+      const bodyOutId = fl.bodyOutputIds[ci];
+      // Body output is typically a body-malloc'd intermediate (already refined)
+      const bodyShmemEntry = fl.bodyShmemMap.get(bodyOutId);
+      if (bodyShmemEntry) {
+        entry.dtype = bodyShmemEntry.dtype;
+        entry.elemCount = entry.sizeBytes / byteWidth(entry.dtype);
+      }
+    }
+  }
+
   // --- Build JitId → buffer name mapping ---
   // Body inputs (consts + block inputs) → global storage buffer names
   // Intermediates (malloc outputs) → shmem array names
@@ -714,21 +733,82 @@ export function blockMapFusedShaderSource(
   // --- Global storage bindings ---
   // Determine dtype of each body input from kernel consumers
   const inputDtypes: (DType | null)[] = new Array(numBodyInputs).fill(null);
-  for (const { step, kernel } of kernelSteps) {
+
+  // Helper: record dtype for a GlobalIndex/GlobalView expression given its step's
+  // input list and a mapping from step input JitIds back to parent bodyInputIds.
+  // Note: kernel expressions may contain either GlobalView (pre-lowering) or
+  // GlobalIndex (post-lowering). Both have the buffer index as arg[0].
+  const recordGlobalIndexDtype = (
+    step: { inputs: JitId[] },
+    kernel: Kernel,
+    mapToBodyInputIdx: (jitId: JitId) => number,
+  ) => {
     for (const output of kernel.outputs) {
       output.exp.fold((exp) => {
-        if (exp.op === AluOp.GlobalIndex) {
+        if (exp.op === AluOp.GlobalIndex || exp.op === AluOp.GlobalView) {
           const bufIdx = exp.arg[0] as number;
           if (bufIdx < step.inputs.length) {
-            // Map back to body input index
             const jitId = step.inputs[bufIdx];
-            const bodyInputIdx = bodyInputIds.indexOf(jitId);
+            const bodyInputIdx = mapToBodyInputIdx(jitId);
             if (bodyInputIdx >= 0) {
               inputDtypes[bodyInputIdx] = exp.dtype;
             }
           }
         }
       });
+    }
+  };
+
+  // Top-level kernel steps
+  for (const { step, kernel } of kernelSteps) {
+    recordGlobalIndexDtype(step, kernel, (jitId) =>
+      bodyInputIds.indexOf(jitId),
+    );
+  }
+
+  // Fori_loop body kernels: trace through foriStep.consts to reach parent bodyInputIds
+  for (const fl of foriLoops) {
+    for (const { step: bStep, kernel: bKernel } of fl.bodyKernels) {
+      recordGlobalIndexDtype(bStep, bKernel, (jitId) => {
+        const biIdx = fl.bodyInputIds.indexOf(jitId);
+        if (biIdx >= 0 && biIdx < fl.numConsts) {
+          const parentJitId = fl.foriStep.consts[biIdx];
+          return bodyInputIds.indexOf(parentJitId);
+        }
+        return -1;
+      });
+    }
+  }
+
+  // WorkgroupAssociativeScan body kernels: trace through wasStep consts
+  for (const was of workgroupAssocScans) {
+    for (const { step: bStep, kernel: bKernel } of was.bodyKernels) {
+      recordGlobalIndexDtype(bStep, bKernel, (jitId) => {
+        const biIdx = was.bodyInputIds.indexOf(jitId);
+        if (biIdx >= 0 && biIdx < was.numConsts) {
+          const parentJitId = was.wasStep.consts[biIdx];
+          return bodyInputIds.indexOf(parentJitId);
+        }
+        return -1;
+      });
+    }
+  }
+
+  // Infer input dtypes from fori_loop init carries: the init carry input
+  // is only used in the init→shmem copy (not by any kernel), so its dtype
+  // must match the carry shmem dtype.
+  for (const fl of foriLoops) {
+    const numCarries = fl.foriStep.initCarries.length;
+    for (let ci = 0; ci < numCarries; ci++) {
+      const initId = fl.foriStep.initCarries[ci];
+      const bodyIdx = bodyInputIds.indexOf(initId);
+      if (bodyIdx >= 0 && inputDtypes[bodyIdx] === null) {
+        const parentOutId = fl.foriStep.outputs[ci];
+        const entry = shmemMap.get(parentOutId);
+        if (entry) {
+          inputDtypes[bodyIdx] = entry.dtype;
+        }
+      }
     }
   }
 
@@ -749,11 +829,17 @@ export function blockMapFusedShaderSource(
         kernelSteps[written.stepIdx].kernel.outputs[written.kernelOutputIdx]
           .dtype;
     } else {
-      // Pass-through output: use the input's dtype
-      const ptInfo = passThroughOutputs.get(o);
-      if (ptInfo) {
-        const inDtype = inputDtypes[bodyInputIds.indexOf(outId)];
-        if (inDtype) dtype = inDtype;
+      // Check if this output is a fori_loop carry output
+      const carryShmem = shmemMap.get(outId);
+      if (carryShmem) {
+        dtype = carryShmem.dtype;
+      } else {
+        // Pass-through output: use the input's dtype
+        const ptInfo = passThroughOutputs.get(o);
+        if (ptInfo) {
+          const inDtype = inputDtypes[bodyInputIds.indexOf(outId)];
+          if (inDtype) dtype = inDtype;
+        }
       }
     }
     outputDtypes.push(dtype);
@@ -912,7 +998,11 @@ export function blockMapFusedShaderSource(
     emit(`let in_base_${i}: u32 = ${baseExpr};`);
   }
 
-  // For each body output, precompute the global base offset
+  // For each body output, precompute the global base offset and strided tidx.
+  // When the output block is a non-contiguous sub-rectangle of the output buffer
+  // (e.g. a 16×16 tile in a 32×32 output), flat tidx ≠ strided output offset.
+  const outBufStrides: number[][] = [];
+  const outNeedsStrided: boolean[] = [];
   for (let o = 0; o < numOutputs; o++) {
     const axes = params.outAxes[o];
     const outShape = params.outputShapes[o];
@@ -922,6 +1012,7 @@ export function blockMapFusedShaderSource(
     for (let d = nd - 2; d >= 0; d--) {
       strides[d] = strides[d + 1] * outShape[d + 1];
     }
+    outBufStrides.push(strides);
     const terms: string[] = [];
     for (let g = 0; g < gridRank; g++) {
       if (axes[g] !== null) {
@@ -932,6 +1023,56 @@ export function blockMapFusedShaderSource(
     }
     const baseExpr = terms.length > 0 ? terms.join(" + ") : "0u";
     emit(`let out_base_${o}: u32 = ${baseExpr};`);
+
+    // Check if flat block-local index matches strided output offset.
+    // They differ when the output buffer stride for any mapped axis
+    // doesn't match the block's inner product for that axis.
+    let needsStrided = false;
+    let innerProd = 1;
+    for (let g = gridRank - 1; g >= 0; g--) {
+      if (axes[g] !== null && strides[axes[g]!] !== innerProd) {
+        needsStrided = true;
+      }
+      innerProd *= blockShape[g];
+    }
+    outNeedsStrided.push(needsStrided);
+    if (needsStrided) {
+      const sTerms: string[] = [];
+      for (let g = 0; g < gridRank; g++) {
+        if (axes[g] !== null) {
+          const stride = strides[axes[g]!];
+          sTerms.push(stride !== 1 ? `tidx_${g} * ${stride}u` : `tidx_${g}`);
+        }
+      }
+      emit(`let out_strided_tidx_${o}: u32 = ${sTerms.join(" + ")};`);
+    }
+  }
+
+  /**
+   * Convert a flat block-local index expression to a strided output offset.
+   * For the common case (flatExpr === "tidx"), uses the precomputed variable.
+   * For complex expressions (e.g., "tidx * 4u + _was_wi"), decomposes inline.
+   */
+  function outOffset(o: number, flatExpr: string = "tidx"): string {
+    if (!outNeedsStrided[o]) return flatExpr;
+    if (flatExpr === "tidx") return `out_strided_tidx_${o}`;
+    // Inline decomposition for arbitrary flat expressions
+    const axes = params.outAxes[o];
+    const strides = outBufStrides[o];
+    const oTerms: string[] = [];
+    let innerProd = 1;
+    for (let g = gridRank - 1; g >= 0; g--) {
+      if (axes[g] !== null) {
+        const axStride = strides[axes[g]!];
+        const tidxG =
+          innerProd === 1
+            ? `((${flatExpr}) % ${blockShape[g]}u)`
+            : `(((${flatExpr}) / ${innerProd}u) % ${blockShape[g]}u)`;
+        oTerms.push(axStride !== 1 ? `${tidxG} * ${axStride}u` : tidxG);
+      }
+      innerProd *= blockShape[g];
+    }
+    return oTerms.reverse().join(" + ");
   }
 
   // Declare gidx — the body kernel expressions reference this variable.
@@ -1221,12 +1362,12 @@ export function blockMapFusedShaderSource(
             if (hasBoundary) {
               emit(`if (valid) {`, pushIndent);
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${castRhs};`,
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${castRhs};`,
               );
               emit(popIndent, "}");
             } else {
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${castRhs};`,
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${castRhs};`,
               );
             }
           } else if (idIsShmem.has(outId)) {
@@ -1310,6 +1451,20 @@ export function blockMapFusedShaderSource(
         // Override the mapping:
         bodyIdToName.set(bodyOutId, carryShmemName);
       }
+
+      // Resolve the shmem dtype for a body JitId. Checks carry shmem
+      // (parent shmemMap) first, then body-internal bodyShmemMap.
+      const bodyOutShmemDtype = (outId: JitId): DType | null => {
+        for (let ci = 0; ci < numCarries; ci++) {
+          if (fl.bodyOutputIds[ci] === outId) {
+            const entry = shmemMap.get(fs.outputs[ci]);
+            if (entry) return entry.dtype;
+          }
+        }
+        const bEntry = fl.bodyShmemMap.get(outId);
+        if (bEntry) return bEntry.dtype;
+        return null;
+      };
 
       // Initialize carry shmem from init carry values
       for (let ci = 0; ci < numCarries; ci++) {
@@ -1421,12 +1576,15 @@ export function blockMapFusedShaderSource(
           );
           // gen() references gidx (→ tidx) and ridx (→ loop var) in the expression
           const rhs = strip1(gen(bKernel.outputs[0].exp));
-          if (bRe.op === AluOp.Add) emit(`  ${accName} += ${rhs};`);
-          else if (bRe.op === AluOp.Mul) emit(`  ${accName} *= ${rhs};`);
+          // Cast RHS to accumulator dtype when they differ (e.g., f16 expr → f32 acc)
+          const exprDtype = bKernel.outputs[0].exp.dtype;
+          const castRhs = exprDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+          if (bRe.op === AluOp.Add) emit(`  ${accName} += ${castRhs};`);
+          else if (bRe.op === AluOp.Mul) emit(`  ${accName} *= ${castRhs};`);
           else if (bRe.op === AluOp.Min)
-            emit(`  ${accName} = min(${accName}, ${rhs});`);
+            emit(`  ${accName} = min(${accName}, ${castRhs});`);
           else if (bRe.op === AluOp.Max)
-            emit(`  ${accName} = max(${accName}, ${rhs});`);
+            emit(`  ${accName} = max(${accName}, ${castRhs});`);
           emit(popIndent, `  }`);
           // Apply epilogue if non-identity
           const isIdentityEpilogue =
@@ -1460,7 +1618,13 @@ export function blockMapFusedShaderSource(
           }
           const targetName = bodyIdToName.get(outId);
           if (targetName) {
-            emit(`  ${targetName}[tidx] = ${finalValue};`);
+            const targetDtype = bodyOutShmemDtype(outId);
+            const targetTy = targetDtype ? dtypeToWgsl(targetDtype) : null;
+            const castFinal =
+              targetTy && targetTy !== dtypeToWgsl(reDtype)
+                ? `${targetTy}(${finalValue})`
+                : finalValue;
+            emit(`  ${targetName}[tidx] = ${castFinal};`);
           }
           emit(`}`);
         } else {
@@ -1473,7 +1637,14 @@ export function blockMapFusedShaderSource(
             const rhs = strip1(gen(bKernel.outputs[oi].exp));
             const targetName = bodyIdToName.get(outId);
             if (targetName) {
-              emit(`${targetName}[tidx] = ${rhs};`);
+              const targetDtype = bodyOutShmemDtype(outId);
+              const targetTy = targetDtype ? dtypeToWgsl(targetDtype) : null;
+              const expDtype = bKernel.outputs[oi].exp.dtype;
+              const castRhs =
+                targetTy && targetDtype !== expDtype
+                  ? `${targetTy}(${rhs})`
+                  : rhs;
+              emit(`${targetName}[tidx] = ${castRhs};`);
             }
           }
           if (needSizeGuard) emit(popIndent, "}");
@@ -1492,12 +1663,12 @@ export function blockMapFusedShaderSource(
           if (hasBoundary) {
             emit(`if (valid) {`, pushIndent);
             emit(
-              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${resultTy}(${carryName}[tidx]);`,
+              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${carryName}[tidx]);`,
             );
             emit(popIndent, "}");
           } else {
             emit(
-              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${resultTy}(${carryName}[tidx]);`,
+              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${carryName}[tidx]);`,
             );
           }
         }
@@ -1795,15 +1966,16 @@ export function blockMapFusedShaderSource(
               `for (var _was_wi: u32 = 0u; _was_wi < ${ec}u; _was_wi++) {`,
               pushIndent,
             );
+            const flatExpr = `tidx * ${ec}u + _was_wi`;
             if (hasBoundary) {
               emit(`if (valid) {`, pushIndent);
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx * ${ec}u + _was_wi)] = ${resultTy}(${finalNames[e]}[tidx * ${ec}u + _was_wi]);`,
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx, flatExpr)})] = ${resultTy}(${finalNames[e]}[${flatExpr}]);`,
               );
               emit(popIndent, "}");
             } else {
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx * ${ec}u + _was_wi)] = ${resultTy}(${finalNames[e]}[tidx * ${ec}u + _was_wi]);`,
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx, flatExpr)})] = ${resultTy}(${finalNames[e]}[${flatExpr}]);`,
               );
             }
             emit(popIndent, "}");
@@ -1811,12 +1983,12 @@ export function blockMapFusedShaderSource(
             if (hasBoundary) {
               emit(`if (valid) {`, pushIndent);
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${resultTy}(${finalNames[e]}[tidx]);`,
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${finalNames[e]}[tidx]);`,
               );
               emit(popIndent, "}");
             } else {
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${resultTy}(${finalNames[e]}[tidx]);`,
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${finalNames[e]}[tidx]);`,
               );
             }
           }
@@ -1849,13 +2021,14 @@ export function blockMapFusedShaderSource(
   for (const [resultIdx, info] of passThroughOutputs) {
     if (info.inputIdx >= 0) {
       // Non-const input: apply block offset
+      // TODO: input read also needs strided tidx when inAxes maps multiple dims
       emit(
-        `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${info.inputName}[i32(in_base_${info.inputIdx}) + i32(tidx)];`,
+        `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${info.inputName}[i32(in_base_${info.inputIdx}) + i32(tidx)];`,
       );
     } else {
       // Const input: no block offset
       emit(
-        `result${resultIdx}[i32(out_base_${resultIdx}) + i32(tidx)] = ${info.inputName}[i32(tidx)];`,
+        `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${info.inputName}[i32(tidx)];`,
       );
     }
   }
