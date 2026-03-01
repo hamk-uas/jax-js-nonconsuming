@@ -147,7 +147,14 @@ export function blockMapFusedShaderSource(
   }
   const foriLoops: ForiLoopInfo[] = [];
 
-  /** Analyzed workgroup_assoc_scan steps. */
+  /**
+   * Analyzed workgroup_assoc_scan steps.
+   *
+   * NOTE: Scalar promotion (P0a) is not implemented for workgroup_assoc_scan.
+   * The binary operator body kernels always take paired elements, so size-1
+   * non-reduction kernels don't arise in practice. If future code paths need
+   * this, add `promotedScalars` and `isScalar` mirroring ForiLoopInfo.
+   */
   interface WorkgroupAssocScanInfo {
     wasStep: Extract<JitStep, { type: "workgroup_assoc_scan" }>;
     /** Body kernels (the binary operator fn). */

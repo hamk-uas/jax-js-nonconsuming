@@ -22,6 +22,7 @@ import {
   jvp,
   lax,
   numpy as np,
+  vmap,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, test } from "vitest";
 
@@ -367,6 +368,48 @@ describe("lax.dynamicSlice — Phase 1b", () => {
     // slice[0:2] = [1,2] sum=3, slice[2:4] = [3,4] sum=7, slice[4:6] = [5,6] sum=11
     // total = 3 + 7 + 11 = 21
     expect(result).toBeAllclose(21);
+  });
+
+  // T4.9: vmap over batched operand, shared start indices
+  test("vmap(dynamicSlice) batched operand, shared indices", () => {
+    // Batch of 3 vectors, each length 6. Slice [2..4] from each.
+    using xRange = np.arange(18);
+    using xFloat = xRange.astype(DType.Float32);
+    using x = xFloat.reshape([3, 6]);
+    using start = np.array(2, { dtype: DType.Int32 });
+    const f = jit((row: np.Array) => lax.dynamicSlice(row, [start], [3]));
+    const vf = vmap(f);
+    using result = vf(x);
+    // Row 0: [0,1,2,3,4,5] → [2,3,4]
+    // Row 1: [6,7,8,9,10,11] → [8,9,10]
+    // Row 2: [12,13,14,15,16,17] → [14,15,16]
+    expect(result.shape).toEqual([3, 3]);
+    expect(result).toBeAllclose([
+      [2, 3, 4],
+      [8, 9, 10],
+      [14, 15, 16],
+    ]);
+    f.dispose();
+  });
+
+  // T4.10: vmap over batched operand for uncheckedDynamicSlice
+  test("vmap(uncheckedDynamicSlice) batched operand, shared indices", () => {
+    using xRange = np.arange(18);
+    using xFloat = xRange.astype(DType.Float32);
+    using x = xFloat.reshape([3, 6]);
+    using start = np.array(0, { dtype: DType.Int32 });
+    const f = jit((row: np.Array) =>
+      lax.uncheckedDynamicSlice(row, [start], [4]),
+    );
+    const vf = vmap(f);
+    using result = vf(x);
+    expect(result.shape).toEqual([3, 4]);
+    expect(result).toBeAllclose([
+      [0, 1, 2, 3],
+      [6, 7, 8, 9],
+      [12, 13, 14, 15],
+    ]);
+    f.dispose();
   });
 });
 

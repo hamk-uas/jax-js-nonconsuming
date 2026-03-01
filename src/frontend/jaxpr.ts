@@ -1,5 +1,6 @@
 import { byteWidth, DType, isFloatDtype } from "../alu";
 import { PPrint } from "../pprint";
+import { DEBUG } from "../utils";
 import {
   concreteDim,
   type Dim,
@@ -1791,6 +1792,15 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
         throw new TypeError(
           `UncheckedDynamicSlice start indices must be scalars, got shape ${args[i].shape}`,
         );
+      }
+    }
+    if (DEBUG >= 2) {
+      for (let k = 0; k < operand.shape.length; k++) {
+        if ((sliceSizes[k] as number) > (operand.shape[k] as number)) {
+          throw new Error(
+            `UncheckedDynamicSlice: slice[${k}]=${sliceSizes[k]} > shape[${k}]=${operand.shape[k]}`,
+          );
+        }
       }
     }
     return [new ShapedArray(sliceSizes, operand.dtype, operand.weakType)];

@@ -1,5 +1,6 @@
+import { DType } from "../alu";
 import { assertNonNull, checkAxis, range, rep, unzip2, zip } from "../utils";
-import { arange, eye, pureArray } from "./array";
+import { arange, eye, pureArray, zeros } from "./array";
 import {
   AbstractValue,
   bind,
@@ -787,11 +788,43 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     // Results have batch at axis 0
     return [results, rep(numLeaves, 0)];
   },
-  [Primitive.DynamicSlice]() {
-    throw new Error("vmap for dynamic slice not implemented");
+  [Primitive.DynamicSlice](axisSize, args, dims, { sliceSizes }) {
+    const [xBdim, ...idxBdims] = dims;
+    if (idxBdims.some((d) => d !== null)) {
+      throw new Error(
+        "vmap(dynamicSlice): batched start indices not supported",
+      );
+    }
+    assertNonNull(xBdim);
+    const origX = args[0];
+    const x = moveBatchAxis(axisSize, xBdim, 0, origX);
+    // Zero index for the inserted batch dimension — always in-bounds
+    using zero = zeros([], { dtype: DType.Int32 });
+    const result = bind1(Primitive.DynamicSlice, [x, zero, ...args.slice(1)], {
+      sliceSizes: [axisSize, ...sliceSizes],
+    });
+    if (x !== origX) x[Symbol.dispose]();
+    return [[result], [0]];
   },
-  [Primitive.UncheckedDynamicSlice]() {
-    throw new Error("vmap for unchecked dynamic slice not implemented");
+  [Primitive.UncheckedDynamicSlice](axisSize, args, dims, { sliceSizes }) {
+    const [xBdim, ...idxBdims] = dims;
+    if (idxBdims.some((d) => d !== null)) {
+      throw new Error(
+        "vmap(uncheckedDynamicSlice): batched start indices not supported",
+      );
+    }
+    assertNonNull(xBdim);
+    const origX = args[0];
+    const x = moveBatchAxis(axisSize, xBdim, 0, origX);
+    // Zero index for the batch dimension — in-bounds by construction (0 + B == B)
+    using zero = zeros([], { dtype: DType.Int32 });
+    const result = bind1(
+      Primitive.UncheckedDynamicSlice,
+      [x, zero, ...args.slice(1)],
+      { sliceSizes: [axisSize, ...sliceSizes] },
+    );
+    if (x !== origX) x[Symbol.dispose]();
+    return [[result], [0]];
   },
   [Primitive.ForiLoop](_axisSize, _args, _bdims, _params) {
     throw new Error("vmap for foriLoop not implemented");
