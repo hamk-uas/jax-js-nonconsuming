@@ -46,9 +46,23 @@ export default defineConfig({
     watch: false, // Run once and exit, don't wait for 'q'
     browser: {
       enabled: true,
-      headless: true,
+      headless: false,
       screenshotFailures: false,
-      provider: playwright(),
+      provider: playwright({
+        launchOptions: {
+          args: [
+            "--enable-unsafe-webgpu",
+            "--enable-features=Vulkan",
+            "--no-sandbox",
+          ],
+          env: {
+            DISPLAY: process.env.DISPLAY ?? ":0",
+            XAUTHORITY:
+              process.env.XAUTHORITY ??
+              `/run/user/${process.getuid?.() ?? 1000}/gdm/Xauthority`,
+          },
+        },
+      }),
       instances: [{ browser: "chromium" }],
     },
     coverage: {
