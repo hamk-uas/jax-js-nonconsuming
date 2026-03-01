@@ -747,6 +747,53 @@ export function workgroupAssociativeScan(
 }
 
 /**
+ * Concrete padding: allocate a zero-filled buffer and copy the original
+ * data into it via dynamicUpdateSlice.  The result has no ShapeTracker
+ * mask, so downstream codegen produces raw reads instead of
+ * `select(0, read, valid_mask)`.
+ *
+ * Falls back to the lightweight mask-based `core.pad` when the overhead
+ * would be disproportionate (tiny matrices or large expansion ratios).
+ */
+function padConcrete(
+  x: Array,
+  padWidths: Record<number, [number, number]>,
+): { result: Array; concrete: boolean } {
+  const shape = x.shape as number[];
+  const paddedShape = shape.slice();
+  for (const [axisStr, [lo, hi]] of Object.entries(padWidths)) {
+    const axis = parseInt(axisStr);
+    paddedShape[axis] += lo + hi;
+  }
+  const origElements = prod(shape);
+  const paddedElements = prod(paddedShape);
+
+  // Heuristic gate: only materialize when copy cost is negligible
+  if (origElements <= 1024 || paddedElements / origElements >= 1.25) {
+    return { result: core.pad(x, padWidths) as Array, concrete: false };
+  }
+
+  // Pad one axis at a time via DUS. Each iteration expands one dimension
+  // so the src/dst shapes match on all non-axis dimensions.
+  const axes = Object.entries(padWidths);
+  let current: Array = x;
+  let ownsCurrentFromPadding = false;
+  for (const [axisStr, [lo]] of axes) {
+    const axis = parseInt(axisStr);
+    // Build the target shape: current's shape but with this axis expanded
+    const targetShape = (current.shape as number[]).slice();
+    targetShape[axis] = paddedShape[axis];
+    const zeros = fullInternal(new ShapedArray(targetShape, x.dtype, false), 0);
+    const next = core.dynamicUpdateSlice(zeros, current, lo, axis) as Array;
+    zeros.dispose();
+    if (ownsCurrentFromPadding) current.dispose();
+    current = next;
+    ownsCurrentFromPadding = true;
+  }
+  return { result: current, concrete: true };
+}
+
+/**
  * Options for {@link tiledMatmul}.
  */
 export interface TiledMatmulOptions {
@@ -807,13 +854,15 @@ export function tiledMatmul(
       const aPad: Record<number, [number, number]> = {};
       if (padM > 0) aPad[0] = [0, padM];
       if (padK > 0) aPad[1] = [0, padK];
-      aInput = core.pad(A, aPad) as Array;
+      const { result } = padConcrete(A, aPad);
+      aInput = result;
     }
     if (padN > 0 || padK > 0) {
       const bPad: Record<number, [number, number]> = {};
       if (padK > 0) bPad[0] = [0, padK];
       if (padN > 0) bPad[1] = [0, padN];
-      bInput = core.pad(B, bPad) as Array;
+      const { result } = padConcrete(B, bPad);
+      bInput = result;
     }
   }
 

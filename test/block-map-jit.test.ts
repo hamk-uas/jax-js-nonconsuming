@@ -1581,4 +1581,97 @@ describe("shader quality gates", () => {
 
     f.dispose();
   });
+
+  test("P2c: non-aligned tiledMatmul produces no select() (padConcrete)", () => {
+    if (!isWebGPU) return;
+
+    // 64x60 @ 60x64: K=60 not divisible by 16, triggers padding to K=64
+    // Ratio 4096/3840=1.07 < 1.25, elements 3840 > 1024 → padConcrete fires
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
+    );
+    using A_flat = np.arange(64 * 60).astype(DType.Float32);
+    using A = A_flat.reshape([64, 60]);
+    using B_flat = np.arange(60 * 64).astype(DType.Float32);
+    using B = B_flat.reshape([60, 64]);
+
+    const shaders = captureShaders(() => {
+      using _result = f(A, B);
+    });
+
+    const fusedShaders = shaders.filter(
+      (s) => s.includes("workgroupBarrier") || s.includes("var<workgroup>"),
+    );
+    expect(fusedShaders.length).toBeGreaterThan(0);
+    for (const shader of fusedShaders) {
+      const selectCount = (shader.match(/\bselect\s*\(/g) || []).length;
+      expect(
+        selectCount,
+        "padConcrete should eliminate all select() in fused shader",
+      ).toBe(0);
+    }
+
+    f.dispose();
+  });
+
+  test("P2c: non-aligned tiledMatmul correctness (64x60 @ 60x64)", () => {
+    using A_flat = np.arange(64 * 60).astype(DType.Float32);
+    using A = A_flat.reshape([64, 60]);
+    using B_flat = np.arange(60 * 64).astype(DType.Float32);
+    using B = B_flat.reshape([60, 64]);
+    using expected = np.matmul(A, B);
+    using result = lax.tiledMatmul(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1 });
+  });
+
+  test("P2c: tiny matrices fall back to mask-based pad (heuristic rejects)", () => {
+    if (!isWebGPU) return;
+
+    // 4x5 @ 5x4: small enough that heuristic rejects concrete padding
+    // (4*5=20 elements < 1024 threshold)
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 4, Bc: 4, Bk: 4 }),
+    );
+    using aFlat = np.arange(20).astype(DType.Float32);
+    using A = aFlat.reshape([4, 5]);
+    using bFlat = np.arange(20).astype(DType.Float32);
+    using B = bFlat.reshape([5, 4]);
+
+    const shaders = captureShaders(() => {
+      using _result = f(A, B);
+    });
+
+    // Small matrix → heuristic rejects padConcrete → mask-based pad → select present
+    const fusedShaders = shaders.filter(
+      (s) => s.includes("workgroupBarrier") || s.includes("var<workgroup>"),
+    );
+    if (fusedShaders.length > 0) {
+      const hasSelect = fusedShaders.some((s) => s.includes("select("));
+      expect(
+        hasSelect,
+        "tiny matrices should still use mask-based pad with select()",
+      ).toBe(true);
+    }
+
+    // But correctness must still hold
+    using expected = np.matmul(A, B);
+    using result = f(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1e-3 });
+
+    f.dispose();
+  });
+
+  test("P2c: padConcrete memory — padded buffers freed after matmul", () => {
+    // Verify no leak: run non-aligned tiledMatmul inside jit and ensure
+    // leak checker (from test setup) does not flag extra live arrays.
+    const f = jit((A: np.Array, B: np.Array) => lax.tiledMatmul(A, B));
+    using A_flat = np.arange(48 * 50).astype(DType.Float32);
+    using A = A_flat.reshape([48, 50]);
+    using B_flat = np.arange(50 * 48).astype(DType.Float32);
+    using B = B_flat.reshape([50, 48]);
+    using result = f(A, B);
+    using expected = np.matmul(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1 });
+    f.dispose();
+  });
 });
