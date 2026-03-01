@@ -111,6 +111,7 @@ async function createBackend(device: Device): Promise<Backend | null> {
     const requestedFeatures: GPUFeatureName[] = [
       "shader-f16", // "enable f16;" feature support for f16 data type
       "timestamp-query", // Performance timing queries.
+      "subgroups" as GPUFeatureName, // SIMD-width operations (shuffle, reduce within wave).
     ];
 
     try {

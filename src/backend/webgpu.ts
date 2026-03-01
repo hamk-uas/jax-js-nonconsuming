@@ -144,6 +144,35 @@ export interface PreparedWebGPUAssocScan {
   code: string;
 }
 
+/**
+ * Prepared WebGPU blocked associative scan.
+ *
+ * Four-stage pipeline:
+ * 1. Local scan: one dispatch with M workgroups, each doing full KS in shmem
+ * 2. Gather: extract last element per block → summary buffer
+ * 3. Summary scan: flat KS on M elements (reuses existing pipeline)
+ * 4. Apply: combine scanned summary with elements in blocks 1..M-1
+ */
+export interface PreparedWebGPUBlockedAssocScan {
+  localScan: {
+    pipeline: GPUComputePipeline;
+    layout: GPUBindGroupLayout;
+    uniformLayout: GPUBindGroupLayout;
+    numRounds: number;
+  };
+  gather: {
+    pipeline: GPUComputePipeline;
+    layout: GPUBindGroupLayout;
+    uniformLayout: GPUBindGroupLayout;
+  };
+  flatScan: PreparedWebGPUAssocScan;
+  apply: {
+    pipeline: GPUComputePipeline;
+    layout: GPUBindGroupLayout;
+    uniformLayout: GPUBindGroupLayout;
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Types for WebGPU preencoded-routine scan (P4)
 // ---------------------------------------------------------------------------
@@ -1053,6 +1082,566 @@ export class WebGPUBackend implements Backend {
     pingBuf.destroy();
     pongBuf.destroy();
     this.#gpuAllocatedBytes -= paddedBytes * 2;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Blocked associative scan methods (WebGPU workgroup-level Kogge-Stone)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compile the blocked Kogge-Stone scan pipelines:
+   *   - local scan (workgroup-level KS in shmem)
+   *   - gather (extract last per block)
+   *   - flat scan for summaries (reuses existing pipeline)
+   *   - apply (combine scanned summary with block elements)
+   *
+   * Returns null if shmem budget is exceeded or compilation fails.
+   */
+  prepareBlockedAssocScan(
+    params: WebGPUAssocScanParams,
+    blockSize: number,
+  ): PreparedWebGPUBlockedAssocScan | null {
+    try {
+      const { numConsts, leafElemCounts, dtype } = params;
+      const bytesPerElem = byteWidth(dtype);
+
+      // Check shmem budget: 2 sets × B × totalLeafElems × bytesPerElem
+      const totalElemsPerPos = leafElemCounts.reduce((a, b) => a + b, 0);
+      const shmemBytes = 2 * blockSize * totalElemsPerPos * bytesPerElem;
+      const maxShmem = this.device.limits.maxComputeWorkgroupStorageSize;
+      if (shmemBytes > maxShmem) {
+        if (DEBUG >= 1) {
+          console.log(
+            `[blocked-assocScan] shmem ${shmemBytes} > limit ${maxShmem}, falling back`,
+          );
+        }
+        return null;
+      }
+
+      // Check workgroup size limit
+      if (blockSize > this.device.limits.maxComputeWorkgroupSizeX) {
+        return null;
+      }
+
+      // 1. Local scan pipeline
+      const localResult = blockedAssocScanLocalShaderSource(
+        this.device,
+        params,
+        blockSize,
+      );
+      if (DEBUG >= 2) {
+        console.info(
+          "=========== blocked assocScan local shader ===========\n" +
+            localResult.code,
+        );
+      }
+
+      const localStorageEntries: GPUBindGroupLayoutEntry[] = [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "read-only-storage" },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "storage" },
+        },
+      ];
+      for (let i = 0; i < numConsts; i++) {
+        localStorageEntries.push({
+          binding: i + 2,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "read-only-storage" },
+        });
+      }
+      const localLayout = this.device.createBindGroupLayout({
+        entries: localStorageEntries,
+      });
+      const localUniformLayout = this.device.createBindGroupLayout({
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "uniform" },
+          },
+        ],
+      });
+      const localPipelineLayout = this.device.createPipelineLayout({
+        bindGroupLayouts: [localLayout, localUniformLayout],
+      });
+      const localModule = this.device.createShaderModule({
+        code: localResult.code,
+      });
+      const localPipeline = this.device.createComputePipeline({
+        layout: localPipelineLayout,
+        compute: { module: localModule, entryPoint: "main" },
+      });
+
+      // 2. Gather pipeline
+      const gatherCode = blockedAssocScanGatherShaderSource(
+        this.device,
+        params,
+        blockSize,
+      );
+      if (DEBUG >= 2) {
+        console.info(
+          "=========== blocked assocScan gather shader ===========\n" +
+            gatherCode,
+        );
+      }
+
+      const gatherLayout = this.device.createBindGroupLayout({
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "read-only-storage" },
+          },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "storage" },
+          },
+        ],
+      });
+      const gatherUniformLayout = this.device.createBindGroupLayout({
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "uniform" },
+          },
+        ],
+      });
+      const gatherPipelineLayout = this.device.createPipelineLayout({
+        bindGroupLayouts: [gatherLayout, gatherUniformLayout],
+      });
+      const gatherModule = this.device.createShaderModule({
+        code: gatherCode,
+      });
+      const gatherPipeline = this.device.createComputePipeline({
+        layout: gatherPipelineLayout,
+        compute: { module: gatherModule, entryPoint: "main" },
+      });
+
+      // 3. Flat scan pipeline for block summaries (reuse existing)
+      const flatPrepared = this.prepareAssocScan(params);
+      if (!flatPrepared) return null;
+
+      // 4. Apply pipeline
+      const applyCode = blockedAssocScanApplyShaderSource(
+        this.device,
+        params,
+        blockSize,
+      );
+      if (DEBUG >= 2) {
+        console.info(
+          "=========== blocked assocScan apply shader ===========\n" +
+            applyCode,
+        );
+      }
+
+      const applyStorageEntries: GPUBindGroupLayoutEntry[] = [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "read-only-storage" },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "storage" },
+        },
+      ];
+      for (let i = 0; i < numConsts; i++) {
+        applyStorageEntries.push({
+          binding: i + 2,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "read-only-storage" },
+        });
+      }
+      const applyLayout = this.device.createBindGroupLayout({
+        entries: applyStorageEntries,
+      });
+      const applyUniformLayout = this.device.createBindGroupLayout({
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "uniform" },
+          },
+        ],
+      });
+      const applyPipelineLayout = this.device.createPipelineLayout({
+        bindGroupLayouts: [applyLayout, applyUniformLayout],
+      });
+      const applyModule = this.device.createShaderModule({ code: applyCode });
+      const applyPipeline = this.device.createComputePipeline({
+        layout: applyPipelineLayout,
+        compute: { module: applyModule, entryPoint: "main" },
+      });
+
+      return {
+        localScan: {
+          pipeline: localPipeline,
+          layout: localLayout,
+          uniformLayout: localUniformLayout,
+          numRounds: localResult.numRounds,
+        },
+        gather: {
+          pipeline: gatherPipeline,
+          layout: gatherLayout,
+          uniformLayout: gatherUniformLayout,
+        },
+        flatScan: flatPrepared,
+        apply: {
+          pipeline: applyPipeline,
+          layout: applyLayout,
+          uniformLayout: applyUniformLayout,
+        },
+      };
+    } catch (e) {
+      if (DEBUG >= 1) {
+        console.warn("WebGPU blocked assocScan codegen failed:", e);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Execute the full blocked associative scan:
+   *   1. Copy inputs → interleaved buffer
+   *   2. Local scan (1 dispatch, M workgroups)
+   *   3. Gather last per block → summary buffer
+   *   4. Flat KS on summaries (ceil(log₂ M) dispatches)
+   *   5. Apply scanned summaries to blocks 1..M-1
+   *   6. Copy results out
+   */
+  dispatchBlockedAssocScan(
+    prepared: PreparedWebGPUBlockedAssocScan,
+    params: WebGPUAssocScanParams,
+    constSlots: Slot[],
+    elemSlots: Slot[],
+    outputSlots: Slot[],
+    N: number,
+    blockSize: number,
+    reverse: boolean,
+  ): void {
+    const { numLeaves, leafElemCounts, dtype } = params;
+    const bytesPerElem = byteWidth(dtype);
+    const totalElemsPerPos = leafElemCounts.reduce((a, b) => a + b, 0);
+
+    const M = Math.ceil(N / blockSize); // number of blocks
+
+    // Allocate buffers
+    const dataBytes = Math.max(
+      Math.ceil((totalElemsPerPos * N * bytesPerElem) / 4) * 4,
+      4,
+    );
+    const summaryBytes = Math.max(
+      Math.ceil((totalElemsPerPos * M * bytesPerElem) / 4) * 4,
+      4,
+    );
+
+    const inputBuf = this.#createBuffer(dataBytes);
+    const scannedBuf = this.#createBuffer(dataBytes);
+    const summaryPingBuf = this.#createBuffer(summaryBytes);
+    const summaryPongBuf = this.#createBuffer(summaryBytes);
+
+    const leafStarts = computeLeafStarts(leafElemCounts);
+    const constBuffers = constSlots.map((slot) => this.#getBuffer(slot).buffer);
+
+    const enc = this.device.createCommandEncoder();
+
+    // 1. Copy input elems → interleaved inputBuf
+    for (let k = 0; k < numLeaves; k++) {
+      const srcBuf = this.#getBuffer(elemSlots[k]).buffer;
+      const dstOffset = leafStarts[k] * N * bytesPerElem;
+      const copySize = leafElemCounts[k] * N * bytesPerElem;
+      if (copySize > 0 && copySize % 4 === 0) {
+        enc.copyBufferToBuffer(srcBuf, 0, inputBuf, dstOffset, copySize);
+      } else if (copySize > 0) {
+        this.#encodeCopyWithShader(
+          enc,
+          srcBuf,
+          0,
+          inputBuf,
+          dstOffset,
+          copySize,
+        );
+      }
+    }
+
+    // 2. Reverse input if needed
+    let reverseTempBuf: GPUBuffer | null = null;
+    if (reverse && N > 1) {
+      reverseTempBuf = this.#createBuffer(dataBytes);
+      for (let k = 0; k < numLeaves; k++) {
+        const ec = leafElemCounts[k];
+        const leafOffset = leafStarts[k] * N * bytesPerElem;
+        const elemBytes = ec * bytesPerElem;
+        for (let j = 0; j < N; j++) {
+          const srcOff = leafOffset + j * elemBytes;
+          const dstOff = leafOffset + (N - 1 - j) * elemBytes;
+          if (elemBytes % 4 === 0) {
+            enc.copyBufferToBuffer(
+              inputBuf,
+              srcOff,
+              reverseTempBuf,
+              dstOff,
+              elemBytes,
+            );
+          }
+        }
+      }
+      enc.copyBufferToBuffer(reverseTempBuf, 0, inputBuf, 0, dataBytes);
+    }
+
+    // 3. Local scan dispatch
+    const localUniformBuf = this.device.createBuffer({
+      size: 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    new DataView(localUniformBuf.getMappedRange()).setUint32(0, N, true);
+    localUniformBuf.unmap();
+
+    const localConstEntries: GPUBindGroupEntry[] = constBuffers.map((b, i) => ({
+      binding: i + 2,
+      resource: { buffer: b },
+    }));
+    const localStorageBG = this.device.createBindGroup({
+      layout: prepared.localScan.layout,
+      entries: [
+        { binding: 0, resource: { buffer: inputBuf } },
+        { binding: 1, resource: { buffer: scannedBuf } },
+        ...localConstEntries,
+      ],
+    });
+    const localUniformBG = this.device.createBindGroup({
+      layout: prepared.localScan.uniformLayout,
+      entries: [{ binding: 0, resource: { buffer: localUniformBuf } }],
+    });
+
+    {
+      const pass = enc.beginComputePass();
+      pass.setPipeline(prepared.localScan.pipeline);
+      pass.setBindGroup(0, localStorageBG);
+      pass.setBindGroup(1, localUniformBG);
+      pass.dispatchWorkgroups(M);
+      pass.end();
+    }
+
+    // 4. Gather: extract last per block → summary
+    const gatherUniformBuf = this.device.createBuffer({
+      size: 8,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    {
+      const view = new DataView(gatherUniformBuf.getMappedRange());
+      view.setUint32(0, N, true);
+      view.setUint32(4, blockSize, true);
+    }
+    gatherUniformBuf.unmap();
+
+    const gatherStorageBG = this.device.createBindGroup({
+      layout: prepared.gather.layout,
+      entries: [
+        { binding: 0, resource: { buffer: scannedBuf } },
+        { binding: 1, resource: { buffer: summaryPingBuf } },
+      ],
+    });
+    const gatherUniformBG = this.device.createBindGroup({
+      layout: prepared.gather.uniformLayout,
+      entries: [{ binding: 0, resource: { buffer: gatherUniformBuf } }],
+    });
+
+    {
+      const gatherWgCount = Math.ceil(M / 256);
+      const pass = enc.beginComputePass();
+      pass.setPipeline(prepared.gather.pipeline);
+      pass.setBindGroup(0, gatherStorageBG);
+      pass.setBindGroup(1, gatherUniformBG);
+      pass.dispatchWorkgroups(gatherWgCount);
+      pass.end();
+    }
+
+    // 5. Flat KS on M summaries using the reused flat scan pipeline
+    let summaryUniformBuf: GPUBuffer | null = null;
+    let applyUniformBuf: GPUBuffer | null = null;
+    if (M > 1) {
+      const numSummaryRounds = Math.ceil(Math.log2(M));
+      const minAlign = this.device.limits.minUniformBufferOffsetAlignment;
+      const uniformEntrySize = Math.max(8, minAlign);
+      const summaryUniformBufSize = Math.max(
+        numSummaryRounds * uniformEntrySize,
+        uniformEntrySize,
+      );
+      summaryUniformBuf = this.device.createBuffer({
+        size: summaryUniformBufSize,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true,
+      });
+      const summaryMapped = new DataView(summaryUniformBuf.getMappedRange());
+      for (let r = 0; r < numSummaryRounds; r++) {
+        summaryMapped.setUint32(r * uniformEntrySize, 1 << r, true);
+        summaryMapped.setUint32(r * uniformEntrySize + 4, M, true);
+      }
+      summaryUniformBuf.unmap();
+
+      const constEntries: GPUBindGroupEntry[] = constBuffers.map((b, i) => ({
+        binding: i + 2,
+        resource: { buffer: b },
+      }));
+      const flatPingPong = this.device.createBindGroup({
+        layout: prepared.flatScan.storageLayout,
+        entries: [
+          { binding: 0, resource: { buffer: summaryPingBuf } },
+          { binding: 1, resource: { buffer: summaryPongBuf } },
+          ...constEntries,
+        ],
+      });
+      const flatPongPing = this.device.createBindGroup({
+        layout: prepared.flatScan.storageLayout,
+        entries: [
+          { binding: 0, resource: { buffer: summaryPongBuf } },
+          { binding: 1, resource: { buffer: summaryPingBuf } },
+          ...constEntries,
+        ],
+      });
+      const flatUniformBG = this.device.createBindGroup({
+        layout: prepared.flatScan.uniformLayout,
+        entries: [
+          { binding: 0, resource: { buffer: summaryUniformBuf, size: 8 } },
+        ],
+      });
+
+      const flatWgSize = prepared.flatScan.workgroupSize;
+      const flatNumWg = Math.ceil(M / flatWgSize);
+      const [flatGridX, flatGridY] = calculateGrid(flatNumWg);
+
+      for (let round = 0; round < numSummaryRounds; round++) {
+        const storageGroup = round % 2 === 0 ? flatPingPong : flatPongPing;
+        const dynamicOffset = round * uniformEntrySize;
+
+        const pass = enc.beginComputePass();
+        pass.setPipeline(prepared.flatScan.pipeline);
+        pass.setBindGroup(0, storageGroup);
+        pass.setBindGroup(1, flatUniformBG, [dynamicOffset]);
+        pass.dispatchWorkgroups(flatGridX, flatGridY);
+        pass.end();
+      }
+
+      // Result in summaryPongBuf if last round even, summaryPingBuf if odd
+      const summaryResultBuf =
+        (numSummaryRounds - 1) % 2 === 0 ? summaryPongBuf : summaryPingBuf;
+
+      // 6. Apply scanned summaries to blocks 1..M-1
+      applyUniformBuf = this.device.createBuffer({
+        size: 12,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true,
+      });
+      {
+        const view = new DataView(applyUniformBuf.getMappedRange());
+        view.setUint32(0, N, true);
+        view.setUint32(4, blockSize, true);
+        view.setUint32(8, M, true);
+      }
+      applyUniformBuf.unmap();
+
+      const applyConstEntries: GPUBindGroupEntry[] = constBuffers.map(
+        (b, i) => ({
+          binding: i + 2,
+          resource: { buffer: b },
+        }),
+      );
+      const applyStorageBG = this.device.createBindGroup({
+        layout: prepared.apply.layout,
+        entries: [
+          { binding: 0, resource: { buffer: summaryResultBuf } },
+          { binding: 1, resource: { buffer: scannedBuf } },
+          ...applyConstEntries,
+        ],
+      });
+      const applyUniformBG = this.device.createBindGroup({
+        layout: prepared.apply.uniformLayout,
+        entries: [{ binding: 0, resource: { buffer: applyUniformBuf } }],
+      });
+
+      {
+        const applyWgCount = Math.ceil(N / 256);
+        const [applyGridX, applyGridY] = calculateGrid(applyWgCount);
+        const pass = enc.beginComputePass();
+        pass.setPipeline(prepared.apply.pipeline);
+        pass.setBindGroup(0, applyStorageBG);
+        pass.setBindGroup(1, applyUniformBG);
+        pass.dispatchWorkgroups(applyGridX, applyGridY);
+        pass.end();
+      }
+    }
+
+    // 7. Reverse result if needed
+    if (reverse && N > 1) {
+      for (let k = 0; k < numLeaves; k++) {
+        const ec = leafElemCounts[k];
+        const leafOffset = leafStarts[k] * N * bytesPerElem;
+        const elemBytes = ec * bytesPerElem;
+        for (let j = 0; j < N; j++) {
+          const srcOff = leafOffset + j * elemBytes;
+          const dstOff = leafOffset + (N - 1 - j) * elemBytes;
+          if (elemBytes % 4 === 0) {
+            enc.copyBufferToBuffer(
+              scannedBuf,
+              srcOff,
+              reverseTempBuf!,
+              dstOff,
+              elemBytes,
+            );
+          }
+        }
+      }
+      enc.copyBufferToBuffer(reverseTempBuf!, 0, scannedBuf, 0, dataBytes);
+    }
+
+    // 8. Copy results from scannedBuf → output slots
+    for (let k = 0; k < numLeaves; k++) {
+      const dstBuf = this.#getBuffer(outputSlots[k]).buffer;
+      const srcOffset = leafStarts[k] * N * bytesPerElem;
+      const copySize = leafElemCounts[k] * N * bytesPerElem;
+      if (copySize > 0 && copySize % 4 === 0) {
+        enc.copyBufferToBuffer(scannedBuf, srcOffset, dstBuf, 0, copySize);
+      } else if (copySize > 0) {
+        this.#encodeCopyWithShader(
+          enc,
+          scannedBuf,
+          srcOffset,
+          dstBuf,
+          0,
+          copySize,
+        );
+      }
+    }
+
+    // 9. Single submit
+    this.device.queue.submit([enc.finish()]);
+
+    // 10. Cleanup
+    localUniformBuf.destroy();
+    gatherUniformBuf.destroy();
+    if (summaryUniformBuf) summaryUniformBuf.destroy();
+    if (applyUniformBuf) applyUniformBuf.destroy();
+    if (reverseTempBuf) {
+      reverseTempBuf.destroy();
+      this.#gpuAllocatedBytes -= dataBytes;
+    }
+    inputBuf.destroy();
+    scannedBuf.destroy();
+    summaryPingBuf.destroy();
+    summaryPongBuf.destroy();
+    this.#gpuAllocatedBytes -= dataBytes * 2 + summaryBytes * 2;
   }
 
   // ---------------------------------------------------------------------------
@@ -3540,65 +4129,28 @@ function nativeScanMultiShaderSource(
 // ---------------------------------------------------------------------------
 
 /**
- * Generate a WGSL expression for an associative scan body kernel step.
- *
- * Maps GlobalIndex gids to:
- *   - gid < numConsts         → const{gid}[idx]
- *   - gid ∈ [numConsts, numConsts+numLeaves)  → "a" leaf: ping at position (gidx - stride)
- *   - gid ∈ [numConsts+numLeaves, numConsts+2*numLeaves) → "b" leaf: ping at position gidx
- *   - gid ≥ numInputs         → internal_N[idx] (private array)
- *
- * Ping buffer layout: [leaf0: N * elemCount0][leaf1: N * elemCount1]...
- * Leaf k at position j, sub-index idx: ping[leafStart_k * uniforms.N + j * elemCount_k + idx]
+ * Core ALU expression translator for assocScan body kernels.
+ * Delegates GlobalIndex resolution to `resolveGid` callback.
+ * Internal (gid >= numInputs) buffers are always resolved as `internal_N[idx]`.
  */
-function genAssocScanExpression(
+function translateAssocScanAluExp(
   exp: AluExp,
-  _dtype: DType,
-  numConsts: number,
-  numLeaves: number,
-  leafElemCounts: number[],
+  resolveGid: (gid: number, idxCode: string, eDtype: DType) => string,
+  numInputs: number,
   _internalElemCounts: number[],
 ): string {
-  const numInputs = numConsts + 2 * numLeaves;
-
-  // Compute prefix sums for leaf start offsets (in typed elements relative to N=1).
-  // leafStarts[k] = sum of leafElemCounts[0..k-1]
-  const leafStarts: number[] = [0];
-  for (let k = 1; k < numLeaves; k++) {
-    leafStarts[k] = leafStarts[k - 1] + leafElemCounts[k - 1];
-  }
-
   const gen = (e: AluExp): string => {
     const { op, src, dtype: eDtype, arg } = e;
 
     if (op === AluOp.GlobalIndex) {
       const gid = arg[0] as number;
       const idxCode = gen(src[0]);
-
-      if (gid < numConsts) {
-        // Constant buffer
-        const access = `const${gid}[${idxCode}]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else if (gid < numConsts + numLeaves) {
-        // "a" leaf — read from ping at position (gidx - stride)
-        const leafIdx = gid - numConsts;
-        const elemCount = leafElemCounts[leafIdx];
-        const start = leafStarts[leafIdx];
-        const access = `ping[${start}u * uniforms.N + u32(a_pos) * ${elemCount}u + u32(${idxCode})]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else if (gid < numInputs) {
-        // "b" leaf — read from ping at position gidx
-        const leafIdx = gid - numConsts - numLeaves;
-        const elemCount = leafElemCounts[leafIdx];
-        const start = leafStarts[leafIdx];
-        const access = `ping[${start}u * uniforms.N + u32(gidx) * ${elemCount}u + u32(${idxCode})]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else {
-        // Internal buffer (var<private>)
+      if (gid >= numInputs) {
         const intIdx = gid - numInputs;
         const access = `internal_${intIdx}[${idxCode}]`;
         return eDtype === DType.Bool ? `(${access} != 0)` : access;
       }
+      return resolveGid(gid, idxCode, eDtype);
     }
 
     if (op === AluOp.Const) return constToWgsl(eDtype, arg);
@@ -3676,10 +4228,59 @@ function genAssocScanExpression(
       return `select(${strip1(gen(src[2]))}, ${strip1(gen(src[1]))}, ${strip1(gen(src[0]))})`;
     }
 
-    throw new Error(`genAssocScanExpression: unsupported op ${AluOp[op]}`);
+    throw new Error(`translateAssocScanAluExp: unsupported op ${AluOp[op]}`);
   };
 
   return strip1(gen(exp));
+}
+
+/** Compute prefix sums of leaf elem counts: leafStarts[k] = sum(leafElemCounts[0..k-1]). */
+function computeLeafStarts(leafElemCounts: number[]): number[] {
+  const starts: number[] = [0];
+  for (let k = 1; k < leafElemCounts.length; k++) {
+    starts[k] = starts[k - 1] + leafElemCounts[k - 1];
+  }
+  return starts;
+}
+
+/**
+ * Generate a WGSL expression for an associative scan body kernel step
+ * reading from GLOBAL ping/pong buffers (flat Kogge-Stone path).
+ */
+function genAssocScanExpression(
+  exp: AluExp,
+  _dtype: DType,
+  numConsts: number,
+  numLeaves: number,
+  leafElemCounts: number[],
+  internalElemCounts: number[],
+): string {
+  const numInputs = numConsts + 2 * numLeaves;
+  const leafStarts = computeLeafStarts(leafElemCounts);
+
+  return translateAssocScanAluExp(
+    exp,
+    (gid, idxCode, eDtype) => {
+      if (gid < numConsts) {
+        const access = `const${gid}[${idxCode}]`;
+        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      }
+      if (gid < numConsts + numLeaves) {
+        const leafIdx = gid - numConsts;
+        const elemCount = leafElemCounts[leafIdx];
+        const start = leafStarts[leafIdx];
+        const access = `ping[${start}u * uniforms.N + u32(a_pos) * ${elemCount}u + u32(${idxCode})]`;
+        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      }
+      const leafIdx = gid - numConsts - numLeaves;
+      const elemCount = leafElemCounts[leafIdx];
+      const start = leafStarts[leafIdx];
+      const access = `ping[${start}u * uniforms.N + u32(gidx) * ${elemCount}u + u32(${idxCode})]`;
+      return eDtype === DType.Bool ? `(${access} != 0)` : access;
+    },
+    numInputs,
+    internalElemCounts,
+  );
 }
 
 /**
@@ -3956,6 +4557,911 @@ function assocScanFusedShaderSource(
   emit(popIndent, "}");
 
   return { code: getCode(), workgroupSize };
+}
+
+// ---------------------------------------------------------------------------
+// Blocked associative scan shaders (WebGPU workgroup-level Kogge-Stone)
+// ---------------------------------------------------------------------------
+
+/**
+ * Local scan shader: each workgroup of B threads scans B elements in shared
+ * memory using ceil(log₂ B) unrolled Kogge-Stone rounds with barriers.
+ *
+ * Uses interleaved shmem layout: shmem[elemIdx * B + lid] so that consecutive
+ * threads access consecutive addresses, eliminating bank conflicts.
+ *
+ * When the device supports subgroups, initial rounds (stride < subgroupSize)
+ * use subgroupShuffleUp instead of shmem reads, avoiding barriers entirely.
+ *
+ * Bindings:
+ *   group(0) binding(0): input (storage, read)
+ *   group(0) binding(1): output (storage, read_write)
+ *   group(0) binding(2..2+K): const0..constK (storage, read)
+ *   group(1) binding(0): uniforms { N: u32 }
+ */
+function blockedAssocScanLocalShaderSource(
+  device: GPUDevice,
+  params: WebGPUAssocScanParams,
+  blockSize: number,
+): { code: string; numRounds: number } {
+  const {
+    numConsts,
+    numLeaves,
+    leafElemCounts,
+    steps,
+    internalElemCounts,
+    leafToInternalIdx,
+    dtype,
+  } = params;
+
+  const numInputs = numConsts + 2 * numLeaves;
+  const resultTy = dtypeToWgsl(dtype, true);
+  const numRounds = Math.ceil(Math.log2(blockSize));
+  const leafStarts = computeLeafStarts(leafElemCounts);
+  const B = blockSize;
+  const useSubgroups = device.features.has("subgroups");
+
+  const { emit, pushIndent, popIndent, getCode } = createShaderEmitter();
+
+  if (dtype === DType.Float16) {
+    if (!device.features.has("shader-f16")) {
+      throw new Error("WebGPU device does not support shader-f16 feature");
+    }
+    emit("enable f16;");
+  }
+  if (useSubgroups) {
+    emit("enable subgroups;");
+  }
+
+  emit(headerWgsl);
+
+  // Collect ops that need global function definitions
+  const allDistinctOps = new Set<AluOp>();
+  for (const step of steps) {
+    const tune = tuneNullopt(step.kernel);
+    for (const [op] of tune.exp.distinctOps()) allDistinctOps.add(op);
+    if (tune.epilogue) {
+      for (const [op] of tune.epilogue.distinctOps()) allDistinctOps.add(op);
+    }
+  }
+  if (allDistinctOps.has(AluOp.Threefry2x32)) emit(threefrySrc);
+  if (allDistinctOps.has(AluOp.Erf) || allDistinctOps.has(AluOp.Erfc)) {
+    emit(erfSrc);
+  }
+  emit("");
+
+  emit("struct LocalScanUniforms { N: u32, }");
+  emit("");
+
+  // Input/output buffer bindings
+  emit(`@group(0) @binding(0) var<storage, read> g_input: array<${resultTy}>;`);
+  emit(
+    `@group(0) @binding(1) var<storage, read_write> g_output: array<${resultTy}>;`,
+  );
+  for (let i = 0; i < numConsts; i++) {
+    emit(
+      `@group(0) @binding(${i + 2}) var<storage, read> const${i}: array<${resultTy}>;`,
+    );
+  }
+  emit("@group(1) @binding(0) var<uniform> uniforms: LocalScanUniforms;");
+  emit("");
+
+  // Shared memory: two sets (ping/pong) of arrays, one per leaf
+  // Interleaved layout: shmem_X_k[elemIdx * B + lid]
+  for (let k = 0; k < numLeaves; k++) {
+    const size = B * leafElemCounts[k];
+    emit(`var<workgroup> shmem_0_${k}: array<${resultTy}, ${size}>;`);
+    emit(`var<workgroup> shmem_1_${k}: array<${resultTy}, ${size}>;`);
+  }
+  emit("");
+
+  emit(`@compute @workgroup_size(${B})`);
+  if (useSubgroups) {
+    emit(
+      "fn main(@builtin(local_invocation_id) lid3: vec3<u32>, @builtin(workgroup_id) wg3: vec3<u32>, @builtin(subgroup_size) sg_size: u32) {",
+    );
+  } else {
+    emit(
+      "fn main(@builtin(local_invocation_id) lid3: vec3<u32>, @builtin(workgroup_id) wg3: vec3<u32>) {",
+    );
+  }
+  emit(pushIndent);
+  emit("let lid = lid3.x;");
+  emit(`let gidx = i32(wg3.x * ${B}u + lid);`);
+  emit("let inBounds = u32(gidx) < uniforms.N;");
+  emit("");
+
+  // Load from global input → shmem_0 (or identity/zero for OOB)
+  // Interleaved: shmem_0_k[elemIdx * B + lid]
+  for (let k = 0; k < numLeaves; k++) {
+    const ec = leafElemCounts[k];
+    const start = leafStarts[k];
+    if (ec > 1) {
+      emit(`for (var li: u32 = 0u; li < ${ec}u; li++) {`);
+      emit(pushIndent);
+      emit(`if (inBounds) {`);
+      emit(
+        pushIndent,
+        `shmem_0_${k}[li * ${B}u + lid] = g_input[${start}u * uniforms.N + u32(gidx) * ${ec}u + li];`,
+      );
+      emit(popIndent, "} else {");
+      emit(pushIndent, `shmem_0_${k}[li * ${B}u + lid] = ${resultTy}(0);`);
+      emit(popIndent, "}");
+      emit(popIndent, "}");
+    } else {
+      emit(`if (inBounds) {`);
+      emit(
+        pushIndent,
+        `shmem_0_${k}[lid] = g_input[${start}u * uniforms.N + u32(gidx)];`,
+      );
+      emit(popIndent, "} else {");
+      emit(pushIndent, `shmem_0_${k}[lid] = ${resultTy}(0);`);
+      emit(popIndent, "}");
+    }
+  }
+  emit("");
+
+  // Helper to emit body steps using shmem-based resolveGid
+  // Interleaved layout: shmem_X_k[elemIdx * B + threadIdx]
+  function emitBodySteps(
+    srcPrefix: string,
+    dstPrefix: string,
+    strideStr: string,
+  ) {
+    // Declare internal buffers
+    for (let i = 0; i < internalElemCounts.length; i++) {
+      const count = internalElemCounts[i];
+      emit(`var internal_${i}: array<${resultTy}, ${count}>;`);
+    }
+    emit("");
+    emit(`let a_lid = i32(lid) - ${strideStr};`);
+    emit("");
+
+    emit(`if (a_lid >= 0) {`);
+    emit(pushIndent);
+
+    // Execute body steps with shmem-based access
+    for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+      const step = steps[stepIdx];
+      const kernel = step.kernel;
+      const tune = tuneNullopt(kernel);
+      const kernelSize =
+        typeof kernel.size === "number"
+          ? kernel.size
+          : (kernel.concreteSizeHint ?? 1);
+
+      emit(`// Step ${stepIdx}`);
+
+      const eidxVar = AluExp.special(DType.Int32, "eidx", kernelSize);
+      const rewriteGidxToEidx = (exp: AluExp): AluExp =>
+        exp.rewrite((node) => {
+          if (node.op === AluOp.Special) {
+            const name = Array.isArray(node.arg) ? node.arg[0] : node.arg;
+            if (name === "gidx") return eidxVar;
+          }
+        });
+
+      // resolveGid that reads from shared memory (interleaved layout)
+      const shmemResolveGid = (
+        gid: number,
+        idxCode: string,
+        eDtype: DType,
+      ): string => {
+        if (gid < numConsts) {
+          const access = `const${gid}[${idxCode}]`;
+          return eDtype === DType.Bool ? `(${access} != 0)` : access;
+        }
+        if (gid < numConsts + numLeaves) {
+          // a-leaf: read from shmem_src at a_lid
+          const leafIdx = gid - numConsts;
+          const ec = leafElemCounts[leafIdx];
+          const access =
+            ec > 1
+              ? `${srcPrefix}_${leafIdx}[u32(${idxCode}) * ${B}u + u32(a_lid)]`
+              : `${srcPrefix}_${leafIdx}[u32(a_lid)]`;
+          return eDtype === DType.Bool ? `(${access} != 0)` : access;
+        }
+        // b-leaf: read from shmem_src at lid
+        const leafIdx = gid - numConsts - numLeaves;
+        const ec = leafElemCounts[leafIdx];
+        const access =
+          ec > 1
+            ? `${srcPrefix}_${leafIdx}[u32(${idxCode}) * ${B}u + lid]`
+            : `${srcPrefix}_${leafIdx}[lid]`;
+        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      };
+
+      const re = kernel.outputs[0].reduction;
+      if (re) {
+        // Reduction kernel
+        const accTy = dtypeToWgsl(re.dtype, true);
+        const redSize =
+          typeof tune.size.reduce === "number"
+            ? tune.size.reduce
+            : (re.concreteHint ?? Number(tune.size.reduce));
+        const substExp = rewriteGidxToEidx(tune.exp);
+        const substEpilogue = rewriteGidxToEidx(tune.epilogue!);
+
+        if (kernelSize > 1) {
+          emit(
+            `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+            pushIndent,
+          );
+        } else {
+          emit(`{`, pushIndent);
+          emit(`let eidx: i32 = 0;`);
+        }
+        emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
+        emit(
+          `for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`,
+          pushIndent,
+        );
+
+        const expCode = translateAssocScanAluExp(
+          substExp,
+          shmemResolveGid,
+          numInputs,
+          internalElemCounts,
+        );
+        emit(`let val = ${expCode};`);
+        if (re.op === AluOp.Add) emit(`acc = acc + val;`);
+        else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
+        else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
+        else if (re.op === AluOp.Max) emit(`acc = max(acc, val);`);
+        else throw new Error(`Unsupported reduction op: ${re.op}`);
+
+        emit(popIndent, "}");
+        const epilogueCode = translateAssocScanAluExp(
+          substEpilogue,
+          shmemResolveGid,
+          numInputs,
+          internalElemCounts,
+        );
+        emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueCode};`);
+        emit(popIndent, "}");
+      } else {
+        // Elementwise kernel
+        if (kernelSize > 1) {
+          emit(
+            `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+            pushIndent,
+          );
+          const substExp = rewriteGidxToEidx(tune.exp);
+          const expCode = translateAssocScanAluExp(
+            substExp,
+            shmemResolveGid,
+            numInputs,
+            internalElemCounts,
+          );
+          emit(`internal_${step.outputInternalIdx}[eidx] = ${expCode};`);
+          emit(popIndent, "}");
+        } else {
+          const expCode = translateAssocScanAluExp(
+            tune.exp,
+            shmemResolveGid,
+            numInputs,
+            internalElemCounts,
+          );
+          emit(`internal_${step.outputInternalIdx}[0] = ${expCode};`);
+        }
+      }
+      emit("");
+    }
+
+    // Write results from internal → shmem_dst (interleaved)
+    for (let k = 0; k < numLeaves; k++) {
+      const intIdx = leafToInternalIdx[k];
+      const ec = leafElemCounts[k];
+      if (ec > 1) {
+        emit(`for (var wi: u32 = 0u; wi < ${ec}u; wi++) {`);
+        emit(
+          pushIndent,
+          `${dstPrefix}_${k}[wi * ${B}u + lid] = internal_${intIdx}[wi];`,
+        );
+        emit(popIndent, "}");
+      } else {
+        emit(`${dstPrefix}_${k}[lid] = internal_${intIdx}[0];`);
+      }
+    }
+
+    emit(popIndent, "} else {");
+    emit(pushIndent);
+
+    // Copy: shmem_src[lid] → shmem_dst[lid] (interleaved)
+    for (let k = 0; k < numLeaves; k++) {
+      const ec = leafElemCounts[k];
+      if (ec > 1) {
+        emit(`for (var ci: u32 = 0u; ci < ${ec}u; ci++) {`);
+        emit(
+          pushIndent,
+          `${dstPrefix}_${k}[ci * ${B}u + lid] = ${srcPrefix}_${k}[ci * ${B}u + lid];`,
+        );
+        emit(popIndent, "}");
+      } else {
+        emit(`${dstPrefix}_${k}[lid] = ${srcPrefix}_${k}[lid];`);
+      }
+    }
+
+    emit(popIndent, "}");
+  }
+
+  // Helper to emit body steps using subgroup shuffles (no shmem reads for a-operand)
+  function emitSubgroupBodySteps(
+    srcPrefix: string,
+    dstPrefix: string,
+    stride: number,
+  ) {
+    // Declare internal buffers
+    for (let i = 0; i < internalElemCounts.length; i++) {
+      const count = internalElemCounts[i];
+      emit(`var internal_${i}: array<${resultTy}, ${count}>;`);
+    }
+    emit("");
+
+    // Read b-leaf values from shmem into registers for shuffling
+    for (let k = 0; k < numLeaves; k++) {
+      const ec = leafElemCounts[k];
+      if (ec > 1) {
+        emit(`var sg_val_${k}: array<${resultTy}, ${ec}>;`);
+        emit(`for (var si: u32 = 0u; si < ${ec}u; si++) {`);
+        emit(
+          pushIndent,
+          `sg_val_${k}[si] = ${srcPrefix}_${k}[si * ${B}u + lid];`,
+        );
+        emit(popIndent, "}");
+      } else {
+        emit(`var sg_val_${k} = ${srcPrefix}_${k}[lid];`);
+      }
+    }
+    emit("");
+
+    // Get a-values via subgroupShuffleUp
+    for (let k = 0; k < numLeaves; k++) {
+      const ec = leafElemCounts[k];
+      if (ec > 1) {
+        emit(`var sg_a_${k}: array<${resultTy}, ${ec}>;`);
+        emit(`for (var si: u32 = 0u; si < ${ec}u; si++) {`);
+        emit(
+          pushIndent,
+          `sg_a_${k}[si] = subgroupShuffleUp(sg_val_${k}[si], ${stride}u);`,
+        );
+        emit(popIndent, "}");
+      } else {
+        emit(`let sg_a_${k} = subgroupShuffleUp(sg_val_${k}, ${stride}u);`);
+      }
+    }
+    emit("");
+
+    emit(`let a_lid = i32(lid) - ${stride};`);
+    emit(`if (a_lid >= 0) {`);
+    emit(pushIndent);
+
+    // Execute body steps reading a-values from sg_a_k, b-values from sg_val_k
+    for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+      const step = steps[stepIdx];
+      const kernel = step.kernel;
+      const tune = tuneNullopt(kernel);
+      const kernelSize =
+        typeof kernel.size === "number"
+          ? kernel.size
+          : (kernel.concreteSizeHint ?? 1);
+
+      emit(`// Step ${stepIdx}`);
+
+      const eidxVar = AluExp.special(DType.Int32, "eidx", kernelSize);
+      const rewriteGidxToEidx = (exp: AluExp): AluExp =>
+        exp.rewrite((node) => {
+          if (node.op === AluOp.Special) {
+            const name = Array.isArray(node.arg) ? node.arg[0] : node.arg;
+            if (name === "gidx") return eidxVar;
+          }
+        });
+
+      // resolveGid that reads from subgroup shuffle results
+      const sgResolveGid = (
+        gid: number,
+        idxCode: string,
+        eDtype: DType,
+      ): string => {
+        if (gid < numConsts) {
+          const access = `const${gid}[${idxCode}]`;
+          return eDtype === DType.Bool ? `(${access} != 0)` : access;
+        }
+        if (gid < numConsts + numLeaves) {
+          // a-leaf: read from shuffled value
+          const leafIdx = gid - numConsts;
+          const ec = leafElemCounts[leafIdx];
+          const access =
+            ec > 1 ? `sg_a_${leafIdx}[u32(${idxCode})]` : `sg_a_${leafIdx}`;
+          return eDtype === DType.Bool ? `(${access} != 0)` : access;
+        }
+        // b-leaf: read from register value
+        const leafIdx = gid - numConsts - numLeaves;
+        const ec = leafElemCounts[leafIdx];
+        const access =
+          ec > 1 ? `sg_val_${leafIdx}[u32(${idxCode})]` : `sg_val_${leafIdx}`;
+        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      };
+
+      const re = kernel.outputs[0].reduction;
+      if (re) {
+        const accTy = dtypeToWgsl(re.dtype, true);
+        const redSize =
+          typeof tune.size.reduce === "number"
+            ? tune.size.reduce
+            : (re.concreteHint ?? Number(tune.size.reduce));
+        const substExp = rewriteGidxToEidx(tune.exp);
+        const substEpilogue = rewriteGidxToEidx(tune.epilogue!);
+
+        if (kernelSize > 1) {
+          emit(
+            `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+            pushIndent,
+          );
+        } else {
+          emit(`{`, pushIndent);
+          emit(`let eidx: i32 = 0;`);
+        }
+        emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
+        emit(
+          `for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`,
+          pushIndent,
+        );
+
+        const expCode = translateAssocScanAluExp(
+          substExp,
+          sgResolveGid,
+          numInputs,
+          internalElemCounts,
+        );
+        emit(`let val = ${expCode};`);
+        if (re.op === AluOp.Add) emit(`acc = acc + val;`);
+        else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
+        else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
+        else if (re.op === AluOp.Max) emit(`acc = max(acc, val);`);
+        else throw new Error(`Unsupported reduction op: ${re.op}`);
+
+        emit(popIndent, "}");
+        const epilogueCode = translateAssocScanAluExp(
+          substEpilogue,
+          sgResolveGid,
+          numInputs,
+          internalElemCounts,
+        );
+        emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueCode};`);
+        emit(popIndent, "}");
+      } else {
+        if (kernelSize > 1) {
+          emit(
+            `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+            pushIndent,
+          );
+          const substExp = rewriteGidxToEidx(tune.exp);
+          const expCode = translateAssocScanAluExp(
+            substExp,
+            sgResolveGid,
+            numInputs,
+            internalElemCounts,
+          );
+          emit(`internal_${step.outputInternalIdx}[eidx] = ${expCode};`);
+          emit(popIndent, "}");
+        } else {
+          const expCode = translateAssocScanAluExp(
+            tune.exp,
+            sgResolveGid,
+            numInputs,
+            internalElemCounts,
+          );
+          emit(`internal_${step.outputInternalIdx}[0] = ${expCode};`);
+        }
+      }
+      emit("");
+    }
+
+    // Write results from internal → shmem_dst (interleaved)
+    for (let k = 0; k < numLeaves; k++) {
+      const intIdx = leafToInternalIdx[k];
+      const ec = leafElemCounts[k];
+      if (ec > 1) {
+        emit(`for (var wi: u32 = 0u; wi < ${ec}u; wi++) {`);
+        emit(
+          pushIndent,
+          `${dstPrefix}_${k}[wi * ${B}u + lid] = internal_${intIdx}[wi];`,
+        );
+        emit(popIndent, "}");
+      } else {
+        emit(`${dstPrefix}_${k}[lid] = internal_${intIdx}[0];`);
+      }
+    }
+
+    emit(popIndent, "} else {");
+    emit(pushIndent);
+
+    // Copy: shmem_src[lid] → shmem_dst[lid] (interleaved)
+    for (let k = 0; k < numLeaves; k++) {
+      const ec = leafElemCounts[k];
+      if (ec > 1) {
+        emit(`for (var ci: u32 = 0u; ci < ${ec}u; ci++) {`);
+        emit(
+          pushIndent,
+          `${dstPrefix}_${k}[ci * ${B}u + lid] = ${srcPrefix}_${k}[ci * ${B}u + lid];`,
+        );
+        emit(popIndent, "}");
+      } else {
+        emit(`${dstPrefix}_${k}[lid] = ${srcPrefix}_${k}[lid];`);
+      }
+    }
+
+    emit(popIndent, "}");
+  }
+
+  // Unroll all KS rounds with barriers
+  // For subgroups: initial rounds where stride < sg_size use subgroupShuffleUp
+  // (no barrier needed). Later rounds use shmem with barrier.
+  for (let round = 0; round < numRounds; round++) {
+    const stride = 1 << round;
+    const src = round % 2 === 0 ? "shmem_0" : "shmem_1";
+    const dst = round % 2 === 0 ? "shmem_1" : "shmem_0";
+
+    if (useSubgroups) {
+      // Check at runtime whether this stride fits within a subgroup
+      emit(`if (${stride}u < sg_size) {`);
+      emit(pushIndent);
+      // No barrier needed — subgroup shuffle is implicitly synchronized
+      emit(`{`);
+      emit(pushIndent);
+      emitSubgroupBodySteps(src, dst, stride);
+      emit(popIndent, "}");
+      emit(popIndent, "} else {");
+      emit(pushIndent);
+      // Fall back to shmem + barrier
+      emit("workgroupBarrier();");
+      emit(`{`);
+      emit(pushIndent);
+      emitBodySteps(src, dst, `${stride}`);
+      emit(popIndent, "}");
+      emit(popIndent, "}");
+    } else {
+      emit("workgroupBarrier();");
+      emit(`{`);
+      emit(pushIndent);
+      emitBodySteps(src, dst, `${stride}`);
+      emit(popIndent, "}");
+    }
+    emit("");
+  }
+
+  // After all rounds, result is in dst of last round
+  const finalPrefix = numRounds % 2 === 0 ? "shmem_0" : "shmem_1";
+
+  // Final barrier before reading results
+  emit("workgroupBarrier();");
+
+  // Write back from shmem → global output (only in-bounds, interleaved layout)
+  emit("if (inBounds) {");
+  emit(pushIndent);
+  for (let k = 0; k < numLeaves; k++) {
+    const ec = leafElemCounts[k];
+    const start = leafStarts[k];
+    if (ec > 1) {
+      emit(`for (var wi: u32 = 0u; wi < ${ec}u; wi++) {`);
+      emit(
+        pushIndent,
+        `g_output[${start}u * uniforms.N + u32(gidx) * ${ec}u + wi] = ${finalPrefix}_${k}[wi * ${B}u + lid];`,
+      );
+      emit(popIndent, "}");
+    } else {
+      emit(
+        `g_output[${start}u * uniforms.N + u32(gidx)] = ${finalPrefix}_${k}[lid];`,
+      );
+    }
+  }
+  emit(popIndent, "}");
+
+  emit(popIndent, "}");
+
+  return { code: getCode(), numRounds };
+}
+
+/**
+ * Gather shader: extract last element of each block → summary buffer.
+ *
+ * Each thread handles one block, reading the last scanned element.
+ * Bindings:
+ *   group(0) binding(0): scanned (storage, read)
+ *   group(0) binding(1): summary (storage, read_write)
+ *   group(1) binding(0): uniforms { N: u32, B: u32 }
+ */
+function blockedAssocScanGatherShaderSource(
+  device: GPUDevice,
+  params: WebGPUAssocScanParams,
+  _blockSize: number,
+): string {
+  const { numLeaves, leafElemCounts, dtype } = params;
+  const resultTy = dtypeToWgsl(dtype, true);
+  const leafStarts = computeLeafStarts(leafElemCounts);
+
+  const { emit, pushIndent, popIndent, getCode } = createShaderEmitter();
+
+  if (dtype === DType.Float16) {
+    if (!device.features.has("shader-f16")) {
+      throw new Error("WebGPU device does not support shader-f16 feature");
+    }
+    emit("enable f16;");
+  }
+  emit(headerWgsl);
+  emit("");
+
+  emit("struct GatherUniforms { N: u32, B: u32, }");
+  emit("");
+
+  emit(`@group(0) @binding(0) var<storage, read> scanned: array<${resultTy}>;`);
+  emit(
+    `@group(0) @binding(1) var<storage, read_write> summary: array<${resultTy}>;`,
+  );
+  emit("@group(1) @binding(0) var<uniform> uniforms: GatherUniforms;");
+  emit("");
+
+  const wgSize = 256;
+  emit(`@compute @workgroup_size(${wgSize})`);
+  emit("fn main(@builtin(global_invocation_id) id: vec3<u32>) {");
+  emit(pushIndent);
+  emit("let blockIdx = id.x;");
+  emit("let M = (uniforms.N + uniforms.B - 1u) / uniforms.B;");
+  emit("if (blockIdx >= M) { return; }");
+  emit("");
+  // Last position for this block: min((blockIdx+1)*B - 1, N-1)
+  emit(
+    "let lastPos = min((blockIdx + 1u) * uniforms.B - 1u, uniforms.N - 1u);",
+  );
+  emit("");
+
+  for (let k = 0; k < numLeaves; k++) {
+    const ec = leafElemCounts[k];
+    const start = leafStarts[k];
+    if (ec > 1) {
+      emit(`for (var gi: u32 = 0u; gi < ${ec}u; gi++) {`);
+      emit(
+        pushIndent,
+        `summary[${start}u * M + blockIdx * ${ec}u + gi] = scanned[${start}u * uniforms.N + lastPos * ${ec}u + gi];`,
+      );
+      emit(popIndent, "}");
+    } else {
+      emit(
+        `summary[${start}u * M + blockIdx] = scanned[${start}u * uniforms.N + lastPos];`,
+      );
+    }
+  }
+
+  emit(popIndent, "}");
+  return getCode();
+}
+
+/**
+ * Apply shader: for blocks 1..M-1, combine scanned_summary[block-1] with each
+ * element. Block 0 is untouched.
+ *
+ * Bindings:
+ *   group(0) binding(0): summary (storage, read) — scanned summaries
+ *   group(0) binding(1): data (storage, read_write) — locally scanned data
+ *   group(0) binding(2..2+K): const0..constK (storage, read)
+ *   group(1) binding(0): uniforms { N: u32, B: u32, M: u32 }
+ */
+function blockedAssocScanApplyShaderSource(
+  device: GPUDevice,
+  params: WebGPUAssocScanParams,
+  _blockSize: number,
+): string {
+  const {
+    numConsts,
+    numLeaves,
+    leafElemCounts,
+    steps,
+    internalElemCounts,
+    leafToInternalIdx,
+    dtype,
+  } = params;
+
+  const numInputs = numConsts + 2 * numLeaves;
+  const resultTy = dtypeToWgsl(dtype, true);
+  const leafStarts = computeLeafStarts(leafElemCounts);
+
+  const { emit, pushIndent, popIndent, getCode } = createShaderEmitter();
+
+  if (dtype === DType.Float16) {
+    if (!device.features.has("shader-f16")) {
+      throw new Error("WebGPU device does not support shader-f16 feature");
+    }
+    emit("enable f16;");
+  }
+  emit(headerWgsl);
+
+  const allDistinctOps = new Set<AluOp>();
+  for (const step of steps) {
+    const tune = tuneNullopt(step.kernel);
+    for (const [op] of tune.exp.distinctOps()) allDistinctOps.add(op);
+    if (tune.epilogue) {
+      for (const [op] of tune.epilogue.distinctOps()) allDistinctOps.add(op);
+    }
+  }
+  if (allDistinctOps.has(AluOp.Threefry2x32)) emit(threefrySrc);
+  if (allDistinctOps.has(AluOp.Erf) || allDistinctOps.has(AluOp.Erfc)) {
+    emit(erfSrc);
+  }
+  emit("");
+
+  emit("struct ApplyUniforms { N: u32, B: u32, M: u32, }");
+  emit("");
+
+  // summary = scanned block summaries; data = locally scanned output
+  emit(`@group(0) @binding(0) var<storage, read> summary: array<${resultTy}>;`);
+  emit(
+    `@group(0) @binding(1) var<storage, read_write> data: array<${resultTy}>;`,
+  );
+  for (let i = 0; i < numConsts; i++) {
+    emit(
+      `@group(0) @binding(${i + 2}) var<storage, read> const${i}: array<${resultTy}>;`,
+    );
+  }
+  emit("@group(1) @binding(0) var<uniform> uniforms: ApplyUniforms;");
+  emit("");
+
+  const wgSize = 256;
+  emit(`@compute @workgroup_size(${wgSize})`);
+  emit("fn main(@builtin(global_invocation_id) id: vec3<u32>) {");
+  emit(pushIndent);
+  emit("let gidx = i32(id.x);");
+  emit("if (u32(gidx) >= uniforms.N) { return; }");
+  emit("");
+  // Block index for this position
+  emit(`let blockIdx = u32(gidx) / uniforms.B;`);
+  emit("if (blockIdx == 0u) { return; }");
+  emit("let summaryIdx = blockIdx - 1u;");
+  emit("");
+
+  // Declare internal buffers
+  for (let i = 0; i < internalElemCounts.length; i++) {
+    const count = internalElemCounts[i];
+    emit(`var internal_${i}: array<${resultTy}, ${count}>;`);
+  }
+  emit("");
+
+  // Apply = fn(summary[blockIdx-1], data[gidx])
+  // "a" is the summary element at summaryIdx, "b" is the data element at gidx
+  const applyResolveGid = (
+    gid: number,
+    idxCode: string,
+    eDtype: DType,
+  ): string => {
+    if (gid < numConsts) {
+      const access = `const${gid}[${idxCode}]`;
+      return eDtype === DType.Bool ? `(${access} != 0)` : access;
+    }
+    if (gid < numConsts + numLeaves) {
+      // a-leaf: read from summary buffer at summaryIdx
+      const leafIdx = gid - numConsts;
+      const ec = leafElemCounts[leafIdx];
+      const start = leafStarts[leafIdx];
+      const access = `summary[${start}u * uniforms.M + summaryIdx * ${ec}u + u32(${idxCode})]`;
+      return eDtype === DType.Bool ? `(${access} != 0)` : access;
+    }
+    // b-leaf: read from data buffer at gidx
+    const leafIdx = gid - numConsts - numLeaves;
+    const ec = leafElemCounts[leafIdx];
+    const start = leafStarts[leafIdx];
+    const access = `data[${start}u * uniforms.N + u32(gidx) * ${ec}u + u32(${idxCode})]`;
+    return eDtype === DType.Bool ? `(${access} != 0)` : access;
+  };
+
+  // Execute body steps — same pattern as flat scan shader
+  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+    const step = steps[stepIdx];
+    const kernel = step.kernel;
+    const tune = tuneNullopt(kernel);
+    const kernelSize =
+      typeof kernel.size === "number"
+        ? kernel.size
+        : (kernel.concreteSizeHint ?? 1);
+
+    emit(`// Step ${stepIdx}`);
+
+    const eidxVar = AluExp.special(DType.Int32, "eidx", kernelSize);
+    const rewriteGidxToEidx = (exp: AluExp): AluExp =>
+      exp.rewrite((node) => {
+        if (node.op === AluOp.Special) {
+          const name = Array.isArray(node.arg) ? node.arg[0] : node.arg;
+          if (name === "gidx") return eidxVar;
+        }
+      });
+
+    const re = kernel.outputs[0].reduction;
+    if (re) {
+      const accTy = dtypeToWgsl(re.dtype, true);
+      const redSize =
+        typeof tune.size.reduce === "number"
+          ? tune.size.reduce
+          : (re.concreteHint ?? Number(tune.size.reduce));
+      const substExp = rewriteGidxToEidx(tune.exp);
+      const substEpilogue = rewriteGidxToEidx(tune.epilogue!);
+
+      if (kernelSize > 1) {
+        emit(
+          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+          pushIndent,
+        );
+      } else {
+        emit(`{`, pushIndent, `let eidx: i32 = 0;`);
+      }
+      emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
+      emit(`for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`, pushIndent);
+      const expCode = translateAssocScanAluExp(
+        substExp,
+        applyResolveGid,
+        numInputs,
+        internalElemCounts,
+      );
+      emit(`let val = ${expCode};`);
+      if (re.op === AluOp.Add) emit(`acc = acc + val;`);
+      else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
+      else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
+      else if (re.op === AluOp.Max) emit(`acc = max(acc, val);`);
+      else throw new Error(`Unsupported reduction op: ${re.op}`);
+      emit(popIndent, "}");
+      const epilogueCode = translateAssocScanAluExp(
+        substEpilogue,
+        applyResolveGid,
+        numInputs,
+        internalElemCounts,
+      );
+      emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueCode};`);
+      emit(popIndent, "}");
+    } else {
+      if (kernelSize > 1) {
+        emit(
+          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+          pushIndent,
+        );
+        const substExp = rewriteGidxToEidx(tune.exp);
+        const expCode = translateAssocScanAluExp(
+          substExp,
+          applyResolveGid,
+          numInputs,
+          internalElemCounts,
+        );
+        emit(`internal_${step.outputInternalIdx}[eidx] = ${expCode};`);
+        emit(popIndent, "}");
+      } else {
+        const expCode = translateAssocScanAluExp(
+          tune.exp,
+          applyResolveGid,
+          numInputs,
+          internalElemCounts,
+        );
+        emit(`internal_${step.outputInternalIdx}[0] = ${expCode};`);
+      }
+    }
+    emit("");
+  }
+
+  // Write results back to data buffer
+  for (let k = 0; k < numLeaves; k++) {
+    const intIdx = leafToInternalIdx[k];
+    const ec = leafElemCounts[k];
+    const start = leafStarts[k];
+    if (ec > 1) {
+      emit(`for (var wi: u32 = 0u; wi < ${ec}u; wi++) {`);
+      emit(
+        pushIndent,
+        `data[${start}u * uniforms.N + u32(gidx) * ${ec}u + wi] = internal_${intIdx}[wi];`,
+      );
+      emit(popIndent, "}");
+    } else {
+      emit(`data[${start}u * uniforms.N + u32(gidx)] = internal_${intIdx}[0];`);
+    }
+  }
+
+  emit(popIndent, "}");
+  return getCode();
 }
 
 function pipelineSubmit(

@@ -18,6 +18,7 @@ import type {
   PreparedPreencodedMultiStep,
   PreparedPreencodedScan,
   PreparedWebGPUAssocScan,
+  PreparedWebGPUBlockedAssocScan,
   WebGPUAssocScanParams,
 } from "../backend/webgpu";
 import type { WebGPUBackend } from "../backend/webgpu";
@@ -70,6 +71,12 @@ export type AssocScanPlan =
       path: "webgpu-fused";
       prepared: PreparedWebGPUAssocScan;
       params: WebGPUAssocScanParams;
+    }
+  | {
+      path: "webgpu-fused-blocked";
+      prepared: PreparedWebGPUBlockedAssocScan;
+      params: WebGPUAssocScanParams;
+      blockSize: number;
     }
   | { path: "fallback" };
 
@@ -1557,6 +1564,30 @@ export function planAssociativeScan(
 
     try {
       const webgpuBackend = backend as WebGPUBackend;
+
+      // Try blocked path first: workgroup-level scan + summary scan.
+      // Blocked reduces dispatches from ceil(log₂ N) to 3 + ceil(log₂ M)
+      // where M = ceil(N / B). Falls through to flat if shmem/wgsize limits.
+      const BLOCK_SIZE = 256;
+      const blockedPrepared = webgpuBackend.prepareBlockedAssocScan(
+        webgpuParams,
+        BLOCK_SIZE,
+      );
+      if (blockedPrepared) {
+        if (DEBUG >= 1) {
+          console.log(
+            `[assoc-scan] SUCCESS! Using WebGPU fused-blocked (B=${BLOCK_SIZE}) with ${webgpuSteps.length} step(s)`,
+          );
+        }
+        return {
+          path: "webgpu-fused-blocked",
+          prepared: blockedPrepared,
+          params: webgpuParams,
+          blockSize: BLOCK_SIZE,
+        };
+      }
+
+      // Fall back to flat fused path
       const prepared = webgpuBackend.prepareAssocScan(webgpuParams);
       if (prepared) {
         if (DEBUG >= 1) {

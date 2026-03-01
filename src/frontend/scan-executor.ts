@@ -452,6 +452,21 @@ export function executeAssociativeScan(
     return { outputs: outputSlots, pending: [] };
   }
 
+  if (plan.path === "webgpu-fused-blocked") {
+    const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
+    (backend as WebGPUBackend).dispatchBlockedAssocScan(
+      plan.prepared,
+      plan.params,
+      constSlots,
+      elemSlots,
+      outputSlots,
+      N,
+      plan.blockSize,
+      reverse,
+    );
+    return { outputs: outputSlots, pending: [] };
+  }
+
   // Fallback: JS Kogge-Stone loop
   const resolveAvalShape = (shape: Dim[]): number[] =>
     hasSymbolicDims(shape)

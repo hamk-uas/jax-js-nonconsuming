@@ -222,10 +222,12 @@ Deno.test({
       await blockUntilReady(y);
     });
 
-    // Lower bound: at least one dispatch per Kogge-Stone round.
+    // Lower bound: blocked path needs at least 3 dispatches (local + gather + apply)
+    // plus summary scan rounds. Flat path needs at least expectedRounds.
+    const minDispatches = 3;
     assert(
-      dispatches >= expectedRounds,
-      `associativeScan dispatches ${dispatches} is below expected rounds ${expectedRounds}`,
+      dispatches >= minDispatches,
+      `associativeScan dispatches ${dispatches} is below minimum ${minDispatches}`,
     );
 
     // Upper bound: allow some overhead from bookkeeping/copy kernels, but
