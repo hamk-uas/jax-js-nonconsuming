@@ -28,6 +28,7 @@ import {
   type ShaderInfo,
 } from "./codegen";
 import {
+  accessorGlobal,
   AluExp,
   AluGroup,
   AluOp,
@@ -1055,6 +1056,11 @@ export function blockMapFusedShaderSource(
         return arg[0] as string;
       } else if (op === AluOp.Variable) {
         return variableOverrides?.get(arg as string) ?? (arg as string);
+      } else if (op === AluOp.GlobalView) {
+        // Rewrite to Where(valid, GlobalIndex(...), Const(0)) and recurse
+        const [gid, st] = arg as [number, import("../../shape").ShapeTracker];
+        const rewritten = accessorGlobal(dtype, gid, st, src);
+        return gen(rewritten);
       } else if (op === AluOp.GlobalIndex) {
         const bufIdx = arg[0] as number;
         const indexExpr = strip1(gen(src[0]));
@@ -1430,7 +1436,24 @@ export function blockMapFusedShaderSource(
             const epilogueGen = createGen(
               bKernel,
               `${prefix}_ep`,
-              () => accName,
+              (bufIdx, indexExpr, dtype) => {
+                const info = bStepInputInfo[bufIdx];
+                if (info.isIndex) {
+                  return `${dtypeToWgsl(dtype)}(${info.name})`;
+                }
+                if (info.isGlobal) {
+                  const inputIdx = info.parentInputIdx;
+                  if (inputIdx >= 0) {
+                    const readExpr = `${info.name}[i32(in_base_${inputIdx}) + ${indexExpr}]`;
+                    return hasBoundary
+                      ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
+                      : readExpr;
+                  } else {
+                    return `${info.name}[${indexExpr}]`;
+                  }
+                }
+                return `${info.name}[${indexExpr}]`;
+              },
               new Map([["acc", accName]]),
             );
             finalValue = strip1(epilogueGen(bRe.epilogue));
