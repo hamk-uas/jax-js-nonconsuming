@@ -1498,4 +1498,44 @@ describe("shader quality gates", () => {
 
     f.dispose();
   });
+
+  test("P1: tiledMatmul fori_loop has exactly 2 barriers per iteration", () => {
+    if (!isWebGPU) return;
+
+    // Tiled matmul K-loop: load A, load B, compute.
+    // Optimal barriers: 1 after load phase, 1 wrap-around after compute.
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
+    );
+    using A_flat = np.arange(4096).astype(DType.Float32);
+    using A = A_flat.reshape([64, 64]);
+    using B = np.eye(64, { dtype: DType.Float32 });
+
+    const shaders = captureShaders(() => {
+      using _result = f(A, B);
+    });
+
+    const fusedShaders = shaders.filter(
+      (s) => s.includes("var<workgroup>") || s.includes("workgroupBarrier"),
+    );
+    expect(fusedShaders.length).toBeGreaterThan(0);
+
+    for (const shader of fusedShaders) {
+      // Find the for loop body and count barriers within it
+      const forMatch = shader.match(
+        /for\s*\(var\s+fl\d+_i.*?\{([\s\S]*?)\n\s*\}\s*\n/,
+      );
+      if (!forMatch) continue;
+      const forBody = forMatch[1];
+      const barrierCount = (forBody.match(/workgroupBarrier\(\)/g) || [])
+        .length;
+      // Exactly 2: after load phase + wrap-around after compute
+      expect(
+        barrierCount,
+        `fori_loop should have exactly 2 barriers, got ${barrierCount}`,
+      ).toBe(2);
+    }
+
+    f.dispose();
+  });
 });

@@ -134,6 +134,8 @@ export function blockMapFusedShaderSource(
       kernel: Kernel;
     }[];
     bodyBarriers: Set<number>;
+    /** P1: whether wrap-around dependencies require a barrier at end of loop body. */
+    needWrapBarrier: boolean;
     bodyShmemMap: Map<JitId, { name: string; dtype: DType; elemCount: number }>;
     bodyShmemIds: Set<JitId>;
     /** P0a: size-1 kernels promoted from shmem to `let` bindings. */
@@ -358,7 +360,10 @@ export function blockMapFusedShaderSource(
           bodyShmemIds.delete(outId);
         }
 
-        // Barrier analysis for body kernel steps
+        // P1: Phase-based barrier scheduling
+        // Build phases: maximal groups of consecutive steps where no step
+        // reads a shmem location written by an earlier step in the same phase.
+        // A barrier is needed at each phase boundary.
         const bStepWrites = new Map<number, Set<JitId>>();
         const bStepReads = new Map<number, Set<JitId>>();
         for (let bsi = 0; bsi < bodyKernels.length; bsi++) {
@@ -374,19 +379,68 @@ export function blockMapFusedShaderSource(
           bStepWrites.set(bsi, w);
           bStepReads.set(bsi, r);
         }
-        const bodyBarriers = new Set<number>();
-        for (let bsi = 1; bsi < bodyKernels.length; bsi++) {
+
+        const phases: {
+          startIdx: number;
+          writes: Set<JitId>;
+          reads: Set<JitId>;
+        }[] = [];
+        let curPhase = {
+          startIdx: 0,
+          writes: new Set<JitId>(),
+          reads: new Set<JitId>(),
+        };
+        for (let bsi = 0; bsi < bodyKernels.length; bsi++) {
+          const writes = bStepWrites.get(bsi)!;
           const reads = bStepReads.get(bsi)!;
-          if (reads.size === 0) continue;
-          for (let prev = 0; prev < bsi; prev++) {
-            const writes = bStepWrites.get(prev)!;
-            for (const id of reads) {
-              if (writes.has(id)) {
-                bodyBarriers.add(bsi);
+          // RAW: does this step read something the current phase wrote?
+          let conflict = false;
+          for (const id of reads) {
+            if (curPhase.writes.has(id)) {
+              conflict = true;
+              break;
+            }
+          }
+          if (conflict) {
+            phases.push(curPhase);
+            curPhase = {
+              startIdx: bsi,
+              writes: new Set<JitId>(),
+              reads: new Set<JitId>(),
+            };
+          }
+          for (const id of writes) curPhase.writes.add(id);
+          for (const id of reads) curPhase.reads.add(id);
+        }
+        phases.push(curPhase);
+
+        // Barriers at phase boundaries (before each phase except the first)
+        const bodyBarriers = new Set<number>();
+        for (let pi = 1; pi < phases.length; pi++) {
+          bodyBarriers.add(phases[pi].startIdx);
+        }
+
+        // Wrap-around: check cross-iteration dependencies between last and
+        // first phases. RAW (first reads what last wrote) and WAR (last reads
+        // what first writes in the next iteration) both require a barrier at
+        // the end of the loop body.
+        let needWrapBarrier = false;
+        if (phases.length >= 2) {
+          const firstPhase = phases[0];
+          const lastPhase = phases[phases.length - 1];
+          for (const id of firstPhase.reads) {
+            if (lastPhase.writes.has(id)) {
+              needWrapBarrier = true;
+              break;
+            }
+          }
+          if (!needWrapBarrier) {
+            for (const id of lastPhase.reads) {
+              if (firstPhase.writes.has(id)) {
+                needWrapBarrier = true;
                 break;
               }
             }
-            if (bodyBarriers.has(bsi)) break;
           }
         }
 
@@ -394,6 +448,7 @@ export function blockMapFusedShaderSource(
           foriStep: step as Extract<JitStep, { type: "fori_loop" }>,
           bodyKernels,
           bodyBarriers,
+          needWrapBarrier,
           bodyShmemMap,
           bodyShmemIds,
           promotedScalars,
@@ -1714,6 +1769,11 @@ export function blockMapFusedShaderSource(
             if (needSizeGuard) emit(popIndent, "}");
           }
         }
+      }
+
+      // P1: Wrap-around barrier for cross-iteration dependencies
+      if (fl.needWrapBarrier) {
+        emit("workgroupBarrier();");
       }
 
       emit(popIndent, "}"); // end for loop
