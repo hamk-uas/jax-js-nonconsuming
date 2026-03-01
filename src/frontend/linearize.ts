@@ -2990,6 +2990,50 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
     return [curr, ...starts.map(() => null)];
   },
+  // UncheckedDynamicSlice adjoint: same as DynamicSlice (indices in-bounds
+  // by construction, clamping is a harmless no-op in the backward pass)
+  [Primitive.UncheckedDynamicSlice]([ct], primals, { sliceSizes }) {
+    const origShape = (
+      primals[0] instanceof UndefPrimal
+        ? primals[0].aval.shape
+        : (primals[0] as Tracer).shape
+    ) as number[];
+    const starts = primals.slice(1) as Tracer[];
+
+    let curr = ct;
+    const currShape = [...sliceSizes];
+    for (let ax = starts.length - 1; ax >= 0; ax--) {
+      if (sliceSizes[ax] === origShape[ax]) continue;
+
+      currShape[ax] = origShape[ax];
+      using target = fullInternal(
+        new ShapedArray(currShape, (ct as Tracer).dtype, false),
+        0,
+      );
+
+      const maxStart = (origShape[ax] as number) - sliceSizes[ax];
+      using zeroArr = array(0, { dtype: starts[ax].dtype });
+      using maxArr = array(maxStart, { dtype: starts[ax].dtype });
+
+      const clampedStart1 = min(starts[ax], maxArr) as Tracer;
+      const start = max(zeroArr, clampedStart1) as Tracer;
+
+      using indicesBase = array(new Int32Array(range(sliceSizes[ax])), {
+        dtype: starts[ax].dtype,
+      });
+      const indices = add(indicesBase, start);
+
+      const nextCurr = scatterAdd(target, indices, curr, ax) as Tracer;
+
+      clampedStart1.dispose();
+      start.dispose();
+      indices.dispose();
+      if (curr !== ct) curr.dispose();
+      curr = nextCurr;
+    }
+
+    return [curr, ...starts.map(() => null)];
+  },
   [Primitive.ForiLoop](
     cts,
     args,

@@ -97,6 +97,8 @@ export enum Primitive {
   DynamicUpdateSlice = "dynamic_update_slice",
   // Extract a contiguous slice using dynamic start indices
   DynamicSlice = "dynamic_slice",
+  // Like DynamicSlice but without min/max clamping (caller guarantees in-bounds)
+  UncheckedDynamicSlice = "unchecked_dynamic_slice",
   // Atomic scatter-add: target[indices[i]] += updates[i]
   ScatterAdd = "scatter_add",
 
@@ -144,6 +146,7 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   // Update a contiguous slice along a single axis: dst[axis=offset:offset+src.shape[axis]] = src
   [Primitive.DynamicUpdateSlice]: { offset: number; axis: number };
   [Primitive.DynamicSlice]: { sliceSizes: number[] };
+  [Primitive.UncheckedDynamicSlice]: { sliceSizes: number[] };
   // Scatter-add: target[indices[i]] += updates[i] along axis
   [Primitive.ScatterAdd]: { axis: number };
   [Primitive.TriangularSolve]: { unitDiagonal: boolean };

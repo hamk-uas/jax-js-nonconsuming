@@ -1933,6 +1933,20 @@ export class Array extends Tracer {
         );
         return [coreShrink(operand, slicePair) as Array];
       },
+      [Primitive.UncheckedDynamicSlice](args, { sliceSizes }) {
+        const operand = args[0];
+        const indices = args.slice(1);
+        const ndim = operand.ndim;
+        const startIndicesVal: number[] = new JsArray(ndim);
+        for (let i = 0; i < ndim; i++) {
+          // No clamping — caller guarantees in-bounds
+          startIndicesVal[i] = indices[i].dataSync()[0] as number;
+        }
+        const slicePair = startIndicesVal.map(
+          (start, i) => [start, start + sliceSizes[i]] as Pair,
+        );
+        return [coreShrink(operand, slicePair) as Array];
+      },
     };
   }
 

@@ -1538,4 +1538,47 @@ describe("shader quality gates", () => {
 
     f.dispose();
   });
+
+  test("P2b: tiledMatmul uses unchecked dynamic slice (no min/max clamping)", () => {
+    if (!isWebGPU) return;
+
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
+    );
+    using A_flat = np.arange(4096).astype(DType.Float32);
+    using A = A_flat.reshape([64, 64]);
+    using B = np.eye(64, { dtype: DType.Float32 });
+
+    const shaders = captureShaders(() => {
+      using _result = f(A, B);
+    });
+
+    const fusedShaders = shaders.filter(
+      (s) => s.includes("var<workgroup>") || s.includes("workgroupBarrier"),
+    );
+    expect(fusedShaders.length).toBeGreaterThan(0);
+
+    for (const shader of fusedShaders) {
+      // Extract the for loop body
+      const forMatch = shader.match(
+        /for\s*\(var\s+fl\d+_i.*?\{([\s\S]*?)\n\s*\}\s*\n/,
+      );
+      if (!forMatch) continue;
+      const forBody = forMatch[1];
+      // UncheckedDynamicSlice should produce no min() or max() clamping in
+      // the index computation. Regular DynamicSlice would have both.
+      const minCount = (forBody.match(/\bmin\s*\(/g) || []).length;
+      const maxCount = (forBody.match(/\bmax\s*\(/g) || []).length;
+      expect(
+        minCount,
+        "unchecked dynamic slice should produce no min() clamping",
+      ).toBe(0);
+      expect(
+        maxCount,
+        "unchecked dynamic slice should produce no max() clamping",
+      ).toBe(0);
+    }
+
+    f.dispose();
+  });
 });

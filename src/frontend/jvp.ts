@@ -1038,6 +1038,21 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     });
     return [[outP], [outT]];
   },
+  [Primitive.UncheckedDynamicSlice](primals, tangents, { sliceSizes }) {
+    const operandT = tangents[0];
+    const startsP = primals.slice(1);
+    const outP = bind1(Primitive.UncheckedDynamicSlice, primals, {
+      sliceSizes,
+    });
+    const outT = bind1(
+      Primitive.UncheckedDynamicSlice,
+      [operandT, ...startsP],
+      {
+        sliceSizes,
+      },
+    );
+    return [[outP], [outT]];
+  },
   [Primitive.ForiLoop](primals, tangents, { jaxpr, numConsts, lower, upper }) {
     const numCarry = primals.length - numConsts;
     const jvpBody = jvpJaxpr(jaxpr);

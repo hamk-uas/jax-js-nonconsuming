@@ -618,6 +618,26 @@ export function dynamicSlice(
 }
 
 /**
+ * Like {@link dynamicSlice} but without min/max clamping on start indices.
+ * The caller MUST guarantee that start indices are in-bounds:
+ * `0 <= start[k] && start[k] + sliceSizes[k] <= operandShape[k]` for all k.
+ *
+ * @internal Used by `tiledMatmul` where padding guarantees alignment.
+ */
+export function uncheckedDynamicSlice(
+  operand: ArrayLike,
+  startIndices: ArrayLike[],
+  sliceSizes: number[],
+): Array {
+  const x = fudgeArray(operand);
+  const starts = startIndices.map(fudgeArray);
+  const result = bind1(Primitive.UncheckedDynamicSlice, [x, ...starts], {
+    sliceSizes,
+  }) as Array;
+  return result;
+}
+
+/**
  * Sequential loop with a carried state.
  */
 export function foriLoop<C extends tree.JsTree<Array>>(
@@ -810,8 +830,10 @@ export function tiledMatmul(
               arrayFn(Bk, { dtype: DType.Int32 }),
             ) as Array;
             using z0 = arrayFn(0, { dtype: DType.Int32 });
-            using a = dynamicSlice(aTile, [z0, kIdx], [Br, Bk]);
-            using b = dynamicSlice(bTile, [kIdx, z0], [Bk, Bc]);
+            // Padding guarantees aTile and bTile shapes are exact tile multiples,
+            // so kIdx is always in-bounds — use unchecked for no min/max clamping.
+            using a = uncheckedDynamicSlice(aTile, [z0, kIdx], [Br, Bk]);
+            using b = uncheckedDynamicSlice(bTile, [kIdx, z0], [Bk, Bc]);
             using prod = dot(a, b, {
               lhsContractingDims: [1],
               rhsContractingDims: [0],

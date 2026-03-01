@@ -790,6 +790,9 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.DynamicSlice]() {
     throw new Error("vmap for dynamic slice not implemented");
   },
+  [Primitive.UncheckedDynamicSlice]() {
+    throw new Error("vmap for unchecked dynamic slice not implemented");
+  },
   [Primitive.ForiLoop](_axisSize, _args, _bdims, _params) {
     throw new Error("vmap for foriLoop not implemented");
   },

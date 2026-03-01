@@ -2400,6 +2400,24 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     // Substitute gidx in operand expression with computed flat index
     return { exp: [operandExp.substitute({ gidx: index })] };
   },
+  [Primitive.UncheckedDynamicSlice](exps, avals, { sliceSizes }) {
+    const operandExp = exps[0];
+    const startExps = exps.slice(1);
+    const operandShape = avals[0].shape as number[];
+    const ndim = operandShape.length;
+
+    const outIndices = unravelAlu(sliceSizes, AluVar.gidx);
+
+    // No clamping — caller guarantees in-bounds
+    const readIndices: AluExp[] = [];
+    for (let k = 0; k < ndim; k++) {
+      const start = AluExp.cast(DType.Int32, startExps[k]);
+      readIndices.push(AluExp.add(start, outIndices[k]));
+    }
+
+    const [index] = ShapeTracker.fromShape(operandShape).toAluExp(readIndices);
+    return { exp: [operandExp.substitute({ gidx: index })] };
+  },
 };
 
 /** Determines how to split the Jaxpr into kernels via dataflow analysis. */
@@ -2550,6 +2568,7 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     Primitive.RandomBits,
     Primitive.Gather,
     Primitive.DynamicSlice,
+    Primitive.UncheckedDynamicSlice,
   ];
   const needsCleanShapePrimitives = [
     // Concatenate is based on Pad internally.

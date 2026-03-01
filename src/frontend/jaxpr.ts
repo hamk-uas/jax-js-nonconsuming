@@ -1778,6 +1778,23 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     }
     return [new ShapedArray(sliceSizes, operand.dtype, operand.weakType)];
   },
+  [Primitive.UncheckedDynamicSlice](args, { sliceSizes }) {
+    const operand = args[0];
+    const numIndices = args.length - 1;
+    if (numIndices !== operand.shape.length) {
+      throw new TypeError(
+        `UncheckedDynamicSlice expected ${operand.shape.length} start indices, got ${numIndices}`,
+      );
+    }
+    for (let i = 1; i < args.length; i++) {
+      if (args[i].shape.length !== 0) {
+        throw new TypeError(
+          `UncheckedDynamicSlice start indices must be scalars, got shape ${args[i].shape}`,
+        );
+      }
+    }
+    return [new ShapedArray(sliceSizes, operand.dtype, operand.weakType)];
+  },
 };
 
 function splitIdx(values: any[], argnums: Set<number>): [any[], any[]] {
