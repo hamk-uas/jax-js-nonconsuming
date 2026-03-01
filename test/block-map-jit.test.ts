@@ -1365,3 +1365,94 @@ describe("lax.blockMap — WASM compiled block-loop", () => {
     f_jit.dispose();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Compiler Plan Phase 1A: Shader Quality Gates (C§8)
+// ---------------------------------------------------------------------------
+describe("shader quality gates", () => {
+  const isWebGPU = defaultDevice() === "webgpu";
+
+  /**
+   * Capture all WGSL shader sources emitted during a callback.
+   * Uses setDebug(2) which logs shaders via console.info.
+   */
+  function captureShaders(fn: () => void): string[] {
+    const shaders: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      const msg = args.map(String).join(" ");
+      if (msg.includes("=========== WebGPU shader ===========")) {
+        // Extract the shader code after the header line
+        const code = msg.replace("=========== WebGPU shader ===========\n", "");
+        shaders.push(code);
+      }
+    };
+    try {
+      setDebug(2);
+      fn();
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
+    return shaders;
+  }
+
+  test("P2a: tile-aligned tiledMatmul emits no select() in fused shader", () => {
+    if (!isWebGPU) return;
+
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
+    );
+    // 64x64 is perfectly divisible by 16 → no boundary masks → no select
+    using A_flat = np.arange(4096).astype(DType.Float32);
+    using A = A_flat.reshape([64, 64]);
+    using B = np.eye(64, { dtype: DType.Float32 });
+
+    const shaders = captureShaders(() => {
+      using _result = f(A, B);
+    });
+
+    // The block_map fused shader is the one with fori_loop.
+    // It should contain no select() calls for tile-aligned inputs.
+    const fusedShaders = shaders.filter(
+      (s) => s.includes("workgroupBarrier") || s.includes("var<workgroup>"),
+    );
+    expect(fusedShaders.length).toBeGreaterThan(0);
+    for (const shader of fusedShaders) {
+      const selectCount = (shader.match(/\bselect\s*\(/g) || []).length;
+      expect(selectCount, "fused shader should have no select() calls").toBe(0);
+    }
+
+    f.dispose();
+  });
+
+  test("P2a: non-aligned inputs still produce select() where needed", () => {
+    if (!isWebGPU) return;
+
+    // Non-divisible: 5 elements with blockShape=4 → boundary block needs select
+    const f = jit((xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          np.multiply(block, np.array(2, { dtype: DType.Float32 })),
+        xs,
+        { blockShape: [4] },
+      ),
+    );
+    using xs = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+
+    const shaders = captureShaders(() => {
+      using _result = f(xs);
+    });
+
+    const fusedShaders = shaders.filter(
+      (s) => s.includes("var<workgroup>") || s.includes("workgroupBarrier"),
+    );
+    // For non-aligned, the fused shader should still have select for boundary
+    if (fusedShaders.length > 0) {
+      const hasSelect = fusedShaders.some((s) => s.includes("select("));
+      expect(hasSelect, "boundary blocks should still use select()").toBe(true);
+    }
+
+    f.dispose();
+  });
+});
