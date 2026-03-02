@@ -304,6 +304,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
       blockShape,
       inAxes: newInAxes,
       outAxes: newOutAxes,
+      threadTile: params.threadTile,
     });
 
     return [res, outBdims];

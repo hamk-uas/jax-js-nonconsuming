@@ -156,6 +156,7 @@ export type JitStep =
       consts: JitId[];
       inputs: JitId[];
       outputs: JitId[];
+      threadTile?: number[];
     }
   | {
       type: "fori_loop";
@@ -703,6 +704,7 @@ export class JitProgram {
             constSlots,
             inputSlots,
             outputSlots,
+            threadTile: step.threadTile,
           });
 
           for (let i = 0; i < step.outputs.length; i++) {
@@ -1602,6 +1604,7 @@ export function jitCompile(
           outAxes,
           numConsts,
           numInputs,
+          threadTile,
         } = params;
 
         // Resolve input JitIds
@@ -1670,6 +1673,7 @@ export function jitCompile(
           consts: constsIds,
           inputs: inputIds,
           outputs: outputIds,
+          threadTile,
         });
         continue;
       }

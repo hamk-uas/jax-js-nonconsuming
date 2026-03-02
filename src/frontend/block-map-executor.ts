@@ -37,6 +37,8 @@ export interface ExecuteBlockMapParams {
   inputSlots: Slot[];
   /** Preallocated output slots — sized to match outputShapes. */
   outputSlots: Slot[];
+  /** Register tiling dimensions. */
+  threadTile?: number[];
 }
 
 export interface ExecuteBlockMapResult {
@@ -86,6 +88,7 @@ function tryExecuteBlockMapFused(
     numInputs: params.numInputs,
     inputShapes: params.inputShapes,
     outputShapes: params.outputShapes,
+    threadTile: params.threadTile,
   });
 
   if (!exe) return null;

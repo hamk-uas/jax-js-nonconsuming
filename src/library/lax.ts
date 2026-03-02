@@ -803,6 +803,8 @@ export interface TiledMatmulOptions {
   Bc?: number;
   /** Block size for the contraction dimension (default 16). */
   Bk?: number;
+  /** Register tiling: each thread handles threadTile[g] elements per axis. */
+  threadTile?: number[];
 }
 
 /**
@@ -824,7 +826,7 @@ export function tiledMatmul(
   B: Array,
   options?: TiledMatmulOptions,
 ): Array {
-  const { Br = 16, Bc = 16, Bk = 16 } = options ?? {};
+  const { Br = 16, Bc = 16, Bk = 16, threadTile } = options ?? {};
 
   if (A.ndim !== 2 || B.ndim !== 2) {
     throw new Error(
@@ -899,6 +901,7 @@ export function tiledMatmul(
           [null, 1],
         ],
         outAxes: [[0, 1]],
+        threadTile,
       },
     );
     // Slice off padding if M or N were padded (dynamicSlice produces contiguous output, unlike shrink)

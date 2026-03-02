@@ -935,6 +935,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
         blockShape,
         inAxes: jvpInAxes,
         outAxes: jvpOutAxes,
+        threadTile: params.threadTile,
         isJvpTransformed: true,
       },
     );

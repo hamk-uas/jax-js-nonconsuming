@@ -42,6 +42,17 @@ export interface BlockMapOptions {
    * @default Same as `inAxes` default.
    */
   outAxes?: (number | null)[] | (number | null)[][];
+
+  /**
+   * Register tiling: each thread computes `threadTile[g]` outputs along
+   * grid axis `g`. Workgroup size becomes `blockShape[g] / threadTile[g]`
+   * per axis. When set, carries are accumulated in `var<private>` and input
+   * tiles are cooperatively loaded to shared memory.
+   *
+   * Each dimension of `threadTile` must evenly divide the corresponding
+   * `blockShape` dimension.
+   */
+  threadTile?: number[];
 }
 
 /**
@@ -128,6 +139,7 @@ export function blockMap<I extends JsTree<Array>, O extends JsTree<Array>>(
     outAxes: flatOutAxes,
     numConsts,
     numInputs,
+    threadTile: options.threadTile,
   }) as Array[];
 
   // Dispose the captured consts from tracing

@@ -326,7 +326,7 @@ describe("lax.blockMap — fused shader guards", () => {
 
       // Should log the fallback reason
       const fallbackLog = logs.find(
-        (l) => l.includes("blockSize") && l.includes("maxInvocations"),
+        (l) => l.includes("numThreads") && l.includes("maxInvocations"),
       );
       expect(fallbackLog).toBeDefined();
 
@@ -1762,6 +1762,161 @@ describe("shader quality gates", () => {
     using result = f(A, B);
     using expected = np.matmul(A, B);
     expect(result).toBeAllclose(expected, { atol: 1 });
+    f.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// O4: Register-tiled tiledMatmul
+// ---------------------------------------------------------------------------
+describe("O4: register-tiled tiledMatmul", () => {
+  // SHADER-DUMP tests MUST run before correctness tests to avoid
+  // ShaderPipelineCache hits (the cache is GPUDevice-lifetime and not cleared
+  // by clearCaches()).
+
+  test("SHADER-DUMP: threadTile=[4,4] shader inspection", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16, threadTile: [4, 4] }),
+    );
+    using A_flat = np.arange(32 * 32).astype(DType.Float32);
+    using A = A_flat.reshape([32, 32]);
+    using B_flat = np.arange(32 * 32).astype(DType.Float32);
+    using B = B_flat.reshape([32, 32]);
+    const shaders: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      const msg = args.map(String).join(" ");
+      if (msg.includes("=========== WebGPU shader ===========")) {
+        shaders.push(
+          msg.replace("=========== WebGPU shader ===========\n", ""),
+        );
+      }
+    };
+    try {
+      setDebug(2);
+      using _r = f(A, B);
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
+    const fusedShader = shaders.find(
+      (s) => s.includes("rt_carry") || s.includes("var<workgroup>"),
+    );
+    if (fusedShader) {
+      console.log("===SHADER-START===");
+      console.log(fusedShader);
+      console.log("===SHADER-END===");
+    }
+    f.dispose();
+    expect(fusedShader).toBeDefined();
+  });
+
+  test("SHADER-DUMP: register-tiled shader uses var<private> arrays", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+
+    const logs: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+
+    try {
+      setDebug(2);
+      const f = jit((A: np.Array, B: np.Array) =>
+        lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16, threadTile: [4, 4] }),
+      );
+      using A = np.eye(16, { dtype: DType.Float32 });
+      using B = np.eye(16, { dtype: DType.Float32 });
+      using result = f(A, B);
+      // Should produce identity matrix
+      expect(result).toBeAllclose(A, { atol: 1e-3 });
+
+      // Check that the register-tiled shader was generated
+      const shaderLog = logs.find((l) => l.includes("var rt_carry_0"));
+      expect(shaderLog).toBeDefined();
+
+      f.dispose();
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
+  });
+
+  test("threadTile=[2,2] 16x16 matches np.matmul", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 8, Bc: 8, Bk: 8, threadTile: [2, 2] }),
+    );
+    using A_flat = np.arange(16 * 16).astype(DType.Float32);
+    using A = A_flat.reshape([16, 16]);
+    using B = np.eye(16, { dtype: DType.Float32 });
+    using expected = np.matmul(A, B);
+    using result = f(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1e-3 });
+    f.dispose();
+  });
+
+  test("threadTile=[4,4] 32x32 matches np.matmul", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+
+    // First run a single-block case to isolate tile size from multi-block
+    const f1 = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16, threadTile: [4, 4] }),
+    );
+    using A16 = np.eye(16, { dtype: DType.Float32 });
+    using B16 = np.eye(16, { dtype: DType.Float32 });
+    using expected16 = np.matmul(A16, B16);
+    using result16 = f1(A16, B16);
+    expect(result16).toBeAllclose(expected16, { atol: 1e-3 });
+    f1.dispose();
+
+    // Now multi-block
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16, threadTile: [4, 4] }),
+    );
+    using A_flat = np.arange(32 * 32).astype(DType.Float32);
+    using A = A_flat.reshape([32, 32]);
+    using B_flat = np.arange(32 * 32).astype(DType.Float32);
+    using B = B_flat.reshape([32, 32]);
+    using expected = np.matmul(A, B);
+    using result = f(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1 });
+    f.dispose();
+  });
+
+  test("standard (no threadTile) 32x32 arange on WebGPU", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
+    );
+    using A_flat = np.arange(32 * 32).astype(DType.Float32);
+    using A = A_flat.reshape([32, 32]);
+    using B_flat = np.arange(32 * 32).astype(DType.Float32);
+    using B = B_flat.reshape([32, 32]);
+    using expected = np.matmul(A, B);
+    using result = f(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1 });
+    f.dispose();
+  });
+
+  test("threadTile=[8,8] 64x64 matches np.matmul", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 64, Bc: 64, Bk: 16, threadTile: [8, 8] }),
+    );
+    using A_flat = np.arange(64 * 64).astype(DType.Float32);
+    using A = A_flat.reshape([64, 64]);
+    using B = np.eye(64, { dtype: DType.Float32 });
+    using expected = np.matmul(A, B);
+    using result = f(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1e-3 });
     f.dispose();
   });
 });
