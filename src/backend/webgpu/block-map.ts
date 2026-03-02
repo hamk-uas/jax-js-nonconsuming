@@ -1201,9 +1201,14 @@ export function blockMapFusedShaderSource(
       /^\d+$/.test(text.slice(prefix.length + 4));
 
     // O2: Simplify kernel expressions with bounded gidx range.
-    // gidx ∈ [0, blockSize-1] lets the simplifier eliminate redundant
+    // gidx ∈ [0, kernelSize-1] lets the simplifier eliminate redundant
     // mod/div from unravelAlu() (e.g. (gidx / 16) % 16 → gidx / 16).
-    const gidxBound = AluExp.special(DType.Int32, "gidx", blockSize);
+    // Use kernel.size (not blockSize) — fori_loop body sub-kernels may
+    // be smaller, and a tighter bound enables more simplifications.
+    const kernelSize = isSymbolicSize(kernel.size)
+      ? blockSize
+      : (kernel.size as number);
+    const gidxBound = AluExp.special(DType.Int32, "gidx", kernelSize);
     const simplifiedMap = new Map<AluExp, AluExp>();
     for (const output of kernel.outputs) {
       const vars: Record<string, AluExp> = { gidx: gidxBound };

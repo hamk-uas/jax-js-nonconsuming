@@ -561,6 +561,16 @@ A few functions in `jax.lax` have been implemented:
   compiled-loop compiles entire Kogge-Stone ladder into a single WASM module with polymorphic N;
   WebGPU fused shader packs all body kernel steps into a single GPU dispatch per round; eager mode
   uses a cached whole-call JIT wrapper outside abstract tracing)
+- `blockMap()` for block-structured computation with shared-memory fusion on WebGPU (supports JVP,
+  transpose, vmap; compiles block bodies into single WGSL compute shaders with `var<workgroup>`
+  arrays, barrier scheduling, scalar promotion, and expression simplification)
+- `tiledMatmul()` for tiled matrix multiplication using `blockMap` + `foriLoop`
+  (`var<workgroup>`-based A/B tile loading with per-thread accumulation loops; supports non-aligned
+  dimensions via `padConcrete`, full autodiff)
+- `foriLoop()` for fixed-iteration loops inside block bodies (carry state via shared memory,
+  compiled into WGSL `for` loops)
+- `workgroupAssociativeScan()` for intra-block parallel prefix scans inside `blockMap` (Kogge-Stone
+  within a single workgroup using ping-pong shared memory)
 - `linalg.triangular_solve()` for triangular system solving
 
 In the future, the library may need a rework to add support for more `lax` operations, which are
