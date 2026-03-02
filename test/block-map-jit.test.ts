@@ -1193,6 +1193,22 @@ describe("lax.tiledMatmul", () => {
     using g_ref = grad(f_ref)(A);
     expect(g_tiled).toBeAllclose(g_ref, { atol: 1e-3 });
   });
+
+  test("32x32 arange×arange on WebGPU (multi-block stride remap)", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+    const f = jit((A: np.Array, B: np.Array) =>
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
+    );
+    using A_flat = np.arange(32 * 32).astype(DType.Float32);
+    using A = A_flat.reshape([32, 32]);
+    using B_flat = np.arange(32 * 32).astype(DType.Float32);
+    using B = B_flat.reshape([32, 32]);
+    using expected = np.matmul(A, B);
+    using result = f(A, B);
+    expect(result).toBeAllclose(expected, { atol: 1 });
+    f.dispose();
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -1069,27 +1069,104 @@ export function blockMapFusedShaderSource(
   // we remap GlobalIndex reads to global buffer positions.
 
   // For each body input, precompute the global base offset
+  // and detect stride mismatches between body-local and global layouts.
+  //
+  // When inAxes maps only a subset of an input's dimensions to grid axes,
+  // the body sees a shape where mapped dims are shrunk to blockShape, creating
+  // body-local strides that differ from the global buffer strides.
+  // Example: B is [32,32] with inAxes=[null,1], blockShape=[16,16].
+  //   Body shape = [32,16], body strides = [16,1], global strides = [32,1].
+  //   Body-local flat index uses stride 16 per row, but global needs stride 32.
+  //
+  // When strides differ, resolveGlobalIndex must decompose the body-local flat
+  // index into n-D coordinates (using body strides) and recompute with global
+  // strides.
+  const inBufStrides: number[][] = []; // global strides per input
+  const inBodyStrides: number[][] = []; // body-local strides per input
+  const inBodyShapes: number[][] = []; // body-local shapes per input
+  const inNeedsRemap: boolean[] = []; // whether remapping is needed
+
   for (let i = 0; i < numInputs; i++) {
     const axes = params.inAxes[i];
     const inShape = params.inputShapes[i];
     const nd = inShape.length;
-    // Build stride array for the input
-    const strides: number[] = new Array(nd);
-    strides[nd - 1] = 1;
+    // Global strides
+    const gStrides: number[] = new Array(nd);
+    gStrides[nd - 1] = 1;
     for (let d = nd - 2; d >= 0; d--) {
-      strides[d] = strides[d + 1] * inShape[d + 1];
+      gStrides[d] = gStrides[d + 1] * inShape[d + 1];
     }
-    // Compute base offset: sum of block_i{g} * blockShape[g] * stride[axes[g]]
+    inBufStrides.push(gStrides);
+    // Body shape: replace mapped dims with blockShape
+    const bShape = [...inShape];
+    for (let g = 0; g < gridRank; g++) {
+      if (axes[g] !== null) bShape[axes[g]!] = blockShape[g];
+    }
+    inBodyShapes.push(bShape);
+    // Body strides
+    const bStrides: number[] = new Array(nd);
+    bStrides[nd - 1] = 1;
+    for (let d = nd - 2; d >= 0; d--) {
+      bStrides[d] = bStrides[d + 1] * bShape[d + 1];
+    }
+    inBodyStrides.push(bStrides);
+    // Detect mismatch
+    let needsRemap = false;
+    for (let d = 0; d < nd; d++) {
+      if (bStrides[d] !== gStrides[d]) {
+        needsRemap = true;
+        break;
+      }
+    }
+    inNeedsRemap.push(needsRemap);
+
+    // Compute base offset: sum of block_i{g} * blockShape[g] * globalStride[axes[g]]
     const terms: string[] = [];
     for (let g = 0; g < gridRank; g++) {
       if (axes[g] !== null) {
         const ax = axes[g]!;
-        const blockStride = blockShape[g] * strides[ax];
+        const blockStride = blockShape[g] * gStrides[ax];
         terms.push(`block_i${g} * ${blockStride}u`);
       }
     }
     const baseExpr = terms.length > 0 ? terms.join(" + ") : "0u";
     emit(`let in_base_${i}: u32 = ${baseExpr};`);
+  }
+
+  /**
+   * Remap a body-local flat index expression to a global flat index for input i.
+   * When body strides match global strides, returns the expression unchanged.
+   * When they differ, decomposes into n-D coords and recomputes with global strides.
+   */
+  function inRemap(i: number, flatExpr: string): string {
+    if (!inNeedsRemap[i]) return flatExpr;
+    const bShape = inBodyShapes[i];
+    const bStrides = inBodyStrides[i];
+    const gStrides = inBufStrides[i];
+    const nd = bShape.length;
+    // Decompose body-local flat index → n-D coords → global flat index
+    // coord[d] = (flatExpr / bodyStride[d]) % bodyShape[d]
+    // globalIdx = sum(coord[d] * globalStride[d])
+    // Use i32 arithmetic to match the gen() output type.
+    const terms: string[] = [];
+    for (let d = 0; d < nd; d++) {
+      if (gStrides[d] === 0) continue;
+      let coordExpr: string;
+      if (bStrides[d] === 1) {
+        coordExpr = `((${flatExpr}) % ${bShape[d]})`;
+      } else if (d === 0) {
+        // First dim: no mod needed (it's the leading dimension)
+        coordExpr = `((${flatExpr}) / ${bStrides[d]})`;
+      } else {
+        coordExpr = `(((${flatExpr}) / ${bStrides[d]}) % ${bShape[d]})`;
+      }
+      if (gStrides[d] === 1) {
+        terms.push(coordExpr);
+      } else {
+        terms.push(`${coordExpr} * ${gStrides[d]}`);
+      }
+    }
+    return terms.length > 0 ? terms.join(" + ") : "0";
   }
 
   // For each body output, precompute the global base offset and strided tidx.
@@ -1393,7 +1470,8 @@ export function blockMapFusedShaderSource(
         if (stepInputIsGlobal[bufIdx]) {
           const inputIdx = stepInputBodyIdx[bufIdx];
           if (inputIdx >= 0) {
-            const readExpr = `${stepInputNames[bufIdx]}[i32(in_base_${inputIdx}) + ${indexExpr}]`;
+            const remapped = inRemap(inputIdx, indexExpr);
+            const readExpr = `${stepInputNames[bufIdx]}[i32(in_base_${inputIdx}) + ${remapped}]`;
             return hasBoundary
               ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
               : readExpr;
@@ -1686,7 +1764,8 @@ export function blockMapFusedShaderSource(
             if (info.isGlobal) {
               const inputIdx = info.parentInputIdx;
               if (inputIdx >= 0) {
-                const readExpr = `${info.name}[i32(in_base_${inputIdx}) + ${indexExpr}]`;
+                const remapped = inRemap(inputIdx, indexExpr);
+                const readExpr = `${info.name}[i32(in_base_${inputIdx}) + ${remapped}]`;
                 return hasBoundary
                   ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
                   : readExpr;
@@ -1749,7 +1828,8 @@ export function blockMapFusedShaderSource(
                 if (info.isGlobal) {
                   const inputIdx = info.parentInputIdx;
                   if (inputIdx >= 0) {
-                    const readExpr = `${info.name}[i32(in_base_${inputIdx}) + ${indexExpr}]`;
+                    const remapped = inRemap(inputIdx, indexExpr);
+                    const readExpr = `${info.name}[i32(in_base_${inputIdx}) + ${remapped}]`;
                     return hasBoundary
                       ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
                       : readExpr;
@@ -2000,7 +2080,8 @@ export function blockMapFusedShaderSource(
                   bodyInputInfo[was.bodyInputIds.indexOf(bStep.inputs[bufIdx])];
                 if (inf.isGlobal) {
                   if (inf.parentInputIdx >= 0) {
-                    const readExpr = `${name}[i32(in_base_${inf.parentInputIdx}) + ${indexExpr}]`;
+                    const remapped = inRemap(inf.parentInputIdx, indexExpr);
+                    const readExpr = `${name}[i32(in_base_${inf.parentInputIdx}) + ${remapped}]`;
                     return hasBoundary
                       ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
                       : readExpr;
@@ -2057,7 +2138,11 @@ export function blockMapFusedShaderSource(
                           was.bodyInputIds.indexOf(bStep.inputs[bufIdx2])
                         ];
                       if (inf2.isGlobal && inf2.parentInputIdx >= 0) {
-                        const readExpr2 = `${name2}[i32(in_base_${inf2.parentInputIdx}) + i32(_was_oi)]`;
+                        const remapped2 = inRemap(
+                          inf2.parentInputIdx,
+                          "i32(_was_oi)",
+                        );
+                        const readExpr2 = `${name2}[i32(in_base_${inf2.parentInputIdx}) + ${remapped2}]`;
                         return hasBoundary
                           ? `select(${dtypeToWgsl(dtype2)}(0), ${readExpr2}, valid)`
                           : readExpr2;
@@ -2188,10 +2273,10 @@ export function blockMapFusedShaderSource(
   }
   for (const [resultIdx, info] of passThroughOutputs) {
     if (info.inputIdx >= 0) {
-      // Non-const input: apply block offset
-      // TODO: input read also needs strided tidx when inAxes maps multiple dims
+      // Non-const input: apply block offset with stride remapping
+      const remapped = inRemap(info.inputIdx, "tidx");
       emit(
-        `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${info.inputName}[i32(in_base_${info.inputIdx}) + i32(tidx)];`,
+        `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${info.inputName}[i32(in_base_${info.inputIdx}) + i32(${remapped})];`,
       );
     } else {
       // Const input: no block offset
