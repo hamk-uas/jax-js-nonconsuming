@@ -1389,6 +1389,7 @@ export function blockMapFusedShaderSource(
       dtype: DType,
     ) => string,
     variableOverrides?: Map<string, string>,
+    gidxOverride?: AluExp,
   ): (exp: AluExp) => string {
     let gensymCount = 0;
     const gensym = () => `${prefix}_alu${gensymCount++}`;
@@ -1399,12 +1400,14 @@ export function blockMapFusedShaderSource(
     // O2: Simplify kernel expressions with bounded gidx range.
     // gidx ∈ [0, kernelSize-1] lets the simplifier eliminate redundant
     // mod/div from unravelAlu() (e.g. (gidx / 16) % 16 → gidx / 16).
-    // Use kernel.size (not blockSize) — fori_loop body sub-kernels may
-    // be smaller, and a tighter bound enables more simplifications.
+    // O5: When gidxOverride is provided (register-tiled path), gidx is
+    // substituted with a structured expression (coord0 * stride + coord1)
+    // so the simplifier can eliminate div/mod from inner loops entirely.
     const kernelSize = isSymbolicSize(kernel.size)
       ? blockSize
       : (kernel.size as number);
-    const gidxBound = AluExp.special(DType.Int32, "gidx", kernelSize);
+    const gidxBound =
+      gidxOverride ?? AluExp.special(DType.Int32, "gidx", kernelSize);
     const simplifiedMap = new Map<AluExp, AluExp>();
     for (const output of kernel.outputs) {
       const vars: Record<string, AluExp> = { gidx: gidxBound };
@@ -1887,6 +1890,27 @@ export function blockMapFusedShaderSource(
           innerProds[g] = innerProds[g + 1] * blockShape[g + 1];
         }
 
+        // O5: Structured gidx for AluExp simplification in register-tiled path.
+        // Instead of a flat Special("gidx", size), represent gidx as
+        // coord0 * stride0 + coord1 with bounded per-axis coords.
+        // This lets the simplifier eliminate div/mod: (c0*S+c1)/S → c0.
+        let structuredGidx: AluExp = AluExp.special(
+          DType.Int32,
+          `_rt_c${gridRank - 1}`,
+          blockShape[gridRank - 1],
+        );
+        for (let g = gridRank - 2; g >= 0; g--) {
+          const coord = AluExp.special(
+            DType.Int32,
+            `_rt_c${g}`,
+            blockShape[g],
+          );
+          structuredGidx = AluExp.add(
+            AluExp.mul(coord, AluExp.const(DType.Int32, innerProds[g])),
+            structuredGidx,
+          );
+        }
+
         const flatGidxExpr = (): string => {
           const terms: string[] = [];
           for (let g = 0; g < gridRank; g++) {
@@ -2060,6 +2084,13 @@ export function blockMapFusedShaderSource(
             const bRe = bKernel.outputs[0]?.reduction ?? null;
 
             emitTileLoopOpen();
+            // O5: Emit per-axis coordinate variables so the AluExp
+            // simplifier's structured gidx maps to real WGSL names.
+            for (let g = 0; g < gridRank; g++) {
+              emit(
+                `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
+              );
+            }
             emit(`gidx = i32(${flatGidxExpr()});`);
 
             if (bRe && bKernelSize === blockSize) {
@@ -2074,6 +2105,8 @@ export function blockMapFusedShaderSource(
                 bKernel,
                 prefix,
                 makeBodyResolve(bStepInputInfo, bStep, privateVarNames),
+                undefined,
+                structuredGidx,
               );
 
               emit(`{`);
@@ -2107,6 +2140,7 @@ export function blockMapFusedShaderSource(
                   `${prefix}_ep`,
                   makeBodyResolve(bStepInputInfo, bStep, privateVarNames),
                   new Map([["acc", accName]]),
+                  structuredGidx,
                 );
                 finalValue = strip1(epilogueGen(bRe.epilogue));
               }
@@ -2127,6 +2161,8 @@ export function blockMapFusedShaderSource(
                 bKernel,
                 `fl${entry.flIdx}_s${bsi}`,
                 makeBodyResolve(bStepInputInfo, bStep, privateVarNames),
+                undefined,
+                structuredGidx,
               );
               for (let oi = 0; oi < bKernel.numOutputs; oi++) {
                 const outId = bStep.outputs[oi];

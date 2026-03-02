@@ -1919,4 +1919,29 @@ describe("O4: register-tiled tiledMatmul", () => {
     expect(result).toBeAllclose(expected, { atol: 1e-3 });
     f.dispose();
   });
+
+  test("grad(tiledMatmul) matches grad(np.matmul) with threadTile", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+    using B = np.eye(16, { dtype: DType.Float32 });
+    const f_tiled = (A: np.Array) => {
+      using result = lax.tiledMatmul(A, B, {
+        Br: 16,
+        Bc: 16,
+        Bk: 16,
+        threadTile: [4, 4],
+      });
+      return np.sum(result);
+    };
+    const f_ref = (A: np.Array) => {
+      using result = np.matmul(A, B);
+      return np.sum(result);
+    };
+
+    using A_flat = np.arange(256).astype(DType.Float32);
+    using A = A_flat.reshape([16, 16]);
+    using g_tiled = grad(f_tiled)(A);
+    using g_ref = grad(f_ref)(A);
+    expect(g_tiled).toBeAllclose(g_ref, { atol: 1e-3 });
+  });
 });

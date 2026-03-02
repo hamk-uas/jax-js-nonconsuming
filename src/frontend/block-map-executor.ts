@@ -8,7 +8,7 @@
  */
 
 import { byteWidth, Kernel, Reduction } from "../alu";
-import type { Backend, Slot } from "../backend";
+import { Executable, type Backend, type Slot } from "../backend";
 import type { BlockMapWasmParams, GeneralScanStep } from "../backend/wasm";
 import { DEBUG } from "../utils";
 import type { PendingExecute } from "./array";
@@ -70,6 +70,12 @@ export function executeBlockMap(
 // Fused WebGPU path: single-dispatch shared-memory shader
 // ---------------------------------------------------------------------------
 
+// Cache fused Executable by bodyProgram identity. The JitProgram is
+// identity-stable (cached by jitCompile) and encodes the backend, so
+// this avoids re-running the full WGSL codegen on every dispatch.
+// WeakMap: when the JitProgram is GC'd (after clearCaches()), the entry dies.
+const blockMapFusedCache = new WeakMap<JitProgram, Executable | null>();
+
 function tryExecuteBlockMapFused(
   params: ExecuteBlockMapParams,
 ): ExecuteBlockMapResult | null {
@@ -78,18 +84,23 @@ function tryExecuteBlockMapFused(
   const webgpuBackend =
     params.backend as import("../backend/webgpu").WebGPUBackend;
 
-  const exe = webgpuBackend.prepareBlockMapFused({
-    bodyProgram: params.bodyProgram,
-    blockShape: params.blockShape,
-    gridShape: params.gridShape,
-    inAxes: params.inAxes,
-    outAxes: params.outAxes,
-    numConsts: params.numConsts,
-    numInputs: params.numInputs,
-    inputShapes: params.inputShapes,
-    outputShapes: params.outputShapes,
-    threadTile: params.threadTile,
-  });
+  let exe = blockMapFusedCache.get(params.bodyProgram);
+  if (exe === undefined) {
+    exe =
+      webgpuBackend.prepareBlockMapFused({
+        bodyProgram: params.bodyProgram,
+        blockShape: params.blockShape,
+        gridShape: params.gridShape,
+        inAxes: params.inAxes,
+        outAxes: params.outAxes,
+        numConsts: params.numConsts,
+        numInputs: params.numInputs,
+        inputShapes: params.inputShapes,
+        outputShapes: params.outputShapes,
+        threadTile: params.threadTile,
+      }) ?? null;
+    blockMapFusedCache.set(params.bodyProgram, exe);
+  }
 
   if (!exe) return null;
 

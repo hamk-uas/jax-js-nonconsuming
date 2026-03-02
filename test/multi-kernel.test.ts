@@ -396,25 +396,24 @@ describe("multi-output kernel (WebGPU)", () => {
     if (available) defaultDevice(prev);
   });
 
-  it.skipIf(!available)(
-    "two independent elementwise outputs are correct",
-    () => {
-      using f = jit((x: np.Array) => {
-        using a = x.add(1) as np.Array;
-        using b = x.mul(2) as np.Array;
-        return [a, b] as [np.Array, np.Array];
-      });
+  it("two independent elementwise outputs are correct", ({ skip }) => {
+    if (!available) skip();
+    using f = jit((x: np.Array) => {
+      using a = x.add(1) as np.Array;
+      using b = x.mul(2) as np.Array;
+      return [a, b] as [np.Array, np.Array];
+    });
 
-      using x = np.array([1, 2, 3, 4]);
-      const [r1, r2] = f(x);
-      expect(r1.js()).toEqual([2, 3, 4, 5]);
-      expect(r2.js()).toEqual([2, 4, 6, 8]);
-      r1.dispose();
-      r2.dispose();
-    },
-  );
+    using x = np.array([1, 2, 3, 4]);
+    const [r1, r2] = f(x);
+    expect(r1.js()).toEqual([2, 3, 4, 5]);
+    expect(r2.js()).toEqual([2, 4, 6, 8]);
+    r1.dispose();
+    r2.dispose();
+  });
 
-  it.skipIf(!available)("three independent outputs are correct", () => {
+  it("three independent outputs are correct", ({ skip }) => {
+    if (!available) skip();
     using f = jit((x: np.Array) => {
       using a = x.add(10) as np.Array;
       using b = x.mul(3) as np.Array;
@@ -432,7 +431,8 @@ describe("multi-output kernel (WebGPU)", () => {
     c.dispose();
   });
 
-  it.skipIf(!available)("grad through multi-output opportunity", () => {
+  it("grad through multi-output opportunity", ({ skip }) => {
+    if (!available) skip();
     const f = (x: np.Array) => {
       using a = x.mul(x) as np.Array;
       using b = x.add(x) as np.Array;
