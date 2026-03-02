@@ -13,6 +13,7 @@ if [[ "$INPUT_HASH" != "$REQUIRED_HASH" ]]; then
   echo "Received Hash: $INPUT_HASH (from AEP=\"${AEP:-}\")"
   echo "Read the Agentic Evolution Protocol (AEP) in"
   echo ".github/copilot-instructions.md, then follow it."
+  echo "Do NOT circumvent this check. Read again, don't memorize!"
   exit 1
 fi
 
