@@ -271,6 +271,39 @@ export interface PreparedPreencodedMultiStep {
 
 const COPY_WORKGROUP_SIZE = 64;
 
+// Reversal shader: reverses N chunks of `wordsPerChunk` u32 words within a
+// contiguous region of a buffer. One dispatch replaces O(N) copy commands.
+const REVERSE_WORKGROUP_SIZE = 256;
+
+const REVERSE_SHADER_CODE = String.raw`
+${headerWgsl}
+
+struct ReverseParams {
+  baseOffset: u32,   // byte offset to start of region
+  N: u32,            // number of chunks to reverse
+  wordsPerChunk: u32, // u32 words per chunk
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> buf: array<u32>;
+@group(1) @binding(0) var<uniform> params: ReverseParams;
+
+@compute @workgroup_size(${REVERSE_WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let tid = id.x + id.y * ${gridOffsetY}u;
+  let chunkIdx = tid / params.wordsPerChunk;
+  let wordInChunk = tid % params.wordsPerChunk;
+  if (chunkIdx >= params.N / 2u) { return; }
+  let mirrorIdx = params.N - 1u - chunkIdx;
+  let baseWord = params.baseOffset / 4u;
+  let aIdx = baseWord + chunkIdx * params.wordsPerChunk + wordInChunk;
+  let bIdx = baseWord + mirrorIdx * params.wordsPerChunk + wordInChunk;
+  let tmp = buf[aIdx];
+  buf[aIdx] = buf[bIdx];
+  buf[bIdx] = tmp;
+}
+`.trim();
+
 const COPY_SHADER_CODE = String.raw`
 ${headerWgsl}
 
@@ -898,9 +931,11 @@ export class WebGPUBackend implements Backend {
     const totalBytes = totalElemsPerPos * N * bytesPerElem;
     const paddedBytes = Math.max(Math.ceil(totalBytes / 4) * 4, 4);
 
-    // Allocate transient ping/pong GPU buffers
-    const pingBuf = this.#createBuffer(paddedBytes);
-    const pongBuf = this.#createBuffer(paddedBytes);
+    // Allocate transient ping/pong GPU buffers (prefer pool reuse)
+    const pingBuf =
+      this.#poolPop(paddedBytes) ?? this.#createBuffer(paddedBytes);
+    const pongBuf =
+      this.#poolPop(paddedBytes) ?? this.#createBuffer(paddedBytes);
 
     // Compute leaf start offsets (prefix sum of elemCounts)
     const leafStarts: number[] = [0];
@@ -983,29 +1018,23 @@ export class WebGPUBackend implements Backend {
       }
     }
 
-    // 2. Reverse input if needed (inline reversal into same encoder)
-    let reverseTempBuf: GPUBuffer | null = null;
+    // 2. Reverse input if needed (single compute-shader dispatch per leaf)
+    const reverseUniformBufs: GPUBuffer[] = [];
     if (reverse && N > 1) {
-      reverseTempBuf = this.#createBuffer(paddedBytes);
       for (let k = 0; k < numLeaves; k++) {
         const ec = leafElemCounts[k];
-        const leafOffset = leafStarts[k] * N * bytesPerElem;
         const elemBytes = ec * bytesPerElem;
-        for (let j = 0; j < N; j++) {
-          const srcOff = leafOffset + j * elemBytes;
-          const dstOff = leafOffset + (N - 1 - j) * elemBytes;
-          if (elemBytes % 4 === 0) {
-            enc.copyBufferToBuffer(
-              pingBuf,
-              srcOff,
-              reverseTempBuf,
-              dstOff,
-              elemBytes,
-            );
-          }
-        }
+        if (elemBytes % 4 !== 0) continue; // non-aligned: skip (f16 edge case)
+        const leafOffset = leafStarts[k] * N * bytesPerElem;
+        const ub = this.#encodeReversalShader(
+          enc,
+          pingBuf,
+          leafOffset,
+          N,
+          elemBytes,
+        );
+        if (ub) reverseUniformBufs.push(ub);
       }
-      enc.copyBufferToBuffer(reverseTempBuf, 0, pingBuf, 0, paddedBytes);
     }
 
     // 3. Encode all Kogge-Stone rounds into same command buffer (1 submit)
@@ -1029,27 +1058,22 @@ export class WebGPUBackend implements Backend {
     // Last round = numRounds-1. Result in pong if last round even, ping if odd.
     const resultBuf = (numRounds - 1) % 2 === 0 ? pongBuf : pingBuf;
 
-    // 4. Reverse result if needed (reuse temp buffer)
+    // 4. Reverse result if needed (single compute-shader dispatch per leaf)
     if (reverse && N > 1) {
       for (let k = 0; k < numLeaves; k++) {
         const ec = leafElemCounts[k];
-        const leafOffset = leafStarts[k] * N * bytesPerElem;
         const elemBytes = ec * bytesPerElem;
-        for (let j = 0; j < N; j++) {
-          const srcOff = leafOffset + j * elemBytes;
-          const dstOff = leafOffset + (N - 1 - j) * elemBytes;
-          if (elemBytes % 4 === 0) {
-            enc.copyBufferToBuffer(
-              resultBuf,
-              srcOff,
-              reverseTempBuf!,
-              dstOff,
-              elemBytes,
-            );
-          }
-        }
+        if (elemBytes % 4 !== 0) continue;
+        const leafOffset = leafStarts[k] * N * bytesPerElem;
+        const ub = this.#encodeReversalShader(
+          enc,
+          resultBuf,
+          leafOffset,
+          N,
+          elemBytes,
+        );
+        if (ub) reverseUniformBufs.push(ub);
       }
-      enc.copyBufferToBuffer(reverseTempBuf!, 0, resultBuf, 0, paddedBytes);
     }
 
     // 5. Copy results from result buffer to output slots
@@ -1074,15 +1098,17 @@ export class WebGPUBackend implements Backend {
     // 6. Single submit for everything
     this.device.queue.submit([enc.finish()]);
 
-    // 7. Cleanup transient buffers
+    // 7. Cleanup transient buffers (return to pool when possible)
     uniformBuf.destroy();
-    if (reverseTempBuf) {
-      reverseTempBuf.destroy();
-      this.#gpuAllocatedBytes -= paddedBytes;
+    for (const ub of reverseUniformBufs) ub.destroy();
+    if (!this.#poolPush(pingBuf)) {
+      this.#gpuAllocatedBytes -= pingBuf.size;
+      pingBuf.destroy();
     }
-    pingBuf.destroy();
-    pongBuf.destroy();
-    this.#gpuAllocatedBytes -= paddedBytes * 2;
+    if (!this.#poolPush(pongBuf)) {
+      this.#gpuAllocatedBytes -= pongBuf.size;
+      pongBuf.destroy();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1345,10 +1371,13 @@ export class WebGPUBackend implements Backend {
       4,
     );
 
-    const inputBuf = this.#createBuffer(dataBytes);
-    const scannedBuf = this.#createBuffer(dataBytes);
-    const summaryPingBuf = this.#createBuffer(summaryBytes);
-    const summaryPongBuf = this.#createBuffer(summaryBytes);
+    const inputBuf = this.#poolPop(dataBytes) ?? this.#createBuffer(dataBytes);
+    const scannedBuf =
+      this.#poolPop(dataBytes) ?? this.#createBuffer(dataBytes);
+    const summaryPingBuf =
+      this.#poolPop(summaryBytes) ?? this.#createBuffer(summaryBytes);
+    const summaryPongBuf =
+      this.#poolPop(summaryBytes) ?? this.#createBuffer(summaryBytes);
 
     const leafStarts = computeLeafStarts(leafElemCounts);
     const constBuffers = constSlots.map((slot) => this.#getBuffer(slot).buffer);
@@ -1374,29 +1403,23 @@ export class WebGPUBackend implements Backend {
       }
     }
 
-    // 2. Reverse input if needed
-    let reverseTempBuf: GPUBuffer | null = null;
+    // 2. Reverse input if needed (single compute-shader dispatch per leaf)
+    const reverseUniformBufs: GPUBuffer[] = [];
     if (reverse && N > 1) {
-      reverseTempBuf = this.#createBuffer(dataBytes);
       for (let k = 0; k < numLeaves; k++) {
         const ec = leafElemCounts[k];
-        const leafOffset = leafStarts[k] * N * bytesPerElem;
         const elemBytes = ec * bytesPerElem;
-        for (let j = 0; j < N; j++) {
-          const srcOff = leafOffset + j * elemBytes;
-          const dstOff = leafOffset + (N - 1 - j) * elemBytes;
-          if (elemBytes % 4 === 0) {
-            enc.copyBufferToBuffer(
-              inputBuf,
-              srcOff,
-              reverseTempBuf,
-              dstOff,
-              elemBytes,
-            );
-          }
-        }
+        if (elemBytes % 4 !== 0) continue;
+        const leafOffset = leafStarts[k] * N * bytesPerElem;
+        const ub = this.#encodeReversalShader(
+          enc,
+          inputBuf,
+          leafOffset,
+          N,
+          elemBytes,
+        );
+        if (ub) reverseUniformBufs.push(ub);
       }
-      enc.copyBufferToBuffer(reverseTempBuf, 0, inputBuf, 0, dataBytes);
     }
 
     // 3. Local scan dispatch
@@ -1584,27 +1607,22 @@ export class WebGPUBackend implements Backend {
       }
     }
 
-    // 7. Reverse result if needed
+    // 7. Reverse result if needed (single compute-shader dispatch per leaf)
     if (reverse && N > 1) {
       for (let k = 0; k < numLeaves; k++) {
         const ec = leafElemCounts[k];
-        const leafOffset = leafStarts[k] * N * bytesPerElem;
         const elemBytes = ec * bytesPerElem;
-        for (let j = 0; j < N; j++) {
-          const srcOff = leafOffset + j * elemBytes;
-          const dstOff = leafOffset + (N - 1 - j) * elemBytes;
-          if (elemBytes % 4 === 0) {
-            enc.copyBufferToBuffer(
-              scannedBuf,
-              srcOff,
-              reverseTempBuf!,
-              dstOff,
-              elemBytes,
-            );
-          }
-        }
+        if (elemBytes % 4 !== 0) continue;
+        const leafOffset = leafStarts[k] * N * bytesPerElem;
+        const ub = this.#encodeReversalShader(
+          enc,
+          scannedBuf,
+          leafOffset,
+          N,
+          elemBytes,
+        );
+        if (ub) reverseUniformBufs.push(ub);
       }
-      enc.copyBufferToBuffer(reverseTempBuf!, 0, scannedBuf, 0, dataBytes);
     }
 
     // 8. Copy results from scannedBuf → output slots
@@ -1629,20 +1647,24 @@ export class WebGPUBackend implements Backend {
     // 9. Single submit
     this.device.queue.submit([enc.finish()]);
 
-    // 10. Cleanup
+    // 10. Cleanup (return data buffers to pool when possible)
     localUniformBuf.destroy();
     gatherUniformBuf.destroy();
     if (summaryUniformBuf) summaryUniformBuf.destroy();
     if (applyUniformBuf) applyUniformBuf.destroy();
-    if (reverseTempBuf) {
-      reverseTempBuf.destroy();
-      this.#gpuAllocatedBytes -= dataBytes;
+    for (const ub of reverseUniformBufs) ub.destroy();
+    for (const buf of [inputBuf, scannedBuf]) {
+      if (!this.#poolPush(buf)) {
+        this.#gpuAllocatedBytes -= buf.size;
+        buf.destroy();
+      }
     }
-    inputBuf.destroy();
-    scannedBuf.destroy();
-    summaryPingBuf.destroy();
-    summaryPongBuf.destroy();
-    this.#gpuAllocatedBytes -= dataBytes * 2 + summaryBytes * 2;
+    for (const buf of [summaryPingBuf, summaryPongBuf]) {
+      if (!this.#poolPush(buf)) {
+        this.#gpuAllocatedBytes -= buf.size;
+        buf.destroy();
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1660,6 +1682,75 @@ export class WebGPUBackend implements Backend {
     };
     this.#copyPipeline = this.pipelines.prepareSync(shader);
     return this.#copyPipeline;
+  }
+
+  // --- Reversal shader cache & dispatch ---
+  #reversePipeline: GPUComputePipeline | null = null;
+
+  #getReversePipeline(): GPUComputePipeline {
+    if (this.#reversePipeline) return this.#reversePipeline;
+    const module = this.device.createShaderModule({
+      code: REVERSE_SHADER_CODE,
+    });
+    this.#reversePipeline = this.device.createComputePipeline({
+      layout: "auto",
+      compute: { module, entryPoint: "main" },
+    });
+    return this.#reversePipeline;
+  }
+
+  /**
+   * Encode a compute-shader reversal of N chunks within a buffer region.
+   * Each chunk is `elemBytes` bytes (must be 4-byte aligned).
+   * Returns the uniform buffer that the caller must destroy after submit.
+   */
+  #encodeReversalShader(
+    enc: GPUCommandEncoder,
+    buf: GPUBuffer,
+    baseOffset: number,
+    N: number,
+    elemBytes: number,
+  ): GPUBuffer | null {
+    if (N <= 1 || elemBytes <= 0) return null;
+    const wordsPerChunk = elemBytes / 4;
+    const totalThreads = Math.floor(N / 2) * wordsPerChunk;
+    if (totalThreads === 0) return null;
+
+    const pipeline = this.#getReversePipeline();
+    const workgroups = Math.ceil(totalThreads / REVERSE_WORKGROUP_SIZE);
+    const [gridX, gridY] = calculateGrid(workgroups);
+
+    const storageBG = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: buf } }],
+    });
+
+    const uniformBuf = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM,
+      mappedAtCreation: true,
+    });
+    new Uint32Array(uniformBuf.getMappedRange()).set([
+      baseOffset,
+      N,
+      wordsPerChunk,
+      0,
+    ]);
+    uniformBuf.unmap();
+
+    const uniformBG = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(1),
+      entries: [{ binding: 0, resource: { buffer: uniformBuf } }],
+    });
+
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, storageBG);
+    pass.setBindGroup(1, uniformBG);
+    pass.dispatchWorkgroups(gridX, gridY);
+    pass.end();
+
+    return uniformBuf;
   }
 
   #encodeCopyWithShader(
