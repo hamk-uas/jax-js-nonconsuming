@@ -6,7 +6,7 @@ set -euo pipefail
 # On every commit the committer must first re-read the AEP in order to commit.
 # DO NOT MISUSE! Read AEP first -- don't circumvent this check!
 REQUIRED_HASH="a28bd144cdc6672c607309e4810aec66be3539ed"
-INPUT_HASH=$(echo -n "${AEP:-}" | sha1sum | awk '{print $1}')
+INPUT_HASH=$(echo -n "${AEP:-}" | shasum | awk '{print $1}')
 if [[ "$INPUT_HASH" != "$REQUIRED_HASH" ]]; then
   echo "AEP GATE: commit rejected"
   echo "Expected Hash: $REQUIRED_HASH"
