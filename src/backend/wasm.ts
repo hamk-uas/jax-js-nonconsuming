@@ -172,6 +172,7 @@ export class WasmBackend implements Backend {
   readonly maxArgs = 64; // Arbitrary choice
   readonly capabilities: BackendCapabilities = {
     atomicF32Add: false,
+    shaderF16: false,
     // SharedArrayBuffer is available when either:
     //   (a) crossOriginIsolated is true (COOP + COEP headers), or
     //   (b) the browser enables it unconditionally (e.g., Chromium

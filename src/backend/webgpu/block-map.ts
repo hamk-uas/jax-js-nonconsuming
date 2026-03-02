@@ -1900,11 +1900,7 @@ export function blockMapFusedShaderSource(
           blockShape[gridRank - 1],
         );
         for (let g = gridRank - 2; g >= 0; g--) {
-          const coord = AluExp.special(
-            DType.Int32,
-            `_rt_c${g}`,
-            blockShape[g],
-          );
+          const coord = AluExp.special(DType.Int32, `_rt_c${g}`, blockShape[g]);
           structuredGidx = AluExp.add(
             AluExp.mul(coord, AluExp.const(DType.Int32, innerProds[g])),
             structuredGidx,

@@ -20,6 +20,8 @@ export type Device = "cpu" | "wasm" | "webgpu" | "webgl";
 export interface BackendCapabilities {
   /** WebGPU: true if shader-f32-atomic-add extension is available. */
   readonly atomicF32Add: boolean;
+  /** WebGPU: true if shader-f16 extension is available. */
+  readonly shaderF16: boolean;
   /** Wasm: true if crossOriginIsolated (SharedArrayBuffer available). */
   readonly sharedMemory: boolean;
   /** Whether the backend supports multi-output kernel dispatch. */

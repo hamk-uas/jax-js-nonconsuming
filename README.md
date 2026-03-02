@@ -568,8 +568,7 @@ export default defineConfig({
           env: {
             DISPLAY: process.env.DISPLAY ?? ":0",
             XAUTHORITY:
-              process.env.XAUTHORITY ??
-              `/run/user/${process.getuid?.() ?? 1000}/gdm/Xauthority`,
+              process.env.XAUTHORITY ?? `/run/user/${process.getuid?.() ?? 1000}/gdm/Xauthority`,
           },
         },
       }),
@@ -579,8 +578,61 @@ export default defineConfig({
 });
 ```
 
-The COOP/COEP headers enable `SharedArrayBuffer` (needed for WASM worker pool parallel dispatch).
 The Chrome flags route WebGPU through your host Vulkan driver in headless mode.
+
+#### Cross-origin isolation (required for full performance)
+
+Browsers gate `SharedArrayBuffer` behind
+[cross-origin isolation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer#security_requirements).
+Without it, the WASM worker pool cannot dispatch in parallel and several WebGPU features are
+unavailable. **This applies to production deployments, not just tests.**
+
+Your server must send two HTTP response headers on every page that uses jax-js:
+
+| Header                         | Value          |
+| ------------------------------ | -------------- |
+| `Cross-Origin-Embedder-Policy` | `require-corp` |
+| `Cross-Origin-Opener-Policy`   | `same-origin`  |
+
+The Vitest config above already sets these for the dev server. For production, configure your
+hosting platform. Examples:
+
+**Vercel** (`vercel.json` — this repo's own config):
+
+```json
+{
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "Cross-Origin-Embedder-Policy", "value": "require-corp" },
+        { "key": "Cross-Origin-Opener-Policy", "value": "same-origin" }
+      ]
+    }
+  ]
+}
+```
+
+**Nginx:**
+
+```nginx
+add_header Cross-Origin-Embedder-Policy "require-corp" always;
+add_header Cross-Origin-Opener-Policy   "same-origin"  always;
+```
+
+**Netlify** (`_headers`):
+
+```
+/*
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Opener-Policy: same-origin
+```
+
+> **Side effect:** `require-corp` means every sub-resource (image, script, iframe) must either be
+> same-origin or served with a `Cross-Origin-Resource-Policy: cross-origin` header. If your page
+> loads third-party assets without that header, they will be blocked. See the
+> [MDN guide](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Cross-Origin_Resource_Policy)
+> for details.
 
 Architectural mode is intended for large refactors and uses `.ci/expected-failures.json` as an
 explicit, expiring debt ledger. See `docs/testing-policy.md` for workflow details.

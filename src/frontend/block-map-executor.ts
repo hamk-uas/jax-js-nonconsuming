@@ -8,7 +8,7 @@
  */
 
 import { byteWidth, Kernel, Reduction } from "../alu";
-import { Executable, type Backend, type Slot } from "../backend";
+import { type Backend, Executable, type Slot } from "../backend";
 import type { BlockMapWasmParams, GeneralScanStep } from "../backend/wasm";
 import { DEBUG } from "../utils";
 import type { PendingExecute } from "./array";

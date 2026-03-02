@@ -421,7 +421,9 @@ suite.each(devices)("device:%s", (device) => {
       expect(variance).toBeCloseTo(Math.PI ** 2 / 6, 1);
     });
 
-    test("multivariate normal distribution", () => {
+    // multivariateNormal requires Cholesky, which is not implemented on WebGL
+    test("multivariate normal distribution", ({ skip }) => {
+      if (device === "webgl") skip();
       using key = random.key(42);
       const count = 5000;
       using mean = np.array([1.0, 2.0]);

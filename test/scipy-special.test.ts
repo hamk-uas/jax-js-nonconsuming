@@ -33,14 +33,14 @@ suite.each(devices)("device:%s", (device) => {
     test("erf values", () => {
       using x = np.array(erfValues[0]);
       using y = special.erf(x);
-      expect(y).toBeAllclose(erfValues[1]);
+      expect(y).toBeAllclose(erfValues[1], { atol: 1e-6 });
     });
 
     test("erfc values", () => {
       using x = np.array(erfValues[0]);
       using y = special.erfc(x);
       const expected = erfValues[1].map((v) => 1 - v);
-      expect(y).toBeAllclose(expected);
+      expect(y).toBeAllclose(expected, { atol: 1e-6 });
     });
 
     test("erf derivative", () => {

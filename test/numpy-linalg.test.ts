@@ -388,6 +388,11 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
   });
 
   suite("numpy.linalg.qr()", () => {
+    // QR routine is not implemented for WebGPU.
+    beforeEach(({ skip }) => {
+      if (device === "webgpu") skip();
+    });
+
     test("computes thin QR for 3x2 matrix", () => {
       using A = np.array([
         [1.0, 2.0],

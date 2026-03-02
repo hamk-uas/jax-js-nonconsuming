@@ -847,7 +847,9 @@ suite.each(devices)("lax.scan device:%s", (device) => {
   });
 
   describe("scan with routines", () => {
-    it("scan with Cholesky in body", async () => {
+    // Cholesky routine is not supported on WebGL
+    it("scan with Cholesky in body", async ({ skip }) => {
+      if (device === "webgl") skip();
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const scaled = np.multiply(carry, x);
         const L = lax.linalg.cholesky(scaled);
@@ -874,7 +876,8 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       outputs.dispose();
     });
 
-    it("jit + scan with Cholesky", async () => {
+    it("jit + scan with Cholesky", async ({ skip }) => {
+      if (device === "webgl") skip();
       const f = jit(() => {
         const step = (carry: np.Array, _x: np.Array): [np.Array, np.Array] => {
           const L = lax.linalg.cholesky(carry);
@@ -2130,13 +2133,15 @@ describe("preencoded multi-step with routines (WebGPU)", () => {
       acceptPath: "preencoded-multi-step",
     });
 
-    // Cholesky of [[4,2],[2,5]]:
-    // L[0,0]=2, L[1,0]=1, L[1,1]=2  →  [[2,0],[1,2]]
+    // After 3 iterations of chol(carry * 1.0) = chol(carry):
+    // iter 0: chol([[4,2],[2,5]]) = [[2,0],[1,2]]
+    // iter 1: chol([[2,0],[1,2]]) ≈ [[1.414,0],[0.707,1.225]]
+    // iter 2: chol of above ≈ [[1.189,0],[0.595,0.933]]
     const carryData = finalCarry.dataSync();
-    expect(carryData[0]).toBeCloseTo(2.0, 4);
+    expect(carryData[0]).toBeCloseTo(1.189, 2);
     expect(carryData[1]).toBeCloseTo(0.0, 4);
-    expect(carryData[2]).toBeCloseTo(1.0, 4);
-    expect(carryData[3]).toBeCloseTo(2.0, 4);
+    expect(carryData[2]).toBeCloseTo(0.595, 2);
+    expect(carryData[3]).toBeCloseTo(0.933, 2);
 
     // 3 iterations, each producing a 2×2 L
     const ysData = ys.dataSync();
@@ -2196,8 +2201,9 @@ describe("preencoded multi-step with routines (WebGPU)", () => {
 
     const [finalCarry, ys] = f();
     const carryData = finalCarry.dataSync();
-    expect(carryData[0]).toBeCloseTo(2.0, 4);
-    expect(carryData[3]).toBeCloseTo(2.0, 4);
+    // 2 iterations: chol(chol([[4,2],[2,5]]))
+    expect(carryData[0]).toBeCloseTo(1.414, 2);
+    expect(carryData[3]).toBeCloseTo(1.225, 2);
 
     finalCarry.dispose();
     ys.dispose();

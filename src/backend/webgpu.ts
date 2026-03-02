@@ -406,6 +406,7 @@ export class WebGPUBackend implements Backend {
       atomicF32Add: device.features.has(
         "shader-f32-atomic-add" as GPUFeatureName,
       ),
+      shaderF16: device.features.has("shader-f16" as GPUFeatureName),
       sharedMemory: false,
       multiOutputKernel: true,
       maxComputeWorkgroupSizeX: device.limits.maxComputeWorkgroupSizeX,
@@ -1797,13 +1798,20 @@ export class WebGPUBackend implements Backend {
 
       const module = this.device.createShaderModule({ code: wrapped.code });
 
-      // Create auto-layout pipeline to extract group(0)'s layout, then
-      // rebuild with explicit group(1) that has hasDynamicOffset: true.
-      const autoPipeline = this.device.createComputePipeline({
-        layout: "auto",
-        compute: { module, entryPoint: "main" },
+      // Create explicit group(0) layout from binding counts. Cannot use
+      // auto-layout extraction: WebGPU forbids reusing a bind group layout
+      // created as part of a pipeline's default layout.
+      const group0Layout = this.device.createBindGroupLayout({
+        entries: range(wrapped.numInputs + wrapped.numOutputs).map((i) => ({
+          binding: i,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: {
+            type: (i < wrapped.numInputs
+              ? "read-only-storage"
+              : "storage") as GPUBufferBindingType,
+          },
+        })),
       });
-      const group0Layout = autoPipeline.getBindGroupLayout(0);
       const pipelineLayout = this.device.createPipelineLayout({
         bindGroupLayouts: [group0Layout, uniformLayout],
       });
@@ -1886,6 +1894,7 @@ export class WebGPUBackend implements Backend {
       carrySizes,
       numCarry,
       numConsts,
+      reverse,
       routineInputJitIds,
       routineOutputJitIds,
     } = params;
@@ -2010,11 +2019,13 @@ export class WebGPUBackend implements Backend {
         }
 
         // Copy carry → ys for this iteration (passthrough pattern)
+        // Use original xs index for stacking position (reverse flips order)
+        const ysIdx = reverse ? length - 1 - iter : iter;
         const currentCarryBuffers = iter % 2 === 0 ? carryPong : carryPing;
         for (let c = 0; c < numCarry; c++) {
           const copySize = carrySizes[c];
           if (copySize <= 0) continue;
-          const yOffset = iter * copySize;
+          const yOffset = ysIdx * copySize;
           if (!copyUsesShader[c]) {
             commandEncoder.copyBufferToBuffer(
               currentCarryBuffers[c],
@@ -2185,16 +2196,24 @@ export class WebGPUBackend implements Backend {
       let offsetAlignment = 0;
 
       if (wrapped.hasUniform) {
-        // Step has xs inputs — needs offset uniform at group(1)
-        // Compile pipeline with explicit layout: [group(0)=auto, group(1)=uniform]
+        // Step has xs inputs — needs offset uniform at group(1).
+        // Create explicit group(0) layout from binding counts. Cannot use
+        // auto-layout extraction: WebGPU forbids reusing a bind group layout
+        // created as part of a pipeline's default layout.
         const module = this.device.createShaderModule({
           code: wrapped.code,
         });
-        const autoPipeline = this.device.createComputePipeline({
-          layout: "auto",
-          compute: { module, entryPoint: "main" },
+        const group0Layout = this.device.createBindGroupLayout({
+          entries: range(wrapped.numInputs + wrapped.numOutputs).map((i) => ({
+            binding: i,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: {
+              type: (i < wrapped.numInputs
+                ? "read-only-storage"
+                : "storage") as GPUBufferBindingType,
+            },
+          })),
         });
-        const group0Layout = autoPipeline.getBindGroupLayout(0);
         const pipelineLayout = this.device.createPipelineLayout({
           bindGroupLayouts: [group0Layout, uniformLayout],
         });
@@ -2477,13 +2496,14 @@ export class WebGPUBackend implements Backend {
         }
       }
 
-      // Stack ys: copy each ys source → ysStacked at iteration offset
+      // Stack ys: copy each ys source → ysStacked at original xs index
+      const ysIdx = _reverse ? length - 1 - iter : iter;
       for (let yi = 0; yi < numY; yi++) {
         const jitId = yOutJitIds[yi];
         const srcBuf = resolveBuffer(jitId, carryRead);
         const sz = ysSizes[yi];
         if (sz <= 0) continue;
-        const yOffset = iter * sz;
+        const yOffset = ysIdx * sz;
         if (!copyUsesShader[yi]) {
           commandEncoder.copyBufferToBuffer(
             srcBuf,
@@ -5103,7 +5123,8 @@ function blockedAssocScanLocalShaderSource(
     const src = round % 2 === 0 ? "shmem_0" : "shmem_1";
     const dst = round % 2 === 0 ? "shmem_1" : "shmem_0";
 
-    if (useSubgroups) {
+    if (useSubgroups && stride < 128) {
+      // WGSL spec: subgroupShuffleUp delta must be < 128
       // Check at runtime whether this stride fits within a subgroup
       emit(`if (${stride}u < sg_size) {`);
       emit(pushIndent);

@@ -2,6 +2,7 @@
 
 import {
   defaultDevice,
+  getBackend,
   grad,
   init,
   jit,
@@ -17,7 +18,9 @@ const devices = ["cpu", "webgpu"] as const;
 const devicesAvailable = await init(...devices);
 
 suite.each(devices)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
+  const skipped =
+    !devicesAvailable.includes(device) ||
+    (device === "webgpu" && !getBackend("webgpu").capabilities.shaderF16);
   beforeEach(({ skip }) => {
     if (skipped) skip();
     defaultDevice(device);

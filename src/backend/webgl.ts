@@ -59,6 +59,7 @@ export class WebGLBackend implements Backend {
   readonly maxArgs = 8; // See: https://web3dsurvey.com/webgl/parameters/MAX_TEXTURE_IMAGE_UNITS
   readonly capabilities: BackendCapabilities = {
     atomicF32Add: false,
+    shaderF16: false,
     sharedMemory: false,
     multiOutputKernel: false,
   };

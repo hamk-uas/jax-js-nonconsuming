@@ -2,7 +2,6 @@
  * Quick Phase 3 timing test for tiledMatmul register tiling.
  * Run: pnpm build && pnpm vitest run tmp/timing-tiled-matmul.test.ts
  */
-import { test } from "vitest";
 import {
   blockUntilReady,
   defaultDevice,
@@ -12,6 +11,7 @@ import {
   numpy as np,
   random,
 } from "@hamk-uas/jax-js-nonconsuming";
+import { test } from "vitest";
 
 async function timeIt(
   label: string,
@@ -66,9 +66,7 @@ test("Phase 3 tiledMatmul benchmark", async () => {
       fTT44(A, B),
     );
 
-    console.log(
-      `  Speedup vs no-threadTile: ${(noTTms / tt44ms).toFixed(2)}x`,
-    );
+    console.log(`  Speedup vs no-threadTile: ${(noTTms / tt44ms).toFixed(2)}x`);
     console.log(`  Speedup vs np.matmul: ${(stdMs / tt44ms).toFixed(2)}x`);
 
     fStd.dispose();

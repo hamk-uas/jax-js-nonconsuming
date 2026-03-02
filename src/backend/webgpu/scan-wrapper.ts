@@ -225,10 +225,11 @@ function generateOffsetDeclarations(
 ): string {
   const decls: string[] = [];
   for (const b of xsBindings) {
-    decls.push(`  let ${b.name}_offset = scan_offsets.${b.name}_offset;`);
+    // Cast to i32: kernel index expressions use i32 (gidx = i32(...))
+    decls.push(`  let ${b.name}_offset = i32(scan_offsets.${b.name}_offset);`);
   }
   for (const b of ysBindings) {
-    decls.push(`  let ${b.name}_offset = scan_offsets.${b.name}_offset;`);
+    decls.push(`  let ${b.name}_offset = i32(scan_offsets.${b.name}_offset);`);
   }
   return decls.join("\n");
 }
