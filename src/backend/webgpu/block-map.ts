@@ -113,6 +113,29 @@ export function blockMapFusedShaderSource(
   // along each axis has some invalid (out-of-bounds) threads. We emit a
   // per-thread `valid` flag and guard all global reads/writes.
   const gridRank = blockShape.length;
+
+  // O11: Extract the tile inner (column) dimension from a GlobalView's last
+  // index, which contains `gidx % cols` from the DynamicSlice unravel pattern.
+  const findModBase = (exp: AluExp): number | null => {
+    if (exp.op === AluOp.Mod && exp.src[1].op === AluOp.Const) {
+      return exp.src[1].arg as number;
+    }
+    for (const s of exp.src) {
+      const r = findModBase(s);
+      if (r !== null) return r;
+    }
+    return null;
+  };
+  const extractTileInnerDim = (exp: AluExp): number | null => {
+    if (exp.op === AluOp.GlobalView && exp.src.length >= 2) {
+      return findModBase(exp.src[exp.src.length - 1]);
+    }
+    for (const s of exp.src) {
+      const r = extractTileInnerDim(s);
+      if (r !== null) return r;
+    }
+    return null;
+  };
   // Per-axis: the original dimension along each grid axis (for validity checks)
   const axisDims: (number | null)[] = new Array(gridRank).fill(null);
   let hasBoundary = false;
@@ -164,6 +187,12 @@ export function blockMapFusedShaderSource(
      * Each thread holds threadTile[0]*threadTile[1] elements per private buffer.
      */
     privateShmemIds: Set<JitId>;
+    /**
+     * O11: Bank padding for cooperative-loaded shmem arrays. Maps JitId → inner
+     * (last) dimension of the 2D tile. Padded stride = innerDim + 1 eliminates
+     * bank conflicts when multiple rows map to the same bank.
+     */
+    shmemBankPad: Map<JitId, number>;
     bodyInputIds: JitId[];
     bodyOutputIds: JitId[];
     numConsts: number;
@@ -544,6 +573,32 @@ export function blockMapFusedShaderSource(
           }
         }
 
+        // O11: Identify cooperative-loaded shmem arrays eligible for bank padding.
+        // For each cooperative body step output stored in shmem, extract the 2D
+        // tile's inner dimension from the kernel expression's GlobalView.
+        const shmemBankPad = new Map<JitId, number>();
+        if (threadTile) {
+          for (const { step: bs, kernel: bk } of bodyKernels) {
+            const isSinglePromoted =
+              bk.numOutputs === 1 && promotedScalars.has(bs.outputs[0]);
+            const allPrivate =
+              !isSinglePromoted &&
+              bs.outputs.every(
+                (oid) => privateShmemIds.has(oid) || promotedScalars.has(oid),
+              );
+            if (isSinglePromoted || allPrivate) continue;
+            // Cooperative step — check outputs for 2D shmem tiles
+            for (let oi = 0; oi < bk.numOutputs; oi++) {
+              const outId = bs.outputs[oi];
+              if (!bodyShmemMap.has(outId)) continue;
+              const innerDim = extractTileInnerDim(bk.outputs[oi].exp);
+              if (innerDim !== null && innerDim > 1) {
+                shmemBankPad.set(outId, innerDim);
+              }
+            }
+          }
+        }
+
         foriLoops.push({
           foriStep: step as Extract<JitStep, { type: "fori_loop" }>,
           bodyKernels,
@@ -553,6 +608,7 @@ export function blockMapFusedShaderSource(
           bodyShmemIds,
           promotedScalars,
           privateShmemIds,
+          shmemBankPad,
           bodyInputIds: bodyProg.inputs,
           bodyOutputIds: bodyProg.outputs,
           numConsts: step.numConsts,
@@ -1071,7 +1127,10 @@ export function blockMapFusedShaderSource(
     for (const [id, info] of fl.bodyShmemMap) {
       if (fl.privateShmemIds.has(id)) continue; // O4: private → declared in fn body
       const ty = dtypeToWgsl(info.dtype, false);
-      emit(`var<workgroup> ${info.name}: array<${ty}, ${info.elemCount}>;`);
+      // O11: bank-padded shmem — add 1 extra element per row
+      const pad = fl.shmemBankPad.get(id);
+      const size = pad ? (info.elemCount / pad) * (pad + 1) : info.elemCount;
+      emit(`var<workgroup> ${info.name}: array<${ty}, ${size}>;`);
     }
   }
 
@@ -1850,6 +1909,7 @@ export function blockMapFusedShaderSource(
           bStepInputInfo: typeof bodyInputInfo,
           bStep: Extract<JitStep, { type: "execute" }>,
           privateVarNames: Map<JitId, string> | null,
+          bankPadMap?: Map<JitId, number>,
         ) =>
         (bufIdx: number, indexExpr: string, dtype: DType): string => {
           if (privateVarNames) {
@@ -1870,6 +1930,14 @@ export function blockMapFusedShaderSource(
                 : readExpr;
             }
             return `${info.name}[${indexExpr}]`;
+          }
+          // O11: bank-padded shmem read
+          if (bankPadMap) {
+            const jitId = bStep.inputs[bufIdx];
+            const innerDim = bankPadMap.get(jitId);
+            if (innerDim !== undefined) {
+              return `${info.name}[(${indexExpr}) + (${indexExpr}) / ${innerDim}]`;
+            }
           }
           return `${info.name}[${indexExpr}]`;
         };
@@ -2100,7 +2168,7 @@ export function blockMapFusedShaderSource(
             const gen = createGen(
               bKernel,
               `fl${entry.flIdx}_s${bsi}`,
-              makeBodyResolve(bStepInputInfo, bStep, null),
+              makeBodyResolve(bStepInputInfo, bStep, null, fl.shmemBankPad),
             );
             const outId = bStep.outputs[0];
             const rhs = strip1(gen(bKernel.outputs[0].exp));
@@ -2132,7 +2200,12 @@ export function blockMapFusedShaderSource(
               const gen = createGen(
                 bKernel,
                 prefix,
-                makeBodyResolve(bStepInputInfo, bStep, privateVarNames),
+                makeBodyResolve(
+                  bStepInputInfo,
+                  bStep,
+                  privateVarNames,
+                  fl.shmemBankPad,
+                ),
                 undefined,
                 structuredGidx,
               );
@@ -2166,7 +2239,12 @@ export function blockMapFusedShaderSource(
                 const epilogueGen = createGen(
                   bKernel,
                   `${prefix}_ep`,
-                  makeBodyResolve(bStepInputInfo, bStep, privateVarNames),
+                  makeBodyResolve(
+                    bStepInputInfo,
+                    bStep,
+                    privateVarNames,
+                    fl.shmemBankPad,
+                  ),
                   new Map([["acc", accName]]),
                   structuredGidx,
                 );
@@ -2188,7 +2266,12 @@ export function blockMapFusedShaderSource(
               const gen = createGen(
                 bKernel,
                 `fl${entry.flIdx}_s${bsi}`,
-                makeBodyResolve(bStepInputInfo, bStep, privateVarNames),
+                makeBodyResolve(
+                  bStepInputInfo,
+                  bStep,
+                  privateVarNames,
+                  fl.shmemBankPad,
+                ),
                 undefined,
                 structuredGidx,
               );
@@ -2223,7 +2306,7 @@ export function blockMapFusedShaderSource(
             const gen = createGen(
               bKernel,
               `fl${entry.flIdx}_s${bsi}`,
-              makeBodyResolve(bStepInputInfo, bStep, null),
+              makeBodyResolve(bStepInputInfo, bStep, null, fl.shmemBankPad),
             );
             for (let oi = 0; oi < bKernel.numOutputs; oi++) {
               const outId = bStep.outputs[oi];
@@ -2237,7 +2320,10 @@ export function blockMapFusedShaderSource(
                   targetTy && targetDtype !== expDtype
                     ? `${targetTy}(${rhs})`
                     : rhs;
-                emit(`${targetName}[_li] = ${castRhs};`);
+                // O11: bank-padded cooperative write
+                const pad = fl.shmemBankPad.get(outId);
+                const writeIdx = pad ? `_li + _li / ${pad}u` : "_li";
+                emit(`${targetName}[${writeIdx}] = ${castRhs};`);
               }
             }
 
