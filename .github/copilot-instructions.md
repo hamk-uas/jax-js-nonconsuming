@@ -14,9 +14,9 @@ These notes help AI coding agents be immediately productive.
 
 Your success is measured by the **net reduction in total system complexity**.
 
-- **Ruthless Refactoring:** Scale is an asset. Refactor 1,000 files to achieve a cleaner
-  architecture rather than patching the edges. Workarounds are not solutions — they are debt that
-  compounds.
+- **Ruthless Refactoring:** Scale is an asset. Refactor 1,000 files to achieve an architecture
+  that will be cleaner in the long term, rather than patching the edges. Workarounds are not
+  solutions — they are debt that compounds.
 
 ## 2. Provider Mode: Writing for the "Downstream Agent"
 
@@ -28,6 +28,7 @@ When you modify our public API, your task is to provide a "Migration Bundle" tha
   likely used to bypass old limitations.
   - _Example:_ "If the consumer has a local utility that manually merges X and Y because v1 didn't
     support it, delete that utility and use the new `nativeMerge` endpoint."
+- **Signal your compliance:** If you were brought here by a failed command call, make sure you actually have read and followed the protocol. Only then call the command again: AEP=AEP COMMAND.
 
 ## 3. Consumer Mode: The Upgrade & Optimization Loop
 
