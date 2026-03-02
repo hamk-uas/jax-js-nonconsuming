@@ -492,6 +492,42 @@ pnpm run test:arch           # Architectural mode: failures gated by manifest
 pnpm run test:website:smoke  # Website build + smoke checks
 ```
 
+#### Headless Chromium WebGPU setup
+
+Tests run in headless Chromium via Playwright with full WebGPU support. This requires a working
+Vulkan GPU driver on the host. Verify with:
+
+```bash
+vulkaninfo --summary   # Should show your GPU device
+```
+
+**Key requirements:**
+
+1. **Vulkan driver** — the headless Chrome flags in `vitest.config.ts` use `--use-angle=vulkan` to
+   route WebGPU through the host GPU. Without a working Vulkan driver, WebGPU tests will be skipped.
+2. **Playwright browsers** — `pnpm exec playwright install` downloads a bundled Chromium that
+   includes the Dawn WebGPU implementation.
+3. **Secure context** — WebGPU requires `isSecureContext === true`. Vitest's dev server serves on
+   `localhost`, which qualifies automatically. Direct `about:blank` navigation would not.
+4. **Display server** — even in headless mode, Chrome needs access to a display for GPU
+   initialization. On Linux, ensure `DISPLAY` is set (X11) or a Wayland session is active. The
+   config passes `DISPLAY` and `XAUTHORITY` from the environment.
+5. **No root / no sandbox** — the `--no-sandbox` flag avoids permission issues in containers or
+   non-root environments.
+
+The full set of Chrome flags used (configured in `vitest.config.ts`):
+
+```
+--no-sandbox --headless=new --use-angle=vulkan --enable-features=Vulkan
+--disable-vulkan-surface --enable-unsafe-webgpu
+```
+
+**Troubleshooting:**
+
+- If WebGPU tests are skipped, check `vulkaninfo --summary` and ensure your GPU driver is installed.
+- On headless servers (no display), use `Xvfb` or a virtual framebuffer.
+- COOP/COEP headers (required for `SharedArrayBuffer`) are configured in `vitest.config.ts`.
+
 Architectural mode is intended for large refactors and uses `.ci/expected-failures.json` as an
 explicit, expiring debt ledger. See `docs/testing-policy.md` for workflow details.
 
