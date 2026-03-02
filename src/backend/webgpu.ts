@@ -2002,13 +2002,15 @@ export class WebGPUBackend implements Backend {
       (slot) => this.#getBuffer(slot).buffer,
     );
 
-    // Create ping-pong buffers for carry state
-    const carryPing = carrySizes.map((size) =>
-      this.#createBuffer(Math.max(size, 4)),
-    );
-    const carryPong = carrySizes.map((size) =>
-      this.#createBuffer(Math.max(size, 4)),
-    );
+    // Create ping-pong buffers for carry state (prefer pool)
+    const carryPing = carrySizes.map((size) => {
+      const padded = Math.max(size, 4);
+      return this.#poolPop(padded) ?? this.#createBuffer(padded);
+    });
+    const carryPong = carrySizes.map((size) => {
+      const padded = Math.max(size, 4);
+      return this.#poolPop(padded) ?? this.#createBuffer(padded);
+    });
 
     const commandEncoder = this.device.createCommandEncoder();
     const copyUniformBuffers: GPUBuffer[] = [];
@@ -2171,8 +2173,10 @@ export class WebGPUBackend implements Backend {
     // Clean up temporary buffers
     for (const buf of copyUniformBuffers) buf.destroy();
     for (const buf of [...carryPing, ...carryPong]) {
-      this.#gpuAllocatedBytes -= buf.size;
-      buf.destroy();
+      if (!this.#poolPush(buf)) {
+        this.#gpuAllocatedBytes -= buf.size;
+        buf.destroy();
+      }
     }
     // offsetBuffer is NOT destroyed — owned by PreparedPreencodedScan for reuse
   }
@@ -2432,18 +2436,21 @@ export class WebGPUBackend implements Backend {
       (s) => this.#getBuffer(s).buffer,
     );
 
-    // Create transient ping-pong carry buffers
-    const carryPing = carrySizes.map((sz) =>
-      this.#createBuffer(Math.max(sz, 4)),
-    );
-    const carryPong = carrySizes.map((sz) =>
-      this.#createBuffer(Math.max(sz, 4)),
-    );
+    // Create transient ping-pong carry buffers (prefer pool)
+    const carryPing = carrySizes.map((sz) => {
+      const padded = Math.max(sz, 4);
+      return this.#poolPop(padded) ?? this.#createBuffer(padded);
+    });
+    const carryPong = carrySizes.map((sz) => {
+      const padded = Math.max(sz, 4);
+      return this.#poolPop(padded) ?? this.#createBuffer(padded);
+    });
 
-    // Create transient internal scratch buffers
-    const internalBuffers = internalSizes.map((sz) =>
-      this.#createBuffer(Math.max(sz, 4)),
-    );
+    // Create transient internal scratch buffers (prefer pool)
+    const internalBuffers = internalSizes.map((sz) => {
+      const padded = Math.max(sz, 4);
+      return this.#poolPop(padded) ?? this.#createBuffer(padded);
+    });
 
     const commandEncoder = this.device.createCommandEncoder();
     const copyUniformBuffers: GPUBuffer[] = [];
@@ -2648,8 +2655,10 @@ export class WebGPUBackend implements Backend {
     // Clean up transient buffers
     for (const buf of copyUniformBuffers) buf.destroy();
     for (const buf of [...carryPing, ...carryPong, ...internalBuffers]) {
-      this.#gpuAllocatedBytes -= buf.size;
-      buf.destroy();
+      if (!this.#poolPush(buf)) {
+        this.#gpuAllocatedBytes -= buf.size;
+        buf.destroy();
+      }
     }
     // Per-step offset buffers are NOT destroyed — owned by prepared for reuse
   }
