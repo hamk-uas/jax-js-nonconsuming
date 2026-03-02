@@ -528,6 +528,60 @@ The full set of Chrome flags used (configured in `vitest.config.ts`):
 - On headless servers (no display), use `Xvfb` or a virtual framebuffer.
 - COOP/COEP headers (required for `SharedArrayBuffer`) are configured in `vitest.config.ts`.
 
+#### Using this config in downstream libraries
+
+Libraries that depend on `@hamk-uas/jax-js-nonconsuming` (e.g. dlm-js) can reuse the same headless
+WebGPU setup. Install the required dev dependencies:
+
+```bash
+pnpm add -D vitest @vitest/browser-playwright playwright
+pnpm exec playwright install
+```
+
+Then create a `vitest.config.ts` with the same Chromium flags and COOP/COEP headers:
+
+```ts
+import { defineConfig } from "vitest/config";
+import { playwright } from "vitest/browser";
+
+export default defineConfig({
+  server: {
+    headers: {
+      "Cross-Origin-Embedder-Policy": "require-corp",
+      "Cross-Origin-Opener-Policy": "same-origin",
+    },
+  },
+  test: {
+    browser: {
+      enabled: true,
+      headless: true,
+      provider: playwright({
+        launchOptions: {
+          args: [
+            "--no-sandbox",
+            "--headless=new",
+            "--use-angle=vulkan",
+            "--enable-features=Vulkan",
+            "--disable-vulkan-surface",
+            "--enable-unsafe-webgpu",
+          ],
+          env: {
+            DISPLAY: process.env.DISPLAY ?? ":0",
+            XAUTHORITY:
+              process.env.XAUTHORITY ??
+              `/run/user/${process.getuid?.() ?? 1000}/gdm/Xauthority`,
+          },
+        },
+      }),
+      instances: [{ browser: "chromium" }],
+    },
+  },
+});
+```
+
+The COOP/COEP headers enable `SharedArrayBuffer` (needed for WASM worker pool parallel dispatch).
+The Chrome flags route WebGPU through your host Vulkan driver in headless mode.
+
 Architectural mode is intended for large refactors and uses `.ci/expected-failures.json` as an
 explicit, expiring debt ledger. See `docs/testing-policy.md` for workflow details.
 
