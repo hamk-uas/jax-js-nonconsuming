@@ -485,10 +485,7 @@ describe("lax.blockMap — in-block reductions", () => {
     f_jit.dispose();
   });
 
-  // KNOWN_BUG: WebGPU fused shader codegen for reduction bodies produces
-  // invalid WGSL (undefined 'ridx' variable). Tracked: blockMap reduction
-  // shader needs reduction loop index declaration in fused-shader path.
-  test.skip("fused path is taken for reduce-then-elementwise body", () => {
+  test("fused path is taken for reduce-then-elementwise body", () => {
     if (!hasWebGPU) return;
     defaultDevice("webgpu");
 
@@ -1484,9 +1481,7 @@ describe("shader quality gates", () => {
     f.dispose();
   });
 
-  // KNOWN_BUG: Same 'ridx' undefined issue as reduce-then-elementwise.
-  // P0a's body uses max+sum+divide+multiply which triggers reduction codegen.
-  test.skip("P0a: scalar intermediates promoted to let bindings (no tidx < 1u guard)", () => {
+  test("P0a: scalar intermediates promoted to let bindings (no tidx < 1u guard)", () => {
     if (!hasWebGPU) return;
     defaultDevice("webgpu");
 
@@ -1519,12 +1514,14 @@ describe("shader quality gates", () => {
     );
     expect(fusedShaders.length).toBeGreaterThan(0);
     for (const shader of fusedShaders) {
-      // The size-1 kernel should be promoted to a let binding, not a guarded
-      // shmem write. "tidx < 1u" is the signature of an un-promoted size-1 step.
+      // The size-1 divide kernel should be fused into a reduction epilogue or
+      // promoted to a let binding — not emitted as a standalone guarded shmem
+      // write. A standalone guard looks like `if (tidx < 1u) {` (without &&).
+      // Tree reduction strides use `if (tidx < 1u && ...)` which is fine.
       expect(
         shader,
-        "promoted scalar should use let binding, not tidx < 1u guard",
-      ).not.toContain("tidx < 1u");
+        "promoted scalar should use epilogue or let, not standalone tidx < 1u guard",
+      ).not.toMatch(/if \(tidx < 1u\) \{/);
     }
 
     f.dispose();

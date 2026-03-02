@@ -1390,6 +1390,7 @@ export function blockMapFusedShaderSource(
     ) => string,
     variableOverrides?: Map<string, string>,
     gidxOverride?: AluExp,
+    ridxOverride?: AluExp,
   ): (exp: AluExp) => string {
     let gensymCount = 0;
     const gensym = () => `${prefix}_alu${gensymCount++}`;
@@ -1412,11 +1413,11 @@ export function blockMapFusedShaderSource(
     for (const output of kernel.outputs) {
       const vars: Record<string, AluExp> = { gidx: gidxBound };
       if (output.reduction && !isSymbolicSize(output.reduction.size)) {
-        vars.ridx = AluExp.special(
-          DType.Int32,
-          "ridx",
-          output.reduction.size as number,
-        );
+        // ridxOverride: for tree reductions, substitute ridx → gidx (tidx)
+        // so each thread evaluates the expression at its own index.
+        vars.ridx =
+          ridxOverride ??
+          AluExp.special(DType.Int32, "ridx", output.reduction.size as number);
       }
       simplifiedMap.set(
         output.exp,
@@ -1610,8 +1611,39 @@ export function blockMapFusedShaderSource(
 
       if (re) {
         // --- Reduction kernel: tree reduction in shared memory ---
+        // Each thread evaluates the expression at its own index (ridx → gidx,
+        // i.e., tidx), then threads cooperatively tree-reduce the results.
+        const reResolve = (
+          bufIdx: number,
+          indexExpr: string,
+          dtype: DType,
+        ): string => {
+          if (stepInputIsGlobal[bufIdx]) {
+            const inputIdx = stepInputBodyIdx[bufIdx];
+            if (inputIdx >= 0) {
+              const remapped = inRemap(inputIdx, indexExpr);
+              const readExpr = `${stepInputNames[bufIdx]}[i32(in_base_${inputIdx}) + ${remapped}]`;
+              return hasBoundary
+                ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
+                : readExpr;
+            } else {
+              return `${stepInputNames[bufIdx]}[${indexExpr}]`;
+            }
+          } else {
+            return `${stepInputNames[bufIdx]}[${indexExpr}]`;
+          }
+        };
+        const treeGen = createGen(
+          kernel,
+          `s${si}`,
+          reResolve,
+          undefined,
+          undefined,
+          // ridxOverride: map ridx → gidx so each thread loads its own element
+          AluExp.special(DType.Int32, "gidx", blockSize),
+        );
         const outId = step.outputs[0];
-        const rhs = strip1(gen(kernel.outputs[0].exp));
+        const rhs = strip1(treeGen(kernel.outputs[0].exp));
         const reDtype = re.dtype;
         const reTy = dtypeToWgsl(reDtype, false);
         const wsName = `reduce_ws_${si}`;
@@ -1656,7 +1688,7 @@ export function blockMapFusedShaderSource(
           const epilogueGen = createGen(
             kernel,
             `s${si}_ep`,
-            () => accVar,
+            reResolve,
             new Map([["acc", accVar]]),
           );
           finalValue = strip1(epilogueGen(re.epilogue));
