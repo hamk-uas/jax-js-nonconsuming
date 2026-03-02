@@ -21,7 +21,6 @@
     "**/*.config.js",
     "**/dist",
     "website",
-    "test/deno",
     "tmp"
   ]
 }

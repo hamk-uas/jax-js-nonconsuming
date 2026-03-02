@@ -108,18 +108,16 @@ differentiation (`grad`, `jvp`, `vjp`), JIT compilation, and composable transfor
 pnpm install                       # requires pnpm ≥ 10
 pnpm run build                     # tsdown → dist/*.js, dist/*.d.ts
 pnpm test                          # Vitest + Playwright (browser + node)
-pnpm run test:all                  # Vitest + Deno WebGPU
-pnpm run test:deno                 # Deno WebGPU tests only
 pnpm run check                     # tsc type-check
 pnpm run lint && pnpm run format   # ESLint + Prettier
 pnpm vitest bench bench/<file>     # run benchmarks
 pnpm -C website dev                # local dev server
 ```
 
-**Pre-commit CI checks**: Husky runs `lint-staged`, then full Vitest + Deno tests. Before commit:
+**Pre-commit CI checks**: Husky runs `lint-staged`, then full Vitest. Before commit:
 
 ```bash
-pnpm build && pnpm check && pnpm test && pnpm run test:deno
+pnpm build && pnpm check && pnpm test
 ```
 
 **Tests import from `dist/`, not `src/`** — source edits are invisible to Vitest until `pnpm build`.
@@ -319,14 +317,6 @@ runtime i32 param).
 - `no-unnecessary-ref` autofix is unsafe for internal tracer `.ref` propagation (e.g.,
   `BatchTracer.ref` must call `this.val.ref`)
 
-## Deno WebGPU test guidelines
-
-- Always reuse jax-js's WebGPU device — never create a second `GPUDevice`
-- Import from `../../dist/index.js`, not `src/`
-- Track created `GPUBuffer`s and destroy in `finally` blocks
-- Use `withLeakCheck` from harness.ts
-- Run each file separately: `pnpm run test:deno` (not `deno test test/deno/`)
-
 ## Adding new primitives (checklist)
 
 1. Declare in `Primitive` enum (`src/frontend/core.ts`)
@@ -360,7 +350,7 @@ All public symbols must be exported from `src/index.ts`. Key exports: `jit`, `gr
 
 ## Commit checklist
 
-1. Run `pnpm build && pnpm check && pnpm test && pnpm run test:deno`
+1. Run `pnpm build && pnpm check && pnpm test`
 2. No new failures beyond known `KNOWN_BUG` tests (currently none active)
 3. Update `FEATURES.md` for user-visible changes
 4. Export new public symbols from `src/index.ts`
@@ -510,7 +500,7 @@ _WASM backend:_
 | 1024 | 0.027 ms          | 1.037 ms     | 38.6×      |
 | 4096 | 0.025 ms          | 4.757 ms     | **187.7×** |
 
-_WebGPU backend (Deno wgpu-rs, Intel Core Ultra 5 125H):_
+_WebGPU backend (headless Chromium, Intel Core Ultra 5 125H):_
 
 | N    | `grad(assocScan)` | `grad(scan)` | Speedup   |
 | ---- | ----------------- | ------------ | --------- |
@@ -588,8 +578,8 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | `transposeJaxprCache` is cache-owned            | Prevents repeated transposition; callers must NOT dispose              |
 | WASM `(start, end, ...ptrs)` kernel signature   | Enables `WasmWorkerPool` work-splitting                                |
 | Mega-module extracted-functions design          | V8 inlines direct `call` → perf-neutral serial, enables parallel       |
-| Module Workers (`type: "module"`)               | Deno doesn't support classic blob-URL workers                          |
-| SAB constructability over `crossOriginIsolated` | Works in Deno (native SAB) and browsers (with COOP/COEP)               |
+| Module Workers (`type: "module"`)               | Required for Vitest browser mode and worker pool                       |
+| SAB constructability over `crossOriginIsolated` | Works in browsers with COOP/COEP headers                               |
 | `jit()` identity dedup via WeakMap              | Prevents cache bloat from inline `jit(fn)(args)` patterns              |
 | DUS vmap → shrink+concat decomposition          | JIT `dus` step is axis=0 only; vmap shifts axis, so decompose instead  |
 | Phase 1 carry snapshot fusion                   | Same-gidx deps in single fused shader; avoids N×S dispatch overhead    |

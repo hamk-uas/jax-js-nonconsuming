@@ -489,7 +489,6 @@ pnpm exec playwright install
 pnpm test
 pnpm run test:policy:strict  # Strict mode: no expected-failure debt
 pnpm run test:arch           # Architectural mode: failures gated by manifest
-pnpm run test:deno           # Deno WebGPU tests (isolated files)
 pnpm run test:website:smoke  # Website build + smoke checks
 ```
 
@@ -520,7 +519,6 @@ Pre-commit is branch-aware and runs via `scripts/precommit.sh`.
 - **Full profile** (default on `main`, `master`, `release/*`, `hotfix/*`):
   - everything in feature profile
   - `test:policy:strict`
-  - `test:deno`
   - `test:website:smoke`
 
 This keeps day-to-day feature iteration fast while enforcing release-grade checks when committing on
@@ -573,7 +571,6 @@ This section is for maintainers who create releases.
 pnpm build
 pnpm check
 pnpm run test:policy:strict
-pnpm run test:deno
 pnpm run test:website:smoke
 pnpm run test:eslint-plugin
 pnpm run lint:ownership:internal
@@ -662,7 +659,7 @@ continues independently.
 Before submitting a PR, run the full CI checks locally:
 
 ```bash
-pnpm build && pnpm check && pnpm run test:policy:strict && pnpm run test:deno && pnpm run test:website:smoke && pnpm run test:eslint-plugin && pnpm run lint:ownership:internal && pnpm run lint:ownership:website
+pnpm build && pnpm check && pnpm run test:policy:strict && pnpm run test:website:smoke && pnpm run test:eslint-plugin && pnpm run lint:ownership:internal && pnpm run lint:ownership:website
 ```
 
 ## Differences from upstream
@@ -793,5 +790,5 @@ incorrectly or awkwardly in the other, especially around `.ref` and disposal dis
 ### AI-assisted development
 
 This fork is developed primarily using AI coding agents (GitHub Copilot, Claude, GPT, Gemini) with
-gentle human supervision. All changes go through the full CI pipeline (`pnpm test`, `pnpm check`,
-`pnpm run test:deno`) and the pre-commit hook runs the complete test suite before every commit.
+gentle human supervision. All changes go through the full CI pipeline (`pnpm test`, `pnpm check`)
+and the pre-commit hook runs the complete test suite before every commit.

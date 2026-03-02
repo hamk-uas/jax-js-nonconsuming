@@ -78,6 +78,5 @@ else
 fi
 
 if [[ "$profile" == "full" ]]; then
-  pnpm run test:deno
   pnpm run test:website:smoke
 fi

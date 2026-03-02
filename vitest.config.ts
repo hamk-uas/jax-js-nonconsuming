@@ -46,14 +46,17 @@ export default defineConfig({
     watch: false, // Run once and exit, don't wait for 'q'
     browser: {
       enabled: true,
-      headless: false,
+      headless: true,
       screenshotFailures: false,
       provider: playwright({
         launchOptions: {
           args: [
-            "--enable-unsafe-webgpu",
-            "--enable-features=Vulkan",
             "--no-sandbox",
+            "--headless=new",
+            "--use-angle=vulkan",
+            "--enable-features=Vulkan",
+            "--disable-vulkan-surface",
+            "--enable-unsafe-webgpu",
           ],
           env: {
             DISPLAY: process.env.DISPLAY ?? ":0",
@@ -78,18 +81,7 @@ export default defineConfig({
     exclude: [
       "**/node_modules/**",
       "**/dist/**",
-      "test/deno/**",
       "tmp/**",
-      // ── Slow-test quarantine ──────────────────────────────────────────
-      // These files contain WebGPU eager-mode tests that individually
-      // take 3–34 s, making them incompatible with the 10 s testTimeout.
-      // They are correct but slow; run them separately via:
-      //   pnpm vitest run test/lax-scan.test.ts  (etc.)
-      // Tracked in .ci/expected-failures.json with expiry 2026-06-01.
-      "test/lax-scan.test.ts",
-      "test/numpy-fft.test.ts",
-      "test/scan-backends.test.ts",
-      "test/pool-memory.test.ts",
       // Performance benchmarks, not correctness tests:
       "test/scan-bench.test.ts",
     ],

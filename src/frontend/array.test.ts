@@ -1,18 +1,12 @@
 import { beforeEach, expect, suite, test } from "vitest";
 
-import { defaultDevice, type Device, devices, init } from "../backend";
+import { defaultDevice, devices, init } from "../backend";
 import { arange, array, eye, ones, zeros } from "./array";
 import { DType } from "../alu";
 
 const devicesAvailable = await init();
 
-// Eager GPU dispatches take seconds each for trivial ops (pipeline creation +
-// readback overhead). Algorithm correctness is proven by cpu + wasm.
-const fastDevices: Device[] = devices.filter(
-  (d) => d !== "webgpu" && d !== "webgl",
-);
-
-suite.each(fastDevices)("device:%s", (device) => {
+suite.each(devices)("device:%s", (device) => {
   const skipped = !devicesAvailable.includes(device);
 
   beforeEach(({ skip }) => {
