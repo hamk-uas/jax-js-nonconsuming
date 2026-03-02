@@ -28,6 +28,10 @@ export interface BackendCapabilities {
   readonly multiOutputKernel: boolean;
   /** WebGPU: maximum workgroup size along X (from device.limits). */
   readonly maxComputeWorkgroupSizeX?: number;
+  /** WebGPU: max threads per workgroup (from device.limits). */
+  readonly maxComputeInvocationsPerWorkgroup?: number;
+  /** WebGPU: max shared memory bytes per workgroup (from device.limits). */
+  readonly maxComputeWorkgroupStorageSize?: number;
 }
 export const devices: Device[] = ["cpu", "wasm", "webgpu", "webgl"];
 

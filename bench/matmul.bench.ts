@@ -3,6 +3,7 @@ import {
   defaultDevice,
   init,
   jit,
+  lax,
   numpy as np,
   random,
 } from "@hamk-uas/jax-js-nonconsuming";
@@ -13,50 +14,39 @@ const devices = await init("webgpu");
 suite.skipIf(!devices.includes("webgpu"))("gpu matmul", async () => {
   defaultDevice("webgpu");
 
-  const a2048 = random.uniform(random.key(0), [2048, 2048]);
-  const b2048 = random.uniform(random.key(1), [2048, 2048]);
-  await blockUntilReady([a2048, b2048]);
-  afterAll(() => {
-    a2048.dispose();
-    b2048.dispose();
-  });
+  for (const N of [2048, 4096] as const) {
+    const a = random.uniform(random.key(0), [N, N]);
+    const b = random.uniform(random.key(1), [N, N]);
+    await blockUntilReady([a, b]);
+    afterAll(() => {
+      a.dispose();
+      b.dispose();
+    });
 
-  bench("2048x2048 eager", async () => {
-    const c = np.matmul(a2048, b2048);
-    await c.blockUntilReady();
-    c.dispose();
-  });
+    bench(`${N} eager`, async () => {
+      const c = np.matmul(a, b);
+      await c.blockUntilReady();
+      c.dispose();
+    });
 
-  // np.matmul inside jit() routes through tiledMatmul on WebGPU
-  const matmul_jit_2048 = jit((a: np.Array, b: np.Array) => np.matmul(a, b));
-  afterAll(() => matmul_jit_2048.dispose());
+    // np.matmul inside jit() → tiledMatmul with auto-selected tile config
+    const fDef = jit((x: np.Array, y: np.Array) => np.matmul(x, y));
+    afterAll(() => fDef.dispose());
+    bench(`${N} jit(matmul)`, async () => {
+      const c = fDef(a, b);
+      await c.blockUntilReady();
+      c.dispose();
+    });
 
-  bench("2048x2048 jit(tiledMatmul)", async () => {
-    const c = matmul_jit_2048(a2048, b2048);
-    await c.blockUntilReady();
-    c.dispose();
-  });
-
-  const a4096 = random.uniform(random.key(0), [4096, 4096]);
-  const b4096 = random.uniform(random.key(1), [4096, 4096]);
-  await blockUntilReady([a4096, b4096]);
-  afterAll(() => {
-    a4096.dispose();
-    b4096.dispose();
-  });
-
-  bench("4096x4096 eager", async () => {
-    const c = np.matmul(a4096, b4096);
-    await c.blockUntilReady();
-    c.dispose();
-  });
-
-  const matmul_jit_4096 = jit((a: np.Array, b: np.Array) => np.matmul(a, b));
-  afterAll(() => matmul_jit_4096.dispose());
-
-  bench("4096x4096 jit(tiledMatmul)", async () => {
-    const c = matmul_jit_4096(a4096, b4096);
-    await c.blockUntilReady();
-    c.dispose();
-  });
+    // Explicit Br=Bc=16 no threadTile (pre-adaptive baseline)
+    const f16 = jit((x: np.Array, y: np.Array) =>
+      lax.tiledMatmul(x, y, { Br: 16, Bc: 16, Bk: 16 }),
+    );
+    afterAll(() => f16.dispose());
+    bench(`${N} 16×16 (baseline)`, async () => {
+      const c = f16(a, b);
+      await c.blockUntilReady();
+      c.dispose();
+    });
+  }
 });

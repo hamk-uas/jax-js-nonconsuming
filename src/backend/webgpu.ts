@@ -443,6 +443,10 @@ export class WebGPUBackend implements Backend {
       sharedMemory: false,
       multiOutputKernel: true,
       maxComputeWorkgroupSizeX: device.limits.maxComputeWorkgroupSizeX,
+      maxComputeInvocationsPerWorkgroup:
+        device.limits.maxComputeInvocationsPerWorkgroup,
+      maxComputeWorkgroupStorageSize:
+        device.limits.maxComputeWorkgroupStorageSize,
     };
     this.pipelines = new ShaderPipelineCache(device);
     this.syncReader = new SyncReader(device);

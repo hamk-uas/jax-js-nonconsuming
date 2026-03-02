@@ -6,6 +6,7 @@
 const JsArray = globalThis.Array;
 
 import { DType } from "../alu";
+import { type BackendCapabilities, getBackend } from "../backend";
 import {
   Array,
   array as arrayFn,
@@ -797,14 +798,68 @@ function padConcrete(
  * Options for {@link tiledMatmul}.
  */
 export interface TiledMatmulOptions {
-  /** Block size for the output tile rows (default 16). */
+  /** Block size for the output tile rows (default: auto-selected). */
   Br?: number;
-  /** Block size for the output tile columns (default 16). */
+  /** Block size for the output tile columns (default: auto-selected). */
   Bc?: number;
-  /** Block size for the contraction dimension (default 16). */
+  /** Block size for the contraction dimension (default: auto-selected). */
   Bk?: number;
   /** Register tiling: each thread handles threadTile[g] elements per axis. */
   threadTile?: number[];
+}
+
+/**
+ * Choose tile configuration based on device capabilities.
+ *
+ * The candidates are tried from most to least aggressive. Each must satisfy:
+ * - numThreads ≤ maxComputeInvocationsPerWorkgroup
+ * - shmem usage ≤ maxComputeWorkgroupStorageSize
+ *
+ * The candidate list was benchmarked on NVIDIA RTX 4070 and validated against
+ * the WebGPU device limit survey (web3dsurvey.com/webgpu):
+ * - 100% of devices: maxInvocations ≥ 256, shmem ≥ 16384
+ * - 81% of devices: maxInvocations ≥ 1024, shmem ≥ 32768
+ */
+function chooseTileConfig(
+  caps: BackendCapabilities,
+  dtype: DType,
+): Required<Pick<TiledMatmulOptions, "Br" | "Bc" | "Bk">> &
+  Pick<TiledMatmulOptions, "threadTile"> {
+  const maxInvocations = caps.maxComputeInvocationsPerWorkgroup ?? 256;
+  const maxShmem = caps.maxComputeWorkgroupStorageSize ?? 16384;
+  const bytesPerElem = dtype === DType.Float16 ? 2 : 4;
+
+  // Candidates ordered by expected performance (best first).
+  // numThreads = (Br/tt[0]) * (Bc/tt[1])
+  // shmem ≈ (Br*Bk + Bk*Bc) * bytesPerElem + bank padding overhead
+  const candidates: {
+    Br: number;
+    Bc: number;
+    Bk: number;
+    threadTile?: [number, number];
+  }[] = [
+    { Br: 32, Bc: 32, Bk: 16, threadTile: [2, 2] }, // 256 threads, 4 out/thread
+    { Br: 64, Bc: 64, Bk: 16, threadTile: [4, 4] }, // 256 threads, 16 out/thread
+    { Br: 16, Bc: 16, Bk: 16 }, // 256 threads, 1 out/thread (safe fallback)
+  ];
+
+  for (const c of candidates) {
+    const tt = c.threadTile;
+    const numThreads = tt ? (c.Br / tt[0]) * (c.Bc / tt[1]) : c.Br * c.Bc;
+    if (numThreads > maxInvocations) continue;
+
+    // Estimate shmem: A tile + B tile + bank padding (~6% overhead)
+    const tileA = c.Br * c.Bk * bytesPerElem;
+    const tileB = c.Bk * c.Bc * bytesPerElem;
+    const padOverhead = Math.ceil((tileA + tileB) * 0.07);
+    const shmemBytes = tileA + tileB + padOverhead;
+    if (shmemBytes > maxShmem) continue;
+
+    return c;
+  }
+
+  // Ultimate fallback — always fits (256 threads, 2KB shmem)
+  return { Br: 16, Bc: 16, Bk: 16 };
 }
 
 /**
@@ -816,6 +871,9 @@ export interface TiledMatmulOptions {
  *
  * M, N, and K are padded with zeros if not divisible by the tile sizes.
  *
+ * When no explicit tile sizes are provided, the configuration is automatically
+ * selected based on the GPU's compute limits (workgroup size, shared memory).
+ *
  * @param A - Left matrix of shape `[M, K]`.
  * @param B - Right matrix of shape `[K, N]`.
  * @param options - Optional tile size configuration.
@@ -826,7 +884,30 @@ export function tiledMatmul(
   B: Array,
   options?: TiledMatmulOptions,
 ): Array {
-  const { Br = 16, Bc = 16, Bk = 16, threadTile } = options ?? {};
+  // When caller doesn't specify tile sizes, auto-select based on device caps.
+  let resolved: Required<Pick<TiledMatmulOptions, "Br" | "Bc" | "Bk">> &
+    Pick<TiledMatmulOptions, "threadTile">;
+  if (
+    options?.Br !== undefined ||
+    options?.Bc !== undefined ||
+    options?.Bk !== undefined
+  ) {
+    resolved = {
+      Br: options.Br ?? 16,
+      Bc: options.Bc ?? 16,
+      Bk: options.Bk ?? 16,
+      threadTile: options.threadTile,
+    };
+  } else {
+    const caps = getBackend().capabilities;
+    const auto = chooseTileConfig(caps, A.dtype);
+    resolved = {
+      ...auto,
+      // Explicit threadTile overrides auto-selected one
+      threadTile: options?.threadTile ?? auto.threadTile,
+    };
+  }
+  const { Br, Bc, Bk, threadTile } = resolved;
 
   if (A.ndim !== 2 || B.ndim !== 2) {
     throw new Error(
