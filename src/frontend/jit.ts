@@ -2398,10 +2398,17 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
       readIndices.push(AluExp.add(start, outIndices[k]));
     }
 
-    // Convert multi-dim read indices to flat index into operand
-    const [index] = ShapeTracker.fromShape(operandShape).toAluExp(readIndices);
+    // If the operand is a GlobalView, directly replace its indices to avoid
+    // an unravel→ravel roundtrip that creates unsimplifiable expressions.
+    if (operandExp.op === AluOp.GlobalView) {
+      const [gid, st] = operandExp.arg as [number, ShapeTracker];
+      return {
+        exp: [AluExp.globalView(operandExp.dtype, gid, st, readIndices)],
+      };
+    }
 
-    // Substitute gidx in operand expression with computed flat index
+    // Fallback: convert multi-dim read indices to flat index and substitute
+    const [index] = ShapeTracker.fromShape(operandShape).toAluExp(readIndices);
     return { exp: [operandExp.substitute({ gidx: index })] };
   },
   [Primitive.UncheckedDynamicSlice](exps, avals, { sliceSizes }) {
@@ -2419,6 +2426,16 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
       readIndices.push(AluExp.add(start, outIndices[k]));
     }
 
+    // If the operand is a GlobalView, directly replace its indices to avoid
+    // an unravel→ravel roundtrip that creates unsimplifiable expressions.
+    if (operandExp.op === AluOp.GlobalView) {
+      const [gid, st] = operandExp.arg as [number, ShapeTracker];
+      return {
+        exp: [AluExp.globalView(operandExp.dtype, gid, st, readIndices)],
+      };
+    }
+
+    // Fallback: convert multi-dim read indices to flat index and substitute
     const [index] = ShapeTracker.fromShape(operandShape).toAluExp(readIndices);
     return { exp: [operandExp.substitute({ gidx: index })] };
   },

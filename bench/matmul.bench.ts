@@ -2,6 +2,7 @@ import {
   blockUntilReady,
   defaultDevice,
   init,
+  jit,
   numpy as np,
   random,
 } from "@hamk-uas/jax-js-nonconsuming";
@@ -20,8 +21,18 @@ suite.skipIf(!devices.includes("webgpu"))("gpu matmul", async () => {
     b2048.dispose();
   });
 
-  bench("2048x2048", async () => {
+  bench("2048x2048 eager", async () => {
     const c = np.matmul(a2048, b2048);
+    await c.blockUntilReady();
+    c.dispose();
+  });
+
+  // np.matmul inside jit() routes through tiledMatmul on WebGPU
+  const matmul_jit_2048 = jit((a: np.Array, b: np.Array) => np.matmul(a, b));
+  afterAll(() => matmul_jit_2048.dispose());
+
+  bench("2048x2048 jit(tiledMatmul)", async () => {
+    const c = matmul_jit_2048(a2048, b2048);
     await c.blockUntilReady();
     c.dispose();
   });
@@ -34,8 +45,17 @@ suite.skipIf(!devices.includes("webgpu"))("gpu matmul", async () => {
     b4096.dispose();
   });
 
-  bench("4096x4096", async () => {
+  bench("4096x4096 eager", async () => {
     const c = np.matmul(a4096, b4096);
+    await c.blockUntilReady();
+    c.dispose();
+  });
+
+  const matmul_jit_4096 = jit((a: np.Array, b: np.Array) => np.matmul(a, b));
+  afterAll(() => matmul_jit_4096.dispose());
+
+  bench("4096x4096 jit(tiledMatmul)", async () => {
+    const c = matmul_jit_4096(a4096, b4096);
     await c.blockUntilReady();
     c.dispose();
   });
