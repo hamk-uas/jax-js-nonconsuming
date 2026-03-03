@@ -1309,27 +1309,25 @@ This phase details the action plan for tackling the targeted technical debt iden
 earlier phases, specifically making `fori_loop` bounds dynamic and routing `associativeScan`
 entirely through `block_map`.
 
-### 8.1: Add Symbolic Bounds for `fori_loop`
+### 8.1: Add Symbolic Bounds for `fori_loop` ✅ COMPLETED
 
-**Goal:** Allow `fori_loop(lower, upper)` to accept trace-time dynamic lengths (e.g., `SymDim("K")`)
+**Goal:** Allow `fori_loop(lower, upper)` to accept trace-time dynamic lengths (e.g., `SymDim("T")`)
 evaluated as runtime variables, unlocking dynamic loops within compiled shaders without hard-coded
 constants.
 
-- **Frontend Tracing Lift:**
-  - Update `lax.fori_loop` to accept 0-D `JaxArray` scalar tracers for bounds.
-  - Modify internal tracing so `lower` and `upper` are inserted as proper inputs to the
-    `Primitive.ForiLoop` equation, preserving dynamic shapes into the JIT cache.
-- **JitStep Contract Refactor:**
-  - Change the JIT representation of `fori_loop` from holding static numbers (e.g., `lower: number`,
-    `upper: number`) to explicit operand indices/slots tracking the dynamically computed bounds.
-- **WebGPU Codegen Adaptation (`src/backend/webgpu/block-map.ts`):**
-  - Switch WGSL generation from hardcoded string literals to dynamically reading loop boundaries.
-  - If bounds are dynamic, emit code that loads them from the Uniform buffer (or a 1-element storage
-    buffer): `for (var i: i32 = dynamic_lower; i < dynamic_upper; i++)`.
-- **WASM Codegen Adaptation:**
-  - Update `wasmblr` `fori_loop` emission so it initializes its index by reading the `lower` bound
-    pointer from shared memory and evaluates the `upper` boundary continuously on each iteration
-    check.
+**Implementation (commit `1a0db2d`):** Followed scan's existing `number | Dim` pattern rather than
+the originally proposed 0-D tracer approach. This was simpler and sufficient for Phase 8.2's needs.
+
+- `PrimitiveParams[ForiLoop].lower/upper`: `number` → `number | Dim`
+- `lax.foriLoop()` signature widened; early-exit guard conditional on concrete bounds
+- JIT execution: `resolveDim()` resolves symbolic bounds at runtime
+- Eager mode: `concreteDim()` asserts concrete values
+- Transpose rule: `concreteDim()` resolution before loop
+- `block-map.ts` WGSL emission: `concreteDim()` at both emission sites (register-tiled + standard)
+- JVP rule: unchanged (already passes bounds through transparently)
+
+**Tests:** 2 new tests in `test/polymorphic-shapes.test.ts` — symbolic upper bound with multiple
+concrete batch sizes (T=1,3,5 and T=4,6).
 
 ### 8.2: Routing `associativeScan` through `block_map`
 
