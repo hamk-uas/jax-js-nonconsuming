@@ -43,6 +43,16 @@ import { Routine } from "../../routine";
 import { isSymbolicSize } from "../../shape";
 import { DEBUG, mapSetUnion, prod, strip1 } from "../../utils";
 
+/**
+ * Info for remapping a GlobalIndex flat index from body-local strides
+ * to global buffer strides at the AluExp level (enabling simplify()).
+ */
+interface GlobalIndexRemapInfo {
+  bodyShape: number[];
+  bodyStrides: number[];
+  globalStrides: number[];
+}
+
 // ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
@@ -1446,10 +1456,12 @@ export function blockMapFusedShaderSource(
       bufIdx: number,
       indexExpr: string,
       dtype: DType,
+      isGloballyStrided?: boolean,
     ) => string,
     variableOverrides?: Map<string, string>,
     gidxOverride?: AluExp,
     ridxOverride?: AluExp,
+    globalIndexRemap?: Map<number, GlobalIndexRemapInfo>,
   ): (exp: AluExp) => string {
     let gensymCount = 0;
     const gensym = () => `${prefix}_alu${gensymCount++}`;
@@ -1593,8 +1605,48 @@ export function blockMapFusedShaderSource(
         return gen(rewritten);
       } else if (op === AluOp.GlobalIndex) {
         const bufIdx = arg[0] as number;
-        const indexExpr = strip1(gen(src[0]));
-        source = resolveGlobalIndex(bufIdx, indexExpr, dtype);
+        // When globalIndexRemap is provided for this buffer, remap the flat
+        // index from body-local to global strides at the AluExp level.
+        // This lets simplify() eliminate redundant div/mod (e.g.
+        // (a*C+b)/C → a) which string-level inRemap cannot do.
+        const remap = globalIndexRemap?.get(bufIdx);
+        if (remap) {
+          // Correction-based remap: global_flat = body_flat + correction
+          // where correction = sum_d(coord_d * (globalStride_d - bodyStride_d))
+          // for each dimension where strides differ.
+          //
+          // This avoids the Mod-based decomposition that string-level inRemap
+          // uses, which creates unsimplifiable expressions. The Idiv extraction
+          // benefits from simplify_remainder (e.g. (a*C+b)/C → a when b<C).
+          // Equal-stride dimensions (typically the trailing dim) need no work.
+          const flatIdx = src[0];
+          const nd = remap.bodyShape.length;
+          let correction: AluExp | null = null;
+          for (let d = 0; d < nd; d++) {
+            const strideDiff = remap.globalStrides[d] - remap.bodyStrides[d];
+            if (strideDiff === 0) continue;
+            let coord: AluExp;
+            if (d === 0) {
+              // Leading dim: no mod needed (flat index is in-range)
+              coord = AluExp.idiv(flatIdx, AluExp.i32(remap.bodyStrides[d]));
+            } else {
+              coord = AluExp.mod(
+                AluExp.idiv(flatIdx, AluExp.i32(remap.bodyStrides[d])),
+                AluExp.i32(remap.bodyShape[d]),
+              );
+            }
+            const term = AluExp.mul(coord, AluExp.i32(strideDiff));
+            correction = correction ? AluExp.add(correction, term) : term;
+          }
+          const remapped = correction
+            ? AluExp.add(flatIdx, correction).simplify()
+            : flatIdx;
+          const indexExpr = strip1(gen(remapped));
+          source = resolveGlobalIndex(bufIdx, indexExpr, dtype, true);
+        } else {
+          const indexExpr = strip1(gen(src[0]));
+          source = resolveGlobalIndex(bufIdx, indexExpr, dtype);
+        }
         if (dtype === DType.Bool) source = `(${source} != 0)`;
       }
 
@@ -1912,7 +1964,12 @@ export function blockMapFusedShaderSource(
           privateVarNames: Map<JitId, string> | null,
           bankPadMap?: Map<JitId, number>,
         ) =>
-        (bufIdx: number, indexExpr: string, dtype: DType): string => {
+        (
+          bufIdx: number,
+          indexExpr: string,
+          dtype: DType,
+          isGloballyStrided?: boolean,
+        ): string => {
           if (privateVarNames) {
             const jitId = bStep.inputs[bufIdx];
             const privName = privateVarNames.get(jitId);
@@ -1924,7 +1981,11 @@ export function blockMapFusedShaderSource(
           if (info.isGlobal) {
             const inputIdx = info.parentInputIdx;
             if (inputIdx >= 0) {
-              const remapped = inRemap(inputIdx, indexExpr);
+              // When isGloballyStrided, the index was already remapped at the
+              // AluExp level by createGen's globalIndexRemap — skip string inRemap.
+              const remapped = isGloballyStrided
+                ? indexExpr
+                : inRemap(inputIdx, indexExpr);
               const readExpr = `${info.name}[i32(in_base_${inputIdx}) + ${remapped}]`;
               return hasBoundary
                 ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
@@ -1972,6 +2033,32 @@ export function blockMapFusedShaderSource(
           }
         }
         return bStepInputInfo;
+      };
+
+      // Build AluExp-level GlobalIndex remap info for a body step.
+      // For global inputs where body strides differ from buffer strides,
+      // provides the shape/strides so createGen can remap at the AluExp level
+      // (where simplify() can eliminate redundant div/mod).
+      const buildStepRemap = (
+        bStepInputInfo: typeof bodyInputInfo,
+      ): Map<number, GlobalIndexRemapInfo> | undefined => {
+        let remap: Map<number, GlobalIndexRemapInfo> | undefined;
+        for (let j = 0; j < bStepInputInfo.length; j++) {
+          const info = bStepInputInfo[j];
+          if (
+            info.isGlobal &&
+            info.parentInputIdx >= 0 &&
+            inNeedsRemap[info.parentInputIdx]
+          ) {
+            remap ??= new Map();
+            remap.set(j, {
+              bodyShape: inBodyShapes[info.parentInputIdx],
+              bodyStrides: inBodyStrides[info.parentInputIdx],
+              globalStrides: inBufStrides[info.parentInputIdx],
+            });
+          }
+        }
+        return remap;
       };
 
       const useRegisterTiling = !!(threadTile && fl.privateShmemIds.size > 0);
@@ -2239,6 +2326,10 @@ export function blockMapFusedShaderSource(
               bKernel,
               `fl${entry.flIdx}_s${bsi}`,
               makeBodyResolve(bStepInputInfo, bStep, null, fl.shmemBankPad),
+              undefined,
+              undefined,
+              undefined,
+              buildStepRemap(bStepInputInfo),
             );
             const outId = bStep.outputs[0];
             const rhs = strip1(gen(bKernel.outputs[0].exp));
@@ -2271,6 +2362,8 @@ export function blockMapFusedShaderSource(
                 ),
                 undefined,
                 structuredGidx,
+                undefined,
+                buildStepRemap(bStepInputInfo),
               );
 
               const isIdentityEpilogue =
@@ -2392,6 +2485,8 @@ export function blockMapFusedShaderSource(
                     ),
                     new Map([["acc", `${accArrName}[_rt_idx]`]]),
                     structuredGidx,
+                    undefined,
+                    buildStepRemap(bStepInputInfo),
                   );
                   finalValue = strip1(epilogueGen(bRe.epilogue));
                 }
@@ -2431,6 +2526,8 @@ export function blockMapFusedShaderSource(
                 ),
                 undefined,
                 structuredGidx,
+                undefined,
+                buildStepRemap(bStepInputInfo),
               );
               for (let oi = 0; oi < bKernel.numOutputs; oi++) {
                 const outId = bStep.outputs[oi];
@@ -2464,6 +2561,10 @@ export function blockMapFusedShaderSource(
               bKernel,
               `fl${entry.flIdx}_s${bsi}`,
               makeBodyResolve(bStepInputInfo, bStep, null, fl.shmemBankPad),
+              undefined,
+              undefined,
+              undefined,
+              buildStepRemap(bStepInputInfo),
             );
             for (let oi = 0; oi < bKernel.numOutputs; oi++) {
               const outId = bStep.outputs[oi];
@@ -2598,6 +2699,10 @@ export function blockMapFusedShaderSource(
             bKernel,
             `fl${entry.flIdx}_s${bsi}`,
             makeBodyResolve(bStepInputInfo, bStep, null),
+            undefined,
+            undefined,
+            undefined,
+            buildStepRemap(bStepInputInfo),
           );
 
           // Check for per-thread contraction (reduction kernel)
@@ -2636,6 +2741,9 @@ export function blockMapFusedShaderSource(
                 `${prefix}_ep`,
                 makeBodyResolve(bStepInputInfo, bStep, null),
                 new Map([["acc", accName]]),
+                undefined,
+                undefined,
+                buildStepRemap(bStepInputInfo),
               );
               finalValue = strip1(epilogueGen(bRe.epilogue));
             }
