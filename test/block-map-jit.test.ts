@@ -1942,3 +1942,196 @@ describe("O4: register-tiled tiledMatmul", () => {
     expect(g_tiled).toBeAllclose(g_ref, { atol: 1e-3 });
   });
 });
+
+// ---------------------------------------------------------------------------
+// T7: Phase 5 — Blocked AssociativeScan
+//
+// Tests for compiled-loop-blocked (WASM) and webgpu-fused-blocked paths.
+// The blocked path is the default for both backends (B=256 per block).
+// Critical new coverage: N > B forces multi-block decomposition where
+// summary-scan (level 2) and apply (level 3) actually execute.
+// ---------------------------------------------------------------------------
+describe("lax.associativeScan — blocked path (Phase 5)", () => {
+  const add = (a: np.Array, b: np.Array) => np.add(a, b);
+  const maxFn = (a: np.Array, b: np.Array) => np.maximum(a, b);
+
+  // T7.1: N=64 (M=1, single block) — levels 2-3 are zero iterations.
+  // Serves as a sanity baseline for the blocked path.
+  test("T7.1: N=64 cumsum (M=1) exact values", () => {
+    const f = jit((xs: np.Array) => lax.associativeScan(add, xs));
+    using xs = np.ones([64], { dtype: DType.Float32 });
+    using result = f(xs) as np.Array;
+    const data = result.js() as number[];
+    expect(data.length).toBe(64);
+    expect(data[0]).toBe(1);
+    expect(data[63]).toBe(64);
+    f.dispose();
+  });
+
+  // T7.2: N=1024 (M=4) — exercises summary scan (level 2) and apply (level 3).
+  // This is the key multi-block correctness test.
+  test("T7.2: N=1024 cumsum (M=4) verifies cross-block carry propagation", () => {
+    const f = jit((xs: np.Array) => lax.associativeScan(add, xs));
+    using xs = np.ones([1024], { dtype: DType.Float32 });
+    using result = f(xs) as np.Array;
+    const data = result.js() as number[];
+    expect(data.length).toBe(1024);
+    expect(data[0]).toBe(1);
+    expect(data[255]).toBe(256); // end of block 0
+    expect(data[256]).toBe(257); // carry from block 0 applied to block 1
+    expect(data[511]).toBe(512); // end of block 1
+    expect(data[512]).toBe(513); // carry from blocks 0+1 applied to block 2
+    expect(data[1023]).toBe(1024); // final element
+    f.dispose();
+  });
+
+  // T7.3: N=4096 (M=16) — stress test, verifies multi-level carry application.
+  test("T7.3: N=4096 cumsum (M=16) boundary values correct", () => {
+    const f = jit((xs: np.Array) => lax.associativeScan(add, xs));
+    using xs = np.ones([4096], { dtype: DType.Float32 });
+    using result = f(xs) as np.Array;
+    const data = result.js() as number[];
+    expect(data.length).toBe(4096);
+    expect(data[255]).toBe(256); // end of block 0
+    expect(data[256]).toBe(257); // first element of block 1 with carry
+    expect(data[767]).toBe(768); // end of block 2 (3 * 256 - 1)
+    expect(data[768]).toBe(769); // first element of block 3 with carry
+    expect(data[4095]).toBe(4096); // final element
+    f.dispose();
+  });
+
+  // T7.4: Non-divisible N crossing a block boundary (N=300, last block 44 elems).
+  test("T7.4: N=300 (non-divisible, M=2) handles partial last block", () => {
+    const f = jit((xs: np.Array) => lax.associativeScan(add, xs));
+    using xs = np.ones([300], { dtype: DType.Float32 });
+    using result = f(xs) as np.Array;
+    const data = result.js() as number[];
+    expect(data.length).toBe(300);
+    expect(data[0]).toBe(1);
+    expect(data[255]).toBe(256); // end of block 0
+    expect(data[256]).toBe(257); // carry applied to partial block 1
+    expect(data[299]).toBe(300); // last element of partial block
+    f.dispose();
+  });
+
+  // T7.5: Non-add operator — maximum.
+  // Crafted input proves carry propagation: block 0 ends at 500,
+  // all of block 1 must become 500 after carry application.
+  test("T7.5: cumulative max (N=300) verifies non-add operator carry propagation", () => {
+    const f = jit((xs: np.Array) => lax.associativeScan(maxFn, xs));
+    // values: [1, 1, ..., 1, 500, 1, 1, ..., 1]
+    //          ^-- block 0 (256) ---^  ^-- block 1 (44) --^
+    // Local cummax of block 0 = [1, ..., 1, 500]
+    // Local cummax of block 1 = [1, ..., 1]
+    // After applying carry 500: block 1 = [500, 500, ..., 500]
+    const values = new Float32Array(300);
+    values.fill(1.0);
+    values[255] = 500.0; // peak at end of block 0
+    using xs = np.array(values, { dtype: DType.Float32 });
+    using result = f(xs) as np.Array;
+    const data = result.js() as number[];
+    expect(data.length).toBe(300);
+    // Block 0: cummax stays 1 until the peak at index 255
+    expect(data[0]).toBe(1);
+    expect(data[254]).toBe(1);
+    expect(data[255]).toBe(500);
+    // Block 1: carry 500 applied to all elements (all < 500)
+    for (let i = 256; i < 300; i++) {
+      expect(data[i]).toBe(500);
+    }
+    f.dispose();
+  });
+
+  // T7.6: grad(sum(cumsum(xs))) at N=512 (2 blocks).
+  // Verifies AD is correct through the blocked path.
+  // Analytical gradient: grad[i] = N - i (0-indexed).
+  test("T7.6: grad(sum(cumsum)) N=512 (M=2) matches analytical gradient", () => {
+    const N = 512;
+    // f(xs) = sum(cumsum(xs)) = sum_j((N-j) * xs[j])
+    // grad[j] = N - j  (0-indexed, grad[0]=N, grad[N-1]=1)
+    const sumCumsum = jit(
+      grad((x: np.Array) => {
+        using scan = lax.associativeScan(add, x);
+        return np.sum(scan);
+      }),
+    );
+    using xs = np.ones([N], { dtype: DType.Float32 });
+    using g = sumCumsum(xs) as np.Array;
+    const data = g.js() as number[];
+    expect(data.length).toBe(N);
+    expect(data[0]).toBe(N); // grad[0] = N
+    expect(data[1]).toBe(N - 1); // grad[1] = N-1
+    expect(data[N - 1]).toBe(1); // grad[N-1] = 1
+    sumCumsum.dispose();
+  });
+
+  // T7.7: Polymorphic N — jit with dynamic_axes compiles one WASM module
+  // reused for N=100 (M=1) and N=400 (M=2, multi-block).
+  test("T7.7: polymorphic N — same compiled module handles N=100 and N=400", () => {
+    const f = jit((xs: np.Array) => lax.associativeScan(add, xs), {
+      dynamic_axes: { 0: "T" },
+    });
+
+    // N=100 (single block, M=1)
+    using xs1 = np.ones([100], { dtype: DType.Float32 });
+    using result1 = f(xs1) as np.Array;
+    const data1 = result1.js() as number[];
+    expect(data1.length).toBe(100);
+    expect(data1[0]).toBe(1);
+    expect(data1[99]).toBe(100);
+
+    // N=400 (M=2, multi-block) — same compiled module reused
+    using xs2 = np.ones([400], { dtype: DType.Float32 });
+    using result2 = f(xs2) as np.Array;
+    const data2 = result2.js() as number[];
+    expect(data2.length).toBe(400);
+    expect(data2[255]).toBe(256); // carry from block 0 applied to block 1
+    expect(data2[399]).toBe(400); // final element
+
+    f.dispose();
+  });
+
+  // T7.2+T7.4 on WebGPU: verify webgpu-fused-blocked path.
+  test("T7-WebGPU: N=1024 and N=300 cumsum correct on WebGPU", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+
+    const f = jit((xs: np.Array) => lax.associativeScan(add, xs));
+
+    // N=1024 (M=4)
+    using xs1 = np.ones([1024], { dtype: DType.Float32 });
+    using r1 = f(xs1) as np.Array;
+    const d1 = r1.js() as number[];
+    expect(d1[255]).toBe(256);
+    expect(d1[256]).toBe(257);
+    expect(d1[1023]).toBe(1024);
+
+    // N=300 (M=2, non-divisible)
+    using xs2 = np.ones([300], { dtype: DType.Float32 });
+    using r2 = f(xs2) as np.Array;
+    const d2 = r2.js() as number[];
+    expect(d2[255]).toBe(256);
+    expect(d2[256]).toBe(257);
+    expect(d2[299]).toBe(300);
+
+    f.dispose();
+  });
+
+  // T7.5 on WebGPU: verify non-add carry propagation on GPU path.
+  test("T7.5-WebGPU: cumulative max (N=300) carry propagation on WebGPU", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+
+    const f = jit((xs: np.Array) => lax.associativeScan(maxFn, xs));
+    const values = new Float32Array(300);
+    values.fill(1.0);
+    values[255] = 500.0;
+    using xs = np.array(values, { dtype: DType.Float32 });
+    using result = f(xs) as np.Array;
+    const data = result.js() as number[];
+    expect(data[255]).toBe(500);
+    expect(data[256]).toBe(500); // carry applied
+    expect(data[299]).toBe(500);
+    f.dispose();
+  });
+});
