@@ -1,9 +1,9 @@
 /**
  * Dual-GPU matmul benchmark: sweeps N×N sizes across tile configs.
  *
- * NVIDIA (with fp16): pnpm vitest run test/intel-matmul.test.ts -c test/vitest.nvidia.config.ts
- * Intel iGPU:         pnpm vitest run test/intel-matmul.test.ts -c test/vitest.intel.config.ts
- * Default config:     pnpm vitest run test/intel-matmul.test.ts --testTimeout=300000
+ * Both GPUs:  scripts/gpu-test.sh run test/gpu-bench.test.ts
+ * NVIDIA:     pnpm vitest run test/gpu-bench.test.ts -c test/vitest.nvidia.config.ts
+ * Intel:      pnpm vitest run test/gpu-bench.test.ts -c test/vitest.intel.config.ts
  */
 import {
   blockUntilReady,

@@ -706,6 +706,15 @@ export class AluExp implements FpHashable {
     }
 
     // Shape tracking ops (can be made more general).
+    // x / C => 0  (when x ∈ [0, C-1])
+    if (
+      op === AluOp.Idiv &&
+      src[1].op === AluOp.Const &&
+      src[0].min >= 0 &&
+      src[0].max < src[1].arg
+    ) {
+      return AluExp.const(this.dtype, 0);
+    }
     // x % C => x
     if (
       op === AluOp.Mod &&

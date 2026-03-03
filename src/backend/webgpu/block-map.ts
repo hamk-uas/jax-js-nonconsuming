@@ -1457,11 +1457,13 @@ export function blockMapFusedShaderSource(
       indexExpr: string,
       dtype: DType,
       isGloballyStrided?: boolean,
+      bankPadApplied?: boolean,
     ) => string,
     variableOverrides?: Map<string, string>,
     gidxOverride?: AluExp,
     ridxOverride?: AluExp,
     globalIndexRemap?: Map<number, GlobalIndexRemapInfo>,
+    bankPadDims?: Map<number, number>,
   ): (exp: AluExp) => string {
     let gensymCount = 0;
     const gensym = () => `${prefix}_alu${gensymCount++}`;
@@ -1481,6 +1483,33 @@ export function blockMapFusedShaderSource(
     const gidxBound =
       gidxOverride ?? AluExp.special(DType.Int32, "gidx", kernelSize);
     const simplifiedMap = new Map<AluExp, AluExp>();
+    // O11b: AluExp-level bank-pad rewrite. For bank-padded shmem
+    // buffers, transform GlobalIndex flat index from `idx` to
+    // `idx + Idiv(idx, innerDim)`. After substitute(gidx → structuredGidx),
+    // the simplifier proves Idiv(row*D+col, D) = row (via range bounds),
+    // yielding row*(D+1)+col — eliminating integer division from the
+    // inner loop entirely.
+    const bankPadRewrite = bankPadDims
+      ? (exp: AluExp): AluExp | undefined => {
+          if (exp.op === AluOp.GlobalIndex) {
+            const bufIdx = exp.arg[0] as number;
+            const innerDim = bankPadDims.get(bufIdx);
+            if (innerDim !== undefined) {
+              const flatIdx = exp.src[0];
+              const paddedIdx = AluExp.add(
+                flatIdx,
+                AluExp.idiv(flatIdx, AluExp.i32(innerDim)),
+              );
+              return AluExp.globalIndex(
+                exp.dtype,
+                bufIdx,
+                exp.arg[1] as number,
+                paddedIdx,
+              );
+            }
+          }
+        }
+      : undefined;
     for (const output of kernel.outputs) {
       const vars: Record<string, AluExp> = { gidx: gidxBound };
       if (output.reduction && !isSymbolicSize(output.reduction.size)) {
@@ -1490,18 +1519,15 @@ export function blockMapFusedShaderSource(
           ridxOverride ??
           AluExp.special(DType.Int32, "ridx", output.reduction.size as number);
       }
-      simplifiedMap.set(
-        output.exp,
-        output.exp.substitute(vars).rewriteGlobalViews().simplify(),
-      );
+      let processed = output.exp.substitute(vars).rewriteGlobalViews();
+      if (bankPadRewrite) processed = processed.rewrite(bankPadRewrite);
+      simplifiedMap.set(output.exp, processed.simplify());
       if (output.reduction) {
-        simplifiedMap.set(
-          output.reduction.epilogue,
-          output.reduction.epilogue
-            .substitute({ gidx: gidxBound })
-            .rewriteGlobalViews()
-            .simplify(),
-        );
+        let procEpilogue = output.reduction.epilogue
+          .substitute({ gidx: gidxBound })
+          .rewriteGlobalViews();
+        if (bankPadRewrite) procEpilogue = procEpilogue.rewrite(bankPadRewrite);
+        simplifiedMap.set(output.reduction.epilogue, procEpilogue.simplify());
       }
     }
 
@@ -1642,10 +1668,22 @@ export function blockMapFusedShaderSource(
             ? AluExp.add(flatIdx, correction).simplify()
             : flatIdx;
           const indexExpr = strip1(gen(remapped));
-          source = resolveGlobalIndex(bufIdx, indexExpr, dtype, true);
+          source = resolveGlobalIndex(
+            bufIdx,
+            indexExpr,
+            dtype,
+            true,
+            bankPadDims?.has(bufIdx),
+          );
         } else {
           const indexExpr = strip1(gen(src[0]));
-          source = resolveGlobalIndex(bufIdx, indexExpr, dtype);
+          source = resolveGlobalIndex(
+            bufIdx,
+            indexExpr,
+            dtype,
+            undefined,
+            bankPadDims?.has(bufIdx),
+          );
         }
         if (dtype === DType.Bool) source = `(${source} != 0)`;
       }
@@ -1969,6 +2007,7 @@ export function blockMapFusedShaderSource(
           indexExpr: string,
           dtype: DType,
           isGloballyStrided?: boolean,
+          bankPadApplied?: boolean,
         ): string => {
           if (privateVarNames) {
             const jitId = bStep.inputs[bufIdx];
@@ -1994,7 +2033,8 @@ export function blockMapFusedShaderSource(
             return `${info.name}[${indexExpr}]`;
           }
           // O11: bank-padded shmem read with CSE for complex index expressions
-          if (bankPadMap) {
+          // O11b: skip string-level bank-pad when already applied at AluExp level
+          if (bankPadMap && !bankPadApplied) {
             const jitId = bStep.inputs[bufIdx];
             const innerDim = bankPadMap.get(jitId);
             if (innerDim !== undefined) {
@@ -2062,6 +2102,22 @@ export function blockMapFusedShaderSource(
       };
 
       const useRegisterTiling = !!(threadTile && fl.privateShmemIds.size > 0);
+
+      // O11b: Build bufIdx → innerDim map for AluExp-level bank-pad rewrite.
+      const buildStepBankPad = (
+        bStep: Extract<JitStep, { type: "execute" }>,
+      ): Map<number, number> | undefined => {
+        if (!fl.shmemBankPad) return undefined;
+        let dims: Map<number, number> | undefined;
+        for (let j = 0; j < bStep.inputs.length; j++) {
+          const innerDim = fl.shmemBankPad.get(bStep.inputs[j]);
+          if (innerDim !== undefined) {
+            dims ??= new Map();
+            dims.set(j, innerDim);
+          }
+        }
+        return dims;
+      };
 
       if (useRegisterTiling) {
         // ==============================================================
@@ -2330,6 +2386,7 @@ export function blockMapFusedShaderSource(
               undefined,
               undefined,
               buildStepRemap(bStepInputInfo),
+              buildStepBankPad(bStep),
             );
             const outId = bStep.outputs[0];
             const rhs = strip1(gen(bKernel.outputs[0].exp));
@@ -2364,6 +2421,7 @@ export function blockMapFusedShaderSource(
                 structuredGidx,
                 undefined,
                 buildStepRemap(bStepInputInfo),
+                buildStepBankPad(bStep),
               );
 
               const isIdentityEpilogue =
@@ -2487,6 +2545,7 @@ export function blockMapFusedShaderSource(
                     structuredGidx,
                     undefined,
                     buildStepRemap(bStepInputInfo),
+                    buildStepBankPad(bStep),
                   );
                   finalValue = strip1(epilogueGen(bRe.epilogue));
                 }
@@ -2528,6 +2587,7 @@ export function blockMapFusedShaderSource(
                 structuredGidx,
                 undefined,
                 buildStepRemap(bStepInputInfo),
+                buildStepBankPad(bStep),
               );
               for (let oi = 0; oi < bKernel.numOutputs; oi++) {
                 const outId = bStep.outputs[oi];
@@ -2565,6 +2625,7 @@ export function blockMapFusedShaderSource(
               undefined,
               undefined,
               buildStepRemap(bStepInputInfo),
+              buildStepBankPad(bStep),
             );
             for (let oi = 0; oi < bKernel.numOutputs; oi++) {
               const outId = bStep.outputs[oi];

@@ -130,7 +130,8 @@ export async function measurePerf(): Promise<PerfResults> {
   } else if (isGoodGpu) {
     gpuDim = isMobile ? 1024 : 2048;
   } else if (isIntelArc) {
-    gpuDim = 1024;
+    // Intel Arc (xe-lpg, xe-hpg) handles 2048 comfortably (~25ms/iter).
+    gpuDim = isMobile ? 1024 : 2048;
   } else if (isIntel) {
     // Intel UHD / Iris iGPUs — keep it light to avoid device-lost.
     gpuDim = 512;

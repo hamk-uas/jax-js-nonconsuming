@@ -85,8 +85,8 @@ export default defineConfig({
       "tmp/**",
       // Performance benchmarks, not correctness tests:
       "test/scan-bench.test.ts",
-      // GPU-specific benchmarks (run manually with dedicated configs):
-      "test/intel-matmul.test.ts",
+      // GPU-specific benchmarks (run with scripts/gpu-test.sh):
+      "test/gpu-bench.test.ts",
       "test/debug-wgsl.test.ts",
       "test/vitest.nvidia.config.ts",
       "test/vitest.intel.config.ts",

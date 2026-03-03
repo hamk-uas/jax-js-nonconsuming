@@ -116,13 +116,41 @@ pnpm vitest bench bench/<file>     # run benchmarks
 pnpm -C website dev                # local dev server
 ```
 
+**Dual-GPU testing** — this machine has both NVIDIA RTX 4070 Ti SUPER (TB3 eGPU) and Intel Arc
+(iGPU). WebGPU tests and benchmarks should always run on both unless there's a specific reason not
+to. GPU selection happens at Chromium launch time via Vulkan driver flags, so each GPU requires a
+separate vitest config.
+
+```bash
+# Run tests on both GPUs (default):
+scripts/gpu-test.sh run test/gpu-bench.test.ts
+pnpm run test:gpu                  # all tests, both GPUs
+
+# Run benchmarks on both GPUs:
+scripts/gpu-test.sh bench bench/matmul.bench.ts
+pnpm run bench:gpu                 # all benches, both GPUs
+
+# Single GPU:
+GPU=nvidia scripts/gpu-test.sh run test/gpu-bench.test.ts
+GPU=intel  scripts/gpu-test.sh bench bench/sort.bench.ts
+pnpm run test:gpu:nvidia           # all tests, NVIDIA only
+pnpm run bench:gpu:intel           # all benches, Intel only
+
+# Or use configs directly:
+pnpm vitest run <file> -c test/vitest.nvidia.config.ts
+pnpm vitest run <file> -c test/vitest.intel.config.ts
+```
+
+**GPU config architecture:** `test/gpu-config.ts` is the shared factory;
+`test/vitest.nvidia.config.ts` and `test/vitest.intel.config.ts` are thin wrappers. Intel needs
+`VK_DRIVER_FILES` to bypass NVIDIA's default Vulkan adapter priority. Intel OOMs on 4096×4096 —
+bench files must handle this gracefully.
+
 **Pre-commit CI checks**: Husky runs `lint-staged`, then full Vitest. Before commit:
 
 ```bash
 pnpm build && pnpm check && pnpm test
 ```
-
-**Tests import from `dist/`, not `src/`** — source edits are invisible to Vitest until `pnpm build`.
 
 **Debug logging** — use `setDebug(level)` (not env vars):
 
@@ -587,3 +615,4 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Phase 1 carry snapshot fusion                   | Same-gidx deps in single fused shader; avoids N×S dispatch overhead    |
 | Phase 2 preencoded-multi-step                   | Cross-element deps as N×S dispatches in 1 submit                       |
 | Phase 3 preencoded routine support              | Non-Sort routines in preencoded-multi-step                             |
+| GPU config factory (`gpu-config.ts`)            | DRY NVIDIA/Intel configs; thin wrappers over shared launch args        |
