@@ -327,7 +327,7 @@ function fori_loop<C extends ArrayOrPytree>(
 // Note: `lower` and `upper` are concrete `number` values, resolved at trace time.
 // Phase 4 tiled matmul uses `K / Bk` as `upper`, where K is always concrete after
 // pre-padding to a multiple of Bk. Supporting symbolic (SymDim) bounds is deferred
-// to a future phase if needed — it would require the WGSL `for` loop to accept a
+// to Phase 8 — it requires the WGSL `for` loop to accept a
 // runtime uniform for `upper`, which is straightforward but out of initial scope.
 ```
 
@@ -953,9 +953,9 @@ and confirmed no regressions.
 **Future consolidation opportunity:** The standalone codegen (~2,844 LOC across both backends) could
 be replaced by routing through the `block_map` fused shader infrastructure, which already handles
 `WorkgroupAssociativeScan`. This would delete substantial code and let block_map optimizations (bank
-padding, manual unrolling) benefit assocScan automatically. Deferred because it requires adding
-dynamic grid (polymorphic N) support to the block_map shader compiler and constructing synthetic
-JitPrograms programmatically — high effort, moderate benefit, regression risk.
+padding, manual unrolling) benefit assocScan automatically. Deferred to Phase 8 because it requires
+adding dynamic grid (polymorphic N) support to the block_map shader compiler and constructing
+synthetic JitPrograms programmatically — high effort, moderate benefit, regression risk.
 
 ### 5.1: Decomposition
 
@@ -1301,6 +1301,62 @@ dispatch retained for small matrices where it's faster.
 
 ---
 
+---
+
+## Phase 8: Deferred Debt Resolution (Planned)
+
+This phase details the action plan for tackling the targeted technical debt identified during
+earlier phases, specifically making `fori_loop` bounds dynamic and routing `associativeScan`
+entirely through `block_map`.
+
+### 8.1: Add Symbolic Bounds for `fori_loop`
+
+**Goal:** Allow `fori_loop(lower, upper)` to accept trace-time dynamic lengths (e.g., `SymDim("K")`)
+evaluated as runtime variables, unlocking dynamic loops within compiled shaders without hard-coded
+constants.
+
+- **Frontend Tracing Lift:**
+  - Update `lax.fori_loop` to accept 0-D `JaxArray` scalar tracers for bounds.
+  - Modify internal tracing so `lower` and `upper` are inserted as proper inputs to the
+    `Primitive.ForiLoop` equation, preserving dynamic shapes into the JIT cache.
+- **JitStep Contract Refactor:**
+  - Change the JIT representation of `fori_loop` from holding static numbers (e.g., `lower: number`,
+    `upper: number`) to explicit operand indices/slots tracking the dynamically computed bounds.
+- **WebGPU Codegen Adaptation (`src/backend/webgpu/block-map.ts`):**
+  - Switch WGSL generation from hardcoded string literals to dynamically reading loop boundaries.
+  - If bounds are dynamic, emit code that loads them from the Uniform buffer (or a 1-element storage
+    buffer): `for (var i: i32 = dynamic_lower; i < dynamic_upper; i++)`.
+- **WASM Codegen Adaptation:**
+  - Update `wasmblr` `fori_loop` emission so it initializes its index by reading the `lower` bound
+    pointer from shared memory and evaluates the `upper` boundary continuously on each iteration
+    check.
+
+### 8.2: Routing `associativeScan` through `block_map`
+
+**Goal:** Delete the ~2,844 LOC of custom, standalone blocked associative scan codegen in WASM and
+WebGPU by executing the Blelloch decomposition natively via the `block_map` infrastructure.
+
+- **Polymorphic Dispatch Support for `block_map`:**
+  - `associativeScan` supports symbolic inputs (`N` as `SymDim`), so the number of blocks
+    `M = ceil(N / blockSize)` isn't known until execution time.
+  - Update the `block_map` compiler (WebGPU dynamic uniform population and WASM param binding) to
+    calculate grid sizes and loop allocations at runtime via uniforms instead of static compile-time
+    folding.
+- **Expand `Primitive.AssociativeScan`:**
+  - At JIT compile-time (or an early IR lowering pass), rewrite `AssociativeScan` into an explicit
+    sequence of sub-primitives:
+    1.  **Local Scans:** Execute `Primitive.BlockMap` mapping `lax.workgroupAssociativeScan` over
+        blocks to extract local scans and block summaries.
+    2.  **Global Summaries:** Dispatch recursive `associativeScan` (or sequentially loop for small
+        $M$) over the summaries.
+    3.  **Apply Phase:** Issue a second `Primitive.BlockMap` mapping a small kernel to inject
+        $Summary_{i-1}$ prefix totals into the blocks.
+- **Verification and Deletion:**
+  - Validate against the comprehensive T7 Phase 5 Test Matrix.
+  - Once fully green, delete the legacy standalone `codegenBlockedAssociativeScan` and
+    `dispatchBlockedAssociativeScan` functionality in both backends, permanently reducing technical
+    debt.
+
 ## Consolidated Test Matrix
 
 This section collects every test case from Phases 0–5 into a single matrix, organized by category.
@@ -1502,6 +1558,7 @@ against.
 | Phase 5                | AssociativeScan lowering (late lowering)                                   | ~360       | Phase 3      |
 | Phase 6                | Flash attention, LayerNorm, SSM, routines                                  | Future     | Phase 3      |
 | Phase 7                | Code deletion (conditional)                                                | -1,074+    | Phase 4/5    |
+| Phase 8                | Routing associativeScan to block_map & dynamic fori_loop bounds (Planned)  | -2,844+    | Phase 5, 1b  |
 | **Total (Phases 0–5)** |                                                                            | **~2,139** |              |
 | **Net after Phase 7**  |                                                                            | **~1,065** |              |
 
@@ -1518,7 +1575,8 @@ against.
 5. **Phase 3** — The shared-memory compiler. The hard part. Ship 1D first.
 6. **Phase 4** — Tiled matmul. The biggest single performance win in the project.
 7. **Phase 5** — AssocScan lowering. Architectural cleanup.
-8. Phase 6/7 — Future, gated on maturity.
+8. **Phase 6/7** — Future additions / completed cleanups.
+9. **Phase 8** — Resolve associativeScan and fori_loop technical debt.
 
 ---
 
