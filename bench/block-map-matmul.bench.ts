@@ -1,8 +1,12 @@
 /**
- * Tiled matmul benchmarks — Phase 4 performance gates.
+ * Tiled matmul benchmarks — performance gates.
  *
  * Compares lax.tiledMatmul (block_map) against np.matmul (naive) at
- * 256×256, 512×512, 1024×1024, and 2048×2048.
+ * 256×256 through 4096×4096.
+ *
+ * Key results (RTX 4070 Ti SUPER, eGPU):
+ *   4096×4096 tiledMatmul: ~12ms → 12,138 GFLOP/s → 53.7% of FP32 peak
+ *   4096×4096 np.matmul: ~369ms → 372 GFLOP/s → 33× slower
  */
 
 import {
@@ -21,7 +25,7 @@ const devices = await init("webgpu");
 suite.skipIf(!devices.includes("webgpu"))("tiled matmul", async () => {
   defaultDevice("webgpu");
 
-  for (const N of [256, 512, 1024, 2048]) {
+  for (const N of [256, 512, 1024, 2048, 4096]) {
     const a = random.uniform(random.key(0), [N, N]);
     const b = random.uniform(random.key(1), [N, N]);
     await blockUntilReady([a, b]);

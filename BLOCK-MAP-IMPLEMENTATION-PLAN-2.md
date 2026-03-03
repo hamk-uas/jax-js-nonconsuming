@@ -6,9 +6,12 @@ shared-memory GPU kernels**. Tiles data into blocks, applies a body sub-jaxpr pe
 flash attention, fused normalization, workgroup-local scans, and eventually replacing hand-written
 WGSL routines.
 
-**Status:** Plan. Not yet implemented. Reviewed Feb 2026; v2.2 incorporates review feedback on
-matmul lowering, pattern detection, barrier placement, memory discipline, `fori_loop` primitive,
-separate input/output types, and workgroup size constraints.
+**Status:** ✅ **COMPLETE** — Phases 0-5 implemented. Phases 7 (assocScan) delivered as standalone
+blocked codegen. See [COMPILING-EFFICIENT-SHADERS-PLAN.md](COMPILING-EFFICIENT-SHADERS-PLAN.md) for
+the shader optimization progression (Phases 0-5 achieved 53.7% of RTX 4070 Ti SUPER peak FP32 at
+4096×4096). Originally reviewed Feb 2026; v2.2 incorporates review feedback on matmul lowering,
+pattern detection, barrier placement, memory discipline, `fori_loop` primitive, separate
+input/output types, and workgroup size constraints.
 
 **Predecessor:** `BLOCK-MAP-IMPLEMENTATION-PLAN.md` (v1, deleted) viewed `block_map` primarily as an
 optimization path for `associativeScan`. This revision reframes it as a **general-purpose
@@ -937,10 +940,22 @@ matrices continue using the current row×col accumulation (lower dispatch overhe
 
 ---
 
-## Phase 5: AssociativeScan Lowering (~220 LOC)
+## Phase 5: AssociativeScan Lowering (~220 LOC) ✅ DONE
 
-**Goal:** Express `associativeScan` as `block_map` + inter-block carry propagation, using the
-standard parallel prefix scan decomposition (Blelloch 1990).
+**Goal:** Express `associativeScan` as blocked Kogge-Stone decomposition with inter-block carry
+propagation, using the standard parallel prefix scan algorithm (Blelloch 1990).
+
+**Status:** Implemented as standalone blocked codegen in both WASM and WebGPU backends. The
+three-level algorithm (per-block local scans, block summary scan, apply summaries) is complete with
+full test coverage (T7 test matrix, commit `253f027`). Phase 7 deleted the flat Kogge-Stone paths
+and confirmed no regressions.
+
+**Future consolidation opportunity:** The standalone codegen (~2,844 LOC across both backends) could
+be replaced by routing through the `block_map` fused shader infrastructure, which already handles
+`WorkgroupAssociativeScan`. This would delete substantial code and let block_map optimizations (bank
+padding, manual unrolling) benefit assocScan automatically. Deferred because it requires adding
+dynamic grid (polymorphic N) support to the block_map shader compiler and constructing synthetic
+JitPrograms programmatically — high effort, moderate benefit, regression risk.
 
 ### 5.1: Decomposition
 
