@@ -533,6 +533,21 @@ _WebGPU backend (headless Chromium, Intel Core Ultra 5 125H):_
 | 1024 | 0.143 ms          | 3.831 ms     | 26.9×     |
 | 4096 | 0.194 ms          | 15.148 ms    | **78.2×** |
 
+## DLM scan throughput (2-tuple matmul compose, 2×2 matrices)
+
+| Benchmark                      | WASM (Hz) | WebGPU (Hz) | WASM/WebGPU |
+| ------------------------------ | --------- | ----------- | ----------- |
+| assocScan 2-tuple N=200        | 48K       | 2.1K        | 23×         |
+| assocScan 2-tuple N=500        | 21K       | 1.3K        | 16×         |
+| assocScan 3-tuple Särkkä N=200 | 26K       | 650         | 40×         |
+| scan 2-tuple N=200             | 139K      | 1.2K        | 116×        |
+| grad(assocScan) 2-tuple N=200  | 790       | 99          | 8×          |
+| grad(scan) 2-tuple N=200       | 827       | —           | —           |
+
+**Key insight:** Small-matrix DLM is latency-bound on WebGPU. WASM is 8–116× faster due to zero GPU
+dispatch overhead. Use WASM for DLM/Kalman workloads. WebGPU blocked assocScan uses M=1
+single-dispatch shortcut for N ≤ blockSize.
+
 ## Benchmark suite
 
 ```bash
@@ -543,6 +558,7 @@ pnpm build && pnpm vitest bench bench/<file>.bench.ts
 | --------------------------------- | ----------------------------------------------------------------------- |
 | `bench/argreduce.bench.ts`        | Argmin/argmax reduction performance                                     |
 | `bench/associative-scan.bench.ts` | `associativeScan` vs sequential `scan` for cumsum/cumprod               |
+| `bench/dlm-scan.bench.ts`         | DLM (Kalman) scan: assocScan/scan/grad with pytree matmul compose       |
 | `bench/matmul.bench.ts`           | Matrix multiplication throughput at various sizes                       |
 | `bench/mega-module.bench.ts`      | Mega-module vs step-by-step: chains, multi-output, reduce, grad, matmul |
 | `bench/parallel-wasm.bench.ts`    | Large elementwise baseline + polymorphic JIT                            |

@@ -1161,18 +1161,24 @@ export class WebGPUBackend implements Backend {
       Math.ceil((totalElemsPerPos * N * bytesPerElem) / 4) * 4,
       4,
     );
-    const summaryBytes = Math.max(
-      Math.ceil((totalElemsPerPos * M * bytesPerElem) / 4) * 4,
-      4,
-    );
 
     const inputBuf = this.#poolPop(dataBytes) ?? this.#createBuffer(dataBytes);
     const scannedBuf =
       this.#poolPop(dataBytes) ?? this.#createBuffer(dataBytes);
-    const summaryPingBuf =
-      this.#poolPop(summaryBytes) ?? this.#createBuffer(summaryBytes);
-    const summaryPongBuf =
-      this.#poolPop(summaryBytes) ?? this.#createBuffer(summaryBytes);
+
+    // Summary buffers only needed when M > 1 (multi-block)
+    let summaryPingBuf: GPUBuffer | undefined;
+    let summaryPongBuf: GPUBuffer | undefined;
+    if (M > 1) {
+      const summaryBytes = Math.max(
+        Math.ceil((totalElemsPerPos * M * bytesPerElem) / 4) * 4,
+        4,
+      );
+      summaryPingBuf =
+        this.#poolPop(summaryBytes) ?? this.#createBuffer(summaryBytes);
+      summaryPongBuf =
+        this.#poolPop(summaryBytes) ?? this.#createBuffer(summaryBytes);
+    }
 
     const leafStarts = computeLeafStarts(leafElemCounts);
     const constBuffers = constSlots.map((slot) => this.#getBuffer(slot).buffer);
@@ -1252,45 +1258,47 @@ export class WebGPUBackend implements Backend {
       pass.end();
     }
 
-    // 4. Gather: extract last per block → summary
-    const gatherUniformBuf = this.device.createBuffer({
-      size: 8,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      mappedAtCreation: true,
-    });
-    {
-      const view = new DataView(gatherUniformBuf.getMappedRange());
-      view.setUint32(0, N, true);
-      view.setUint32(4, blockSize, true);
-    }
-    gatherUniformBuf.unmap();
-
-    const gatherStorageBG = this.device.createBindGroup({
-      layout: prepared.gather.layout,
-      entries: [
-        { binding: 0, resource: { buffer: scannedBuf } },
-        { binding: 1, resource: { buffer: summaryPingBuf } },
-      ],
-    });
-    const gatherUniformBG = this.device.createBindGroup({
-      layout: prepared.gather.uniformLayout,
-      entries: [{ binding: 0, resource: { buffer: gatherUniformBuf } }],
-    });
-
-    {
-      const gatherWgCount = Math.ceil(M / 256);
-      const pass = enc.beginComputePass();
-      pass.setPipeline(prepared.gather.pipeline);
-      pass.setBindGroup(0, gatherStorageBG);
-      pass.setBindGroup(1, gatherUniformBG);
-      pass.dispatchWorkgroups(gatherWgCount);
-      pass.end();
-    }
-
-    // 5. Flat KS on M summaries using the reused flat scan pipeline
-    let summaryUniformBuf: GPUBuffer | null = null;
-    let applyUniformBuf: GPUBuffer | null = null;
+    // 4-6. Gather + summary scan + apply (only needed for multi-block)
+    let gatherUniformBuf: GPUBuffer | undefined;
+    let summaryUniformBuf: GPUBuffer | undefined;
+    let applyUniformBuf: GPUBuffer | undefined;
     if (M > 1) {
+      // 4. Gather: extract last per block → summary
+      gatherUniformBuf = this.device.createBuffer({
+        size: 8,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true,
+      });
+      {
+        const view = new DataView(gatherUniformBuf.getMappedRange());
+        view.setUint32(0, N, true);
+        view.setUint32(4, blockSize, true);
+      }
+      gatherUniformBuf.unmap();
+
+      const gatherStorageBG = this.device.createBindGroup({
+        layout: prepared.gather.layout,
+        entries: [
+          { binding: 0, resource: { buffer: scannedBuf } },
+          { binding: 1, resource: { buffer: summaryPingBuf! } },
+        ],
+      });
+      const gatherUniformBG = this.device.createBindGroup({
+        layout: prepared.gather.uniformLayout,
+        entries: [{ binding: 0, resource: { buffer: gatherUniformBuf } }],
+      });
+
+      {
+        const gatherWgCount = Math.ceil(M / 256);
+        const pass = enc.beginComputePass();
+        pass.setPipeline(prepared.gather.pipeline);
+        pass.setBindGroup(0, gatherStorageBG);
+        pass.setBindGroup(1, gatherUniformBG);
+        pass.dispatchWorkgroups(gatherWgCount);
+        pass.end();
+      }
+
+      // 5. Flat KS on M summaries
       const numSummaryRounds = Math.ceil(Math.log2(M));
       const minAlign = this.device.limits.minUniformBufferOffsetAlignment;
       const uniformEntrySize = Math.max(8, minAlign);
@@ -1317,16 +1325,16 @@ export class WebGPUBackend implements Backend {
       const flatPingPong = this.device.createBindGroup({
         layout: prepared.flatScan.storageLayout,
         entries: [
-          { binding: 0, resource: { buffer: summaryPingBuf } },
-          { binding: 1, resource: { buffer: summaryPongBuf } },
+          { binding: 0, resource: { buffer: summaryPingBuf! } },
+          { binding: 1, resource: { buffer: summaryPongBuf! } },
           ...constEntries,
         ],
       });
       const flatPongPing = this.device.createBindGroup({
         layout: prepared.flatScan.storageLayout,
         entries: [
-          { binding: 0, resource: { buffer: summaryPongBuf } },
-          { binding: 1, resource: { buffer: summaryPingBuf } },
+          { binding: 0, resource: { buffer: summaryPongBuf! } },
+          { binding: 1, resource: { buffer: summaryPingBuf! } },
           ...constEntries,
         ],
       });
@@ -1355,7 +1363,7 @@ export class WebGPUBackend implements Backend {
 
       // Result in summaryPongBuf if last round even, summaryPingBuf if odd
       const summaryResultBuf =
-        (numSummaryRounds - 1) % 2 === 0 ? summaryPongBuf : summaryPingBuf;
+        (numSummaryRounds - 1) % 2 === 0 ? summaryPongBuf! : summaryPingBuf!;
 
       // 6. Apply scanned summaries to blocks 1..M-1
       applyUniformBuf = this.device.createBuffer({
@@ -1444,7 +1452,7 @@ export class WebGPUBackend implements Backend {
 
     // 10. Cleanup (return data buffers to pool when possible)
     localUniformBuf.destroy();
-    gatherUniformBuf.destroy();
+    if (gatherUniformBuf) gatherUniformBuf.destroy();
     if (summaryUniformBuf) summaryUniformBuf.destroy();
     if (applyUniformBuf) applyUniformBuf.destroy();
     for (const ub of reverseUniformBufs) ub.destroy();
@@ -1454,10 +1462,12 @@ export class WebGPUBackend implements Backend {
         buf.destroy();
       }
     }
-    for (const buf of [summaryPingBuf, summaryPongBuf]) {
-      if (!this.#poolPush(buf)) {
-        this.#gpuAllocatedBytes -= buf.size;
-        buf.destroy();
+    if (summaryPingBuf && summaryPongBuf) {
+      for (const buf of [summaryPingBuf, summaryPongBuf]) {
+        if (!this.#poolPush(buf)) {
+          this.#gpuAllocatedBytes -= buf.size;
+          buf.destroy();
+        }
       }
     }
   }
