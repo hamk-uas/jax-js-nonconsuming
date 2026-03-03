@@ -6,7 +6,7 @@
  * elimination) and AluExp simplification with bounded variable ranges.
  */
 
-import { constToWgsl, dtypeToWgsl } from "./codegen";
+import { castSaturateWgsl, constToWgsl, dtypeToWgsl } from "./codegen";
 import {
   accessorGlobal,
   AluExp,
@@ -221,7 +221,7 @@ export function createWgslGen(
         else if (op === AluOp.Floor) source = `floor(${strip1(a)})`;
         else if (op === AluOp.Ceil) source = `ceil(${strip1(a)})`;
         else if (op === AluOp.Cast)
-          source = `${dtypeToWgsl(dtype)}(${strip1(a)})`;
+          source = castSaturateWgsl(strip1(a), src[0].dtype, dtype);
         else if (op === AluOp.Bitcast)
           source = `bitcast<${dtypeToWgsl(dtype)}>(${strip1(a)})`;
       }

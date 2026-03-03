@@ -35,6 +35,7 @@ import {
 import { erfSrc, threefrySrc } from "./webgpu/builtins";
 import {
   calculateGrid,
+  castSaturateWgsl,
   constToWgsl,
   dtypeToWgsl,
   gridOffsetY,
@@ -3043,7 +3044,7 @@ function pipelineSourceMulti(
         else if (op === AluOp.Floor) source = `floor(${strip1(a)})`;
         else if (op === AluOp.Ceil) source = `ceil(${strip1(a)})`;
         else if (op === AluOp.Cast)
-          source = `${dtypeToWgsl(dtype)}(${strip1(a)})`;
+          source = castSaturateWgsl(strip1(a), src[0].dtype, dtype);
         else if (op === AluOp.Bitcast)
           source = `bitcast<${dtypeToWgsl(dtype)}>(${strip1(a)})`;
       }
@@ -3421,7 +3422,7 @@ function pipelineSource(
         else if (op === AluOp.Floor) source = `floor(${strip1(a)})`;
         else if (op === AluOp.Ceil) source = `ceil(${strip1(a)})`;
         else if (op === AluOp.Cast)
-          source = `${dtypeToWgsl(dtype)}(${strip1(a)})`;
+          source = castSaturateWgsl(strip1(a), src[0].dtype, dtype);
         else if (op === AluOp.Bitcast)
           source = `bitcast<${dtypeToWgsl(dtype)}>(${strip1(a)})`;
       }
@@ -3831,7 +3832,8 @@ function genScanExpressionWithRidx(
       if (op === AluOp.Reciprocal) return `(1.0 / ${a})`;
       if (op === AluOp.Floor) return `floor(${strip1(a)})`;
       if (op === AluOp.Ceil) return `ceil(${strip1(a)})`;
-      if (op === AluOp.Cast) return `${dtypeToWgsl(eDtype)}(${strip1(a)})`;
+      if (op === AluOp.Cast)
+        return castSaturateWgsl(strip1(a), src[0].dtype, eDtype);
       if (op === AluOp.Bitcast) {
         return `bitcast<${dtypeToWgsl(eDtype)}>(${strip1(a)})`;
       }
