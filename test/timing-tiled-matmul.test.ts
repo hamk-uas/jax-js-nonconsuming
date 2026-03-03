@@ -45,8 +45,10 @@ test("Phase 3 tiledMatmul benchmark", async () => {
 
   for (const N of [256, 512, 1024]) {
     console.log(`\n=== ${N}x${N} ===`);
-    const A = random.uniform(random.key(0), [N, N]);
-    const B = random.uniform(random.key(1), [N, N]);
+    using k0 = random.key(0);
+    using k1 = random.key(1);
+    const A = random.uniform(k0, [N, N]);
+    const B = random.uniform(k1, [N, N]);
     await blockUntilReady([A, B]);
 
     const fStd = jit((a: np.Array, b: np.Array) => np.matmul(a, b));

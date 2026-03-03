@@ -150,15 +150,17 @@ describe("Phase 3 matmul benchmark", () => {
 
     setDebug(2);
 
-    using A = np.ones([32, 32]);
-    using B = np.ones([32, 32]);
-    const f = jit((a: any, b: any) =>
-      lax.tiledMatmul(a, b, { Br: 16, Bc: 16, Bk: 16, threadTile: [4, 4] }),
-    );
-    // eslint-disable-next-line @typescript-eslint/await-thenable
-    using _result = await f(A, B);
-    f.dispose();
-    clearCaches();
+    {
+      using A = np.ones([32, 32]);
+      using B = np.ones([32, 32]);
+      const f = jit((a: any, b: any) =>
+        lax.tiledMatmul(a, b, { Br: 16, Bc: 16, Bk: 16, threadTile: [4, 4] }),
+      );
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      using _result = await f(A, B);
+      f.dispose();
+      clearCaches();
+    }
     setDebug(0);
     defaultDevice(prev);
     checkLeaks.start();
@@ -213,8 +215,9 @@ describe("Phase 3 matmul benchmark", () => {
       N = 512,
       K = 512;
     const flops = 2 * M * N * K;
-    using a = np.ones([M, K], { dtype: DType.Float32 });
-    using b = np.ones([K, N], { dtype: DType.Float32 });
+    // Explicit dispose (not `using`) so disposal happens before checkLeaks.start()
+    const a = np.ones([M, K], { dtype: DType.Float32 });
+    const b = np.ones([K, N], { dtype: DType.Float32 });
 
     const configs = [
       {
@@ -272,6 +275,8 @@ describe("Phase 3 matmul benchmark", () => {
       );
     }
 
+    a.dispose();
+    b.dispose();
     defaultDevice(prev);
     checkLeaks.start();
   });
