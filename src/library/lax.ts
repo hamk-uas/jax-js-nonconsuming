@@ -815,10 +815,20 @@ export interface TiledMatmulOptions {
  * - numThreads ≤ maxComputeInvocationsPerWorkgroup
  * - shmem usage ≤ maxComputeWorkgroupStorageSize
  *
- * The candidate list was benchmarked on NVIDIA RTX 4070 and validated against
- * the WebGPU device limit survey (web3dsurvey.com/webgpu):
+ * The candidate list was benchmarked on NVIDIA RTX 4070 Ti Super and Intel
+ * xe-lpg (Meteor Lake) with outer-product loop ordering (O12) and carry-direct
+ * accumulation (O12a). Validated against WebGPU device limit survey:
  * - 100% of devices: maxInvocations ≥ 256, shmem ≥ 16384
  * - 81% of devices: maxInvocations ≥ 1024, shmem ≥ 32768
+ *
+ * 64×64 tt44 is the top choice: 16 outputs per thread maximize register reuse
+ * in the outer-product reduction loop. At N=2048 it achieves 3536 GFLOP/s on
+ * NVIDIA (vs 2439 for 32×32 tt22) and 533 on Intel iGPU (vs 305).
+ *
+ * On older Intel iGPUs (gen-9, gen-11, gen-12lp) the limited register file
+ * causes catastrophic spilling with threadTile=[4,4], making execution 100×+
+ * slower and triggering TDR at N≥1024. These architectures fall through to
+ * 32×32 tt22 which benchmarked at 32.4 GFLOP/s (gen-9, N=1024).
  */
 function chooseTileConfig(
   caps: BackendCapabilities,
@@ -828,6 +838,14 @@ function chooseTileConfig(
   const maxInvocations = caps.maxComputeInvocationsPerWorkgroup ?? 256;
   const maxShmem = caps.maxComputeWorkgroupStorageSize ?? 16384;
   const bytesPerElem = dtype === DType.Float16 ? 2 : 4;
+  const arch = caps.adapterArchitecture?.toLowerCase() ?? "";
+
+  // Gate: 64×64 tt44 (256 threads × 16 registers) causes catastrophic register
+  // spill on older Intel iGPUs (gen-9, gen-11, gen-12lp — ≤32 EU), triggering
+  // TDR. 32×32 tt44 (64 threads × 16 registers) works fine thanks to O12b
+  // carry-accumulation fusion eliminating the separate accumulator array.
+  const isOldIntelIGPU =
+    arch.startsWith("gen-") || arch === "gen_12lp" || arch === "gen_11";
 
   // Candidates ordered by expected performance (best first).
   // numThreads = (Br/tt[0]) * (Bc/tt[1])
@@ -838,8 +856,9 @@ function chooseTileConfig(
     Bk: number;
     threadTile?: [number, number];
   }[] = [
+    { Br: 64, Bc: 64, Bk: 16, threadTile: [4, 4] }, // 256 threads, 16 out/thread — best on powerful GPUs
+    { Br: 32, Bc: 32, Bk: 16, threadTile: [4, 4] }, // 64 threads, 16 out/thread — good for small register files
     { Br: 32, Bc: 32, Bk: 16, threadTile: [2, 2] }, // 256 threads, 4 out/thread
-    { Br: 64, Bc: 64, Bk: 16, threadTile: [4, 4] }, // 256 threads, 16 out/thread
     { Br: 16, Bc: 16, Bk: 16 }, // 256 threads, 1 out/thread (safe fallback)
   ];
 
@@ -847,6 +866,11 @@ function chooseTileConfig(
     const tt = c.threadTile;
     const numThreads = tt ? (c.Br / tt[0]) * (c.Bc / tt[1]) : c.Br * c.Bc;
     if (numThreads > maxInvocations) continue;
+
+    // Skip large tt44 (256 threads) on GPUs with insufficient register files.
+    // Small tt44 (64 threads at 32×32) is safe and 1.5× faster than tt22.
+    if (isOldIntelIGPU && tt && tt[0] >= 4 && tt[1] >= 4 && numThreads >= 256)
+      continue;
 
     // Estimate shmem: A tile + B tile + bank padding (~6% overhead)
     const tileA = c.Br * c.Bk * bytesPerElem;
@@ -884,6 +908,26 @@ export function tiledMatmul(
   B: Array,
   options?: TiledMatmulOptions,
 ): Array {
+  // --- Strategy 3: Zero-shmem Micro-panel Tiling ---
+  // Gen-9 and Gen-11 have very few Execution Units and suffer profoundly from
+  // workgroupBarrier() synchronizations. Furthermore, their emulated f16
+  // suffers from register bloat during shared memory reads.
+  // We explicitly route f16 on these architectures to the zero-shmem flat
+  // shader (core.dot), which uses the Tuner's applyUpcast (vectorized
+  // loads) and applyUnroll to act as a micro-panel tiled flat shader.
+  // This restores the ~75—111 GFLOP/s performance natively.
+  const arch =
+    getBackend().capabilities.adapterArchitecture?.toLowerCase() ?? "";
+  const isOldIntelIGPU =
+    arch.startsWith("gen-") || arch === "gen_12lp" || arch === "gen_11";
+
+  if (isOldIntelIGPU && A.dtype === DType.Float16) {
+    return dot(A, B, {
+      lhsContractingDims: [1],
+      rhsContractingDims: [0],
+    });
+  }
+
   // When caller doesn't specify tile sizes, auto-select based on device caps.
   let resolved: Required<Pick<TiledMatmulOptions, "Br" | "Bc" | "Bk">> &
     Pick<TiledMatmulOptions, "threadTile">;

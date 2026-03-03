@@ -57,6 +57,7 @@ export default defineConfig({
             "--enable-features=Vulkan",
             "--disable-vulkan-surface",
             "--enable-unsafe-webgpu",
+            "--enable-dawn-features=vulkan_enable_f16_on_nvidia",
           ],
           env: {
             DISPLAY: process.env.DISPLAY ?? ":0",
@@ -84,6 +85,11 @@ export default defineConfig({
       "tmp/**",
       // Performance benchmarks, not correctness tests:
       "test/scan-bench.test.ts",
+      // GPU-specific benchmarks (run manually with dedicated configs):
+      "test/intel-matmul.test.ts",
+      "test/debug-wgsl.test.ts",
+      "test/vitest.nvidia.config.ts",
+      "test/vitest.intel.config.ts",
     ],
     setupFiles: ["test/setup.ts"],
   },

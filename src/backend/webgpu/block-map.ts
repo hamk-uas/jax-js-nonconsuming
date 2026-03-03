@@ -2048,6 +2048,59 @@ export function blockMapFusedShaderSource(
           }
         };
 
+        // O12b: Pre-scan body kernels to detect carry-accumulating reductions.
+        // When a fused reduction kernel outputs to a carry and its epilogue
+        // is Add(acc_term, carry_read), we can accumulate directly into the
+        // carry. For f16 matmul, this also promotes the carry to f32 for
+        // precision (the inner reduction already uses an f32 accumulator).
+        const carryPromotedDtype = new Map<number, DType>(); // ci → promoted dtype
+        {
+          // Build set of carry input JitIds for quick lookup
+          const carryInputJitIds = new Set<JitId>();
+          for (let ci = 0; ci < numCarries; ci++) {
+            const carryInputIdx = numBodyConsts + 1 + ci;
+            if (carryInputIdx < fl.bodyInputIds.length) {
+              carryInputJitIds.add(fl.bodyInputIds[carryInputIdx]);
+            }
+          }
+          // Check each body kernel for the carry-accumulation pattern
+          for (const { step: bStep, kernel: bKernel } of fl.bodyKernels) {
+            const bRe = bKernel.outputs[0]?.reduction ?? null;
+            if (!bRe || bRe.op !== AluOp.Add) continue;
+            const outId = bStep.outputs[0];
+            // Must be a carry output
+            const ci = fl.bodyOutputIds.indexOf(outId);
+            if (ci < 0 || ci >= numCarries) continue;
+            if (!fl.privateShmemIds.has(outId)) continue;
+            // Detect epilogue pattern: Add(acc_term, carry_gv) or Add(carry_gv, acc_term)
+            const ep = bRe.epilogue;
+            if (ep.op !== AluOp.Add) continue;
+            const isAccTerm = (e: AluExp): boolean =>
+              (e.op === AluOp.Variable && e.arg === "acc") ||
+              (e.op === AluOp.Cast && isAccTerm(e.src[0]));
+            const isCarryGV = (e: AluExp): boolean => {
+              if (e.op !== AluOp.GlobalView && e.op !== AluOp.GlobalIndex)
+                return false;
+              const gid = e.arg[0] as number;
+              if (gid >= bStep.inputs.length) return false;
+              return carryInputJitIds.has(bStep.inputs[gid]);
+            };
+            if (
+              (isAccTerm(ep.src[0]) && isCarryGV(ep.src[1])) ||
+              (isAccTerm(ep.src[1]) && isCarryGV(ep.src[0]))
+            ) {
+              // This carry's reduction accumulates f32 products into it.
+              // Promote carry to f32 if reduction dtype is wider.
+              if (bRe.dtype !== DType.Float32) continue; // only promote to f32
+              const carryDtype =
+                shmemMap.get(fs.outputs[ci])?.dtype ?? DType.Float32;
+              if (carryDtype !== bRe.dtype) {
+                carryPromotedDtype.set(ci, bRe.dtype);
+              }
+            }
+          }
+        }
+
         // Declare private register arrays for carries and private intermediates
         const privateVarNames = new Map<JitId, string>();
         for (let ci = 0; ci < numCarries; ci++) {
@@ -2062,7 +2115,11 @@ export function blockMapFusedShaderSource(
           if (carryInputIdx < fl.bodyInputIds.length) {
             privateVarNames.set(fl.bodyInputIds[carryInputIdx], varName);
           }
-          const dtype = shmemMap.get(parentOutId)?.dtype ?? DType.Float32;
+          // O12b: Use promoted dtype (f32) for carries with f16 Add reductions
+          const dtype =
+            carryPromotedDtype.get(ci) ??
+            shmemMap.get(parentOutId)?.dtype ??
+            DType.Float32;
           emit(
             `var ${varName}: array<${dtypeToWgsl(dtype, false)}, ${tileElems}>;`,
           );
@@ -2090,16 +2147,22 @@ export function blockMapFusedShaderSource(
           const parentBodyIdx = bodyInputIds.indexOf(parentInitId);
           const inIdx =
             parentBodyIdx >= numConsts ? parentBodyIdx - numConsts : -1;
+          // O12b: wrap init value in a cast when carry is promoted to f32
+          const promoted = carryPromotedDtype.get(ci);
+          const wrapInit = (expr: string) =>
+            promoted ? `${dtypeToWgsl(promoted, false)}(${expr})` : expr;
 
           if (initName) {
             emitTileLoopOpen();
             emit(`gidx = i32(${flatGidxExpr()});`);
             if (isGlobalInit && inIdx >= 0) {
               emit(
-                `${varName}[_rt_idx] = ${initName}[i32(in_base_${inIdx}) + ${inRemap(inIdx, "gidx")}];`,
+                `${varName}[_rt_idx] = ${wrapInit(`${initName}[i32(in_base_${inIdx}) + ${inRemap(inIdx, "gidx")}]`)};`,
               );
             } else {
-              emit(`${varName}[_rt_idx] = ${initName}[u32(gidx)];`);
+              emit(
+                `${varName}[_rt_idx] = ${wrapInit(`${initName}[u32(gidx)]`)};`,
+              );
             }
             emitTileLoopClose();
           }
@@ -2179,24 +2242,17 @@ export function blockMapFusedShaderSource(
             // O4: Private step — thread-tile loop
             const bRe = bKernel.outputs[0]?.reduction ?? null;
 
-            emitTileLoopOpen();
-            // O5: Emit per-axis coordinate variables so the AluExp
-            // simplifier's structured gidx maps to real WGSL names.
-            for (let g = 0; g < gridRank; g++) {
-              emit(
-                `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
-              );
-            }
-            emit(`gidx = i32(${flatGidxExpr()});`);
-
             if (bRe && bKernelSize === blockSize) {
-              // Private reduction: per-element accumulator
+              // O12: Outer-product private reduction.
+              // ridx outermost, tile loops inside → the GPU compiler can CSE
+              // shared memory loads across tile iterations. For threadTile=[T0,T1]
+              // and Bk reduction elements, this reduces shmem reads from
+              // T0*T1*Bk*2 to Bk*(T0+T1) — a (2*T0*T1)/(T0+T1)× improvement.
               const outId = bStep.outputs[0];
               const reDtype = bRe.dtype;
               const reTy = dtypeToWgsl(reDtype, false);
               const reSize = bRe.size as number;
               const prefix = `fl${entry.flIdx}_s${bsi}`;
-              const accName = `${prefix}_acc`;
               const gen = createGen(
                 bKernel,
                 prefix,
@@ -2210,58 +2266,152 @@ export function blockMapFusedShaderSource(
                 structuredGidx,
               );
 
-              emit(`{`);
-              emit(
-                `  var ${accName}: ${reTy} = ${constToWgsl(reDtype, bRe.identity)};`,
-              );
-              emit(
-                `  for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
-                pushIndent,
-              );
-              const rhs = strip1(gen(bKernel.outputs[0].exp));
-              const exprDtype = bKernel.outputs[0].exp.dtype;
-              const castRhs = exprDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
-              if (bRe.op === AluOp.Add) emit(`  ${accName} += ${castRhs};`);
-              else if (bRe.op === AluOp.Mul)
-                emit(`  ${accName} *= ${castRhs};`);
-              else if (bRe.op === AluOp.Min)
-                emit(`  ${accName} = min(${accName}, ${castRhs});`);
-              else if (bRe.op === AluOp.Max)
-                emit(`  ${accName} = max(${accName}, ${castRhs});`);
-              emit(popIndent, `  }`);
-
-              // Epilogue
               const isIdentityEpilogue =
                 bRe.epilogue.op === AluOp.Variable &&
                 bRe.epilogue.arg === "acc";
-              let finalValue = accName;
-              if (!isIdentityEpilogue) {
-                const epilogueGen = createGen(
-                  bKernel,
-                  `${prefix}_ep`,
-                  makeBodyResolve(
-                    bStepInputInfo,
-                    bStep,
-                    privateVarNames,
-                    fl.shmemBankPad,
-                  ),
-                  new Map([["acc", accName]]),
-                  structuredGidx,
-                );
-                finalValue = strip1(epilogueGen(bRe.epilogue));
-              }
+
+              // O12a/O12b: Detect carry-accumulating Add reduction.
+              // After JIT fusion, the matmul body is a single kernel whose
+              // epilogue has structure: Add(acc_term, carry_read).
+              // acc_term is Variable("acc") [f32] or Cast(f16, Variable("acc")) [f16].
+              // carry_read is a GlobalView/GlobalIndex of the carry input buffer.
+              //
+              // When detected, skip the separate accumulator array and accumulate
+              // directly into the carry: carry[i] += product.
+              // For f16: the carry is promoted to f32 (O12b pre-scan), so all
+              // accumulation happens in f32 with a single cast at final writeback.
               const privName = privateVarNames.get(outId);
-              if (privName) {
-                const targetDtype = bodyOutShmemDtype(outId);
-                const targetTy = targetDtype ? dtypeToWgsl(targetDtype) : null;
-                const castFinal =
-                  targetTy && targetTy !== dtypeToWgsl(reDtype)
-                    ? `${targetTy}(${finalValue})`
-                    : finalValue;
-                emit(`  ${privName}[_rt_idx] = ${castFinal};`);
+              let canFuseIntoCarry = false;
+              if (bRe.op === AluOp.Add && privName) {
+                if (isIdentityEpilogue) {
+                  // Original O12a: identity epilogue (non-fused bodies)
+                  canFuseIntoCarry = true;
+                } else if (bRe.epilogue.op === AluOp.Add) {
+                  // O12b: fused epilogue Add(acc_term, carry_gv) pattern
+                  const isAccTerm = (e: AluExp): boolean =>
+                    (e.op === AluOp.Variable && e.arg === "acc") ||
+                    (e.op === AluOp.Cast && isAccTerm(e.src[0]));
+                  const isCarryRead = (e: AluExp): boolean =>
+                    e.op === AluOp.GlobalView || e.op === AluOp.GlobalIndex;
+                  const [a, b] = bRe.epilogue.src;
+                  canFuseIntoCarry =
+                    (isAccTerm(a) && isCarryRead(b)) ||
+                    (isAccTerm(b) && isCarryRead(a));
+                }
               }
-              emit(`}`);
+
+              const bodyExp = bKernel.outputs[0].exp;
+              const bodyDtype = bodyExp.dtype;
+
+              if (canFuseIntoCarry) {
+                // Direct carry accumulation: just ridx loop + tile loop
+                emit(
+                  `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
+                  pushIndent,
+                );
+                emitTileLoopOpen();
+                for (let g = 0; g < gridRank; g++) {
+                  emit(
+                    `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
+                  );
+                }
+                emit(`gidx = i32(${flatGidxExpr()});`);
+
+                const rhs = strip1(gen(bodyExp));
+                const castRhs = bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+                emit(`${privName}[_rt_idx] += ${castRhs};`);
+
+                emitTileLoopClose();
+                emit(popIndent, `}`); // end ridx
+              } else {
+                // General case: separate accumulator array
+                const accArrName = `${prefix}_acc_arr`;
+                emit(`var ${accArrName}: array<${reTy}, ${tileElems}>;`);
+                emitTileLoopOpen();
+                emit(
+                  `${accArrName}[_rt_idx] = ${constToWgsl(reDtype, bRe.identity)};`,
+                );
+                emitTileLoopClose();
+
+                emit(
+                  `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
+                  pushIndent,
+                );
+                emitTileLoopOpen();
+                for (let g = 0; g < gridRank; g++) {
+                  emit(
+                    `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
+                  );
+                }
+                emit(`gidx = i32(${flatGidxExpr()});`);
+
+                const rhs = strip1(gen(bodyExp));
+                const castRhs = bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+                if (bRe.op === AluOp.Add)
+                  emit(`${accArrName}[_rt_idx] += ${castRhs};`);
+                else if (bRe.op === AluOp.Mul)
+                  emit(`${accArrName}[_rt_idx] *= ${castRhs};`);
+                else if (bRe.op === AluOp.Min)
+                  emit(
+                    `${accArrName}[_rt_idx] = min(${accArrName}[_rt_idx], ${castRhs});`,
+                  );
+                else if (bRe.op === AluOp.Max)
+                  emit(
+                    `${accArrName}[_rt_idx] = max(${accArrName}[_rt_idx], ${castRhs});`,
+                  );
+
+                emitTileLoopClose();
+                emit(popIndent, `}`); // end ridx
+
+                // Apply epilogue and store results
+                emitTileLoopOpen();
+                for (let g = 0; g < gridRank; g++) {
+                  emit(
+                    `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
+                  );
+                }
+                emit(`gidx = i32(${flatGidxExpr()});`);
+
+                let finalValue = `${accArrName}[_rt_idx]`;
+                if (!isIdentityEpilogue) {
+                  const epilogueGen = createGen(
+                    bKernel,
+                    `${prefix}_ep`,
+                    makeBodyResolve(
+                      bStepInputInfo,
+                      bStep,
+                      privateVarNames,
+                      fl.shmemBankPad,
+                    ),
+                    new Map([["acc", `${accArrName}[_rt_idx]`]]),
+                    structuredGidx,
+                  );
+                  finalValue = strip1(epilogueGen(bRe.epilogue));
+                }
+                if (privName) {
+                  const targetDtype = bodyOutShmemDtype(outId);
+                  const targetTy = targetDtype
+                    ? dtypeToWgsl(targetDtype)
+                    : null;
+                  const castFinal =
+                    targetTy && targetTy !== dtypeToWgsl(reDtype)
+                      ? `${targetTy}(${finalValue})`
+                      : finalValue;
+                  emit(`${privName}[_rt_idx] = ${castFinal};`);
+                }
+                emitTileLoopClose();
+              }
             } else {
+              // Non-reduction private step: standard tile loop
+              emitTileLoopOpen();
+              // O5: Emit per-axis coordinate variables so the AluExp
+              // simplifier's structured gidx maps to real WGSL names.
+              for (let g = 0; g < gridRank; g++) {
+                emit(
+                  `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
+                );
+              }
+              emit(`gidx = i32(${flatGidxExpr()});`);
               // Private elementwise
               const gen = createGen(
                 bKernel,
@@ -2292,9 +2442,9 @@ export function blockMapFusedShaderSource(
                   emit(`${privName}[_rt_idx] = ${castRhs};`);
                 }
               }
-            }
 
-            emitTileLoopClose();
+              emitTileLoopClose();
+            }
           } else {
             // Cooperative step — stride loop over all elements
             emit(

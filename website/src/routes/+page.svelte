@@ -64,6 +64,11 @@
       description: "Measure matrix multiplication GFLOP/s on your device.",
     },
     {
+      title: "Tiled Matmul Sweep",
+      href: resolve("/bench/results"),
+      description: "Run all tile configs on your GPU and compare GFLOP/s.",
+    },
+    {
       title: "Conv2d Benchmark",
       href: resolve("/bench/conv2d"),
       description: "Measure convolution throughput on your device.",

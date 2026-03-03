@@ -32,6 +32,8 @@ export interface BackendCapabilities {
   readonly maxComputeInvocationsPerWorkgroup?: number;
   /** WebGPU: max shared memory bytes per workgroup (from device.limits). */
   readonly maxComputeWorkgroupStorageSize?: number;
+  /** WebGPU: adapter architecture string (e.g. "gen-9", "xe-lpg"). */
+  readonly adapterArchitecture?: string;
 }
 export const devices: Device[] = ["cpu", "wasm", "webgpu", "webgl"];
 

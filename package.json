@@ -91,7 +91,7 @@
     "globals": "^16.0.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.7",
-    "playwright": "~1.52.0",
+    "playwright": "~1.58.2",
     "prettier": "^3.6.2",
     "prettier-plugin-svelte": "^3.4.0",
     "tsdown": "0.13.2",
@@ -104,8 +104,8 @@
   },
   "optionalDependencies": {
     "@bufbuild/protobuf": "^2.10.2",
-    "sentencepiece-buf": "^0.2.1-0",
-    "onnx-buf": "^1.20.0-1"
+    "onnx-buf": "^1.20.0-1",
+    "sentencepiece-buf": "^0.2.1-0"
   },
   "packageManager": "pnpm@10.22.0",
   "engines": {

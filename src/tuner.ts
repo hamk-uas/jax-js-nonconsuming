@@ -414,8 +414,13 @@ export function tuneWebgpu(
 
   // Try to do loop unrolling on the reduce axis, with an upcast limit.
   // Skip doing this on mobile browsers, as it may reduce performance.
+  // WebGPU returns maxComputeWorkgroupSizeX=256 for many desktops (Intel Gen-9, Apple Silicon)
+  // so we should not use > 256 as a strict mobile check.
+  const isMobile =
+    typeof navigator !== "undefined" &&
+    /Mobi|Android/i.test(navigator.userAgent);
   if (
-    (caps?.maxComputeWorkgroupSizeX ?? 1024) > 256 &&
+    !isMobile &&
     dim.reduce < dim.unroll &&
     (prod(dim.st.shape.slice(dim.unroll)) <= 4 ||
       (dim.unroll === dim.upcast && prod(dim.st.shape.slice(dim.upcast)) < 64))
