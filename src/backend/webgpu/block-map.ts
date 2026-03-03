@@ -2462,25 +2462,62 @@ export function blockMapFusedShaderSource(
               const bodyDtype = bodyExp.dtype;
 
               if (canFuseIntoCarry) {
-                // Direct carry accumulation: just ridx loop + tile loop
-                emit(
-                  `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
-                  pushIndent,
-                );
-                emitTileLoopOpen();
-                for (let g = 0; g < gridRank; g++) {
+                // Direct carry accumulation: ridx loop + tile loop.
+                // O5: Manual unrolling for small reduction sizes — bypasses
+                // Chrome/Tint's broken @unroll attribute by emitting the loop
+                // body N times with literal ridx values. Each iteration gets
+                // its own createGen() so the simplifier can constant-fold the
+                // ridx-dependent shmem index expressions.
+                const UNROLL_THRESHOLD = 32;
+                if (reSize <= UNROLL_THRESHOLD) {
+                  // Manually unrolled: emit body reSize times
+                  for (let ri = 0; ri < reSize; ri++) {
+                    const riGen = createGen(
+                      bKernel,
+                      `${prefix}_r${ri}`,
+                      makeBodyResolve(
+                        bStepInputInfo,
+                        bStep,
+                        privateVarNames,
+                        fl.shmemBankPad,
+                      ),
+                      undefined,
+                      structuredGidx,
+                      AluExp.i32(ri),
+                      buildStepRemap(bStepInputInfo),
+                      buildStepBankPad(bStep),
+                    );
+                    emitTileLoopOpen();
+                    for (let g = 0; g < gridRank; g++) {
+                      emit(
+                        `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
+                      );
+                    }
+                    const rhs = strip1(riGen(bodyExp));
+                    const castRhs =
+                      bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+                    emit(`${privName}[_rt_idx] += ${castRhs};`);
+                    emitTileLoopClose();
+                  }
+                } else {
+                  // Too large to unroll — use standard loop
                   emit(
-                    `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
+                    `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
+                    pushIndent,
                   );
+                  emitTileLoopOpen();
+                  for (let g = 0; g < gridRank; g++) {
+                    emit(
+                      `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
+                    );
+                  }
+                  const rhs = strip1(gen(bodyExp));
+                  const castRhs =
+                    bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+                  emit(`${privName}[_rt_idx] += ${castRhs};`);
+                  emitTileLoopClose();
+                  emit(popIndent, `}`); // end ridx
                 }
-                // gidx not needed: structuredGidx decomposes into _rt_c* coords
-
-                const rhs = strip1(gen(bodyExp));
-                const castRhs = bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
-                emit(`${privName}[_rt_idx] += ${castRhs};`);
-
-                emitTileLoopClose();
-                emit(popIndent, `}`); // end ridx
               } else {
                 // General case: separate accumulator array
                 const accArrName = `${prefix}_acc_arr`;
@@ -2491,35 +2528,70 @@ export function blockMapFusedShaderSource(
                 );
                 emitTileLoopClose();
 
-                emit(
-                  `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
-                  pushIndent,
-                );
-                emitTileLoopOpen();
-                for (let g = 0; g < gridRank; g++) {
+                // O5: Manual unrolling for small reduction sizes
+                const UNROLL_THRESHOLD_GEN = 32;
+                const emitAccum = (accName: string, castRhs: string) => {
+                  if (bRe.op === AluOp.Add)
+                    emit(`${accName}[_rt_idx] += ${castRhs};`);
+                  else if (bRe.op === AluOp.Mul)
+                    emit(`${accName}[_rt_idx] *= ${castRhs};`);
+                  else if (bRe.op === AluOp.Min)
+                    emit(
+                      `${accName}[_rt_idx] = min(${accName}[_rt_idx], ${castRhs});`,
+                    );
+                  else if (bRe.op === AluOp.Max)
+                    emit(
+                      `${accName}[_rt_idx] = max(${accName}[_rt_idx], ${castRhs});`,
+                    );
+                };
+
+                if (reSize <= UNROLL_THRESHOLD_GEN) {
+                  for (let ri = 0; ri < reSize; ri++) {
+                    const riGen = createGen(
+                      bKernel,
+                      `${prefix}_r${ri}`,
+                      makeBodyResolve(
+                        bStepInputInfo,
+                        bStep,
+                        privateVarNames,
+                        fl.shmemBankPad,
+                      ),
+                      undefined,
+                      structuredGidx,
+                      AluExp.i32(ri),
+                      buildStepRemap(bStepInputInfo),
+                      buildStepBankPad(bStep),
+                    );
+                    emitTileLoopOpen();
+                    for (let g = 0; g < gridRank; g++) {
+                      emit(
+                        `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
+                      );
+                    }
+                    const rhs = strip1(riGen(bodyExp));
+                    const castRhs =
+                      bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+                    emitAccum(accArrName, castRhs);
+                    emitTileLoopClose();
+                  }
+                } else {
                   emit(
-                    `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
+                    `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
+                    pushIndent,
                   );
+                  emitTileLoopOpen();
+                  for (let g = 0; g < gridRank; g++) {
+                    emit(
+                      `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
+                    );
+                  }
+                  const rhs = strip1(gen(bodyExp));
+                  const castRhs =
+                    bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+                  emitAccum(accArrName, castRhs);
+                  emitTileLoopClose();
+                  emit(popIndent, `}`); // end ridx
                 }
-                // gidx not needed: structuredGidx decomposes into _rt_c* coords
-
-                const rhs = strip1(gen(bodyExp));
-                const castRhs = bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
-                if (bRe.op === AluOp.Add)
-                  emit(`${accArrName}[_rt_idx] += ${castRhs};`);
-                else if (bRe.op === AluOp.Mul)
-                  emit(`${accArrName}[_rt_idx] *= ${castRhs};`);
-                else if (bRe.op === AluOp.Min)
-                  emit(
-                    `${accArrName}[_rt_idx] = min(${accArrName}[_rt_idx], ${castRhs});`,
-                  );
-                else if (bRe.op === AluOp.Max)
-                  emit(
-                    `${accArrName}[_rt_idx] = max(${accArrName}[_rt_idx], ${castRhs});`,
-                  );
-
-                emitTileLoopClose();
-                emit(popIndent, `}`); // end ridx
 
                 // Apply epilogue and store results
                 emitTileLoopOpen();
