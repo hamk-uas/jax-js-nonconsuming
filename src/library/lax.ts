@@ -19,7 +19,7 @@ import * as core from "../frontend/core";
 import { bind1, Primitive, ShapedArray } from "../frontend/core";
 import * as jaxpr from "../frontend/jaxpr";
 import { moveaxis, vmap } from "../frontend/vmap";
-import { Pair } from "../shape";
+import { type Dim, isSymbolicDim, Pair } from "../shape";
 import * as tree from "../tree";
 import { checkAxis, deepEqual, prod, range, rep, zipn } from "../utils";
 import { blockMap } from "./lax-block-map";
@@ -642,14 +642,19 @@ export function uncheckedDynamicSlice(
  * Sequential loop with a carried state.
  */
 export function foriLoop<C extends tree.JsTree<Array>>(
-  lower: number, // TODO should be array type ideally
-  upper: number,
+  lower: number | Dim,
+  upper: number | Dim,
   body: (i: Array, carry: C) => C,
   init: C,
 ): C {
-  lower = Math.floor(lower);
-  upper = Math.floor(upper);
-  if (upper - lower <= 0) return init;
+  if (typeof lower === "number") lower = Math.floor(lower);
+  if (typeof upper === "number") upper = Math.floor(upper);
+  if (
+    typeof lower === "number" &&
+    typeof upper === "number" &&
+    upper - lower <= 0
+  )
+    return init;
 
   const [initFlat, initTree] = tree.flatten(init);
 

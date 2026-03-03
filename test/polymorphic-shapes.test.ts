@@ -406,3 +406,66 @@ suite("Polymorphic-N: associativeScan + scan with dynamic_axes", () => {
     expect(r6.js()).toEqual([[1], [2], [3], [4], [5], [6]]);
   });
 });
+
+suite("Polymorphic foriLoop bounds (Phase 8.1)", () => {
+  test("foriLoop with symbolic upper bound accumulates correctly", () => {
+    // x.shape[0] is SymDim("T") during tracing — passed as foriLoop upper bound.
+    // Body: carry += 1 each iteration → result = N (the batch size).
+    using f = jit(
+      (x: np.Array) => {
+        using init = np.array(0, { dtype: DType.Float32 });
+        return lax.foriLoop(
+          0,
+          x.shape[0] as unknown as number, // SymDim at trace time
+          (_i: np.Array, carry: np.Array) => np.add(carry, np.array(1)),
+          init,
+        );
+      },
+      { dynamic_axes: { 0: "T" } },
+    );
+
+    // T=5
+    using x5 = np.ones([5, 2]);
+    using r5 = f(x5) as np.Array;
+    expect(r5).toBeAllclose(5);
+
+    // T=3 — reuses compiled program
+    using x3 = np.ones([3, 2]);
+    using r3 = f(x3) as np.Array;
+    expect(r3).toBeAllclose(3);
+
+    // T=1 — edge case
+    using x1 = np.ones([1, 2]);
+    using r1 = f(x1) as np.Array;
+    expect(r1).toBeAllclose(1);
+  });
+
+  test("foriLoop with symbolic bound and index-dependent body", () => {
+    // Sum of indices 0..N-1 = N*(N-1)/2.
+    using f = jit(
+      (x: np.Array) => {
+        using init = np.array(0, { dtype: DType.Float32 });
+        return lax.foriLoop(
+          0,
+          x.shape[0] as unknown as number,
+          (i: np.Array, carry: np.Array) => {
+            using iF = i.astype(DType.Float32);
+            return np.add(carry, iF);
+          },
+          init,
+        );
+      },
+      { dynamic_axes: { 0: "T" } },
+    );
+
+    // T=4: 0+1+2+3 = 6
+    using x4 = np.ones([4, 1]);
+    using r4 = f(x4) as np.Array;
+    expect(r4).toBeAllclose(6);
+
+    // T=6: 0+1+2+3+4+5 = 15
+    using x6 = np.ones([6, 1]);
+    using r6 = f(x6) as np.Array;
+    expect(r6).toBeAllclose(15);
+  });
+});

@@ -162,8 +162,8 @@ export type JitStep =
       type: "fori_loop";
       bodyProgram: JitProgram;
       bodyJaxpr: Jaxpr;
-      lower: number;
-      upper: number;
+      lower: number | Dim;
+      upper: number | Dim;
       numConsts: number;
       consts: JitId[];
       initCarries: JitId[];
@@ -717,11 +717,20 @@ export class JitProgram {
           // Flush pending ops — fori_loop needs materialized inputs
           flushPendingBatched(pending, this.backend);
 
+          const lower =
+            typeof step.lower === "number"
+              ? step.lower
+              : resolveDim(step.lower, dimBindings!);
+          const upper =
+            typeof step.upper === "number"
+              ? step.upper
+              : resolveDim(step.upper, dimBindings!);
+
           const constSlots = step.consts.map((id) => scope.get(id)!);
           let carrySlots = step.initCarries.map((id) => scope.get(id)!);
           let ownsCarry = false; // first iteration uses parent-owned init carries
 
-          for (let i = step.lower; i < step.upper; i++) {
+          for (let i = lower; i < upper; i++) {
             // Create scalar int32 index slot
             const idxData = new Int32Array([i]);
             const idxSlot = this.backend.malloc(

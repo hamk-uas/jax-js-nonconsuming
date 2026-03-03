@@ -3037,7 +3037,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
   [Primitive.ForiLoop](
     cts,
     args,
-    { jaxpr, numConsts, lower, upper, isJvpTransformed },
+    { jaxpr, numConsts, lower: lowerDim, upper: upperDim, isJvpTransformed },
   ) {
     // ForiLoop backward pass: unrolled forward + backward.
     //
@@ -3057,6 +3057,8 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       );
     }
 
+    const lower = concreteDim(lowerDim, "foriLoop transpose");
+    const upper = concreteDim(upperDim, "foriLoop transpose");
     const N = upper - lower;
     const numCarryTotal = args.length - numConsts;
     const numCarryHalf = numCarryTotal / 2;

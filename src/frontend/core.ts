@@ -195,8 +195,8 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.ForiLoop]: {
     jaxpr: Jaxpr;
     numConsts: number;
-    lower: number;
-    upper: number;
+    lower: number | Dim;
+    upper: number | Dim;
     /** Set by JVP rule when this fori_loop was produced by differentiating. */
     isJvpTransformed?: boolean;
   };

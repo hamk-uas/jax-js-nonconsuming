@@ -1873,7 +1873,12 @@ export class Array extends Tracer {
 
         return results;
       },
-      [Primitive.ForiLoop](args, { jaxpr, numConsts, lower, upper }) {
+      [Primitive.ForiLoop](
+        args,
+        { jaxpr, numConsts, lower: lowerDim, upper: upperDim },
+      ) {
+        const lower = concreteDim(lowerDim, "foriLoop eager");
+        const upper = concreteDim(upperDim, "foriLoop eager");
         const consts = args.slice(0, numConsts);
         let carry = args.slice(numConsts);
         for (let i = lower; i < upper; i++) {

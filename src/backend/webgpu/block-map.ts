@@ -35,7 +35,7 @@ import {
 import { AluExp, AluOp, byteWidth, DType, Kernel, Reduction } from "../../alu";
 import type { JitId, JitProgram, JitStep } from "../../frontend/jit";
 import { Routine } from "../../routine";
-import { isSymbolicSize } from "../../shape";
+import { concreteDim, isSymbolicSize } from "../../shape";
 import { DEBUG, mapSetUnion, prod, strip1 } from "../../utils";
 
 // ---------------------------------------------------------------------------
@@ -1706,6 +1706,14 @@ export function blockMapFusedShaderSource(
       // --- fori_loop step ---
       const fl = foriLoops[entry.flIdx];
       const fs = fl.foriStep;
+      const foriLower = concreteDim(
+        fs.lower,
+        "block_map fused fori_loop lower",
+      );
+      const foriUpper = concreteDim(
+        fs.upper,
+        "block_map fused fori_loop upper",
+      );
       const numBodyConsts = fl.numConsts;
       const numCarries = fs.initCarries.length;
 
@@ -2167,7 +2175,7 @@ export function blockMapFusedShaderSource(
 
         // For loop
         emit(
-          `for (var ${fl.loopVar}: i32 = ${fs.lower}; ${fl.loopVar} < ${fs.upper}; ${fl.loopVar}++) {`,
+          `for (var ${fl.loopVar}: i32 = ${foriLower}; ${fl.loopVar} < ${foriUpper}; ${fl.loopVar}++) {`,
           pushIndent,
         );
 
@@ -2630,7 +2638,7 @@ export function blockMapFusedShaderSource(
 
         // Emit WGSL for loop
         emit(
-          `for (var ${fl.loopVar}: i32 = ${fs.lower}; ${fl.loopVar} < ${fs.upper}; ${fl.loopVar}++) {`,
+          `for (var ${fl.loopVar}: i32 = ${foriLower}; ${fl.loopVar} < ${foriUpper}; ${fl.loopVar}++) {`,
           pushIndent,
         );
 
