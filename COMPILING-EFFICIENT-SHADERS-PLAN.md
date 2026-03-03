@@ -446,8 +446,8 @@ shmem + barrier, but tells the hardware to use broadcast mechanisms (available s
 P0a is strictly better when applicable; `workgroupUniformLoad` is the fallback for when shmem is
 still needed but the read is uniform across all threads.
 
-**Capability gating:** `workgroupUniformLoad` is not universally available (missing in some Deno
-`wgpu` versions and older Safari). The codegen must feature-check at device init and fall back to
+**Capability gating:** `workgroupUniformLoad` is not universally available (missing in older Safari
+and some older browser versions). The codegen must feature-check at device init and fall back to
 plain `shmem[0]` reads when unavailable. Store the capability in the backend's feature flags
 (alongside `shader-f16`, etc.).
 
@@ -1187,13 +1187,13 @@ Cholesky all use `blockMap` + `foriLoop`. Every compiler improvement benefits al
 
 Features used by the plan, gated by runtime detection at device init:
 
-| Feature                | Chrome | Safari | Deno wgpu | Phase | Fallback              |
-| ---------------------- | ------ | ------ | --------- | ----- | --------------------- |
-| `shader-f16`           | 113+   | 18+    | ✅        | All   | f32 accumulation      |
-| `workgroupUniformLoad` | 137+   | ❌     | Varies    | 1B    | Plain `shmem[0]` read |
-| `@unroll` attribute    | 141+   | ❌     | ❌        | 4     | Manual loop expansion |
-| `subgroups`            | 144+   | ❌     | Varies    | 6     | Standard tiled path   |
-| `subgroup_matrix`      | 144+   | ❌     | ❌        | 6     | Standard tiled path   |
+| Feature                | Chrome | Safari | Phase | Fallback              |
+| ---------------------- | ------ | ------ | ----- | --------------------- |
+| `shader-f16`           | 113+   | 18+    | All   | f32 accumulation      |
+| `workgroupUniformLoad` | 137+   | ❌     | 1B    | Plain `shmem[0]` read |
+| `@unroll` attribute    | 141+   | ❌     | 4     | Manual loop expansion |
+| `subgroups`            | 144+   | ❌     | 6     | Standard tiled path   |
+| `subgroup_matrix`      | 144+   | ❌     | 6     | Standard tiled path   |
 
 The codegen must query the backend's feature set and select the best available strategy. Features
 that are unavailable fall back gracefully — the generated shader is always correct, just slower.

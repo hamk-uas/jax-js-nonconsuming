@@ -578,7 +578,7 @@ function sliceXsAtIteration(
 
     // Copy the xs slice into a new buffer. Prefer copyBufferToBuffer
     // (keeps data on-device, avoids readSync which needs OffscreenCanvas
-    // on WebGPU and is unavailable in Deno). Fall back to readSync + malloc
+    // on WebGPU). Fall back to readSync + malloc
     // for backends that don't implement copyBufferToBuffer (CPU).
     if (backend.copyBufferToBuffer) {
       const slot = backend.malloc(sliceSize);

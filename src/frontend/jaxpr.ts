@@ -1242,7 +1242,7 @@ function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
       try {
         data = ar.dataSync();
       } catch {
-        // Sync readback not available (e.g., Deno WebGPU without OffscreenCanvas)
+        // Sync readback not available (e.g., WebGPU without OffscreenCanvas)
         // — keep as const instead of inlining as Lit
         constBinders.push(jaxpr.inBinders[i]);
         newConsts.push(consts[i]);

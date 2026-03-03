@@ -1,7 +1,8 @@
 # WebGPU Performance Benchmark Findings
 
-**Date:** 2026-03-02 (updated 2026-03-02)  
-**Hardware:** NVIDIA RTX 4070 Ti SUPER (16 GB) via Razer Core X Chroma eGPU over Thunderbolt 3  
+**Date:** 2026-03-02 (updated 2026-03-03)  
+**Hardware:** NVIDIA RTX 4070 Ti SUPER (16 GB) via Razer Core X Chroma eGPU over Thunderbolt 3;
+Intel Arc (integrated)  
 **Driver:** 590.48.01, Vulkan 1.3.275  
 **Host OS:** Linux (bare metal)
 
@@ -9,12 +10,18 @@
 
 ## 1. Test Setup
 
-### Runtimes Compared
+### Runtime
 
-| Runtime                            | WebGPU Backend            | GPU Adapter Description                                       | Key Features                                                                 |
-| ---------------------------------- | ------------------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| **Deno 2.x** (`--unstable-webgpu`) | wgpu-rs (native Vulkan)   | `NVIDIA GeForce RTX 4070 Ti SUPER` (vendor 4318, device 9989) | `shader-f16`, `timestamp-query`, `dual-source-blending` — **no `subgroups`** |
-| **Chromium** (Playwright, headed)  | Dawn (via Vulkan → ANGLE) | `nvidia`, architecture `lovelace`                             | `subgroups`, `timestamp-query`, `shader-f16`                                 |
+All benchmarks run on **headless Chromium** (Playwright) with Dawn (Vulkan → ANGLE). Deno was
+previously used but has been retired — headless Chromium now covers both GPUs.
+
+| GPU Config              | WebGPU Backend            | Adapter / Architecture | Key Features                                 |
+| ----------------------- | ------------------------- | ---------------------- | -------------------------------------------- |
+| **NVIDIA** (default)    | Dawn (via Vulkan → ANGLE) | `nvidia` / `lovelace`  | `subgroups`, `timestamp-query`, `shader-f16` |
+| **Intel Arc** (via env) | Dawn (via Vulkan → ANGLE) | `intel` / varies       | `shader-f16`, `timestamp-query`              |
+
+GPU selection: the default vitest config picks NVIDIA (discrete preferred). Use
+`test/vitest.intel.config.ts` with `VK_DRIVER_FILES` to force Intel.
 
 ### Vitest Chromium Launch Flags
 
@@ -52,7 +59,7 @@ At large compute sizes the bandwidth/latency is amortized; at small sizes it dom
 
 ## 2. Results
 
-### 2.1 Multi-Size Scaling: `np.matmul` (Deno WebGPU)
+### 2.1 Multi-Size Scaling: `np.matmul` (headless Chromium, NVIDIA)
 
 Naive matmul (Mul→Reduce kernel fusion, no shared memory tiling):
 
@@ -67,7 +74,7 @@ Naive matmul (Mul→Reduce kernel fusion, no shared memory tiling):
 Peak theoretical: ~40 TFLOP/s (RTX 4070 Ti SUPER f32). Achieved **~1.1% of peak at 1024×1024** —
 expected for naive row×col without shared memory tiling.
 
-### 2.2 Tiled Matmul Variants (Deno WebGPU)
+### 2.2 Tiled Matmul Variants (headless Chromium, NVIDIA)
 
 `lax.tiledMatmul` via `block_map` fused shader, with and without register tiling (`threadTile`):
 
@@ -88,7 +95,7 @@ expected for naive row×col without shared memory tiling.
 - **None reach the P1 target** (40% of peak = ~16 TFLOP/s). Next optimizations needed: vec4 loads,
   bank padding, larger thread tiles, and workgroup count tuning.
 
-### 2.3 JS Dispatch Overhead (Deno WebGPU)
+### 2.3 JS Dispatch Overhead (headless Chromium)
 
 | Metric                                | Value        |
 | ------------------------------------- | ------------ |
@@ -113,7 +120,7 @@ dispatches served from a localhost page (secure context required):
 
 **Key insight:** An earlier session observed headed Chromium at 400–1300 ms/call through vitest.
 That was the jax-js JIT pipeline overhead (tracing → Jaxpr → codegen → compile → dispatch), not
-Chrome's GPU performance. Raw dispatch latency is **0.05 ms** — comparable to Deno.
+Chrome's GPU performance. Raw dispatch latency is **0.05 ms**.
 
 ### 2.5 Chromium Secure Context Requirement
 
@@ -162,29 +169,29 @@ args: [
 
 ## 4. Action Items
 
-| Priority | Item                                                                | Status                          |
-| -------- | ------------------------------------------------------------------- | ------------------------------- |
-| ✅       | Deno WebGPU for GPU performance benchmarks                          | Done                            |
-| ✅       | Headless Chromium with full flag set                                | Done — identical perf to headed |
-| ✅       | Switch vitest to headless mode                                      | Done — 5× faster startup        |
-| **Low**  | Investigate `timestamp-query` for GPU-side timing                   | Future                          |
-| **Note** | Deno lacks `subgroups` — subgroup optimizations need Chromium tests | Documented                      |
+| Priority | Item                                              | Status                          |
+| -------- | ------------------------------------------------- | ------------------------------- |
+| ✅       | Headless Chromium with full flag set              | Done — identical perf to headed |
+| ✅       | Switch vitest to headless mode                    | Done — 5× faster startup        |
+| ✅       | NVIDIA + Intel Arc both via headless Chromium     | Done — Deno retired             |
+| **Low**  | Investigate `timestamp-query` for GPU-side timing | Future                          |
 
 ---
 
-## 5. Deno vs Chromium Feature Comparison
+## 5. Chromium Feature Summary
 
-| Feature                           | Deno (wgpu-rs) | Chromium (Dawn)          |
-| --------------------------------- | -------------- | ------------------------ |
-| `subgroups`                       | ❌             | ✅                       |
-| `shader-f16`                      | ✅             | ✅                       |
-| `timestamp-query`                 | ✅             | ✅                       |
-| `dual-source-blending`            | ✅             | ✅                       |
-| `float32-filterable`              | ✅             | ✅                       |
-| `maxStorageBuffersPerShaderStage` | 1048576        | 10                       |
-| Headless GPU support              | ✅ (native)    | ✅ (with full flags)     |
-| Benchmark reliability             | ✅ Consistent  | ✅ Consistent (headless) |
+All testing now uses headless Chromium (Dawn). Deno was retired — no longer needed.
 
-The `maxStorageBuffers` difference is significant: Deno's wgpu-rs reports the Vulkan hardware limit
-(~1M) while Chromium caps at the WebGPU spec minimum (10). This means `splitGraphDataflow` P2 will
-rarely trigger on Deno but may split fused kernels on Chromium.
+| Feature                           | Chromium (Dawn)          |
+| --------------------------------- | ------------------------ |
+| `subgroups`                       | ✅                       |
+| `shader-f16`                      | ✅                       |
+| `timestamp-query`                 | ✅                       |
+| `dual-source-blending`            | ✅                       |
+| `float32-filterable`              | ✅                       |
+| `maxStorageBuffersPerShaderStage` | 10                       |
+| Headless GPU support              | ✅ (with full flags)     |
+| Benchmark reliability             | ✅ Consistent (headless) |
+
+**Note:** Chromium caps `maxStorageBuffersPerShaderStage` at the WebGPU spec minimum (10). This
+means `splitGraphDataflow` P2 may split fused kernels that exceed this limit.

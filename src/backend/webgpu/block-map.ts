@@ -1904,6 +1904,7 @@ export function blockMapFusedShaderSource(
       // Common resolveGlobalIndex factory for fori_loop body kernels.
       // When usePrivate=true and a buffer is in privateVarNames, reads
       // return the private register array indexed by _rt_idx.
+      let bpCount = 0; // Counter for bank-pad CSE temp variables
       const makeBodyResolve =
         (
           bStepInputInfo: typeof bodyInputInfo,
@@ -1931,12 +1932,18 @@ export function blockMapFusedShaderSource(
             }
             return `${info.name}[${indexExpr}]`;
           }
-          // O11: bank-padded shmem read
+          // O11: bank-padded shmem read with CSE for complex index expressions
           if (bankPadMap) {
             const jitId = bStep.inputs[bufIdx];
             const innerDim = bankPadMap.get(jitId);
             if (innerDim !== undefined) {
-              return `${info.name}[(${indexExpr}) + (${indexExpr}) / ${innerDim}]`;
+              // Simple identifiers/numbers don't need a let binding
+              if (/^\w+$/.test(indexExpr)) {
+                return `${info.name}[${indexExpr} + ${indexExpr} / ${innerDim}]`;
+              }
+              const bp = `_bp${bpCount++}`;
+              emit(`let ${bp}: i32 = ${indexExpr};`);
+              return `${info.name}[${bp} + ${bp} / ${innerDim}]`;
             }
           }
           return `${info.name}[${indexExpr}]`;
@@ -2315,7 +2322,7 @@ export function blockMapFusedShaderSource(
                     `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
                   );
                 }
-                emit(`gidx = i32(${flatGidxExpr()});`);
+                // gidx not needed: structuredGidx decomposes into _rt_c* coords
 
                 const rhs = strip1(gen(bodyExp));
                 const castRhs = bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
@@ -2343,7 +2350,7 @@ export function blockMapFusedShaderSource(
                     `let _rt_c${g}: i32 = i32(tidx_${g} * RT_T${g} + _rt_${g});`,
                   );
                 }
-                emit(`gidx = i32(${flatGidxExpr()});`);
+                // gidx not needed: structuredGidx decomposes into _rt_c* coords
 
                 const rhs = strip1(gen(bodyExp));
                 const castRhs = bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;

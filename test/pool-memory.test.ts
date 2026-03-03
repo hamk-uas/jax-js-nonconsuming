@@ -1,8 +1,7 @@
 /**
  * WebGPU buffer pool peak-memory guarantee tests.
  *
- * Ports the Deno-only pool-memory.test.ts to Vitest/Playwright so that
- * buffer-pool invariants are exercised on real Chromium WebGPU as well.
+ * Tests buffer-pool invariants on real Chromium WebGPU.
  *
  * Key mechanisms tested:
  * - `configurePool()` called before each JIT execution caps retained bytes

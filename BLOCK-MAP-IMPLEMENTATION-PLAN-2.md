@@ -1275,7 +1275,7 @@ option once the compiler matures.
 ### M7.4 fused assocScan (~1,074 LOC)
 
 Delete only if Phase 5's block_map assocScan matches within 20% of M7.4 performance at N=256, N=1000
-on both Deno wgpu-rs and Chromium.
+on both NVIDIA and Intel Arc via headless Chromium.
 
 ### Current naive matmul dispatch
 

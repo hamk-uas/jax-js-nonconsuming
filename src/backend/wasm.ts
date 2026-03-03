@@ -176,7 +176,7 @@ export class WasmBackend implements Backend {
     // SharedArrayBuffer is available when either:
     //   (a) crossOriginIsolated is true (COOP + COEP headers), or
     //   (b) the browser enables it unconditionally (e.g., Chromium
-    //       --enable-features=SharedArrayBuffer; Deno; Node.js)
+    //       --enable-features=SharedArrayBuffer; Node.js)
     // We test constructability rather than relying on crossOriginIsolated
     // so that the Chromium flag and non-browser runtimes work too.
     sharedMemory: (() => {
@@ -205,7 +205,7 @@ export class WasmBackend implements Backend {
    * causing deadlock.  This affects **all** browser engines (Chrome, Firefox,
    * Safari) running on the main thread.
    *
-   * On Deno and Node.js, `Atomics.wait` works on the main thread and message
+   * On Node.js, `Atomics.wait` works on the main thread and message
    * delivery is independent of the event loop, so spin-waits work correctly.
    *
    * We detect this by probing `Atomics.wait` — if it throws, we're on a
