@@ -440,6 +440,7 @@ export class WebGPUBackend implements Backend {
         "shader-f32-atomic-add" as GPUFeatureName,
       ),
       shaderF16: device.features.has("shader-f16" as GPUFeatureName),
+      subgroups: device.features.has("subgroups" as GPUFeatureName),
       sharedMemory: false,
       multiOutputKernel: true,
       maxComputeWorkgroupSizeX: device.limits.maxComputeWorkgroupSizeX,
@@ -3114,6 +3115,15 @@ function pipelineSource(
   const re = kernel.outputs[0].reduction;
   const args = Array.from({ length: nargs }, (_, i) => `in${i}`);
 
+  // Pre-compute subgroup eligibility (needed for enable directive).
+  const _groupSizeForSg = re
+    ? ((tune as WebGPUTuneResult).size.groups ?? 1)
+    : 1;
+  const useSubgroups =
+    _groupSizeForSg > 1 &&
+    re!.dtype !== DType.Bool &&
+    device.features.has("subgroups");
+
   // binding(0..n-1): input buffers
   // binding(n): output buffer
 
@@ -3136,6 +3146,9 @@ function pipelineSource(
     if (!device.features.has("shader-f16"))
       throw new Error("WebGPU device does not support shader-f16 feature");
     emit("enable f16;");
+  }
+  if (useSubgroups) {
+    emit("enable subgroups;");
   }
 
   emit(headerWgsl);
@@ -3231,12 +3244,18 @@ function pipelineSource(
     emit(`var<workgroup> shmem: array<${shmemTy}, ${groupSize * upcast}>;`);
   }
 
-  emit(
-    "",
-    `@compute @workgroup_size(${workgroupSize})`,
-    "fn main(@builtin(global_invocation_id) id : vec3<u32>) {",
-    pushIndent,
-  );
+  emit("", `@compute @workgroup_size(${workgroupSize})`);
+  if (useSubgroups) {
+    emit(
+      "fn main(@builtin(global_invocation_id) id : vec3<u32>, @builtin(subgroup_size) sg_size: u32) {",
+      pushIndent,
+    );
+  } else {
+    emit(
+      "fn main(@builtin(global_invocation_id) id : vec3<u32>) {",
+      pushIndent,
+    );
+  }
 
   if (symbolic) {
     // For symbolic: always use 2D formula (works for 1D when id.y=0).
@@ -3511,32 +3530,80 @@ function pipelineSource(
     // Shared-memory tree reduction: each thread wrote its partial into acc[i],
     // now combine across workgroup threads via shmem.
     if (useSharedMem) {
-      // Store each thread's partial into shared memory.
-      for (let i = 0; i < upcast; i++) {
-        emit(`shmem[${i * groupSize} + group] = ${acc[i]};`);
-      }
-      emit("workgroupBarrier();");
-
-      // Tree reduction with halving stride.
-      for (let stride = groupSize >> 1; stride >= 1; stride >>= 1) {
-        emit(`if (group < ${stride}) {`, pushIndent);
+      if (useSubgroups) {
+        // Subgroup-accelerated reduction:
+        // Phase 1: reduce within each subgroup (no barriers needed).
+        const sgOp =
+          re.op === AluOp.Add
+            ? "subgroupAdd"
+            : re.op === AluOp.Mul
+              ? "subgroupMul"
+              : re.op === AluOp.Min
+                ? "subgroupMin"
+                : "subgroupMax";
         for (let i = 0; i < upcast; i++) {
-          const thisSlot = `shmem[${i * groupSize} + group]`;
-          const otherSlot = `shmem[${i * groupSize} + group + ${stride}]`;
-          if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
-          else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
-          else if (re.op === AluOp.Min) {
-            if (re.dtype === DType.Bool)
-              emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
-            else emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
-          } else if (re.op === AluOp.Max) {
-            if (re.dtype === DType.Bool)
-              emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
-            else emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
-          }
+          emit(`${acc[i]} = ${sgOp}(${acc[i]});`);
+        }
+        // Phase 2: leaders store packed subgroup results to shmem.
+        emit("let _sg_leader: bool = (group % i32(sg_size)) == 0;");
+        emit("let _sg_idx: i32 = group / i32(sg_size);");
+        emit("if (_sg_leader) {");
+        emit(pushIndent);
+        for (let i = 0; i < upcast; i++) {
+          emit(`shmem[${i * groupSize} + _sg_idx] = ${acc[i]};`);
         }
         emit(popIndent, "}");
         emit("workgroupBarrier();");
+        // Phase 3: inter-subgroup tree reduction.
+        // num_subgroups = groupSize / sg_size (runtime). Unroll all
+        // possible strides; guard each with stride * sg_size < groupSize.
+        for (let stride = groupSize >> 1; stride >= 1; stride >>= 1) {
+          emit(`if (${stride}u * sg_size < ${groupSize}u) {`);
+          emit(pushIndent);
+          emit(`if (_sg_leader && _sg_idx < ${stride}) {`);
+          emit(pushIndent);
+          for (let i = 0; i < upcast; i++) {
+            const thisSlot = `shmem[${i * groupSize} + _sg_idx]`;
+            const otherSlot = `shmem[${i * groupSize} + _sg_idx + ${stride}]`;
+            if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
+            else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
+            else if (re.op === AluOp.Min)
+              emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
+            else if (re.op === AluOp.Max)
+              emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
+          }
+          emit(popIndent, "}");
+          emit("workgroupBarrier();");
+          emit(popIndent, "}");
+        }
+      } else {
+        // Store each thread's partial into shared memory.
+        for (let i = 0; i < upcast; i++) {
+          emit(`shmem[${i * groupSize} + group] = ${acc[i]};`);
+        }
+        emit("workgroupBarrier();");
+
+        // Tree reduction with halving stride.
+        for (let stride = groupSize >> 1; stride >= 1; stride >>= 1) {
+          emit(`if (group < ${stride}) {`, pushIndent);
+          for (let i = 0; i < upcast; i++) {
+            const thisSlot = `shmem[${i * groupSize} + group]`;
+            const otherSlot = `shmem[${i * groupSize} + group + ${stride}]`;
+            if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
+            else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
+            else if (re.op === AluOp.Min) {
+              if (re.dtype === DType.Bool)
+                emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
+              else emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
+            } else if (re.op === AluOp.Max) {
+              if (re.dtype === DType.Bool)
+                emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
+              else emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
+            }
+          }
+          emit(popIndent, "}");
+          emit("workgroupBarrier();");
+        }
       }
 
       // Thread 0 reads the final reduced value back into accumulators.

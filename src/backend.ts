@@ -22,6 +22,8 @@ export interface BackendCapabilities {
   readonly atomicF32Add: boolean;
   /** WebGPU: true if shader-f16 extension is available. */
   readonly shaderF16: boolean;
+  /** WebGPU: true if subgroups extension is available. */
+  readonly subgroups?: boolean;
   /** Wasm: true if crossOriginIsolated (SharedArrayBuffer available). */
   readonly sharedMemory: boolean;
   /** Whether the backend supports multi-output kernel dispatch. */

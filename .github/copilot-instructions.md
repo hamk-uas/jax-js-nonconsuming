@@ -230,35 +230,29 @@ work around 256-byte alignment.
 
 ### Features exploited
 
-| Feature                     | Usage                                                      |
-| --------------------------- | ---------------------------------------------------------- |
-| **shader-f16**              | Float16 dtype support                                      |
-| **Workgroup shared memory** | Sort, JIT cooperative reductions                           |
-| **workgroupBarrier()**      | Sort, shared-memory reduction tree                         |
-| **storageBarrier()**        | Memory fence in Sort, Cholesky, LU                         |
-| **Pipeline caching**        | Compiled pipelines stored by shader hash                   |
-| **Pipeline layout caching** | Cached by `numInputs:numOutputs:hasUniform` signature      |
-| **Command batching**        | Multiple dispatches encoded before single `queue.submit()` |
-| **WGSL copy shader**        | Byte-level buffer copy when alignment fails                |
-| **shader-f32-atomic-add**   | Native f32 `atomicAdd` in scatter-add shader               |
-| **Ping-pong buffers**       | Scan carry alternates between two buffers                  |
-| **Uniform buffers**         | Per-iteration offsets for scan                             |
+| Feature                     | Usage                                                                                           |
+| --------------------------- | ----------------------------------------------------------------------------------------------- |
+| **shader-f16**              | Float16 dtype support                                                                           |
+| **Workgroup shared memory** | Sort, JIT cooperative reductions                                                                |
+| **workgroupBarrier()**      | Sort, shared-memory reduction tree                                                              |
+| **storageBarrier()**        | Memory fence in Sort, Cholesky, LU                                                              |
+| **Pipeline caching**        | Compiled pipelines stored by shader hash                                                        |
+| **Pipeline layout caching** | Cached by `numInputs:numOutputs:hasUniform` signature                                           |
+| **Command batching**        | Multiple dispatches encoded before single `queue.submit()`                                      |
+| **WGSL copy shader**        | Byte-level buffer copy when alignment fails                                                     |
+| **shader-f32-atomic-add**   | Native f32 `atomicAdd` in scatter-add shader                                                    |
+| **Ping-pong buffers**       | Scan carry alternates between two buffers                                                       |
+| **Uniform buffers**         | Per-iteration offsets for scan                                                                  |
+| **Subgroups**               | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in assocScan |
 
 ### Features NOT exploited (opportunities)
 
-| Feature                   | What it enables                                     | Why not used                             |
-| ------------------------- | --------------------------------------------------- | ---------------------------------------- |
-| **Subgroups**             | SIMD-width operations (shuffle, reduce within wave) | Requires `subgroups` feature; not stable |
-| **Indirect dispatch**     | GPU-driven workgroup counts                         | No dynamic control flow needs it yet     |
-| **Texture sampling**      | Hardware-accelerated interpolation                  | All ops use storage buffers              |
-| **Tiled matrix multiply** | Shared memory blocking for large matmuls            | Matmul uses simple row×col accumulation  |
-| **Atomic operations**     | Lock-free reductions, histograms                    | Reductions via shader accumulation       |
-| **timestamp-query**       | GPU-side profiling                                  | Not wired up yet                         |
-
-**Tiled matmul** is the single largest performance opportunity — 5-10× speedup for large matrices
-via `var<workgroup>` shared memory blocking.
-
-**Subgroups** would accelerate reductions 2–4× via `subgroupAdd()`. Blocked on spec stability.
+| Feature               | What it enables                    | Why not used                         |
+| --------------------- | ---------------------------------- | ------------------------------------ |
+| **Indirect dispatch** | GPU-driven workgroup counts        | No dynamic control flow needs it yet |
+| **Texture sampling**  | Hardware-accelerated interpolation | All ops use storage buffers          |
+| **Atomic operations** | Lock-free reductions, histograms   | Reductions via shader accumulation   |
+| **timestamp-query**   | GPU-side profiling                 | Not wired up yet                     |
 
 ### WASM feature opportunities
 

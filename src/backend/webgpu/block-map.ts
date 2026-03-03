@@ -979,6 +979,12 @@ export function blockMapFusedShaderSource(
     emit("enable f16;");
   }
 
+  // Check if subgroup reduction is available for non-Bool reductions.
+  const hasSubgroups = device.features.has("subgroups");
+  if (hasSubgroups) {
+    emit("enable subgroups;");
+  }
+
   emit(headerWgsl);
   if (allOps.has(AluOp.Threefry2x32)) emit(threefrySrc);
   if (allOps.has(AluOp.Erf) || allOps.has(AluOp.Erfc)) emit(erfSrc);
@@ -1174,15 +1180,25 @@ export function blockMapFusedShaderSource(
   if (wgSizeY > 1 || wgSizeZ > 1) wgSizeStr += `, ${wgSizeY}`;
   if (wgSizeZ > 1) wgSizeStr += `, ${wgSizeZ}`;
 
-  emit(
-    "",
-    `@compute @workgroup_size(${wgSizeStr})`,
-    "fn main(",
-    `  @builtin(local_invocation_index) tidx: u32,`,
-    `  @builtin(workgroup_id) wg_id: vec3<u32>,`,
-    ") {",
-    pushIndent,
-  );
+  emit("", `@compute @workgroup_size(${wgSizeStr})`);
+  if (hasSubgroups) {
+    emit(
+      "fn main(",
+      `  @builtin(local_invocation_index) tidx: u32,`,
+      `  @builtin(workgroup_id) wg_id: vec3<u32>,`,
+      `  @builtin(subgroup_size) sg_size: u32,`,
+      ") {",
+      pushIndent,
+    );
+  } else {
+    emit(
+      "fn main(",
+      `  @builtin(local_invocation_index) tidx: u32,`,
+      `  @builtin(workgroup_id) wg_id: vec3<u32>,`,
+      ") {",
+      pushIndent,
+    );
+  }
 
   // Compute flat block index from workgroup_id
   if (gridY === 1) {
@@ -1797,32 +1813,80 @@ export function blockMapFusedShaderSource(
         const reTy = dtypeToWgsl(reDtype, false);
         const wsName = `reduce_ws_${si}`;
 
-        emit(`${wsName}[tidx] = ${reTy}(${rhs});`);
-        emit("workgroupBarrier();");
+        const useSubgroupReduce = hasSubgroups && reDtype !== DType.Bool;
 
-        let startStride = 1;
-        while (startStride * 2 < blockSize) startStride *= 2;
-
-        for (let stride = startStride; stride >= 1; stride >>= 1) {
-          emit(
-            `if (tidx < ${stride}u && tidx + ${stride}u < ${blockSize}u) {`,
-            pushIndent,
-          );
-          const thisSlot = `${wsName}[tidx]`;
-          const otherSlot = `${wsName}[tidx + ${stride}u]`;
-          if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
-          else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
-          else if (re.op === AluOp.Min) {
-            if (reDtype === DType.Bool)
-              emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
-            else emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
-          } else if (re.op === AluOp.Max) {
-            if (reDtype === DType.Bool)
-              emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
-            else emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
-          }
+        if (useSubgroupReduce) {
+          // Subgroup-accelerated reduction:
+          // Phase 1: reduce within each subgroup (no barriers needed).
+          const sgOp =
+            re.op === AluOp.Add
+              ? "subgroupAdd"
+              : re.op === AluOp.Mul
+                ? "subgroupMul"
+                : re.op === AluOp.Min
+                  ? "subgroupMin"
+                  : "subgroupMax";
+          emit(`var _sg_val_${si}: ${reTy} = ${sgOp}(${reTy}(${rhs}));`);
+          // Phase 2: leaders store packed subgroup results.
+          emit(`let _sg_leader_${si}: bool = (tidx % sg_size) == 0u;`);
+          emit(`let _sg_idx_${si}: u32 = tidx / sg_size;`);
+          emit(`if (_sg_leader_${si}) {`);
+          emit(pushIndent);
+          emit(`${wsName}[_sg_idx_${si}] = _sg_val_${si};`);
           emit(popIndent, "}");
           emit("workgroupBarrier();");
+          // Phase 3: inter-subgroup tree reduction.
+          let startStride = 1;
+          while (startStride * 2 < blockSize) startStride *= 2;
+          for (let stride = startStride; stride >= 1; stride >>= 1) {
+            emit(`if (${stride}u * sg_size < ${blockSize}u) {`);
+            emit(pushIndent);
+            emit(
+              `if (_sg_leader_${si} && _sg_idx_${si} < ${stride}u && (_sg_idx_${si} + ${stride}u) * sg_size < ${blockSize}u) {`,
+              pushIndent,
+            );
+            const thisSlot = `${wsName}[_sg_idx_${si}]`;
+            const otherSlot = `${wsName}[_sg_idx_${si} + ${stride}u]`;
+            if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
+            else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
+            else if (re.op === AluOp.Min)
+              emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
+            else if (re.op === AluOp.Max)
+              emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
+            emit(popIndent, "}");
+            emit("workgroupBarrier();");
+            emit(popIndent, "}");
+          }
+        } else {
+          // Original tree reduction: store to shmem, barrier, halving
+          // stride loop.
+          emit(`${wsName}[tidx] = ${reTy}(${rhs});`);
+          emit("workgroupBarrier();");
+
+          let startStride = 1;
+          while (startStride * 2 < blockSize) startStride *= 2;
+
+          for (let stride = startStride; stride >= 1; stride >>= 1) {
+            emit(
+              `if (tidx < ${stride}u && tidx + ${stride}u < ${blockSize}u) {`,
+              pushIndent,
+            );
+            const thisSlot = `${wsName}[tidx]`;
+            const otherSlot = `${wsName}[tidx + ${stride}u]`;
+            if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
+            else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
+            else if (re.op === AluOp.Min) {
+              if (reDtype === DType.Bool)
+                emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
+              else emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
+            } else if (re.op === AluOp.Max) {
+              if (reDtype === DType.Bool)
+                emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
+              else emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
+            }
+            emit(popIndent, "}");
+            emit("workgroupBarrier();");
+          }
         }
 
         emit("if (tidx == 0u) {", pushIndent);
