@@ -28,30 +28,15 @@ import {
   type ShaderInfo,
 } from "./codegen";
 import {
-  accessorGlobal,
-  AluExp,
-  AluGroup,
-  AluOp,
-  byteWidth,
-  DType,
-  isFloatDtype,
-  Kernel,
-  Reduction,
-} from "../../alu";
+  createWgslGen,
+  type GlobalIndexRemapInfo,
+  type ResolveGlobalIndex,
+} from "./wgsl-gen";
+import { AluExp, AluOp, byteWidth, DType, Kernel, Reduction } from "../../alu";
 import type { JitId, JitProgram, JitStep } from "../../frontend/jit";
 import { Routine } from "../../routine";
 import { isSymbolicSize } from "../../shape";
 import { DEBUG, mapSetUnion, prod, strip1 } from "../../utils";
-
-/**
- * Info for remapping a GlobalIndex flat index from body-local strides
- * to global buffer strides at the AluExp level (enabling simplify()).
- */
-interface GlobalIndexRemapInfo {
-  bodyShape: number[];
-  bodyStrides: number[];
-  globalStrides: number[];
-}
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -1462,264 +1447,30 @@ export function blockMapFusedShaderSource(
   }
 
   // --- Helper: create gen() function for a kernel step ---
-  // The gen() function translates AluExp trees into WGSL expressions.
-  // It is parameterized by a resolveGlobalIndex callback that maps
-  // GlobalIndex reads to the correct WGSL (different for parent vs body steps).
+  // Delegates to the shared createWgslGen, passing emit and blockSize
+  // from the enclosing fused shader context.
   function createGen(
     kernel: Kernel,
     prefix: string,
-    resolveGlobalIndex: (
-      bufIdx: number,
-      indexExpr: string,
-      dtype: DType,
-      isGloballyStrided?: boolean,
-      bankPadApplied?: boolean,
-    ) => string,
+    resolveGlobalIndex: ResolveGlobalIndex,
     variableOverrides?: Map<string, string>,
     gidxOverride?: AluExp,
     ridxOverride?: AluExp,
     globalIndexRemap?: Map<number, GlobalIndexRemapInfo>,
     bankPadDims?: Map<number, number>,
   ): (exp: AluExp) => string {
-    let gensymCount = 0;
-    const gensym = () => `${prefix}_alu${gensymCount++}`;
-    const isGensym = (text: string) =>
-      text.startsWith(prefix + "_alu") &&
-      /^\d+$/.test(text.slice(prefix.length + 4));
-
-    // O2: Simplify kernel expressions with bounded gidx range.
-    // gidx ∈ [0, kernelSize-1] lets the simplifier eliminate redundant
-    // mod/div from unravelAlu() (e.g. (gidx / 16) % 16 → gidx / 16).
-    // O5: When gidxOverride is provided (register-tiled path), gidx is
-    // substituted with a structured expression (coord0 * stride + coord1)
-    // so the simplifier can eliminate div/mod from inner loops entirely.
-    const kernelSize = isSymbolicSize(kernel.size)
-      ? blockSize
-      : (kernel.size as number);
-    const gidxBound =
-      gidxOverride ?? AluExp.special(DType.Int32, "gidx", kernelSize);
-    const simplifiedMap = new Map<AluExp, AluExp>();
-    // O11b: AluExp-level bank-pad rewrite. For bank-padded shmem
-    // buffers, transform GlobalIndex flat index from `idx` to
-    // `idx + Idiv(idx, innerDim)`. After substitute(gidx → structuredGidx),
-    // the simplifier proves Idiv(row*D+col, D) = row (via range bounds),
-    // yielding row*(D+1)+col — eliminating integer division from the
-    // inner loop entirely.
-    const bankPadRewrite = bankPadDims
-      ? (exp: AluExp): AluExp | undefined => {
-          if (exp.op === AluOp.GlobalIndex) {
-            const bufIdx = exp.arg[0] as number;
-            const innerDim = bankPadDims.get(bufIdx);
-            if (innerDim !== undefined) {
-              const flatIdx = exp.src[0];
-              const paddedIdx = AluExp.add(
-                flatIdx,
-                AluExp.idiv(flatIdx, AluExp.i32(innerDim)),
-              );
-              return AluExp.globalIndex(
-                exp.dtype,
-                bufIdx,
-                exp.arg[1] as number,
-                paddedIdx,
-              );
-            }
-          }
-        }
-      : undefined;
-    for (const output of kernel.outputs) {
-      const vars: Record<string, AluExp> = { gidx: gidxBound };
-      if (output.reduction && !isSymbolicSize(output.reduction.size)) {
-        // ridxOverride: for tree reductions, substitute ridx → gidx (tidx)
-        // so each thread evaluates the expression at its own index.
-        vars.ridx =
-          ridxOverride ??
-          AluExp.special(DType.Int32, "ridx", output.reduction.size as number);
-      }
-      let processed = output.exp.substitute(vars).rewriteGlobalViews();
-      if (bankPadRewrite) processed = processed.rewrite(bankPadRewrite);
-      simplifiedMap.set(output.exp, processed.simplify());
-      if (output.reduction) {
-        let procEpilogue = output.reduction.epilogue
-          .substitute({ gidx: gidxBound })
-          .rewriteGlobalViews();
-        if (bankPadRewrite) procEpilogue = procEpilogue.rewrite(bankPadRewrite);
-        simplifiedMap.set(output.reduction.epilogue, procEpilogue.simplify());
-      }
-    }
-
-    const references = new Map<AluExp, number>();
-    const seen = new Set<AluExp>();
-    const countReferences = (exp: AluExp) => {
-      references.set(exp, (references.get(exp) ?? 0) + 1);
-      if (!seen.has(exp)) {
-        seen.add(exp);
-        for (const src of exp.src) countReferences(src);
-      }
-    };
-    for (const sExp of simplifiedMap.values()) countReferences(sExp);
-
-    const expContext = new Map<AluExp, string>();
-    const gen = (exp: AluExp): string => {
-      // O2: resolve original expressions to their simplified counterparts
-      exp = simplifiedMap.get(exp) ?? exp;
-      if (expContext.has(exp)) return expContext.get(exp)!;
-      const { op, src, dtype, arg } = exp;
-
-      let source = "";
-      if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
-        const a = gen(src[0]);
-        const b = gen(src[1]);
-        if (op === AluOp.Add) {
-          if (dtype === DType.Bool) source = `(${a} || ${b})`;
-          else source = `(${a} + ${b})`;
-        } else if (op === AluOp.Sub) source = `(${a} - ${b})`;
-        else if (op === AluOp.Mul) {
-          if (dtype === DType.Bool) source = `(${a} && ${b})`;
-          else source = `(${a} * ${b})`;
-        } else if (op === AluOp.Idiv)
-          source = isFloatDtype(dtype) ? `trunc(${a} / ${b})` : `(${a} / ${b})`;
-        else if (op === AluOp.Mod) source = `(${a} % ${b})`;
-        else if (op === AluOp.Min) {
-          if (dtype === DType.Bool) source = `(${a} && ${b})`;
-          else source = `min(${strip1(a)}, ${strip1(b)})`;
-        } else if (op === AluOp.Max) {
-          if (dtype === DType.Bool) source = `(${a} || ${b})`;
-          else source = `max(${strip1(a)}, ${strip1(b)})`;
-        } else if (op === AluOp.Cmplt) source = `(${a} < ${b})`;
-        else if (op === AluOp.Cmpne) {
-          if (isFloatDtype(src[0].dtype)) {
-            const x = isGensym(a) ? a : gensym();
-            if (x !== a) emit(`let ${x} = ${a};`);
-            source = `(${x} != ${b} || min(${x}, ${dtypeToWgsl(src[0].dtype)}(inf())) != ${x})`;
-          } else {
-            source = `(${a} != ${b})`;
-          }
-        }
-      } else if (AluGroup.Unary.has(op)) {
-        if (op === AluOp.Reciprocal && src[0].op === AluOp.Sqrt) {
-          const a = gen(src[0].src[0]);
-          source = `inverseSqrt(${a})`;
-        } else {
-          const a = gen(src[0]);
-          if (op === AluOp.Sin) source = `sin(${strip1(a)})`;
-          else if (op === AluOp.Cos) source = `cos(${strip1(a)})`;
-          else if (op === AluOp.Asin) source = `asin(${strip1(a)})`;
-          else if (op === AluOp.Atan) source = `atan(${strip1(a)})`;
-          else if (op === AluOp.Exp) source = `exp(${strip1(a)})`;
-          else if (op === AluOp.Log) source = `log(${strip1(a)})`;
-          else if (op === AluOp.Erf || op === AluOp.Erfc) {
-            const funcName = op === AluOp.Erf ? "erf" : "erfc";
-            if (dtype !== DType.Float32) {
-              source = `${dtypeToWgsl(dtype)}(${funcName}(f32(${strip1(a)})))`;
-            } else {
-              source = `${funcName}(${strip1(a)})`;
-            }
-          } else if (op === AluOp.Sqrt) source = `sqrt(${strip1(a)})`;
-          else if (op === AluOp.Reciprocal) source = `(1.0 / ${a})`;
-          else if (op === AluOp.Floor) source = `floor(${strip1(a)})`;
-          else if (op === AluOp.Ceil) source = `ceil(${strip1(a)})`;
-          else if (op === AluOp.Cast)
-            source = `${dtypeToWgsl(dtype)}(${strip1(a)})`;
-          else if (op === AluOp.Bitcast)
-            source = `bitcast<${dtypeToWgsl(dtype)}>(${strip1(a)})`;
-        }
-      } else if (op === AluOp.Where) {
-        source = `select(${strip1(gen(src[2]))}, ${strip1(gen(src[1]))}, ${strip1(gen(src[0]))})`;
-      } else if (op === AluOp.Threefry2x32) {
-        const x = gensym();
-        const [k0, k1, c0, c1] = src.map((s) => strip1(gen(s)));
-        emit(
-          `let ${x} = threefry2x32(vec2(${k0}, ${k1}), vec2(${c0}, ${c1}));`,
-        );
-        if (arg === "xor") source = `(${x}.x ^ ${x}.y)`;
-        else if (arg === 0) source = `${x}.x`;
-        else if (arg === 1) source = `${x}.y`;
-      } else if (op === AluOp.Const) {
-        return constToWgsl(dtype, arg);
-      } else if (op === AluOp.Special) {
-        return arg[0] as string;
-      } else if (op === AluOp.Variable) {
-        return variableOverrides?.get(arg as string) ?? (arg as string);
-      } else if (op === AluOp.GlobalView) {
-        // Rewrite to Where(valid, GlobalIndex(...), Const(0)) and recurse
-        const [gid, st] = arg as [number, import("../../shape").ShapeTracker];
-        const rewritten = accessorGlobal(dtype, gid, st, src);
-        return gen(rewritten);
-      } else if (op === AluOp.GlobalIndex) {
-        const bufIdx = arg[0] as number;
-        // When globalIndexRemap is provided for this buffer, remap the flat
-        // index from body-local to global strides at the AluExp level.
-        // This lets simplify() eliminate redundant div/mod (e.g.
-        // (a*C+b)/C → a) which string-level inRemap cannot do.
-        const remap = globalIndexRemap?.get(bufIdx);
-        if (remap) {
-          // Correction-based remap: global_flat = body_flat + correction
-          // where correction = sum_d(coord_d * (globalStride_d - bodyStride_d))
-          // for each dimension where strides differ.
-          //
-          // This avoids the Mod-based decomposition that string-level inRemap
-          // uses, which creates unsimplifiable expressions. The Idiv extraction
-          // benefits from simplify_remainder (e.g. (a*C+b)/C → a when b<C).
-          // Equal-stride dimensions (typically the trailing dim) need no work.
-          const flatIdx = src[0];
-          const nd = remap.bodyShape.length;
-          let correction: AluExp | null = null;
-          for (let d = 0; d < nd; d++) {
-            const strideDiff = remap.globalStrides[d] - remap.bodyStrides[d];
-            if (strideDiff === 0) continue;
-            let coord: AluExp;
-            if (d === 0) {
-              // Leading dim: no mod needed (flat index is in-range)
-              coord = AluExp.idiv(flatIdx, AluExp.i32(remap.bodyStrides[d]));
-            } else {
-              coord = AluExp.mod(
-                AluExp.idiv(flatIdx, AluExp.i32(remap.bodyStrides[d])),
-                AluExp.i32(remap.bodyShape[d]),
-              );
-            }
-            const term = AluExp.mul(coord, AluExp.i32(strideDiff));
-            correction = correction ? AluExp.add(correction, term) : term;
-          }
-          const remapped = correction
-            ? AluExp.add(flatIdx, correction).simplify()
-            : flatIdx;
-          const indexExpr = strip1(gen(remapped));
-          source = resolveGlobalIndex(
-            bufIdx,
-            indexExpr,
-            dtype,
-            true,
-            bankPadDims?.has(bufIdx),
-          );
-        } else {
-          const indexExpr = strip1(gen(src[0]));
-          source = resolveGlobalIndex(
-            bufIdx,
-            indexExpr,
-            dtype,
-            undefined,
-            bankPadDims?.has(bufIdx),
-          );
-        }
-        if (dtype === DType.Bool) source = `(${source} != 0)`;
-      }
-
-      if (!source) {
-        throw new Error(`block_map fused: unsupported AluOp ${op}`);
-      }
-
-      const typeName = dtypeToWgsl(dtype);
-      if ((references.get(exp) ?? 0) > 1) {
-        const name = gensym();
-        expContext.set(exp, name);
-        emit(`let ${name}: ${typeName} = ${strip1(source)};`);
-        return name;
-      } else {
-        expContext.set(exp, source);
-        return source;
-      }
-    };
-    return gen;
+    return createWgslGen({
+      kernel,
+      prefix,
+      resolveGlobalIndex,
+      emit,
+      blockSize,
+      variableOverrides,
+      gidxOverride,
+      ridxOverride,
+      globalIndexRemap,
+      bankPadDims,
+    });
   }
 
   // --- Generate codegen entries ---

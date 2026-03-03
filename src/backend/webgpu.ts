@@ -48,6 +48,7 @@ import {
   type ScanBindingInfo,
   wrapRoutineForScan,
 } from "./webgpu/scan-wrapper";
+import { createWgslGen, type ResolveGlobalIndex } from "./webgpu/wgsl-gen";
 
 interface ShaderDispatch extends ShaderInfo {
   pipeline: GPUComputePipeline; // Compiled pipeline for the shader.
@@ -4119,112 +4120,6 @@ function nativeScanMultiShaderSource(
 // Fused associative scan shader (WebGPU Kogge-Stone)
 // ---------------------------------------------------------------------------
 
-/**
- * Core ALU expression translator for assocScan body kernels.
- * Delegates GlobalIndex resolution to `resolveGid` callback.
- * Internal (gid >= numInputs) buffers are always resolved as `internal_N[idx]`.
- */
-function translateAssocScanAluExp(
-  exp: AluExp,
-  resolveGid: (gid: number, idxCode: string, eDtype: DType) => string,
-  numInputs: number,
-  _internalElemCounts: number[],
-): string {
-  const gen = (e: AluExp): string => {
-    const { op, src, dtype: eDtype, arg } = e;
-
-    if (op === AluOp.GlobalIndex) {
-      const gid = arg[0] as number;
-      const idxCode = gen(src[0]);
-      if (gid >= numInputs) {
-        const intIdx = gid - numInputs;
-        const access = `internal_${intIdx}[${idxCode}]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      }
-      return resolveGid(gid, idxCode, eDtype);
-    }
-
-    if (op === AluOp.Const) return constToWgsl(eDtype, arg);
-
-    if (op === AluOp.Special) {
-      const name = Array.isArray(arg) ? arg[0] : arg;
-      if (name === "gidx") return "gidx";
-      if (name === "ridx") return "ridx";
-      return name as string;
-    }
-
-    if (op === AluOp.Variable) {
-      if (arg === "acc") return "acc";
-      if (arg === "gidx") return "gidx";
-      if (arg === "ridx") return "ridx";
-      return arg as string;
-    }
-
-    if (op === AluOp.Erf || op === AluOp.Erfc) {
-      const funcName = op === AluOp.Erf ? "erf" : "erfc";
-      const a = strip1(gen(src[0]));
-      if (eDtype !== DType.Float32) {
-        return `${dtypeToWgsl(eDtype)}(${funcName}(f32(${a})))`;
-      }
-      return `${funcName}(${a})`;
-    }
-
-    if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
-      const a = gen(src[0]);
-      const b = gen(src[1]);
-      if (op === AluOp.Add) {
-        return eDtype === DType.Bool ? `(${a} || ${b})` : `(${a} + ${b})`;
-      }
-      if (op === AluOp.Sub) return `(${a} - ${b})`;
-      if (op === AluOp.Mul) {
-        return eDtype === DType.Bool ? `(${a} && ${b})` : `(${a} * ${b})`;
-      }
-      if (op === AluOp.Idiv) {
-        return isFloatDtype(eDtype) ? `trunc(${a} / ${b})` : `(${a} / ${b})`;
-      }
-      if (op === AluOp.Mod) return `(${a} % ${b})`;
-      if (op === AluOp.Min) {
-        return eDtype === DType.Bool
-          ? `(${a} && ${b})`
-          : `min(${strip1(a)}, ${strip1(b)})`;
-      }
-      if (op === AluOp.Max) {
-        return eDtype === DType.Bool
-          ? `(${a} || ${b})`
-          : `max(${strip1(a)}, ${strip1(b)})`;
-      }
-      if (op === AluOp.Cmplt) return `(${a} < ${b})`;
-      if (op === AluOp.Cmpne) return `(${a} != ${b})`;
-    }
-
-    if (AluGroup.Unary.has(op)) {
-      const a = gen(src[0]);
-      if (op === AluOp.Sin) return `sin(${strip1(a)})`;
-      if (op === AluOp.Cos) return `cos(${strip1(a)})`;
-      if (op === AluOp.Asin) return `asin(${strip1(a)})`;
-      if (op === AluOp.Atan) return `atan(${strip1(a)})`;
-      if (op === AluOp.Exp) return `exp(${strip1(a)})`;
-      if (op === AluOp.Log) return `log(${strip1(a)})`;
-      if (op === AluOp.Sqrt) return `sqrt(${strip1(a)})`;
-      if (op === AluOp.Reciprocal) return `(1.0 / ${a})`;
-      if (op === AluOp.Floor) return `floor(${strip1(a)})`;
-      if (op === AluOp.Ceil) return `ceil(${strip1(a)})`;
-      if (op === AluOp.Cast) return `${dtypeToWgsl(eDtype)}(${strip1(a)})`;
-      if (op === AluOp.Bitcast) {
-        return `bitcast<${dtypeToWgsl(eDtype)}>(${strip1(a)})`;
-      }
-    }
-
-    if (op === AluOp.Where) {
-      return `select(${strip1(gen(src[2]))}, ${strip1(gen(src[1]))}, ${strip1(gen(src[0]))})`;
-    }
-
-    throw new Error(`translateAssocScanAluExp: unsupported op ${AluOp[op]}`);
-  };
-
-  return strip1(gen(exp));
-}
-
 /** Compute prefix sums of leaf elem counts: leafStarts[k] = sum(leafElemCounts[0..k-1]). */
 function computeLeafStarts(leafElemCounts: number[]): number[] {
   const starts: number[] = [0];
@@ -4235,43 +4130,98 @@ function computeLeafStarts(leafElemCounts: number[]): number[] {
 }
 
 /**
- * Generate a WGSL expression for an associative scan body kernel step
- * reading from GLOBAL ping/pong buffers (flat Kogge-Stone path).
+ * Emit WGSL body steps for an associative scan fn(a, b) computation.
+ *
+ * Shared by: flat KS shader, blocked local scan (shmem + subgroup
+ * variants), blocked apply shader. Each caller provides a
+ * resolveGlobalIndex callback that maps GlobalIndex buffer reads to
+ * the correct WGSL (shared memory, global buffers, etc.).
+ *
+ * Expects the caller to have already declared:
+ *   - `var internal_N: array<resultTy, count>;` for each internal buffer
+ *   - An `eidx` loop variable if any kernel has size > 1
+ *   - An `acc` accumulator if any kernel has a reduction
+ *
+ * Writes results to `internal_N[eidx]` (or `internal_N[0]` for size-1).
  */
-function genAssocScanExpression(
-  exp: AluExp,
-  _dtype: DType,
-  numConsts: number,
-  numLeaves: number,
-  leafElemCounts: number[],
-  internalElemCounts: number[],
-): string {
-  const numInputs = numConsts + 2 * numLeaves;
-  const leafStarts = computeLeafStarts(leafElemCounts);
+function emitAssocScanBodySteps(
+  steps: AssocScanStep[],
+  resolveGlobalIndex: ResolveGlobalIndex,
+  emit: (...lines: (string | symbol)[]) => void,
+  pushIndent: symbol,
+  popIndent: symbol,
+  blockSize: number,
+  prefix: string,
+): void {
+  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+    const step = steps[stepIdx];
+    const kernel = step.kernel;
+    const kernelSize =
+      typeof kernel.size === "number"
+        ? kernel.size
+        : (kernel.concreteSizeHint ?? 1);
 
-  return translateAssocScanAluExp(
-    exp,
-    (gid, idxCode, eDtype) => {
-      if (gid < numConsts) {
-        const access = `const${gid}[${idxCode}]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+    emit(`// Step ${stepIdx}`);
+
+    const gidxOverride = AluExp.special(DType.Int32, "eidx", kernelSize);
+    const gen = createWgslGen({
+      kernel,
+      prefix: `${prefix}_s${stepIdx}`,
+      resolveGlobalIndex,
+      emit,
+      blockSize,
+      gidxOverride,
+    });
+
+    const re = kernel.outputs[0].reduction;
+    if (re) {
+      const accTy = dtypeToWgsl(re.dtype, true);
+      const redSize =
+        typeof re.size === "number"
+          ? re.size
+          : (re.concreteHint ?? Number(re.size));
+
+      if (kernelSize > 1) {
+        emit(
+          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+          pushIndent,
+        );
+      } else {
+        emit(`{`, pushIndent, `let eidx: i32 = 0;`);
       }
-      if (gid < numConsts + numLeaves) {
-        const leafIdx = gid - numConsts;
-        const elemCount = leafElemCounts[leafIdx];
-        const start = leafStarts[leafIdx];
-        const access = `ping[${start}u * uniforms.N + u32(a_pos) * ${elemCount}u + u32(${idxCode})]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
+      emit(`for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`, pushIndent);
+      emit(`let val = ${strip1(gen(kernel.outputs[0].exp))};`);
+
+      if (re.op === AluOp.Add) emit(`acc = acc + val;`);
+      else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
+      else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
+      else if (re.op === AluOp.Max) emit(`acc = max(acc, val);`);
+      else throw new Error(`Unsupported reduction op: ${re.op}`);
+
+      emit(popIndent, "}");
+      emit(
+        `internal_${step.outputInternalIdx}[eidx] = ${strip1(gen(kernel.outputs[0].reduction!.epilogue))};`,
+      );
+      emit(popIndent, "}");
+    } else {
+      if (kernelSize > 1) {
+        emit(
+          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+          pushIndent,
+        );
+        emit(
+          `internal_${step.outputInternalIdx}[eidx] = ${strip1(gen(kernel.outputs[0].exp))};`,
+        );
+        emit(popIndent, "}");
+      } else {
+        emit(
+          `internal_${step.outputInternalIdx}[0] = ${strip1(gen(kernel.outputs[0].exp))};`,
+        );
       }
-      const leafIdx = gid - numConsts - numLeaves;
-      const elemCount = leafElemCounts[leafIdx];
-      const start = leafStarts[leafIdx];
-      const access = `ping[${start}u * uniforms.N + u32(gidx) * ${elemCount}u + u32(${idxCode})]`;
-      return eDtype === DType.Bool ? `(${access} != 0)` : access;
-    },
-    numInputs,
-    internalElemCounts,
-  );
+    }
+    emit("");
+  }
 }
 
 /**
@@ -4308,6 +4258,7 @@ function assocScanFusedShaderSource(
   } = params;
 
   const resultTy = dtypeToWgsl(dtype, true);
+  const numInputs = numConsts + 2 * numLeaves;
 
   // Compute max per-position elements across all leaves for thread count
   // Compute leaf start offsets (prefix sum of elemCounts)
@@ -4390,120 +4341,34 @@ function assocScanFusedShaderSource(
   emit(pushIndent);
 
   // Execute all body steps — this is the fused fn(a, b) computation
-  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
-    const step = steps[stepIdx];
-    const kernel = step.kernel;
-    const tune = tuneNullopt(kernel);
-    const kernelSize =
-      typeof kernel.size === "number"
-        ? kernel.size
-        : (kernel.concreteSizeHint ?? 1);
-
-    emit(`// Step ${stepIdx}`);
-
-    // After tuneNullopt, the expression uses AluOp.Special("gidx") for the
-    // output element index. In the fused scan shader, `gidx` is the scan
-    // position (thread ID). We must rewrite Special("gidx") → Special("eidx")
-    // so the expression indexes the per-position output element, not the scan
-    // position. `substitute()` only matches AluOp.Variable — it won't touch
-    // AluOp.Special nodes. Use `rewrite()` instead.
-    const eidxVar = AluExp.special(DType.Int32, "eidx", kernelSize);
-    const rewriteGidxToEidx = (exp: AluExp): AluExp =>
-      exp.rewrite((node) => {
-        if (node.op === AluOp.Special) {
-          const name = Array.isArray(node.arg) ? node.arg[0] : node.arg;
-          if (name === "gidx") return eidxVar;
-        }
-      });
-
-    const re = kernel.outputs[0].reduction;
-    if (re) {
-      // Reduction kernel — must iterate over output elements (eidx)
-      // just like elementwise kernels. Each output element has its own
-      // reduction accumulator. For kernelSize=1 (scalar reduction) the
-      // loop body runs once; for kernelSize>1 (e.g. matmul output) it
-      // runs once per output element.
-      const accTy = dtypeToWgsl(re.dtype, true);
-      const redSize =
-        typeof tune.size.reduce === "number"
-          ? tune.size.reduce
-          : (re.concreteHint ?? Number(tune.size.reduce));
-
-      const substExp = rewriteGidxToEidx(tune.exp);
-      const substEpilogue = rewriteGidxToEidx(tune.epilogue!);
-
-      if (kernelSize > 1) {
-        emit(
-          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
-          pushIndent,
-        );
-      } else {
-        emit(`{`);
-        emit(pushIndent);
-        emit(`let eidx: i32 = 0;`);
-      }
-      emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
-      emit(`for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`, pushIndent);
-
-      const expCode = genAssocScanExpression(
-        substExp,
-        dtype,
-        numConsts,
-        numLeaves,
-        leafElemCounts,
-        internalElemCounts,
-      );
-      emit(`let val = ${expCode};`);
-
-      if (re.op === AluOp.Add) emit(`acc = acc + val;`);
-      else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
-      else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
-      else if (re.op === AluOp.Max) emit(`acc = max(acc, val);`);
-      else throw new Error(`Unsupported reduction op: ${re.op}`);
-
-      emit(popIndent, "}");
-
-      const epilogueCode = genAssocScanExpression(
-        substEpilogue,
-        dtype,
-        numConsts,
-        numLeaves,
-        leafElemCounts,
-        internalElemCounts,
-      );
-      emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueCode};`);
-      emit(popIndent, "}");
-    } else {
-      // Elementwise kernel — iterate over sub-elements
-      if (kernelSize > 1) {
-        emit(`for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`);
-        emit(pushIndent);
-
-        const substExp = rewriteGidxToEidx(tune.exp);
-        const expCode = genAssocScanExpression(
-          substExp,
-          dtype,
-          numConsts,
-          numLeaves,
-          leafElemCounts,
-          internalElemCounts,
-        );
-        emit(`internal_${step.outputInternalIdx}[eidx] = ${expCode};`);
-        emit(popIndent, "}");
-      } else {
-        const expCode = genAssocScanExpression(
-          tune.exp,
-          dtype,
-          numConsts,
-          numLeaves,
-          leafElemCounts,
-          internalElemCounts,
-        );
-        emit(`internal_${step.outputInternalIdx}[0] = ${expCode};`);
-      }
+  // Build resolve callback: consts → const buffers, a-leaves → ping[a_pos],
+  // b-leaves → ping[gidx], internals → internal_N arrays
+  const flatResolve: ResolveGlobalIndex = (gid, idxCode, _dtype) => {
+    if (gid >= numInputs) {
+      return `internal_${gid - numInputs}[${idxCode}]`;
     }
-    emit("");
-  }
+    if (gid < numConsts) return `const${gid}[${idxCode}]`;
+    if (gid < numConsts + numLeaves) {
+      const leafIdx = gid - numConsts;
+      const ec = leafElemCounts[leafIdx];
+      const start = leafStarts[leafIdx];
+      return `ping[${start}u * uniforms.N + u32(a_pos) * ${ec}u + u32(${idxCode})]`;
+    }
+    const leafIdx = gid - numConsts - numLeaves;
+    const ec = leafElemCounts[leafIdx];
+    const start = leafStarts[leafIdx];
+    return `ping[${start}u * uniforms.N + u32(gidx) * ${ec}u + u32(${idxCode})]`;
+  };
+
+  emitAssocScanBodySteps(
+    steps,
+    flatResolve,
+    emit,
+    pushIndent,
+    popIndent,
+    workgroupSize,
+    "flat",
+  );
 
   // Write results from internal buffers to pong
   for (let k = 0; k < numLeaves; k++) {
@@ -4711,133 +4576,34 @@ function blockedAssocScanLocalShaderSource(
     emit(`if (a_lid >= 0) {`);
     emit(pushIndent);
 
-    // Execute body steps with shmem-based access
-    for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
-      const step = steps[stepIdx];
-      const kernel = step.kernel;
-      const tune = tuneNullopt(kernel);
-      const kernelSize =
-        typeof kernel.size === "number"
-          ? kernel.size
-          : (kernel.concreteSizeHint ?? 1);
-
-      emit(`// Step ${stepIdx}`);
-
-      const eidxVar = AluExp.special(DType.Int32, "eidx", kernelSize);
-      const rewriteGidxToEidx = (exp: AluExp): AluExp =>
-        exp.rewrite((node) => {
-          if (node.op === AluOp.Special) {
-            const name = Array.isArray(node.arg) ? node.arg[0] : node.arg;
-            if (name === "gidx") return eidxVar;
-          }
-        });
-
-      // resolveGid that reads from shared memory (interleaved layout)
-      const shmemResolveGid = (
-        gid: number,
-        idxCode: string,
-        eDtype: DType,
-      ): string => {
-        if (gid < numConsts) {
-          const access = `const${gid}[${idxCode}]`;
-          return eDtype === DType.Bool ? `(${access} != 0)` : access;
-        }
-        if (gid < numConsts + numLeaves) {
-          // a-leaf: read from shmem_src at a_lid
-          const leafIdx = gid - numConsts;
-          const ec = leafElemCounts[leafIdx];
-          const access =
-            ec > 1
-              ? `${srcPrefix}_${leafIdx}[u32(${idxCode}) * ${B}u + u32(a_lid)]`
-              : `${srcPrefix}_${leafIdx}[u32(a_lid)]`;
-          return eDtype === DType.Bool ? `(${access} != 0)` : access;
-        }
-        // b-leaf: read from shmem_src at lid
-        const leafIdx = gid - numConsts - numLeaves;
+    // Build shmem-based resolve: consts → global, a-leaves → shmem[a_lid],
+    // b-leaves → shmem[lid], internals → internal_N arrays
+    const shmemResolve: ResolveGlobalIndex = (gid, idxCode, _dtype) => {
+      if (gid >= numInputs) return `internal_${gid - numInputs}[${idxCode}]`;
+      if (gid < numConsts) return `const${gid}[${idxCode}]`;
+      if (gid < numConsts + numLeaves) {
+        const leafIdx = gid - numConsts;
         const ec = leafElemCounts[leafIdx];
-        const access =
-          ec > 1
-            ? `${srcPrefix}_${leafIdx}[u32(${idxCode}) * ${B}u + lid]`
-            : `${srcPrefix}_${leafIdx}[lid]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      };
-
-      const re = kernel.outputs[0].reduction;
-      if (re) {
-        // Reduction kernel
-        const accTy = dtypeToWgsl(re.dtype, true);
-        const redSize =
-          typeof tune.size.reduce === "number"
-            ? tune.size.reduce
-            : (re.concreteHint ?? Number(tune.size.reduce));
-        const substExp = rewriteGidxToEidx(tune.exp);
-        const substEpilogue = rewriteGidxToEidx(tune.epilogue!);
-
-        if (kernelSize > 1) {
-          emit(
-            `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
-            pushIndent,
-          );
-        } else {
-          emit(`{`, pushIndent);
-          emit(`let eidx: i32 = 0;`);
-        }
-        emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
-        emit(
-          `for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`,
-          pushIndent,
-        );
-
-        const expCode = translateAssocScanAluExp(
-          substExp,
-          shmemResolveGid,
-          numInputs,
-          internalElemCounts,
-        );
-        emit(`let val = ${expCode};`);
-        if (re.op === AluOp.Add) emit(`acc = acc + val;`);
-        else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
-        else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
-        else if (re.op === AluOp.Max) emit(`acc = max(acc, val);`);
-        else throw new Error(`Unsupported reduction op: ${re.op}`);
-
-        emit(popIndent, "}");
-        const epilogueCode = translateAssocScanAluExp(
-          substEpilogue,
-          shmemResolveGid,
-          numInputs,
-          internalElemCounts,
-        );
-        emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueCode};`);
-        emit(popIndent, "}");
-      } else {
-        // Elementwise kernel
-        if (kernelSize > 1) {
-          emit(
-            `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
-            pushIndent,
-          );
-          const substExp = rewriteGidxToEidx(tune.exp);
-          const expCode = translateAssocScanAluExp(
-            substExp,
-            shmemResolveGid,
-            numInputs,
-            internalElemCounts,
-          );
-          emit(`internal_${step.outputInternalIdx}[eidx] = ${expCode};`);
-          emit(popIndent, "}");
-        } else {
-          const expCode = translateAssocScanAluExp(
-            tune.exp,
-            shmemResolveGid,
-            numInputs,
-            internalElemCounts,
-          );
-          emit(`internal_${step.outputInternalIdx}[0] = ${expCode};`);
-        }
+        return ec > 1
+          ? `${srcPrefix}_${leafIdx}[u32(${idxCode}) * ${B}u + u32(a_lid)]`
+          : `${srcPrefix}_${leafIdx}[u32(a_lid)]`;
       }
-      emit("");
-    }
+      const leafIdx = gid - numConsts - numLeaves;
+      const ec = leafElemCounts[leafIdx];
+      return ec > 1
+        ? `${srcPrefix}_${leafIdx}[u32(${idxCode}) * ${B}u + lid]`
+        : `${srcPrefix}_${leafIdx}[lid]`;
+    };
+
+    emitAssocScanBodySteps(
+      steps,
+      shmemResolve,
+      emit,
+      pushIndent,
+      popIndent,
+      B,
+      `shmem_${strideStr}`,
+    );
 
     // Write results from internal → shmem_dst (interleaved)
     for (let k = 0; k < numLeaves; k++) {
@@ -4927,127 +4693,31 @@ function blockedAssocScanLocalShaderSource(
     emit(`if (a_lid >= 0) {`);
     emit(pushIndent);
 
-    // Execute body steps reading a-values from sg_a_k, b-values from sg_val_k
-    for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
-      const step = steps[stepIdx];
-      const kernel = step.kernel;
-      const tune = tuneNullopt(kernel);
-      const kernelSize =
-        typeof kernel.size === "number"
-          ? kernel.size
-          : (kernel.concreteSizeHint ?? 1);
-
-      emit(`// Step ${stepIdx}`);
-
-      const eidxVar = AluExp.special(DType.Int32, "eidx", kernelSize);
-      const rewriteGidxToEidx = (exp: AluExp): AluExp =>
-        exp.rewrite((node) => {
-          if (node.op === AluOp.Special) {
-            const name = Array.isArray(node.arg) ? node.arg[0] : node.arg;
-            if (name === "gidx") return eidxVar;
-          }
-        });
-
-      // resolveGid that reads from subgroup shuffle results
-      const sgResolveGid = (
-        gid: number,
-        idxCode: string,
-        eDtype: DType,
-      ): string => {
-        if (gid < numConsts) {
-          const access = `const${gid}[${idxCode}]`;
-          return eDtype === DType.Bool ? `(${access} != 0)` : access;
-        }
-        if (gid < numConsts + numLeaves) {
-          // a-leaf: read from shuffled value
-          const leafIdx = gid - numConsts;
-          const ec = leafElemCounts[leafIdx];
-          const access =
-            ec > 1 ? `sg_a_${leafIdx}[u32(${idxCode})]` : `sg_a_${leafIdx}`;
-          return eDtype === DType.Bool ? `(${access} != 0)` : access;
-        }
-        // b-leaf: read from register value
-        const leafIdx = gid - numConsts - numLeaves;
+    // Build subgroup-based resolve: a-leaves → sg_a_k, b-leaves → sg_val_k
+    const sgResolve: ResolveGlobalIndex = (gid, idxCode, _dtype) => {
+      if (gid >= numInputs) return `internal_${gid - numInputs}[${idxCode}]`;
+      if (gid < numConsts) return `const${gid}[${idxCode}]`;
+      if (gid < numConsts + numLeaves) {
+        const leafIdx = gid - numConsts;
         const ec = leafElemCounts[leafIdx];
-        const access =
-          ec > 1 ? `sg_val_${leafIdx}[u32(${idxCode})]` : `sg_val_${leafIdx}`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      };
-
-      const re = kernel.outputs[0].reduction;
-      if (re) {
-        const accTy = dtypeToWgsl(re.dtype, true);
-        const redSize =
-          typeof tune.size.reduce === "number"
-            ? tune.size.reduce
-            : (re.concreteHint ?? Number(tune.size.reduce));
-        const substExp = rewriteGidxToEidx(tune.exp);
-        const substEpilogue = rewriteGidxToEidx(tune.epilogue!);
-
-        if (kernelSize > 1) {
-          emit(
-            `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
-            pushIndent,
-          );
-        } else {
-          emit(`{`, pushIndent);
-          emit(`let eidx: i32 = 0;`);
-        }
-        emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
-        emit(
-          `for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`,
-          pushIndent,
-        );
-
-        const expCode = translateAssocScanAluExp(
-          substExp,
-          sgResolveGid,
-          numInputs,
-          internalElemCounts,
-        );
-        emit(`let val = ${expCode};`);
-        if (re.op === AluOp.Add) emit(`acc = acc + val;`);
-        else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
-        else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
-        else if (re.op === AluOp.Max) emit(`acc = max(acc, val);`);
-        else throw new Error(`Unsupported reduction op: ${re.op}`);
-
-        emit(popIndent, "}");
-        const epilogueCode = translateAssocScanAluExp(
-          substEpilogue,
-          sgResolveGid,
-          numInputs,
-          internalElemCounts,
-        );
-        emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueCode};`);
-        emit(popIndent, "}");
-      } else {
-        if (kernelSize > 1) {
-          emit(
-            `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
-            pushIndent,
-          );
-          const substExp = rewriteGidxToEidx(tune.exp);
-          const expCode = translateAssocScanAluExp(
-            substExp,
-            sgResolveGid,
-            numInputs,
-            internalElemCounts,
-          );
-          emit(`internal_${step.outputInternalIdx}[eidx] = ${expCode};`);
-          emit(popIndent, "}");
-        } else {
-          const expCode = translateAssocScanAluExp(
-            tune.exp,
-            sgResolveGid,
-            numInputs,
-            internalElemCounts,
-          );
-          emit(`internal_${step.outputInternalIdx}[0] = ${expCode};`);
-        }
+        return ec > 1 ? `sg_a_${leafIdx}[u32(${idxCode})]` : `sg_a_${leafIdx}`;
       }
-      emit("");
-    }
+      const leafIdx = gid - numConsts - numLeaves;
+      const ec = leafElemCounts[leafIdx];
+      return ec > 1
+        ? `sg_val_${leafIdx}[u32(${idxCode})]`
+        : `sg_val_${leafIdx}`;
+    };
+
+    emitAssocScanBodySteps(
+      steps,
+      sgResolve,
+      emit,
+      pushIndent,
+      popIndent,
+      B,
+      `sg_${stride}`,
+    );
 
     // Write results from internal → shmem_dst (interleaved)
     for (let k = 0; k < numLeaves; k++) {
@@ -5320,120 +4990,35 @@ function blockedAssocScanApplyShaderSource(
 
   // Apply = fn(summary[blockIdx-1], data[gidx])
   // "a" is the summary element at summaryIdx, "b" is the data element at gidx
-  const applyResolveGid = (
-    gid: number,
-    idxCode: string,
-    eDtype: DType,
-  ): string => {
-    if (gid < numConsts) {
-      const access = `const${gid}[${idxCode}]`;
-      return eDtype === DType.Bool ? `(${access} != 0)` : access;
+  const applyResolve: ResolveGlobalIndex = (gid, idxCode, _dtype) => {
+    if (gid >= numInputs) {
+      return `internal_${gid - numInputs}[${idxCode}]`;
     }
+    if (gid < numConsts) return `const${gid}[${idxCode}]`;
     if (gid < numConsts + numLeaves) {
       // a-leaf: read from summary buffer at summaryIdx
       const leafIdx = gid - numConsts;
       const ec = leafElemCounts[leafIdx];
       const start = leafStarts[leafIdx];
-      const access = `summary[${start}u * uniforms.M + summaryIdx * ${ec}u + u32(${idxCode})]`;
-      return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      return `summary[${start}u * uniforms.M + summaryIdx * ${ec}u + u32(${idxCode})]`;
     }
     // b-leaf: read from data buffer at gidx
     const leafIdx = gid - numConsts - numLeaves;
     const ec = leafElemCounts[leafIdx];
     const start = leafStarts[leafIdx];
-    const access = `data[${start}u * uniforms.N + u32(gidx) * ${ec}u + u32(${idxCode})]`;
-    return eDtype === DType.Bool ? `(${access} != 0)` : access;
+    return `data[${start}u * uniforms.N + u32(gidx) * ${ec}u + u32(${idxCode})]`;
   };
 
   // Execute body steps — same pattern as flat scan shader
-  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
-    const step = steps[stepIdx];
-    const kernel = step.kernel;
-    const tune = tuneNullopt(kernel);
-    const kernelSize =
-      typeof kernel.size === "number"
-        ? kernel.size
-        : (kernel.concreteSizeHint ?? 1);
-
-    emit(`// Step ${stepIdx}`);
-
-    const eidxVar = AluExp.special(DType.Int32, "eidx", kernelSize);
-    const rewriteGidxToEidx = (exp: AluExp): AluExp =>
-      exp.rewrite((node) => {
-        if (node.op === AluOp.Special) {
-          const name = Array.isArray(node.arg) ? node.arg[0] : node.arg;
-          if (name === "gidx") return eidxVar;
-        }
-      });
-
-    const re = kernel.outputs[0].reduction;
-    if (re) {
-      const accTy = dtypeToWgsl(re.dtype, true);
-      const redSize =
-        typeof tune.size.reduce === "number"
-          ? tune.size.reduce
-          : (re.concreteHint ?? Number(tune.size.reduce));
-      const substExp = rewriteGidxToEidx(tune.exp);
-      const substEpilogue = rewriteGidxToEidx(tune.epilogue!);
-
-      if (kernelSize > 1) {
-        emit(
-          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
-          pushIndent,
-        );
-      } else {
-        emit(`{`, pushIndent, `let eidx: i32 = 0;`);
-      }
-      emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
-      emit(`for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`, pushIndent);
-      const expCode = translateAssocScanAluExp(
-        substExp,
-        applyResolveGid,
-        numInputs,
-        internalElemCounts,
-      );
-      emit(`let val = ${expCode};`);
-      if (re.op === AluOp.Add) emit(`acc = acc + val;`);
-      else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
-      else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
-      else if (re.op === AluOp.Max) emit(`acc = max(acc, val);`);
-      else throw new Error(`Unsupported reduction op: ${re.op}`);
-      emit(popIndent, "}");
-      const epilogueCode = translateAssocScanAluExp(
-        substEpilogue,
-        applyResolveGid,
-        numInputs,
-        internalElemCounts,
-      );
-      emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueCode};`);
-      emit(popIndent, "}");
-    } else {
-      if (kernelSize > 1) {
-        emit(
-          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
-          pushIndent,
-        );
-        const substExp = rewriteGidxToEidx(tune.exp);
-        const expCode = translateAssocScanAluExp(
-          substExp,
-          applyResolveGid,
-          numInputs,
-          internalElemCounts,
-        );
-        emit(`internal_${step.outputInternalIdx}[eidx] = ${expCode};`);
-        emit(popIndent, "}");
-      } else {
-        const expCode = translateAssocScanAluExp(
-          tune.exp,
-          applyResolveGid,
-          numInputs,
-          internalElemCounts,
-        );
-        emit(`internal_${step.outputInternalIdx}[0] = ${expCode};`);
-      }
-    }
-    emit("");
-  }
+  emitAssocScanBodySteps(
+    steps,
+    applyResolve,
+    emit,
+    pushIndent,
+    popIndent,
+    wgSize,
+    "apply",
+  );
 
   // Write results back to data buffer
   for (let k = 0; k < numLeaves; k++) {
