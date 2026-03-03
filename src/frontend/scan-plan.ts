@@ -17,7 +17,6 @@ import type {
   NativeScanMultiStep,
   PreparedPreencodedMultiStep,
   PreparedPreencodedScan,
-  PreparedWebGPUAssocScan,
   PreparedWebGPUBlockedAssocScan,
   WebGPUAssocScanParams,
 } from "../backend/webgpu";
@@ -50,27 +49,15 @@ export type ScanPlan =
 /**
  * Execution plan for `lax.associativeScan` (Kogge-Stone parallel prefix scan).
  *
- * - `compiled-loop`: Entire Kogge-Stone ladder compiled to a single WASM module.
- *   N is a runtime parameter — the same compiled module supports any input length.
  * - `compiled-loop-blocked`: Three-level blocked Kogge-Stone in a single WASM module.
  *   Reduces total work from O(N log N) to O(N log B) for large N.
  * - `fallback`: JS-driven Kogge-Stone loop calling body program per round.
  */
 export type AssocScanPlan =
   | {
-      path: "compiled-loop";
-      executable: Executable;
-      params: NativeAssocScanParams;
-    }
-  | {
       path: "compiled-loop-blocked";
       executable: Executable;
       params: NativeAssocScanBlockedParams;
-    }
-  | {
-      path: "webgpu-fused";
-      prepared: PreparedWebGPUAssocScan;
-      params: WebGPUAssocScanParams;
     }
   | {
       path: "webgpu-fused-blocked";
@@ -1586,17 +1573,6 @@ export function planAssociativeScan(
           blockSize: BLOCK_SIZE,
         };
       }
-
-      // Fall back to flat fused path
-      const prepared = webgpuBackend.prepareAssocScan(webgpuParams);
-      if (prepared) {
-        if (DEBUG >= 1) {
-          console.log(
-            `[assoc-scan] SUCCESS! Using WebGPU fused with ${webgpuSteps.length} step(s)`,
-          );
-        }
-        return { path: "webgpu-fused", prepared, params: webgpuParams };
-      }
     } catch (e) {
       if (DEBUG >= 2) {
         console.warn("[assoc-scan] WebGPU fused compilation failed:", e);
@@ -1605,7 +1581,7 @@ export function planAssociativeScan(
     return { path: "fallback" };
   }
 
-  // --- WASM path: try blocked, then flat compiled-loop ---
+  // --- WASM path: blocked compiled-loop ---
   const params: NativeAssocScanParams = {
     numConsts,
     constSizes,
@@ -1641,21 +1617,6 @@ export function planAssociativeScan(
   } catch (e) {
     if (DEBUG >= 2) {
       console.warn("[assoc-scan] blocked compilation failed:", e);
-    }
-  }
-
-  // Flat fallback
-  try {
-    const exe = wasmBackend.prepareNativeAssociativeScan(params);
-    if (DEBUG >= 1) {
-      console.log(
-        `[assoc-scan] SUCCESS! Using WASM compiled-loop with ${steps.length} step(s)`,
-      );
-    }
-    return { path: "compiled-loop", executable: exe, params };
-  } catch (e) {
-    if (DEBUG >= 2) {
-      console.warn("[assoc-scan] compilation failed:", e);
     }
     return { path: "fallback" };
   }

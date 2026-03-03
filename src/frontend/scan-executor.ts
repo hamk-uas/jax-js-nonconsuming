@@ -412,19 +412,6 @@ export function executeAssociativeScan(
     dimBindings,
   } = params;
 
-  if (plan.path === "compiled-loop") {
-    const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
-    (backend as WasmBackend).dispatchNativeAssociativeScan(
-      plan.executable,
-      plan.params,
-      N,
-      constSlots,
-      elemSlots,
-      outputSlots,
-    );
-    return { outputs: outputSlots, pending: [] };
-  }
-
   if (plan.path === "compiled-loop-blocked") {
     const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
     (backend as WasmBackend).dispatchBlockedAssociativeScan(
@@ -434,20 +421,6 @@ export function executeAssociativeScan(
       constSlots,
       elemSlots,
       outputSlots,
-    );
-    return { outputs: outputSlots, pending: [] };
-  }
-
-  if (plan.path === "webgpu-fused") {
-    const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
-    (backend as WebGPUBackend).dispatchAssocScan(
-      plan.prepared,
-      plan.params,
-      constSlots,
-      elemSlots,
-      outputSlots,
-      N,
-      reverse,
     );
     return { outputs: outputSlots, pending: [] };
   }

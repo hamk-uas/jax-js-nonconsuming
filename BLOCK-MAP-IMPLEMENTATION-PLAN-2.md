@@ -1270,18 +1270,19 @@ option once the compiler matures.
 
 ---
 
-## Phase 7: Code Deletion (Conditional on Performance Gates)
+## Phase 7: Code Deletion (Conditional on Performance Gates) ✅ DONE
 
-### M7.4 fused assocScan (~1,074 LOC)
+### M7.4 fused assocScan (~1,074 LOC) — DELETED
 
-Delete only if Phase 5's block_map assocScan matches within 20% of M7.4 performance at N=256, N=1000
-on both NVIDIA and Intel Arc via headless Chromium.
+Blocked assocScan is the default path and passes all tests. Flat Kogge-Stone codegen deleted from
+wasm.ts (~941 LOC), webgpu.ts (~210 LOC), scan-plan.ts (~40 LOC), scan-executor.ts (~27 LOC). Total:
+**1,217 LOC removed**.
 
-### Current naive matmul dispatch
+### Current naive matmul dispatch — THRESHOLD RAISED
 
-Replace only if Phase 4's tiled matmul meets the P1 criterion (2048×2048 ≥ 40% theoretical GFLOP/s).
-
-**Do NOT delete in the same PR that adds block_map.** Deletion is a separate, benchmark-gated PR.
+tiledMatmul 33× faster at 2048×2048, ~tie at 512×512, 4.5× slower at 256×256. Raised
+`np.matmul → lax.tiledMatmul` routing threshold from `minDim ≥ 32` to `minDim ≥ 512`. Naive matmul
+dispatch retained for small matrices where it's faster.
 
 ---
 

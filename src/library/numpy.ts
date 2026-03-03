@@ -1142,7 +1142,7 @@ export function matmul(x: ArrayLike, y: ArrayLike): Array {
       x.shape[0] as number,
       x.shape[1] as number,
       y.shape[1] as number,
-    ) >= 32
+    ) >= 512
   ) {
     return lax.tiledMatmul(x, y);
   }
