@@ -3166,7 +3166,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       tangentBodyUndefPrimals,
     );
 
-    // ---- Forward pass: collect primal carry at each step ----
+    // ---- Forward pass: collect primal carry at each step via Scan ----
     const constResiduals = args
       .slice(0, numConsts)
       .filter((_, i) => !bodyUndefPrimals[i]) as Tracer[];
@@ -3175,113 +3175,109 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       numConsts + numCarryHalf,
     ) as Tracer[];
 
-    const primalHistory: Tracer[][] = [];
-    let fwdCarry = primalCarryInit.map((c) => c.ref);
-    primalHistory.push(fwdCarry.map((c) => c.ref));
+    // Build Forward Scan body: 
+    // Takes: [i, ...primalCarry]
+    // Returns: [iNext, ...nextPrimalCarry, i, ...primalCarry]  <- stacked ys are the history
+    const { jaxpr: fwdScanBody } = makeJaxpr((iIn: Tracer, ...carryIn: Tracer[]) => {
+       const forwardOuts = evalJaxpr(primalForwardJaxpr.jaxpr, [
+         ...primalForwardJaxpr.consts,
+         ...constResiduals,
+         iIn,
+         ...carryIn
+       ]);
+       const iNext = bind(Primitive.Add, [iIn, array(1, {dtype: iDtype})])[0];
+       return [iNext, ...forwardOuts, iIn, ...carryIn];
+    })(new ShapedArray([], iDtype, false) as any, ...primalCarryInit.map(c => (c.aval) as any));
 
-    for (let step = lower; step < upper; step++) {
-      const iArr = array(step, { dtype: iDtype });
-      const forwardInputs = [...constResiduals, iArr, ...fwdCarry];
-      const forwardOuts = evalJaxpr(primalForwardJaxpr.jaxpr, [
-        ...primalForwardJaxpr.consts,
-        ...forwardInputs,
-      ]);
-      for (const c of fwdCarry) c.dispose();
-      fwdCarry = forwardOuts;
-      primalHistory.push(fwdCarry.map((c) => c.ref));
-      iArr.dispose();
-    }
-    for (const c of fwdCarry) c.dispose();
+    let initialILoc = typeof lowerDim === 'number' ? lowerDim : 0;
+    const fwdScanOuts = bind(Primitive.Scan, [
+       ...fwdScanBody.consts,
+       array(initialILoc, {dtype: iDtype}),
+       ...primalCarryInit
+    ], {
+       jaxpr: fwdScanBody.jaxpr,
+       numConsts: fwdScanBody.consts.length,
+       numCarry: 1 + numCarryHalf,
+       length: N,
+       reverse: false
+    }) as Tracer[];
 
-    // ---- Backward pass ----
-    let ctCarry = cts.slice(numCarryHalf).map((c) => c.ref);
-    for (let i = 0; i < numCarryHalf; i++) cts[i]?.dispose?.();
+    // Extract stacked arrays
+    const ysStart = 1 + numCarryHalf;
+    const historyI = fwdScanOuts[ysStart];
+    const historyPrimals = fwdScanOuts.slice(ysStart + 1);
 
-    let ctConstsAccum: Tracer[] | null = null;
+    // ---- Backward pass via Scan ----
+    const ctCarryInit = cts.slice(numCarryHalf);
 
-    for (let step = upper - 1; step >= lower; step--) {
-      const k = step - lower;
-      const iArr = array(step, { dtype: iDtype });
-      const primals_k = primalHistory[k];
+    const tangentConstsAvals = tangentBodyInAvals.slice(0, numTangentConsts);
 
-      // Transposed body takes: [transposed consts, primal residuals, cotangents]
-      // Primal residuals = [const residuals, i, primal carry at step k]
-      const transposedInputs = [
-        ...transposedBody.consts,
-        ...constResiduals,
-        iArr,
-        ...primals_k,
-        ...ctCarry,
-      ];
+    const { jaxpr: bwdScanBody } = makeJaxpr((...bwdArgs: Tracer[]) => {
+       const ctConstsIn = bwdArgs.slice(0, numTangentConsts);
+       const ctCarryIn = bwdArgs.slice(numTangentConsts, numTangentConsts + numTangentCarry);
+       const iArr_k = bwdArgs[numTangentConsts + numTangentCarry];
+       const primals_k = bwdArgs.slice(numTangentConsts + numTangentCarry + 1);
 
-      const transposedOuts = evalJaxpr(transposedBody.jaxpr, transposedInputs);
+       const transposedInputs = [
+         ...transposedBody.consts,
+         ...constResiduals,
+         iArr_k,
+         ...primals_k,
+         ...ctCarryIn
+       ];
 
-      // Extract: [ct tangent consts, ct tangent carry]
-      let outIdx = 0;
-      const ctConstsStep: Tracer[] = [];
-      for (let i = 0; i < numTangentConsts; i++) {
-        ctConstsStep.push(transposedOuts[outIdx++]);
-      }
-      const ctCarryNew: Tracer[] = [];
-      for (let i = 0; i < numTangentCarry; i++) {
-        ctCarryNew.push(transposedOuts[outIdx++]);
-      }
+       const transposedOuts = evalJaxpr(transposedBody.jaxpr, transposedInputs);
 
-      // Accumulate const cotangents
-      if (ctConstsAccum === null) {
-        ctConstsAccum = ctConstsStep;
-      } else {
-        const next: Tracer[] = [];
-        for (let i = 0; i < ctConstsStep.length; i++) {
-          const summed = add(ctConstsAccum[i], ctConstsStep[i]);
-          ctConstsAccum[i].dispose();
-          ctConstsStep[i].dispose();
-          next.push(summed);
-        }
-        ctConstsAccum = next;
-      }
+       const ctConstsStep = transposedOuts.slice(0, numTangentConsts);
+       const ctCarryStep = transposedOuts.slice(numTangentConsts, numTangentConsts + numTangentCarry);
 
-      // Dispose old carry ct and step intermediates
-      for (const c of ctCarry) c.dispose();
-      for (const c of primals_k) c.dispose();
-      iArr.dispose();
+       const ctConstsOut = ctConstsIn.map((c, idx) => bind(Primitive.Add, [c, ctConstsStep[idx]])[0]);
 
-      ctCarry = ctCarryNew;
-    }
-    // Dispose unused final primal history entry
-    for (const c of primalHistory[N]) c.dispose();
+       return [...ctConstsOut, ...ctCarryStep];
+    })(
+      ...Array.from({length: numTangentConsts}, (_, i) => (new ShapedArray(tangentConstsAvals[i].shape, tangentConstsAvals[i].dtype, false) as any)),
+      ...ctCarryInit.map((c, i) => c ? (c.aval) as any : (new ShapedArray(primalCarryInit[i].shape, primalCarryInit[i].dtype, false) as any)),
+      new ShapedArray([], iDtype, false) as any,
+      ...primalCarryInit.map(c => (c.aval) as any)
+    );
 
-    // Dispose the primal forward jaxpr (consumed).
-    // transposedBody is cache-owned — do NOT dispose.
-    // tangentBody.jaxpr is the cache key for transposedBody — disposing its
-    // Literal-originated consts would invalidate the cache entry. Let GC
-    // reclaim it once the Jaxpr key is unreachable.
-    primalForwardJaxpr.dispose();
+    const ctConstsZeros = Array.from({length: numTangentConsts}, (_, i) => zerosInternal(tangentConstsAvals[i].shape, tangentConstsAvals[i].dtype));
+    const ctCarrySafeInit = ctCarryInit.map((c, i) => c || zerosInternal(primalCarryInit[i].shape, primalCarryInit[i].dtype));
 
-    // ---- Build result ----
-    const result: (Tracer | null)[] = [];
-    let constCtIdx = 0;
+    const bwdScanOuts = bind(Primitive.Scan, [
+       ...bwdScanBody.consts,
+       ...ctConstsZeros,
+       ...ctCarrySafeInit,
+       historyI,
+       ...historyPrimals
+    ], {
+       jaxpr: bwdScanBody.jaxpr,
+       numConsts: bwdScanBody.consts.length,
+       numCarry: numTangentConsts + numTangentCarry,
+       length: N,
+       reverse: true
+    }) as Tracer[];
+
+    const ctConstsFinal = bwdScanOuts.slice(0, numTangentConsts);
+    const ctCarryFinal = bwdScanOuts.slice(numTangentConsts, numTangentConsts + numTangentCarry);
+
+    const resultCts: (Tracer | null)[] = [];
+    let ctConstsIdx = 0;
     for (let i = 0; i < numConsts; i++) {
-      if (args[i] instanceof UndefPrimal) {
-        result.push(ctConstsAccum ? ctConstsAccum[constCtIdx++] : null);
-      } else {
-        result.push(null);
-      }
+       resultCts.push(bodyUndefPrimals[i] ? ctConstsFinal[ctConstsIdx++] : null);
     }
-    for (let i = 0; i < numCarryHalf; i++) {
-      result.push(null); // primal carry: known
-    }
-    for (let i = 0; i < numCarryHalf; i++) {
-      const argIdx = numConsts + numCarryHalf + i;
-      if (args[argIdx] instanceof UndefPrimal) {
-        result.push(ctCarry[i]);
-      } else {
-        result.push(null);
-        ctCarry[i].dispose();
-      }
+    
+
+    let ctCarryIdx = 0;
+    for (let i = 0; i < numCarryTotal; i++) {
+       if (i < numCarryHalf) {
+          resultCts.push(null);
+       } else {
+          resultCts.push(ctCarryFinal[ctCarryIdx++]);
+       }
     }
 
-    return result;
+    return resultCts;
   },
 };
 
