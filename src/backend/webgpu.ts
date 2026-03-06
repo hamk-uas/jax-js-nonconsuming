@@ -91,6 +91,10 @@ export interface NativeScanMultiParams {
   reverse?: boolean;
   /** Number of internal intermediate locals (from steps with internal deps). */
   numInternal: number;
+  /** Per-internal element count (typed, not bytes). */
+  internalElemCounts: number[];
+  /** Per-internal dtype. */
+  internalDtypes: DType[];
 }
 
 // ---------------------------------------------------------------------------
@@ -3716,145 +3720,6 @@ function createShaderEmitter(): {
 }
 
 /**
- * Generate a WGSL expression for a scan body kernel.
- *
- * Maps GlobalIndex gids to scan-specific buffer names (const0, carry0, xs0).
- * xs inputs use `dataIdx` for iteration-aware addressing.
- */
-function genScanExpressionWithRidx(
-  exp: AluExp,
-  _dtype: DType,
-  numConsts: number,
-  numCarry: number,
-  xsElemStrides: number[],
-  carryElemCounts?: number[],
-): string {
-  const numX = xsElemStrides.length;
-  const gen = (e: AluExp): string => {
-    const { op, src, dtype: eDtype, arg } = e;
-
-    // Handle scan-specific GlobalIndex classification
-    if (op === AluOp.GlobalIndex) {
-      const gid = arg[0] as number;
-      const idxCode = gen(src[0]);
-
-      if (gid < numConsts) {
-        const access = `const${gid}[${idxCode}]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else if (gid < numConsts + numCarry) {
-        // Carry: use snapshot local when index is trivially gidx (elementwise)
-        // or carry has only 1 element (any index == gidx == 0).
-        // Otherwise fall back to buffer access (e.g., dot product with ridx-dep index)
-        const carryIdx = gid - numConsts;
-        const isElementLocal =
-          idxCode === "gidx" ||
-          (carryElemCounts !== undefined && carryElemCounts[carryIdx] === 1);
-        if (isElementLocal) {
-          const varName = `c_${carryIdx}`;
-          return eDtype === DType.Bool ? `(${varName} != 0)` : varName;
-        }
-        const access = `carry${carryIdx}[${idxCode}]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else if (gid < numConsts + numCarry + numX) {
-        const xIdx = gid - numConsts - numCarry;
-        const stride = xsElemStrides[xIdx];
-        const access = `xs${xIdx}[i32(dataIdx) * ${stride} + ${idxCode}]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else {
-        // Internal intermediate: read from local variable
-        const internalIdx = gid - numConsts - numCarry - numX;
-        const varName = `internal_${internalIdx}`;
-        return eDtype === DType.Bool ? `(${varName} != 0)` : varName;
-      }
-    }
-
-    if (op === AluOp.Const) return constToWgsl(eDtype, arg);
-
-    if (op === AluOp.Special) {
-      const name = Array.isArray(arg) ? arg[0] : arg;
-      if (name === "gidx") return "gidx";
-      if (name === "ridx") return "ridx";
-      return name as string;
-    }
-
-    if (op === AluOp.Variable) {
-      if (arg === "acc") return "acc";
-      if (arg === "gidx") return "gidx";
-      if (arg === "ridx") return "ridx";
-      return arg as string;
-    }
-
-    // Erf/Erfc with f32 precision wrapper
-    if (op === AluOp.Erf || op === AluOp.Erfc) {
-      const funcName = op === AluOp.Erf ? "erf" : "erfc";
-      const a = strip1(gen(src[0]));
-      if (eDtype !== DType.Float32) {
-        return `${dtypeToWgsl(eDtype)}(${funcName}(f32(${a})))`;
-      }
-      return `${funcName}(${a})`;
-    }
-
-    // Binary ops
-    if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
-      const a = gen(src[0]);
-      const b = gen(src[1]);
-      if (op === AluOp.Add) {
-        return eDtype === DType.Bool ? `(${a} || ${b})` : `(${a} + ${b})`;
-      }
-      if (op === AluOp.Sub) return `(${a} - ${b})`;
-      if (op === AluOp.Mul) {
-        return eDtype === DType.Bool ? `(${a} && ${b})` : `(${a} * ${b})`;
-      }
-      if (op === AluOp.Idiv) {
-        return isFloatDtype(eDtype) ? `trunc(${a} / ${b})` : `(${a} / ${b})`;
-      }
-      if (op === AluOp.Mod) return `(${a} % ${b})`;
-      if (op === AluOp.Min) {
-        return eDtype === DType.Bool
-          ? `(${a} && ${b})`
-          : `min(${strip1(a)}, ${strip1(b)})`;
-      }
-      if (op === AluOp.Max) {
-        return eDtype === DType.Bool
-          ? `(${a} || ${b})`
-          : `max(${strip1(a)}, ${strip1(b)})`;
-      }
-      if (op === AluOp.Cmplt) return `(${a} < ${b})`;
-      if (op === AluOp.Cmpne) return `(${a} != ${b})`;
-    }
-
-    // Unary ops
-    if (AluGroup.Unary.has(op)) {
-      const a = gen(src[0]);
-      if (op === AluOp.Sin) return `sin(${strip1(a)})`;
-      if (op === AluOp.Cos) return `cos(${strip1(a)})`;
-      if (op === AluOp.Asin) return `asin(${strip1(a)})`;
-      if (op === AluOp.Atan) return `atan(${strip1(a)})`;
-      if (op === AluOp.Exp) return `exp(${strip1(a)})`;
-      if (op === AluOp.Log) return `log(${strip1(a)})`;
-      if (op === AluOp.Sqrt) return `sqrt(${strip1(a)})`;
-      if (op === AluOp.Reciprocal) return `(1.0 / ${a})`;
-      if (op === AluOp.Floor) return `floor(${strip1(a)})`;
-      if (op === AluOp.Ceil) return `ceil(${strip1(a)})`;
-      if (op === AluOp.Cast)
-        return castSaturateWgsl(strip1(a), src[0].dtype, eDtype);
-      if (op === AluOp.Bitcast) {
-        return `bitcast<${dtypeToWgsl(eDtype)}>(${strip1(a)})`;
-      }
-    }
-
-    // Ternary
-    if (op === AluOp.Where) {
-      return `select(${strip1(gen(src[2]))}, ${strip1(gen(src[1]))}, ${strip1(gen(src[0]))})`;
-    }
-
-    throw new Error(`genScanExpressionWithRidx: unsupported op ${AluOp[op]}`);
-  };
-
-  return strip1(gen(exp));
-}
-
-/**
  * Generate a WGSL shader for native scan with multiple kernel steps.
  *
  * Uses carry snapshot locals to avoid read-after-write hazards: at each
@@ -3887,6 +3752,8 @@ function nativeScanMultiShaderSource(
     numX,
     numY,
     reverse,
+    internalElemCounts,
+    internalDtypes,
   } = params;
 
   // Determine dtype from first kernel step
@@ -3899,6 +3766,7 @@ function nativeScanMultiShaderSource(
   const xsTys = (params.xsDtypes ?? []).map((d) => dtypeToWgsl(d, true));
   const carryTys = (params.carryDtypes ?? []).map((d) => dtypeToWgsl(d, true));
   const ysTys = (params.ysDtypes ?? []).map((d) => dtypeToWgsl(d, true));
+  const internalTys = (internalDtypes ?? []).map((d) => dtypeToWgsl(d, true));
 
   // Compute element-level strides (byte strides / per-xs element size)
   const xsElemStrides = xsStrides.map((s, i) => {
@@ -3909,7 +3777,25 @@ function nativeScanMultiShaderSource(
     return s / xElemSize;
   });
 
-  // Find the maximum kernel size across all steps
+  // Carry element counts for snapshot / writeback
+  const carryElemCounts = carrySizes.map((s, i) => {
+    const cElemSize =
+      params.carryDtypes && params.carryDtypes[i]
+        ? byteWidth(params.carryDtypes[i])
+        : elemSize;
+    return s / cElemSize;
+  });
+
+  // Ys element strides for output indexing
+  const ysElemStrides = ysStrides.map((s, i) => {
+    const yElemSize =
+      params.ysDtypes && params.ysDtypes[i]
+        ? byteWidth(params.ysDtypes[i])
+        : elemSize;
+    return s / yElemSize;
+  });
+
+  // Find the maximum kernel size across all steps — determines workgroup size
   const maxKernelSize = Math.max(
     ...steps.map((s) => s.kernel.size as number),
     1,
@@ -3971,20 +3857,9 @@ function nativeScanMultiShaderSource(
     );
   }
 
-  // Carry element counts for snapshot guards
-  const carryElemCounts = carrySizes.map((s, i) => {
-    const cElemSize =
-      params.carryDtypes && params.carryDtypes[i]
-        ? byteWidth(params.carryDtypes[i])
-        : elemSize;
-    return s / cElemSize;
-  });
-
-  // Compute shader entry point
-  const workgroupSize = Math.min(Math.max(maxKernelSize, 1), 256);
-  const [gridX, gridY] = calculateGrid(
-    Math.ceil(Math.max(maxKernelSize, 1) / workgroupSize),
-  );
+  // Compute shader entry point — single thread per scan (sequential loop)
+  const workgroupSize = 1;
+  const [gridX, gridY] = calculateGrid(1);
 
   emit(
     "",
@@ -3993,7 +3868,20 @@ function nativeScanMultiShaderSource(
     pushIndent,
   );
 
-  emit(`let gidx = i32(id.x);`);
+  // Declare var<private> arrays for carry snapshots
+  for (let i = 0; i < numCarry; i++) {
+    const cTy = carryTys[i] ?? resultTy;
+    const count = carryElemCounts[i];
+    emit(`var c_${i}: array<${cTy}, ${count}>;`);
+  }
+
+  // Declare var<private> arrays for internal intermediates
+  for (let i = 0; i < (internalElemCounts?.length ?? 0); i++) {
+    const count = internalElemCounts[i];
+    const ty = internalTys[i] ?? resultTy;
+    emit(`var internal_${i}: array<${ty}, ${count}>;`);
+  }
+
   emit("");
 
   // Main scan loop
@@ -4005,28 +3893,46 @@ function nativeScanMultiShaderSource(
     emit(`let dataIdx = iter;`);
   }
 
-  // Snapshot carry into local variables (avoids RAW hazard across steps)
+  // Snapshot carry into local arrays (avoids RAW hazard across steps)
   emit("");
   emit("// Snapshot carry values for this iteration");
   for (let i = 0; i < numCarry; i++) {
-    const cTy = carryTys[i] ?? resultTy;
-    emit(`var c_${i}: ${cTy} = ${cTy}(0);`);
-    if (carryElemCounts[i] === maxKernelSize) {
-      // All valid threads can load — no guard needed
-      emit(`c_${i} = carry${i}[gidx];`);
+    const count = carryElemCounts[i];
+    if (count > 1) {
+      emit(
+        `for (var ci: i32 = 0; ci < ${count}; ci++) { c_${i}[ci] = carry${i}[ci]; }`,
+      );
     } else {
-      emit(`if (gidx < ${carryElemCounts[i]}) { c_${i} = carry${i}[gidx]; }`);
+      emit(`c_${i}[0] = carry${i}[0];`);
     }
   }
 
-  // Execute each step
+  // Build scan-specific resolveGlobalIndex callback
+  // gid space: [consts | carry | xs | internals]
+  const numInputs = numConsts + numCarry + numX;
+  const scanResolve: ResolveGlobalIndex = (gid, idxCode, _dtype) => {
+    if (gid < numConsts) {
+      return `const${gid}[${idxCode}]`;
+    } else if (gid < numConsts + numCarry) {
+      const ci = gid - numConsts;
+      // Use carry snapshot array
+      return `c_${ci}[${idxCode}]`;
+    } else if (gid < numConsts + numCarry + numX) {
+      const xi = gid - numConsts - numCarry;
+      const stride = xsElemStrides[xi];
+      return `xs${xi}[i32(dataIdx) * ${stride} + ${idxCode}]`;
+    } else {
+      // Internal intermediate — array access with proper index
+      const ii = gid - numInputs;
+      return `internal_${ii}[${idxCode}]`;
+    }
+  };
+
+  // Execute each step using createWgslGen + eidx loops
   for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
     const step = steps[stepIdx];
     const kernel = step.kernel;
-    const tune = tuneNullopt(kernel);
-    const kernelSize = kernel.size;
-    const stepDtype = kernel.outputs[0].dtype;
-    const stepTy = dtypeToWgsl(stepDtype, true);
+    const kernelSize = kernel.size as number;
 
     const isCarryStep = step.outputCarryIdx >= 0;
     const targetLabel = isCarryStep
@@ -4036,34 +3942,36 @@ function nativeScanMultiShaderSource(
     emit("");
     emit(`// Step ${stepIdx}: writes to ${targetLabel}`);
 
-    // Declare result outside if-block so internal assignments can reference it
-    const needsOuterDecl = !isCarryStep;
-    if (needsOuterDecl) {
-      emit(`var result_val_${stepIdx}: ${stepTy} = ${stepTy}(0);`);
-    }
-
-    emit(`if (gidx < ${kernelSize}) {`);
-    emit(pushIndent);
+    const gidxOverride = AluExp.special(DType.Int32, "eidx", kernelSize);
+    const gen = createWgslGen({
+      kernel,
+      prefix: `sc_s${stepIdx}`,
+      resolveGlobalIndex: scanResolve,
+      emit,
+      blockSize: maxKernelSize,
+      gidxOverride,
+    });
 
     const re = kernel.outputs[0].reduction;
     if (re) {
-      // Reduction kernel: inner ridx loop + epilogue
+      // Reduction kernel: eidx loop × ridx loop
       const accTy = dtypeToWgsl(re.dtype, true);
-      emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
-      emit(
-        `for (var ridx: i32 = 0; ridx < ${tune.size.reduce}; ridx++) {`,
-        pushIndent,
-      );
+      const redSize =
+        typeof re.size === "number"
+          ? re.size
+          : (re.concreteHint ?? Number(re.size));
 
-      const expCode = genScanExpressionWithRidx(
-        tune.exp,
-        stepDtype,
-        numConsts,
-        numCarry,
-        xsElemStrides,
-        carryElemCounts,
-      );
-      emit(`let val = ${expCode};`);
+      if (kernelSize > 1) {
+        emit(
+          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+          pushIndent,
+        );
+      } else {
+        emit(`{`, pushIndent, `let eidx: i32 = 0;`);
+      }
+      emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
+      emit(`for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`, pushIndent);
+      emit(`let val = ${strip1(gen(kernel.outputs[0].exp))};`);
 
       if (re.op === AluOp.Add) emit(`acc = acc + val;`);
       else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
@@ -4073,66 +3981,42 @@ function nativeScanMultiShaderSource(
 
       emit(popIndent, "}");
 
-      const epilogueCode = genScanExpressionWithRidx(
-        tune.epilogue!,
-        stepDtype,
-        numConsts,
-        numCarry,
-        xsElemStrides,
-        carryElemCounts,
-      );
-      if (needsOuterDecl) {
-        emit(`result_val_${stepIdx} = ${epilogueCode};`);
+      // Epilogue + store
+      const epilogueVal = strip1(gen(kernel.outputs[0].reduction!.epilogue));
+      if (isCarryStep) {
+        const ci = step.outputCarryIdx;
+        const ysStride = ysElemStrides[ci] ?? 0;
+        if (numY > 0 && ci < numY && ysStride > 0) {
+          emit(`ys${ci}[i32(dataIdx) * ${ysStride} + eidx] = ${epilogueVal};`);
+        }
+        emit(`carry${ci}[eidx] = ${epilogueVal};`);
       } else {
-        emit(`let result_val_${stepIdx}: ${stepTy} = ${epilogueCode};`);
+        emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueVal};`);
       }
+      emit(popIndent, "}");
     } else {
       // Elementwise kernel
-      const expCode = genScanExpressionWithRidx(
-        tune.exp,
-        stepDtype,
-        numConsts,
-        numCarry,
-        xsElemStrides,
-        carryElemCounts,
-      );
-      if (needsOuterDecl) {
-        emit(`result_val_${stepIdx} = ${expCode};`);
-      } else {
-        emit(`let result_val_${stepIdx}: ${stepTy} = ${expCode};`);
-      }
-    }
-
-    if (isCarryStep) {
-      const carryIdx = step.outputCarryIdx;
-      const carryElemSize =
-        params.carryDtypes && params.carryDtypes[carryIdx]
-          ? byteWidth(params.carryDtypes[carryIdx])
-          : elemSize;
-      const ysElemStride = ysStrides[carryIdx]
-        ? ysStrides[carryIdx] / carryElemSize
-        : 0;
-
-      // Write to ysStacked at dataIdx * stride + gidx
-      if (numY > 0 && carryIdx < numY && ysElemStride > 0) {
+      if (kernelSize > 1) {
         emit(
-          `ys${carryIdx}[i32(dataIdx) * ${ysElemStride} + gidx] = result_val_${stepIdx};`,
+          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+          pushIndent,
         );
+      } else {
+        emit(`{`, pushIndent, `let eidx: i32 = 0;`);
       }
 
-      // Update carry buffer for next iteration
-      emit(`carry${carryIdx}[gidx] = result_val_${stepIdx};`);
-    }
-
-    emit(popIndent, "}");
-
-    // For internal steps, the var was declared before the if-block
-    // so it's now accessible to subsequent steps
-    if (!isCarryStep) {
-      // Alias to internal_N for readability in subsequent step expressions
-      emit(
-        `var internal_${step.outputInternalIdx}: ${stepTy} = result_val_${stepIdx};`,
-      );
+      const val = strip1(gen(kernel.outputs[0].exp));
+      if (isCarryStep) {
+        const ci = step.outputCarryIdx;
+        const ysStride = ysElemStrides[ci] ?? 0;
+        if (numY > 0 && ci < numY && ysStride > 0) {
+          emit(`ys${ci}[i32(dataIdx) * ${ysStride} + eidx] = ${val};`);
+        }
+        emit(`carry${ci}[eidx] = ${val};`);
+      } else {
+        emit(`internal_${step.outputInternalIdx}[eidx] = ${val};`);
+      }
+      emit(popIndent, "}");
     }
   }
 

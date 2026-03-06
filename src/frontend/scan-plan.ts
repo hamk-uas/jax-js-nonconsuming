@@ -2,7 +2,7 @@
  * @file Scan plan construction — determines the execution strategy for a scan.
  */
 
-import { byteWidth, Kernel, Reduction } from "../alu";
+import { byteWidth, DType, Kernel, Reduction } from "../alu";
 import type { Backend, Executable } from "../backend";
 import {
   getScanRoutineInfo,
@@ -738,18 +738,39 @@ function tryPrepareWebGPUNativeScan(
   }
 
   // Assign internal indices to step outputs that aren't carry outputs.
-  // Internal intermediates become local WGSL variables (no storage bindings).
+  // Internal intermediates become var<private> arrays in WGSL (no storage bindings).
   let nextInternalIdx = 0;
   const jitIdToInternalIdx = new Map<JitId, number>();
+  const internalElemCounts: number[] = [];
+  const internalDtypes: DType[] = [];
   for (const step of executeSteps) {
+    const source = step.source as Kernel;
     for (let oi = 0; oi < step.outputs.length; oi++) {
       const outId = step.outputs[oi];
       if (!carryOutputJitIds.has(outId)) {
-        jitIdToInternalIdx.set(outId, nextInternalIdx++);
+        const idx = nextInternalIdx++;
+        jitIdToInternalIdx.set(outId, idx);
+        const kOut = source.outputs[oi] ?? source.outputs[0];
+        internalElemCounts[idx] = source.size as number;
+        internalDtypes[idx] = kOut.dtype;
       }
     }
   }
   const numInternal = nextInternalIdx;
+
+  // Budget check: reject if total private-memory internal arrays exceed 8KB.
+  // var<private> has no spec limit but excessive register pressure hurts occupancy.
+  const totalInternalBytes = internalElemCounts.reduce(
+    (sum, count, i) => sum + count * byteWidth(internalDtypes[i]),
+    0,
+  );
+  if (totalInternalBytes > 8192) {
+    if (DEBUG >= 1)
+      console.log(
+        `[webgpu-scan] skipped compiled-loop, internal arrays ${totalInternalBytes}B > 8KB budget`,
+      );
+    return null;
+  }
 
   // Build scan gid mapping: body JitId → scan gid space.
   // Gid space: [0..numConsts) const, [numConsts..+numCarry) carry,
@@ -782,21 +803,6 @@ function tryPrepareWebGPUNativeScan(
       );
 
       const kernelOutput = source.outputs[oi] ?? source.outputs[0];
-
-      // Reject: reduction kernel with internal dependency.
-      // In the fused shader, internals are per-gidx scalars, but reductions
-      // need ridx-dependent array access. This pattern can't be correctly
-      // fused (e.g. matmul in backward scan body).
-      if (kernelOutput.reduction) {
-        const hasInternalInput = scanReindexMap.some((gid) => gid >= numInputs);
-        if (hasInternalInput) {
-          if (DEBUG >= 1)
-            console.log(
-              `[webgpu-scan] skipped compiled-loop, reduction step ${oi} depends on internal intermediate`,
-            );
-          return null;
-        }
-      }
 
       const reindexedExp = kernelOutput.exp.reindexGids(scanReindexMap);
       const reindexedReduction = kernelOutput.reduction
@@ -841,6 +847,8 @@ function tryPrepareWebGPUNativeScan(
     steps: multiSteps,
     reverse,
     numInternal,
+    internalElemCounts,
+    internalDtypes,
   };
 
   // Call backend
