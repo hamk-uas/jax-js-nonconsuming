@@ -3429,13 +3429,10 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     );
 
     const initialILoc = typeof lowerDim === "number" ? lowerDim : 0;
+    const initialIArr = array(initialILoc, { dtype: iDtype });
     const fwdScanOuts = bind(
       Primitive.Scan,
-      [
-        ...fwdScanBody.consts,
-        array(initialILoc, { dtype: iDtype }),
-        ...primalCarryInit,
-      ],
+      [...fwdScanBody.consts, initialIArr, ...primalCarryInit],
       {
         jaxpr: fwdScanBody.jaxpr,
         numConsts: fwdScanBody.consts.length,
@@ -3445,8 +3442,10 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       },
     ) as Tracer[];
 
-    // Extract stacked arrays
+    // Dispose forward scan carry outputs (final i + final primal carries)
     const ysStart = 1 + numCarryHalf;
+    for (let i = 0; i < ysStart; i++) fwdScanOuts[i].dispose();
+    initialIArr.dispose();
     const historyI = fwdScanOuts[ysStart];
     const historyPrimals = fwdScanOuts.slice(ysStart + 1);
 
@@ -3550,9 +3549,23 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     for (let i = 0; i < numCarryTotal; i++) {
       if (i < numCarryHalf) {
         resultCts.push(null);
-      } else {
+      } else if (args[numConsts + i] instanceof UndefPrimal) {
         resultCts.push(ctCarryFinal[ctCarryIdx++]);
+      } else {
+        // JVP tangent carry that isn't actually UndefPrimal (e.g., zero init
+        // created inside the function) — dispose computed ct, return null.
+        ctCarryFinal[ctCarryIdx++].dispose();
+        resultCts.push(null);
       }
+    }
+
+    // Dispose intermediate arrays (only locally-created ones)
+    historyI.dispose();
+    for (const t of historyPrimals) t.dispose();
+    for (const t of ctConstsZeros) t.dispose();
+    // Only dispose zeros we created, not caller-owned cts
+    for (let i = 0; i < ctCarrySafeInit.length; i++) {
+      if (ctCarrySafeInit[i] !== ctCarryInit[i]) ctCarrySafeInit[i].dispose();
     }
 
     return resultCts;
