@@ -3720,6 +3720,16 @@ function createShaderEmitter(): {
 }
 
 /**
+ * Convert a WGSL expression to storage representation when types differ.
+ * WGSL Bool maps to `bool` in expressions but `i32` in storage buffers.
+ */
+function wgslToStorage(expr: string, dtype: DType): string {
+  const storageTy = dtypeToWgsl(dtype, true);
+  const exprTy = dtypeToWgsl(dtype);
+  return storageTy !== exprTy ? `${storageTy}(${expr})` : expr;
+}
+
+/**
  * Generate a WGSL shader for native scan with multiple kernel steps.
  *
  * Uses carry snapshot locals to avoid read-after-write hazards: at each
@@ -3953,9 +3963,11 @@ function nativeScanMultiShaderSource(
     });
 
     const re = kernel.outputs[0].reduction;
+    const outDtype = kernel.outputs[0].dtype;
     if (re) {
       // Reduction kernel: eidx loop × ridx loop
-      const accTy = dtypeToWgsl(re.dtype, true);
+      // Use non-storage type for accumulator (bool stays bool during computation)
+      const accTy = dtypeToWgsl(re.dtype);
       const redSize =
         typeof re.size === "number"
           ? re.size
@@ -3981,8 +3993,11 @@ function nativeScanMultiShaderSource(
 
       emit(popIndent, "}");
 
-      // Epilogue + store
-      const epilogueVal = strip1(gen(kernel.outputs[0].reduction!.epilogue));
+      // Epilogue + store (convert bool→i32 for storage buffers)
+      const epilogueVal = wgslToStorage(
+        strip1(gen(kernel.outputs[0].reduction!.epilogue)),
+        outDtype,
+      );
       if (isCarryStep) {
         const ci = step.outputCarryIdx;
         const ysStride = ysElemStrides[ci] ?? 0;
@@ -4005,7 +4020,8 @@ function nativeScanMultiShaderSource(
         emit(`{`, pushIndent, `let eidx: i32 = 0;`);
       }
 
-      const val = strip1(gen(kernel.outputs[0].exp));
+      // Convert bool→i32 for storage buffers
+      const val = wgslToStorage(strip1(gen(kernel.outputs[0].exp)), outDtype);
       if (isCarryStep) {
         const ci = step.outputCarryIdx;
         const ysStride = ysElemStrides[ci] ?? 0;
@@ -4093,8 +4109,10 @@ function emitAssocScanBodySteps(
     });
 
     const re = kernel.outputs[0].reduction;
+    const outDtype = kernel.outputs[0].dtype;
     if (re) {
-      const accTy = dtypeToWgsl(re.dtype, true);
+      // Use non-storage type for accumulator (bool stays bool during computation)
+      const accTy = dtypeToWgsl(re.dtype);
       const redSize =
         typeof re.size === "number"
           ? re.size
@@ -4119,9 +4137,11 @@ function emitAssocScanBodySteps(
       else throw new Error(`Unsupported reduction op: ${re.op}`);
 
       emit(popIndent, "}");
-      emit(
-        `internal_${step.outputInternalIdx}[eidx] = ${strip1(gen(kernel.outputs[0].reduction!.epilogue))};`,
+      const epilogueStore = wgslToStorage(
+        strip1(gen(kernel.outputs[0].reduction!.epilogue)),
+        outDtype,
       );
+      emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueStore};`);
       emit(popIndent, "}");
     } else {
       if (kernelSize > 1) {
@@ -4129,14 +4149,12 @@ function emitAssocScanBodySteps(
           `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
           pushIndent,
         );
-        emit(
-          `internal_${step.outputInternalIdx}[eidx] = ${strip1(gen(kernel.outputs[0].exp))};`,
-        );
+        const val = wgslToStorage(strip1(gen(kernel.outputs[0].exp)), outDtype);
+        emit(`internal_${step.outputInternalIdx}[eidx] = ${val};`);
         emit(popIndent, "}");
       } else {
-        emit(
-          `internal_${step.outputInternalIdx}[0] = ${strip1(gen(kernel.outputs[0].exp))};`,
-        );
+        const val = wgslToStorage(strip1(gen(kernel.outputs[0].exp)), outDtype);
+        emit(`internal_${step.outputInternalIdx}[0] = ${val};`);
       }
     }
     emit("");

@@ -1,7 +1,11 @@
 // Linear algebra functions, mirroring `jax.lax.linalg`.
 
+import { defaultDevice } from "../backend";
+import * as laxLib from "./lax";
 import { moveaxis } from "./numpy";
+import * as numpy from "./numpy";
 import { Array, type ArrayLike, fudgeArray } from "../frontend/array";
+import { _peArrayCreationTracker } from "../frontend/core";
 import * as core from "../frontend/core";
 
 /**
@@ -102,6 +106,11 @@ export function lu(x: ArrayLike): [Array, Array, Array] {
  * ```
  */
 export function qr(a: ArrayLike): [Array, Array] {
+  const arr = fudgeArray(a);
+  const dev = defaultDevice();
+  if (dev === "webgpu" || dev === "webgl" || dev === "wasm") {
+    return householderQRBatched(arr);
+  }
   return core.qr(a) as [Array, Array];
 }
 
@@ -165,4 +174,136 @@ export function triangularSolve(
   } finally {
     for (const v of d) v[Symbol.dispose]();
   }
+}
+
+/**
+ * Pure-primitive Householder QR decomposition for 2D matrices.
+ * Uses fully unrolled `lax.foriLoop` natively for AD-compliant execution.
+ * @internal
+ */
+function householderQR2D(a: Array): [Array, Array] {
+  const m = a.shape[0] as number;
+  const n = a.shape[1] as number;
+  const k = Math.min(m, n);
+  const dtype = a.dtype;
+
+  const Q = numpy.eye(m, { dtype });
+  const R: Array = a;
+  const carry0 = [Q, R];
+
+  // Don't use `using` — under PE tracing (grad), these concrete arrays
+  // become jaxpr consts referenced by the backward pass. Disposing them
+  // at block exit would free the buffers while the AD system still needs them.
+  const arange_m = numpy.arange(m);
+  const arange_n = numpy.arange(n);
+
+  const [Q_out, R_out] = laxLib.foriLoop(
+    0,
+    k,
+    (j: any, carry: any) => {
+      const [Q_curr, R_curr] = carry;
+
+      // Extract column j via one-hot mask
+      const j_mask_n = numpy.equal(arange_n, j);
+      let col = numpy.sum(numpy.where(j_mask_n, R_curr, 0), 1);
+
+      // Zero entries above diagonal (i < j)
+      const row_mask = numpy.greaterEqual(arange_m, j);
+      col = numpy.where(row_mask, col, 0);
+
+      const colSq = numpy.square(col);
+      const normCol = numpy.sqrt(numpy.sum(colSq));
+
+      // Extract r_jj = col[j]
+      const j_mask_m = numpy.equal(arange_m, j);
+      const r_jj = numpy.sum(numpy.where(j_mask_m, col, 0));
+
+      const zero = numpy.array(0, { dtype });
+      const one = numpy.array(1, { dtype });
+      const signVal = numpy.where(
+        numpy.equal(r_jj, zero),
+        one,
+        numpy.sign(r_jj),
+      );
+
+      const shift = numpy.multiply(signVal, normCol);
+      const shiftVec = numpy.multiply(shift, numpy.where(j_mask_m, 1, 0));
+      const vUnscaled = numpy.add(col, shiftVec);
+
+      const normV = numpy.sqrt(numpy.sum(numpy.square(vUnscaled)));
+      const isZero = numpy.equal(normV, zero);
+      const safeNormV = numpy.where(isZero, one, normV);
+      let v = numpy.divide(vUnscaled, safeNormV);
+      v = numpy.where(isZero, zero, v);
+
+      const v_col = numpy.expandDims(v, 1);
+      const v_row = numpy.expandDims(v, 0);
+      const vvTR = numpy.multiply(v_col, v_row);
+
+      const H = numpy.subtract(
+        numpy.eye(m, { dtype }),
+        numpy.multiply(2, vvTR),
+      );
+
+      const R_next = numpy.dot(H, R_curr);
+      const Q_next = numpy.dot(Q_curr, H);
+
+      return [Q_next, R_next];
+    },
+    carry0,
+  );
+
+  // In eager mode, dispose intermediates that foriLoop doesn't consume.
+  // Under PE tracing (grad), the JVPTracer cascade disposes them later —
+  // freeing here would cause use-after-free on WebGPU (buffer recycled).
+  if (!_peArrayCreationTracker) {
+    Q.dispose();
+    arange_m.dispose();
+    arange_n.dispose();
+  }
+
+  let Qthin: Array = Q_out as Array;
+  let Rupper: Array = R_out as Array;
+  if (k < m) {
+    Qthin = laxLib.sliceInDim(Q_out as Array, 0, k, 1);
+    Rupper = laxLib.sliceInDim(R_out as Array, 0, k, 0);
+  }
+
+  if (Qthin !== (Q_out as any)) (Q_out as Array).dispose();
+  if (Rupper !== (R_out as any)) (R_out as Array).dispose();
+
+  return [Qthin, Rupper];
+}
+
+/**
+ * Batched pure-primitive Householder QR.
+ * @internal
+ */
+function householderQRBatched(a: Array): [Array, Array] {
+  if (a.ndim === 2) return householderQR2D(a);
+
+  const batchSize = a.shape[0] as number;
+  const innerShape = a.shape.slice(1);
+  const Qs: Array[] = [];
+  const Rs: Array[] = [];
+  if (batchSize === 1) {
+    using mat = numpy.reshape(a, innerShape);
+    const [Q, R] = householderQRBatched(mat);
+    const Qout = numpy.expandDims(Q, 0);
+    const Rout = numpy.expandDims(R, 0);
+    return [Qout, Rout];
+  }
+
+  for (let b = 0; b < batchSize; b++) {
+    using slice = laxLib.sliceInDim(a, b, b + 1, 0);
+    using mat = numpy.reshape(slice, innerShape);
+    const [Q, R] = householderQRBatched(mat);
+    Qs.push(Q);
+    Rs.push(R);
+  }
+  const Qstacked = numpy.stack(Qs, 0);
+  const Rstacked = numpy.stack(Rs, 0);
+  for (const q of Qs) q.dispose();
+  for (const r of Rs) r.dispose();
+  return [Qstacked, Rstacked];
 }

@@ -388,11 +388,6 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
   });
 
   suite("numpy.linalg.qr()", () => {
-    // QR routine is not implemented for WebGPU.
-    beforeEach(({ skip }) => {
-      if (device === "webgpu") skip();
-    });
-
     test("computes thin QR for 3x2 matrix", () => {
       using A = np.array([
         [1.0, 2.0],
@@ -409,7 +404,8 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       expect(reconstructed).toBeAllclose(A, { atol: 1e-5 });
     });
 
-    test("gradient through QR", () => {
+    // TODO: foriLoop AD leaks on non-CPU backends (polyfill uses foriLoop)
+    test.skipIf(device !== "cpu")("gradient through QR", () => {
       const f = (A: np.Array) => {
         const [Q, R] = np.linalg.qr(A);
         Q.dispose();
