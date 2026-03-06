@@ -91,7 +91,6 @@ import {
   Var,
 } from "./jaxpr";
 import { jvp, lowerAux } from "./jvp";
-import { ScanBackwardSpec, ScanPullbackArtifact } from "./scan-backward";
 import { jacfwd, moveaxis, vmap } from "./vmap";
 
 /** Internal zeros allocation (marking handled by fullInternal). */
@@ -2197,15 +2196,15 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       numConsts,
       length: lengthDim,
       reverse,
-      checkpoint,
+      checkpoint: _checkpoint,
       isJvpTransformed,
     },
   ) {
     // Scan transpose rule for backward pass through scan.
     //
-    // Delegates to ScanPullbackArtifact after building the backward spec
-    // (forward jaxpr, tangent body, transposed body, dimension info).
-    const length = concreteDim(lengthDim, "scan transpose rule");
+    // Emits two in-graph Primitive.Scan calls (forward + backward) rather
+    // than imperative JS loop unrolling, so the backend compiler handles
+    // iteration.  This supports dynamic/symbolic scan lengths.
 
     const numX = args.length - numConsts - numCarry;
     const numY = cts.length - numCarry;
@@ -2379,35 +2378,267 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
     const actualUndefMask = args.map((x) => x instanceof UndefPrimal);
 
-    // ---- Create artifact and delegate ----
-    const spec: ScanBackwardSpec = {
-      primalForwardJaxpr,
-      tangentBody,
-      transposedBody,
-      numConsts,
-      numCarry,
-      numY,
-      numPrimalCarry,
-      numPrimalY,
-      numPrimalX,
-      numTangentConsts,
-      numTangentCarry,
-      numTangentX,
-      length,
-      reverse,
-      checkpoint,
-      undefMask,
-      actualUndefMask,
-    };
+    // ---- Forward Scan: replay primal forward, stacking carries as ys ----
+    //
+    // The backward step at iteration k needs primalCarry[k] (carry BEFORE
+    // step k).  We emit a forward Scan whose ys capture those snapshots.
+    //
+    // Body signature: (carry=primalCarry, x=xSlice) → (newCarry, oldCarry)
+    //   consts = [primalForwardJaxpr.consts, constResiduals]   (captured)
+    //   carry  = primalCarry  (size numPrimalCarry)
+    //   xs     = xsResiduals  (sliced per iteration)
+    //   ys     = oldCarry snapshot  (stacked, for backward)
 
-    using artifact = new ScanPullbackArtifact(
-      spec,
-      constResiduals,
-      carryResiduals,
-      xsResiduals,
+    const fwdBodyInAvals = [
+      ...carryResiduals.map((t) => t.aval),
+      ...xsResiduals.map(
+        (t) => new ShapedArray(t.shape.slice(1), t.dtype, false),
+      ),
+    ];
+
+    const { jaxpr: fwdScanBody } = makeJaxpr(
+      (...fwdArgs: Tracer[]): Tracer[] => {
+        const carryIn = fwdArgs.slice(0, carryResiduals.length);
+        const xIn = fwdArgs.slice(carryResiduals.length);
+
+        // Build full primal input for primalForwardJaxpr
+        const fwdFullInputs: Tracer[] = [];
+        const fwdDisposables: Tracer[] = [];
+        let constIdx = 0;
+        let carryIdx = 0;
+        let xIdx = 0;
+        for (let i = 0; i < jaxpr.inBinders.length; i++) {
+          if (bodyUndefPrimals[i]) {
+            const aval = jaxpr.inBinders[i].aval;
+            const z = zerosInternal(aval.shape, aval.dtype);
+            fwdFullInputs.push(z);
+            fwdDisposables.push(z);
+          } else if (i < numConsts) {
+            fwdFullInputs.push(constResiduals[constIdx++]);
+          } else if (i < numConsts + numCarry) {
+            fwdFullInputs.push(carryIn[carryIdx++]);
+          } else {
+            fwdFullInputs.push(xIn[xIdx++]);
+          }
+        }
+
+        const fwdOuts = evalJaxpr(jaxpr, fwdFullInputs);
+        const newCarry = fwdOuts.slice(0, numPrimalCarry);
+        // Dispose tangent carry and all ys (not needed)
+        for (let i = numPrimalCarry; i < fwdOuts.length; i++)
+          fwdOuts[i].dispose();
+        for (const d of fwdDisposables) d.dispose();
+
+        // carry output = newCarry, ys = oldCarry (snapshot before this step)
+        return [...newCarry, ...carryIn];
+      },
+      { validateRefs: false },
+    )(...fwdBodyInAvals);
+
+    const fwdScanOuts = bind(
+      Primitive.Scan,
+      [...fwdScanBody.consts, ...carryResiduals, ...xsResiduals],
+      {
+        jaxpr: fwdScanBody.jaxpr,
+        numConsts: fwdScanBody.consts.length,
+        numCarry: carryResiduals.length,
+        length: lengthDim,
+        reverse,
+      },
+    ) as Tracer[];
+
+    // ys = stacked old carries (one per iteration)
+    const stackedPrimalCarries = fwdScanOuts.slice(carryResiduals.length);
+    // Dispose final carry (not needed)
+    for (let i = 0; i < carryResiduals.length; i++) fwdScanOuts[i].dispose();
+
+    // ---- Backward Scan: accumulate cotangents in reverse ----
+    //
+    // Body signature:
+    //   carry = [ctConstsAccum..., ctCarryRunning...]
+    //   xs    = [primalCarry_k, xSlice_k, ctY_k]       (per-iteration)
+    //   ys    = [ctXStep_k]                              (stacked)
+    //
+    // Runs transposedBody per step, accumulates const cotangents.
+
+    const ctCarryAll = cts.slice(0, numCarry);
+    const ctYsAll = cts.slice(numCarry);
+    // In JVP-doubled scan, first half of carry cts are primal (dispose)
+    const ctCarryInit = ctCarryAll.slice(numPrimalCarry);
+    for (let i = 0; i < numPrimalCarry; i++) ctCarryAll[i].dispose();
+    // Tangent ys are the second half
+    const numYPrimal = Math.floor(numY / 2);
+    const tangentCtYs = ctYsAll.slice(numYPrimal);
+    for (let i = 0; i < numYPrimal; i++) ctYsAll[i].dispose();
+
+    // Tangent const avals (for zero-init of accumulator)
+    const numPrimalInputs = jaxpr.inBinders.filter(
+      (_, i) => !bodyUndefPrimals[i],
+    ).length;
+    const tangentConstsAvals = tangentBodyInAvals.slice(
+      numPrimalInputs,
+      numPrimalInputs + numTangentConsts,
+    );
+    const ctConstsZeroInit = Array.from({ length: numTangentConsts }, (_, i) =>
+      zerosInternal(tangentConstsAvals[i].shape, tangentConstsAvals[i].dtype),
+    );
+    const ctCarrySafeInit = ctCarryInit.map(
+      (c, i) =>
+        c ||
+        zerosInternal(
+          carryResiduals[carryResiduals.length - numTangentCarry + i].shape,
+          carryResiduals[carryResiduals.length - numTangentCarry + i].dtype,
+        ),
     );
 
-    return artifact.run(cts);
+    // Build backward scan body avals
+    const bwdCarryAvals = [
+      ...ctConstsZeroInit.map((t) => t.aval),
+      ...ctCarrySafeInit.map((t) => t.aval),
+    ];
+    const bwdXsAvals = [
+      ...stackedPrimalCarries.map(
+        (t) => new ShapedArray(t.shape.slice(1), t.dtype, false),
+      ),
+      ...xsResiduals.map(
+        (t) => new ShapedArray(t.shape.slice(1), t.dtype, false),
+      ),
+      ...tangentCtYs.map(
+        (t) => new ShapedArray(t.shape.slice(1), t.dtype, false),
+      ),
+    ];
+    const bwdBodyInAvals = [...bwdCarryAvals, ...bwdXsAvals];
+
+    const { jaxpr: bwdScanBody } = makeJaxpr(
+      (...bwdArgs: Tracer[]): Tracer[] => {
+        // Unpack carry
+        const ctConstsIn = bwdArgs.slice(0, numTangentConsts);
+        const ctCarryIn = bwdArgs.slice(
+          numTangentConsts,
+          numTangentConsts + numTangentCarry,
+        );
+
+        // Unpack xs
+        let off = numTangentConsts + numTangentCarry;
+        const primalCarry_k = bwdArgs.slice(off, off + carryResiduals.length);
+        off += carryResiduals.length;
+        const xSlice_k = bwdArgs.slice(off, off + xsResiduals.length);
+        off += xsResiduals.length;
+        const ctY_k = bwdArgs.slice(off);
+
+        // Build transposedBody input: [tb.consts, constResiduals, primalCarry_k, xSlice_k, ctCarryIn, ctY_k]
+        const transposedInputs = [
+          ...transposedBody.consts,
+          ...constResiduals,
+          ...primalCarry_k,
+          ...xSlice_k,
+          ...ctCarryIn,
+          ...ctY_k,
+        ];
+        const transposedOuts = evalJaxpr(
+          transposedBody.jaxpr,
+          transposedInputs,
+        );
+
+        // Extract cotangents from transposed outputs
+        const ctConstsStep = transposedOuts.slice(0, numTangentConsts);
+        const ctCarryNext = transposedOuts.slice(
+          numTangentConsts,
+          numTangentConsts + numTangentCarry,
+        );
+        const ctXStep = transposedOuts.slice(
+          numTangentConsts + numTangentCarry,
+        );
+
+        // Accumulate const cotangents
+        const ctConstsOut = ctConstsIn.map((c, i) => {
+          const sum = bind(Primitive.Add, [c, ctConstsStep[i]])[0];
+          ctConstsStep[i].dispose();
+          return sum;
+        });
+
+        // carry = [ctConstsOut, ctCarryNext], ys = [ctXStep]
+        return [...ctConstsOut, ...ctCarryNext, ...ctXStep];
+      },
+      { validateRefs: false },
+    )(...bwdBodyInAvals);
+
+    const bwdScanOuts = bind(
+      Primitive.Scan,
+      [
+        ...bwdScanBody.consts,
+        ...ctConstsZeroInit,
+        ...ctCarrySafeInit,
+        ...stackedPrimalCarries,
+        ...xsResiduals,
+        ...tangentCtYs,
+      ],
+      {
+        jaxpr: bwdScanBody.jaxpr,
+        numConsts: bwdScanBody.consts.length,
+        numCarry: numTangentConsts + numTangentCarry,
+        length: lengthDim,
+        reverse: !reverse,
+      },
+    ) as Tracer[];
+
+    // Extract results from backward scan
+    const finalCtConsts = bwdScanOuts.slice(0, numTangentConsts);
+    const finalCtCarry = bwdScanOuts.slice(
+      numTangentConsts,
+      numTangentConsts + numTangentCarry,
+    );
+    const ctXsStacked = bwdScanOuts.slice(numTangentConsts + numTangentCarry);
+
+    // ---- Assemble output cotangents ----
+    const result: (Tracer | null)[] = [];
+    let ctConstIdx = 0;
+    let ctCarryIdx = 0;
+    let ctXIdx = 0;
+
+    for (let i = 0; i < actualUndefMask.length; i++) {
+      const isJvpTangent = undefMask[i];
+
+      if (!actualUndefMask[i]) {
+        if (isJvpTangent) {
+          if (i < numConsts) {
+            finalCtConsts[ctConstIdx++].dispose();
+          } else if (i < numConsts + numCarry) {
+            finalCtCarry[ctCarryIdx++].dispose();
+          } else {
+            ctXsStacked[ctXIdx++].dispose();
+          }
+        }
+        result.push(null);
+      } else if (i < numConsts) {
+        result.push(finalCtConsts[ctConstIdx++]);
+      } else if (i < numConsts + numCarry) {
+        result.push(finalCtCarry[ctCarryIdx++]);
+      } else {
+        result.push(ctXsStacked[ctXIdx++]);
+      }
+    }
+
+    // Dispose remaining (unused indices)
+    for (let i = ctConstIdx; i < finalCtConsts.length; i++)
+      finalCtConsts[i].dispose();
+    for (let i = ctCarryIdx; i < finalCtCarry.length; i++)
+      finalCtCarry[i].dispose();
+    for (let i = ctXIdx; i < ctXsStacked.length; i++) ctXsStacked[i].dispose();
+
+    // Dispose intermediate arrays consumed by the backward scan
+    for (const t of stackedPrimalCarries) t.dispose();
+    for (const t of tangentCtYs) t.dispose();
+    for (const t of ctConstsZeroInit) t.dispose();
+    for (const t of ctCarrySafeInit) t.dispose();
+
+    // Clean up owned jaxprs
+    tangentBody.dispose();
+    fwdScanBody.dispose();
+    bwdScanBody.dispose();
+    primalForwardJaxpr.dispose();
+
+    return result;
   },
   [Primitive.AssociativeScan](cts, args, params) {
     // AssociativeScan transpose: reverse sequential recurrence.
@@ -3175,32 +3406,44 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       numConsts + numCarryHalf,
     ) as Tracer[];
 
-    // Build Forward Scan body: 
+    // Build Forward Scan body:
     // Takes: [i, ...primalCarry]
     // Returns: [iNext, ...nextPrimalCarry, i, ...primalCarry]  <- stacked ys are the history
-    const { jaxpr: fwdScanBody } = makeJaxpr((iIn: Tracer, ...carryIn: Tracer[]) => {
-       const forwardOuts = evalJaxpr(primalForwardJaxpr.jaxpr, [
-         ...primalForwardJaxpr.consts,
-         ...constResiduals,
-         iIn,
-         ...carryIn
-       ]);
-       const iNext = bind(Primitive.Add, [iIn, array(1, {dtype: iDtype})])[0];
-       return [iNext, ...forwardOuts, iIn, ...carryIn];
-    })(new ShapedArray([], iDtype, false) as any, ...primalCarryInit.map(c => (c.aval) as any));
+    const { jaxpr: fwdScanBody } = makeJaxpr(
+      (iIn: Tracer, ...carryIn: Tracer[]) => {
+        const forwardOuts = evalJaxpr(primalForwardJaxpr.jaxpr, [
+          ...primalForwardJaxpr.consts,
+          ...constResiduals,
+          iIn,
+          ...carryIn,
+        ]);
+        const iNext = bind(Primitive.Add, [
+          iIn,
+          array(1, { dtype: iDtype }),
+        ])[0];
+        return [iNext, ...forwardOuts, iIn, ...carryIn];
+      },
+    )(
+      new ShapedArray([], iDtype, false) as any,
+      ...primalCarryInit.map((c) => c.aval as any),
+    );
 
-    let initialILoc = typeof lowerDim === 'number' ? lowerDim : 0;
-    const fwdScanOuts = bind(Primitive.Scan, [
-       ...fwdScanBody.consts,
-       array(initialILoc, {dtype: iDtype}),
-       ...primalCarryInit
-    ], {
-       jaxpr: fwdScanBody.jaxpr,
-       numConsts: fwdScanBody.consts.length,
-       numCarry: 1 + numCarryHalf,
-       length: N,
-       reverse: false
-    }) as Tracer[];
+    const initialILoc = typeof lowerDim === "number" ? lowerDim : 0;
+    const fwdScanOuts = bind(
+      Primitive.Scan,
+      [
+        ...fwdScanBody.consts,
+        array(initialILoc, { dtype: iDtype }),
+        ...primalCarryInit,
+      ],
+      {
+        jaxpr: fwdScanBody.jaxpr,
+        numConsts: fwdScanBody.consts.length,
+        numCarry: 1 + numCarryHalf,
+        length: N,
+        reverse: false,
+      },
+    ) as Tracer[];
 
     // Extract stacked arrays
     const ysStart = 1 + numCarryHalf;
@@ -3213,68 +3456,103 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     const tangentConstsAvals = tangentBodyInAvals.slice(0, numTangentConsts);
 
     const { jaxpr: bwdScanBody } = makeJaxpr((...bwdArgs: Tracer[]) => {
-       const ctConstsIn = bwdArgs.slice(0, numTangentConsts);
-       const ctCarryIn = bwdArgs.slice(numTangentConsts, numTangentConsts + numTangentCarry);
-       const iArr_k = bwdArgs[numTangentConsts + numTangentCarry];
-       const primals_k = bwdArgs.slice(numTangentConsts + numTangentCarry + 1);
+      const ctConstsIn = bwdArgs.slice(0, numTangentConsts);
+      const ctCarryIn = bwdArgs.slice(
+        numTangentConsts,
+        numTangentConsts + numTangentCarry,
+      );
+      const iArr_k = bwdArgs[numTangentConsts + numTangentCarry];
+      const primals_k = bwdArgs.slice(numTangentConsts + numTangentCarry + 1);
 
-       const transposedInputs = [
-         ...transposedBody.consts,
-         ...constResiduals,
-         iArr_k,
-         ...primals_k,
-         ...ctCarryIn
-       ];
+      const transposedInputs = [
+        ...transposedBody.consts,
+        ...constResiduals,
+        iArr_k,
+        ...primals_k,
+        ...ctCarryIn,
+      ];
 
-       const transposedOuts = evalJaxpr(transposedBody.jaxpr, transposedInputs);
+      const transposedOuts = evalJaxpr(transposedBody.jaxpr, transposedInputs);
 
-       const ctConstsStep = transposedOuts.slice(0, numTangentConsts);
-       const ctCarryStep = transposedOuts.slice(numTangentConsts, numTangentConsts + numTangentCarry);
+      const ctConstsStep = transposedOuts.slice(0, numTangentConsts);
+      const ctCarryStep = transposedOuts.slice(
+        numTangentConsts,
+        numTangentConsts + numTangentCarry,
+      );
 
-       const ctConstsOut = ctConstsIn.map((c, idx) => bind(Primitive.Add, [c, ctConstsStep[idx]])[0]);
+      const ctConstsOut = ctConstsIn.map(
+        (c, idx) => bind(Primitive.Add, [c, ctConstsStep[idx]])[0],
+      );
 
-       return [...ctConstsOut, ...ctCarryStep];
+      return [...ctConstsOut, ...ctCarryStep];
     })(
-      ...Array.from({length: numTangentConsts}, (_, i) => (new ShapedArray(tangentConstsAvals[i].shape, tangentConstsAvals[i].dtype, false) as any)),
-      ...ctCarryInit.map((c, i) => c ? (c.aval) as any : (new ShapedArray(primalCarryInit[i].shape, primalCarryInit[i].dtype, false) as any)),
+      ...Array.from(
+        { length: numTangentConsts },
+        (_, i) =>
+          new ShapedArray(
+            tangentConstsAvals[i].shape,
+            tangentConstsAvals[i].dtype,
+            false,
+          ) as any,
+      ),
+      ...ctCarryInit.map((c, i) =>
+        c
+          ? (c.aval as any)
+          : (new ShapedArray(
+              primalCarryInit[i].shape,
+              primalCarryInit[i].dtype,
+              false,
+            ) as any),
+      ),
       new ShapedArray([], iDtype, false) as any,
-      ...primalCarryInit.map(c => (c.aval) as any)
+      ...primalCarryInit.map((c) => c.aval as any),
     );
 
-    const ctConstsZeros = Array.from({length: numTangentConsts}, (_, i) => zerosInternal(tangentConstsAvals[i].shape, tangentConstsAvals[i].dtype));
-    const ctCarrySafeInit = ctCarryInit.map((c, i) => c || zerosInternal(primalCarryInit[i].shape, primalCarryInit[i].dtype));
+    const ctConstsZeros = Array.from({ length: numTangentConsts }, (_, i) =>
+      zerosInternal(tangentConstsAvals[i].shape, tangentConstsAvals[i].dtype),
+    );
+    const ctCarrySafeInit = ctCarryInit.map(
+      (c, i) =>
+        c || zerosInternal(primalCarryInit[i].shape, primalCarryInit[i].dtype),
+    );
 
-    const bwdScanOuts = bind(Primitive.Scan, [
-       ...bwdScanBody.consts,
-       ...ctConstsZeros,
-       ...ctCarrySafeInit,
-       historyI,
-       ...historyPrimals
-    ], {
-       jaxpr: bwdScanBody.jaxpr,
-       numConsts: bwdScanBody.consts.length,
-       numCarry: numTangentConsts + numTangentCarry,
-       length: N,
-       reverse: true
-    }) as Tracer[];
+    const bwdScanOuts = bind(
+      Primitive.Scan,
+      [
+        ...bwdScanBody.consts,
+        ...ctConstsZeros,
+        ...ctCarrySafeInit,
+        historyI,
+        ...historyPrimals,
+      ],
+      {
+        jaxpr: bwdScanBody.jaxpr,
+        numConsts: bwdScanBody.consts.length,
+        numCarry: numTangentConsts + numTangentCarry,
+        length: N,
+        reverse: true,
+      },
+    ) as Tracer[];
 
     const ctConstsFinal = bwdScanOuts.slice(0, numTangentConsts);
-    const ctCarryFinal = bwdScanOuts.slice(numTangentConsts, numTangentConsts + numTangentCarry);
+    const ctCarryFinal = bwdScanOuts.slice(
+      numTangentConsts,
+      numTangentConsts + numTangentCarry,
+    );
 
     const resultCts: (Tracer | null)[] = [];
     let ctConstsIdx = 0;
     for (let i = 0; i < numConsts; i++) {
-       resultCts.push(bodyUndefPrimals[i] ? ctConstsFinal[ctConstsIdx++] : null);
+      resultCts.push(bodyUndefPrimals[i] ? ctConstsFinal[ctConstsIdx++] : null);
     }
-    
 
     let ctCarryIdx = 0;
     for (let i = 0; i < numCarryTotal; i++) {
-       if (i < numCarryHalf) {
-          resultCts.push(null);
-       } else {
-          resultCts.push(ctCarryFinal[ctCarryIdx++]);
-       }
+      if (i < numCarryHalf) {
+        resultCts.push(null);
+      } else {
+        resultCts.push(ctCarryFinal[ctCarryIdx++]);
+      }
     }
 
     return resultCts;
@@ -3428,11 +3706,9 @@ function vjpFlat(
   // Phase 3: Call-time transposition.
   //
   // evalJaxprTransposed runs with concrete arrays when fVjp is invoked.
-  // For scan-containing jaxprs, the scan transpose rule creates
-  // ScanPullbackArtifact and runs the checkpoint-based backward pass.
-  // For non-scan jaxprs, evalJaxprTransposed applies per-equation
-  // transpose rules directly. In both cases, evalJaxprTransposed
-  // preserves caller-owned args and cotangents (no .ref needed).
+  // The scan transpose rule emits in-graph Primitive.Scan calls for the
+  // backward pass.  evalJaxprTransposed applies per-equation transpose
+  // rules directly and preserves caller-owned args and cotangents.
   const fVjp = (...cotangents: Tracer[]) => {
     const transposeInputs = [
       ...forwardJaxpr.consts,

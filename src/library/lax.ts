@@ -19,7 +19,7 @@ import * as core from "../frontend/core";
 import { bind1, Primitive, ShapedArray } from "../frontend/core";
 import * as jaxpr from "../frontend/jaxpr";
 import { moveaxis, vmap } from "../frontend/vmap";
-import { type Dim, isSymbolicDim, Pair } from "../shape";
+import { type Dim, Pair } from "../shape";
 import * as tree from "../tree";
 import { checkAxis, deepEqual, prod, range, rep, zipn } from "../utils";
 import { blockMap } from "./lax-block-map";

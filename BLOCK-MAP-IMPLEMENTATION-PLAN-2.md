@@ -1312,20 +1312,38 @@ entirely through `block_map`.
 ### 8.1: Add Symbolic Bounds for `fori_loop`
 
 **Goal:** Allow `fori_loop(lower, upper)` to accept trace-time dynamic lengths (e.g., `SymDim("T")`)
-evaluated as runtime variables, unlocking dynamic loops within compiled shaders and native code without hard-coded constants.
+evaluated as runtime variables, unlocking dynamic loops within compiled shaders and native code
+without hard-coded constants.
 
-*Note: Initial work (commit `1a0db2d`) widened types to `number | Dim` and hooked up WebGPU. However, shortcuts were taken by falling back to JS loops for WASM, and asserting concrete bounds in the `transpose` rule. The following remaining steps are explicitly required to make `fori_loop` fully dynamic without shortcuts.*
+_Note: Initial work (commit `1a0db2d`) widened types to `number | Dim` and hooked up WebGPU.
+However, shortcuts were taken by falling back to JS loops for WASM, and asserting concrete bounds in
+the `transpose` rule. The following remaining steps are explicitly required to make `fori_loop`
+fully dynamic without shortcuts._
 
 #### Phase 8.1.1: WASM-native `fori_loop` Codegen
-- **Mega-Module Integration:** Currently `src/backend/wasm/mega-module.ts` returns `false` (rejects) for `fori_loop`, forcing a fallback to JS execution. Update the mega-module compiler to emit native `wasmblr` `loop` and `br_if` blocks for `Primitive.ForiLoop`.
-- **Dynamic Bound Loading:** Bind the explicitly resolved `lower` and `upper` variables as `i32` runtime arguments (or shared memory reads) so the WebAssembly loop dynamically respects `N` iterations securely inside WASM without JS overhead.
+
+- **Mega-Module Integration:** Currently `src/backend/wasm/mega-module.ts` returns `false` (rejects)
+  for `fori_loop`, forcing a fallback to JS execution. Update the mega-module compiler to emit
+  native `wasmblr` `loop` and `br_if` blocks for `Primitive.ForiLoop`.
+- **Dynamic Bound Loading:** Bind the explicitly resolved `lower` and `upper` variables as `i32`
+  runtime arguments (or shared memory reads) so the WebAssembly loop dynamically respects `N`
+  iterations securely inside WASM without JS overhead.
 
 #### Phase 8.1.2: Dynamic Autodiff (Transpose/Linearize) for `fori_loop`
-- **Eliminate Trace-Time Unrolling:** `src/frontend/linearize.ts` currently uses `concreteDim` to extract exact numbers for `upper - lower` and blindly unrolls the primal/reverse passes at JAXPR trace time. This aborts if bounds are truly symbolic (`SymDim`).
-- **Graph-Level History Management:** To support symbolic bounds (`N` is unknown), the backward pass can no longer statically unroll an array of tracers `primalHistory[N]`. Instead:
-  - **Option A (Scan Rewrite):** During differentiation, automatically lower `fori_loop` into a `lax.scan` so it inherently allocates a dynamic `(N, ...)` shape tensor for holding `primalHistory`.
-  - **Option B (Dynamic Slicing/Allocation):** If we wish to preserve it as a `fori_loop`, explicitly allocate an array of shape `[N, ...]` and write to it dynamically inside the primal forward's JAXPR body, doing the inverse on the backward pass loop.
-- *(Note: Similarly, the `concreteDim(lengthDim)` shortcut in the `scan` transpose rule should be investigated and fixed using the same proper dynamic tensor strategy).*
+
+- **Eliminate Trace-Time Unrolling:** `src/frontend/linearize.ts` currently uses `concreteDim` to
+  extract exact numbers for `upper - lower` and blindly unrolls the primal/reverse passes at JAXPR
+  trace time. This aborts if bounds are truly symbolic (`SymDim`).
+- **Graph-Level History Management:** To support symbolic bounds (`N` is unknown), the backward pass
+  can no longer statically unroll an array of tracers `primalHistory[N]`. Instead:
+  - **Option A (Scan Rewrite):** During differentiation, automatically lower `fori_loop` into a
+    `lax.scan` so it inherently allocates a dynamic `(N, ...)` shape tensor for holding
+    `primalHistory`.
+  - **Option B (Dynamic Slicing/Allocation):** If we wish to preserve it as a `fori_loop`,
+    explicitly allocate an array of shape `[N, ...]` and write to it dynamically inside the primal
+    forward's JAXPR body, doing the inverse on the backward pass loop.
+- _(Note: Similarly, the `concreteDim(lengthDim)` shortcut in the `scan` transpose rule should be
+  investigated and fixed using the same proper dynamic tensor strategy)._
 
 ### 8.2: Routing `associativeScan` through `block_map`
 
