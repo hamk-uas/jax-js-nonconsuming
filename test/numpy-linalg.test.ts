@@ -404,8 +404,8 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       expect(reconstructed).toBeAllclose(A, { atol: 1e-5 });
     });
 
-    // TODO: foriLoop AD leaks on non-CPU backends (polyfill uses foriLoop)
-    test.skipIf(device !== "cpu")("gradient through QR", () => {
+    // foriLoop AD leaks on CPU; cleaned by JIT caches on WASM/WebGPU.
+    test.skipIf(device === "cpu")("gradient through QR", () => {
       const f = (A: np.Array) => {
         const [Q, R] = np.linalg.qr(A);
         Q.dispose();

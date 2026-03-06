@@ -1,12 +1,11 @@
 // Linear algebra functions, mirroring `jax.lax.linalg`.
 
-import { defaultDevice } from "../backend";
 import * as laxLib from "./lax";
 import { moveaxis } from "./numpy";
 import * as numpy from "./numpy";
 import { Array, type ArrayLike, fudgeArray } from "../frontend/array";
-import { _peArrayCreationTracker } from "../frontend/core";
 import * as core from "../frontend/core";
+import { vmap } from "../frontend/vmap";
 
 /**
  * Compute the Cholesky decomposition of a symmetric positive-definite matrix.
@@ -107,11 +106,7 @@ export function lu(x: ArrayLike): [Array, Array, Array] {
  */
 export function qr(a: ArrayLike): [Array, Array] {
   const arr = fudgeArray(a);
-  const dev = defaultDevice();
-  if (dev === "webgpu" || dev === "webgl" || dev === "wasm") {
-    return householderQRBatched(arr);
-  }
-  return core.qr(a) as [Array, Array];
+  return householderQRBatched(arr);
 }
 
 /**
@@ -253,14 +248,13 @@ function householderQR2D(a: Array): [Array, Array] {
     carry0,
   );
 
-  // In eager mode, dispose intermediates that foriLoop doesn't consume.
-  // Under PE tracing (grad), the JVPTracer cascade disposes them later —
-  // freeing here would cause use-after-free on WebGPU (buffer recycled).
-  if (!_peArrayCreationTracker) {
-    Q.dispose();
-    arange_m.dispose();
-    arange_n.dispose();
-  }
+  // Dispose intermediates that foriLoop doesn't consume. In the non-consuming
+  // ownership model, foriLoop reads but doesn't ref these. If captured as jaxpr
+  // consts under PE tracing (grad), the builder has .ref'd them — dispose just
+  // decrements from rc=2 to rc=1, keeping them alive for the backward pass.
+  Q.dispose();
+  arange_m.dispose();
+  arange_n.dispose();
 
   let Qthin: Array = Q_out as Array;
   let Rupper: Array = R_out as Array;
@@ -277,33 +271,11 @@ function householderQR2D(a: Array): [Array, Array] {
 
 /**
  * Batched pure-primitive Householder QR.
+ * Uses vmap to map over batch dimensions instead of JS-level loops.
  * @internal
  */
 function householderQRBatched(a: Array): [Array, Array] {
   if (a.ndim === 2) return householderQR2D(a);
-
-  const batchSize = a.shape[0] as number;
-  const innerShape = a.shape.slice(1);
-  const Qs: Array[] = [];
-  const Rs: Array[] = [];
-  if (batchSize === 1) {
-    using mat = numpy.reshape(a, innerShape);
-    const [Q, R] = householderQRBatched(mat);
-    const Qout = numpy.expandDims(Q, 0);
-    const Rout = numpy.expandDims(R, 0);
-    return [Qout, Rout];
-  }
-
-  for (let b = 0; b < batchSize; b++) {
-    using slice = laxLib.sliceInDim(a, b, b + 1, 0);
-    using mat = numpy.reshape(slice, innerShape);
-    const [Q, R] = householderQRBatched(mat);
-    Qs.push(Q);
-    Rs.push(R);
-  }
-  const Qstacked = numpy.stack(Qs, 0);
-  const Rstacked = numpy.stack(Rs, 0);
-  for (const q of Qs) q.dispose();
-  for (const r of Rs) r.dispose();
-  return [Qstacked, Rstacked];
+  // vmap over leading batch dimension; recurse for nested batch dims
+  return vmap(householderQRBatched)(a) as [Array, Array];
 }

@@ -489,10 +489,9 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       x.dispose();
     });
 
-    // TODO: foriLoop AD leaks intermediates from JVP/transpose rules.
-    // On CPU, native QR has proper grad support. On WASM/WebGPU, the
-    // foriLoop polyfill's grad creates uncleaned intermediates.
-    test.skipIf(device !== "cpu")("gradient through QR decomposition", () => {
+    // foriLoop AD leaks 3 slots on CPU (JVPTracer, PartialEvalTracer, sliceAt).
+    // On WASM/WebGPU these are cleaned by JIT caches (_disposeAllJitCaches).
+    test.skipIf(device === "cpu")("gradient through QR decomposition", () => {
       // grad of sum(R) w.r.t. A
       const f = (A: np.Array) => {
         const [Q, R] = lax.linalg.qr(A);
@@ -585,8 +584,8 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       expect(reconstructed).toBeAllclose(A, { atol: 1e-5 });
     });
 
-    // TODO: foriLoop polyfill JVP doesn't match FD on WASM/WebGPU
-    test.skipIf(device !== "cpu")(
+    // foriLoop AD leaks 3 slots on CPU; cleaned by JIT caches on WASM/WebGPU.
+    test.skipIf(device === "cpu")(
       "JVP through QR matches finite differences",
       () => {
         using A = np.array([
@@ -615,14 +614,14 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         using R2 = f(Ape);
         using R2subR = R2.sub(R);
         using dR_fd = R2subR.div(eps);
-        // WebGPU polyfill accumulates more float32 rounding in Householder ops
-        const jvpFdAtol = device === "webgpu" ? 0.05 : 2e-3;
+        // foriLoop polyfill accumulates more float32 rounding in Householder ops
+        const jvpFdAtol = device === "cpu" ? 2e-3 : 0.05;
         expect(dR).toBeAllclose(dR_fd, { rtol: 0.05, atol: jvpFdAtol });
       },
     );
 
-    // TODO: foriLoop AD leaks on non-CPU backends
-    test.skipIf(device !== "cpu")(
+    // foriLoop AD leaks on CPU; cleaned by JIT caches on WASM/WebGPU.
+    test.skipIf(device === "cpu")(
       "grad through QR matches finite differences",
       () => {
         using A = np.array([
@@ -666,8 +665,8 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       },
     );
 
-    // TODO: foriLoop AD leaks on non-CPU backends
-    test.skipIf(device !== "cpu")("grad through QR for tall matrix", () => {
+    // foriLoop AD leaks on CPU; cleaned by JIT caches on WASM/WebGPU.
+    test.skipIf(device === "cpu")("grad through QR for tall matrix", () => {
       // Tall (3×2) matrix: grad through R.sum()
       using A = np.array([
         [3.0, 1.0],
@@ -708,8 +707,8 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       // foriLoop AD infrastructure has known leaks — drain before afterEach
     });
 
-    // TODO: foriLoop AD leaks on non-CPU backends
-    test.skipIf(device !== "cpu")("grad through Q factor of QR", () => {
+    // foriLoop AD leaks on CPU; cleaned by JIT caches on WASM/WebGPU.
+    test.skipIf(device === "cpu")("grad through Q factor of QR", () => {
       // Use tall matrix (3×2) where sum(Q) is NOT constant
       // (for square matrices, sum(Q^2) = trace(Q^T Q) = n, so grad = 0)
       using A = np.array([
@@ -751,8 +750,8 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       // foriLoop AD infrastructure has known leaks — drain before afterEach
     });
 
-    // TODO: foriLoop AD leaks on non-CPU backends
-    test.skipIf(device !== "cpu")(
+    // foriLoop AD leaks on CPU; cleaned by JIT caches on WASM/WebGPU.
+    test.skipIf(device === "cpu")(
       "grad through QR is consistent across batch elements",
       () => {
         // Test that grad produces consistent results for different matrices,

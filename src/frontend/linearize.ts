@@ -3569,6 +3569,16 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       if (ctCarrySafeInit[i] !== ctCarryInit[i]) ctCarrySafeInit[i].dispose();
     }
 
+    // Dispose locally-created ClosedJaxpr objects. Their consts were .ref'd
+    // by the scan body builders; disposing balances those refs. In tracing
+    // mode the outer builder also .ref'd them, so they survive; in eager
+    // mode the scans have finished and the consts are freed.
+    // transposedBody is cache-owned (transposeJaxprCache) — do NOT dispose.
+    primalForwardJaxpr.dispose();
+    tangentBody.dispose();
+    fwdScanBody.dispose();
+    bwdScanBody.dispose();
+
     return resultCts;
   },
 };
