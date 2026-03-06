@@ -1213,6 +1213,7 @@ export class WasmBackend implements Backend {
    */
   shouldUseParallelMegaModule(megaModule: WasmMegaModule): boolean {
     if (
+      !megaModule.canParallelize ||
       !this.capabilities.sharedMemory ||
       typeof Worker === "undefined" ||
       !this.#canSpinWaitWorkers
