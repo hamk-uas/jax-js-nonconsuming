@@ -85,6 +85,7 @@ export default defineConfig({
       "tmp/**",
       // Performance benchmarks, not correctness tests:
       "test/scan-bench.test.ts",
+      "test/bench-phase3.test.ts",
       // GPU-specific benchmarks (run with scripts/gpu-test.sh):
       "test/gpu-bench.test.ts",
       "test/debug-wgsl.test.ts",
