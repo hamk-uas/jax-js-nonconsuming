@@ -1826,6 +1826,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         outAxes: transposeOutAxes,
         numConsts: allConsts.length,
         numInputs: argResiduals.length + cts.length,
+        threadTile: params.threadTile,
       },
     );
 

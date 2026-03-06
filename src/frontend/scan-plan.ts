@@ -127,9 +127,13 @@ export function getScanBufferSizes(
 
   return {
     constSizes: constAvals.map((a) => a.size * byteWidth(a.dtype)),
+    constDtypes: constAvals.map((a) => a.dtype),
     carrySizes: carryAvals.map((a) => a.size * byteWidth(a.dtype)),
+    carryDtypes: carryAvals.map((a) => a.dtype),
     xsStrides: xAvals.map((a) => a.size * byteWidth(a.dtype)),
+    xsDtypes: xAvals.map((a) => a.dtype),
     ysStrides: yAvals.map((a) => a.size * byteWidth(a.dtype)),
+    ysDtypes: yAvals.map((a) => a.dtype),
   };
 }
 
@@ -650,12 +654,16 @@ function tryPrepareWebGPUNativeScan(
 
   const executeSteps = classification.executeSteps;
   const numInputs = numConsts + numCarry + numX;
-  const { constSizes, carrySizes, xsStrides, ysStrides } = getScanBufferSizes(
-    bodyJaxpr,
-    numConsts,
-    numCarry,
-    numX,
-  );
+  const {
+    constSizes,
+    constDtypes,
+    carrySizes,
+    carryDtypes,
+    xsStrides,
+    xsDtypes,
+    ysStrides,
+    ysDtypes,
+  } = getScanBufferSizes(bodyJaxpr, numConsts, numCarry, numX);
 
   // Check binding count: consts + xs + carry(rw) + ys(rw) ≤ limit
   const totalBindings = numConsts + numX + numCarry + numY;
@@ -774,6 +782,22 @@ function tryPrepareWebGPUNativeScan(
       );
 
       const kernelOutput = source.outputs[oi] ?? source.outputs[0];
+
+      // Reject: reduction kernel with internal dependency.
+      // In the fused shader, internals are per-gidx scalars, but reductions
+      // need ridx-dependent array access. This pattern can't be correctly
+      // fused (e.g. matmul in backward scan body).
+      if (kernelOutput.reduction) {
+        const hasInternalInput = scanReindexMap.some((gid) => gid >= numInputs);
+        if (hasInternalInput) {
+          if (DEBUG >= 1)
+            console.log(
+              `[webgpu-scan] skipped compiled-loop, reduction step ${oi} depends on internal intermediate`,
+            );
+          return null;
+        }
+      }
+
       const reindexedExp = kernelOutput.exp.reindexGids(scanReindexMap);
       const reindexedReduction = kernelOutput.reduction
         ? new Reduction(
@@ -804,12 +828,16 @@ function tryPrepareWebGPUNativeScan(
     length,
     numConsts,
     constSizes,
+    constDtypes,
     numCarry,
     carrySizes,
+    carryDtypes,
     numX,
     xsStrides,
+    xsDtypes,
     numY,
     ysStrides,
+    ysDtypes,
     steps: multiSteps,
     reverse,
     numInternal,

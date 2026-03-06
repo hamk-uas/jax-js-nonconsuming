@@ -77,12 +77,16 @@ export interface NativeScanMultiParams {
   length: number;
   numConsts: number;
   constSizes: number[];
+  constDtypes: DType[];
   numCarry: number;
   carrySizes: number[];
+  carryDtypes: DType[];
   numX: number;
   xsStrides: number[];
+  xsDtypes: DType[];
   numY: number;
   ysStrides: number[];
+  ysDtypes: DType[];
   steps: NativeScanMultiStep[];
   reverse?: boolean;
   /** Number of internal intermediate locals (from steps with internal deps). */
@@ -3890,8 +3894,20 @@ function nativeScanMultiShaderSource(
   const resultTy = dtypeToWgsl(dtype, true);
   const elemSize = byteWidth(dtype);
 
-  // Compute element-level strides (byte strides / element size)
-  const xsElemStrides = xsStrides.map((s) => s / elemSize);
+  // Per-buffer WGSL type names
+  const constTys = (params.constDtypes ?? []).map((d) => dtypeToWgsl(d, true));
+  const xsTys = (params.xsDtypes ?? []).map((d) => dtypeToWgsl(d, true));
+  const carryTys = (params.carryDtypes ?? []).map((d) => dtypeToWgsl(d, true));
+  const ysTys = (params.ysDtypes ?? []).map((d) => dtypeToWgsl(d, true));
+
+  // Compute element-level strides (byte strides / per-xs element size)
+  const xsElemStrides = xsStrides.map((s, i) => {
+    const xElemSize =
+      params.xsDtypes && params.xsDtypes[i]
+        ? byteWidth(params.xsDtypes[i])
+        : elemSize;
+    return s / xElemSize;
+  });
 
   // Find the maximum kernel size across all steps
   const maxKernelSize = Math.max(
@@ -3931,28 +3947,38 @@ function nativeScanMultiShaderSource(
   let bindingIdx = 0;
 
   for (let i = 0; i < numConsts; i++) {
+    const ty = constTys[i] ?? resultTy;
     emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read> const${i}: array<${resultTy}>;`,
+      `@group(0) @binding(${bindingIdx++}) var<storage, read> const${i}: array<${ty}>;`,
     );
   }
   for (let i = 0; i < numX; i++) {
+    const ty = xsTys[i] ?? resultTy;
     emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read> xs${i}: array<${resultTy}>;`,
+      `@group(0) @binding(${bindingIdx++}) var<storage, read> xs${i}: array<${ty}>;`,
     );
   }
   for (let i = 0; i < numCarry; i++) {
+    const ty = carryTys[i] ?? resultTy;
     emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> carry${i}: array<${resultTy}>;`,
+      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> carry${i}: array<${ty}>;`,
     );
   }
   for (let i = 0; i < numY; i++) {
+    const ty = ysTys[i] ?? resultTy;
     emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> ys${i}: array<${resultTy}>;`,
+      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> ys${i}: array<${ty}>;`,
     );
   }
 
   // Carry element counts for snapshot guards
-  const carryElemCounts = carrySizes.map((s) => s / elemSize);
+  const carryElemCounts = carrySizes.map((s, i) => {
+    const cElemSize =
+      params.carryDtypes && params.carryDtypes[i]
+        ? byteWidth(params.carryDtypes[i])
+        : elemSize;
+    return s / cElemSize;
+  });
 
   // Compute shader entry point
   const workgroupSize = Math.min(Math.max(maxKernelSize, 1), 256);
@@ -3983,7 +4009,8 @@ function nativeScanMultiShaderSource(
   emit("");
   emit("// Snapshot carry values for this iteration");
   for (let i = 0; i < numCarry; i++) {
-    emit(`var c_${i}: ${resultTy} = ${resultTy}(0);`);
+    const cTy = carryTys[i] ?? resultTy;
+    emit(`var c_${i}: ${cTy} = ${cTy}(0);`);
     if (carryElemCounts[i] === maxKernelSize) {
       // All valid threads can load — no guard needed
       emit(`c_${i} = carry${i}[gidx];`);
@@ -3998,6 +4025,8 @@ function nativeScanMultiShaderSource(
     const kernel = step.kernel;
     const tune = tuneNullopt(kernel);
     const kernelSize = kernel.size;
+    const stepDtype = kernel.outputs[0].dtype;
+    const stepTy = dtypeToWgsl(stepDtype, true);
 
     const isCarryStep = step.outputCarryIdx >= 0;
     const targetLabel = isCarryStep
@@ -4010,7 +4039,7 @@ function nativeScanMultiShaderSource(
     // Declare result outside if-block so internal assignments can reference it
     const needsOuterDecl = !isCarryStep;
     if (needsOuterDecl) {
-      emit(`var result_val_${stepIdx}: ${resultTy} = ${resultTy}(0);`);
+      emit(`var result_val_${stepIdx}: ${stepTy} = ${stepTy}(0);`);
     }
 
     emit(`if (gidx < ${kernelSize}) {`);
@@ -4028,7 +4057,7 @@ function nativeScanMultiShaderSource(
 
       const expCode = genScanExpressionWithRidx(
         tune.exp,
-        dtype,
+        stepDtype,
         numConsts,
         numCarry,
         xsElemStrides,
@@ -4046,7 +4075,7 @@ function nativeScanMultiShaderSource(
 
       const epilogueCode = genScanExpressionWithRidx(
         tune.epilogue!,
-        dtype,
+        stepDtype,
         numConsts,
         numCarry,
         xsElemStrides,
@@ -4055,13 +4084,13 @@ function nativeScanMultiShaderSource(
       if (needsOuterDecl) {
         emit(`result_val_${stepIdx} = ${epilogueCode};`);
       } else {
-        emit(`let result_val_${stepIdx}: ${resultTy} = ${epilogueCode};`);
+        emit(`let result_val_${stepIdx}: ${stepTy} = ${epilogueCode};`);
       }
     } else {
       // Elementwise kernel
       const expCode = genScanExpressionWithRidx(
         tune.exp,
-        dtype,
+        stepDtype,
         numConsts,
         numCarry,
         xsElemStrides,
@@ -4070,14 +4099,18 @@ function nativeScanMultiShaderSource(
       if (needsOuterDecl) {
         emit(`result_val_${stepIdx} = ${expCode};`);
       } else {
-        emit(`let result_val_${stepIdx}: ${resultTy} = ${expCode};`);
+        emit(`let result_val_${stepIdx}: ${stepTy} = ${expCode};`);
       }
     }
 
     if (isCarryStep) {
       const carryIdx = step.outputCarryIdx;
+      const carryElemSize =
+        params.carryDtypes && params.carryDtypes[carryIdx]
+          ? byteWidth(params.carryDtypes[carryIdx])
+          : elemSize;
       const ysElemStride = ysStrides[carryIdx]
-        ? ysStrides[carryIdx] / elemSize
+        ? ysStrides[carryIdx] / carryElemSize
         : 0;
 
       // Write to ysStacked at dataIdx * stride + gidx
@@ -4098,7 +4131,7 @@ function nativeScanMultiShaderSource(
     if (!isCarryStep) {
       // Alias to internal_N for readability in subsequent step expressions
       emit(
-        `var internal_${step.outputInternalIdx}: ${resultTy} = result_val_${stepIdx};`,
+        `var internal_${step.outputInternalIdx}: ${stepTy} = result_val_${stepIdx};`,
       );
     }
   }
