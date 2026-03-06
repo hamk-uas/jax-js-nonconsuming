@@ -827,8 +827,61 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     if (x !== origX) x[Symbol.dispose]();
     return [[result], [0]];
   },
-  [Primitive.ForiLoop](_axisSize, _args, _bdims, _params) {
-    throw new Error("vmap for foriLoop not implemented");
+  [Primitive.ForiLoop](
+    axisSize,
+    args,
+    dims,
+    { jaxpr, numConsts, lower, upper },
+  ) {
+    // vmap of fori_loop: batch over independent loops
+    //
+    // ForiLoop args layout: [...consts, ...carry]
+    // Body takes: [i, ...carry] -> [...newCarry]
+    // The loop index `i` is scalar int32, NOT batched.
+    const numCarry = args.length - numConsts;
+
+    const consts = args.slice(0, numConsts);
+    const initCarry = args.slice(numConsts);
+
+    const constDims = dims.slice(0, numConsts);
+    const carryDims = dims.slice(numConsts);
+
+    // Move batch dims to axis 0
+    const movedConsts = consts.map((c, i) =>
+      moveBatchAxis(axisSize, constDims[i], 0, c),
+    );
+    const movedCarry = initCarry.map((c, i) =>
+      moveBatchAxis(axisSize, carryDims[i], 0, c),
+    );
+
+    // Body dims: [0, ..., 0 (consts batched), null (i not batched), 0, ..., 0 (carry batched)]
+    // Body jaxpr inBinders: [const_0, ..., const_k, i, carry_0, ..., carry_n]
+    const bodyDims: (number | null)[] = [
+      ...rep(numConsts, 0),
+      null,
+      ...rep(numCarry, 0),
+    ];
+
+    const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims);
+
+    const foriArgs = [...vmappedBody.consts, ...movedConsts, ...movedCarry];
+
+    const results = bind(Primitive.ForiLoop, foriArgs, {
+      jaxpr: vmappedBody.jaxpr,
+      numConsts: vmappedBody.consts.length + numConsts,
+      lower,
+      upper,
+    });
+
+    // Dispose intermediates from moveBatchAxis
+    for (let i = 0; i < movedConsts.length; i++) {
+      if (movedConsts[i] !== consts[i]) movedConsts[i][Symbol.dispose]();
+    }
+    for (let i = 0; i < movedCarry.length; i++) {
+      if (movedCarry[i] !== initCarry[i]) movedCarry[i][Symbol.dispose]();
+    }
+
+    return [results, rep(numCarry, 0)];
   },
   [Primitive.WorkgroupAssociativeScan]() {
     throw new Error("vmap for WorkgroupAssociativeScan not implemented");

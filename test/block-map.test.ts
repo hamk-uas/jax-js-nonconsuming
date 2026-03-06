@@ -271,6 +271,57 @@ describe("lax.foriLoop — Phase 1b", () => {
     expect(sum).toBeAllclose(6); // 0 + 2 + 2 + 2
     expect(prod).toBeAllclose(8); // 1 * 2 * 2 * 2
   });
+
+  // T3.7: vmap over foriLoop — batch of independent loops
+  test("vmap over foriLoop (batch accumulation)", () => {
+    const f = (x: np.Array) =>
+      lax.foriLoop(
+        0,
+        3,
+        (_i: np.Array, carry: np.Array) => np.add(carry, x),
+        x,
+      );
+    // Each element: init=x, then add x three times → 4*x
+    using batch = np.array([1, 2, 3], { dtype: DType.Float32 });
+    using result = vmap(f)(batch) as np.Array;
+    expect(result).toBeAllclose([4, 8, 12]);
+  });
+
+  // T3.8: vmap(grad(foriLoop)) — batch of gradients
+  // TODO: foriLoop AD leaks intermediates from JVP/transpose rules
+  test.skip("vmap(grad(foriLoop))", () => {
+    // f(x) = fori_loop(0, 3, (_, c) => c * x, 1.0) = x^3
+    // grad(f)(x) = 3*x^2
+    const f = (x: np.Array) => {
+      using one = np.array(1, { dtype: DType.Float32 });
+      return lax.foriLoop(
+        0,
+        3,
+        (_i: np.Array, carry: np.Array) => np.multiply(carry, x),
+        one,
+      );
+    };
+    using batch = np.array([1, 2, 3], { dtype: DType.Float32 });
+    using result = vmap(grad(f))(batch) as np.Array;
+    // [3*1^2, 3*2^2, 3*3^2] = [3, 12, 27]
+    expect(result).toBeAllclose([3, 12, 27]);
+  });
+
+  // T3.9: jit(vmap(foriLoop))
+  test("jit(vmap(foriLoop))", () => {
+    const f = (x: np.Array) =>
+      lax.foriLoop(
+        0,
+        4,
+        (_i: np.Array, carry: np.Array) => np.add(carry, x),
+        x,
+      );
+    using batch = np.array([10, 20], { dtype: DType.Float32 });
+    using jitF = jit(vmap(f));
+    using result = jitF(batch) as np.Array;
+    // init=x, add x 4 times → 5*x
+    expect(result).toBeAllclose([50, 100]);
+  });
 });
 
 describe("lax.dynamicSlice — Phase 1b", () => {

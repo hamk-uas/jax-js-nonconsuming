@@ -536,8 +536,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       expect(dR.shape).toEqual([2, 2]);
     });
 
-    // TODO: foriLoop vmap not implemented (vmap.ts:831)
-    test.skipIf(device !== "cpu")("vmap over QR decomposition", () => {
+    test("vmap over QR decomposition", () => {
       // Batch of 3 matrices, each 3×2
       using flat = np.array(
         [1, 2, 3, 4, 5, 6, 2, 1, 0, 3, 1, 2, 4, 0, 1, 3, 2, 5],
