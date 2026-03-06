@@ -47,6 +47,8 @@ export interface ExecuteScanParams {
   xsAvals: ShapedArray[];
   /** Preallocated output slots: [carry_out..., stacked_ys...] */
   outputSlots: Slot[];
+  /** Dim bindings for resolving symbolic sizes in body program execution */
+  dimBindings?: ReadonlyMap<string, number>;
 }
 
 export interface ExecuteScanResult {
@@ -96,14 +98,29 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
     xsSlots,
     xsAvals,
     outputSlots,
+    dimBindings,
   } = params;
 
+  // Helper: resolve size of an aval, handling symbolic shapes via dimBindings
+  const resolveAvalSize = (aval: ShapedArray): number => {
+    if (hasSymbolicDims(aval.shape)) {
+      if (!dimBindings) throw new Error("Symbolic shape but no dimBindings");
+      const shape = resolveShape(aval.shape, dimBindings);
+      return shape.reduce((a, b) => a * b, 1);
+    }
+    return aval.size as number;
+  };
+
   // Compute per-xs byte strides (size of one iteration's slice)
-  const xsStrides = xsAvals.map((aval) => aval.size * byteWidth(aval.dtype));
+  const xsStrides = xsAvals.map(
+    (aval) => resolveAvalSize(aval) * byteWidth(aval.dtype),
+  );
 
   // Compute per-y byte strides from body jaxpr outputs
   const yOutAvals = bodyJaxpr.outs.slice(numCarry).map((v) => v.aval);
-  const ysStrides = yOutAvals.map((aval) => aval.size * byteWidth(aval.dtype));
+  const ysStrides = yOutAvals.map(
+    (aval) => resolveAvalSize(aval) * byteWidth(aval.dtype),
+  );
 
   // Current carry slots — start with initCarry.
   // IncRef so the loop can uniformly decRef old carry each iteration
@@ -151,7 +168,7 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
       const bodyInputs = [...constSlots, ...carry, ...xSlices];
 
       // Execute body
-      const bodyResult = bodyProgram.execute(bodyInputs);
+      const bodyResult = bodyProgram.execute(bodyInputs, dimBindings);
       pending.push(...bodyResult.pending);
 
       // Flush pending ops from body execution before reading output slots
@@ -219,8 +236,8 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
       continue;
     }
     // Copy carry data into the preallocated output slot
-    const carrySize =
-      bodyJaxpr.outs[ci].aval.size * byteWidth(bodyJaxpr.outs[ci].aval.dtype);
+    const carryAval = bodyJaxpr.outs[ci].aval;
+    const carrySize = resolveAvalSize(carryAval) * byteWidth(carryAval.dtype);
     copySliceToBuffer(
       backend,
       carryOutputSlots[ci],
@@ -547,7 +564,7 @@ function sliceXsAtIteration(
   const slices: Slot[] = [];
   for (let j = 0; j < xsSlots.length; j++) {
     const srcOffset = iterIdx * xsStrides[j];
-    const sliceSize = xsAvals[j].size * byteWidth(xsAvals[j].dtype);
+    const sliceSize = xsStrides[j]; // stride = per-element bytes
 
     // Copy the xs slice into a new buffer. Prefer copyBufferToBuffer
     // (keeps data on-device, avoids readSync which needs OffscreenCanvas

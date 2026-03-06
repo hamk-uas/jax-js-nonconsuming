@@ -2,7 +2,7 @@
 // jax-js-lint: allow-ref — .ref is the core ownership mechanism in autodiff internals
 
 import { AluOp, type DType, isFloatDtype } from "../alu";
-import { concreteDim, type Dim } from "../dim";
+import { type Dim, dimSub, hasSymbolicDims } from "../dim";
 import {
   dispose as treeDispose,
   flatten as treeFlatten,
@@ -93,9 +93,16 @@ import {
 import { jvp, lowerAux } from "./jvp";
 import { jacfwd, moveaxis, vmap } from "./vmap";
 
-/** Internal zeros allocation (marking handled by fullInternal). */
-const zerosInternal = (shape: Dim[] | number[], dtype: DType) =>
-  fullInternal({ shape, dtype, weakType: false }, 0);
+/** Internal zeros allocation (marking handled by fullInternal).
+ * For symbolic shapes during tracing, broadcasts a scalar zero. */
+const zerosInternal = (shape: Dim[] | number[], dtype: DType) => {
+  if (hasSymbolicDims(shape as Dim[])) {
+    const scalar = fullInternal({ shape: [], dtype, weakType: false }, 0);
+    const axis = range(shape.length);
+    return broadcast(scalar, shape as Dim[], axis);
+  }
+  return fullInternal({ shape, dtype, weakType: false }, 0);
+};
 
 /** Array value that can either be known or unknown. */
 class PartialVal {
@@ -1756,7 +1763,7 @@ function unbroadcast(x: Tracer, target: UndefPrimal): Tracer {
   let result = x.sum(reductionDims);
   if (!deepEqual(result.shape, shape)) {
     const sumResult = result;
-    result = broadcast(sumResult, shape as number[], unsqueeze); // keep dims selectively
+    result = broadcast(sumResult, shape, unsqueeze); // keep dims selectively
     sumResult.dispose();
   }
   return result;
@@ -3289,9 +3296,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       );
     }
 
-    const lower = concreteDim(lowerDim, "foriLoop transpose");
-    const upper = concreteDim(upperDim, "foriLoop transpose");
-    const N = upper - lower;
+    const N = dimSub(upperDim, lowerDim);
     const numCarryTotal = args.length - numConsts;
     const numCarryHalf = numCarryTotal / 2;
 

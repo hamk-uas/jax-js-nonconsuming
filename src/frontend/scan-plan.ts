@@ -22,7 +22,12 @@ import type {
 } from "../backend/webgpu";
 import type { WebGPUBackend } from "../backend/webgpu";
 import { Routine, Routines } from "../routine";
-import { type Dim, isSymbolicDim } from "../shape";
+import {
+  type Dim,
+  hasSymbolicDims,
+  isSymbolicDim,
+  resolveShape,
+} from "../shape";
 import { DEBUG } from "../utils";
 import type { ScanPath } from "../utils";
 import type { Jaxpr } from "./jaxpr";
@@ -115,7 +120,15 @@ export function getScanBufferSizes(
   numConsts: number,
   numCarry: number,
   numX: number,
+  dimBindings?: ReadonlyMap<string, number>,
 ) {
+  const resolveSize = (a: { shape: readonly Dim[]; dtype: DType }) => {
+    const shape =
+      dimBindings && hasSymbolicDims(a.shape)
+        ? resolveShape(a.shape, dimBindings)
+        : (a.shape as number[]);
+    return shape.reduce((acc, d) => acc * d, 1) * byteWidth(a.dtype);
+  };
   const constAvals = bodyJaxpr.inBinders.slice(0, numConsts).map((v) => v.aval);
   const carryAvals = bodyJaxpr.inBinders
     .slice(numConsts, numConsts + numCarry)
@@ -126,13 +139,13 @@ export function getScanBufferSizes(
   const yAvals = bodyJaxpr.outs.slice(numCarry).map((v) => v.aval);
 
   return {
-    constSizes: constAvals.map((a) => a.size * byteWidth(a.dtype)),
+    constSizes: constAvals.map(resolveSize),
     constDtypes: constAvals.map((a) => a.dtype),
-    carrySizes: carryAvals.map((a) => a.size * byteWidth(a.dtype)),
+    carrySizes: carryAvals.map(resolveSize),
     carryDtypes: carryAvals.map((a) => a.dtype),
-    xsStrides: xAvals.map((a) => a.size * byteWidth(a.dtype)),
+    xsStrides: xAvals.map(resolveSize),
     xsDtypes: xAvals.map((a) => a.dtype),
-    ysStrides: yAvals.map((a) => a.size * byteWidth(a.dtype)),
+    ysStrides: yAvals.map(resolveSize),
     ysDtypes: yAvals.map((a) => a.dtype),
   };
 }
@@ -290,6 +303,7 @@ function tryPrepareWasmNativeScan(
   numX: number,
   numY: number,
   reverse: boolean,
+  dimBindings?: ReadonlyMap<string, number>,
 ): {
   executable: Executable;
   internalSizes: number[];
@@ -322,6 +336,7 @@ function tryPrepareWasmNativeScan(
     numConsts,
     numCarry,
     numX,
+    dimBindings,
   );
 
   // Build mapping from JitId (output slot) to internal buffer index
@@ -633,6 +648,7 @@ function tryPrepareWebGPUNativeScan(
   numX: number,
   numY: number,
   reverse: boolean,
+  dimBindings?: ReadonlyMap<string, number>,
 ): {
   executable: Executable;
   params: NativeScanMultiParams;
@@ -663,7 +679,7 @@ function tryPrepareWebGPUNativeScan(
     xsDtypes,
     ysStrides,
     ysDtypes,
-  } = getScanBufferSizes(bodyJaxpr, numConsts, numCarry, numX);
+  } = getScanBufferSizes(bodyJaxpr, numConsts, numCarry, numX, dimBindings);
 
   // Check binding count: consts + xs + carry(rw) + ys(rw) ≤ limit
   const totalBindings = numConsts + numX + numCarry + numY;
@@ -881,6 +897,7 @@ function tryPrepareNativeScan(
   numX: number,
   numY: number,
   reverse: boolean,
+  dimBindings?: ReadonlyMap<string, number>,
 ): {
   executable: Executable;
   internalSizes?: number[];
@@ -908,6 +925,7 @@ function tryPrepareNativeScan(
       numX,
       numY,
       reverse,
+      dimBindings,
     );
   }
 
@@ -930,6 +948,7 @@ function tryPrepareNativeScan(
       numX,
       numY,
       reverse,
+      dimBindings,
     );
   }
 
@@ -1258,6 +1277,7 @@ export function planScan(
   numY: number,
   reverse: boolean,
   acceptPath?: ScanPath | ScanPath[],
+  dimBindings?: ReadonlyMap<string, number>,
 ): ScanPlan {
   // Try compiled-loop (WASM native scan)
   const nativeScanResult = tryPrepareNativeScan(
@@ -1270,6 +1290,7 @@ export function planScan(
     numX,
     numY,
     reverse,
+    dimBindings,
   );
 
   if (nativeScanResult) {

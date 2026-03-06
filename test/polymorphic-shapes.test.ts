@@ -1,5 +1,6 @@
 import {
   DType,
+  grad,
   jit,
   lax,
   makeJaxpr,
@@ -467,5 +468,36 @@ suite("Polymorphic foriLoop bounds (Phase 8.1)", () => {
     using x6 = np.ones([6, 1]);
     using r6 = f(x6) as np.Array;
     expect(r6).toBeAllclose(15);
+  });
+
+  test("grad through foriLoop with symbolic upper bound", () => {
+    // f(x) = foriLoop(0, x.shape[0], (i, carry) => carry + sum(x), 0.0)
+    // = N * sum(x). For x = [2, 2, 2] (N=3, sum=6): f = 18.
+    // grad = N * ones_like(x) = [3, 3, 3].
+    using gFn = jit(
+      grad((x: np.Array) => {
+        using init = np.array(0, { dtype: DType.Float32 });
+        return lax.foriLoop(
+          0,
+          x.shape[0] as unknown as number,
+          (_i: np.Array, carry: np.Array) => {
+            using s = np.sum(x);
+            return np.add(carry, s);
+          },
+          init,
+        );
+      }),
+      { dynamic_axes: { 0: "T" } },
+    );
+
+    // N=3: f = 3 * 6 = 18, grad = [3, 3, 3]
+    using x3 = np.full([3], 2, { dtype: DType.Float32 });
+    using g3 = gFn(x3) as np.Array;
+    expect(g3).toBeAllclose([3, 3, 3]);
+
+    // N=4: f = 4 * 8 = 32, grad = [4, 4, 4]
+    using x4 = np.full([4], 2, { dtype: DType.Float32 });
+    using g4 = gFn(x4) as np.Array;
+    expect(g4).toBeAllclose([4, 4, 4, 4]);
   });
 });

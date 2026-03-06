@@ -563,6 +563,7 @@ export class JitProgram {
             xsSlots,
             xsAvals: step.xsAvals,
             outputSlots,
+            dimBindings,
           });
 
           // DecRef borrowed consts and xs
@@ -742,7 +743,10 @@ export class JitProgram {
             for (const s of constSlots) this.backend.incRef(s);
 
             const bodyInputs = [...constSlots, idxSlot, ...carrySlots];
-            const bodyResult = step.bodyProgram.execute(bodyInputs);
+            const bodyResult = step.bodyProgram.execute(
+              bodyInputs,
+              dimBindings,
+            );
             flushPendingBatched(bodyResult.pending, this.backend);
 
             // DecRef consts and index
@@ -1170,8 +1174,9 @@ export function jitCompile(
   const cached = jitCompileCache.get(cacheKey);
   if (cached) return cached;
 
-  // Set module-level dim bindings for jitRules to resolve symbolic shapes
-  // to concrete values in ShapeTracker operations.
+  // Save/restore dim bindings for nested jitCompile calls (e.g., grad(foriLoop)
+  // creates Scan body that contains ForiLoop, each triggering jitCompile).
+  const prevDimBindings = _currentDimBindings;
   _currentDimBindings = dimBindings;
 
   try {
@@ -1363,7 +1368,7 @@ export function jitCompile(
         }
 
         // Compile body jaxpr
-        const bodyProgram = jitCompile(backend, bodyJaxpr);
+        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
 
         // Determine scan plan
         const scanPlan = planScan(
@@ -1377,6 +1382,7 @@ export function jitCompile(
           numY,
           reverse,
           acceptPath as ScanPath | ScanPath[] | undefined,
+          _currentDimBindings,
         );
 
         // Compute per-slice xsAvals (without leading length dimension)
@@ -1518,7 +1524,7 @@ export function jitCompile(
         }
 
         // Compile the body jaxpr → JitProgram (for fallback path)
-        const bodyProgram = jitCompile(backend, bodyJaxpr);
+        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
 
         // Plan the assoc scan — try compiled-loop (WASM), fallback otherwise
         const assocPlan = planAssociativeScan(
@@ -1660,7 +1666,7 @@ export function jitCompile(
         }
 
         // Compile body jaxpr
-        const bodyProgram = jitCompile(backend, bodyJaxpr);
+        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
 
         const inputShapes = inputAvals.map((a) => a.shape as number[]);
         const outputShapes = eqn.outBinders.map(
@@ -1729,7 +1735,7 @@ export function jitCompile(
           ctx.set(outVar, { type: "imm", arg: outId });
         }
 
-        const bodyProgram = jitCompile(backend, bodyJaxpr);
+        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
 
         builder.steps.push({
           type: "workgroup_assoc_scan",
@@ -1780,7 +1786,7 @@ export function jitCompile(
         }
 
         // Compile body jaxpr
-        const bodyProgram = jitCompile(backend, bodyJaxpr);
+        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
 
         const carrySizeBytes = eqn.outBinders.map(
           (v) => (v.aval.size as number) * byteWidth(v.aval.dtype),
@@ -2025,7 +2031,7 @@ export function jitCompile(
     jitCompileCache.set(cacheKey, jp);
     return jp;
   } finally {
-    _currentDimBindings = undefined;
+    _currentDimBindings = prevDimBindings;
   }
 }
 
@@ -2337,10 +2343,20 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     return { exp: [x.substitute({ gidx: index })] };
   },
   [Primitive.Transpose]: reshapeJit((st, { perm }) => st.permute(perm)),
-  [Primitive.Broadcast]: reshapeJit((st, { shape, axis }) =>
-    st.broadcast(shape, axis),
-  ),
-  [Primitive.Reshape]: reshapeJit((st, { shape }) => st.reshape(shape)),
+  [Primitive.Broadcast]: reshapeJit((st, { shape, axis }) => {
+    const concreteShape =
+      _currentDimBindings && hasSymbolicDims(shape)
+        ? resolveShape(shape, _currentDimBindings)
+        : (shape as number[]);
+    return st.broadcast(concreteShape, axis);
+  }),
+  [Primitive.Reshape]: reshapeJit((st, { shape }) => {
+    const concreteShape =
+      _currentDimBindings && hasSymbolicDims(shape)
+        ? resolveShape(shape, _currentDimBindings)
+        : (shape as number[]);
+    return st.reshape(concreteShape);
+  }),
   [Primitive.Flip]: reshapeJit((st, { axis }) => {
     const arg = rep(st.shape.length, false);
     for (const ax of axis) arg[ax] = true;

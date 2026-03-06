@@ -138,7 +138,7 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.RandomBits]: { shape: number[]; mode: "xor" | 0 | 1 };
   [Primitive.Gather]: { axis: number[]; outDim: number };
   [Primitive.Transpose]: { perm: number[] };
-  [Primitive.Broadcast]: { shape: number[]; axis: number[] };
+  [Primitive.Broadcast]: { shape: Dim[]; axis: number[] };
   [Primitive.Reshape]: { shape: number[] };
   [Primitive.Flip]: { axis: number[] };
   [Primitive.Shrink]: { slice: Pair[] };
@@ -517,7 +517,7 @@ export function transpose(x: TracerValue, perm?: number[]) {
   return bind1(Primitive.Transpose, [x], { perm });
 }
 
-export function broadcast(x: TracerValue, shape: number[], axis: number[]) {
+export function broadcast(x: TracerValue, shape: Dim[], axis: number[]) {
   axis = normalizeAxis(axis, shape.length);
   return bind1(Primitive.Broadcast, [x], { shape, axis });
 }

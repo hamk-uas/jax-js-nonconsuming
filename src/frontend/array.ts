@@ -1218,7 +1218,7 @@ export class Array extends Tracer {
         return [x.#transpose(perm)];
       },
       [Primitive.Broadcast]([x], { shape, axis }) {
-        return [x.#reshape(x.#st.broadcast(shape, axis))];
+        return [x.#reshape(x.#st.broadcast(shape as number[], axis))];
       },
       [Primitive.Reshape]([x], { shape }) {
         return [x.#reshape(x.#st.reshape(shape))];
