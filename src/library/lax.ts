@@ -22,7 +22,7 @@ import { moveaxis, vmap } from "../frontend/vmap";
 import { type Dim, Pair } from "../shape";
 import * as tree from "../tree";
 import { checkAxis, deepEqual, prod, range, rep, zipn } from "../utils";
-import { blockMap } from "./lax-block-map";
+import { blockIndex, blockMap } from "./lax-block-map";
 import { scan } from "./lax-scan";
 
 export * as linalg from "./lax-linalg";
@@ -30,7 +30,7 @@ export { scan };
 export type { ScanOptions } from "./lax-scan";
 export { associativeScan } from "./lax-associative-scan";
 export type { AssociativeScanOptions } from "./lax-associative-scan";
-export { blockMap };
+export { blockIndex, blockMap };
 export type { BlockMapOptions } from "./lax-block-map";
 
 /**

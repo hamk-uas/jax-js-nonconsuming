@@ -56,11 +56,67 @@ import {
   routinePrimitives,
   ShapedArray,
 } from "./core";
-import { Jaxpr, Lit, Var } from "./jaxpr";
+import { type Atom, Jaxpr, JaxprEqn, Lit, Var } from "./jaxpr";
 import { executeAssociativeScan, executeScan } from "./scan-executor";
 import type { AssocScanPlan, ScanPlan } from "./scan-plan";
 import { planAssociativeScan, planScan } from "./scan-plan";
 import type { ScanPath } from "../utils";
+
+/**
+ * Rewrite a body jaxpr: replace all `Primitive.BlockIndex` equations with a
+ * reference to a new synthetic input (appended as the last inBinder).
+ * Returns the original jaxpr unchanged if no BlockIndex is present.
+ */
+function rewriteBlockIndex(jaxpr: Jaxpr): {
+  jaxpr: Jaxpr;
+  hasBlockIndex: boolean;
+} {
+  const biEqns: number[] = [];
+  for (let i = 0; i < jaxpr.eqns.length; i++) {
+    if (jaxpr.eqns[i].primitive === Primitive.BlockIndex) biEqns.push(i);
+  }
+  if (biEqns.length === 0) return { jaxpr, hasBlockIndex: false };
+
+  // Create synthetic inBinder for the block index
+  const biVar = new Var(new ShapedArray([], DType.Int32, false));
+
+  // Map old BlockIndex output Vars → biVar
+  const varMap = new Map<Var, Var>();
+  for (const idx of biEqns) {
+    for (const outBinder of jaxpr.eqns[idx].outBinders) {
+      varMap.set(outBinder, biVar);
+    }
+  }
+
+  // Remap atom references
+  const remapAtom = (a: Atom): Atom =>
+    a instanceof Var ? (varMap.get(a) ?? a) : a;
+
+  // Filter out BlockIndex eqns and remap Var references in remaining eqns
+  const newEqns: JaxprEqn[] = [];
+  for (let i = 0; i < jaxpr.eqns.length; i++) {
+    if (jaxpr.eqns[i].primitive === Primitive.BlockIndex) continue;
+    const eqn = jaxpr.eqns[i];
+    const newInputs = eqn.inputs.map(remapAtom);
+    const needsRemap = newInputs.some((a, j) => a !== eqn.inputs[j]);
+    if (needsRemap) {
+      const newEqn = new JaxprEqn(
+        eqn.primitive,
+        newInputs,
+        eqn.params,
+        eqn.outBinders,
+      );
+      newEqn.copyEffectsFrom(eqn);
+      newEqns.push(newEqn);
+    } else {
+      newEqns.push(eqn);
+    }
+  }
+
+  const newOuts = jaxpr.outs.map(remapAtom);
+  const newJaxpr = new Jaxpr([...jaxpr.inBinders, biVar], newEqns, newOuts);
+  return { jaxpr: newJaxpr, hasBlockIndex: true };
+}
 
 export type JitId = number;
 
@@ -158,6 +214,10 @@ export type JitStep =
       inputs: JitId[];
       outputs: JitId[];
       threadTile?: number[];
+      /** Explicit grid shape from BlockMap params. */
+      explicitGridShape?: number[];
+      /** Body uses BlockIndex: the compiled body program has one extra input (block index scalar). */
+      hasBlockIndex?: boolean;
     }
   | {
       type: "fori_loop";
@@ -699,15 +759,19 @@ export class JitProgram {
             dimBindings ? resolveShape(s, dimBindings) : (s as number[]),
           );
 
-          // Compute gridShape from resolved input shapes and inAxes.
+          // Compute gridShape from explicit params or resolved input shapes.
           const gridRank = step.blockShape.length;
-          const gridShape: number[] = new globalThis.Array(gridRank).fill(0);
-          for (let ii = 0; ii < step.numInputs; ii++) {
-            const axes = step.inAxes[ii];
-            for (let g = 0; g < gridRank; g++) {
-              if (axes[g] !== null) {
-                const dim = inputShapes[ii][axes[g]!];
-                gridShape[g] = Math.ceil(dim / step.blockShape[g]);
+          const gridShape: number[] = step.explicitGridShape
+            ? [...step.explicitGridShape]
+            : new globalThis.Array(gridRank).fill(0);
+          if (!step.explicitGridShape) {
+            for (let ii = 0; ii < step.numInputs; ii++) {
+              const axes = step.inAxes[ii];
+              for (let g = 0; g < gridRank; g++) {
+                if (axes[g] !== null) {
+                  const dim = inputShapes[ii][axes[g]!];
+                  gridShape[g] = Math.ceil(dim / step.blockShape[g]);
+                }
               }
             }
           }
@@ -728,6 +792,7 @@ export class JitProgram {
             inputSlots,
             outputSlots,
             threadTile: step.threadTile,
+            hasBlockIndex: step.hasBlockIndex,
           });
 
           for (let i = 0; i < step.outputs.length; i++) {
@@ -1643,7 +1708,12 @@ export function jitCompile(
           numConsts,
           numInputs,
           threadTile,
+          gridShape: explicitGridShape,
         } = params;
+
+        // Rewrite body jaxpr: replace BlockIndex equations with extra input.
+        const { jaxpr: compiledBodyJaxpr, hasBlockIndex } =
+          rewriteBlockIndex(bodyJaxpr);
 
         // Resolve input JitIds
         const allInputIds: JitId[] = [];
@@ -1678,8 +1748,12 @@ export function jitCompile(
           ctx.set(outVar, { type: "imm", arg: outId });
         }
 
-        // Compile body jaxpr
-        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
+        // Compile body jaxpr (rewritten if BlockIndex was present)
+        const bodyProgram = jitCompile(
+          backend,
+          compiledBodyJaxpr,
+          _currentDimBindings,
+        );
 
         const inputShapes: Dim[][] = inputAvals.map((a) => [...a.shape]);
         const outputShapes: Dim[][] = eqn.outBinders.map((v) => [
@@ -1689,7 +1763,7 @@ export function jitCompile(
         builder.steps.push({
           type: "block_map",
           bodyProgram,
-          bodyJaxpr,
+          bodyJaxpr: compiledBodyJaxpr,
           blockShape,
           inAxes,
           outAxes,
@@ -1701,6 +1775,8 @@ export function jitCompile(
           inputs: inputIds,
           outputs: outputIds,
           threadTile,
+          explicitGridShape,
+          hasBlockIndex,
         });
         continue;
       }
@@ -2407,6 +2483,11 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   },
   [Primitive.BlockMap]() {
     throw new Error("internal: BlockMap is handled specially in jitCompile");
+  },
+  [Primitive.BlockIndex]() {
+    throw new Error(
+      "internal: BlockIndex should be rewritten by rewriteBlockIndex before jitCompile",
+    );
   },
   [Primitive.ForiLoop]() {
     throw new Error("internal: ForiLoop is handled specially in jitCompile");

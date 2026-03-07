@@ -40,6 +40,8 @@ export interface ExecuteBlockMapParams {
   outputSlots: Slot[];
   /** Register tiling dimensions. */
   threadTile?: number[];
+  /** Body uses BlockIndex: compiled body has one extra input for the block index. */
+  hasBlockIndex?: boolean;
 }
 
 export interface ExecuteBlockMapResult {
@@ -120,6 +122,7 @@ function blockMapSpecKey(params: ExecuteBlockMapParams): string {
     params.inputShapes.map((s) => s.join(",")).join(";"),
     params.outputShapes.map((s) => s.join(",")).join(";"),
     params.threadTile?.join(",") ?? "-",
+    params.hasBlockIndex ? "bi" : "-",
   ];
   return parts.join("|");
 }
@@ -153,6 +156,7 @@ function tryExecuteBlockMapFused(
         inputShapes: params.inputShapes,
         outputShapes: params.outputShapes,
         threadTile: params.threadTile,
+        hasBlockIndex: params.hasBlockIndex,
       }) ?? null;
     inner.set(specKey, exe);
   }
@@ -479,6 +483,7 @@ function executeBlockMapFallback(
     constSlots,
     inputSlots,
     outputSlots,
+    hasBlockIndex,
   } = params;
 
   const gridRank = blockShape.length;
@@ -486,8 +491,10 @@ function executeBlockMapFallback(
   const numOutputs = bodyJaxpr.outs.length;
   const pending: PendingExecute[] = [];
 
+  // When hasBlockIndex, the rewritten body jaxpr has one extra inBinder
+  // at the end for the block index. Exclude it from input avals.
   const bodyInputAvals = bodyJaxpr.inBinders
-    .slice(_numConsts)
+    .slice(_numConsts, _numConsts + numInputs)
     .map((v) => v.aval);
   const bodyOutAvals = bodyJaxpr.outs.map((v) => v.aval);
 
@@ -606,8 +613,16 @@ function executeBlockMapFallback(
       // IncRef consts (body borrows them)
       for (const slot of constSlots) backend.incRef(slot);
 
-      // Build body inputs: [consts, blockInputs]
-      const bodyInputs = [...constSlots, ...blockInputSlots];
+      // Build body inputs: [consts, blockInputs, (blockIndex if needed)]
+      const bodyInputs: Slot[] = [...constSlots, ...blockInputSlots];
+
+      // Provide block index as extra input when body uses BlockIndex.
+      let blockIndexSlot: Slot | undefined;
+      if (hasBlockIndex) {
+        const idxData = new Int32Array([flatIdx]);
+        blockIndexSlot = backend.malloc(4, new Uint8Array(idxData.buffer));
+        bodyInputs.push(blockIndexSlot);
+      }
 
       // Execute body program
       const bodyResult = bodyProgram.execute(bodyInputs);
@@ -616,9 +631,10 @@ function executeBlockMapFallback(
       // Flush pending from body execution
       flushPending(pending, backend);
 
-      // Release consts and block input slices
+      // Release consts, block input slices, and block index slot
       for (const slot of constSlots) backend.decRef(slot);
       for (const slot of ownedSlices) backend.decRef(slot);
+      if (blockIndexSlot) backend.decRef(blockIndexSlot);
 
       // Copy body outputs into the preallocated output buffers
       for (let o = 0; o < numOutputs; o++) {

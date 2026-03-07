@@ -12,6 +12,15 @@ import type { JsTree } from "../tree";
 const JsArray = globalThis.Array;
 
 /**
+ * Return the current block index inside a {@link blockMap} body.
+ * Only valid when called from within a `blockMap` body function.
+ * Produces a scalar int32.
+ */
+export function blockIndex(): Array {
+  return (bind(Primitive.BlockIndex, [], {}) as unknown as Array[])[0];
+}
+
+/**
  * Options for {@link blockMap}.
  */
 export interface BlockMapOptions {
@@ -42,6 +51,13 @@ export interface BlockMapOptions {
    * @default Same as `inAxes` default.
    */
   outAxes?: (number | null)[] | (number | null)[][];
+
+  /**
+   * Explicit grid shape. When provided, overrides grid inference from mapped
+   * inputs. Useful when all inputs are broadcast (no mapped axis) but the
+   * body should still execute over a grid (e.g., gather/apply stages).
+   */
+  gridShape?: number[];
 
   /**
    * Register tiling: each thread computes `threadTile[g]` outputs along
@@ -139,6 +155,7 @@ export function blockMap<I extends JsTree<Array>, O extends JsTree<Array>>(
     outAxes: flatOutAxes,
     numConsts,
     numInputs,
+    gridShape: options.gridShape,
     threadTile: options.threadTile,
   }) as Array[];
 

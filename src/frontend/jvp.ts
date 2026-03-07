@@ -373,6 +373,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Dot]: bilinearTangentsJvp(Primitive.Dot),
   [Primitive.Conv]: bilinearTangentsJvp(Primitive.Conv),
   [Primitive.Compare]: zeroTangentsJvp(Primitive.Compare),
+  [Primitive.BlockIndex]: zeroTangentsJvp(Primitive.BlockIndex),
   [Primitive.Where]([cond, x, y], [_dcond, dx, dy]) {
     return [[where(cond, x, y)], [where(cond, dx, dy)]];
   },

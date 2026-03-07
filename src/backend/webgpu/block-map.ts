@@ -63,6 +63,8 @@ export interface BlockMapShaderParams {
   outputShapes: number[][];
   /** Register tiling dimensions. When set, each thread handles threadTile[g] outputs per axis. */
   threadTile?: number[];
+  /** Body uses BlockIndex: compiled body has one extra input (block index scalar). */
+  hasBlockIndex?: boolean;
 }
 
 /**
@@ -772,11 +774,17 @@ export function blockMapFusedShaderSource(
   }
 
   // --- Determine body input/output buffer mapping ---
-  // Body program inputs: [const0..constN, input0..inputM]
+  // Body program inputs: [const0..constN, input0..inputM, (blockIndex?)]
   // Body program outputs: [out0..outK]
   const bodyInputIds = bodyProgram.inputs; // JitId[]
   const bodyOutputIds = bodyProgram.outputs; // JitId[]
-  const numBodyInputs = bodyInputIds.length;
+  const hasBlockIndex = params.hasBlockIndex === true;
+  // blockIndexInputId is the JitId of the synth block-index input (last input).
+  const blockIndexInputId = hasBlockIndex
+    ? bodyInputIds[bodyInputIds.length - 1]
+    : -1;
+  // numBodyInputs excludes the block index (it's not a storage buffer).
+  const numBodyInputs = bodyInputIds.length - (hasBlockIndex ? 1 : 0);
 
   // Total global storage bindings needed:
   //   numConsts + numInputs (read) + numOutputs (read_write)
@@ -850,6 +858,10 @@ export function blockMapFusedShaderSource(
     inputIdToName.set(bodyInputIds[i], `in${i}`);
     idToReadName.set(bodyInputIds[i], `in${i}`);
   }
+  // BlockIndex input: not a storage buffer — resolved to `block_idx` inline.
+  // Add sentinel to idToReadName so fori_loop const mapping can find it.
+  const BLOCK_IDX_SENTINEL = "__block_idx__";
+  if (hasBlockIndex) idToReadName.set(blockIndexInputId, BLOCK_IDX_SENTINEL);
 
   // Detect pass-through outputs
   for (let o = 0; o < numOutputs; o++) {
@@ -1487,8 +1499,16 @@ export function blockMapFusedShaderSource(
       const stepInputNames: string[] = [];
       const stepInputIsGlobal: boolean[] = [];
       const stepInputBodyIdx: number[] = [];
+      const stepInputIsBlockIndex: boolean[] = [];
       for (let j = 0; j < step.inputs.length; j++) {
         const jitId = step.inputs[j];
+        if (hasBlockIndex && jitId === blockIndexInputId) {
+          stepInputNames.push("_block_idx_scalar");
+          stepInputIsGlobal.push(false);
+          stepInputBodyIdx.push(-1);
+          stepInputIsBlockIndex.push(true);
+          continue;
+        }
         const name = idToReadName.get(jitId) ?? inputIdToName.get(jitId);
         if (name) {
           stepInputNames.push(name);
@@ -1503,9 +1523,11 @@ export function blockMapFusedShaderSource(
           stepInputIsGlobal.push(false);
           stepInputBodyIdx.push(-1);
         }
+        stepInputIsBlockIndex.push(false);
       }
 
       const gen = createGen(kernel, `s${si}`, (bufIdx, indexExpr, dtype) => {
+        if (stepInputIsBlockIndex[bufIdx]) return `i32(block_idx)`;
         if (stepInputIsGlobal[bufIdx]) {
           const inputIdx = stepInputBodyIdx[bufIdx];
           if (inputIdx >= 0) {
@@ -1534,6 +1556,7 @@ export function blockMapFusedShaderSource(
           indexExpr: string,
           dtype: DType,
         ): string => {
+          if (stepInputIsBlockIndex[bufIdx]) return `i32(block_idx)`;
           if (stepInputIsGlobal[bufIdx]) {
             const inputIdx = stepInputBodyIdx[bufIdx];
             if (inputIdx >= 0) {
@@ -1840,6 +1863,7 @@ export function blockMapFusedShaderSource(
           const info = bStepInputInfo[bufIdx];
           if (info.isIndex) return `${dtypeToWgsl(dtype)}(${info.name})`;
           if (info.isScalar) return `${dtypeToWgsl(dtype)}(${info.name})`;
+          if (info.name === BLOCK_IDX_SENTINEL) return `i32(block_idx)`;
           if (info.isGlobal) {
             const inputIdx = info.parentInputIdx;
             if (inputIdx >= 0) {
@@ -2937,6 +2961,7 @@ export function blockMapFusedShaderSource(
               const kind = bStepInputKind[bufIdx];
               const name = bStepInputNames[bufIdx];
               if (kind === "const") {
+                if (name === BLOCK_IDX_SENTINEL) return `i32(block_idx)`;
                 const inf =
                   bodyInputInfo[was.bodyInputIds.indexOf(bStep.inputs[bufIdx])];
                 if (inf.isGlobal) {
@@ -2994,6 +3019,7 @@ export function blockMapFusedShaderSource(
                     const kind2 = bStepInputKind[bufIdx2];
                     const name2 = bStepInputNames[bufIdx2];
                     if (kind2 === "const") {
+                      if (name2 === BLOCK_IDX_SENTINEL) return `i32(block_idx)`;
                       const inf2 =
                         bodyInputInfo[
                           was.bodyInputIds.indexOf(bStep.inputs[bufIdx2])

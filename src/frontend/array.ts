@@ -1668,6 +1668,9 @@ export class Array extends Tracer {
           reverse,
         );
       },
+      [Primitive.BlockIndex]() {
+        throw new Error("blockIndex() is only valid inside a block_map body");
+      },
       [Primitive.BlockMap](
         args,
         { jaxpr: bodyJaxpr, blockShape, inAxes, outAxes, numConsts, numInputs },

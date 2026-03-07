@@ -2187,4 +2187,98 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
 
     f.dispose();
   });
+
+  // ---------------------------------------------------------------------------
+  // BlockIndex primitive
+  // ---------------------------------------------------------------------------
+
+  test("blockIndex() returns block index in JIT fallback path", () => {
+    // Body reads blockIndex() and adds it to each element.
+    const f = jit((xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) => {
+          const idx = lax.blockIndex();
+          // Add block index (scalar int32) to each element.
+          return np.add(block, np.astype(idx, DType.Float32));
+        },
+        xs,
+        { blockShape: [4] },
+      ),
+    );
+    using xs = np.zeros([8], { dtype: DType.Float32 });
+    using result = f(xs);
+    // Block 0: 0+0=0, Block 1: 0+1=1
+    expect(result).toBeAllclose([0, 0, 0, 0, 1, 1, 1, 1]);
+    f.dispose();
+  });
+
+  test("blockIndex() works with fused WebGPU path", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+
+    const f = jit((xs: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) => {
+          const idx = lax.blockIndex();
+          // Add block index (scalar int32 → f32) to each element.
+          return np.add(block, np.astype(idx, DType.Float32));
+        },
+        xs,
+        { blockShape: [4] },
+      ),
+    );
+    using xs = np.ones([12], { dtype: DType.Float32 });
+    using result = f(xs);
+    // Block 0: 1+0=1, Block 1: 1+1=2, Block 2: 1+2=3
+    expect(result).toBeAllclose([1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
+    f.dispose();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Explicit gridShape
+  // ---------------------------------------------------------------------------
+
+  test("explicit gridShape with broadcast inputs", () => {
+    // All inputs are broadcast (inAxes: [[null]]) — normally grid would be
+    // inferred as empty, but explicit gridShape forces 3 blocks.
+    const f = jit((x: np.Array) =>
+      lax.blockMap(
+        (block: np.Array) =>
+          np.multiply(block, np.array(2, { dtype: DType.Float32 })),
+        x,
+        { blockShape: [4], gridShape: [3], inAxes: [[null]] },
+      ),
+    );
+    using x = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
+    using result = f(x);
+    // gridShape=[3] → 3 blocks each with blockShape=[4] → output size is 3*4=12
+    // Each block processes the same input x (broadcast), doubled.
+    expect(result.shape).toEqual([12]);
+    expect(result).toBeAllclose([2, 4, 6, 8, 2, 4, 6, 8, 2, 4, 6, 8]);
+    f.dispose();
+  });
+
+  test("explicit gridShape + blockIndex for indexed output", () => {
+    // Use gridShape + blockIndex to generate a sequence: block_idx * blockSize + element_idx
+    const f = jit((_dummy: np.Array) =>
+      lax.blockMap(
+        (_block: np.Array) => {
+          const idx = lax.blockIndex();
+          // Each block returns [idx*4, idx*4+1, idx*4+2, idx*4+3]
+          const base = np.multiply(
+            np.astype(idx, DType.Float32),
+            np.array(4, { dtype: DType.Float32 }),
+          );
+          return np.add(base, np.array([0, 1, 2, 3], { dtype: DType.Float32 }));
+        },
+        _dummy,
+        { blockShape: [4], gridShape: [3], inAxes: [[null]] },
+      ),
+    );
+    using dummy = np.zeros([4], { dtype: DType.Float32 });
+    using result = f(dummy);
+    expect(result.shape).toEqual([12]);
+    expect(result).toBeAllclose([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    f.dispose();
+  });
 });

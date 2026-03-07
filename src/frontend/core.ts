@@ -117,6 +117,7 @@ export enum Primitive {
   Scan = "scan",
   AssociativeScan = "associative_scan",
   BlockMap = "block_map",
+  BlockIndex = "block_index",
   ForiLoop = "fori_loop",
   WorkgroupAssociativeScan = "workgroup_associative_scan",
 }
@@ -187,6 +188,8 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     outAxes: (number | null)[][];
     numConsts: number;
     numInputs: number;
+    /** Explicit grid shape. When provided, overrides grid inference from mapped inputs. */
+    gridShape?: number[];
     /** Register tiling: each thread handles threadTile[g] outputs per axis. */
     threadTile?: number[];
     /** Set by JVP rule when this block_map was produced by differentiating an outer block_map. */

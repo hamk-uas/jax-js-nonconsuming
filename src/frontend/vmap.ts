@@ -320,6 +320,10 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.Floor]: unopBatcher(Primitive.Floor),
   [Primitive.Ceil]: unopBatcher(Primitive.Ceil),
   [Primitive.StopGradient]: unopBatcher(Primitive.StopGradient),
+  [Primitive.BlockIndex]() {
+    // BlockIndex is body-local (inside block_map); not batched by vmap.
+    return [[bind1(Primitive.BlockIndex, [], {})], [null]];
+  },
   [Primitive.Cast]: unopBatcher(Primitive.Cast),
   [Primitive.Bitcast]: unopBatcher(Primitive.Bitcast),
   [Primitive.Sin]: unopBatcher(Primitive.Sin),

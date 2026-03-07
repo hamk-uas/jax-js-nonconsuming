@@ -1664,9 +1664,21 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     return args.slice(numConsts);
   },
 
+  [Primitive.BlockIndex]() {
+    return [new ShapedArray([], DType.Int32, false)];
+  },
+
   [Primitive.BlockMap](
     args,
-    { jaxpr: bodyJaxpr, blockShape, inAxes, outAxes, numConsts, numInputs },
+    {
+      jaxpr: bodyJaxpr,
+      blockShape,
+      inAxes,
+      outAxes,
+      numConsts,
+      numInputs,
+      gridShape: explicitGridShape,
+    },
   ) {
     // Args layout: [...consts, ...inputs]
     // bodyJaxpr operates on block-shaped slices; outputs are block-shaped.
@@ -1679,15 +1691,19 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
       );
     }
 
-    // Compute grid shape from inputs + inAxes
+    // Compute grid shape from inputs + inAxes, or use explicit gridShape
     const inputs = args.slice(numConsts);
-    const gridShape: number[] = new globalThis.Array(blockShape.length).fill(0);
-    for (let i = 0; i < inputs.length; i++) {
-      const axes = inAxes[i];
-      for (let g = 0; g < blockShape.length; g++) {
-        if (axes[g] !== null) {
-          const dim = inputs[i].shape[axes[g]!] as number;
-          gridShape[g] = Math.ceil(dim / blockShape[g]);
+    const gridShape: number[] = explicitGridShape
+      ? [...explicitGridShape]
+      : new globalThis.Array(blockShape.length).fill(0);
+    if (!explicitGridShape) {
+      for (let i = 0; i < inputs.length; i++) {
+        const axes = inAxes[i];
+        for (let g = 0; g < blockShape.length; g++) {
+          if (axes[g] !== null) {
+            const dim = inputs[i].shape[axes[g]!] as number;
+            gridShape[g] = Math.ceil(dim / blockShape[g]);
+          }
         }
       }
     }
@@ -1702,6 +1718,15 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
       for (let g = 0; g < blockShape.length; g++) {
         if (axes[g] !== null) {
           origDims[g] = inputs[i].shape[axes[g]!] as number;
+        }
+      }
+    }
+    // When explicit gridShape is provided and no mapped input contributes
+    // the original dimension, use gridShape[g] * blockShape[g].
+    if (explicitGridShape) {
+      for (let g = 0; g < blockShape.length; g++) {
+        if (origDims[g] === 0) {
+          origDims[g] = explicitGridShape[g] * blockShape[g];
         }
       }
     }
