@@ -13,11 +13,7 @@ import { Array as JaxArray } from "./array";
 import { _associativeScanCoreImpl, ShapedArray } from "./core";
 import type { Jaxpr } from "./jaxpr";
 import type { JitProgram } from "./jit";
-import {
-  type AssocScanPlan,
-  planAssociativeScan,
-  type ScanPlan,
-} from "./scan-plan";
+import { type AssocScanPlan, type ScanPlan } from "./scan-plan";
 import type { WasmBackend } from "../backend/wasm";
 import type { NativeScanMultiParams, WebGPUBackend } from "../backend/webgpu";
 import {
@@ -30,8 +26,11 @@ import {
   ShapeTracker,
 } from "../shape";
 import {
+  copyAxisRange,
   executeBlockMap,
   type ExecuteBlockMapParams,
+  gatherAxisPoints,
+  mapOverBlocks,
 } from "./block-map-executor";
 
 // ---------------------------------------------------------------------------
@@ -548,10 +547,8 @@ function executeAssocScanBlockMap(
   }
 
   const {
-    localScanBodyProgram,
-    localScanBodyJaxpr,
+    localScan,
     scanBodyJaxpr,
-    scanBodyProgram,
     blockSize: B,
     numConsts,
     applyVmapProgram,
@@ -567,16 +564,11 @@ function executeAssocScanBlockMap(
     dimBindings ? resolveShape(a.shape, dimBindings) : (a.shape as number[]),
   );
 
+  const dtypes = elemAvals.map((a) => a.dtype);
+
   // --- Phase 1: Local scan via block_map ---
   const gridShape = [M];
   const blockShape = [B];
-
-  // inAxes: constants broadcast (null), elements sliced along axis 0
-  const inAxes: (number | null)[][] = [
-    ...constAvals.map(() => [null as number | null]),
-    ...elemAvals.map(() => [0 as number | null]),
-  ];
-  const outAxes: (number | null)[][] = elemAvals.map(() => [0]);
 
   const inputShapes = resolvedElemShapes;
   const outputShapes = resolvedElemShapes;
@@ -592,13 +584,13 @@ function executeAssocScanBlockMap(
 
   const blockMapParams: ExecuteBlockMapParams = {
     backend,
-    bodyProgram: localScanBodyProgram,
-    bodyJaxpr: localScanBodyJaxpr,
+    bodyProgram: localScan.bodyProgram,
+    bodyJaxpr: localScan.bodyJaxpr,
     blockShape,
-    inAxes,
-    outAxes,
-    numConsts,
-    numInputs: numLeaves,
+    inAxes: localScan.inAxes,
+    outAxes: localScan.outAxes,
+    numConsts: localScan.numConsts,
+    numInputs: localScan.numInputs,
     gridShape,
     inputShapes,
     outputShapes,
@@ -615,51 +607,32 @@ function executeAssocScanBlockMap(
 
   if (M === 1) {
     // Single block: local scan output IS the final output.
-    // Copy to pre-allocated output slots.
-    for (let k = 0; k < numLeaves; k++) {
-      const totalBytes =
-        resolvedElemShapes[k].reduce((a, b) => a * b, 1) *
-        byteWidth(elemAvals[k].dtype);
-      backend.copyBufferToBuffer(
-        localScanSlots[k],
-        0,
-        outputSlots[k],
-        0,
-        totalBytes,
-      );
-      backend.decRef(localScanSlots[k]);
-    }
+    copyAxisRange(
+      backend,
+      localScanSlots,
+      outputSlots,
+      resolvedElemShapes,
+      dtypes,
+      0,
+      N,
+    );
+    for (const s of localScanSlots) backend.decRef(s);
     return { outputs: outputSlots, pending: [] };
   }
 
   // --- Phase 2: Gather block summaries ---
-  // For each leaf, extract the last element of each block.
-  // summary_k[i] = localScan_k[min((i+1)*B - 1, N-1)]
-  const summarySlots: Slot[] = [];
-  for (let k = 0; k < numLeaves; k++) {
-    const elemShape = resolvedElemShapes[k];
-    const perElemBytes =
-      elemShape.slice(1).reduce((a, b) => a * b, 1) *
-      byteWidth(elemAvals[k].dtype);
-    const summaryBytes = M * perElemBytes;
-    const summarySlot = backend.malloc(summaryBytes);
-    for (let i = 0; i < M; i++) {
-      const srcIdx = Math.min((i + 1) * B - 1, N - 1);
-      backend.copyBufferToBuffer(
-        localScanSlots[k],
-        srcIdx * perElemBytes,
-        summarySlot,
-        i * perElemBytes,
-        perElemBytes,
-      );
-    }
-    summarySlots.push(summarySlot);
-  }
+  const summarySlots = gatherAxisPoints(
+    backend,
+    localScanSlots,
+    resolvedElemShapes,
+    dtypes,
+    B,
+    N,
+  );
 
   // --- Phase 3: Recursive prefix scan of summaries ---
-  // Use recursive associative scan on the M summary values instead of
-  // a sequential O(M) host loop.  For M ≤ B the recursive call is
-  // single-block; for M > B it decomposes automatically.
+  // Recurse through public dispatch with the same plan (self-similar).
+  // For M ≤ B the recursive call is single-block; for M > B it decomposes.
   const scannedSummarySlots: Slot[] = [];
   for (let k = 0; k < numLeaves; k++) {
     const perElemBytes =
@@ -673,19 +646,9 @@ function executeAssocScanBlockMap(
     return new ShapedArray([M, ...perElemShape], a.dtype, a.weakType);
   });
 
-  const summaryPlan = planAssociativeScan(
-    backend,
-    scanBodyProgram,
-    scanBodyJaxpr,
-    numLeaves,
-    numConsts,
-    false, // always forward — reverse handled at outer level
-    dimBindings,
-  );
-
   const summaryResult = executeAssociativeScan({
     backend,
-    plan: summaryPlan,
+    plan,
     bodyJaxpr: scanBodyJaxpr,
     numLeaves,
     numConsts,
@@ -706,96 +669,48 @@ function executeAssocScanBlockMap(
   // Free raw summaries
   for (const s of summarySlots) backend.decRef(s);
 
-  // --- Phase 4: Apply scanned summaries to blocks 1..M-1 ---
-  // Use vmapped body that processes entire blocks of B elements at once,
-  // reducing O(N) per-element dispatches to O(M) per-block dispatches.
-  for (let blockIdx = 1; blockIdx < M; blockIdx++) {
-    const blockStart = blockIdx * B;
-    const blockEnd = Math.min(blockStart + B, N);
-    const blockLen = blockEnd - blockStart;
+  // --- Phase 4: Copy block 0 + apply blocks 1..M-1 ---
+  copyAxisRange(
+    backend,
+    localScanSlots,
+    outputSlots,
+    resolvedElemShapes,
+    dtypes,
+    0,
+    Math.min(B, N),
+  );
 
-    // Extract prefix = scannedSummary[blockIdx - 1] for each leaf
-    const prefixSlots: Slot[] = [];
-    for (let k = 0; k < numLeaves; k++) {
-      const perElemBytes =
-        resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
-        byteWidth(elemAvals[k].dtype);
-      const prefixSlot = backend.malloc(perElemBytes);
-      backend.copyBufferToBuffer(
-        finalScannedSummarySlots[k],
-        (blockIdx - 1) * perElemBytes,
-        prefixSlot,
-        0,
-        perElemBytes,
-      );
-      prefixSlots.push(prefixSlot);
-    }
+  const summaryShapes = resolvedElemShapes.map((s) => [M, ...s.slice(1)]);
 
-    // Extract block = localScan[blockStart..blockStart+B) for each leaf.
-    // For partial last block, allocate full B elements (extra is unused).
-    const blockSlots: Slot[] = [];
-    for (let k = 0; k < numLeaves; k++) {
-      const perElemBytes =
-        resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
-        byteWidth(elemAvals[k].dtype);
-      const blockBytes = B * perElemBytes;
-      const blockSlot = backend.malloc(blockBytes);
-      const copyBytes = blockLen * perElemBytes;
-      backend.copyBufferToBuffer(
-        localScanSlots[k],
-        blockStart * perElemBytes,
-        blockSlot,
-        0,
-        copyBytes,
-      );
-      blockSlots.push(blockSlot);
-    }
-
-    // IncRef consts for vmapped body
-    for (const s of constSlots) backend.incRef(s);
-
-    // Execute vmapped body: [consts, prefix, block] -> [result[B,...]]
-    const vmapInputs = [...constSlots, ...prefixSlots, ...blockSlots];
-    const vmapResult = applyVmapProgram.execute(vmapInputs, dimBindings);
-    if (vmapResult.pending.length > 0) flushPending(vmapResult.pending);
-
-    // DecRef consts, prefix, block temporaries
-    for (const s of constSlots) backend.decRef(s);
-    for (const s of prefixSlots) backend.decRef(s);
-    for (const s of blockSlots) backend.decRef(s);
-
-    // Copy only valid elements (blockLen) from result to output
-    for (let k = 0; k < numLeaves; k++) {
-      const perElemBytes =
-        resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
-        byteWidth(elemAvals[k].dtype);
-      backend.copyBufferToBuffer(
-        vmapResult.outputs[k],
-        0,
-        outputSlots[k],
-        blockStart * perElemBytes,
-        blockLen * perElemBytes,
-      );
-      backend.decRef(vmapResult.outputs[k]);
-    }
-  }
-
-  // Copy block 0 from local scan to output (unchanged)
-  {
-    const block0End = Math.min(B, N);
-    for (let k = 0; k < numLeaves; k++) {
-      const perElemBytes =
-        resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
-        byteWidth(elemAvals[k].dtype);
-      backend.copyBufferToBuffer(
-        localScanSlots[k],
-        0,
-        outputSlots[k],
-        0,
-        block0End * perElemBytes,
-      );
-    }
-  }
+  mapOverBlocks(
+    backend,
+    applyVmapProgram,
+    constSlots,
+    [
+      {
+        slots: finalScannedSummarySlots,
+        shapes: summaryShapes,
+        dtypes,
+        mode: "point",
+        indexOffset: -1,
+      },
+      {
+        slots: localScanSlots,
+        shapes: resolvedElemShapes,
+        dtypes,
+        mode: "block",
+      },
+    ],
+    outputSlots,
+    resolvedElemShapes,
+    dtypes,
+    B,
+    N,
+    1,
+    M,
+    numConsts,
+    dimBindings,
+  );
 
   // Cleanup
   for (const s of localScanSlots) backend.decRef(s);

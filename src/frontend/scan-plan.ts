@@ -59,6 +59,20 @@ export type ScanPlan =
  * - `webgpu-block-map`: Block-map–based three-level blocked Kogge-Stone on WebGPU.
  * - `fallback`: JS-driven Kogge-Stone loop calling body program per round.
  */
+/**
+ * Plan-time metadata for a block_map stage. Holds the compiled body and
+ * axis mapping separately from runtime data (gridShape, slots, shapes).
+ */
+export interface BlockMapStage {
+  bodyProgram: JitProgram;
+  bodyJaxpr: Jaxpr;
+  inAxes: (number | null)[][];
+  outAxes: (number | null)[][];
+  blockShape: number[];
+  numConsts: number;
+  numInputs: number;
+}
+
 export type AssocScanPlan =
   | {
       path: "compiled-loop-blocked";
@@ -69,27 +83,21 @@ export type AssocScanPlan =
       /**
        * Block-map–based path: uses {@link Primitive.BlockMap} with a
        * {@link Primitive.WorkgroupAssociativeScan} body for the local scan
-       * phase, then JS-level gather + recursive summary scan + apply.
+       * phase, then generic blocked-data-movement primitives for gather,
+       * recursive summary scan, and apply.
        *
-       * Replaces the standalone WebGPU blocked assocScan shader codegen
-       * by reusing the block-map fused shader infrastructure.
+       * The plan is self-similar: the same plan object works at every
+       * recursion level because all compiled programs are shape-independent.
        */
       path: "webgpu-block-map";
-      /** Compiled body program for the block_map (contains WAS step). */
-      localScanBodyProgram: JitProgram;
-      /** Body Jaxpr for the block_map. */
-      localScanBodyJaxpr: Jaxpr;
-      /** The original associative scan body Jaxpr (per-element). */
-      scanBodyJaxpr: Jaxpr;
-      /** Compiled per-element body program (for summary scan fallback). */
-      scanBodyProgram: JitProgram;
       blockSize: number;
       numLeaves: number;
       numConsts: number;
-      reverse: boolean;
-      /** Vmapped apply body Jaxpr: applies prefix to a block of B elements. */
-      applyVmapJaxpr: Jaxpr;
-      /** Compiled vmapped apply body program. */
+      /** Local scan: block_map with WorkgroupAssociativeScan body. */
+      localScan: BlockMapStage;
+      /** Per-element body Jaxpr for recursive summary scan dispatch. */
+      scanBodyJaxpr: Jaxpr;
+      /** Vmapped apply body: [consts, prefix, block[B,…]] → [result[B,…]]. */
       applyVmapProgram: JitProgram;
     }
   | { path: "fallback" };
@@ -1779,17 +1787,30 @@ function tryBuildBlockMapAssocScanPlan(
     return null;
   }
 
+  // inAxes: constants broadcast (null), elements sliced along axis 0
+  const inAxes: (number | null)[][] = [
+    ...constAvals.map(() => [null as number | null]),
+    ...elemAvals.map(() => [0 as number | null]),
+  ];
+  const outAxes: (number | null)[][] = elemAvals.map(() => [0]);
+
+  const localScan: BlockMapStage = {
+    bodyProgram: localScanBodyProgram,
+    bodyJaxpr: localScanBodyJaxpr,
+    inAxes,
+    outAxes,
+    blockShape: [blockSize],
+    numConsts,
+    numInputs: numLeaves,
+  };
+
   return {
     path: "webgpu-block-map",
-    localScanBodyProgram,
-    localScanBodyJaxpr,
+    localScan,
     scanBodyJaxpr: bodyJaxpr,
-    scanBodyProgram: bodyProgram,
     blockSize,
     numLeaves,
     numConsts,
-    reverse,
-    applyVmapJaxpr: applyVmapClosed.jaxpr,
     applyVmapProgram,
   };
 }

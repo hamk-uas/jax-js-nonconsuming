@@ -7,7 +7,7 @@
  * where each workgroup processes one block using shared memory.
  */
 
-import { byteWidth, Kernel, Reduction } from "../alu";
+import { byteWidth, type DType, Kernel, Reduction } from "../alu";
 import { type Backend, Executable, type Slot } from "../backend";
 import type { BlockMapWasmParams, GeneralScanStep } from "../backend/wasm";
 import { DEBUG } from "../utils";
@@ -699,7 +699,7 @@ function executeBlockMapFallback(
 // ---------------------------------------------------------------------------
 
 /** Check if a slice is contiguous in memory (can be copied in one go). */
-function isSliceContiguous(
+export function isSliceContiguous(
   starts: number[],
   sizes: number[],
   fullShape: number[],
@@ -719,7 +719,7 @@ function isSliceContiguous(
 }
 
 /** Compute linear byte offset for a multi-index into a row-major shape. */
-function computeLinearOffset(
+export function computeLinearOffset(
   starts: number[],
   fullShape: number[],
   elemBytes: number,
@@ -735,7 +735,10 @@ function computeLinearOffset(
 }
 
 /** Flush pending operations. */
-function flushPending(pending: PendingExecute[], backend: Backend): void {
+export function flushPending(
+  pending: PendingExecute[],
+  backend: Backend,
+): void {
   if (pending.length === 0) return;
   backend.beginBatch?.();
   try {
@@ -753,7 +756,7 @@ function flushPending(pending: PendingExecute[], backend: Backend): void {
  * Copy a block between buffers with arbitrary source/dest offsets and shapes.
  * Handles both contiguous (single copy) and strided (row-by-row) cases.
  */
-function copyBlock(
+export function copyBlock(
   backend: Backend,
   srcSlot: Slot,
   srcFullShape: number[],
@@ -821,7 +824,7 @@ function copyBlock(
 }
 
 /** Compute byte strides for a shape (row-major, last dim is innermost). */
-function computeStrides(shape: number[], elemBytes: number): number[] {
+export function computeStrides(shape: number[], elemBytes: number): number[] {
   const nd = shape.length;
   const strides = new Array(nd);
   strides[nd - 1] = elemBytes;
@@ -829,4 +832,188 @@ function computeStrides(shape: number[], elemBytes: number): number[] {
     strides[d] = strides[d + 1] * shape[d + 1];
   }
   return strides;
+}
+
+// ---------------------------------------------------------------------------
+// Generic blocked-data-movement primitives
+// ---------------------------------------------------------------------------
+
+/**
+ * Gather one element per block along axis 0.
+ *
+ * For each source buffer with shape `[axisLen, ...rest]`, allocates an output
+ * of shape `[M, ...rest]` where `M = ceil(axisLen / blockSize)`, and copies
+ * the element at index `min((i+1)*blockSize - 1, axisLen - 1)` to position `i`.
+ */
+export function gatherAxisPoints(
+  backend: Backend,
+  srcSlots: Slot[],
+  srcShapes: number[][],
+  dtypes: DType[],
+  blockSize: number,
+  axisLen: number,
+): Slot[] {
+  const M = Math.ceil(axisLen / blockSize);
+  const outSlots: Slot[] = [];
+
+  for (let k = 0; k < srcSlots.length; k++) {
+    const perElemBytes =
+      srcShapes[k].slice(1).reduce((a, b) => a * b, 1) * byteWidth(dtypes[k]);
+    const outBytes = M * perElemBytes;
+    const outSlot = backend.malloc(outBytes);
+    for (let i = 0; i < M; i++) {
+      const srcIdx = Math.min((i + 1) * blockSize - 1, axisLen - 1);
+      backend.copyBufferToBuffer(
+        srcSlots[k],
+        srcIdx * perElemBytes,
+        outSlot,
+        i * perElemBytes,
+        perElemBytes,
+      );
+    }
+    outSlots.push(outSlot);
+  }
+  return outSlots;
+}
+
+/**
+ * Copy a contiguous range along axis 0 across multi-leaf slot arrays.
+ *
+ * Copies elements `[axisStart, axisStart + axisLen)` from each src to
+ * `dst[axisStart .. axisStart + axisLen)`.
+ */
+export function copyAxisRange(
+  backend: Backend,
+  srcSlots: Slot[],
+  dstSlots: Slot[],
+  srcShapes: number[][],
+  dtypes: DType[],
+  axisStart: number,
+  axisLen: number,
+): void {
+  for (let k = 0; k < srcSlots.length; k++) {
+    const perElemBytes =
+      srcShapes[k].slice(1).reduce((a, b) => a * b, 1) * byteWidth(dtypes[k]);
+    const offset = axisStart * perElemBytes;
+    const copyBytes = axisLen * perElemBytes;
+    backend.copyBufferToBuffer(
+      srcSlots[k],
+      offset,
+      dstSlots[k],
+      offset,
+      copyBytes,
+    );
+  }
+}
+
+/** Declarative input description for {@link mapOverBlocks}. */
+export interface BlockInput {
+  slots: Slot[];
+  shapes: number[][];
+  dtypes: DType[];
+  /** "point": gather one element at `blockIdx + indexOffset`. "block": gather `[B, …]` slice. */
+  mode: "point" | "block";
+  /** For "point" mode: offset added to blockIdx to compute source index. */
+  indexOffset?: number;
+}
+
+/**
+ * Run a compiled body program over a grid of blocks, materializing
+ * point-gathered and block-gathered inputs per iteration.
+ *
+ * For each block in `[gridStart, gridEnd)`: materializes each input group
+ * according to its mode, runs the body, copies only valid output elements
+ * to the destination.
+ */
+export function mapOverBlocks(
+  backend: Backend,
+  bodyProgram: JitProgram,
+  constSlots: Slot[],
+  inputs: BlockInput[],
+  outputSlots: Slot[],
+  outputShapes: number[][],
+  outputDtypes: DType[],
+  blockSize: number,
+  axisLen: number,
+  gridStart: number,
+  gridEnd: number,
+  numConsts: number,
+  dimBindings?: ReadonlyMap<string, number>,
+): void {
+  const numOutputs = outputSlots.length;
+
+  for (let blockIdx = gridStart; blockIdx < gridEnd; blockIdx++) {
+    const blockStart = blockIdx * blockSize;
+    const blockEnd = Math.min(blockStart + blockSize, axisLen);
+    const blockLen = blockEnd - blockStart;
+
+    // Materialize inputs for this block
+    const bodyInputSlots: Slot[] = [];
+    const tempSlots: Slot[] = []; // track temporaries for cleanup
+
+    for (const input of inputs) {
+      for (let k = 0; k < input.slots.length; k++) {
+        const elemBytes = byteWidth(input.dtypes[k]);
+        if (input.mode === "point") {
+          const srcIdx = blockIdx + (input.indexOffset ?? 0);
+          const perElemBytes =
+            input.shapes[k].slice(1).reduce((a, b) => a * b, 1) * elemBytes;
+          const slot = backend.malloc(perElemBytes);
+          backend.copyBufferToBuffer(
+            input.slots[k],
+            srcIdx * perElemBytes,
+            slot,
+            0,
+            perElemBytes,
+          );
+          bodyInputSlots.push(slot);
+          tempSlots.push(slot);
+        } else {
+          // "block" mode: full [B, …] temporary, only valid prefix copied in
+          const perElemBytes =
+            input.shapes[k].slice(1).reduce((a, b) => a * b, 1) * elemBytes;
+          const fullBytes = blockSize * perElemBytes;
+          const slot = backend.malloc(fullBytes);
+          const copyBytes = blockLen * perElemBytes;
+          backend.copyBufferToBuffer(
+            input.slots[k],
+            blockStart * perElemBytes,
+            slot,
+            0,
+            copyBytes,
+          );
+          bodyInputSlots.push(slot);
+          tempSlots.push(slot);
+        }
+      }
+    }
+
+    // IncRef consts for body execution
+    for (const s of constSlots) backend.incRef(s);
+
+    // Execute body: [consts, ...inputs] -> [outputs]
+    const allInputs = [...constSlots, ...bodyInputSlots];
+    const bodyResult = bodyProgram.execute(allInputs, dimBindings);
+    if (bodyResult.pending.length > 0)
+      flushPending(bodyResult.pending, backend);
+
+    // DecRef consts and temporary inputs
+    for (const s of constSlots) backend.decRef(s);
+    for (const s of tempSlots) backend.decRef(s);
+
+    // Copy valid output elements to destination
+    for (let k = 0; k < numOutputs; k++) {
+      const perElemBytes =
+        outputShapes[k].slice(1).reduce((a, b) => a * b, 1) *
+        byteWidth(outputDtypes[k]);
+      backend.copyBufferToBuffer(
+        bodyResult.outputs[k],
+        0,
+        outputSlots[k],
+        blockStart * perElemBytes,
+        blockLen * perElemBytes,
+      );
+      backend.decRef(bodyResult.outputs[k]);
+    }
+  }
 }
