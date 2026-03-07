@@ -17,8 +17,6 @@ import type {
   NativeScanMultiStep,
   PreparedPreencodedMultiStep,
   PreparedPreencodedScan,
-  PreparedWebGPUBlockedAssocScan,
-  WebGPUAssocScanParams,
 } from "../backend/webgpu";
 import type { WebGPUBackend } from "../backend/webgpu";
 import { Routine, Routines } from "../routine";
@@ -58,6 +56,7 @@ export type ScanPlan =
  *
  * - `compiled-loop-blocked`: Three-level blocked Kogge-Stone in a single WASM module.
  *   Reduces total work from O(N log N) to O(N log B) for large N.
+ * - `webgpu-block-map`: Block-map–based three-level blocked Kogge-Stone on WebGPU.
  * - `fallback`: JS-driven Kogge-Stone loop calling body program per round.
  */
 export type AssocScanPlan =
@@ -65,12 +64,6 @@ export type AssocScanPlan =
       path: "compiled-loop-blocked";
       executable: Executable;
       params: NativeAssocScanBlockedParams;
-    }
-  | {
-      path: "webgpu-fused-blocked";
-      prepared: PreparedWebGPUBlockedAssocScan;
-      params: WebGPUAssocScanParams;
-      blockSize: number;
     }
   | {
       /**
@@ -1578,12 +1571,9 @@ export function planAssociativeScan(
 
   // Build per-element leaf sizes (bytes) for WASM
   const leafElemSizes: number[] = [];
-  // Build per-element leaf counts (typed elements) for WebGPU
-  const leafElemCounts: number[] = [];
   for (let k = 0; k < numLeaves; k++) {
     const aval = bodyJaxpr.inBinders[numConsts + k].aval;
     leafElemSizes.push(aval.size * byteWidth(aval.dtype));
-    leafElemCounts.push(aval.size);
   }
 
   // Build const sizes
@@ -1593,57 +1583,9 @@ export function planAssociativeScan(
     constSizes.push(aval.size * byteWidth(aval.dtype));
   }
 
-  // --- WebGPU fused path ---
+  // --- WebGPU block-map path ---
   if (backend.type === "webgpu") {
-    // Determine the dtype — must be homogeneous across all leaves
-    const dtype0 = bodyJaxpr.inBinders[numConsts].aval.dtype;
-    let homogeneous = true;
-    for (let k = 1; k < numLeaves; k++) {
-      if (bodyJaxpr.inBinders[numConsts + k].aval.dtype !== dtype0) {
-        homogeneous = false;
-        break;
-      }
-    }
-    if (!homogeneous) {
-      if (DEBUG >= 1) {
-        console.log(
-          "[assoc-scan] skipping webgpu-fused: mixed dtypes across leaves",
-        );
-      }
-      return { path: "fallback" };
-    }
-
-    // Compute internal element counts (typed elements, not bytes)
-    const internalElemCounts = internalSizes.map((s) => s / byteWidth(dtype0));
-
-    // Build WebGPU-specific step list (shares same structure as GeneralScanStep
-    // but typed as AssocScanStep)
-    const webgpuSteps: import("../backend/webgpu").AssocScanStep[] = steps.map(
-      (s) => ({
-        kernel: s.source as Kernel,
-        inputSlots: s.inputSlots,
-        outputInternalIdx: s.outputInternalIdx,
-      }),
-    );
-
-    const webgpuParams: WebGPUAssocScanParams = {
-      numConsts,
-      numLeaves,
-      leafElemCounts,
-      steps: webgpuSteps,
-      internalElemCounts,
-      reverse,
-      leafToInternalIdx,
-      dtype: dtype0,
-    };
-
     try {
-      const webgpuBackend = backend as WebGPUBackend;
-
-      // Try block-map–based path: constructs a BlockMap body containing
-      // WorkgroupAssociativeScan, which block-map.ts compiles into a fused
-      // shared-memory Kogge-Stone shader. This reuses the block-map codegen
-      // and eliminates the standalone local scan shader.
       const BLOCK_SIZE = 256;
       const blockMapPlan = tryBuildBlockMapAssocScanPlan(
         backend,
@@ -1663,28 +1605,9 @@ export function planAssociativeScan(
         }
         return blockMapPlan;
       }
-
-      // Fallback: try legacy standalone blocked path.
-      const blockedPrepared = webgpuBackend.prepareBlockedAssocScan(
-        webgpuParams,
-        BLOCK_SIZE,
-      );
-      if (blockedPrepared) {
-        if (DEBUG >= 1) {
-          console.log(
-            `[assoc-scan] SUCCESS! Using WebGPU fused-blocked (B=${BLOCK_SIZE}) with ${webgpuSteps.length} step(s)`,
-          );
-        }
-        return {
-          path: "webgpu-fused-blocked",
-          prepared: blockedPrepared,
-          params: webgpuParams,
-          blockSize: BLOCK_SIZE,
-        };
-      }
     } catch (e) {
       if (DEBUG >= 2) {
-        console.warn("[assoc-scan] WebGPU fused compilation failed:", e);
+        console.warn("[assoc-scan] WebGPU block-map compilation failed:", e);
       }
     }
     return { path: "fallback" };

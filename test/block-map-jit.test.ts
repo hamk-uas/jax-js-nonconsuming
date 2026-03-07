@@ -1948,7 +1948,7 @@ describe("O4: register-tiled tiledMatmul", () => {
 // ---------------------------------------------------------------------------
 // T7: Phase 5 — Blocked AssociativeScan
 //
-// Tests for compiled-loop-blocked (WASM) and webgpu-fused-blocked paths.
+// Tests for compiled-loop-blocked (WASM) and webgpu-block-map (WebGPU) paths.
 // The blocked path is the default for both backends (B=256 per block).
 // Critical new coverage: N > B forces multi-block decomposition where
 // summary-scan (level 2) and apply (level 3) actually execute.
@@ -2093,7 +2093,7 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
     f.dispose();
   });
 
-  // T7.2+T7.4 on WebGPU: verify webgpu-fused-blocked path.
+  // T7.2+T7.4 on WebGPU: verify webgpu-block-map path.
   test("T7-WebGPU: N=1024 and N=300 cumsum correct on WebGPU", () => {
     if (!hasWebGPU) return;
     defaultDevice("webgpu");
