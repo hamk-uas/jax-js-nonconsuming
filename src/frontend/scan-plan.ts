@@ -30,8 +30,9 @@ import {
 } from "../shape";
 import { DEBUG } from "../utils";
 import type { ScanPath } from "../utils";
-import type { Jaxpr } from "./jaxpr";
-import type { JitId, JitProgram, JitStep } from "./jit";
+import { Primitive, ShapedArray } from "./core";
+import { Jaxpr, JaxprEqn, Var } from "./jaxpr";
+import { jitCompile, type JitId, type JitProgram, type JitStep } from "./jit";
 
 // ---------------------------------------------------------------------------
 // ScanPlan: a discriminated union of execution strategies
@@ -69,6 +70,29 @@ export type AssocScanPlan =
       prepared: PreparedWebGPUBlockedAssocScan;
       params: WebGPUAssocScanParams;
       blockSize: number;
+    }
+  | {
+      /**
+       * Block-map–based path: uses {@link Primitive.BlockMap} with a
+       * {@link Primitive.WorkgroupAssociativeScan} body for the local scan
+       * phase, then JS-level gather + recursive summary scan + apply.
+       *
+       * Replaces the standalone WebGPU blocked assocScan shader codegen
+       * by reusing the block-map fused shader infrastructure.
+       */
+      path: "webgpu-block-map";
+      /** Compiled body program for the block_map (contains WAS step). */
+      localScanBodyProgram: JitProgram;
+      /** Body Jaxpr for the block_map. */
+      localScanBodyJaxpr: Jaxpr;
+      /** The original associative scan body Jaxpr (per-element). */
+      scanBodyJaxpr: Jaxpr;
+      /** Compiled per-element body program (for summary scan fallback). */
+      scanBodyProgram: JitProgram;
+      blockSize: number;
+      numLeaves: number;
+      numConsts: number;
+      reverse: boolean;
     }
   | { path: "fallback" };
 
@@ -1380,6 +1404,7 @@ export function planScan(
  * @param numLeaves       Number of pytree leaves
  * @param numConsts       Number of constant inputs closed over by the body
  * @param reverse         Whether to reverse the scan direction
+ * @param dimBindings     Dimension bindings from the enclosing jitCompile
  */
 export function planAssociativeScan(
   backend: Backend,
@@ -1388,6 +1413,7 @@ export function planAssociativeScan(
   numLeaves: number,
   numConsts: number,
   reverse: boolean,
+  dimBindings?: ReadonlyMap<string, number>,
 ): AssocScanPlan {
   // Only WASM and WebGPU backends support native assoc scan
   if (backend.type !== "wasm" && backend.type !== "webgpu") {
@@ -1609,10 +1635,31 @@ export function planAssociativeScan(
     try {
       const webgpuBackend = backend as WebGPUBackend;
 
-      // Try blocked path first: workgroup-level scan + summary scan.
-      // Blocked reduces dispatches from ceil(log₂ N) to 3 + ceil(log₂ M)
-      // where M = ceil(N / B). Falls through to flat if shmem/wgsize limits.
+      // Try block-map–based path: constructs a BlockMap body containing
+      // WorkgroupAssociativeScan, which block-map.ts compiles into a fused
+      // shared-memory Kogge-Stone shader. This reuses the block-map codegen
+      // and eliminates the standalone local scan shader.
       const BLOCK_SIZE = 256;
+      const blockMapPlan = tryBuildBlockMapAssocScanPlan(
+        backend,
+        bodyProgram,
+        bodyJaxpr,
+        numLeaves,
+        numConsts,
+        reverse,
+        BLOCK_SIZE,
+        dimBindings,
+      );
+      if (blockMapPlan) {
+        if (DEBUG >= 1) {
+          console.log(
+            `[assoc-scan] SUCCESS! Using WebGPU block-map path (B=${BLOCK_SIZE})`,
+          );
+        }
+        return blockMapPlan;
+      }
+
+      // Fallback: try legacy standalone blocked path.
       const blockedPrepared = webgpuBackend.prepareBlockedAssocScan(
         webgpuParams,
         BLOCK_SIZE,
@@ -1677,4 +1724,105 @@ export function planAssociativeScan(
     }
     return { path: "fallback" };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Block-map–based associative scan plan builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a block-map–based plan for associative scan (WebGPU only).
+ *
+ * Constructs a body Jaxpr containing a single WorkgroupAssociativeScan
+ * equation, then JIT-compiles it for use as a block_map body. The block-map
+ * fused shader compiler in block-map.ts handles the Kogge-Stone codegen.
+ *
+ * Returns null if the block-map path is not viable.
+ */
+function tryBuildBlockMapAssocScanPlan(
+  backend: Backend,
+  bodyProgram: JitProgram,
+  bodyJaxpr: Jaxpr,
+  numLeaves: number,
+  numConsts: number,
+  reverse: boolean,
+  blockSize: number,
+  dimBindings?: ReadonlyMap<string, number>,
+): AssocScanPlan | null {
+  if (backend.type !== "webgpu") return null;
+
+  // Build block-shaped element avals: [blockSize, ...elemShape]
+  const constAvals: ShapedArray[] = [];
+  for (let i = 0; i < numConsts; i++) {
+    constAvals.push(bodyJaxpr.inBinders[i].aval);
+  }
+
+  const elemAvals: ShapedArray[] = [];
+  for (let i = 0; i < numLeaves; i++) {
+    const perElem = bodyJaxpr.inBinders[numConsts + i].aval;
+    elemAvals.push(
+      new ShapedArray(
+        [blockSize, ...(perElem.shape as number[])],
+        perElem.dtype,
+        perElem.weakType,
+      ),
+    );
+  }
+
+  // Construct the body Jaxpr for the block_map:
+  //   inputs: [const_0, ..., const_C, elem_0[B,...], ..., elem_L[B,...]]
+  //   eqn:    [out_0,...,out_L] = WorkgroupAssociativeScan(all_inputs)
+  //   outputs: [out_0, ..., out_L]
+  const inBinders: Var[] = [];
+  for (const a of constAvals) inBinders.push(new Var(a));
+  for (const a of elemAvals) inBinders.push(new Var(a));
+
+  const outBinders: Var[] = [];
+  for (const a of elemAvals) outBinders.push(new Var(a));
+
+  const wasEqn = new JaxprEqn(
+    Primitive.WorkgroupAssociativeScan,
+    inBinders,
+    { jaxpr: bodyJaxpr, numConsts } as Record<string, any>,
+    outBinders,
+  );
+
+  const localScanBodyJaxpr = new Jaxpr(inBinders, [wasEqn], outBinders);
+
+  // JIT-compile the body. block-map.ts will see the workgroup_assoc_scan step
+  // and generate inlined Kogge-Stone rounds in the fused shader.
+  let localScanBodyProgram: JitProgram;
+  try {
+    localScanBodyProgram = jitCompile(backend, localScanBodyJaxpr, dimBindings);
+  } catch (e) {
+    if (DEBUG >= 1) {
+      console.log("[assoc-scan] block-map path: body jitCompile failed:", e);
+    }
+    return null;
+  }
+
+  // Verify the body program contains a workgroup_assoc_scan step.
+  const hasWAS = localScanBodyProgram.steps.some(
+    (s) => s.type === "workgroup_assoc_scan",
+  );
+  if (!hasWAS) {
+    if (DEBUG >= 1) {
+      console.log(
+        "[assoc-scan] block-map path: body has no workgroup_assoc_scan step",
+      );
+    }
+    return null;
+  }
+
+  return {
+    path: "webgpu-block-map",
+    localScanBodyProgram,
+    localScanBodyJaxpr,
+    scanBodyJaxpr: bodyJaxpr,
+    scanBodyProgram: bodyProgram,
+    blockSize,
+    numLeaves,
+    numConsts,
+    reverse,
+  };
 }

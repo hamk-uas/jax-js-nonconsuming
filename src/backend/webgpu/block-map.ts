@@ -3080,16 +3080,21 @@ export function blockMapFusedShaderSource(
               `for (var _was_wi: u32 = 0u; _was_wi < ${ec}u; _was_wi++) {`,
               pushIndent,
             );
-            const flatExpr = `tidx * ${ec}u + _was_wi`;
+            const shmemIdx = `tidx * ${ec}u + _was_wi`;
+            // The output offset is the block-axis strided offset for tidx
+            // plus the flat sub-element index _was_wi. outOffset("tidx")
+            // handles the block→global stride remapping; _was_wi indexes
+            // into the non-block element dimensions whose strides match.
+            const outOff = `i32(${outOffset(resultIdx)}) + i32(_was_wi)`;
             if (hasBoundary) {
               emit(`if (valid) {`, pushIndent);
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx, flatExpr)})] = ${resultTy}(${finalNames[e]}[${flatExpr}]);`,
+                `result${resultIdx}[i32(out_base_${resultIdx}) + ${outOff}] = ${resultTy}(${finalNames[e]}[${shmemIdx}]);`,
               );
               emit(popIndent, "}");
             } else {
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx, flatExpr)})] = ${resultTy}(${finalNames[e]}[${flatExpr}]);`,
+                `result${resultIdx}[i32(out_base_${resultIdx}) + ${outOff}] = ${resultTy}(${finalNames[e]}[${shmemIdx}]);`,
               );
             }
             emit(popIndent, "}");

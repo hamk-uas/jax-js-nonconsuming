@@ -25,6 +25,10 @@ import {
   resolveShape,
   ShapeTracker,
 } from "../shape";
+import {
+  executeBlockMap,
+  type ExecuteBlockMapParams,
+} from "./block-map-executor";
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -457,6 +461,10 @@ export function executeAssociativeScan(
     return { outputs: outputSlots, pending: [] };
   }
 
+  if (plan.path === "webgpu-block-map") {
+    return executeAssocScanBlockMap(params);
+  }
+
   // Fallback: JS Kogge-Stone loop
   const resolveAvalShape = (shape: Dim[]): number[] =>
     hasSymbolicDims(shape)
@@ -516,6 +524,396 @@ export function executeAssociativeScan(
   for (const a of elemArrays) a.dispose();
 
   return { outputs: finalOutputs, pending: [] };
+}
+
+// ---------------------------------------------------------------------------
+// Block-map–based associative scan execution
+// ---------------------------------------------------------------------------
+
+/**
+ * Execute an associative scan using the block-map decomposition:
+ * 1. Local scan: block_map with WorkgroupAssociativeScan body
+ * 2. If M > 1: gather block summaries → recursive scan → apply
+ *
+ * This path reuses block-map.ts's fused shader infrastructure for the
+ * local scan, eliminating the standalone WebGPU assocScan shaders.
+ */
+function executeAssocScanBlockMap(
+  params: ExecuteAssocScanParams,
+): ExecuteAssocScanResult {
+  const {
+    backend,
+    plan,
+    numLeaves,
+    axis,
+    reverse,
+    constSlots,
+    elemSlots,
+    elemAvals,
+    constAvals,
+    outputSlots,
+    dimBindings,
+  } = params;
+
+  if (plan.path !== "webgpu-block-map") {
+    throw new Error("executeAssocScanBlockMap: expected webgpu-block-map plan");
+  }
+
+  const {
+    localScanBodyProgram,
+    localScanBodyJaxpr,
+    scanBodyJaxpr: _scanBodyJaxpr,
+    scanBodyProgram,
+    blockSize: B,
+    numConsts,
+  } = plan;
+
+  // Resolve N at runtime
+  const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
+  const M = Math.ceil(N / B);
+
+  // Handle reverse: reverse input elements before local scan, reverse output after apply.
+  // For simplicity, we reverse in-place in the output buffers.
+  let inputSlots = elemSlots;
+  if (reverse) {
+    // Allocate reversed copies of input elements.
+    inputSlots = [];
+    for (let k = 0; k < numLeaves; k++) {
+      const elemShape = elemAvals[k].shape as number[];
+      const elemBw = byteWidth(elemAvals[k].dtype);
+      const perElemBytes =
+        elemShape.slice(1).reduce((a, b) => a * b, 1) * elemBw;
+      const totalBytes = N * perElemBytes;
+      const revSlot = backend.malloc(totalBytes);
+      // Reverse: copy element i → position N-1-i
+      for (let i = 0; i < N; i++) {
+        backend.copyBufferToBuffer(
+          elemSlots[k],
+          i * perElemBytes,
+          revSlot,
+          (N - 1 - i) * perElemBytes,
+          perElemBytes,
+        );
+      }
+      inputSlots.push(revSlot);
+    }
+  }
+
+  // --- Phase 1: Local scan via block_map ---
+  const gridShape = [M];
+  const blockShape = [B];
+
+  // inAxes: constants broadcast (null), elements sliced along axis 0
+  const inAxes: (number | null)[][] = [
+    ...constAvals.map(() => [null as number | null]),
+    ...elemAvals.map(() => [0 as number | null]),
+  ];
+  const outAxes: (number | null)[][] = elemAvals.map(() => [0]);
+
+  const inputShapes = elemAvals.map((a) => a.shape as number[]);
+  const outputShapes = elemAvals.map((a) => a.shape as number[]);
+
+  // Allocate local scan output buffers
+  const localScanSlots: Slot[] = [];
+  for (let k = 0; k < numLeaves; k++) {
+    const totalBytes =
+      (elemAvals[k].shape as number[]).reduce((a, b) => a * b, 1) *
+      byteWidth(elemAvals[k].dtype);
+    localScanSlots.push(backend.malloc(totalBytes));
+  }
+
+  const blockMapParams: ExecuteBlockMapParams = {
+    backend,
+    bodyProgram: localScanBodyProgram,
+    bodyJaxpr: localScanBodyJaxpr,
+    blockShape,
+    inAxes,
+    outAxes,
+    numConsts,
+    numInputs: numLeaves,
+    gridShape,
+    inputShapes,
+    outputShapes,
+    constSlots,
+    inputSlots: reverse ? inputSlots : elemSlots,
+    outputSlots: localScanSlots,
+  };
+
+  const bmResult = executeBlockMap(blockMapParams);
+  // Flush any pending block map operations
+  if (bmResult.pending.length > 0) {
+    flushPending(bmResult.pending);
+  }
+
+  if (M === 1) {
+    // Single block: local scan output IS the final output.
+    // Copy to pre-allocated output slots.
+    for (let k = 0; k < numLeaves; k++) {
+      const totalBytes =
+        (elemAvals[k].shape as number[]).reduce((a, b) => a * b, 1) *
+        byteWidth(elemAvals[k].dtype);
+      if (reverse) {
+        // Reverse the output
+        const perElemBytes =
+          (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+          byteWidth(elemAvals[k].dtype);
+        for (let i = 0; i < N; i++) {
+          backend.copyBufferToBuffer(
+            localScanSlots[k],
+            i * perElemBytes,
+            outputSlots[k],
+            (N - 1 - i) * perElemBytes,
+            perElemBytes,
+          );
+        }
+      } else {
+        backend.copyBufferToBuffer(
+          localScanSlots[k],
+          0,
+          outputSlots[k],
+          0,
+          totalBytes,
+        );
+      }
+      backend.decRef(localScanSlots[k]);
+    }
+    if (reverse) {
+      for (const s of inputSlots) backend.decRef(s);
+    }
+    return { outputs: outputSlots, pending: [] };
+  }
+
+  // --- Phase 2: Gather block summaries ---
+  // For each leaf, extract the last element of each block.
+  // summary_k[i] = localScan_k[min((i+1)*B - 1, N-1)]
+  const summarySlots: Slot[] = [];
+  for (let k = 0; k < numLeaves; k++) {
+    const elemShape = elemAvals[k].shape as number[];
+    const perElemBytes =
+      elemShape.slice(1).reduce((a, b) => a * b, 1) *
+      byteWidth(elemAvals[k].dtype);
+    const summaryBytes = M * perElemBytes;
+    const summarySlot = backend.malloc(summaryBytes);
+    for (let i = 0; i < M; i++) {
+      const srcIdx = Math.min((i + 1) * B - 1, N - 1);
+      backend.copyBufferToBuffer(
+        localScanSlots[k],
+        srcIdx * perElemBytes,
+        summarySlot,
+        i * perElemBytes,
+        perElemBytes,
+      );
+    }
+    summarySlots.push(summarySlot);
+  }
+
+  // --- Phase 3: Prefix scan the summaries ---
+  // Use the per-element body program to scan M summary values.
+  // For small M (≤ B), this runs as a sequential scan.
+  // The body takes [consts, a, b] and returns [result].
+  const scannedSummarySlots: Slot[] = [];
+  for (let k = 0; k < numLeaves; k++) {
+    const elemShape = elemAvals[k].shape as number[];
+    const perElemBytes =
+      elemShape.slice(1).reduce((a, b) => a * b, 1) *
+      byteWidth(elemAvals[k].dtype);
+    const scannedSlot = backend.malloc(M * perElemBytes);
+    scannedSummarySlots.push(scannedSlot);
+  }
+
+  // Sequential prefix scan on summaries: scanned[0] = summary[0],
+  // scanned[i] = body(scanned[i-1], summary[i])
+  {
+    // Initialize: scanned[0] = summary[0]
+    for (let k = 0; k < numLeaves; k++) {
+      const perElemBytes =
+        (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+        byteWidth(elemAvals[k].dtype);
+      backend.copyBufferToBuffer(
+        summarySlots[k],
+        0,
+        scannedSummarySlots[k],
+        0,
+        perElemBytes,
+      );
+    }
+
+    // Prefix scan: for i = 1..M-1
+    for (let i = 1; i < M; i++) {
+      // Extract a = scanned[i-1], b = summary[i]
+      const aSlots: Slot[] = [];
+      const bSlots: Slot[] = [];
+      for (let k = 0; k < numLeaves; k++) {
+        const perElemBytes =
+          (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+          byteWidth(elemAvals[k].dtype);
+        const a = backend.malloc(perElemBytes);
+        backend.copyBufferToBuffer(
+          scannedSummarySlots[k],
+          (i - 1) * perElemBytes,
+          a,
+          0,
+          perElemBytes,
+        );
+        aSlots.push(a);
+
+        const b = backend.malloc(perElemBytes);
+        backend.copyBufferToBuffer(
+          summarySlots[k],
+          i * perElemBytes,
+          b,
+          0,
+          perElemBytes,
+        );
+        bSlots.push(b);
+      }
+
+      // IncRef consts for body
+      for (const s of constSlots) backend.incRef(s);
+
+      const bodyInputs = [...constSlots, ...aSlots, ...bSlots];
+      const bodyResult = scanBodyProgram.execute(bodyInputs, dimBindings);
+      if (bodyResult.pending.length > 0) flushPending(bodyResult.pending);
+
+      // DecRef consts
+      for (const s of constSlots) backend.decRef(s);
+      // DecRef a and b
+      for (const s of aSlots) backend.decRef(s);
+      for (const s of bSlots) backend.decRef(s);
+
+      // Write result to scannedSummary[i]
+      for (let k = 0; k < numLeaves; k++) {
+        const perElemBytes =
+          (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+          byteWidth(elemAvals[k].dtype);
+        backend.copyBufferToBuffer(
+          bodyResult.outputs[k],
+          0,
+          scannedSummarySlots[k],
+          i * perElemBytes,
+          perElemBytes,
+        );
+        backend.decRef(bodyResult.outputs[k]);
+      }
+    }
+  }
+
+  // Free raw summaries
+  for (const s of summarySlots) backend.decRef(s);
+
+  // --- Phase 4: Apply scanned summaries to blocks 1..M-1 ---
+  // For each element in block i > 0: output[i*B+j] = body(scannedSummary[i-1], localScan[i*B+j])
+  for (let blockIdx = 1; blockIdx < M; blockIdx++) {
+    const blockStart = blockIdx * B;
+    const blockEnd = Math.min(blockStart + B, N);
+    const blockLen = blockEnd - blockStart;
+
+    for (let j = 0; j < blockLen; j++) {
+      const globalIdx = blockStart + j;
+      const aSlots: Slot[] = []; // scannedSummary[blockIdx - 1]
+      const bSlots: Slot[] = []; // localScan[globalIdx]
+
+      for (let k = 0; k < numLeaves; k++) {
+        const perElemBytes =
+          (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+          byteWidth(elemAvals[k].dtype);
+
+        const a = backend.malloc(perElemBytes);
+        backend.copyBufferToBuffer(
+          scannedSummarySlots[k],
+          (blockIdx - 1) * perElemBytes,
+          a,
+          0,
+          perElemBytes,
+        );
+        aSlots.push(a);
+
+        const b = backend.malloc(perElemBytes);
+        backend.copyBufferToBuffer(
+          localScanSlots[k],
+          globalIdx * perElemBytes,
+          b,
+          0,
+          perElemBytes,
+        );
+        bSlots.push(b);
+      }
+
+      // IncRef consts
+      for (const s of constSlots) backend.incRef(s);
+
+      const bodyInputs = [...constSlots, ...aSlots, ...bSlots];
+      const bodyResult = scanBodyProgram.execute(bodyInputs, dimBindings);
+      if (bodyResult.pending.length > 0) flushPending(bodyResult.pending);
+
+      // DecRef consts, a, b
+      for (const s of constSlots) backend.decRef(s);
+      for (const s of aSlots) backend.decRef(s);
+      for (const s of bSlots) backend.decRef(s);
+
+      // Write result to output at globalIdx
+      for (let k = 0; k < numLeaves; k++) {
+        const perElemBytes =
+          (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+          byteWidth(elemAvals[k].dtype);
+        backend.copyBufferToBuffer(
+          bodyResult.outputs[k],
+          0,
+          outputSlots[k],
+          globalIdx * perElemBytes,
+          perElemBytes,
+        );
+        backend.decRef(bodyResult.outputs[k]);
+      }
+    }
+  }
+
+  // Copy block 0 from local scan to output (unchanged)
+  {
+    const block0End = Math.min(B, N);
+    for (let k = 0; k < numLeaves; k++) {
+      const perElemBytes =
+        (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+        byteWidth(elemAvals[k].dtype);
+      backend.copyBufferToBuffer(
+        localScanSlots[k],
+        0,
+        outputSlots[k],
+        0,
+        block0End * perElemBytes,
+      );
+    }
+  }
+
+  // If reverse, reverse the output
+  if (reverse) {
+    for (let k = 0; k < numLeaves; k++) {
+      const perElemBytes =
+        (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+        byteWidth(elemAvals[k].dtype);
+      const totalBytes = N * perElemBytes;
+      const tmpSlot = backend.malloc(totalBytes);
+      backend.copyBufferToBuffer(outputSlots[k], 0, tmpSlot, 0, totalBytes);
+      for (let i = 0; i < N; i++) {
+        backend.copyBufferToBuffer(
+          tmpSlot,
+          i * perElemBytes,
+          outputSlots[k],
+          (N - 1 - i) * perElemBytes,
+          perElemBytes,
+        );
+      }
+      backend.decRef(tmpSlot);
+    }
+    // Free reversed input copies
+    for (const s of inputSlots) backend.decRef(s);
+  }
+
+  // Cleanup
+  for (const s of localScanSlots) backend.decRef(s);
+  for (const s of scannedSummarySlots) backend.decRef(s);
+
+  return { outputs: outputSlots, pending: [] };
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ import { type Backend, Executable, type Slot } from "../backend";
 import type { BlockMapWasmParams, GeneralScanStep } from "../backend/wasm";
 import { DEBUG } from "../utils";
 import type { PendingExecute } from "./array";
+import { _registerJitCacheDisposer } from "./check-leaks";
 import type { Jaxpr } from "./jaxpr";
 import type { JitProgram, JitStep } from "./jit";
 
@@ -73,8 +74,11 @@ export function executeBlockMap(
 // Cache fused Executable by bodyProgram identity. The JitProgram is
 // identity-stable (cached by jitCompile) and encodes the backend, so
 // this avoids re-running the full WGSL codegen on every dispatch.
-// WeakMap: when the JitProgram is GC'd (after clearCaches()), the entry dies.
-const blockMapFusedCache = new WeakMap<JitProgram, Executable | null>();
+// Uses a regular Map (not WeakMap) so that clearCaches() deterministically
+// invalidates entries — avoiding non-deterministic GC timing issues with
+// checkLeaks slot counting.
+const blockMapFusedCache = new Map<JitProgram, Executable | null>();
+_registerJitCacheDisposer(() => blockMapFusedCache.clear());
 
 function tryExecuteBlockMapFused(
   params: ExecuteBlockMapParams,

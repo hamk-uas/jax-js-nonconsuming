@@ -1534,6 +1534,7 @@ export function jitCompile(
           numLeaves,
           numConsts,
           reverse,
+          _currentDimBindings,
         );
 
         builder.steps.push({
