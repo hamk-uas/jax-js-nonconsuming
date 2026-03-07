@@ -33,6 +33,7 @@ import type { ScanPath } from "../utils";
 import { Primitive, ShapedArray } from "./core";
 import { Jaxpr, JaxprEqn, Var } from "./jaxpr";
 import { jitCompile, type JitId, type JitProgram, type JitStep } from "./jit";
+import { vmapJaxpr } from "./vmap";
 
 // ---------------------------------------------------------------------------
 // ScanPlan: a discriminated union of execution strategies
@@ -93,6 +94,10 @@ export type AssocScanPlan =
       numLeaves: number;
       numConsts: number;
       reverse: boolean;
+      /** Vmapped apply body Jaxpr: applies prefix to a block of B elements. */
+      applyVmapJaxpr: Jaxpr;
+      /** Compiled vmapped apply body program. */
+      applyVmapProgram: JitProgram;
     }
   | { path: "fallback" };
 
@@ -1814,6 +1819,43 @@ function tryBuildBlockMapAssocScanPlan(
     return null;
   }
 
+  // Build vmapped apply body: processes a block of B elements at once.
+  // Signature: (consts..., prefix_0, ..., prefix_L, block_0[B,...], ..., block_L[B,...])
+  //         -> (result_0[B,...], ..., result_L[B,...])
+  // where prefix leaves are broadcast (same for all B elements)
+  // and block leaves are mapped on axis 0.
+  const applyVmapDims: (number | null)[] = [
+    ...Array(numConsts).fill(null), // consts: broadcast
+    ...Array(numLeaves).fill(null), // prefix: broadcast
+    ...Array(numLeaves).fill(0), // block elements: mapped on axis 0
+  ];
+  const applyVmapClosed = vmapJaxpr(bodyJaxpr, blockSize, applyVmapDims);
+
+  // The vmapped body should be const-free when the source body is pure.
+  // If it has captured consts, fall back — we don't propagate vmap const
+  // slots through the plan.
+  if (applyVmapClosed.consts.length > 0) {
+    if (DEBUG >= 1) {
+      console.log(
+        "[assoc-scan] block-map path: vmapped apply body has unexpected consts",
+      );
+    }
+    return null;
+  }
+
+  let applyVmapProgram: JitProgram;
+  try {
+    applyVmapProgram = jitCompile(backend, applyVmapClosed.jaxpr, dimBindings);
+  } catch (e) {
+    if (DEBUG >= 1) {
+      console.log(
+        "[assoc-scan] block-map path: applyVmap jitCompile failed:",
+        e,
+      );
+    }
+    return null;
+  }
+
   return {
     path: "webgpu-block-map",
     localScanBodyProgram,
@@ -1824,5 +1866,7 @@ function tryBuildBlockMapAssocScanPlan(
     numLeaves,
     numConsts,
     reverse,
+    applyVmapJaxpr: applyVmapClosed.jaxpr,
+    applyVmapProgram,
   };
 }

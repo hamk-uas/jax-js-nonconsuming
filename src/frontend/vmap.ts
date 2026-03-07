@@ -907,7 +907,7 @@ _registerCacheSizeGetter("vmapJaxpr", () => {
   return total;
 });
 
-function vmapJaxpr(
+export function vmapJaxpr(
   jaxpr: Jaxpr,
   axisSize: number,
   dims: (number | null)[],
