@@ -538,109 +538,79 @@ from scan-executor.ts. Total: **~-1,170 LOC**.
 
 ---
 
-## Plan 3: Shape-Aware Fused Cache
+## Plan 3: Codegen-Specialization Cache for Fused Block-Map ✅ IMPLEMENTED
 
 ### Goal
 
 Fix `blockMapFusedCache` so it produces correct executables when the same body program is used with
 different grid shapes, input shapes, or thread tiles.
 
-### 3a. Build specialization key
+### Cache architecture context
 
-**File:** `src/frontend/block-map-executor.ts`
+The `jitCompile` cache (`jitCompileCache`) is keyed by `backend.type + FpHash.hash(jaxpr)`. When
+`dynamic_axes` is used, the jaxpr contains `SymDim` nodes so the hash is identical regardless of
+concrete lengths — one `JitProgram` is reused for all concrete sizes. This is the **polymorphic
+frontend cache** and must not be disturbed.
 
-Add a serialization helper:
+`blockMapFusedCache` is a **backend codegen-specialization cache** sitting below `jitCompile`. The
+fused WebGPU shader bakes concrete values into WGSL: grid decomposition, boundary guards, stride
+remapping, buffer indexing. A single polymorphic `JitProgram` can therefore require multiple
+concrete fused executables — one per distinct codegen-affecting geometry.
 
-```ts
-function blockMapSpecKey(params: ExecuteBlockMapParams): string {
-  // Include all shape-dependent fields that affect the compiled shader.
-  // Exclude runtime data (slots, backend) that don't affect code generation.
-  const parts = [
-    params.blockShape.join(","),
-    params.gridShape.join(","),
-    params.inAxes.map((a) => a.map((v) => v ?? "_").join(",")).join(";"),
-    params.outAxes.map((a) => a.map((v) => v ?? "_").join(",")).join(";"),
-    params.numConsts,
-    params.numInputs,
-    params.inputShapes.map((s) => s.join(",")).join(";"),
-    params.outputShapes.map((s) => s.join(",")).join(";"),
-    params.threadTile?.join(",") ?? "-",
-  ];
-  return parts.join("|");
-}
-```
+The specialization key includes only values that actually affect the generated WGSL — everything the
+fused codegen reads from `BlockMapShaderParams`: `blockShape`, `gridShape`, `inputShapes`,
+`outputShapes`, `inAxes`, `outAxes`, `numConsts`, `numInputs`, `threadTile`. Audited against all
+`params.*` accesses in `src/backend/webgpu/block-map.ts` — **complete, no missing fields.**
 
-### 3b. Replace flat Map with two-level cache
+If future work makes some of these runtime-driven (e.g., grid extent as a uniform buffer), they
+should be removed from the key at that time.
 
-```ts
-// CURRENT:
-const blockMapFusedCache = new Map<JitProgram, Executable | null>();
+### 3a. Specialization key — ✅ Done
 
-// NEW:
-const blockMapFusedCache = new Map<JitProgram, Map<string, Executable | null>>();
-_registerJitCacheDisposer(() => blockMapFusedCache.clear());
+`blockMapSpecKey()` in `src/frontend/block-map-executor.ts` serializes all codegen-affecting fields.
 
-function tryExecuteBlockMapFused(params: ExecuteBlockMapParams): ... {
-  const key = blockMapSpecKey(params);
-  let inner = blockMapFusedCache.get(params.bodyProgram);
-  if (!inner) {
-    inner = new Map();
-    blockMapFusedCache.set(params.bodyProgram, inner);
-  }
-  let exe = inner.get(key);
-  if (exe === undefined) {
-    exe = webgpuBackend.prepareBlockMapFused({ ... }) ?? null;
-    inner.set(key, exe);
-  }
-  if (!exe) return null;
-  // dispatch...
-}
-```
+### 3b. Two-level cache — ✅ Done
 
-### 3c. Test coverage
+`Map<JitProgram, Map<string, Executable | null>>` with inner map keyed by `blockMapSpecKey()`.
+Compile-count counter (`_fusedCacheCompileCount`) exported for test observability.
 
-**File:** `test/block-map-jit.test.ts`
+### 3c. dynamic_axes block_map fix — ✅ Done
 
-Add a test that exercises the same body with different input sizes:
+**Root cause:** The `block_map` JitStep stored `inputShapes`, `outputShapes`, and `gridShape` as
+`number[]` at jitCompile time. When `dynamic_axes` was used, shapes contained `SymDim` objects. The
+`as number` casts caused `Math.ceil(SymDim / blockShape)` → `NaN` for gridShape, and SymDim objects
+were passed where WGSL codegen expected concrete numbers.
 
-```ts
-test("fused cache handles different N values", () => {
-  const body = (block: np.Array) => np.multiply(block, np.array([2]));
+**Fix (src/frontend/jit.ts):**
 
-  const jitF = jit((xs: np.Array) => lax.blockMap(body, xs, { blockShape: [4] }));
+- JitStep type: `inputShapes: Dim[][]`, `outputShapes: Dim[][]`, `gridShape` removed (computed at
+  execution time from resolved shapes)
+- Compile time: store raw `Dim[][]` shapes, no unsafe casts
+- Execution time: `resolveShape()` via `dimBindings`, then compute `gridShape` from concrete values
 
-  // First call: N=8 (2 blocks)
-  using xs1 = np.arange(8, { dtype: DType.Float32 });
-  using r1 = jitF(xs1) as np.Array;
-  expect(r1.data()).toEqual(new Float32Array([0, 2, 4, 6, 8, 10, 12, 14]));
+**Fix (src/frontend/scan-executor.ts):**
 
-  // Second call: N=12 (3 blocks)
-  using xs2 = np.arange(12, { dtype: DType.Float32 });
-  using r2 = jitF(xs2) as np.Array;
-  expect(r2.data()).toEqual(new Float32Array([0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]));
+- `executeAssocScanBlockMap()`: resolve `elemAvals[k].shape` once at function entry via
+  `resolveShape()`, replacing all 14 unsafe `as number[]` casts with resolved shapes.
 
-  jitF.dispose();
-});
-```
+### 3d. Test coverage — ✅ Done
 
-**File:** `test/polymorphic-shapes.test.ts`
+**T7.8-WebGPU** (`test/block-map-jit.test.ts`): One `jit` function with `dynamic_axes`, called with
+N=8 (gridShape=[2]) and N=12 (gridShape=[3]). Verifies:
 
-Add a polymorphic block_map test if symbolic shapes can reach the fused path.
+- Correctness: both sizes produce correct outputs
+- Cache partitioning: `_fusedCacheCompileCount` asserts exactly 2 compiles (one per geometry)
+- Cache reuse: repeat calls show compile count stays at 2
 
-### 3d. Commit plan
-
-**Single commit:** `fix: shape-aware blockMapFusedCache specialization`
+### 3e. Commit summary
 
 Files modified:
 
-- `src/frontend/block-map-executor.ts` — two-level cache + `blockMapSpecKey()`
-- `test/block-map-jit.test.ts` — regression test
-
-Test gates:
-
-- New regression test passes
-- All block-map tests pass
-- Full suite passes
+- `src/frontend/jit.ts` — `Dim[][]` types, deferred gridShape computation, `resolveShape()` at exec
+- `src/frontend/block-map-executor.ts` — two-level cache, `blockMapSpecKey()`, compile counter
+- `src/frontend/scan-executor.ts` — resolve symbolic shapes in `executeAssocScanBlockMap()`
+- `src/index.ts` — export `_fusedCacheCompileCount`
+- `test/block-map-jit.test.ts` — T7.8-WebGPU with compile-count assertions
 
 ---
 
@@ -695,7 +665,9 @@ When implementing these plans, search for and eliminate:
 - [ ] Apply embeds the vmapped body by inlining `evalJaxpr`, not by adding a new nested call
       primitive
 - [ ] Legacy `webgpu-fused-blocked` path fully deleted
-- [ ] `blockMapFusedCache` is shape-specialized
+- [x] `blockMapFusedCache` is shape-specialized (two-level cache with `blockMapSpecKey()`)
+- [x] `dynamic_axes` + `block_map` WebGPU bug fixed (SymDim resolution at execution time)
+- [x] Compile-count test observability via `_fusedCacheCompileCount()`
 - [ ] All 2641 tests pass (3 consecutive full-suite runs)
 - [ ] Associative-scan benchmarks show no regression > 2×
 - [ ] `BLOCK-MAP-IMPLEMENTATION-PLAN-2.md` updated to reference this plan's completion

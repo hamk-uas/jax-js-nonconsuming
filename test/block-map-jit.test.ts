@@ -6,6 +6,7 @@
  */
 
 import {
+  _fusedCacheCompileCount,
   defaultDevice,
   DType,
   grad,
@@ -2132,6 +2133,58 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
     expect(data[255]).toBe(500);
     expect(data[256]).toBe(500); // carry applied
     expect(data[299]).toBe(500);
+    f.dispose();
+  });
+
+  // T7.8-WebGPU: One polymorphic JitProgram fans out to multiple fused
+  // executables via the two-level specialization cache. Uses dynamic_axes
+  // so a single JitProgram is reused across invocations with different N,
+  // while the fused WebGPU shader requires distinct executables per gridShape.
+  // Verifies both correctness and cache partitioning via compile counter.
+  test("T7.8-WebGPU: dynamic_axes blockMap — one JitProgram, multiple fused executables", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+
+    const f = jit(
+      (xs: np.Array) =>
+        lax.blockMap(
+          (block: np.Array) =>
+            np.multiply(block, np.array(2, { dtype: DType.Float32 })),
+          xs,
+          { blockShape: [4] },
+        ),
+      { dynamic_axes: { 0: "T" } },
+    );
+
+    // Reset compile counter
+    _fusedCacheCompileCount(true);
+
+    // N=8 — gridShape=[2]: first specialization, expect 1 compile
+    using xs1 = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    using r1 = f(xs1);
+    expect(r1).toBeAllclose([2, 4, 6, 8, 10, 12, 14, 16]);
+    expect(_fusedCacheCompileCount()).toBe(1);
+
+    // N=12 — gridShape=[3]: second specialization, expect 2 total compiles
+    using xs2 = np.ones([12], { dtype: DType.Float32 });
+    using r2 = f(xs2);
+    expect(r2).toBeAllclose(new Array(12).fill(2));
+    expect(_fusedCacheCompileCount()).toBe(2);
+
+    // Re-run N=8 — cache hit, compile count stays at 2
+    using xs3 = np.array([10, 20, 30, 40, 50, 60, 70, 80], {
+      dtype: DType.Float32,
+    });
+    using r3 = f(xs3);
+    expect(r3).toBeAllclose([20, 40, 60, 80, 100, 120, 140, 160]);
+    expect(_fusedCacheCompileCount()).toBe(2);
+
+    // Re-run N=12 — cache hit, compile count stays at 2
+    using xs4 = np.ones([12], { dtype: DType.Float32 });
+    using r4 = f(xs4);
+    expect(r4).toBeAllclose(new Array(12).fill(2));
+    expect(_fusedCacheCompileCount()).toBe(2);
+
     f.dispose();
   });
 });

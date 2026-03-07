@@ -11,6 +11,7 @@ import type {
   PullbackArtifact,
   ResidualPack,
 } from "./frontend/artifacts";
+import { _fusedCacheCompileCount } from "./frontend/block-map-executor";
 import {
   type CacheSizes,
   checkLeaks,
@@ -66,6 +67,7 @@ export {
   devices,
   DType,
   type EffectVerificationResult,
+  _fusedCacheCompileCount,
   getBackend,
   getCacheSizes,
   hasSymbolicDims,

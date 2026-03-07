@@ -150,9 +150,10 @@ export type JitStep =
       outAxes: (number | null)[][];
       numConsts: number;
       numInputs: number;
-      gridShape: number[];
-      inputShapes: number[][];
-      outputShapes: number[][];
+      /** Potentially symbolic — must be resolved via dimBindings at execution. */
+      inputShapes: Dim[][];
+      /** Potentially symbolic — must be resolved via dimBindings at execution. */
+      outputShapes: Dim[][];
       consts: JitId[];
       inputs: JitId[];
       outputs: JitId[];
@@ -333,7 +334,7 @@ export class JitProgram {
           );
         case "block_map":
           return PPrint.pp(
-            `block_map grid=[${step.gridShape}] blockShape=[${step.blockShape}] numConsts=${step.numConsts} numInputs=${step.numInputs}`,
+            `block_map blockShape=[${step.blockShape}] numConsts=${step.numConsts} numInputs=${step.numInputs} inputShapes=[${step.inputShapes.map((s) => `[${s}]`).join(",")}]`,
           );
         case "fori_loop":
           return PPrint.pp(
@@ -690,6 +691,27 @@ export class JitProgram {
           const inputSlots = step.inputs.map((id) => scope.get(id)!);
           const outputSlots = step.outputs.map((id) => scope.get(id)!);
 
+          // Resolve potentially-symbolic shapes to concrete numbers.
+          const inputShapes = step.inputShapes.map((s) =>
+            dimBindings ? resolveShape(s, dimBindings) : (s as number[]),
+          );
+          const outputShapes = step.outputShapes.map((s) =>
+            dimBindings ? resolveShape(s, dimBindings) : (s as number[]),
+          );
+
+          // Compute gridShape from resolved input shapes and inAxes.
+          const gridRank = step.blockShape.length;
+          const gridShape: number[] = new globalThis.Array(gridRank).fill(0);
+          for (let ii = 0; ii < step.numInputs; ii++) {
+            const axes = step.inAxes[ii];
+            for (let g = 0; g < gridRank; g++) {
+              if (axes[g] !== null) {
+                const dim = inputShapes[ii][axes[g]!];
+                gridShape[g] = Math.ceil(dim / step.blockShape[g]);
+              }
+            }
+          }
+
           const bmResult = executeBlockMap({
             backend: this.backend,
             bodyProgram: step.bodyProgram,
@@ -699,9 +721,9 @@ export class JitProgram {
             outAxes: step.outAxes,
             numConsts: step.numConsts,
             numInputs: step.numInputs,
-            gridShape: step.gridShape,
-            inputShapes: step.inputShapes,
-            outputShapes: step.outputShapes,
+            gridShape,
+            inputShapes,
+            outputShapes,
             constSlots,
             inputSlots,
             outputSlots,
@@ -1640,21 +1662,11 @@ export function jitCompile(
         const constsIds = allInputIds.slice(0, numConsts);
         const inputIds = allInputIds.slice(numConsts, numConsts + numInputs);
 
-        // Compute grid shape from input shapes and inAxes
-        const gridRank = blockShape.length;
-        const gridShape: number[] = new globalThis.Array(gridRank).fill(0);
+        // Store raw (possibly symbolic) input/output shapes.
+        // gridShape is computed at execution time from resolved shapes.
         const inputAvals = eqn.inputs
           .slice(numConsts, numConsts + numInputs)
           .map((v) => v.aval);
-        for (let ii = 0; ii < numInputs; ii++) {
-          const axes = inAxes[ii];
-          for (let g = 0; g < gridRank; g++) {
-            if (axes[g] !== null) {
-              const dim = inputAvals[ii].shape[axes[g]!] as number;
-              gridShape[g] = Math.ceil(dim / blockShape[g]);
-            }
-          }
-        }
 
         // Allocate output buffers
         const outputIds: JitId[] = [];
@@ -1669,10 +1681,10 @@ export function jitCompile(
         // Compile body jaxpr
         const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
 
-        const inputShapes = inputAvals.map((a) => a.shape as number[]);
-        const outputShapes = eqn.outBinders.map(
-          (v) => v.aval.shape as number[],
-        );
+        const inputShapes: Dim[][] = inputAvals.map((a) => [...a.shape]);
+        const outputShapes: Dim[][] = eqn.outBinders.map((v) => [
+          ...v.aval.shape,
+        ]);
 
         builder.steps.push({
           type: "block_map",
@@ -1683,7 +1695,6 @@ export function jitCompile(
           outAxes,
           numConsts,
           numInputs,
-          gridShape,
           inputShapes,
           outputShapes,
           consts: constsIds,

@@ -572,6 +572,12 @@ function executeAssocScanBlockMap(
   const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
   const M = Math.ceil(N / B);
 
+  // Resolve elem shapes once — elemAvals may carry SymDim when dynamic_axes is
+  // used. Every subsequent shape access uses this concrete resolved array.
+  const resolvedElemShapes: number[][] = elemAvals.map((a) =>
+    dimBindings ? resolveShape(a.shape, dimBindings) : (a.shape as number[]),
+  );
+
   // Handle reverse: reverse input elements before local scan, reverse output after apply.
   // For simplicity, we reverse in-place in the output buffers.
   let inputSlots = elemSlots;
@@ -579,7 +585,7 @@ function executeAssocScanBlockMap(
     // Allocate reversed copies of input elements.
     inputSlots = [];
     for (let k = 0; k < numLeaves; k++) {
-      const elemShape = elemAvals[k].shape as number[];
+      const elemShape = resolvedElemShapes[k];
       const elemBw = byteWidth(elemAvals[k].dtype);
       const perElemBytes =
         elemShape.slice(1).reduce((a, b) => a * b, 1) * elemBw;
@@ -610,14 +616,14 @@ function executeAssocScanBlockMap(
   ];
   const outAxes: (number | null)[][] = elemAvals.map(() => [0]);
 
-  const inputShapes = elemAvals.map((a) => a.shape as number[]);
-  const outputShapes = elemAvals.map((a) => a.shape as number[]);
+  const inputShapes = resolvedElemShapes;
+  const outputShapes = resolvedElemShapes;
 
   // Allocate local scan output buffers
   const localScanSlots: Slot[] = [];
   for (let k = 0; k < numLeaves; k++) {
     const totalBytes =
-      (elemAvals[k].shape as number[]).reduce((a, b) => a * b, 1) *
+      resolvedElemShapes[k].reduce((a, b) => a * b, 1) *
       byteWidth(elemAvals[k].dtype);
     localScanSlots.push(backend.malloc(totalBytes));
   }
@@ -650,12 +656,12 @@ function executeAssocScanBlockMap(
     // Copy to pre-allocated output slots.
     for (let k = 0; k < numLeaves; k++) {
       const totalBytes =
-        (elemAvals[k].shape as number[]).reduce((a, b) => a * b, 1) *
+        resolvedElemShapes[k].reduce((a, b) => a * b, 1) *
         byteWidth(elemAvals[k].dtype);
       if (reverse) {
         // Reverse the output
         const perElemBytes =
-          (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+          resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
           byteWidth(elemAvals[k].dtype);
         for (let i = 0; i < N; i++) {
           backend.copyBufferToBuffer(
@@ -688,7 +694,7 @@ function executeAssocScanBlockMap(
   // summary_k[i] = localScan_k[min((i+1)*B - 1, N-1)]
   const summarySlots: Slot[] = [];
   for (let k = 0; k < numLeaves; k++) {
-    const elemShape = elemAvals[k].shape as number[];
+    const elemShape = resolvedElemShapes[k];
     const perElemBytes =
       elemShape.slice(1).reduce((a, b) => a * b, 1) *
       byteWidth(elemAvals[k].dtype);
@@ -713,7 +719,7 @@ function executeAssocScanBlockMap(
   // The body takes [consts, a, b] and returns [result].
   const scannedSummarySlots: Slot[] = [];
   for (let k = 0; k < numLeaves; k++) {
-    const elemShape = elemAvals[k].shape as number[];
+    const elemShape = resolvedElemShapes[k];
     const perElemBytes =
       elemShape.slice(1).reduce((a, b) => a * b, 1) *
       byteWidth(elemAvals[k].dtype);
@@ -727,7 +733,7 @@ function executeAssocScanBlockMap(
     // Initialize: scanned[0] = summary[0]
     for (let k = 0; k < numLeaves; k++) {
       const perElemBytes =
-        (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+        resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
         byteWidth(elemAvals[k].dtype);
       backend.copyBufferToBuffer(
         summarySlots[k],
@@ -745,7 +751,7 @@ function executeAssocScanBlockMap(
       const bSlots: Slot[] = [];
       for (let k = 0; k < numLeaves; k++) {
         const perElemBytes =
-          (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+          resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
           byteWidth(elemAvals[k].dtype);
         const a = backend.malloc(perElemBytes);
         backend.copyBufferToBuffer(
@@ -784,7 +790,7 @@ function executeAssocScanBlockMap(
       // Write result to scannedSummary[i]
       for (let k = 0; k < numLeaves; k++) {
         const perElemBytes =
-          (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+          resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
           byteWidth(elemAvals[k].dtype);
         backend.copyBufferToBuffer(
           bodyResult.outputs[k],
@@ -815,7 +821,7 @@ function executeAssocScanBlockMap(
 
       for (let k = 0; k < numLeaves; k++) {
         const perElemBytes =
-          (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+          resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
           byteWidth(elemAvals[k].dtype);
 
         const a = backend.malloc(perElemBytes);
@@ -854,7 +860,7 @@ function executeAssocScanBlockMap(
       // Write result to output at globalIdx
       for (let k = 0; k < numLeaves; k++) {
         const perElemBytes =
-          (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+          resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
           byteWidth(elemAvals[k].dtype);
         backend.copyBufferToBuffer(
           bodyResult.outputs[k],
@@ -873,7 +879,7 @@ function executeAssocScanBlockMap(
     const block0End = Math.min(B, N);
     for (let k = 0; k < numLeaves; k++) {
       const perElemBytes =
-        (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+        resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
         byteWidth(elemAvals[k].dtype);
       backend.copyBufferToBuffer(
         localScanSlots[k],
@@ -889,7 +895,7 @@ function executeAssocScanBlockMap(
   if (reverse) {
     for (let k = 0; k < numLeaves; k++) {
       const perElemBytes =
-        (elemAvals[k].shape as number[]).slice(1).reduce((a, b) => a * b, 1) *
+        resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
         byteWidth(elemAvals[k].dtype);
       const totalBytes = N * perElemBytes;
       const tmpSlot = backend.malloc(totalBytes);

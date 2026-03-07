@@ -68,17 +68,61 @@ export function executeBlockMap(
 }
 
 // ---------------------------------------------------------------------------
+// Fused cache compile counter — test observability for cache partitioning
+// ---------------------------------------------------------------------------
+
+/** Number of times prepareBlockMapFused was actually called (cache miss). */
+let _fusedCompileCount = 0;
+
+/**
+ * Return the current fused-cache compile count and optionally reset it.
+ * Test-only — verifies cache hit/miss behaviour.
+ */
+export function _fusedCacheCompileCount(reset = false): number {
+  const count = _fusedCompileCount;
+  if (reset) _fusedCompileCount = 0;
+  return count;
+}
+
+// ---------------------------------------------------------------------------
 // Fused WebGPU path: single-dispatch shared-memory shader
 // ---------------------------------------------------------------------------
 
-// Cache fused Executable by bodyProgram identity. The JitProgram is
-// identity-stable (cached by jitCompile) and encodes the backend, so
-// this avoids re-running the full WGSL codegen on every dispatch.
+// Cache fused Executable by bodyProgram identity + codegen-specialization key.
+// The JitProgram is identity-stable (cached by jitCompile) and may be
+// polymorphic (via dynamic_axes / SymDim). A single polymorphic JitProgram
+// can require multiple fused executables when concrete grid geometry differs,
+// because the WGSL bakes grid decomposition, boundary guards, strides, and
+// buffer indexing as compile-time constants.
 // Uses a regular Map (not WeakMap) so that clearCaches() deterministically
 // invalidates entries — avoiding non-deterministic GC timing issues with
 // checkLeaks slot counting.
-const blockMapFusedCache = new Map<JitProgram, Executable | null>();
+const blockMapFusedCache = new Map<
+  JitProgram,
+  Map<string, Executable | null>
+>();
 _registerJitCacheDisposer(() => blockMapFusedCache.clear());
+
+/**
+ * Codegen-specialization key for fused block-map executables.
+ * Includes only fields that affect the generated WGSL — excludes runtime
+ * data (slots, backend). If future work makes a field runtime-driven
+ * (e.g., grid extent as a uniform), remove it from the key at that time.
+ */
+function blockMapSpecKey(params: ExecuteBlockMapParams): string {
+  const parts = [
+    params.blockShape.join(","),
+    params.gridShape.join(","),
+    params.inAxes.map((a) => a.map((v) => v ?? "_").join(",")).join(";"),
+    params.outAxes.map((a) => a.map((v) => v ?? "_").join(",")).join(";"),
+    params.numConsts,
+    params.numInputs,
+    params.inputShapes.map((s) => s.join(",")).join(";"),
+    params.outputShapes.map((s) => s.join(",")).join(";"),
+    params.threadTile?.join(",") ?? "-",
+  ];
+  return parts.join("|");
+}
 
 function tryExecuteBlockMapFused(
   params: ExecuteBlockMapParams,
@@ -88,8 +132,15 @@ function tryExecuteBlockMapFused(
   const webgpuBackend =
     params.backend as import("../backend/webgpu").WebGPUBackend;
 
-  let exe = blockMapFusedCache.get(params.bodyProgram);
+  const specKey = blockMapSpecKey(params);
+  let inner = blockMapFusedCache.get(params.bodyProgram);
+  if (!inner) {
+    inner = new Map();
+    blockMapFusedCache.set(params.bodyProgram, inner);
+  }
+  let exe = inner.get(specKey);
   if (exe === undefined) {
+    _fusedCompileCount++;
     exe =
       webgpuBackend.prepareBlockMapFused({
         bodyProgram: params.bodyProgram,
@@ -103,7 +154,7 @@ function tryExecuteBlockMapFused(
         outputShapes: params.outputShapes,
         threadTile: params.threadTile,
       }) ?? null;
-    blockMapFusedCache.set(params.bodyProgram, exe);
+    inner.set(specKey, exe);
   }
 
   if (!exe) return null;
