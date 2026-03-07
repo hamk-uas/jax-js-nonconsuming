@@ -6,12 +6,15 @@ shared-memory GPU kernels**. Tiles data into blocks, applies a body sub-jaxpr pe
 flash attention, fused normalization, workgroup-local scans, and eventually replacing hand-written
 WGSL routines.
 
-**Status:** ✅ **COMPLETE** — Phases 0-5 implemented. Phases 7 (assocScan) delivered as standalone
-blocked codegen. See [COMPILING-EFFICIENT-SHADERS-PLAN.md](COMPILING-EFFICIENT-SHADERS-PLAN.md) for
-the shader optimization progression (Phases 0-5 achieved 53.7% of RTX 4070 Ti SUPER peak FP32 at
-4096×4096). Originally reviewed Feb 2026; v2.2 incorporates review feedback on matmul lowering,
-pattern detection, barrier placement, memory discipline, `fori_loop` primitive, separate
-input/output types, and workgroup size constraints.
+**Status:** ✅ **COMPLETE** — Phases 0-5 implemented. Phase 7 (assocScan local scan) routed through
+block_map (commit `6ab7203`). Inter-block phases (gather, summary scan, apply) are still JS-level;
+see [ASSOC-SCAN-UNIFORM-JAXPR-PLAN.md](ASSOC-SCAN-UNIFORM-JAXPR-PLAN.md) for the plan to make them
+fully jaxpr-driven and delete the legacy standalone WebGPU blocked shader path (~1,126 LOC). See
+[COMPILING-EFFICIENT-SHADERS-PLAN.md](COMPILING-EFFICIENT-SHADERS-PLAN.md) for the shader
+optimization progression (Phases 0-5 achieved 53.7% of RTX 4070 Ti SUPER peak FP32 at 4096×4096).
+Originally reviewed Feb 2026; v2.2 incorporates review feedback on matmul lowering, pattern
+detection, barrier placement, memory discipline, `fori_loop` primitive, separate input/output types,
+and workgroup size constraints.
 
 **Predecessor:** `BLOCK-MAP-IMPLEMENTATION-PLAN.md` (v1, deleted) viewed `block_map` primarily as an
 optimization path for `associativeScan`. This revision reframes it as a **general-purpose
