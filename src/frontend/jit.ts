@@ -183,6 +183,16 @@ export type JitStep =
       dtype: DType;
     }
   | {
+      type: "reverse";
+      input: JitId;
+      output: JitId;
+      axis: number;
+      axisSize: Dim;
+      innerBytes: number;
+      totalBytes: SizeExpr;
+      dtype: DType;
+    }
+  | {
       type: "assoc_scan";
       plan: AssocScanPlan;
       bodyProgram: JitProgram;
@@ -254,6 +264,7 @@ export interface JitStepCounts {
   scan: number;
   dus: number;
   scatter_add: number;
+  reverse: number;
   assoc_scan: number;
   block_map: number;
   fori_loop: number;
@@ -387,6 +398,10 @@ export class JitProgram {
           return PPrint.pp(
             `%${step.output} = scatter_add %${step.target} %${step.indices} %${step.updates} axis=${step.axis}`,
           );
+        case "reverse":
+          return PPrint.pp(
+            `%${step.output} = reverse %${step.input} axis=${step.axis} axisSize=${step.axisSize}`,
+          );
         case "assoc_scan":
           return PPrint.pp(
             `assoc_scan [${step.plan.path}] numLeaves=${step.numLeaves} numConsts=${step.numConsts} axis=${step.axis}` +
@@ -439,6 +454,7 @@ export class JitProgram {
       scan: 0,
       dus: 0,
       scatter_add: 0,
+      reverse: 0,
       assoc_scan: 0,
       block_map: 0,
       fori_loop: 0,
@@ -709,6 +725,41 @@ export class JitProgram {
             step.updatesLen,
             step.dtype,
           );
+          break;
+        }
+        case "reverse": {
+          // Flush pending ops — reverse needs materialized input
+          flushPendingBatched(pending, this.backend);
+
+          const inputSlot = scope.get(step.input)!;
+          const outSlot = scope.get(step.output)!;
+          const concreteAxisSize =
+            typeof step.axisSize === "number"
+              ? step.axisSize
+              : dimBindings!.get(
+                  (step.axisSize as import("../dim").SymDim).name,
+                )!;
+
+          if (this.backend.reverseBuffer) {
+            this.backend.reverseBuffer(
+              inputSlot,
+              outSlot,
+              concreteAxisSize,
+              step.innerBytes,
+              step.dtype,
+            );
+          } else {
+            // Generic fallback: copy slices in reverse order
+            for (let i = 0; i < concreteAxisSize; i++) {
+              this.backend.copyBufferToBuffer(
+                inputSlot,
+                i * step.innerBytes,
+                outSlot,
+                (concreteAxisSize - 1 - i) * step.innerBytes,
+                step.innerBytes,
+              );
+            }
+          }
           break;
         }
         case "assoc_scan": {
@@ -1008,6 +1059,8 @@ function stepUsesId(step: JitStep, id: JitId): boolean {
         step.updates === id ||
         step.output === id
       );
+    case "reverse":
+      return step.input === id || step.output === id;
     case "assoc_scan":
       return (
         step.outputs.includes(id) ||
@@ -1690,6 +1743,55 @@ export function jitCompile(
           axis,
           targetShape,
           updatesLen,
+          dtype,
+        });
+        continue;
+      }
+
+      // Handle Primitive.Reverse — compile to a reverse JitStep.
+      // Unlike Flip (which uses reshapeJit/ShapeTracker), Reverse materializes
+      // the reversal at execution time, supporting polymorphic lengths.
+      if (eqn.primitive === Primitive.Reverse) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<typeof Primitive.Reverse>;
+        const { axis } = params;
+
+        // Resolve input JitId
+        const input = eqn.inputs[0];
+        let inputId: JitId;
+        if (input instanceof Var) {
+          const jv = ctx.get(input)!;
+          if (jv.type !== "imm") {
+            throw new Error("jit: Reverse input is not imm");
+          }
+          inputId = jv.arg;
+        } else {
+          inputId = builder.pushLit(input as Lit);
+        }
+
+        const outVar = eqn.outBinders[0];
+        const dtype = outVar.aval.dtype;
+        const shape = input.aval.shape;
+        const axisSize = shape[axis]; // may be Dim (symbolic)
+        // innerBytes: product of all dimensions after the reversed axis × byteWidth
+        const trailingShape = (shape as Dim[]).slice(axis + 1);
+        const innerBytes =
+          (trailingShape.length > 0
+            ? (trailingShape as number[]).reduce((a, b) => a * b, 1)
+            : 1) * byteWidth(dtype);
+        const totalBytes = sizeExprMul(outVar.aval.sizeExpr, byteWidth(dtype));
+
+        const outId = builder.pushBuffer(totalBytes);
+        ctx.set(outVar, { type: "imm", arg: outId });
+
+        builder.steps.push({
+          type: "reverse",
+          input: inputId,
+          output: outId,
+          axis,
+          axisSize,
+          innerBytes,
+          totalBytes,
           dtype,
         });
         continue;
@@ -2475,6 +2577,9 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   },
   [Primitive.ScatterAdd]() {
     throw new Error("internal: ScatterAdd is handled specially in jitCompile");
+  },
+  [Primitive.Reverse]() {
+    throw new Error("internal: Reverse is handled specially in jitCompile");
   },
   [Primitive.AssociativeScan]() {
     throw new Error(

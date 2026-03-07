@@ -23,6 +23,7 @@ import {
   randomBits,
   reduce,
   reshape,
+  reverse,
   scatterAdd,
   ShapedArray,
   shrink,
@@ -511,6 +512,11 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     assertNonNull(xBdim);
     const newAxis = axis.map((ax) => ax + (xBdim <= ax ? 1 : 0));
     return [[flip(x, newAxis)], [xBdim]];
+  },
+  [Primitive.Reverse](axisSize, [x], [xBdim], { axis }) {
+    assertNonNull(xBdim);
+    const newAxis = axis + (xBdim <= axis ? 1 : 0);
+    return [[reverse(x, newAxis)], [xBdim]];
   },
   [Primitive.Shrink](axisSize, [x], [xBdim], { slice }) {
     assertNonNull(xBdim);

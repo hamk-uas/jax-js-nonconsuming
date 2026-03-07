@@ -293,6 +293,19 @@ export interface Backend {
     updatesLen: number,
     dtype: DType,
   ): void;
+
+  /**
+   * Optional: reverse a buffer along a single axis.
+   * Copies `axisSize` contiguous slices of `innerBytes` in reverse order
+   * from `input` to `output`.
+   */
+  reverseBuffer?(
+    input: Slot,
+    output: Slot,
+    axisSize: number,
+    innerBytes: number,
+    dtype: DType,
+  ): void;
 }
 
 export class Executable<T = any> {

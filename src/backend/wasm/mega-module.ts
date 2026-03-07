@@ -157,6 +157,7 @@ export function canCompileToMegaModule(steps: JitStep[]): boolean {
       case "scan":
       case "dus":
       case "scatter_add":
+      case "reverse":
       case "assoc_scan":
       case "block_map":
       case "workgroup_assoc_scan":

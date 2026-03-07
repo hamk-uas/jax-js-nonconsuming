@@ -535,7 +535,6 @@ function executeAssocScanBlockMap(
     plan,
     numLeaves,
     axis,
-    reverse,
     constSlots,
     elemSlots,
     elemAvals,
@@ -567,33 +566,6 @@ function executeAssocScanBlockMap(
   const resolvedElemShapes: number[][] = elemAvals.map((a) =>
     dimBindings ? resolveShape(a.shape, dimBindings) : (a.shape as number[]),
   );
-
-  // Handle reverse: reverse input elements before local scan, reverse output after apply.
-  // For simplicity, we reverse in-place in the output buffers.
-  let inputSlots = elemSlots;
-  if (reverse) {
-    // Allocate reversed copies of input elements.
-    inputSlots = [];
-    for (let k = 0; k < numLeaves; k++) {
-      const elemShape = resolvedElemShapes[k];
-      const elemBw = byteWidth(elemAvals[k].dtype);
-      const perElemBytes =
-        elemShape.slice(1).reduce((a, b) => a * b, 1) * elemBw;
-      const totalBytes = N * perElemBytes;
-      const revSlot = backend.malloc(totalBytes);
-      // Reverse: copy element i → position N-1-i
-      for (let i = 0; i < N; i++) {
-        backend.copyBufferToBuffer(
-          elemSlots[k],
-          i * perElemBytes,
-          revSlot,
-          (N - 1 - i) * perElemBytes,
-          perElemBytes,
-        );
-      }
-      inputSlots.push(revSlot);
-    }
-  }
 
   // --- Phase 1: Local scan via block_map ---
   const gridShape = [M];
@@ -631,7 +603,7 @@ function executeAssocScanBlockMap(
     inputShapes,
     outputShapes,
     constSlots,
-    inputSlots: reverse ? inputSlots : elemSlots,
+    inputSlots: elemSlots,
     outputSlots: localScanSlots,
   };
 
@@ -648,33 +620,14 @@ function executeAssocScanBlockMap(
       const totalBytes =
         resolvedElemShapes[k].reduce((a, b) => a * b, 1) *
         byteWidth(elemAvals[k].dtype);
-      if (reverse) {
-        // Reverse the output
-        const perElemBytes =
-          resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
-          byteWidth(elemAvals[k].dtype);
-        for (let i = 0; i < N; i++) {
-          backend.copyBufferToBuffer(
-            localScanSlots[k],
-            i * perElemBytes,
-            outputSlots[k],
-            (N - 1 - i) * perElemBytes,
-            perElemBytes,
-          );
-        }
-      } else {
-        backend.copyBufferToBuffer(
-          localScanSlots[k],
-          0,
-          outputSlots[k],
-          0,
-          totalBytes,
-        );
-      }
+      backend.copyBufferToBuffer(
+        localScanSlots[k],
+        0,
+        outputSlots[k],
+        0,
+        totalBytes,
+      );
       backend.decRef(localScanSlots[k]);
-    }
-    if (reverse) {
-      for (const s of inputSlots) backend.decRef(s);
     }
     return { outputs: outputSlots, pending: [] };
   }
@@ -842,30 +795,6 @@ function executeAssocScanBlockMap(
         block0End * perElemBytes,
       );
     }
-  }
-
-  // If reverse, reverse the output
-  if (reverse) {
-    for (let k = 0; k < numLeaves; k++) {
-      const perElemBytes =
-        resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
-        byteWidth(elemAvals[k].dtype);
-      const totalBytes = N * perElemBytes;
-      const tmpSlot = backend.malloc(totalBytes);
-      backend.copyBufferToBuffer(outputSlots[k], 0, tmpSlot, 0, totalBytes);
-      for (let i = 0; i < N; i++) {
-        backend.copyBufferToBuffer(
-          tmpSlot,
-          i * perElemBytes,
-          outputSlots[k],
-          (N - 1 - i) * perElemBytes,
-          perElemBytes,
-        );
-      }
-      backend.decRef(tmpSlot);
-    }
-    // Free reversed input copies
-    for (const s of inputSlots) backend.decRef(s);
   }
 
   // Cleanup

@@ -176,7 +176,7 @@ function associativeScanCore<T extends JsTree<Array>>(
     workingOwned = [];
     for (let i = 0; i < flatElems.length; i++) {
       const m = movedArrays[i];
-      const flipped = core.flip(m, [0]) as Array;
+      const flipped = core.reverse(m, 0) as Array;
       // Dispose the moved intermediate if it was a fresh allocation (axis≠0).
       if (m !== flatElems[i]) m.dispose();
       working.push(flipped);
@@ -269,7 +269,7 @@ function associativeScanCore<T extends JsTree<Array>>(
   let postReverse: Array[];
   let postReverseOwned: boolean[];
   if (reverse) {
-    postReverse = current.map((a) => core.flip(a, [0]) as Array);
+    postReverse = current.map((a) => core.reverse(a, 0) as Array);
     // Dispose current (we own them all at this point).
     for (let i = 0; i < current.length; i++) {
       if (currentOwned[i]) current[i].dispose();
@@ -372,25 +372,44 @@ export function associativeScan<T extends JsTree<Array>>(
     }
   }
 
-  // 5. Emit primitive (closedJaxpr is live here — early return above if !shapeOk)
+  // 5. Canonicalize reverse: Reverse(AssocScan(Reverse(xs))).
+  //    The primitive always sees reverse=false; reverse semantics live in
+  //    surrounding Reverse nodes so the executor never needs reverse awareness.
+  let scanInputs = movedElems;
+  if (reverse) {
+    scanInputs = movedElems.map((a) => core.reverse(a, 0) as Array);
+  }
+
   /* eslint-disable jax-js/no-use-after-dispose */
-  const results = bind(
+  const rawResults = bind(
     Primitive.AssociativeScan,
-    [...closedJaxpr.consts, ...movedElems],
+    [...closedJaxpr.consts, ...scanInputs],
     {
       jaxpr: closedJaxpr.jaxpr,
       numLeaves,
       axis: 0,
-      reverse,
+      reverse: false,
     },
   );
 
   // 6. Cleanup
   closedJaxpr.dispose();
   /* eslint-enable jax-js/no-use-after-dispose */
+  if (reverse) {
+    for (const s of scanInputs) (s as Array).dispose();
+  }
   for (let i = 0; i < movedElems.length; i++) {
     if (movedOwned[i]) movedElems[i].dispose();
   }
+
+  // 6b. Reverse outputs back if needed
+  const results = reverse
+    ? (rawResults as Array[]).map((r) => {
+        const rev = core.reverse(r, 0) as Array;
+        (r as Array).dispose();
+        return rev;
+      })
+    : rawResults;
 
   // 7. Move axis back if needed
   let finalResults = results as Array[];

@@ -63,6 +63,7 @@ import {
   PrimitiveParams,
   reduce,
   reshape,
+  reverse,
   scatterAdd,
   ShapedArray,
   shrink,
@@ -2101,6 +2102,11 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
   [Primitive.Flip]([ct], [x], { axis }) {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Flip);
     return [flip(ct, axis)];
+  },
+  [Primitive.Reverse]([ct], [x], { axis }) {
+    if (!(x instanceof UndefPrimal))
+      throw new NonlinearError(Primitive.Reverse);
+    return [reverse(ct, axis)];
   },
   [Primitive.Shrink]([ct], [x], { slice }) {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Shrink);

@@ -652,12 +652,12 @@ When implementing these plans, search for and eliminate:
 
 - [x] No algorithmic JS loops remain in `executeAssocScanBlockMap()` other than stage dispatch /
       cleanup (Plan 1c+1d: recursive summary + vmapped apply)
-- [x] Gather is executed as a planned block_map stage or equivalent primitive-backed Jaxpr
-      (local scan via block_map with WorkgroupAssociativeScan primitive)
+- [x] Gather is executed as a planned block_map stage or equivalent primitive-backed Jaxpr (local
+      scan via block_map with WorkgroupAssociativeScan primitive)
 - [x] Summary recursion is represented in the plan tree; the executor only dispatches the child plan
       (Plan 1c: recursive `planAssociativeScan()` + `executeAssociativeScan()`)
-- [x] Apply phase is executed as one planned block_map stage across all blocks
-      (Plan 1d: vmapped apply body via `vmapJaxpr()`)
+- [x] Apply phase is executed as one planned block_map stage across all blocks (Plan 1d: vmapped
+      apply body via `vmapJaxpr()`)
 - [ ] Reverse is represented by traced `flip` semantics or a Jaxpr primitive, not executor-side
       copies — **SKIPPED**: Plan 1b reverted; `ShapeTracker.flip()` bakes `(N-1)*stride` into
       compiled offset, incompatible with `dynamic_axes`. Reverse handled at executor level.

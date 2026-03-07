@@ -405,6 +405,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Broadcast]: linearTangentsJvp(Primitive.Broadcast),
   [Primitive.Reshape]: linearTangentsJvp(Primitive.Reshape),
   [Primitive.Flip]: linearTangentsJvp(Primitive.Flip),
+  [Primitive.Reverse]: linearTangentsJvp(Primitive.Reverse),
   [Primitive.Shrink]: linearTangentsJvp(Primitive.Shrink),
   [Primitive.Pad]: linearTangentsJvp(Primitive.Pad),
   [Primitive.Sort]([x], [dx]) {

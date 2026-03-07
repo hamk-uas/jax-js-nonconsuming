@@ -20,7 +20,7 @@ import {
   type LeakReport,
   type SnapshotEntry,
 } from "./frontend/check-leaks";
-import { scatterAdd } from "./frontend/core";
+import { reverse, scatterAdd } from "./frontend/core";
 import * as jaxprModule from "./frontend/jaxpr";
 import {
   _setDebugAnonymousConsts,
@@ -88,6 +88,7 @@ export {
   type PullbackArtifact,
   random,
   type ResidualPack,
+  reverse,
   scatterAdd,
   _setVerifyEffects,
   _setDebugAnonymousConsts,

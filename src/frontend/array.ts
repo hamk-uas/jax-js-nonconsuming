@@ -1228,6 +1228,13 @@ export class Array extends Tracer {
         for (const ax of axis) arg[ax] = true;
         return [x.#reshape(x.#st.flip(arg))];
       },
+      [Primitive.Reverse]([x], { axis }) {
+        const arg = rep(x.ndim, false);
+        arg[axis] = true;
+        const flipped = x.#reshape(x.#st.flip(arg));
+        flipped.#realize();
+        return [flipped];
+      },
       [Primitive.Shrink]([x], { slice }) {
         return [x.#reshape(x.#st.shrink(slice))];
       },

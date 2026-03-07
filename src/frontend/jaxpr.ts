@@ -1482,6 +1482,9 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
   [Primitive.Flip]([x], _) {
     return [ShapedArray.fromAval(x)];
   },
+  [Primitive.Reverse]([x], _) {
+    return [ShapedArray.fromAval(x)];
+  },
   [Primitive.Shrink]([x], { slice }) {
     const newShape: Dim[] = slice.map((s) => s[1] - s[0]);
     return [new ShapedArray(newShape, x.dtype, x.weakType)];

@@ -99,6 +99,8 @@ export enum Primitive {
   DynamicSlice = "dynamic_slice",
   // Like DynamicSlice but without min/max clamping (caller guarantees in-bounds)
   UncheckedDynamicSlice = "unchecked_dynamic_slice",
+  // Reverse elements along an axis (materializing, not a view)
+  Reverse = "reverse",
   // Atomic scatter-add: target[indices[i]] += updates[i]
   ScatterAdd = "scatter_add",
 
@@ -142,6 +144,7 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.Broadcast]: { shape: Dim[]; axis: number[] };
   [Primitive.Reshape]: { shape: number[] };
   [Primitive.Flip]: { axis: number[] };
+  [Primitive.Reverse]: { axis: number };
   [Primitive.Shrink]: { slice: Pair[] };
   [Primitive.Pad]: { width: Pair[] };
   // Update a contiguous slice along a single axis: dst[axis=offset:offset+src.shape[axis]] = src
@@ -549,6 +552,11 @@ export function reshape(x: TracerValue, shape: number | number[]) {
 export function flip(x: TracerValue, axis: number[]) {
   axis = normalizeAxis(axis, ndim(x));
   return bind1(Primitive.Flip, [x], { axis });
+}
+
+export function reverse(x: TracerValue, axis: number) {
+  axis = normalizeAxis([axis], ndim(x))[0];
+  return bind1(Primitive.Reverse, [x], { axis });
 }
 
 export function shrink(x: TracerValue, slice: Pair[]) {
