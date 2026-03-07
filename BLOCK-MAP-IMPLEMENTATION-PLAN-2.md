@@ -7,9 +7,11 @@ flash attention, fused normalization, workgroup-local scans, and eventually repl
 WGSL routines.
 
 **Status:** ✅ **COMPLETE** — Phases 0-5 implemented. Phase 7 (assocScan local scan) routed through
-block_map (commit `6ab7203`). Inter-block phases (gather, summary scan, apply) are still JS-level;
-see [ASSOC-SCAN-UNIFORM-JAXPR-PLAN.md](ASSOC-SCAN-UNIFORM-JAXPR-PLAN.md) for the plan to make them
-fully jaxpr-driven and delete the legacy standalone WebGPU blocked shader path (~1,126 LOC). See
+block_map (commit `6ab7203`). The
+[ASSOC-SCAN-UNIFORM-JAXPR-PLAN.md](ASSOC-SCAN-UNIFORM-JAXPR-PLAN.md) is now also complete: all
+inter-block phases (gather, summary scan, apply) are jaxpr-driven, the legacy standalone WebGPU
+blocked shader path is deleted (-1761 LOC, commit `db6a870`), and reverse is canonicalized via
+`Primitive.Reverse` (commit `7c7a7f9`). See
 [COMPILING-EFFICIENT-SHADERS-PLAN.md](COMPILING-EFFICIENT-SHADERS-PLAN.md) for the shader
 optimization progression (Phases 0-5 achieved 53.7% of RTX 4070 Ti SUPER peak FP32 at 4096×4096).
 Originally reviewed Feb 2026; v2.2 incorporates review feedback on matmul lowering, pattern

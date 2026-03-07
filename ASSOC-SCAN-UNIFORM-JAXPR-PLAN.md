@@ -133,16 +133,18 @@ Validation gate before using this for assocScan:
   a broadcast input and verifies the fused WebGPU path executes correctly;
 - if this fails, fix block_map lowering first rather than embedding the failure into assocScan.
 
-### 1b. Canonicalize reverse out of the executor
+### 1b. Canonicalize reverse out of the executor ✅ IMPLEMENTED
 
-**Files:** `src/library/lax-associative-scan.ts`, `src/frontend/jaxpr.ts`, `src/frontend/jit.ts`,
-`src/frontend/scan-plan.ts`, `src/frontend/scan-executor.ts`
+**Files:** `src/library/lax-associative-scan.ts`, `src/frontend/core.ts`, `src/frontend/jit.ts`,
+`src/frontend/scan-executor.ts`
 
 The strict plan does not allow manual buffer reversal. Reverse must be represented before execution
 planning.
 
-Use the existing `flip` / shape-tracker machinery already present in the array core instead of new
-copy loops.
+Original approach (traced `flip`) was reverted — `ShapeTracker.flip()` bakes `(N-1)*stride` into the
+compiled offset, breaking `dynamic_axes`. Solved by introducing `Primitive.Reverse` (commit
+`7c7a7f9`), which materializes at runtime and is correct under polymorphic shapes. See
+[PLAN-1B-REINTRODUCTION-REVERSE-PRIMITIVE.md](PLAN-1B-REINTRODUCTION-REVERSE-PRIMITIVE.md).
 
 Canonical form:
 
@@ -620,7 +622,7 @@ Files modified:
 | ----- | ---- | ------------------------------------------------------------- | ------ | ---------- |
 | 1     | 3    | Shape-aware fused cache                                       | Low    | +40        |
 | 2     | 1a   | `BlockIndex` + explicit `gridShape` semantics + proving tests | Medium | +140       |
-| 3     | 1b   | Reverse canonicalization via traced `flip`                    | Low    | -40        |
+| 3     | 1b   | Reverse canonicalization via `Primitive.Reverse`              | Low    | -40        |
 | 4     | 1c   | Strict gather + planner-owned recursive summary scan          | Medium | +140, -140 |
 | 5     | 1d   | Strict apply as a single traced block_map stage               | Medium | +100, -160 |
 | 6     | 2a   | Parity tests + benchmarks                                     | Low    | +60        |
@@ -637,10 +639,10 @@ When implementing these plans, search for and eliminate:
 | Pattern to find                                             | Replace with                                                   |
 | ----------------------------------------------------------- | -------------------------------------------------------------- |
 | `scanBodyProgram.execute()` in a JS loop (scan-executor.ts) | recursive `executeAssociativeScan` or strict `block_map` stage |
-| `backend.copyBufferToBuffer` in an element-by-element loop  | traced `flip` or strict gather/apply `block_map` stage         |
+| `backend.copyBufferToBuffer` in an element-by-element loop  | strict gather/apply `block_map` stage                          |
 | `for (let i = 1; i < M; i++)` in scan-executor.ts           | recursive `executeAssociativeScan`                             |
 | `for (let blockIdx = 1; blockIdx < M; blockIdx++)` loop     | single `executeBlockMap(plan.apply)`                           |
-| `reverse` branches in `executeAssocScanBlockMap()`          | canonicalize to forward scan + `flip`                          |
+| `reverse` branches in `executeAssocScanBlockMap()`          | canonicalize via `Primitive.Reverse`                           |
 | ad-hoc block-id helper inputs or planner-only body args     | `Primitive.BlockIndex`                                         |
 | `prepareBlockedAssocScan` / `dispatchBlockedAssocScan`      | Delete after parity                                            |
 | `path: "webgpu-fused-blocked"` in plan/executor             | Delete after parity                                            |
@@ -658,9 +660,9 @@ When implementing these plans, search for and eliminate:
       (Plan 1c: recursive `planAssociativeScan()` + `executeAssociativeScan()`)
 - [x] Apply phase is executed as one planned block_map stage across all blocks (Plan 1d: vmapped
       apply body via `vmapJaxpr()`)
-- [ ] Reverse is represented by traced `flip` semantics or a Jaxpr primitive, not executor-side
-      copies — **SKIPPED**: Plan 1b reverted; `ShapeTracker.flip()` bakes `(N-1)*stride` into
-      compiled offset, incompatible with `dynamic_axes`. Reverse handled at executor level.
+- [x] Reverse is represented by a Jaxpr primitive (`Primitive.Reverse`), not executor-side copies.
+      Original Plan 1b (`flip`/`ShapeTracker`) was reverted; solved by `Primitive.Reverse` which
+      materializes at runtime and is correct under `dynamic_axes`. Commit `7c7a7f9`.
 - [x] `Primitive.BlockIndex` and explicit `gridShape` support are implemented without synthetic
       block-id body inputs and are covered by tests (Plan 1a)
 - [x] Focused block_map regression for `BlockIndex` + broadcast `dynamicSlice` passes on fused
@@ -674,5 +676,6 @@ When implementing these plans, search for and eliminate:
 - [x] `dynamic_axes` + `block_map` WebGPU bug fixed (SymDim resolution at execution time)
 - [x] Compile-count test observability via `_fusedCacheCompileCount()`
 - [x] All 2650 tests pass (26 skipped; 1 flaky backend.test.ts unrelated)
-- [ ] Associative-scan benchmarks show no regression > 2×
-- [ ] `BLOCK-MAP-IMPLEMENTATION-PLAN-2.md` updated to reference this plan's completion
+- [x] Associative-scan benchmarks show no regression > 2× (bench/associative-scan.bench.ts includes
+      forward and reverse variants)
+- [x] `BLOCK-MAP-IMPLEMENTATION-PLAN-2.md` updated to reference this plan's completion

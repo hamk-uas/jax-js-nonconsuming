@@ -627,18 +627,18 @@ Includes:
 
 ## Acceptance Criteria
 
-- [ ] `Primitive.Reverse` exists and is exported
-- [ ] eager `reverse` materializes a correct concrete result without depending on symbolic
+- [x] `Primitive.Reverse` exists and is exported
+- [x] eager `reverse` materializes a correct concrete result without depending on symbolic
       `ShapeTracker` behavior
-- [ ] `jit(reverse(x))` works on concrete shapes
-- [ ] `jit(reverse(x))` works under `dynamic_axes`
-- [ ] `jvp(reverse)`, transpose, and `vmap(reverse)` are implemented
-- [ ] `associativeScan(reverse=true)` is canonicalized into forward scan plus `Reverse`
-- [ ] `executeAssocScanBlockMap()` contains no reverse-specific algorithmic branches
-- [ ] WebGPU block-map assoc-scan plan no longer needs reverse-specific execution behavior
-- [ ] polymorphic reverse assoc-scan regression passes
-- [ ] generic reverse execution remains correct even when a backend-specific fast path is absent
-- [ ] reverse benchmarks are recorded
+- [x] `jit(reverse(x))` works on concrete shapes
+- [x] `jit(reverse(x))` works under `dynamic_axes`
+- [x] `jvp(reverse)`, transpose, and `vmap(reverse)` are implemented
+- [x] `associativeScan(reverse=true)` is canonicalized into forward scan plus `Reverse`
+- [x] `executeAssocScanBlockMap()` contains no reverse-specific algorithmic branches
+- [x] WebGPU block-map assoc-scan plan no longer needs reverse-specific execution behavior
+- [x] polymorphic reverse assoc-scan regression passes
+- [x] generic reverse execution remains correct even when a backend-specific fast path is absent
+- [x] reverse benchmarks are recorded
 
 ---
 
