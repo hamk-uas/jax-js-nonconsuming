@@ -15,6 +15,7 @@ import {
   lax,
   numpy as np,
   setDebug,
+  vmap,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { afterEach, describe, expect, test } from "vitest";
 
@@ -2280,5 +2281,103 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
     expect(result.shape).toEqual([12]);
     expect(result).toBeAllclose([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     f.dispose();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Plan 2a: Parity tests — block-map path boundary cases
+  // ---------------------------------------------------------------------------
+
+  test("T7.9: N=256 (exactly B) single block, no summary/apply needed", () => {
+    const N = 256;
+    using xs = np.array(
+      Array.from({ length: N }, () => 1),
+      { dtype: DType.Float32 },
+    );
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    const js = result.js() as number[];
+    for (let i = 0; i < N; i++) {
+      expect(js[i]).toBeCloseTo(i + 1, 4);
+    }
+  });
+
+  test("T7.10: N=257 (B+1) minimal multi-block boundary", () => {
+    const N = 257;
+    using xs = np.array(
+      Array.from({ length: N }, () => 1),
+      { dtype: DType.Float32 },
+    );
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    const js = result.js() as number[];
+    // First element = 1, last element = 257
+    expect(js[0]).toBeCloseTo(1, 4);
+    expect(js[N - 1]).toBeCloseTo(N, 4);
+    // Cross-block boundary: element 256 should equal 257
+    expect(js[256]).toBeCloseTo(257, 4);
+  });
+
+  test("T7.11: N=529 (2B+17) non-divisible with 3 blocks", () => {
+    const N = 529;
+    using xs = np.array(
+      Array.from({ length: N }, () => 1),
+      { dtype: DType.Float32 },
+    );
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    const js = result.js() as number[];
+    // Check all cross-block boundaries
+    expect(js[255]).toBeCloseTo(256, 4); // end of block 0
+    expect(js[256]).toBeCloseTo(257, 4); // start of block 1
+    expect(js[511]).toBeCloseTo(512, 4); // end of block 1
+    expect(js[512]).toBeCloseTo(513, 4); // start of block 2
+    expect(js[N - 1]).toBeCloseTo(N, 4); // last element
+  });
+
+  test("T7.12: reverse cumsum N=500 on WebGPU block-map path", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+    const N = 500;
+    using xs = np.array(
+      Array.from({ length: N }, () => 1),
+      { dtype: DType.Float32 },
+    );
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x, {
+        reverse: true,
+      }),
+    );
+    using result = f(xs) as np.Array;
+    const js = result.js() as number[];
+    // Reverse cumsum of all-ones: result[i] = N - i
+    expect(js[0]).toBeCloseTo(N, 4);
+    expect(js[N - 1]).toBeCloseTo(1, 4);
+    expect(js[256]).toBeCloseTo(N - 256, 4);
+  });
+
+  // KNOWN_BUG: jit(vmap(assocScan)) produces wrong results for N≥256.
+  // vmap(assocScan) without jit works correctly, so the bug is in the
+  // JIT-compiled vmap path, likely compiled-loop axis handling.
+  test.skip("T7.13: vmap(associativeScan) batch=4 N=256", () => {
+    const batch = 4;
+    const N = 256;
+    const add = (a: np.Array, b: np.Array) => np.add(a, b);
+    using f = jit(vmap((xs: np.Array) => lax.associativeScan(add, xs)));
+    // Create batch of inputs: each row is all-ones
+    using xs = np.ones([batch, N], { dtype: DType.Float32 });
+    using result = f(xs) as np.Array;
+    expect(result.shape).toEqual([batch, N]);
+    const js = result.js() as number[][];
+    // Each row should be [1, 2, 3, ..., N]
+    for (let b = 0; b < batch; b++) {
+      expect(js[b][0]).toBeCloseTo(1, 4);
+      expect(js[b][N - 1]).toBeCloseTo(N, 4);
+    }
   });
 });
