@@ -2793,8 +2793,8 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         const primalOuts = outs.slice(0, numOrigLeaves);
         for (let i = numOrigLeaves; i < outs.length; i++) outs[i].dispose();
 
-        // carry = newY, ys = snapshot of carry before step
-        return [...primalOuts, ...carry];
+        // carry = newY, ys = newY passthrough (enables compiled-loop)
+        return [...primalOuts, ...primalOuts];
       },
       { validateRefs: false },
     )(...fwdBodyInAvals);
@@ -2811,9 +2811,26 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       },
     ) as Tracer[];
 
-    // stackedPrevYs[j] has shape [N-1, ...leaf_j] = y[0], y[1], ..., y[N-2]
-    const stackedPrevYs = fwdScanOuts.slice(numOrigLeaves);
+    // Stacked Ys are [y[1], ..., y[N-1]] (carry output at each iteration).
+    // We need stackedPrevYs = [y[0], ..., y[N-2]] (carry input at each step).
+    // Reconstruct by prepending initCarry and removing the last element.
+    const stackedAfterYs = fwdScanOuts.slice(numOrigLeaves);
     for (let i = 0; i < numOrigLeaves; i++) fwdScanOuts[i].dispose();
+
+    const stackedPrevYs: Tracer[] = [];
+    for (let j = 0; j < numOrigLeaves; j++) {
+      const leafShape = fwdInitCarry[j].shape as number[];
+      const y0 = broadcast(fwdInitCarry[j], [1, ...leafShape], [0]);
+      const rest = shrink(stackedAfterYs[j], [
+        [0, N - 2],
+        ...leafShape.map((s) => [0, s] as [number, number]),
+      ]);
+      const prev = concatenate([y0, rest], 0);
+      y0.dispose();
+      rest.dispose();
+      stackedAfterYs[j].dispose();
+      stackedPrevYs.push(prev);
+    }
 
     // ----- Split cotangents -----
     const ctPrimal = cts.slice(0, numOrigLeaves);

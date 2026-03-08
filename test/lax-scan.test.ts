@@ -1915,7 +1915,7 @@ describe("preencoded multi-step scan (WebGPU)", () => {
     ]);
 
     const [[finalA, finalB], ys] = lax.scan(step, [initA, initB], xs, {
-      acceptPath: "preencoded-multi-step",
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
     });
 
     // a accumulates: [0,0]+[1,2]=[1,2], +[3,4]=[4,6], +[5,6]=[9,12]
@@ -1946,7 +1946,7 @@ describe("preencoded multi-step scan (WebGPU)", () => {
     using xs = np.array([[1.0], [2.0], [3.0], [4.0]]);
 
     const [finalCarry, ys] = lax.scan(step, initCarry, xs, {
-      acceptPath: "preencoded-multi-step",
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
     });
 
     // carry: 0+1=1, 1+2=3, 3+3=6, 6+4=10
@@ -1974,7 +1974,7 @@ describe("preencoded multi-step scan (WebGPU)", () => {
 
     const [[finalA, finalB], ys] = lax.scan(step, [initA, initB], xs, {
       reverse: true,
-      acceptPath: "preencoded-multi-step",
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
     });
 
     // reverse order: x=[3],[2],[1]
@@ -2004,7 +2004,7 @@ describe("preencoded multi-step scan (WebGPU)", () => {
     using xs = np.ones([100, size]);
 
     const [finalCarry, ys] = lax.scan(step, initCarry, xs, {
-      acceptPath: "preencoded-multi-step",
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
     });
 
     using expected = np.full([size], 100);
@@ -2031,7 +2031,7 @@ describe("preencoded multi-step scan (WebGPU)", () => {
 
     using f = jit((init: np.Array, data: np.Array) =>
       lax.scan(step, init, data, {
-        acceptPath: "preencoded-multi-step",
+        acceptPath: ["compiled-loop", "preencoded-multi-step"],
       }),
     );
 
@@ -2065,7 +2065,7 @@ describe("preencoded multi-step scan (WebGPU)", () => {
       step,
       { sum: initSum, count: initCount },
       xs,
-      { acceptPath: "preencoded-multi-step" },
+      { acceptPath: ["compiled-loop", "preencoded-multi-step"] },
     );
 
     expect(finalCarry.sum).toBeAllclose([60]);
@@ -2130,7 +2130,7 @@ describe("preencoded multi-step with routines (WebGPU)", () => {
     using xs = np.array([[1.0], [1.0], [1.0]]);
 
     const [finalCarry, ys] = lax.scan(step, initVal, xs, {
-      acceptPath: "preencoded-multi-step",
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
     });
 
     // After 3 iterations of chol(carry * 1.0) = chol(carry):
@@ -2165,7 +2165,7 @@ describe("preencoded multi-step with routines (WebGPU)", () => {
     using xs = np.array([[1.0], [1.0]]);
 
     const [finalCarry, ys] = lax.scan(step, initVal, xs, {
-      acceptPath: "preencoded-multi-step",
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
     });
 
     // L·L^T should reconstruct the original matrix (idempotent)
@@ -2195,7 +2195,7 @@ describe("preencoded multi-step with routines (WebGPU)", () => {
       using xs = np.array([[1.0], [1.0]]);
 
       return lax.scan(step, initVal, xs, {
-        acceptPath: "preencoded-multi-step",
+        acceptPath: ["compiled-loop", "preencoded-multi-step"],
       });
     });
 

@@ -663,9 +663,9 @@ function tryPrepareWasmNativeScan(
  * local variables for internal intermediates — no extra storage bindings.
  *
  * Constraints:
- * - numCarry === numY or numY === 0 (each carry maps 1:1 to a Y output)
  * - No routine steps (only kernel steps)
  * - Total storage bindings ≤ maxStorageBuffersPerShaderStage
+ * - Y outputs must be produced by body steps or be carry passthroughs
  */
 function tryPrepareWebGPUNativeScan(
   backend: Backend,
@@ -683,15 +683,6 @@ function tryPrepareWebGPUNativeScan(
   executable: Executable;
   params: NativeScanMultiParams;
 } | null {
-  // Constraint: numCarry === numY or numY === 0
-  if (numY !== 0 && numCarry !== numY) {
-    if (DEBUG >= 1)
-      console.log(
-        `[webgpu-scan] skipped, numCarry=${numCarry} !== numY=${numY}`,
-      );
-    return null;
-  }
-
   // No routine steps
   if (classification.hasRoutines) {
     if (DEBUG >= 1) console.log(`[webgpu-scan] skipped, routine in scan body`);
@@ -761,18 +752,25 @@ function tryPrepareWebGPUNativeScan(
     // Passthrough carries are fine — carry buffer retains its value
   }
 
-  // Check Y outputs match carries (when numY > 0)
-  if (numY > 0) {
-    const yOutIds = bodyProgram.outputs.slice(numCarry);
-    for (let yi = 0; yi < numY; yi++) {
-      if (yOutIds[yi] !== carryOutIds[yi]) {
-        if (DEBUG >= 1)
-          console.log(
-            `[webgpu-scan] skipped, y${yi} output slot differs from carry${yi}`,
-          );
-        return null;
-      }
+  // Map Y output JitIds — each Y must be either a carry passthrough (same
+  // JitId as a carry output) or produced by a body step.
+  const yOutIds =
+    numY > 0 ? bodyProgram.outputs.slice(numCarry, numCarry + numY) : [];
+  const yOutputJitIds = new Set<JitId>();
+  const jitIdToYIdx = new Map<JitId, number>();
+  for (let yi = 0; yi < numY; yi++) {
+    const yId = yOutIds[yi];
+    // Y = carry passthrough: same JitId already mapped via carry
+    // Y = separate step output: must be produced by a step
+    if (!carryOutputJitIds.has(yId) && !outputToStepInfo.has(yId)) {
+      // Y references a body input (carry snapshot) — not yet supported
+      // in compiled-loop. Fall back.
+      if (DEBUG >= 1)
+        console.log(`[webgpu-scan] skipped, y${yi} not produced by body step`);
+      return null;
     }
+    yOutputJitIds.add(yId);
+    jitIdToYIdx.set(yId, yi);
   }
 
   // Map carry output JitIds → carry index
@@ -785,6 +783,7 @@ function tryPrepareWebGPUNativeScan(
 
   // Assign internal indices to step outputs that aren't carry outputs.
   // Internal intermediates become var<private> arrays in WGSL (no storage bindings).
+  // Y-only outputs also get internal indices so subsequent steps can read them.
   let nextInternalIdx = 0;
   const jitIdToInternalIdx = new Map<JitId, number>();
   const internalElemCounts: number[] = [];
@@ -840,8 +839,8 @@ function tryPrepareWebGPUNativeScan(
     for (let oi = 0; oi < step.outputs.length; oi++) {
       const outId = step.outputs[oi];
       const carryIdx = jitIdToCarryIdx.get(outId) ?? -1;
-      const internalIdx =
-        carryIdx < 0 ? (jitIdToInternalIdx.get(outId) ?? -1) : -1;
+      const yIdx = jitIdToYIdx.get(outId) ?? -1;
+      const internalIdx = jitIdToInternalIdx.get(outId) ?? -1;
 
       // Build reindex map: local kernel arg → scan gid
       const scanReindexMap = step.inputs.map(
@@ -870,6 +869,7 @@ function tryPrepareWebGPUNativeScan(
         kernel: reindexedKernel,
         inputs: scanReindexMap.slice(),
         outputCarryIdx: carryIdx,
+        outputYIdx: yIdx,
         outputInternalIdx: internalIdx,
         outputSize: source.size as number,
       });
@@ -903,12 +903,16 @@ function tryPrepareWebGPUNativeScan(
   if (!exe) return null;
 
   if (DEBUG >= 1) {
+    const yOnlySteps = multiSteps.filter(
+      (s) => s.outputYIdx >= 0 && s.outputCarryIdx < 0,
+    ).length;
     console.log(
       `[webgpu-scan] SUCCESS! Using WebGPU native scan with ${multiSteps.length} steps` +
         (numInternal > 0 ? ` (${numInternal} internal locals)` : "") +
         (carryOutputJitIds.size < numCarry
           ? ` (${numCarry - carryOutputJitIds.size} passthrough carries)`
-          : ""),
+          : "") +
+        (yOnlySteps > 0 ? ` (${yOnlySteps} Y-only steps)` : ""),
     );
   }
   return { executable: exe, params };
@@ -1156,11 +1160,9 @@ function tryPreparePreencodedMultiStep(
     return null;
   }
 
-  if (classification.hasCrossGidxDeps) {
-    if (DEBUG >= 2)
-      console.log("Preencoded multi-step: skipped, cross-gidx deps");
-    return null;
-  }
+  // Cross-gidx deps are safe in preencoded-multi-step: each step dispatches
+  // independently with its own grid size and internal buffers. The cross-gidx
+  // restriction only applies to same-gidx fusion (compiled-loop Phase 1).
 
   const { executeSteps } = classification;
   if (executeSteps.length < 2) {

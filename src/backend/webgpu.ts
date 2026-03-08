@@ -64,9 +64,11 @@ export interface NativeScanMultiStep {
   kernel: Kernel;
   /** Input mapping: indices into [consts, carry, xs, internals] flattened. */
   inputs: number[];
-  /** Which carry slot this kernel writes to (0..numCarry-1), or -1 for internal. */
+  /** Which carry slot this kernel writes to (0..numCarry-1), or -1. */
   outputCarryIdx: number;
-  /** Which internal local this step defines (0..numInternal-1), or -1 for carry. */
+  /** Which Y output slot this step writes to (0..numY-1), or -1. */
+  outputYIdx: number;
+  /** Which internal local this step defines (0..numInternal-1), or -1. */
   outputInternalIdx: number;
   /** Size of output in elements (not bytes). */
   outputSize: number;
@@ -3094,19 +3096,38 @@ function nativeScanMultiShaderSource(
     }
   };
 
+  // Helper: emit store(s) for a step's computed value.
+  // A step can write to any combination of carry, Y, and internal.
+  const emitStepStore = (step: NativeScanMultiStep, valExpr: string) => {
+    if (step.outputCarryIdx >= 0) {
+      emit(`carry${step.outputCarryIdx}[eidx] = ${valExpr};`);
+    }
+    if (step.outputYIdx >= 0) {
+      const yi = step.outputYIdx;
+      const ysStride = ysElemStrides[yi] ?? 0;
+      if (ysStride > 0) {
+        emit(`ys${yi}[i32(dataIdx) * ${ysStride} + eidx] = ${valExpr};`);
+      }
+    }
+    if (step.outputInternalIdx >= 0) {
+      emit(`internal_${step.outputInternalIdx}[eidx] = ${valExpr};`);
+    }
+  };
+
   // Execute each step using createWgslGen + eidx loops
   for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
     const step = steps[stepIdx];
     const kernel = step.kernel;
     const kernelSize = kernel.size as number;
 
-    const isCarryStep = step.outputCarryIdx >= 0;
-    const targetLabel = isCarryStep
-      ? `carry${step.outputCarryIdx}`
-      : `internal_${step.outputInternalIdx}`;
+    const targets: string[] = [];
+    if (step.outputCarryIdx >= 0) targets.push(`carry${step.outputCarryIdx}`);
+    if (step.outputYIdx >= 0) targets.push(`ys${step.outputYIdx}`);
+    if (step.outputInternalIdx >= 0)
+      targets.push(`internal_${step.outputInternalIdx}`);
 
     emit("");
-    emit(`// Step ${stepIdx}: writes to ${targetLabel}`);
+    emit(`// Step ${stepIdx}: writes to ${targets.join(", ")}`);
 
     const gidxOverride = AluExp.special(DType.Int32, "eidx", kernelSize);
     const gen = createWgslGen({
@@ -3154,16 +3175,7 @@ function nativeScanMultiShaderSource(
         strip1(gen(kernel.outputs[0].reduction!.epilogue)),
         outDtype,
       );
-      if (isCarryStep) {
-        const ci = step.outputCarryIdx;
-        const ysStride = ysElemStrides[ci] ?? 0;
-        if (numY > 0 && ci < numY && ysStride > 0) {
-          emit(`ys${ci}[i32(dataIdx) * ${ysStride} + eidx] = ${epilogueVal};`);
-        }
-        emit(`carry${ci}[eidx] = ${epilogueVal};`);
-      } else {
-        emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueVal};`);
-      }
+      emitStepStore(step, epilogueVal);
       emit(popIndent, "}");
     } else {
       // Elementwise kernel
@@ -3178,16 +3190,7 @@ function nativeScanMultiShaderSource(
 
       // Convert bool→i32 for storage buffers
       const val = wgslToStorage(strip1(gen(kernel.outputs[0].exp)), outDtype);
-      if (isCarryStep) {
-        const ci = step.outputCarryIdx;
-        const ysStride = ysElemStrides[ci] ?? 0;
-        if (numY > 0 && ci < numY && ysStride > 0) {
-          emit(`ys${ci}[i32(dataIdx) * ${ysStride} + eidx] = ${val};`);
-        }
-        emit(`carry${ci}[eidx] = ${val};`);
-      } else {
-        emit(`internal_${step.outputInternalIdx}[eidx] = ${val};`);
-      }
+      emitStepStore(step, val);
       emit(popIndent, "}");
     }
   }
