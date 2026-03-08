@@ -1088,7 +1088,20 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
         iT,
         ...carryT,
       ];
-      return evalJaxpr(jvpBody.jaxpr, callArgs);
+      const result = evalJaxpr(jvpBody.jaxpr, callArgs);
+
+      // iT is the zero tangent for the loop counter — always dead in the
+      // JVP'd body (loop counters don't participate in differentiation).
+      // makeJaxpr resets _peArrayCreationTracker to null, so iT is not
+      // tracked by the PE collector. If the JaxprBuilder never captures it
+      // (dead input), the anonymous const lifecycle won't dispose it.
+      // Remove from anonymous set and dispose explicitly to prevent leak.
+      if (iT instanceof Array) {
+        anonymousConstArrays.delete(iT);
+        iT.dispose();
+      }
+
+      return result;
     })(
       ...primals.slice(0, numConsts),
       ...tangents.slice(0, numConsts),
@@ -1209,15 +1222,17 @@ function jvpFlat(
         a[Symbol.dispose]?.();
       }
     }
-    // Dispose zero tangents created by JVPTrace.lift() for lifted inputs.
-    // These are created when fullRaise lifts a lower-level tracer (e.g.,
-    // a captured constant) into the JVP trace. The zero Array is not
-    // tracked in intermediates and would leak if not disposed here.
-    // Skip zeros that are in the output tangents (identity/passthrough).
+  }
+  // Dispose zero tangents created by JVPTrace.lift() for lifted inputs.
+  // These are freshly created by the JVP trace (not owned by PE or other
+  // abstract traces), so they must be cleaned up unconditionally.
+  // Use .dispose() instead of [Symbol.dispose]() because the latter is
+  // suppressed during PE scope (_peArrayCreationTracker guard).
+  {
     const outputTangents = new Set<Tracer>(result[1]);
     for (const z of jvpData.liftedTangents) {
       if (!outputTangents.has(z) && z.refCount > 0) {
-        z[Symbol.dispose]?.();
+        z.dispose();
       }
     }
   }

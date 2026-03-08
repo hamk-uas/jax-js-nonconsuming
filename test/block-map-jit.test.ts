@@ -9,6 +9,7 @@ import {
   _fusedCacheCompileCount,
   defaultDevice,
   DType,
+  getBackend,
   grad,
   init,
   jit,
@@ -362,11 +363,18 @@ describe("lax.blockMap — fused shader guards", () => {
     f_jit.dispose();
   });
 
-  // TODO: GPU-dependent — shmem budget varies by GPU and codegen may reuse
-  // reduction workspaces. Needs adaptive threshold based on actual device limits.
-  test.skip("shmem budget exceeded logs fallback on WebGPU", () => {
+  test("shmem budget exceeded logs fallback on WebGPU", () => {
     if (!hasWebGPU) return;
     defaultDevice("webgpu");
+
+    // Query the actual device shmem limit so this test works on any GPU.
+    const maxShmem =
+      getBackend("webgpu").capabilities.maxComputeWorkgroupStorageSize ?? 16384;
+    const blockSize = 256;
+    const bytesPerReduction = blockSize * 4; // f32 workspace per reduction
+    // Enough reductions to guarantee totalShmemBytes > maxShmem
+    // (mallocs and other shmem entries only increase the total further).
+    const numReductions = Math.floor(maxShmem / bytesPerReduction) + 1;
 
     const logs: string[] = [];
     const origInfo = console.info;
@@ -378,17 +386,16 @@ describe("lax.blockMap — fused shader guards", () => {
       setDebug(1);
       const body = (block: np.Array) => {
         let acc = block;
-        // 40 reductions × 256 blockSize × 4 bytes = 40960 > 32768 (NVIDIA maxShmem)
-        for (let i = 0; i < 40; i++) {
+        for (let i = 0; i < numReductions; i++) {
           using s = np.sum(acc);
           acc = np.subtract(acc, s);
         }
         return acc;
       };
       const f_jit = jit((xs: np.Array) =>
-        lax.blockMap(body, xs, { blockShape: [256] }),
+        lax.blockMap(body, xs, { blockShape: [blockSize] }),
       );
-      using xs_i32 = np.arange(512);
+      using xs_i32 = np.arange(blockSize * 2);
       using xs = xs_i32.astype(DType.Float32);
       using result = f_jit(xs);
       void result; // consume
@@ -1710,14 +1717,12 @@ describe("shader quality gates", () => {
     expect(result).toBeAllclose(expected, { atol: 1 });
   });
 
-  // TODO: Recalibrate assertion — WebGPU fused shader may use different
-  // boundary handling than select() for tiny matrices. Needs shader dump.
-  test.skip("P2c: tiny matrices fall back to mask-based pad (heuristic rejects)", () => {
+  test("P2c: tiny non-aligned tiledMatmul also benefits from padConcrete", () => {
     if (!hasWebGPU) return;
     defaultDevice("webgpu");
 
-    // 4x5 @ 5x4: small enough that heuristic rejects concrete padding
-    // (4*5=20 elements < 1024 threshold)
+    // 4x5 @ 5x4: non-aligned but small — padConcrete still applies
+    // (pads to 4x8 @ 8x4), so select() should be eliminated.
     const f = jit((A: np.Array, B: np.Array) =>
       lax.tiledMatmul(A, B, { Br: 4, Bc: 4, Bk: 4 }),
     );
@@ -1730,19 +1735,20 @@ describe("shader quality gates", () => {
       using _result = f(A, B);
     });
 
-    // Small matrix → heuristic rejects padConcrete → mask-based pad → select present
+    // Fused shader should have no select() — padConcrete handles boundaries.
     const fusedShaders = shaders.filter(
       (s) => s.includes("workgroupBarrier") || s.includes("var<workgroup>"),
     );
     if (fusedShaders.length > 0) {
-      const hasSelect = fusedShaders.some((s) => s.includes("select("));
+      const selectCount = (fusedShaders[0].match(/\bselect\s*\(/g) || [])
+        .length;
       expect(
-        hasSelect,
-        "tiny matrices should still use mask-based pad with select()",
-      ).toBe(true);
+        selectCount,
+        "padConcrete should eliminate select() even for tiny matrices",
+      ).toBe(0);
     }
 
-    // But correctness must still hold
+    // Correctness must still hold
     using expected = np.matmul(A, B);
     using result = f(A, B);
     expect(result).toBeAllclose(expected, { atol: 1e-3 });

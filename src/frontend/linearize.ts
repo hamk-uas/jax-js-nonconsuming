@@ -847,11 +847,12 @@ class PartialEvalTrace extends Trace {
 
     const synthesizedSet = new Set(synthesizedZeroInputs);
     for (const inp of fullInputs) {
-      if (
-        !retainedKnownOutputs.has(inp) &&
-        !synthesizedSet.has(inp) &&
-        inp.refCount > 0
-      ) {
+      // Dispose the .ref() taken at fullInputs creation. Skip synthesized
+      // zeros (disposed by PE collector) and retained outputs (still alive).
+      // Don't guard on inp.refCount — non-Array tracers (BatchTracer, etc.)
+      // report refCount=0 from the base Tracer class, but their .dispose()
+      // correctly cascades to the inner value.
+      if (!retainedKnownOutputs.has(inp) && !synthesizedSet.has(inp)) {
         inp.dispose();
       }
     }

@@ -288,9 +288,7 @@ describe("lax.foriLoop — Phase 1b", () => {
   });
 
   // T3.8: vmap(grad(foriLoop)) — batch of gradients
-  // Correctness verified; leaks 1 int32[] from anonymous const tracking in
-  // nested PE/JVP/vmap contexts (zerosLike(i) in ForiLoop JVP rule).
-  test.skip("vmap(grad(foriLoop))", () => {
+  test("vmap(grad(foriLoop))", () => {
     // f(x) = fori_loop(0, 3, (_, c) => c * x, 1.0) = x^3
     // grad(f)(x) = 3*x^2
     const f = (x: np.Array) => {
