@@ -1422,19 +1422,19 @@ export function planAssociativeScan(
   reverse: boolean,
   dimBindings?: ReadonlyMap<string, number>,
 ): AssocScanPlan {
-  // Compiled paths assume axis=0 (contiguous elements). The user-facing
-  // associativeScan normalizes via moveaxis, but vmap shifts axis to 1+.
-  if (axis !== 0) {
-    if (DEBUG >= 1) {
-      console.log(`[assoc-scan] skipping native: axis=${axis} (need 0)`);
-    }
-    return { path: "fallback" };
-  }
-
   // Only WASM and WebGPU backends support native assoc scan
   if (backend.type !== "wasm" && backend.type !== "webgpu") {
     if (DEBUG >= 1) {
       console.log(`[assoc-scan] skipping native: backend is ${backend.type}`);
+    }
+    return { path: "fallback" };
+  }
+
+  // WASM compiled paths require axis=0 (contiguous layout).
+  // WebGPU block-map path is axis-aware via inAxes/outAxes.
+  if (axis !== 0 && backend.type === "wasm") {
+    if (DEBUG >= 1) {
+      console.log(`[assoc-scan] skipping native: axis=${axis} (WASM needs 0)`);
     }
     return { path: "fallback" };
   }
@@ -1611,6 +1611,7 @@ export function planAssociativeScan(
         bodyJaxpr,
         numLeaves,
         numConsts,
+        axis,
         reverse,
         BLOCK_SIZE,
         dimBindings,
@@ -1691,13 +1692,15 @@ function tryBuildBlockMapAssocScanPlan(
   bodyJaxpr: Jaxpr,
   numLeaves: number,
   numConsts: number,
+  axis: number,
   reverse: boolean,
   blockSize: number,
   dimBindings?: ReadonlyMap<string, number>,
 ): AssocScanPlan | null {
   if (backend.type !== "webgpu") return null;
 
-  // Build block-shaped element avals: [blockSize, ...elemShape]
+  // Build block-shaped element avals: insert blockSize at the scan axis.
+  // Body always sees B at axis 0; inAxes/outAxes handle the mapping.
   const constAvals: ShapedArray[] = [];
   for (let i = 0; i < numConsts; i++) {
     constAvals.push(bodyJaxpr.inBinders[i].aval);
@@ -1706,12 +1709,15 @@ function tryBuildBlockMapAssocScanPlan(
   const elemAvals: ShapedArray[] = [];
   for (let i = 0; i < numLeaves; i++) {
     const perElem = bodyJaxpr.inBinders[numConsts + i].aval;
+    const perShape = perElem.shape as number[];
+    // Insert blockSize at position `axis` (where the scan axis was removed)
+    const blockElemShape = [
+      ...perShape.slice(0, axis),
+      blockSize,
+      ...perShape.slice(axis),
+    ];
     elemAvals.push(
-      new ShapedArray(
-        [blockSize, ...(perElem.shape as number[])],
-        perElem.dtype,
-        perElem.weakType,
-      ),
+      new ShapedArray(blockElemShape, perElem.dtype, perElem.weakType),
     );
   }
 
@@ -1761,14 +1767,14 @@ function tryBuildBlockMapAssocScanPlan(
   }
 
   // Build vmapped apply body: processes a block of B elements at once.
-  // Signature: (consts..., prefix_0, ..., prefix_L, block_0[B,...], ..., block_L[B,...])
-  //         -> (result_0[B,...], ..., result_L[B,...])
+  // Signature: (consts..., prefix_0, ..., prefix_L, block_0, ..., block_L)
+  //         -> (result_0, ..., result_L)
   // where prefix leaves are broadcast (same for all B elements)
-  // and block leaves are mapped on axis 0.
+  // and block leaves are mapped on the scan axis.
   const applyVmapDims: (number | null)[] = [
     ...Array(numConsts).fill(null), // consts: broadcast
     ...Array(numLeaves).fill(null), // prefix: broadcast
-    ...Array(numLeaves).fill(0), // block elements: mapped on axis 0
+    ...Array(numLeaves).fill(axis), // block elements: mapped on scan axis
   ];
   const applyVmapClosed = vmapJaxpr(bodyJaxpr, blockSize, applyVmapDims);
 
@@ -1797,12 +1803,12 @@ function tryBuildBlockMapAssocScanPlan(
     return null;
   }
 
-  // inAxes: constants broadcast (null), elements sliced along axis 0
+  // inAxes: constants broadcast (null), elements sliced along scan axis
   const inAxes: (number | null)[][] = [
     ...constAvals.map(() => [null as number | null]),
-    ...elemAvals.map(() => [0 as number | null]),
+    ...elemAvals.map(() => [axis as number | null]),
   ];
-  const outAxes: (number | null)[][] = elemAvals.map(() => [0]);
+  const outAxes: (number | null)[][] = elemAvals.map(() => [axis]);
 
   const localScan: BlockMapStage = {
     bodyProgram: localScanBodyProgram,

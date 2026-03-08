@@ -613,7 +613,7 @@ function executeAssocScanBlockMap(
       outputSlots,
       resolvedElemShapes,
       dtypes,
-      0,
+      axis,
       0,
       N,
     );
@@ -627,7 +627,7 @@ function executeAssocScanBlockMap(
     localScanSlots,
     resolvedElemShapes,
     dtypes,
-    0,
+    axis,
     B,
     N,
   );
@@ -637,15 +637,19 @@ function executeAssocScanBlockMap(
   // For M ≤ B the recursive call is single-block; for M > B it decomposes.
   const scannedSummarySlots: Slot[] = [];
   for (let k = 0; k < numLeaves; k++) {
-    const perElemBytes =
-      resolvedElemShapes[k].slice(1).reduce((a, b) => a * b, 1) *
-      byteWidth(elemAvals[k].dtype);
-    scannedSummarySlots.push(backend.malloc(M * perElemBytes));
+    const summaryShape = [...resolvedElemShapes[k]];
+    summaryShape[axis] = M;
+    scannedSummarySlots.push(
+      backend.malloc(
+        summaryShape.reduce((a, b) => a * b, 1) * byteWidth(elemAvals[k].dtype),
+      ),
+    );
   }
 
   const summaryElemAvals = elemAvals.map((a, k) => {
-    const perElemShape = resolvedElemShapes[k].slice(1);
-    return new ShapedArray([M, ...perElemShape], a.dtype, a.weakType);
+    const shape = [...resolvedElemShapes[k]];
+    shape[axis] = M;
+    return new ShapedArray(shape, a.dtype, a.weakType);
   });
 
   const summaryResult = executeAssociativeScan({
@@ -654,7 +658,7 @@ function executeAssocScanBlockMap(
     bodyJaxpr: scanBodyJaxpr,
     numLeaves,
     numConsts,
-    axis: 0,
+    axis,
     reverse: false,
     constSlots,
     elemSlots: summarySlots,
@@ -678,12 +682,16 @@ function executeAssocScanBlockMap(
     outputSlots,
     resolvedElemShapes,
     dtypes,
-    0,
+    axis,
     0,
     Math.min(B, N),
   );
 
-  const summaryShapes = resolvedElemShapes.map((s) => [M, ...s.slice(1)]);
+  const summaryShapes = resolvedElemShapes.map((s) => {
+    const shape = [...s];
+    shape[axis] = M;
+    return shape;
+  });
 
   mapOverBlocks(
     backend,
@@ -707,7 +715,7 @@ function executeAssocScanBlockMap(
     outputSlots,
     resolvedElemShapes,
     dtypes,
-    0,
+    axis,
     B,
     N,
     1,

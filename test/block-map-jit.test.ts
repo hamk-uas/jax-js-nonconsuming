@@ -2366,8 +2366,8 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
     expect(js[256]).toBeCloseTo(N - 256, 4);
   });
 
-  // Fixed: planAssociativeScan now rejects axis != 0, falling back to
-  // JS Kogge-Stone which correctly handles vmapped scan axis.
+  // A2.2: WebGPU block-map path is now axis-aware via inAxes/outAxes.
+  // vmap shifts scan axis to 1, and the native path handles it.
   test("T7.13: vmap(associativeScan) batch=4 N=256", () => {
     const batch = 4;
     const N = 256;
