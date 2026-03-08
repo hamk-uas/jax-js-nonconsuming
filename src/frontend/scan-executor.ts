@@ -614,6 +614,7 @@ function executeAssocScanBlockMap(
       resolvedElemShapes,
       dtypes,
       0,
+      0,
       N,
     );
     for (const s of localScanSlots) backend.decRef(s);
@@ -626,6 +627,7 @@ function executeAssocScanBlockMap(
     localScanSlots,
     resolvedElemShapes,
     dtypes,
+    0,
     B,
     N,
   );
@@ -677,6 +679,7 @@ function executeAssocScanBlockMap(
     resolvedElemShapes,
     dtypes,
     0,
+    0,
     Math.min(B, N),
   );
 
@@ -704,6 +707,7 @@ function executeAssocScanBlockMap(
     outputSlots,
     resolvedElemShapes,
     dtypes,
+    0,
     B,
     N,
     1,

@@ -839,17 +839,18 @@ export function computeStrides(shape: number[], elemBytes: number): number[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Gather one element per block along axis 0.
+ * Gather one element per block along a given axis.
  *
- * For each source buffer with shape `[axisLen, ...rest]`, allocates an output
- * of shape `[M, ...rest]` where `M = ceil(axisLen / blockSize)`, and copies
- * the element at index `min((i+1)*blockSize - 1, axisLen - 1)` to position `i`.
+ * For each source buffer, allocates an output where axis `axis` has size
+ * `M = ceil(axisLen / blockSize)` and copies the element at index
+ * `min((i+1)*blockSize - 1, axisLen - 1)` to position `i`.
  */
 export function gatherAxisPoints(
   backend: Backend,
   srcSlots: Slot[],
   srcShapes: number[][],
   dtypes: DType[],
+  axis: number,
   blockSize: number,
   axisLen: number,
 ): Slot[] {
@@ -857,30 +858,56 @@ export function gatherAxisPoints(
   const outSlots: Slot[] = [];
 
   for (let k = 0; k < srcSlots.length; k++) {
-    const perElemBytes =
-      srcShapes[k].slice(1).reduce((a, b) => a * b, 1) * byteWidth(dtypes[k]);
-    const outBytes = M * perElemBytes;
-    const outSlot = backend.malloc(outBytes);
-    for (let i = 0; i < M; i++) {
-      const srcIdx = Math.min((i + 1) * blockSize - 1, axisLen - 1);
-      backend.copyBufferToBuffer(
-        srcSlots[k],
-        srcIdx * perElemBytes,
-        outSlot,
-        i * perElemBytes,
-        perElemBytes,
-      );
+    const shape = srcShapes[k];
+    const elemBytes = byteWidth(dtypes[k]);
+    const innerBytes =
+      shape.slice(axis + 1).reduce((a, b) => a * b, 1) * elemBytes;
+
+    if (axis === 0) {
+      // Fast path: contiguous elements
+      const outBytes = M * innerBytes;
+      const outSlot = backend.malloc(outBytes);
+      for (let i = 0; i < M; i++) {
+        const srcIdx = Math.min((i + 1) * blockSize - 1, axisLen - 1);
+        backend.copyBufferToBuffer(
+          srcSlots[k],
+          srcIdx * innerBytes,
+          outSlot,
+          i * innerBytes,
+          innerBytes,
+        );
+      }
+      outSlots.push(outSlot);
+    } else {
+      // General case: fiber-by-fiber for non-contiguous axis
+      const outerSize = shape.slice(0, axis).reduce((a, b) => a * b, 1);
+      const srcOuterStride = shape[axis] * innerBytes;
+      const dstOuterStride = M * innerBytes;
+      const outTotalBytes = outerSize * M * innerBytes;
+      const outSlot = backend.malloc(outTotalBytes);
+      for (let i = 0; i < M; i++) {
+        const srcIdx = Math.min((i + 1) * blockSize - 1, axisLen - 1);
+        for (let f = 0; f < outerSize; f++) {
+          backend.copyBufferToBuffer(
+            srcSlots[k],
+            f * srcOuterStride + srcIdx * innerBytes,
+            outSlot,
+            f * dstOuterStride + i * innerBytes,
+            innerBytes,
+          );
+        }
+      }
+      outSlots.push(outSlot);
     }
-    outSlots.push(outSlot);
   }
   return outSlots;
 }
 
 /**
- * Copy a contiguous range along axis 0 across multi-leaf slot arrays.
+ * Copy a contiguous range along a given axis across multi-leaf slot arrays.
  *
- * Copies elements `[axisStart, axisStart + axisLen)` from each src to
- * `dst[axisStart .. axisStart + axisLen)`.
+ * Copies elements `[axisStart, axisStart + axisLen)` along `axis` from
+ * each src to the corresponding position in dst.
  */
 export function copyAxisRange(
   backend: Backend,
@@ -888,21 +915,43 @@ export function copyAxisRange(
   dstSlots: Slot[],
   srcShapes: number[][],
   dtypes: DType[],
+  axis: number,
   axisStart: number,
   axisLen: number,
 ): void {
   for (let k = 0; k < srcSlots.length; k++) {
-    const perElemBytes =
-      srcShapes[k].slice(1).reduce((a, b) => a * b, 1) * byteWidth(dtypes[k]);
-    const offset = axisStart * perElemBytes;
-    const copyBytes = axisLen * perElemBytes;
-    backend.copyBufferToBuffer(
-      srcSlots[k],
-      offset,
-      dstSlots[k],
-      offset,
-      copyBytes,
-    );
+    const shape = srcShapes[k];
+    const elemBytes = byteWidth(dtypes[k]);
+    const innerBytes =
+      shape.slice(axis + 1).reduce((a, b) => a * b, 1) * elemBytes;
+
+    if (axis === 0) {
+      // Fast path: contiguous
+      const offset = axisStart * innerBytes;
+      const copyBytes = axisLen * innerBytes;
+      backend.copyBufferToBuffer(
+        srcSlots[k],
+        offset,
+        dstSlots[k],
+        offset,
+        copyBytes,
+      );
+    } else {
+      // General case: fiber-by-fiber
+      const outerSize = shape.slice(0, axis).reduce((a, b) => a * b, 1);
+      const outerStride = shape[axis] * innerBytes;
+      const offset = axisStart * innerBytes;
+      const copyBytes = axisLen * innerBytes;
+      for (let f = 0; f < outerSize; f++) {
+        backend.copyBufferToBuffer(
+          srcSlots[k],
+          f * outerStride + offset,
+          dstSlots[k],
+          f * outerStride + offset,
+          copyBytes,
+        );
+      }
+    }
   }
 }
 
@@ -948,6 +997,7 @@ export function mapOverBlocks(
   outputSlots: Slot[],
   outputShapes: number[][],
   outputDtypes: DType[],
+  axis: number,
   blockSize: number,
   axisLen: number,
   gridStart: number,
@@ -989,39 +1039,70 @@ export function mapOverBlocks(
     for (const input of inputs) {
       for (let k = 0; k < input.slots.length; k++) {
         const elemBytes = byteWidth(input.dtypes[k]);
+        const shape = input.shapes[k];
+        const innerBytes =
+          shape.slice(axis + 1).reduce((a, b) => a * b, 1) * elemBytes;
+        const outerSize =
+          axis === 0 ? 1 : shape.slice(0, axis).reduce((a, b) => a * b, 1);
+        const srcOuterStride = shape[axis] * innerBytes;
+
         if (input.mode === "point") {
           const srcIdx = blockIdx + (input.indexOffset ?? 0);
-          if (srcIdx < 0 || srcIdx >= input.shapes[k][0]) {
+          const srcAxisLen = shape[axis];
+          if (srcIdx < 0 || srcIdx >= srcAxisLen) {
             throw new Error(
-              `mapOverBlocks: point-mode source index ${srcIdx} out of range [0, ${input.shapes[k][0]}) for input leaf ${k} at blockIdx=${blockIdx}`,
+              `mapOverBlocks: point-mode source index ${srcIdx} out of range [0, ${srcAxisLen}) for input leaf ${k} at blockIdx=${blockIdx}`,
             );
           }
-          const perElemBytes =
-            input.shapes[k].slice(1).reduce((a, b) => a * b, 1) * elemBytes;
-          const slot = backend.malloc(perElemBytes);
-          backend.copyBufferToBuffer(
-            input.slots[k],
-            srcIdx * perElemBytes,
-            slot,
-            0,
-            perElemBytes,
-          );
+          const totalBytes = outerSize * innerBytes;
+          const slot = backend.malloc(totalBytes);
+          if (axis === 0) {
+            backend.copyBufferToBuffer(
+              input.slots[k],
+              srcIdx * innerBytes,
+              slot,
+              0,
+              innerBytes,
+            );
+          } else {
+            const dstOuterStride = innerBytes; // output has no axis dim
+            for (let f = 0; f < outerSize; f++) {
+              backend.copyBufferToBuffer(
+                input.slots[k],
+                f * srcOuterStride + srcIdx * innerBytes,
+                slot,
+                f * dstOuterStride,
+                innerBytes,
+              );
+            }
+          }
           bodyInputSlots.push(slot);
           tempSlots.push(slot);
         } else {
-          // "block" mode: full [B, …] temporary, only valid prefix copied in
-          const perElemBytes =
-            input.shapes[k].slice(1).reduce((a, b) => a * b, 1) * elemBytes;
-          const fullBytes = blockSize * perElemBytes;
+          // "block" mode: full [.., B, …] temporary, only valid prefix copied in
+          const fullBytes = outerSize * blockSize * innerBytes;
           const slot = backend.malloc(fullBytes);
-          const copyBytes = blockLen * perElemBytes;
-          backend.copyBufferToBuffer(
-            input.slots[k],
-            blockStart * perElemBytes,
-            slot,
-            0,
-            copyBytes,
-          );
+          const copyBytes = blockLen * innerBytes;
+          if (axis === 0) {
+            backend.copyBufferToBuffer(
+              input.slots[k],
+              blockStart * innerBytes,
+              slot,
+              0,
+              copyBytes,
+            );
+          } else {
+            const dstOuterStride = blockSize * innerBytes;
+            for (let f = 0; f < outerSize; f++) {
+              backend.copyBufferToBuffer(
+                input.slots[k],
+                f * srcOuterStride + blockStart * innerBytes,
+                slot,
+                f * dstOuterStride,
+                copyBytes,
+              );
+            }
+          }
           bodyInputSlots.push(slot);
           tempSlots.push(slot);
         }
@@ -1043,16 +1124,33 @@ export function mapOverBlocks(
 
     // Copy valid output elements to destination
     for (let k = 0; k < numOutputs; k++) {
-      const perElemBytes =
-        outputShapes[k].slice(1).reduce((a, b) => a * b, 1) *
-        byteWidth(outputDtypes[k]);
-      backend.copyBufferToBuffer(
-        bodyResult.outputs[k],
-        0,
-        outputSlots[k],
-        blockStart * perElemBytes,
-        blockLen * perElemBytes,
-      );
+      const elemBytes = byteWidth(outputDtypes[k]);
+      const shape = outputShapes[k];
+      const innerBytes =
+        shape.slice(axis + 1).reduce((a, b) => a * b, 1) * elemBytes;
+
+      if (axis === 0) {
+        backend.copyBufferToBuffer(
+          bodyResult.outputs[k],
+          0,
+          outputSlots[k],
+          blockStart * innerBytes,
+          blockLen * innerBytes,
+        );
+      } else {
+        const outerSize = shape.slice(0, axis).reduce((a, b) => a * b, 1);
+        const srcOuterStride = blockSize * innerBytes; // body output has blockSize along axis
+        const dstOuterStride = shape[axis] * innerBytes;
+        for (let f = 0; f < outerSize; f++) {
+          backend.copyBufferToBuffer(
+            bodyResult.outputs[k],
+            f * srcOuterStride,
+            outputSlots[k],
+            f * dstOuterStride + blockStart * innerBytes,
+            blockLen * innerBytes,
+          );
+        }
+      }
       backend.decRef(bodyResult.outputs[k]);
     }
   }
