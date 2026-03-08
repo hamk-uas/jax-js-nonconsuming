@@ -857,6 +857,7 @@ export function gatherAxisPoints(
   const M = Math.ceil(axisLen / blockSize);
   const outSlots: Slot[] = [];
 
+  backend.beginBatch?.();
   for (let k = 0; k < srcSlots.length; k++) {
     const shape = srcShapes[k];
     const elemBytes = byteWidth(dtypes[k]);
@@ -900,6 +901,7 @@ export function gatherAxisPoints(
       outSlots.push(outSlot);
     }
   }
+  backend.endBatch?.();
   return outSlots;
 }
 
@@ -1026,6 +1028,9 @@ export function mapOverBlocks(
     );
   }
   const numOutputs = outputSlots.length;
+  const numBlocks = gridEnd - gridStart;
+  const useBatching = backend.beginBatch != null && numBlocks > 1;
+  if (useBatching) backend.beginBatch!();
 
   for (let blockIdx = gridStart; blockIdx < gridEnd; blockIdx++) {
     const blockStart = blockIdx * blockSize;
@@ -1154,4 +1159,6 @@ export function mapOverBlocks(
       backend.decRef(bodyResult.outputs[k]);
     }
   }
+
+  if (useBatching) backend.endBatch!();
 }
