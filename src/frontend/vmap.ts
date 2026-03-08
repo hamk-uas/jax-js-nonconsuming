@@ -708,10 +708,14 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     ];
 
     // Run the scan
+    // numConsts must include BOTH the vmapJaxpr's own consts AND the original
+    // scan consts (movedConsts). The vmapped body jaxpr still expects the
+    // original consts as its first N inputs — these must remain const (not
+    // evolve as carry) in the scan.
     const results = bind(Primitive.Scan, scanArgs, {
       jaxpr: vmappedBody.jaxpr,
       numCarry,
-      numConsts: vmappedBody.consts.length,
+      numConsts: vmappedBody.consts.length + numConsts,
       length,
       reverse,
     });
@@ -841,7 +845,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     axisSize,
     args,
     dims,
-    { jaxpr, numConsts, lower, upper },
+    { jaxpr, numConsts, lower, upper, isJvpTransformed },
   ) {
     // vmap of fori_loop: batch over independent loops
     //
@@ -881,6 +885,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
       numConsts: vmappedBody.consts.length + numConsts,
       lower,
       upper,
+      ...(isJvpTransformed ? { isJvpTransformed } : {}),
     });
 
     // Dispose intermediates from moveBatchAxis
