@@ -1430,15 +1430,6 @@ export function planAssociativeScan(
     return { path: "fallback" };
   }
 
-  // WASM compiled paths require axis=0 (contiguous layout).
-  // WebGPU block-map path is axis-aware via inAxes/outAxes.
-  if (axis !== 0 && backend.type === "wasm") {
-    if (DEBUG >= 1) {
-      console.log(`[assoc-scan] skipping native: axis=${axis} (WASM needs 0)`);
-    }
-    return { path: "fallback" };
-  }
-
   // Classify body steps (shared analysis)
   const classification = classifyBodySteps(
     bodyProgram,

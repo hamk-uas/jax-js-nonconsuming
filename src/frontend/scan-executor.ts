@@ -438,14 +438,59 @@ export function executeAssociativeScan(
 
   if (plan.path === "compiled-loop-blocked") {
     const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
-    (backend as WasmBackend).dispatchBlockedAssociativeScan(
-      plan.executable,
-      plan.params,
-      N,
-      constSlots,
-      elemSlots,
-      outputSlots,
-    );
+    if (axis === 0) {
+      // Fast path: scan axis is contiguous — dispatch directly.
+      (backend as WasmBackend).dispatchBlockedAssociativeScan(
+        plan.executable,
+        plan.params,
+        N,
+        constSlots,
+        elemSlots,
+        outputSlots,
+      );
+    } else {
+      // Strided boundary copies: transpose scan axis to 0, run WASM, transpose back.
+      const tempIn: Slot[] = [];
+      const tempOut: Slot[] = [];
+      for (let k = 0; k < numLeaves; k++) {
+        const shape = resolveLeafShape(elemAvals[k].shape, dimBindings);
+        const totalBytes = shapeProduct(shape) * byteWidth(elemAvals[k].dtype);
+        tempIn.push(backend.malloc(totalBytes));
+        tempOut.push(backend.malloc(totalBytes));
+      }
+      // Gather: input (scan at `axis`) → temp (scan at axis 0)
+      for (let k = 0; k < numLeaves; k++) {
+        transposeAxisToFront(
+          backend,
+          elemSlots[k],
+          tempIn[k],
+          resolveLeafShape(elemAvals[k].shape, dimBindings),
+          axis,
+          byteWidth(elemAvals[k].dtype),
+        );
+      }
+      (backend as WasmBackend).dispatchBlockedAssociativeScan(
+        plan.executable,
+        plan.params,
+        N,
+        constSlots,
+        tempIn,
+        tempOut,
+      );
+      // Scatter: temp (scan at axis 0) → output (scan at `axis`)
+      for (let k = 0; k < numLeaves; k++) {
+        transposeAxisFromFront(
+          backend,
+          tempOut[k],
+          outputSlots[k],
+          resolveLeafShape(elemAvals[k].shape, dimBindings),
+          axis,
+          byteWidth(elemAvals[k].dtype),
+        );
+      }
+      for (const s of tempIn) backend.decRef(s);
+      for (const s of tempOut) backend.decRef(s);
+    }
     return { outputs: outputSlots, pending: [] };
   }
 
@@ -745,6 +790,87 @@ function resolveAxisN(
   return isSymbolicDim(nDim)
     ? concreteDim(resolveShape([nDim], dimBindings!)[0], "assoc_scan N")
     : (nDim as number);
+}
+
+/** Resolve a possibly-symbolic shape to concrete numbers. */
+function resolveLeafShape(
+  shape: Dim[],
+  dimBindings?: ReadonlyMap<string, number>,
+): number[] {
+  return hasSymbolicDims(shape)
+    ? concreteShape(resolveShape(shape, dimBindings!))
+    : (shape as number[]);
+}
+
+/** Product of all elements in a shape array. */
+function shapeProduct(shape: number[]): number {
+  let p = 1;
+  for (let i = 0; i < shape.length; i++) p *= shape[i];
+  return p;
+}
+
+/**
+ * Copy data from `src` (row-major, scan at `axis`) to `dst` (row-major, scan at axis 0).
+ * Equivalent to moveaxis(src, axis, 0).
+ */
+function transposeAxisToFront(
+  backend: Backend,
+  src: Slot,
+  dst: Slot,
+  shape: number[],
+  axis: number,
+  elemBytes: number,
+): void {
+  const N = shape[axis];
+  let outerSize = 1;
+  for (let i = 0; i < axis; i++) outerSize *= shape[i];
+  let innerBytes = elemBytes;
+  for (let i = axis + 1; i < shape.length; i++) innerBytes *= shape[i];
+  const srcFiberStride = N * innerBytes;
+  const dstElemStride = outerSize * innerBytes;
+  for (let f = 0; f < outerSize; f++) {
+    for (let n = 0; n < N; n++) {
+      backend.copyBufferToBuffer(
+        src,
+        f * srcFiberStride + n * innerBytes,
+        dst,
+        n * dstElemStride + f * innerBytes,
+        innerBytes,
+      );
+    }
+  }
+}
+
+/**
+ * Copy data from `src` (row-major, scan at axis 0) to `dst` (row-major, scan at `axis`).
+ * Inverse of transposeAxisToFront.
+ */
+function transposeAxisFromFront(
+  backend: Backend,
+  src: Slot,
+  dst: Slot,
+  shape: number[],
+  axis: number,
+  elemBytes: number,
+): void {
+  const N = shape[axis];
+  let outerSize = 1;
+  for (let i = 0; i < axis; i++) outerSize *= shape[i];
+  let innerBytes = elemBytes;
+  for (let i = axis + 1; i < shape.length; i++) innerBytes *= shape[i];
+  const dstFiberStride = N * innerBytes;
+  const srcElemStride = outerSize * innerBytes;
+  for (let f = 0; f < outerSize; f++) {
+    for (let n = 0; n < N; n++) {
+      backend.copyBufferToBuffer(
+        src,
+        n * srcElemStride + f * innerBytes,
+        dst,
+        f * dstFiberStride + n * innerBytes,
+        innerBytes,
+      );
+    }
+  }
 }
 
 /** Flush all pending GPU/WASM operations, batching dispatches when possible. */
