@@ -1673,6 +1673,7 @@ export function jitCompile(
           bodyJaxpr,
           numLeaves,
           numConsts,
+          axis,
           reverse,
           _currentDimBindings,
         );

@@ -2361,10 +2361,9 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
     expect(js[256]).toBeCloseTo(N - 256, 4);
   });
 
-  // KNOWN_BUG: jit(vmap(assocScan)) produces wrong results for N≥256.
-  // vmap(assocScan) without jit works correctly, so the bug is in the
-  // JIT-compiled vmap path, likely compiled-loop axis handling.
-  test.skip("T7.13: vmap(associativeScan) batch=4 N=256", () => {
+  // Fixed: planAssociativeScan now rejects axis != 0, falling back to
+  // JS Kogge-Stone which correctly handles vmapped scan axis.
+  test("T7.13: vmap(associativeScan) batch=4 N=256", () => {
     const batch = 4;
     const N = 256;
     const add = (a: np.Array, b: np.Array) => np.add(a, b);

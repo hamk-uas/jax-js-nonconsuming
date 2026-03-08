@@ -1418,9 +1418,19 @@ export function planAssociativeScan(
   bodyJaxpr: Jaxpr,
   numLeaves: number,
   numConsts: number,
+  axis: number,
   reverse: boolean,
   dimBindings?: ReadonlyMap<string, number>,
 ): AssocScanPlan {
+  // Compiled paths assume axis=0 (contiguous elements). The user-facing
+  // associativeScan normalizes via moveaxis, but vmap shifts axis to 1+.
+  if (axis !== 0) {
+    if (DEBUG >= 1) {
+      console.log(`[assoc-scan] skipping native: axis=${axis} (need 0)`);
+    }
+    return { path: "fallback" };
+  }
+
   // Only WASM and WebGPU backends support native assoc scan
   if (backend.type !== "wasm" && backend.type !== "webgpu") {
     if (DEBUG >= 1) {
