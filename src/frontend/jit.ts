@@ -2831,6 +2831,7 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     Primitive.DynamicUpdateSlice,
     Primitive.ScatterAdd,
     Primitive.AssociativeScan,
+    Primitive.Reverse,
     Primitive.BlockMap,
     Primitive.ForiLoop,
   ];

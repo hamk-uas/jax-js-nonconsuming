@@ -125,6 +125,17 @@ describe("lax.associativeScan — reverse", () => {
     );
     expect(result).toBeAllclose([5, 5, 5, 5, 5]);
   });
+
+  test("jit(reverse cumsum) — Primitive.Reverse must be in specialBlackPrimitives", () => {
+    using xs = np.array([1.0, 2.0, 3.0, 4.0]);
+    using f = jit((xs: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), xs, {
+        reverse: true,
+      }),
+    );
+    using result = f(xs);
+    expect(result).toBeAllclose([10, 9, 7, 4]);
+  });
 });
 
 // ============================================================================
