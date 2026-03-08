@@ -20,6 +20,37 @@ import { isSymbolicSize } from "../../shape";
 import { strip1 } from "../../utils";
 
 /**
+ * Generate a WGSL reduction accumulation statement.
+ *
+ * Shared by block-map tiled reductions and workgroup-associative-scan
+ * reduction bodies. Returns the WGSL source for accumulating `rhs` into
+ * `accExpr` using `op`.
+ */
+export function wgslReductionAccumStmt(
+  op: AluOp,
+  accExpr: string,
+  rhs: string,
+): string {
+  if (op === AluOp.Add) return `${accExpr} += ${rhs};`;
+  if (op === AluOp.Mul) return `${accExpr} *= ${rhs};`;
+  if (op === AluOp.Min) return `${accExpr} = min(${accExpr}, ${rhs});`;
+  if (op === AluOp.Max) return `${accExpr} = max(${accExpr}, ${rhs});`;
+  throw new Error(`Unsupported reduction op in WGSL: ${op}`);
+}
+
+/**
+ * Cast a reduction body RHS to the reduction accumulator dtype if needed.
+ */
+export function wgslCastReductionRhs(
+  rhs: string,
+  bodyDtype: DType,
+  reDtype: DType,
+): string {
+  const reTy = dtypeToWgsl(reDtype, false);
+  return bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+}
+
+/**
  * Info for remapping a GlobalIndex flat index from body-local strides
  * to global buffer strides at the AluExp level (enabling simplify()).
  */

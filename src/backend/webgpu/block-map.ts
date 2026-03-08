@@ -31,6 +31,8 @@ import {
   createWgslGen,
   type GlobalIndexRemapInfo,
   type ResolveGlobalIndex,
+  wgslCastReductionRhs,
+  wgslReductionAccumStmt,
 } from "./wgsl-gen";
 import { AluExp, AluOp, byteWidth, DType, Kernel, Reduction } from "../../alu";
 import type { JitId, JitProgram, JitStep } from "../../frontend/jit";
@@ -638,9 +640,21 @@ export function blockMapFusedShaderSource(
                 return null;
               }
               const bk = bs.source as Kernel;
-              if (bk.isSymbolic || bk.hasReduction) {
+              if (bk.isSymbolic) {
                 valid = false;
                 break;
+              }
+              // Allow reduction kernels (e.g., matmul in DLM bodies)
+              // but reject multi-output reductions and symbolic reduction sizes.
+              // Multi-output rejection is required: the reduction's `for (var gidx`
+              // loop would shadow the elementwise output's implicit gidx, and
+              // the two outputs need different iteration structures.
+              if (bk.hasReduction) {
+                const re = bk.outputs[0]?.reduction;
+                if (!re || isSymbolicSize(re.size) || bk.numOutputs > 1) {
+                  valid = false;
+                  break;
+                }
               }
               bodyKernels.push({
                 step: bs as Extract<JitStep, { type: "execute" }>,
@@ -2341,8 +2355,11 @@ export function blockMapFusedShaderSource(
                       );
                     }
                     const rhs = strip1(riGen(bodyExp));
-                    const castRhs =
-                      bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+                    const castRhs = wgslCastReductionRhs(
+                      rhs,
+                      bodyDtype,
+                      reDtype,
+                    );
                     emit(`${privName}[_rt_idx] += ${castRhs};`);
                     emitTileLoopClose();
                   }
@@ -2359,8 +2376,7 @@ export function blockMapFusedShaderSource(
                     );
                   }
                   const rhs = strip1(gen(bodyExp));
-                  const castRhs =
-                    bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+                  const castRhs = wgslCastReductionRhs(rhs, bodyDtype, reDtype);
                   emit(`${privName}[_rt_idx] += ${castRhs};`);
                   emitTileLoopClose();
                   emit(popIndent, `}`); // end ridx
@@ -2378,18 +2394,13 @@ export function blockMapFusedShaderSource(
                 // O5: Manual unrolling for small reduction sizes
                 const UNROLL_THRESHOLD_GEN = 32;
                 const emitAccum = (accName: string, castRhs: string) => {
-                  if (bRe.op === AluOp.Add)
-                    emit(`${accName}[_rt_idx] += ${castRhs};`);
-                  else if (bRe.op === AluOp.Mul)
-                    emit(`${accName}[_rt_idx] *= ${castRhs};`);
-                  else if (bRe.op === AluOp.Min)
-                    emit(
-                      `${accName}[_rt_idx] = min(${accName}[_rt_idx], ${castRhs});`,
-                    );
-                  else if (bRe.op === AluOp.Max)
-                    emit(
-                      `${accName}[_rt_idx] = max(${accName}[_rt_idx], ${castRhs});`,
-                    );
+                  emit(
+                    wgslReductionAccumStmt(
+                      bRe.op,
+                      `${accName}[_rt_idx]`,
+                      castRhs,
+                    ),
+                  );
                 };
 
                 if (reSize <= UNROLL_THRESHOLD_GEN) {
@@ -2416,8 +2427,11 @@ export function blockMapFusedShaderSource(
                       );
                     }
                     const rhs = strip1(riGen(bodyExp));
-                    const castRhs =
-                      bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+                    const castRhs = wgslCastReductionRhs(
+                      rhs,
+                      bodyDtype,
+                      reDtype,
+                    );
                     emitAccum(accArrName, castRhs);
                     emitTileLoopClose();
                   }
@@ -2433,8 +2447,7 @@ export function blockMapFusedShaderSource(
                     );
                   }
                   const rhs = strip1(gen(bodyExp));
-                  const castRhs =
-                    bodyDtype !== reDtype ? `${reTy}(${rhs})` : rhs;
+                  const castRhs = wgslCastReductionRhs(rhs, bodyDtype, reDtype);
                   emitAccum(accArrName, castRhs);
                   emitTileLoopClose();
                   emit(popIndent, `}`); // end ridx
@@ -2954,49 +2967,146 @@ export function blockMapFusedShaderSource(
             }
           }
 
+          const wasResolve: ResolveGlobalIndex = (bufIdx, indexExpr, dtype) => {
+            const kind = bStepInputKind[bufIdx];
+            const name = bStepInputNames[bufIdx];
+            if (kind === "const") {
+              if (name === BLOCK_IDX_SENTINEL) return `i32(block_idx)`;
+              const inf =
+                bodyInputInfo[was.bodyInputIds.indexOf(bStep.inputs[bufIdx])];
+              if (inf.isGlobal) {
+                if (inf.parentInputIdx >= 0) {
+                  const remapped = inRemap(inf.parentInputIdx, indexExpr);
+                  const readExpr = `${name}[i32(in_base_${inf.parentInputIdx}) + ${remapped}]`;
+                  return hasBoundary
+                    ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
+                    : readExpr;
+                }
+                return `${name}[${indexExpr}]`;
+              }
+              return `${name}[${indexExpr}]`;
+            } else if (kind === "a") {
+              const e = bStepInputElemIdx[bufIdx];
+              const ec = was.elemCounts[e];
+              if (ec > 1) {
+                return `${name}[(tidx - ${stride}u) * ${ec}u + u32(${indexExpr})]`;
+              }
+              return `${name}[tidx - ${stride}u]`;
+            } else if (kind === "b") {
+              const e = bStepInputElemIdx[bufIdx];
+              const ec = was.elemCounts[e];
+              if (ec > 1) {
+                return `${name}[tidx * ${ec}u + u32(${indexExpr})]`;
+              }
+              return `${name}[tidx]`;
+            }
+            // shmem intermediate
+            return `${name}[${indexExpr}]`;
+          };
+
           const gen = createGen(
             bKernel,
             `was${entry.wasIdx}_r${r}_s${bsi}`,
-            (bufIdx, indexExpr, dtype) => {
-              const kind = bStepInputKind[bufIdx];
-              const name = bStepInputNames[bufIdx];
-              if (kind === "const") {
-                if (name === BLOCK_IDX_SENTINEL) return `i32(block_idx)`;
-                const inf =
-                  bodyInputInfo[was.bodyInputIds.indexOf(bStep.inputs[bufIdx])];
-                if (inf.isGlobal) {
-                  if (inf.parentInputIdx >= 0) {
-                    const remapped = inRemap(inf.parentInputIdx, indexExpr);
-                    const readExpr = `${name}[i32(in_base_${inf.parentInputIdx}) + ${remapped}]`;
-                    return hasBoundary
-                      ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
-                      : readExpr;
-                  }
-                  return `${name}[${indexExpr}]`;
-                }
-                return `${name}[${indexExpr}]`;
-              } else if (kind === "a") {
-                const e = bStepInputElemIdx[bufIdx];
-                const ec = was.elemCounts[e];
-                if (ec > 1) {
-                  return `${name}[(tidx - ${stride}u) * ${ec}u + u32(${indexExpr})]`;
-                }
-                return `${name}[tidx - ${stride}u]`;
-              } else if (kind === "b") {
-                const e = bStepInputElemIdx[bufIdx];
-                const ec = was.elemCounts[e];
-                if (ec > 1) {
-                  return `${name}[tidx * ${ec}u + u32(${indexExpr})]`;
-                }
-                return `${name}[tidx]`;
-              }
-              // shmem intermediate
-              return `${name}[${indexExpr}]`;
-            },
+            wasResolve,
           );
 
           for (let oi = 0; oi < bKernel.numOutputs; oi++) {
             const outId = bStep.outputs[oi];
+
+            // --- Reduction kernel: gidx loop + ridx accumulation ---
+            const bRe = bKernel.outputs[oi]?.reduction ?? null;
+            if (bRe) {
+              const reDtype = bRe.dtype;
+              const reTy = dtypeToWgsl(reDtype, false);
+              const bodyDtype = bKernel.outputs[oi].dtype;
+              const reSize = bRe.size as number;
+              const bodyExp = bKernel.outputs[oi].exp;
+              const kernelSize = bKernel.size as number;
+              const prefix = `was${entry.wasIdx}_r${r}_s${bsi}`;
+              const isIdentityEpilogue =
+                bRe.epilogue.op === AluOp.Variable &&
+                bRe.epilogue.arg === "acc";
+
+              // Emit a gidx loop over output elements
+              emit(
+                `for (var gidx: i32 = 0; gidx < ${kernelSize}; gidx++) {`,
+                pushIndent,
+              );
+
+              // Accumulator
+              const accName = `${prefix}_acc`;
+              emit(
+                `var ${accName}: ${reTy} = ${constToWgsl(reDtype, bRe.identity)};`,
+              );
+
+              // Reduction loop — unroll for small sizes (DLM typical: 2)
+              const UNROLL_THRESHOLD = 8;
+              const emitAccum = (rhs: string) => {
+                const castRhs = wgslCastReductionRhs(rhs, bodyDtype, reDtype);
+                emit(wgslReductionAccumStmt(bRe.op, accName, castRhs));
+              };
+
+              if (reSize <= UNROLL_THRESHOLD) {
+                for (let ri = 0; ri < reSize; ri++) {
+                  const riGen = createGen(
+                    bKernel,
+                    `${prefix}_r${ri}`,
+                    wasResolve,
+                    undefined,
+                    undefined,
+                    AluExp.i32(ri),
+                  );
+                  emitAccum(strip1(riGen(bodyExp)));
+                }
+              } else {
+                emit(
+                  `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
+                  pushIndent,
+                );
+                emitAccum(strip1(gen(bodyExp)));
+                emit(popIndent, "}");
+              }
+
+              // Apply epilogue
+              let finalValue: string;
+              if (isIdentityEpilogue) {
+                finalValue = accName;
+              } else {
+                const epGen = createGen(
+                  bKernel,
+                  `${prefix}_ep`,
+                  wasResolve,
+                  new Map([["acc", accName]]),
+                );
+                finalValue = strip1(epGen(bRe.epilogue));
+              }
+
+              // Write result
+              const bodyOutIdx = was.bodyOutputIds.indexOf(outId);
+              if (bodyOutIdx >= 0) {
+                const e = bodyOutIdx;
+                const ec = was.elemCounts[e];
+                if (ec > 1) {
+                  emit(
+                    `${writeNames[e]}[tidx * ${ec}u + u32(gidx)] = ${dtypeToWgsl(was.elemDtypes[e])}(${finalValue});`,
+                  );
+                } else {
+                  emit(
+                    `${writeNames[e]}[tidx] = ${dtypeToWgsl(was.elemDtypes[e])}(${finalValue});`,
+                  );
+                }
+              } else {
+                const sname = bodyIdToName.get(outId);
+                if (sname) {
+                  emit(`${sname}[gidx] = ${finalValue};`);
+                }
+              }
+
+              emit(popIndent, "}"); // end gidx loop
+              continue; // skip the elementwise path below
+            }
+
+            // --- Elementwise kernel: existing codegen ---
             const rhs = strip1(gen(bKernel.outputs[oi].exp));
             // Map body output to the correct write buffer
             const bodyOutIdx = was.bodyOutputIds.indexOf(outId);

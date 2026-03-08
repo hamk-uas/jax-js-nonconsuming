@@ -3497,9 +3497,49 @@ function codegenBlockedAssociativeScan(
     }
     // Copy from internal buffers to output
     for (let k = 0; k < numLeaves; k++) {
-      const size = leafElemSizes[k];
       emitCopyDstAddr(k);
       cg.local.get(internalsBase + params.leafToInternalIdx[k]);
+      emitCopy(leafElemSizes[k]);
+    }
+  }
+
+  // Helper: emit an inline byte copy for small compile-time-known sizes.
+  // Expects [dst, src] on the WASM operand stack. Uses i32/v128 load/store
+  // (not f32) for bit-exact raw copies that preserve all bit patterns.
+  let tmpCopyDst: number | undefined;
+  let tmpCopySrc: number | undefined;
+  function emitCopy(size: number) {
+    if (size === 4) {
+      cg.i32.load(2, 0);
+      cg.i32.store(2, 0);
+    } else if (size === 16) {
+      cg.v128.load(2, 0);
+      cg.v128.store(2, 0);
+    } else if (size === 8) {
+      tmpCopyDst ??= cg.local.declare(cg.i32);
+      tmpCopySrc ??= cg.local.declare(cg.i32);
+      cg.local.set(tmpCopySrc);
+      cg.local.tee(tmpCopyDst);
+      cg.local.get(tmpCopySrc);
+      cg.i32.load(2, 0);
+      cg.i32.store(2, 0);
+      cg.local.get(tmpCopyDst);
+      cg.local.get(tmpCopySrc);
+      cg.i32.load(2, 4);
+      cg.i32.store(2, 4);
+    } else if (size === 32) {
+      tmpCopyDst ??= cg.local.declare(cg.i32);
+      tmpCopySrc ??= cg.local.declare(cg.i32);
+      cg.local.set(tmpCopySrc);
+      cg.local.tee(tmpCopyDst);
+      cg.local.get(tmpCopySrc);
+      cg.v128.load(2, 0);
+      cg.v128.store(2, 0);
+      cg.local.get(tmpCopyDst);
+      cg.local.get(tmpCopySrc);
+      cg.v128.load(2, 16);
+      cg.v128.store(2, 16);
+    } else {
       cg.i32.const(size);
       cg.memory.copy();
     }
@@ -3597,16 +3637,13 @@ function codegenBlockedAssociativeScan(
           // swap via pong temp
           cg.local.get(curPong);
           cg.local.get(tmp);
-          cg.i32.const(bw);
-          cg.memory.copy();
+          emitCopy(bw);
           cg.local.get(tmp);
           cg.local.get(posInBlock);
-          cg.i32.const(bw);
-          cg.memory.copy();
+          emitCopy(bw);
           cg.local.get(posInBlock);
           cg.local.get(curPong);
-          cg.i32.const(bw);
-          cg.memory.copy();
+          emitCopy(bw);
           cg.local.get(j);
           cg.i32.const(1);
           cg.i32.add();
@@ -3720,8 +3757,7 @@ function codegenBlockedAssociativeScan(
             cg.i32.const(size);
             cg.i32.mul();
             cg.i32.add();
-            cg.i32.const(size);
-            cg.memory.copy();
+            emitCopy(size);
           }
         }
         cg.end();
@@ -3815,8 +3851,7 @@ function codegenBlockedAssociativeScan(
           cg.i32.const(size);
           cg.i32.mul();
           cg.i32.add();
-          cg.i32.const(size);
-          cg.memory.copy();
+          emitCopy(size);
         }
 
         cg.local.get(i);
@@ -3931,8 +3966,7 @@ function codegenBlockedAssociativeScan(
             cg.i32.const(size);
             cg.i32.mul();
             cg.i32.add();
-            cg.i32.const(size);
-            cg.memory.copy();
+            emitCopy(size);
           }
           cg.local.get(i);
           cg.i32.const(1);
@@ -4100,8 +4134,7 @@ function codegenBlockedAssociativeScan(
           cg.i32.const(bw);
           cg.i32.mul();
           cg.i32.add();
-          cg.i32.const(bw);
-          cg.memory.copy();
+          emitCopy(bw);
           cg.local.get(j);
           cg.i32.const(1);
           cg.i32.add();
