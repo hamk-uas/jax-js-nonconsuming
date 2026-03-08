@@ -1672,16 +1672,15 @@ describe("shader quality gates", () => {
     f.dispose();
   });
 
-  // KNOWN_BUG: padConcrete uses DynamicUpdateSlice on axis != 0, which
-  // the WebGPU JIT step doesn't support (axis=0 only). Works on WASM.
-  test.skip("P2c: non-aligned tiledMatmul produces no select() (padConcrete)", () => {
+  test("P2c: non-aligned tiledMatmul produces no select() (padConcrete)", () => {
     if (!hasWebGPU) return;
     defaultDevice("webgpu");
 
-    // 64x60 @ 60x64: K=60 not divisible by 16, triggers padding to K=64
+    // 64x60 @ 60x64: K=60 not divisible by 8, triggers padding to K=64
     // Ratio 4096/3840=1.07 < 1.25, elements 3840 > 1024 → padConcrete fires
+    // Use Bk=8 (different from other tests) to avoid ShaderPipelineCache hit
     const f = jit((A: np.Array, B: np.Array) =>
-      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
+      lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 8 }),
     );
     using A_flat = np.arange(64 * 60).astype(DType.Float32);
     using A = A_flat.reshape([64, 60]);

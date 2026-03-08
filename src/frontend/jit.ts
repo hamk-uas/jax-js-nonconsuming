@@ -167,9 +167,12 @@ export type JitStep =
       dst: JitId; // the destination buffer (mutated via Mutate effect)
       src: JitId; // the source slice to copy
       output: JitId; // the result (same slot as dst if recycled, else separate)
-      offsetBytes: number; // byte offset into dst where src is written
-      sliceBytes: SizeExpr; // byte size of the src slice
+      offsetBytes: number; // per-fiber byte offset into dst where src is written
+      sliceBytes: SizeExpr; // byte size of the src slice (axis=0 fast path)
       dstSizeBytes: SizeExpr; // total byte size of dst (= output size)
+      outerFibers: number; // product(shape[0:axis]), 1 for axis=0
+      srcFiberBytes: number; // bytes per fiber in src (stride between fibers)
+      dstFiberBytes: number; // bytes per fiber in dst (stride between fibers)
     }
   | {
       type: "scatter_add";
@@ -670,10 +673,6 @@ export class JitProgram {
             typeof step.dstSizeBytes === "number"
               ? step.dstSizeBytes
               : resolveSizeExpr(step.dstSizeBytes, dimBindings!);
-          const concreteSliceSize =
-            typeof step.sliceBytes === "number"
-              ? step.sliceBytes
-              : resolveSizeExpr(step.sliceBytes, dimBindings!);
 
           if (dstSlot !== outSlot) {
             this.backend.copyBufferToBuffer!(
@@ -684,14 +683,32 @@ export class JitProgram {
               concreteDstSize,
             );
           }
-          // Copy src slice into output at the byte offset
-          this.backend.copyBufferToBuffer!(
-            srcSlot,
-            0,
-            outSlot,
-            step.offsetBytes,
-            concreteSliceSize,
-          );
+          // Copy src slice into output — fiber loop for axis > 0
+          if (step.outerFibers === 1) {
+            // Contiguous fast path (axis=0)
+            const concreteSliceSize =
+              typeof step.sliceBytes === "number"
+                ? step.sliceBytes
+                : resolveSizeExpr(step.sliceBytes, dimBindings!);
+            this.backend.copyBufferToBuffer!(
+              srcSlot,
+              0,
+              outSlot,
+              step.offsetBytes,
+              concreteSliceSize,
+            );
+          } else {
+            // Fiber-by-fiber copy for non-contiguous axis > 0
+            for (let i = 0; i < step.outerFibers; i++) {
+              this.backend.copyBufferToBuffer!(
+                srcSlot,
+                i * step.srcFiberBytes,
+                outSlot,
+                i * step.dstFiberBytes + step.offsetBytes,
+                step.srcFiberBytes,
+              );
+            }
+          }
           break;
         }
         case "scatter_add": {
@@ -1560,12 +1577,6 @@ export function jitCompile(
         >;
         const { offset, axis } = params;
 
-        if (axis !== 0) {
-          throw new Error(
-            "DynamicUpdateSlice JIT: only axis=0 is currently supported",
-          );
-        }
-
         // Resolve input JitIds
         const dstInput = eqn.inputs[0];
         const srcInput = eqn.inputs[1];
@@ -1595,11 +1606,27 @@ export function jitCompile(
         const outVar = eqn.outBinders[0];
         const elemBytes = byteWidth(outVar.aval.dtype);
         const innerSize = (outVar.aval.shape as number[])
-          .slice(1)
+          .slice(axis + 1)
           .reduce((a, b) => a * b, 1);
         const offsetBytes = offset * innerSize * elemBytes;
         const sliceBytes = sizeExprMul(srcInput.aval.sizeExpr, elemBytes);
         const dstSizeBytes = sizeExprMul(outVar.aval.sizeExpr, elemBytes);
+
+        // Fiber loop data for axis > 0 (non-contiguous slices)
+        const outerFibers =
+          axis === 0
+            ? 1
+            : (srcInput.aval.shape as number[])
+                .slice(0, axis)
+                .reduce((a, b) => a * b, 1);
+        const srcFiberBytes =
+          axis === 0
+            ? 0
+            : (srcInput.aval.shape[axis] as number) * innerSize * elemBytes;
+        const dstFiberBytes =
+          axis === 0
+            ? 0
+            : (outVar.aval.shape[axis] as number) * innerSize * elemBytes;
 
         // Allocate output buffer (same size as dst — recycling may reclaim dst)
         const outId = builder.pushBuffer(dstSizeBytes);
@@ -1613,6 +1640,9 @@ export function jitCompile(
           offsetBytes,
           sliceBytes,
           dstSizeBytes,
+          outerFibers,
+          srcFiberBytes,
+          dstFiberBytes,
         });
         continue;
       }
