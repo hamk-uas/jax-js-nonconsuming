@@ -924,6 +924,21 @@ export interface BlockInput {
  * For each block in `[gridStart, gridEnd)`: materializes each input group
  * according to its mode, runs the body, copies only valid output elements
  * to the destination.
+ *
+ * **Partial trailing block contract:** Block-mode inputs are always
+ * materialized as full `[blockSize, …]` temporaries even when fewer than
+ * `blockSize` elements remain. Only the valid prefix is copied in; the
+ * suffix is uninitialized padding. Only the valid prefix of the body result
+ * is written back to the destination — padding elements are never exposed.
+ *
+ * The body program must tolerate uninitialized padding in block-mode inputs
+ * for the trailing block. Elementwise and vmapped bodies satisfy this
+ * naturally because the padding outputs are discarded.
+ *
+ * @param constSlots  Constant slots retained/released symmetrically per iteration.
+ * @param inputs      Declarative input groups — see {@link BlockInput}.
+ * @param numConsts   Number of leading constant slots in the body program signature.
+ *                    Must equal `constSlots.length`.
  */
 export function mapOverBlocks(
   backend: Backend,
@@ -940,6 +955,26 @@ export function mapOverBlocks(
   numConsts: number,
   dimBindings?: ReadonlyMap<string, number>,
 ): void {
+  if (numConsts !== constSlots.length) {
+    throw new Error(
+      `mapOverBlocks: numConsts (${numConsts}) !== constSlots.length (${constSlots.length})`,
+    );
+  }
+  if (gridStart < 0 || gridEnd < gridStart) {
+    throw new Error(
+      `mapOverBlocks: invalid grid range [${gridStart}, ${gridEnd})`,
+    );
+  }
+  if (outputSlots.length !== outputShapes.length) {
+    throw new Error(
+      `mapOverBlocks: outputSlots.length (${outputSlots.length}) !== outputShapes.length (${outputShapes.length})`,
+    );
+  }
+  if (outputSlots.length !== outputDtypes.length) {
+    throw new Error(
+      `mapOverBlocks: outputSlots.length (${outputSlots.length}) !== outputDtypes.length (${outputDtypes.length})`,
+    );
+  }
   const numOutputs = outputSlots.length;
 
   for (let blockIdx = gridStart; blockIdx < gridEnd; blockIdx++) {
@@ -956,6 +991,11 @@ export function mapOverBlocks(
         const elemBytes = byteWidth(input.dtypes[k]);
         if (input.mode === "point") {
           const srcIdx = blockIdx + (input.indexOffset ?? 0);
+          if (srcIdx < 0 || srcIdx >= input.shapes[k][0]) {
+            throw new Error(
+              `mapOverBlocks: point-mode source index ${srcIdx} out of range [0, ${input.shapes[k][0]}) for input leaf ${k} at blockIdx=${blockIdx}`,
+            );
+          }
           const perElemBytes =
             input.shapes[k].slice(1).reduce((a, b) => a * b, 1) * elemBytes;
           const slot = backend.malloc(perElemBytes);
