@@ -28,8 +28,8 @@ const compose2 = (
 };
 
 // DLM-like 5-tuple forward compose with inv (mirrors dlm-js composeForward)
-// Uses einsum — identical to compose5 (fast path lowers einsum to matmul/swapaxes)
-const _compose5_einsum = (
+// Uses einsum — einsumFastPath lowers these to matmul/swapaxes before parsing
+const compose5_einsum = (
   a: { A: np.Array; b: np.Array; C: np.Array; eta: np.Array; J: np.Array },
   b_elem: { A: np.Array; b: np.Array; C: np.Array; eta: np.Array; J: np.Array },
 ) => {
@@ -75,8 +75,8 @@ const _compose5_einsum = (
   return { A: A_comp, b: b_comp, C: C_comp, eta: eta_comp, J: J_comp };
 };
 
-// Alternative: uses np.matmul / np.swapaxes directly (equivalent to einsum fast path)
-const compose5 = (
+// Reference: uses np.matmul / np.swapaxes directly (equivalent to einsum fast path output)
+const _compose5_matmul = (
   a: { A: np.Array; b: np.Array; C: np.Array; eta: np.Array; J: np.Array },
   b_elem: { A: np.Array; b: np.Array; C: np.Array; eta: np.Array; J: np.Array },
 ) => {
@@ -140,7 +140,13 @@ test("DLM 5-tuple compose scaling", async () => {
 
     const fn = jit(
       (AA: np.Array, bb: np.Array, CC: np.Array, ee: np.Array, JJ: np.Array) =>
-        lax.associativeScan(compose5, { A: AA, b: bb, C: CC, eta: ee, J: JJ }),
+        lax.associativeScan(compose5_einsum, {
+          A: AA,
+          b: bb,
+          C: CC,
+          eta: ee,
+          J: JJ,
+        }),
     );
     tree.dispose(fn(A, b, C, eta, J));
     const ITERS = 3;
@@ -175,7 +181,13 @@ test("DLM 5-tuple compose scaling", async () => {
 
     const fn = jit(
       (AA: np.Array, bb: np.Array, CC: np.Array, ee: np.Array, JJ: np.Array) =>
-        lax.associativeScan(compose5, { A: AA, b: bb, C: CC, eta: ee, J: JJ }),
+        lax.associativeScan(compose5_einsum, {
+          A: AA,
+          b: bb,
+          C: CC,
+          eta: ee,
+          J: JJ,
+        }),
     );
     if (N === Ns[0]) setDebug(1);
     await tree.consumeData(fn(A, b, C, eta, J) as any);

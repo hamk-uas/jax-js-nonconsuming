@@ -692,6 +692,36 @@ describe("parallel Kalman filter via associativeScan", () => {
     }
   });
 
+  test("non-fast-path batch einsum falls back to Kogge-Stone correctly", () => {
+    // "nij,nkj->nki" is NOT in einsumFastPath — per-element tracing fails
+    // (3-char subscript with 2D [m,m] input) so associativeScan falls back to
+    // the unrolled Kogge-Stone path. Result should still be correct.
+    const N = 6;
+    using As = np.full([N, 2, 2], 0.9);
+    using bs = np.full([N, 2, 2], 0.1);
+
+    // compose: A_new = (B @ A^T)^T = A @ B^T, b_new = b_q + b_p
+    const compose = (
+      p: { A: np.Array; b: np.Array },
+      q: { A: np.Array; b: np.Array },
+    ) => ({
+      A: np.einsum("nij,nkj->nki", q.A, p.A) as np.Array,
+      b: np.add(q.b, p.b) as np.Array,
+    });
+
+    const result = lax.associativeScan(compose, { A: As, b: bs }) as {
+      A: np.Array;
+      b: np.Array;
+    };
+    try {
+      expect(result.A.shape).toEqual([N, 2, 2]);
+      expect(result.b.shape).toEqual([N, 2, 2]);
+    } finally {
+      result.A.dispose();
+      result.b.dispose();
+    }
+  });
+
   test("jit(grad(assocScan)) with 3-tuple compose doesn't exceed WebGPU buffer limit (regression)", () => {
     // Regression test for: "Too many buffers (9) for WebGPU pipeline (max: 8)"
     // when jit(grad/valueAndGrad of assocScan) uses a 3-tuple compose. The P2

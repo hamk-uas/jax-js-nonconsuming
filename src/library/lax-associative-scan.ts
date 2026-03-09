@@ -324,9 +324,9 @@ export function associativeScan<T extends JsTree<Array>>(
   }
 
   // 4. Trace fn into a body jaxpr (per-element shapes, scan axis removed).
-  //    If tracing fails (e.g. compose fn uses ops that explicitly reference
-  //    the scan axis like einsum "nij,njk->nik"), fall back to the direct
-  //    Kogge-Stone path via associativeScanCore.
+  //    If tracing fails, fall back to the direct Kogge-Stone path via
+  //    associativeScanCore.  Note: einsum patterns like "nij,njk->nik" work
+  //    fine — einsumFastPath lowers them to matmul before subscript parsing.
   const elemAvals = movedElems.map(
     (e) => new ShapedArray(e.shape.slice(1) as number[], e.dtype, false),
   );

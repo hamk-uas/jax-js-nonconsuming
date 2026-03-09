@@ -185,11 +185,11 @@ output → 2 storage bindings + 1 uniform = 3 total.
 
 ## Prioritization
 
-| Phase                      | Effort                                      | Impact                         | Recommendation |
-| -------------------------- | ------------------------------------------- | ------------------------------ | -------------- |
-| einsum cleanup             | Small (remove comments/warnings, add tests) | Correctness of docs            | **Do first**   |
-| Phase 1: Uniform constants | Medium (shader + executor + plan changes)   | **Unblocks 5-tuple on WebGPU** | **Do second**  |
-| Phase 2: Leaf packing      | Large (new allocator + shader rewrite)      | Unblocks 6+ tuples             | Do when needed |
+| Phase                       | Effort                                 | Impact                         | Recommendation |
+| --------------------------- | -------------------------------------- | ------------------------------ | -------------- |
+| ~~einsum cleanup~~          | ~~Small~~                              | ~~Correctness of docs~~        | **Done** ✅    |
+| ~~Phase 1: Uniform consts~~ | ~~Medium~~                             | ~~Unblocks 5-tuple on WebGPU~~ | **Done** ✅    |
+| Phase 2: Leaf packing       | Large (new allocator + shader rewrite) | Unblocks 6+ tuples             | Do when needed |
 
 Phase 1 alone is sufficient to enable the 5-tuple DLM compose on WebGPU's fused block-map path.
 Phase 2 is insurance for the future and can be deferred until a real 6+ tuple use case materializes.
