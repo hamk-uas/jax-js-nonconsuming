@@ -706,6 +706,15 @@ export class AluExp implements FpHashable {
     }
 
     // Shape tracking ops (can be made more general).
+    // x / C => 0  (when x ∈ [0, C-1])
+    if (
+      op === AluOp.Idiv &&
+      src[1].op === AluOp.Const &&
+      src[0].min >= 0 &&
+      src[0].max < src[1].arg
+    ) {
+      return AluExp.const(this.dtype, 0);
+    }
     // x % C => x
     if (
       op === AluOp.Mod &&
@@ -1783,11 +1792,11 @@ export function accessorGlobal(
 ): AluExp {
   const [index, valid] = st.toAluExp(indices);
   const [, len] = st.views[0].dataRange();
-  return AluExp.where(
-    valid,
-    AluExp.globalIndex(dtype, gid, len, index),
-    AluExp.const(dtype, 0),
-  );
+  const read = AluExp.globalIndex(dtype, gid, len, index);
+  // P2a: skip select(read, 0, true) — valid is always AluExp.bool(true) = Const(Bool, 1)
+  // when there's no ShapeTracker mask (tile-aligned inputs).
+  if (valid.op === AluOp.Const && valid.arg === 1) return read;
+  return AluExp.where(valid, read, AluExp.const(dtype, 0));
 }
 
 /** Expression for accessing `indices` in an array recipe with variable "idx". */
@@ -1797,11 +1806,9 @@ export function accessorAluExp(
   indices: AluExp[],
 ): AluExp {
   const [index, valid] = st.toAluExp(indices);
-  return AluExp.where(
-    valid,
-    exp.substitute({ idx: index }),
-    AluExp.const(exp.dtype, 0),
-  );
+  const substituted = exp.substitute({ idx: index });
+  if (valid.op === AluOp.Const && valid.arg === 1) return substituted;
+  return AluExp.where(valid, substituted, AluExp.const(exp.dtype, 0));
 }
 
 // Threefry 2x32, 20 rounds (NR = 20)

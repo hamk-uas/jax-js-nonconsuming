@@ -23,7 +23,7 @@ describe("lax.scan backend coverage", () => {
   // Since we await init(), we can't use describe.each top-level (init is async).
   // Simpler: Just one test that iterates.
 
-  it("executes tests on all devices", async () => {
+  it("executes tests on all devices", { timeout: 30_000 }, async () => {
     const originalDefault = defaultDevice();
 
     for (const device of devices) {

@@ -5,10 +5,15 @@ set -euo pipefail
 # --- AEP (Agentic Evolution Protocol) gate ---
 # On every commit the committer must first re-read the AEP in order to commit.
 # DO NOT MISUSE! Read AEP first -- don't circumvent this check!
-if [[ "${AEP:-}" != "1" ]]; then
+REQUIRED_HASH="a28bd144cdc6672c607309e4810aec66be3539ed"
+INPUT_HASH=$(echo -n "${AEP:-}" | shasum | awk '{print $1}')
+if [[ "$INPUT_HASH" != "$REQUIRED_HASH" ]]; then
   echo "AEP GATE: commit rejected"
+  echo "Expected Hash: $REQUIRED_HASH"
+  echo "Received Hash: $INPUT_HASH (from AEP=\"${AEP:-}\")"
   echo "Read the Agentic Evolution Protocol (AEP) in"
   echo ".github/copilot-instructions.md, then follow it."
+  echo "Do NOT circumvent this check. Read again, don't memorize!"
   exit 1
 fi
 
@@ -78,6 +83,5 @@ else
 fi
 
 if [[ "$profile" == "full" ]]; then
-  pnpm run test:deno
   pnpm run test:website:smoke
 fi

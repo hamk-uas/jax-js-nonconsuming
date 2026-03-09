@@ -48,7 +48,25 @@ export default defineConfig({
       enabled: true,
       headless: true,
       screenshotFailures: false,
-      provider: playwright(),
+      provider: playwright({
+        launchOptions: {
+          args: [
+            "--no-sandbox",
+            "--headless=new",
+            "--use-angle=vulkan",
+            "--enable-features=Vulkan",
+            "--disable-vulkan-surface",
+            "--enable-unsafe-webgpu",
+            "--enable-dawn-features=vulkan_enable_f16_on_nvidia",
+          ],
+          env: {
+            DISPLAY: process.env.DISPLAY ?? ":0",
+            XAUTHORITY:
+              process.env.XAUTHORITY ??
+              `/run/user/${process.getuid?.() ?? 1000}/gdm/Xauthority`,
+          },
+        },
+      }),
       instances: [{ browser: "chromium" }],
     },
     coverage: {
@@ -56,8 +74,24 @@ export default defineConfig({
       enabled: false,
       provider: "v8",
     },
+    // fileParallelism defaults to true — vitest runs files concurrently.
+    // All tests share one Chromium tab / GPUDevice so this is safe and
+    // eliminates the ~3 s per-file startup cost that dominates with serial.
+    testTimeout: 10000,
     passWithNoTests: true,
-    exclude: ["**/node_modules/**", "**/dist/**", "test/deno/**", "tmp/**"],
+    exclude: [
+      "**/node_modules/**",
+      "**/dist/**",
+      "tmp/**",
+      // Performance benchmarks, not correctness tests:
+      "test/scan-bench.test.ts",
+      "test/bench-phase3.test.ts",
+      // GPU-specific benchmarks (run with scripts/gpu-test.sh):
+      "test/gpu-bench.test.ts",
+      "test/debug-wgsl.test.ts",
+      "test/vitest.nvidia.config.ts",
+      "test/vitest.intel.config.ts",
+    ],
     setupFiles: ["test/setup.ts"],
   },
 });

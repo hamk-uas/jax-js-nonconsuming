@@ -95,6 +95,12 @@ export enum Primitive {
   Pad = "pad",
   // Update a contiguous slice along an axis: dst[axis=offset:offset+len] = src
   DynamicUpdateSlice = "dynamic_update_slice",
+  // Extract a contiguous slice using dynamic start indices
+  DynamicSlice = "dynamic_slice",
+  // Like DynamicSlice but without min/max clamping (caller guarantees in-bounds)
+  UncheckedDynamicSlice = "unchecked_dynamic_slice",
+  // Reverse elements along an axis (materializing, not a view)
+  Reverse = "reverse",
   // Atomic scatter-add: target[indices[i]] += updates[i]
   ScatterAdd = "scatter_add",
 
@@ -112,6 +118,10 @@ export enum Primitive {
   // Control flow
   Scan = "scan",
   AssociativeScan = "associative_scan",
+  BlockMap = "block_map",
+  BlockIndex = "block_index",
+  ForiLoop = "fori_loop",
+  WorkgroupAssociativeScan = "workgroup_associative_scan",
 }
 
 interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
@@ -131,13 +141,16 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.RandomBits]: { shape: number[]; mode: "xor" | 0 | 1 };
   [Primitive.Gather]: { axis: number[]; outDim: number };
   [Primitive.Transpose]: { perm: number[] };
-  [Primitive.Broadcast]: { shape: number[]; axis: number[] };
+  [Primitive.Broadcast]: { shape: Dim[]; axis: number[] };
   [Primitive.Reshape]: { shape: number[] };
   [Primitive.Flip]: { axis: number[] };
+  [Primitive.Reverse]: { axis: number };
   [Primitive.Shrink]: { slice: Pair[] };
   [Primitive.Pad]: { width: Pair[] };
   // Update a contiguous slice along a single axis: dst[axis=offset:offset+src.shape[axis]] = src
   [Primitive.DynamicUpdateSlice]: { offset: number; axis: number };
+  [Primitive.DynamicSlice]: { sliceSizes: number[] };
+  [Primitive.UncheckedDynamicSlice]: { sliceSizes: number[] };
   // Scatter-add: target[indices[i]] += updates[i] along axis
   [Primitive.ScatterAdd]: { axis: number };
   [Primitive.TriangularSolve]: { unitDiagonal: boolean };
@@ -170,6 +183,32 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     numLeaves: number;
     axis: number;
     reverse: boolean;
+  };
+  [Primitive.BlockMap]: {
+    jaxpr: Jaxpr;
+    blockShape: number[];
+    inAxes: (number | null)[][];
+    outAxes: (number | null)[][];
+    numConsts: number;
+    numInputs: number;
+    /** Explicit grid shape. When provided, overrides grid inference from mapped inputs. */
+    gridShape?: number[];
+    /** Register tiling: each thread handles threadTile[g] outputs per axis. */
+    threadTile?: number[];
+    /** Set by JVP rule when this block_map was produced by differentiating an outer block_map. */
+    isJvpTransformed?: boolean;
+  };
+  [Primitive.ForiLoop]: {
+    jaxpr: Jaxpr;
+    numConsts: number;
+    lower: number | Dim;
+    upper: number | Dim;
+    /** Set by JVP rule when this fori_loop was produced by differentiating. */
+    isJvpTransformed?: boolean;
+  };
+  [Primitive.WorkgroupAssociativeScan]: {
+    jaxpr: Jaxpr;
+    numConsts: number;
   };
 }
 
@@ -484,7 +523,7 @@ export function transpose(x: TracerValue, perm?: number[]) {
   return bind1(Primitive.Transpose, [x], { perm });
 }
 
-export function broadcast(x: TracerValue, shape: number[], axis: number[]) {
+export function broadcast(x: TracerValue, shape: Dim[], axis: number[]) {
   axis = normalizeAxis(axis, shape.length);
   return bind1(Primitive.Broadcast, [x], { shape, axis });
 }
@@ -513,6 +552,11 @@ export function reshape(x: TracerValue, shape: number | number[]) {
 export function flip(x: TracerValue, axis: number[]) {
   axis = normalizeAxis(axis, ndim(x));
   return bind1(Primitive.Flip, [x], { axis });
+}
+
+export function reverse(x: TracerValue, axis: number) {
+  axis = normalizeAxis([axis], ndim(x))[0];
+  return bind1(Primitive.Reverse, [x], { axis });
 }
 
 export function shrink(x: TracerValue, slice: Pair[]) {

@@ -28,9 +28,14 @@ import {
   range,
   strip1,
 } from "../utils";
+import {
+  blockMapFusedShaderSource,
+  type BlockMapShaderParams,
+} from "./webgpu/block-map";
 import { erfSrc, threefrySrc } from "./webgpu/builtins";
 import {
   calculateGrid,
+  castSaturateWgsl,
   constToWgsl,
   dtypeToWgsl,
   gridOffsetY,
@@ -44,6 +49,7 @@ import {
   type ScanBindingInfo,
   wrapRoutineForScan,
 } from "./webgpu/scan-wrapper";
+import { createWgslGen, type ResolveGlobalIndex } from "./webgpu/wgsl-gen";
 
 interface ShaderDispatch extends ShaderInfo {
   pipeline: GPUComputePipeline; // Compiled pipeline for the shader.
@@ -58,9 +64,11 @@ export interface NativeScanMultiStep {
   kernel: Kernel;
   /** Input mapping: indices into [consts, carry, xs, internals] flattened. */
   inputs: number[];
-  /** Which carry slot this kernel writes to (0..numCarry-1), or -1 for internal. */
+  /** Which carry slot this kernel writes to (0..numCarry-1), or -1. */
   outputCarryIdx: number;
-  /** Which internal local this step defines (0..numInternal-1), or -1 for carry. */
+  /** Which Y output slot this step writes to (0..numY-1), or -1. */
+  outputYIdx: number;
+  /** Which internal local this step defines (0..numInternal-1), or -1. */
   outputInternalIdx: number;
   /** Size of output in elements (not bytes). */
   outputSize: number;
@@ -71,73 +79,24 @@ export interface NativeScanMultiParams {
   length: number;
   numConsts: number;
   constSizes: number[];
+  constDtypes: DType[];
   numCarry: number;
   carrySizes: number[];
+  carryDtypes: DType[];
   numX: number;
   xsStrides: number[];
+  xsDtypes: DType[];
   numY: number;
   ysStrides: number[];
+  ysDtypes: DType[];
   steps: NativeScanMultiStep[];
   reverse?: boolean;
   /** Number of internal intermediate locals (from steps with internal deps). */
   numInternal: number;
-}
-
-// ---------------------------------------------------------------------------
-// Types for WebGPU native associative scan (fused Kogge-Stone)
-// ---------------------------------------------------------------------------
-
-/** A reindexed kernel step for the associative scan body. */
-export interface AssocScanStep {
-  /** Reindexed kernel (gids relative to [consts, a-leaves, b-leaves, internals]). */
-  kernel: Kernel;
-  /** Input mapping for this step. */
-  inputSlots: number[];
-  /** Which internal buffer this step writes to. */
-  outputInternalIdx: number;
-}
-
-/**
- * Parameters for WebGPU fused associative scan.
- * The shader fuses all body kernel steps into a single dispatch per
- * Kogge-Stone round, reducing from ~20 dispatches/round to 1.
- */
-export interface WebGPUAssocScanParams {
-  /** Number of constant inputs. */
-  numConsts: number;
-  /** Number of pytree leaves. */
-  numLeaves: number;
-  /** Per-leaf element count in typed values (e.g. 16 for a 4×4 f32 matrix). */
-  leafElemCounts: number[];
-  /** Body kernel steps with reindexed gids. */
-  steps: AssocScanStep[];
-  /** Typed element counts for internal buffers. */
+  /** Per-internal element count (typed, not bytes). */
   internalElemCounts: number[];
-  /** Whether to reverse the scan direction. */
-  reverse: boolean;
-  /**
-   * Mapping from output leaf index to internal buffer index.
-   * leafToInternalIdx[k] = the internal buffer that produces leaf k.
-   */
-  leafToInternalIdx: number[];
-  /** dtype for all leaves (must be homogeneous). */
-  dtype: DType;
-}
-
-/**
- * Prepared WebGPU fused associative scan — ready to dispatch.
- */
-export interface PreparedWebGPUAssocScan {
-  /** Compiled compute pipeline for one Kogge-Stone round. */
-  pipeline: GPUComputePipeline;
-  /** Bind group layout for storage bindings (ping, pong, consts). */
-  storageLayout: GPUBindGroupLayout;
-  /** Bind group layout for uniform bindings (stride, N). */
-  uniformLayout: GPUBindGroupLayout;
-  /** Workgroup size for dispatches. */
-  workgroupSize: number;
-  /** Shader source code (for debugging). */
-  code: string;
+  /** Per-internal dtype. */
+  internalDtypes: DType[];
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +144,55 @@ export interface PreparedPreencodedScan {
   copyUsesShader: boolean[];
   /** Bind group layout for the uniform offset group (with dynamic offset). */
   uniformLayout: GPUBindGroupLayout;
+}
+
+// ---------------------------------------------------------------------------
+// Types for WebGPU preencoded multi-step scan (Phase 2)
+// ---------------------------------------------------------------------------
+
+/** A single prepared step in a multi-step preencoded scan body. */
+export interface PreencodedMultiStepEntry {
+  /** The compiled pipeline(s) for this execute step. */
+  dispatches: ShaderDispatch[];
+  /** Input JitIds for this step (used to build bind groups). */
+  inputJitIds: number[];
+  /** Output JitIds for this step. */
+  outputJitIds: number[];
+  /** Per-step offset buffer for xs offsets (null if step has no xs inputs). */
+  offsetBuffer: GPUBuffer | null;
+  /** Alignment between iterations in the offset buffer (0 if no offsets). */
+  offsetAlignment: number;
+}
+
+/** Prepared preencoded multi-step scan with per-step pipelines and layout. */
+export interface PreparedPreencodedMultiStep {
+  /** Scan iteration count. */
+  length: number;
+  /** One entry per execute step in the body program. */
+  stepEntries: PreencodedMultiStepEntry[];
+  /** Sizes of each carry buffer in bytes. */
+  carrySizes: number[];
+  /** Sizes of each internal buffer in bytes (pre-allocated scratch). */
+  internalSizes: number[];
+  /** Map from body JitId to internal buffer index. */
+  internalMap: Map<number, number>;
+  /** Number of carry, const, xs, ys arrays. */
+  numCarry: number;
+  numConsts: number;
+  numX: number;
+  numY: number;
+  /** Whether to scan in reverse order. */
+  reverse: boolean;
+  /** Per-ys copy strategy for ys stacking (true = use shader copy for non-4b-aligned). */
+  copyUsesShader: boolean[];
+  /** Bind group layout for the uniform offset group (with dynamic offset). */
+  uniformLayout: GPUBindGroupLayout;
+  /** Body program output JitIds for carry outputs [0..numCarry). */
+  carryOutJitIds: number[];
+  /** Body program output JitIds for ys outputs [numCarry..numCarry+numY). */
+  yOutJitIds: number[];
+  /** Per-ys byte sizes for ys stacking. */
+  ysSizes: number[];
 }
 
 const COPY_WORKGROUP_SIZE = 64;
@@ -324,9 +332,15 @@ export class WebGPUBackend implements Backend {
       atomicF32Add: device.features.has(
         "shader-f32-atomic-add" as GPUFeatureName,
       ),
+      shaderF16: device.features.has("shader-f16" as GPUFeatureName),
+      subgroups: device.features.has("subgroups" as GPUFeatureName),
       sharedMemory: false,
       multiOutputKernel: true,
       maxComputeWorkgroupSizeX: device.limits.maxComputeWorkgroupSizeX,
+      maxComputeInvocationsPerWorkgroup:
+        device.limits.maxComputeInvocationsPerWorkgroup,
+      maxComputeWorkgroupStorageSize:
+        device.limits.maxComputeWorkgroupStorageSize,
     };
     this.pipelines = new ShaderPipelineCache(device);
     this.syncReader = new SyncReader(device);
@@ -695,313 +709,6 @@ export class WebGPUBackend implements Backend {
     }
     this.device.queue.submit([commandEncoder.finish()]);
   }
-
-  // ---------------------------------------------------------------------------
-  // Fused associative scan methods (WebGPU Kogge-Stone)
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Compile the fused Kogge-Stone shader and create a reusable pipeline.
-   *
-   * Returns `PreparedWebGPUAssocScan` containing the pipeline plus the
-   * precomputed bind group layout. The pipeline is cached by shader source.
-   */
-  prepareAssocScan(
-    params: WebGPUAssocScanParams,
-  ): PreparedWebGPUAssocScan | null {
-    try {
-      const { code, workgroupSize } = assocScanFusedShaderSource(
-        this.device,
-        params,
-      );
-
-      if (DEBUG >= 2) {
-        console.info(
-          "=========== WebGPU assocScan shader ===========\n" + code,
-        );
-      }
-
-      // Build bind group layout:
-      //   group(0): ping (read), pong (read_write), const0..constK (read)
-      //   group(1): uniforms (uniform, hasDynamicOffset=false)
-      const { numConsts } = params;
-      const storageEntries: GPUBindGroupLayoutEntry[] = [
-        {
-          binding: 0,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "read-only-storage" },
-        },
-        {
-          binding: 1,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "storage" },
-        },
-      ];
-      for (let i = 0; i < numConsts; i++) {
-        storageEntries.push({
-          binding: i + 2,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: "read-only-storage" },
-        });
-      }
-      const storageLayout = this.device.createBindGroupLayout({
-        entries: storageEntries,
-      });
-      const uniformLayout = this.device.createBindGroupLayout({
-        entries: [
-          {
-            binding: 0,
-            visibility: GPUShaderStage.COMPUTE,
-            buffer: {
-              type: "uniform",
-              hasDynamicOffset: true,
-              minBindingSize: 8,
-            },
-          },
-        ],
-      });
-      const pipelineLayout = this.device.createPipelineLayout({
-        bindGroupLayouts: [storageLayout, uniformLayout],
-      });
-
-      const shaderModule = this.device.createShaderModule({ code });
-      const pipeline = this.device.createComputePipeline({
-        layout: pipelineLayout,
-        compute: { module: shaderModule, entryPoint: "main" },
-      });
-
-      return {
-        pipeline,
-        storageLayout,
-        uniformLayout,
-        workgroupSize,
-        code,
-      };
-    } catch (e) {
-      if (DEBUG >= 1) {
-        console.warn("WebGPU assocScan codegen failed:", e);
-      }
-      return null;
-    }
-  }
-
-  /**
-   * Execute the full Kogge-Stone scan: ceil(log₂ N) dispatches of the
-   * fused shader, swapping ping/pong buffers each round.
-   *
-   * @param prepared  Compiled pipeline from `prepareAssocScan()`
-   * @param params    Scan parameters (leaf info, steps, etc.)
-   * @param constSlots  Constant input slots (backend Slots)
-   * @param elemSlots   Input leaf element slots (one per leaf)
-   * @param outputSlots Output slots (one per leaf, caller-allocated)
-   * @param N           Number of positions (scan length)
-   * @param reverse     Whether to process in reverse order
-   */
-  dispatchAssocScan(
-    prepared: PreparedWebGPUAssocScan,
-    params: WebGPUAssocScanParams,
-    constSlots: Slot[],
-    elemSlots: Slot[],
-    outputSlots: Slot[],
-    N: number,
-    reverse: boolean,
-  ): void {
-    const { numLeaves, leafElemCounts, dtype } = params;
-    const bytesPerElem = byteWidth(dtype);
-
-    // Compute total interleaved buffer size:
-    // sum(leafElemCounts) * N * bytesPerElem
-    const totalElemsPerPos = leafElemCounts.reduce((a, b) => a + b, 0);
-    const totalBytes = totalElemsPerPos * N * bytesPerElem;
-    const paddedBytes = Math.max(Math.ceil(totalBytes / 4) * 4, 4);
-
-    // Allocate transient ping/pong GPU buffers
-    const pingBuf = this.#createBuffer(paddedBytes);
-    const pongBuf = this.#createBuffer(paddedBytes);
-
-    // Compute leaf start offsets (prefix sum of elemCounts)
-    const leafStarts: number[] = [0];
-    for (let k = 1; k < numLeaves; k++) {
-      leafStarts[k] = leafStarts[k - 1] + leafElemCounts[k - 1];
-    }
-
-    // Create const GPU buffers array
-    const constBuffers = constSlots.map((slot) => this.#getBuffer(slot).buffer);
-
-    // --- Kogge-Stone round count ---
-    const numRounds = Math.ceil(Math.log2(N));
-
-    // --- Pre-allocate single uniform buffer for all rounds (dynamic offsets) ---
-    const minAlign = this.device.limits.minUniformBufferOffsetAlignment;
-    const uniformEntrySize = Math.max(8, minAlign);
-    const uniformBufSize = Math.max(
-      numRounds * uniformEntrySize,
-      uniformEntrySize,
-    );
-    const uniformBuf = this.device.createBuffer({
-      size: uniformBufSize,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      mappedAtCreation: true,
-    });
-    const uniformMapped = new DataView(uniformBuf.getMappedRange());
-    for (let r = 0; r < numRounds; r++) {
-      uniformMapped.setUint32(r * uniformEntrySize, 1 << r, true); // stride
-      uniformMapped.setUint32(r * uniformEntrySize + 4, N, true); // N
-    }
-    uniformBuf.unmap();
-
-    // --- Pre-create bind groups ---
-    // 2 storage bind groups: even rounds (ping→pong), odd rounds (pong→ping)
-    const constEntries: GPUBindGroupEntry[] = constBuffers.map((b, i) => ({
-      binding: i + 2,
-      resource: { buffer: b },
-    }));
-    const storagePingPong = this.device.createBindGroup({
-      layout: prepared.storageLayout,
-      entries: [
-        { binding: 0, resource: { buffer: pingBuf } },
-        { binding: 1, resource: { buffer: pongBuf } },
-        ...constEntries,
-      ],
-    });
-    const storagePongPing = this.device.createBindGroup({
-      layout: prepared.storageLayout,
-      entries: [
-        { binding: 0, resource: { buffer: pongBuf } },
-        { binding: 1, resource: { buffer: pingBuf } },
-        ...constEntries,
-      ],
-    });
-    // 1 uniform bind group with dynamic offset
-    const uniformBindGroup = this.device.createBindGroup({
-      layout: prepared.uniformLayout,
-      entries: [{ binding: 0, resource: { buffer: uniformBuf, size: 8 } }],
-    });
-
-    // --- Single command encoder for entire operation ---
-    const enc = this.device.createCommandEncoder();
-
-    // 1. Copy input elems into ping buffer (interleaved layout)
-    for (let k = 0; k < numLeaves; k++) {
-      const srcBuf = this.#getBuffer(elemSlots[k]).buffer;
-      const dstOffset = leafStarts[k] * N * bytesPerElem;
-      const copySize = leafElemCounts[k] * N * bytesPerElem;
-      if (copySize > 0 && copySize % 4 === 0) {
-        enc.copyBufferToBuffer(srcBuf, 0, pingBuf, dstOffset, copySize);
-      } else if (copySize > 0) {
-        this.#encodeCopyWithShader(
-          enc,
-          srcBuf,
-          0,
-          pingBuf,
-          dstOffset,
-          copySize,
-        );
-      }
-    }
-
-    // 2. Reverse input if needed (inline reversal into same encoder)
-    let reverseTempBuf: GPUBuffer | null = null;
-    if (reverse && N > 1) {
-      reverseTempBuf = this.#createBuffer(paddedBytes);
-      for (let k = 0; k < numLeaves; k++) {
-        const ec = leafElemCounts[k];
-        const leafOffset = leafStarts[k] * N * bytesPerElem;
-        const elemBytes = ec * bytesPerElem;
-        for (let j = 0; j < N; j++) {
-          const srcOff = leafOffset + j * elemBytes;
-          const dstOff = leafOffset + (N - 1 - j) * elemBytes;
-          if (elemBytes % 4 === 0) {
-            enc.copyBufferToBuffer(
-              pingBuf,
-              srcOff,
-              reverseTempBuf,
-              dstOff,
-              elemBytes,
-            );
-          }
-        }
-      }
-      enc.copyBufferToBuffer(reverseTempBuf, 0, pingBuf, 0, paddedBytes);
-    }
-
-    // 3. Encode all Kogge-Stone rounds into same command buffer (1 submit)
-    const wgSize = prepared.workgroupSize;
-    const numWorkgroups = Math.ceil(N / wgSize);
-    const [gridX, gridY] = calculateGrid(numWorkgroups);
-
-    for (let round = 0; round < numRounds; round++) {
-      const storageGroup = round % 2 === 0 ? storagePingPong : storagePongPing;
-      const dynamicOffset = round * uniformEntrySize;
-
-      const pass = enc.beginComputePass();
-      pass.setPipeline(prepared.pipeline);
-      pass.setBindGroup(0, storageGroup);
-      pass.setBindGroup(1, uniformBindGroup, [dynamicOffset]);
-      pass.dispatchWorkgroups(gridX, gridY);
-      pass.end();
-    }
-
-    // After all rounds: even rounds write to pong, odd rounds write to ping.
-    // Last round = numRounds-1. Result in pong if last round even, ping if odd.
-    const resultBuf = (numRounds - 1) % 2 === 0 ? pongBuf : pingBuf;
-
-    // 4. Reverse result if needed (reuse temp buffer)
-    if (reverse && N > 1) {
-      for (let k = 0; k < numLeaves; k++) {
-        const ec = leafElemCounts[k];
-        const leafOffset = leafStarts[k] * N * bytesPerElem;
-        const elemBytes = ec * bytesPerElem;
-        for (let j = 0; j < N; j++) {
-          const srcOff = leafOffset + j * elemBytes;
-          const dstOff = leafOffset + (N - 1 - j) * elemBytes;
-          if (elemBytes % 4 === 0) {
-            enc.copyBufferToBuffer(
-              resultBuf,
-              srcOff,
-              reverseTempBuf!,
-              dstOff,
-              elemBytes,
-            );
-          }
-        }
-      }
-      enc.copyBufferToBuffer(reverseTempBuf!, 0, resultBuf, 0, paddedBytes);
-    }
-
-    // 5. Copy results from result buffer to output slots
-    for (let k = 0; k < numLeaves; k++) {
-      const dstBuf = this.#getBuffer(outputSlots[k]).buffer;
-      const srcOffset = leafStarts[k] * N * bytesPerElem;
-      const copySize = leafElemCounts[k] * N * bytesPerElem;
-      if (copySize > 0 && copySize % 4 === 0) {
-        enc.copyBufferToBuffer(resultBuf, srcOffset, dstBuf, 0, copySize);
-      } else if (copySize > 0) {
-        this.#encodeCopyWithShader(
-          enc,
-          resultBuf,
-          srcOffset,
-          dstBuf,
-          0,
-          copySize,
-        );
-      }
-    }
-
-    // 6. Single submit for everything
-    this.device.queue.submit([enc.finish()]);
-
-    // 7. Cleanup transient buffers
-    uniformBuf.destroy();
-    if (reverseTempBuf) {
-      reverseTempBuf.destroy();
-      this.#gpuAllocatedBytes -= paddedBytes;
-    }
-    pingBuf.destroy();
-    pongBuf.destroy();
-    this.#gpuAllocatedBytes -= paddedBytes * 2;
-  }
-
   // ---------------------------------------------------------------------------
   // Preencoded-routine scan methods (P4)
   // ---------------------------------------------------------------------------
@@ -1155,13 +862,20 @@ export class WebGPUBackend implements Backend {
 
       const module = this.device.createShaderModule({ code: wrapped.code });
 
-      // Create auto-layout pipeline to extract group(0)'s layout, then
-      // rebuild with explicit group(1) that has hasDynamicOffset: true.
-      const autoPipeline = this.device.createComputePipeline({
-        layout: "auto",
-        compute: { module, entryPoint: "main" },
+      // Create explicit group(0) layout from binding counts. Cannot use
+      // auto-layout extraction: WebGPU forbids reusing a bind group layout
+      // created as part of a pipeline's default layout.
+      const group0Layout = this.device.createBindGroupLayout({
+        entries: range(wrapped.numInputs + wrapped.numOutputs).map((i) => ({
+          binding: i,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: {
+            type: (i < wrapped.numInputs
+              ? "read-only-storage"
+              : "storage") as GPUBufferBindingType,
+          },
+        })),
       });
-      const group0Layout = autoPipeline.getBindGroupLayout(0);
       const pipelineLayout = this.device.createPipelineLayout({
         bindGroupLayouts: [group0Layout, uniformLayout],
       });
@@ -1244,6 +958,7 @@ export class WebGPUBackend implements Backend {
       carrySizes,
       numCarry,
       numConsts,
+      reverse,
       routineInputJitIds,
       routineOutputJitIds,
     } = params;
@@ -1260,13 +975,15 @@ export class WebGPUBackend implements Backend {
       (slot) => this.#getBuffer(slot).buffer,
     );
 
-    // Create ping-pong buffers for carry state
-    const carryPing = carrySizes.map((size) =>
-      this.#createBuffer(Math.max(size, 4)),
-    );
-    const carryPong = carrySizes.map((size) =>
-      this.#createBuffer(Math.max(size, 4)),
-    );
+    // Create ping-pong buffers for carry state (prefer pool)
+    const carryPing = carrySizes.map((size) => {
+      const padded = Math.max(size, 4);
+      return this.#poolPop(padded) ?? this.#createBuffer(padded);
+    });
+    const carryPong = carrySizes.map((size) => {
+      const padded = Math.max(size, 4);
+      return this.#poolPop(padded) ?? this.#createBuffer(padded);
+    });
 
     const commandEncoder = this.device.createCommandEncoder();
     const copyUniformBuffers: GPUBuffer[] = [];
@@ -1368,11 +1085,13 @@ export class WebGPUBackend implements Backend {
         }
 
         // Copy carry → ys for this iteration (passthrough pattern)
+        // Use original xs index for stacking position (reverse flips order)
+        const ysIdx = reverse ? length - 1 - iter : iter;
         const currentCarryBuffers = iter % 2 === 0 ? carryPong : carryPing;
         for (let c = 0; c < numCarry; c++) {
           const copySize = carrySizes[c];
           if (copySize <= 0) continue;
-          const yOffset = iter * copySize;
+          const yOffset = ysIdx * copySize;
           if (!copyUsesShader[c]) {
             commandEncoder.copyBufferToBuffer(
               currentCarryBuffers[c],
@@ -1427,10 +1146,494 @@ export class WebGPUBackend implements Backend {
     // Clean up temporary buffers
     for (const buf of copyUniformBuffers) buf.destroy();
     for (const buf of [...carryPing, ...carryPong]) {
-      this.#gpuAllocatedBytes -= buf.size;
-      buf.destroy();
+      if (!this.#poolPush(buf)) {
+        this.#gpuAllocatedBytes -= buf.size;
+        buf.destroy();
+      }
     }
     // offsetBuffer is NOT destroyed — owned by PreparedPreencodedScan for reuse
+  }
+
+  // -------------------------------------------------------------------------
+  // Preencoded multi-step scan (Phase 2c)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Prepare a preencoded multi-step scan: wrap each kernel's shader with
+   * per-iteration xs offsets, compile pipelines, and create offset buffers.
+   */
+  preparePreencodedMultiStepScan(params: {
+    length: number;
+    executeSteps: {
+      source: Kernel | Routine;
+      inputs: number[];
+      outputs: number[];
+    }[];
+    carrySizes: number[];
+    internalSizes: number[];
+    internalMap: Map<number, number>;
+    numCarry: number;
+    numConsts: number;
+    numX: number;
+    numY: number;
+    reverse: boolean;
+    xsElemStrides: number[];
+    ysElemStrides: number[];
+    ysSizes: number[];
+    carryOutJitIds: number[];
+    yOutJitIds: number[];
+  }): PreparedPreencodedMultiStep | null {
+    const {
+      length,
+      executeSteps,
+      carrySizes,
+      internalSizes,
+      internalMap,
+      numCarry,
+      numConsts,
+      numX,
+      numY,
+      reverse,
+      xsElemStrides,
+      ysSizes,
+      carryOutJitIds,
+      yOutJitIds,
+    } = params;
+
+    if (length === 0) return null;
+
+    // Shared layout for group(1) with dynamic offset support
+    const uniformLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "uniform", hasDynamicOffset: true },
+        },
+      ],
+    });
+
+    const minAlignment = this.getPreencodedScanAlignment();
+    const xsStart = numConsts + numCarry;
+    const stepEntries: PreencodedMultiStepEntry[] = [];
+
+    for (const step of executeSteps) {
+      // Obtain shader info: kernels use the cached shader, routines use
+      // createRoutineShader which returns ShaderInfo[] (one per sub-shader).
+      // All current non-sort routines produce exactly 1 ShaderInfo.
+      let shaderInfo: ShaderInfo;
+      if (step.source instanceof Kernel) {
+        shaderInfo = this.#cachedShader(step.source);
+      } else {
+        const routine = step.source as Routine;
+        const shaderInfos = createRoutineShader(this.device, routine);
+        if (shaderInfos.length !== 1) {
+          if (DEBUG >= 2)
+            console.log(
+              "preparePreencodedMultiStepScan: multi-shader routine not supported",
+            );
+          return null;
+        }
+        shaderInfo = shaderInfos[0];
+      }
+
+      // Reject steps that already use uniforms (symbolic dims or Sort)
+      if (shaderInfo.hasUniform) {
+        if (DEBUG >= 2)
+          console.log(
+            "preparePreencodedMultiStepScan: step already has uniform",
+          );
+        return null;
+      }
+
+      // Build ScanBindingInfo for this step — only count this step's
+      // actual xs inputs, excluding internal buffer JitIds.
+      const scanInfo: ScanBindingInfo = {
+        numConsts,
+        numCarry,
+        numX,
+        routineInputJitIds: step.inputs,
+        routineOutputJitIds: step.outputs,
+      };
+
+      // Wrap the shader with xs offset support
+      const wrapped = wrapRoutineForScan(shaderInfo, scanInfo);
+
+      let dispatches: ShaderDispatch[];
+      let offsetBuffer: GPUBuffer | null = null;
+      let offsetAlignment = 0;
+
+      if (wrapped.hasUniform) {
+        // Step has xs inputs — needs offset uniform at group(1).
+        // Create explicit group(0) layout from binding counts. Cannot use
+        // auto-layout extraction: WebGPU forbids reusing a bind group layout
+        // created as part of a pipeline's default layout.
+        const module = this.device.createShaderModule({
+          code: wrapped.code,
+        });
+        const group0Layout = this.device.createBindGroupLayout({
+          entries: range(wrapped.numInputs + wrapped.numOutputs).map((i) => ({
+            binding: i,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: {
+              type: (i < wrapped.numInputs
+                ? "read-only-storage"
+                : "storage") as GPUBufferBindingType,
+            },
+          })),
+        });
+        const pipelineLayout = this.device.createPipelineLayout({
+          bindGroupLayouts: [group0Layout, uniformLayout],
+        });
+        const pipeline = this.device.createComputePipeline({
+          layout: pipelineLayout,
+          compute: { module, entryPoint: "main" },
+        });
+
+        dispatches = [{ ...wrapped, pipeline }];
+
+        // Compute per-step xs element strides (in order of binding appearance)
+        const stepXsStrides: number[] = [];
+        for (const jitId of step.inputs) {
+          if (jitId >= xsStart && jitId < xsStart + numX) {
+            stepXsStrides.push(xsElemStrides[jitId - xsStart]);
+          }
+        }
+
+        // Create per-step offset buffer
+        const { buffer: offsetData, alignment } =
+          createAllIterationsOffsetsBuffer(
+            stepXsStrides.length,
+            0, // no ys offsets in shader — ys stacked via copy
+            length,
+            stepXsStrides,
+            [],
+            minAlignment,
+            reverse,
+          );
+
+        offsetBuffer = this.device.createBuffer({
+          size: Math.max(offsetData.length, 4),
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true,
+        });
+        new Uint8Array(offsetBuffer.getMappedRange()).set(offsetData);
+        offsetBuffer.unmap();
+        offsetAlignment = alignment;
+      } else {
+        // Step has no xs inputs — use normal pipeline without group(1)
+        const pipeline = this.pipelines.prepareSync(shaderInfo);
+        dispatches = [{ ...shaderInfo, pipeline }];
+      }
+
+      stepEntries.push({
+        dispatches,
+        inputJitIds: step.inputs,
+        outputJitIds: step.outputs,
+        offsetBuffer,
+        offsetAlignment,
+      });
+    }
+
+    const copyUsesShader = ysSizes.map((size) => size % 4 !== 0);
+
+    if (DEBUG >= 1) {
+      const wrappedCount = stepEntries.filter(
+        (e) => e.offsetBuffer !== null,
+      ).length;
+      console.log(
+        `Preencoded multi-step scan: prepared ${stepEntries.length} steps ` +
+          `(${wrappedCount} with xs offsets), ${length} iterations`,
+      );
+    }
+
+    return {
+      length,
+      stepEntries,
+      carrySizes,
+      internalSizes,
+      internalMap,
+      numCarry,
+      numConsts,
+      numX,
+      numY,
+      reverse,
+      copyUsesShader,
+      uniformLayout,
+      carryOutJitIds,
+      yOutJitIds,
+      ysSizes,
+    };
+  }
+
+  /**
+   * Dispatch a preencoded multi-step scan.
+   *
+   * Encodes ALL iterations into a single command buffer: for each iteration,
+   * dispatches all kernel steps, then copies carry outputs and stacks ys.
+   */
+  dispatchPreencodedMultiStepScan(
+    prepared: PreparedPreencodedMultiStep,
+    constSlots: Slot[],
+    initCarrySlots: Slot[],
+    xsSlots: Slot[],
+    carryOutSlots: Slot[],
+    ysStackedSlots: Slot[],
+  ): void {
+    const {
+      length,
+      stepEntries,
+      carrySizes,
+      internalSizes,
+      internalMap,
+      numCarry,
+      numConsts,
+      numX,
+      reverse: _reverse,
+      numY,
+      copyUsesShader,
+      uniformLayout,
+      carryOutJitIds,
+      yOutJitIds,
+      ysSizes,
+    } = prepared;
+
+    // Resolve slots to GPU buffers
+    const constBuffers = constSlots.map((s) => this.#getBuffer(s).buffer);
+    const initCarryBuffers = initCarrySlots.map(
+      (s) => this.#getBuffer(s).buffer,
+    );
+    const xsBuffers = xsSlots.map((s) => this.#getBuffer(s).buffer);
+    const carryOutBuffers = carryOutSlots.map((s) => this.#getBuffer(s).buffer);
+    const ysStackedBuffers = ysStackedSlots.map(
+      (s) => this.#getBuffer(s).buffer,
+    );
+
+    // Create transient ping-pong carry buffers (prefer pool)
+    const carryPing = carrySizes.map((sz) => {
+      const padded = Math.max(sz, 4);
+      return this.#poolPop(padded) ?? this.#createBuffer(padded);
+    });
+    const carryPong = carrySizes.map((sz) => {
+      const padded = Math.max(sz, 4);
+      return this.#poolPop(padded) ?? this.#createBuffer(padded);
+    });
+
+    // Create transient internal scratch buffers (prefer pool)
+    const internalBuffers = internalSizes.map((sz) => {
+      const padded = Math.max(sz, 4);
+      return this.#poolPop(padded) ?? this.#createBuffer(padded);
+    });
+
+    const commandEncoder = this.device.createCommandEncoder();
+    const copyUniformBuffers: GPUBuffer[] = [];
+
+    // Copy initCarry → carryPing
+    for (let i = 0; i < numCarry; i++) {
+      if (carrySizes[i] > 0) {
+        commandEncoder.copyBufferToBuffer(
+          initCarryBuffers[i],
+          0,
+          carryPing[i],
+          0,
+          carrySizes[i],
+        );
+      }
+    }
+
+    const xsStart = numConsts + numCarry;
+
+    // Helper: resolve a body JitId to a GPU buffer.
+    // carryRead is the current iteration's carry read side (ping or pong).
+    const resolveBuffer = (
+      jitId: number,
+      carryRead: GPUBuffer[],
+    ): GPUBuffer => {
+      if (jitId < numConsts) return constBuffers[jitId];
+      if (jitId < xsStart) return carryRead[jitId - numConsts];
+      if (jitId < xsStart + numX) return xsBuffers[jitId - xsStart];
+      const internalIdx = internalMap.get(jitId);
+      if (internalIdx !== undefined) return internalBuffers[internalIdx];
+      throw new Error(
+        `dispatchPreencodedMultiStepScan: unknown JitId ${jitId}`,
+      );
+    };
+
+    // Build per-step bind groups (two per step: ping=carry-read-from-ping,
+    // pong=carry-read-from-pong). Uniform bind groups are created separately.
+    const pingBindGroups: GPUBindGroup[] = [];
+    const pongBindGroups: GPUBindGroup[] = [];
+    const uniformBindGroups: (GPUBindGroup | null)[] = [];
+
+    for (const entry of stepEntries) {
+      const pipeline = entry.dispatches[0].pipeline;
+      const layout0 = pipeline.getBindGroupLayout(0);
+
+      const buildStorageBG = (carryRead: GPUBuffer[]): GPUBindGroup => {
+        const entries: GPUBindGroupEntry[] = [];
+        let binding = 0;
+        for (const jitId of entry.inputJitIds) {
+          entries.push({
+            binding: binding++,
+            resource: { buffer: resolveBuffer(jitId, carryRead) },
+          });
+        }
+        for (const jitId of entry.outputJitIds) {
+          // Outputs always go to internal buffers
+          const internalIdx = internalMap.get(jitId);
+          if (internalIdx === undefined) {
+            throw new Error(
+              `dispatchPreencodedMultiStepScan: output JitId ${jitId} not in internalMap`,
+            );
+          }
+          entries.push({
+            binding: binding++,
+            resource: { buffer: internalBuffers[internalIdx] },
+          });
+        }
+        return this.device.createBindGroup({ layout: layout0, entries });
+      };
+
+      pingBindGroups.push(buildStorageBG(carryPing));
+      pongBindGroups.push(buildStorageBG(carryPong));
+
+      // Uniform bind group for xs offsets (if this step has offset data)
+      if (entry.offsetBuffer) {
+        uniformBindGroups.push(
+          this.device.createBindGroup({
+            layout: uniformLayout,
+            entries: [
+              {
+                binding: 0,
+                resource: {
+                  buffer: entry.offsetBuffer,
+                  offset: 0,
+                  size: Math.max(entry.offsetAlignment, 4),
+                },
+              },
+            ],
+          }),
+        );
+      } else {
+        uniformBindGroups.push(null);
+      }
+    }
+
+    // Encode all iterations
+    for (let iter = 0; iter < length; iter++) {
+      const readPing = iter % 2 === 0;
+      const carryRead = readPing ? carryPing : carryPong;
+      const carryWrite = readPing ? carryPong : carryPing;
+
+      // Dispatch each body step (kernel or routine)
+      for (let si = 0; si < stepEntries.length; si++) {
+        const entry = stepEntries[si];
+        const storageBG = readPing ? pingBindGroups[si] : pongBindGroups[si];
+        const ubg = uniformBindGroups[si];
+
+        for (const dispatch of entry.dispatches) {
+          for (const { grid } of dispatch.passes) {
+            if (grid[0] === 0 || grid[1] === 0) continue;
+            const pass = commandEncoder.beginComputePass();
+            pass.setPipeline(dispatch.pipeline);
+            pass.setBindGroup(0, storageBG);
+            if (ubg) {
+              pass.setBindGroup(1, ubg, [iter * entry.offsetAlignment]);
+            }
+            pass.dispatchWorkgroups(grid[0], grid[1]);
+            pass.end();
+          }
+        }
+      }
+
+      // Copy carry outputs: resolve body output JitIds → carry write buffers
+      for (let ci = 0; ci < numCarry; ci++) {
+        const jitId = carryOutJitIds[ci];
+        const srcBuf = resolveBuffer(jitId, carryRead);
+        const sz = carrySizes[ci];
+        if (sz <= 0) continue;
+        if (sz % 4 === 0) {
+          commandEncoder.copyBufferToBuffer(srcBuf, 0, carryWrite[ci], 0, sz);
+        } else {
+          const ub = this.#encodeCopyWithShader(
+            commandEncoder,
+            srcBuf,
+            0,
+            carryWrite[ci],
+            0,
+            sz,
+          );
+          if (ub) copyUniformBuffers.push(ub);
+        }
+      }
+
+      // Stack ys: copy each ys source → ysStacked at original xs index
+      const ysIdx = _reverse ? length - 1 - iter : iter;
+      for (let yi = 0; yi < numY; yi++) {
+        const jitId = yOutJitIds[yi];
+        const srcBuf = resolveBuffer(jitId, carryRead);
+        const sz = ysSizes[yi];
+        if (sz <= 0) continue;
+        const yOffset = ysIdx * sz;
+        if (!copyUsesShader[yi]) {
+          commandEncoder.copyBufferToBuffer(
+            srcBuf,
+            0,
+            ysStackedBuffers[yi],
+            yOffset,
+            sz,
+          );
+        } else {
+          const ub = this.#encodeCopyWithShader(
+            commandEncoder,
+            srcBuf,
+            0,
+            ysStackedBuffers[yi],
+            yOffset,
+            sz,
+          );
+          if (ub) copyUniformBuffers.push(ub);
+        }
+      }
+    }
+
+    // Copy final carry → carryOut
+    const finalCarry = length % 2 === 0 ? carryPing : carryPong;
+    for (let i = 0; i < numCarry; i++) {
+      const sz = carrySizes[i];
+      if (sz <= 0) continue;
+      if (sz % 4 === 0) {
+        commandEncoder.copyBufferToBuffer(
+          finalCarry[i],
+          0,
+          carryOutBuffers[i],
+          0,
+          sz,
+        );
+      } else {
+        const ub = this.#encodeCopyWithShader(
+          commandEncoder,
+          finalCarry[i],
+          0,
+          carryOutBuffers[i],
+          0,
+          sz,
+        );
+        if (ub) copyUniformBuffers.push(ub);
+      }
+    }
+
+    this.device.queue.submit([commandEncoder.finish()]);
+
+    // Clean up transient buffers
+    for (const buf of copyUniformBuffers) buf.destroy();
+    for (const buf of [...carryPing, ...carryPong, ...internalBuffers]) {
+      if (!this.#poolPush(buf)) {
+        this.#gpuAllocatedBytes -= buf.size;
+        buf.destroy();
+      }
+    }
+    // Per-step offset buffers are NOT destroyed — owned by prepared for reuse
   }
 
   #getBuffer(slot: Slot): { buffer: GPUBuffer; size: number } {
@@ -1520,6 +1723,56 @@ export class WebGPUBackend implements Backend {
       }
       if (!evicted) break;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // BlockMap fused shader (Phase 3: single-dispatch shared-memory compiler)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compile a block_map body into a fused WGSL compute shader.
+   * Returns a reusable Executable, or null if the body is not eligible.
+   */
+  prepareBlockMapFused(
+    params: BlockMapShaderParams,
+  ): Executable<ShaderDispatch[]> | null {
+    try {
+      const shader = blockMapFusedShaderSource(
+        this.device,
+        params,
+        this.capabilities,
+      );
+      if (!shader) return null;
+      const pipeline = this.pipelines.prepareSync(shader);
+      return new Executable(null as any, [{ ...shader, pipeline }]);
+    } catch (e) {
+      if (DEBUG >= 2) {
+        console.warn("WebGPU block_map fused shader codegen failed:", e);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Dispatch a fused block_map shader.
+   * Buffer binding order: [bodyInputs (consts + block inputs), outputs]
+   */
+  dispatchBlockMapFused(
+    exe: Executable<ShaderDispatch[]>,
+    inputs: Slot[],
+    outputs: Slot[],
+  ): void {
+    const inputBuffers = inputs.map((slot) => this.#getBuffer(slot).buffer);
+    const outputBuffers = outputs.map((slot) => this.#getBuffer(slot).buffer);
+    pipelineSubmit(
+      this.device,
+      exe.data,
+      inputBuffers,
+      outputBuffers,
+      undefined,
+      this.#batchEncoder ?? undefined,
+      this.#batchEncoder ? this.#batchUniformsToDestroy : undefined,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -1957,7 +2210,7 @@ function pipelineSourceMulti(
         else if (op === AluOp.Floor) source = `floor(${strip1(a)})`;
         else if (op === AluOp.Ceil) source = `ceil(${strip1(a)})`;
         else if (op === AluOp.Cast)
-          source = `${dtypeToWgsl(dtype)}(${strip1(a)})`;
+          source = castSaturateWgsl(strip1(a), src[0].dtype, dtype);
         else if (op === AluOp.Bitcast)
           source = `bitcast<${dtypeToWgsl(dtype)}>(${strip1(a)})`;
       }
@@ -2040,6 +2293,15 @@ function pipelineSource(
   const re = kernel.outputs[0].reduction;
   const args = Array.from({ length: nargs }, (_, i) => `in${i}`);
 
+  // Pre-compute subgroup eligibility (needed for enable directive).
+  const _groupSizeForSg = re
+    ? ((tune as WebGPUTuneResult).size.groups ?? 1)
+    : 1;
+  const useSubgroups =
+    _groupSizeForSg > 1 &&
+    re!.dtype !== DType.Bool &&
+    device.features.has("subgroups");
+
   // binding(0..n-1): input buffers
   // binding(n): output buffer
 
@@ -2062,6 +2324,9 @@ function pipelineSource(
     if (!device.features.has("shader-f16"))
       throw new Error("WebGPU device does not support shader-f16 feature");
     emit("enable f16;");
+  }
+  if (useSubgroups) {
+    emit("enable subgroups;");
   }
 
   emit(headerWgsl);
@@ -2157,12 +2422,18 @@ function pipelineSource(
     emit(`var<workgroup> shmem: array<${shmemTy}, ${groupSize * upcast}>;`);
   }
 
-  emit(
-    "",
-    `@compute @workgroup_size(${workgroupSize})`,
-    "fn main(@builtin(global_invocation_id) id : vec3<u32>) {",
-    pushIndent,
-  );
+  emit("", `@compute @workgroup_size(${workgroupSize})`);
+  if (useSubgroups) {
+    emit(
+      "fn main(@builtin(global_invocation_id) id : vec3<u32>, @builtin(subgroup_size) sg_size: u32) {",
+      pushIndent,
+    );
+  } else {
+    emit(
+      "fn main(@builtin(global_invocation_id) id : vec3<u32>) {",
+      pushIndent,
+    );
+  }
 
   if (symbolic) {
     // For symbolic: always use 2D formula (works for 1D when id.y=0).
@@ -2317,7 +2588,7 @@ function pipelineSource(
         else if (op === AluOp.Floor) source = `floor(${strip1(a)})`;
         else if (op === AluOp.Ceil) source = `ceil(${strip1(a)})`;
         else if (op === AluOp.Cast)
-          source = `${dtypeToWgsl(dtype)}(${strip1(a)})`;
+          source = castSaturateWgsl(strip1(a), src[0].dtype, dtype);
         else if (op === AluOp.Bitcast)
           source = `bitcast<${dtypeToWgsl(dtype)}>(${strip1(a)})`;
       }
@@ -2437,32 +2708,80 @@ function pipelineSource(
     // Shared-memory tree reduction: each thread wrote its partial into acc[i],
     // now combine across workgroup threads via shmem.
     if (useSharedMem) {
-      // Store each thread's partial into shared memory.
-      for (let i = 0; i < upcast; i++) {
-        emit(`shmem[${i * groupSize} + group] = ${acc[i]};`);
-      }
-      emit("workgroupBarrier();");
-
-      // Tree reduction with halving stride.
-      for (let stride = groupSize >> 1; stride >= 1; stride >>= 1) {
-        emit(`if (group < ${stride}) {`, pushIndent);
+      if (useSubgroups) {
+        // Subgroup-accelerated reduction:
+        // Phase 1: reduce within each subgroup (no barriers needed).
+        const sgOp =
+          re.op === AluOp.Add
+            ? "subgroupAdd"
+            : re.op === AluOp.Mul
+              ? "subgroupMul"
+              : re.op === AluOp.Min
+                ? "subgroupMin"
+                : "subgroupMax";
         for (let i = 0; i < upcast; i++) {
-          const thisSlot = `shmem[${i * groupSize} + group]`;
-          const otherSlot = `shmem[${i * groupSize} + group + ${stride}]`;
-          if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
-          else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
-          else if (re.op === AluOp.Min) {
-            if (re.dtype === DType.Bool)
-              emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
-            else emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
-          } else if (re.op === AluOp.Max) {
-            if (re.dtype === DType.Bool)
-              emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
-            else emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
-          }
+          emit(`${acc[i]} = ${sgOp}(${acc[i]});`);
+        }
+        // Phase 2: leaders store packed subgroup results to shmem.
+        emit("let _sg_leader: bool = (group % i32(sg_size)) == 0;");
+        emit("let _sg_idx: i32 = group / i32(sg_size);");
+        emit("if (_sg_leader) {");
+        emit(pushIndent);
+        for (let i = 0; i < upcast; i++) {
+          emit(`shmem[${i * groupSize} + _sg_idx] = ${acc[i]};`);
         }
         emit(popIndent, "}");
         emit("workgroupBarrier();");
+        // Phase 3: inter-subgroup tree reduction.
+        // num_subgroups = groupSize / sg_size (runtime). Unroll all
+        // possible strides; guard each with stride * sg_size < groupSize.
+        for (let stride = groupSize >> 1; stride >= 1; stride >>= 1) {
+          emit(`if (${stride}u * sg_size < ${groupSize}u) {`);
+          emit(pushIndent);
+          emit(`if (_sg_leader && _sg_idx < ${stride}) {`);
+          emit(pushIndent);
+          for (let i = 0; i < upcast; i++) {
+            const thisSlot = `shmem[${i * groupSize} + _sg_idx]`;
+            const otherSlot = `shmem[${i * groupSize} + _sg_idx + ${stride}]`;
+            if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
+            else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
+            else if (re.op === AluOp.Min)
+              emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
+            else if (re.op === AluOp.Max)
+              emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
+          }
+          emit(popIndent, "}");
+          emit("workgroupBarrier();");
+          emit(popIndent, "}");
+        }
+      } else {
+        // Store each thread's partial into shared memory.
+        for (let i = 0; i < upcast; i++) {
+          emit(`shmem[${i * groupSize} + group] = ${acc[i]};`);
+        }
+        emit("workgroupBarrier();");
+
+        // Tree reduction with halving stride.
+        for (let stride = groupSize >> 1; stride >= 1; stride >>= 1) {
+          emit(`if (group < ${stride}) {`, pushIndent);
+          for (let i = 0; i < upcast; i++) {
+            const thisSlot = `shmem[${i * groupSize} + group]`;
+            const otherSlot = `shmem[${i * groupSize} + group + ${stride}]`;
+            if (re.op === AluOp.Add) emit(`${thisSlot} += ${otherSlot};`);
+            else if (re.op === AluOp.Mul) emit(`${thisSlot} *= ${otherSlot};`);
+            else if (re.op === AluOp.Min) {
+              if (re.dtype === DType.Bool)
+                emit(`${thisSlot} = ${thisSlot} && ${otherSlot};`);
+              else emit(`${thisSlot} = min(${thisSlot}, ${otherSlot});`);
+            } else if (re.op === AluOp.Max) {
+              if (re.dtype === DType.Bool)
+                emit(`${thisSlot} = ${thisSlot} || ${otherSlot};`);
+              else emit(`${thisSlot} = max(${thisSlot}, ${otherSlot});`);
+            }
+          }
+          emit(popIndent, "}");
+          emit("workgroupBarrier();");
+        }
       }
 
       // Thread 0 reads the final reduced value back into accumulators.
@@ -2559,141 +2878,13 @@ function createShaderEmitter(): {
 }
 
 /**
- * Generate a WGSL expression for a scan body kernel.
- *
- * Maps GlobalIndex gids to scan-specific buffer names (const0, carry0, xs0).
- * xs inputs use `dataIdx` for iteration-aware addressing.
+ * Convert a WGSL expression to storage representation when types differ.
+ * WGSL Bool maps to `bool` in expressions but `i32` in storage buffers.
  */
-function genScanExpressionWithRidx(
-  exp: AluExp,
-  _dtype: DType,
-  numConsts: number,
-  numCarry: number,
-  xsElemStrides: number[],
-  carryElemCounts?: number[],
-): string {
-  const numX = xsElemStrides.length;
-  const gen = (e: AluExp): string => {
-    const { op, src, dtype: eDtype, arg } = e;
-
-    // Handle scan-specific GlobalIndex classification
-    if (op === AluOp.GlobalIndex) {
-      const gid = arg[0] as number;
-      const idxCode = gen(src[0]);
-
-      if (gid < numConsts) {
-        const access = `const${gid}[${idxCode}]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else if (gid < numConsts + numCarry) {
-        // Carry: use snapshot local when index is trivially gidx (elementwise)
-        // or carry has only 1 element (any index == gidx == 0).
-        // Otherwise fall back to buffer access (e.g., dot product with ridx-dep index)
-        const carryIdx = gid - numConsts;
-        const isElementLocal =
-          idxCode === "gidx" ||
-          (carryElemCounts !== undefined && carryElemCounts[carryIdx] === 1);
-        if (isElementLocal) {
-          const varName = `c_${carryIdx}`;
-          return eDtype === DType.Bool ? `(${varName} != 0)` : varName;
-        }
-        const access = `carry${carryIdx}[${idxCode}]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else if (gid < numConsts + numCarry + numX) {
-        const xIdx = gid - numConsts - numCarry;
-        const stride = xsElemStrides[xIdx];
-        const access = `xs${xIdx}[i32(dataIdx) * ${stride} + ${idxCode}]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else {
-        // Internal intermediate: read from local variable
-        const internalIdx = gid - numConsts - numCarry - numX;
-        const varName = `internal_${internalIdx}`;
-        return eDtype === DType.Bool ? `(${varName} != 0)` : varName;
-      }
-    }
-
-    if (op === AluOp.Const) return constToWgsl(eDtype, arg);
-
-    if (op === AluOp.Special) {
-      const name = Array.isArray(arg) ? arg[0] : arg;
-      if (name === "gidx") return "gidx";
-      if (name === "ridx") return "ridx";
-      return name as string;
-    }
-
-    if (op === AluOp.Variable) {
-      if (arg === "acc") return "acc";
-      if (arg === "gidx") return "gidx";
-      if (arg === "ridx") return "ridx";
-      return arg as string;
-    }
-
-    // Erf/Erfc with f32 precision wrapper
-    if (op === AluOp.Erf || op === AluOp.Erfc) {
-      const funcName = op === AluOp.Erf ? "erf" : "erfc";
-      const a = strip1(gen(src[0]));
-      if (eDtype !== DType.Float32) {
-        return `${dtypeToWgsl(eDtype)}(${funcName}(f32(${a})))`;
-      }
-      return `${funcName}(${a})`;
-    }
-
-    // Binary ops
-    if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
-      const a = gen(src[0]);
-      const b = gen(src[1]);
-      if (op === AluOp.Add) {
-        return eDtype === DType.Bool ? `(${a} || ${b})` : `(${a} + ${b})`;
-      }
-      if (op === AluOp.Sub) return `(${a} - ${b})`;
-      if (op === AluOp.Mul) {
-        return eDtype === DType.Bool ? `(${a} && ${b})` : `(${a} * ${b})`;
-      }
-      if (op === AluOp.Idiv) {
-        return isFloatDtype(eDtype) ? `trunc(${a} / ${b})` : `(${a} / ${b})`;
-      }
-      if (op === AluOp.Mod) return `(${a} % ${b})`;
-      if (op === AluOp.Min) {
-        return eDtype === DType.Bool
-          ? `(${a} && ${b})`
-          : `min(${strip1(a)}, ${strip1(b)})`;
-      }
-      if (op === AluOp.Max) {
-        return eDtype === DType.Bool
-          ? `(${a} || ${b})`
-          : `max(${strip1(a)}, ${strip1(b)})`;
-      }
-      if (op === AluOp.Cmplt) return `(${a} < ${b})`;
-      if (op === AluOp.Cmpne) return `(${a} != ${b})`;
-    }
-
-    // Unary ops
-    if (AluGroup.Unary.has(op)) {
-      const a = gen(src[0]);
-      if (op === AluOp.Sin) return `sin(${strip1(a)})`;
-      if (op === AluOp.Cos) return `cos(${strip1(a)})`;
-      if (op === AluOp.Asin) return `asin(${strip1(a)})`;
-      if (op === AluOp.Atan) return `atan(${strip1(a)})`;
-      if (op === AluOp.Exp) return `exp(${strip1(a)})`;
-      if (op === AluOp.Log) return `log(${strip1(a)})`;
-      if (op === AluOp.Sqrt) return `sqrt(${strip1(a)})`;
-      if (op === AluOp.Reciprocal) return `(1.0 / ${a})`;
-      if (op === AluOp.Floor) return `floor(${strip1(a)})`;
-      if (op === AluOp.Ceil) return `ceil(${strip1(a)})`;
-      if (op === AluOp.Cast) return `${dtypeToWgsl(eDtype)}(${strip1(a)})`;
-      if (op === AluOp.Bitcast) {
-        return `bitcast<${dtypeToWgsl(eDtype)}>(${strip1(a)})`;
-      }
-    }
-
-    // Ternary
-    if (op === AluOp.Where) {
-      return `select(${strip1(gen(src[2]))}, ${strip1(gen(src[1]))}, ${strip1(gen(src[0]))})`;
-    }
-
-    throw new Error(`genScanExpressionWithRidx: unsupported op ${AluOp[op]}`);
-  };
-
-  return strip1(gen(exp));
+function wgslToStorage(expr: string, dtype: DType): string {
+  const storageTy = dtypeToWgsl(dtype, true);
+  const exprTy = dtypeToWgsl(dtype);
+  return storageTy !== exprTy ? `${storageTy}(${expr})` : expr;
 }
 
 /**
@@ -2728,7 +2919,10 @@ function nativeScanMultiShaderSource(
     numCarry,
     numX,
     numY,
+    numInternal,
     reverse,
+    internalElemCounts,
+    internalDtypes,
   } = params;
 
   // Determine dtype from first kernel step
@@ -2736,10 +2930,41 @@ function nativeScanMultiShaderSource(
   const resultTy = dtypeToWgsl(dtype, true);
   const elemSize = byteWidth(dtype);
 
-  // Compute element-level strides (byte strides / element size)
-  const xsElemStrides = xsStrides.map((s) => s / elemSize);
+  // Per-buffer WGSL type names
+  const constTys = (params.constDtypes ?? []).map((d) => dtypeToWgsl(d, true));
+  const xsTys = (params.xsDtypes ?? []).map((d) => dtypeToWgsl(d, true));
+  const carryTys = (params.carryDtypes ?? []).map((d) => dtypeToWgsl(d, true));
+  const ysTys = (params.ysDtypes ?? []).map((d) => dtypeToWgsl(d, true));
+  const internalTys = (internalDtypes ?? []).map((d) => dtypeToWgsl(d, true));
 
-  // Find the maximum kernel size across all steps
+  // Compute element-level strides (byte strides / per-xs element size)
+  const xsElemStrides = xsStrides.map((s, i) => {
+    const xElemSize =
+      params.xsDtypes && params.xsDtypes[i]
+        ? byteWidth(params.xsDtypes[i])
+        : elemSize;
+    return s / xElemSize;
+  });
+
+  // Carry element counts for snapshot / writeback
+  const carryElemCounts = carrySizes.map((s, i) => {
+    const cElemSize =
+      params.carryDtypes && params.carryDtypes[i]
+        ? byteWidth(params.carryDtypes[i])
+        : elemSize;
+    return s / cElemSize;
+  });
+
+  // Ys element strides for output indexing
+  const ysElemStrides = ysStrides.map((s, i) => {
+    const yElemSize =
+      params.ysDtypes && params.ysDtypes[i]
+        ? byteWidth(params.ysDtypes[i])
+        : elemSize;
+    return s / yElemSize;
+  });
+
+  // Find the maximum kernel size across all steps — determines workgroup size
   const maxKernelSize = Math.max(
     ...steps.map((s) => s.kernel.size as number),
     1,
@@ -2777,34 +3002,33 @@ function nativeScanMultiShaderSource(
   let bindingIdx = 0;
 
   for (let i = 0; i < numConsts; i++) {
+    const ty = constTys[i] ?? resultTy;
     emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read> const${i}: array<${resultTy}>;`,
+      `@group(0) @binding(${bindingIdx++}) var<storage, read> const${i}: array<${ty}>;`,
     );
   }
   for (let i = 0; i < numX; i++) {
+    const ty = xsTys[i] ?? resultTy;
     emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read> xs${i}: array<${resultTy}>;`,
+      `@group(0) @binding(${bindingIdx++}) var<storage, read> xs${i}: array<${ty}>;`,
     );
   }
   for (let i = 0; i < numCarry; i++) {
+    const ty = carryTys[i] ?? resultTy;
     emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> carry${i}: array<${resultTy}>;`,
+      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> carry${i}: array<${ty}>;`,
     );
   }
   for (let i = 0; i < numY; i++) {
+    const ty = ysTys[i] ?? resultTy;
     emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> ys${i}: array<${resultTy}>;`,
+      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> ys${i}: array<${ty}>;`,
     );
   }
 
-  // Carry element counts for snapshot guards
-  const carryElemCounts = carrySizes.map((s) => s / elemSize);
-
-  // Compute shader entry point
-  const workgroupSize = Math.min(Math.max(maxKernelSize, 1), 256);
-  const [gridX, gridY] = calculateGrid(
-    Math.ceil(Math.max(maxKernelSize, 1) / workgroupSize),
-  );
+  // Compute shader entry point — single thread per scan (sequential loop)
+  const workgroupSize = 1;
+  const [gridX, gridY] = calculateGrid(1);
 
   emit(
     "",
@@ -2813,7 +3037,20 @@ function nativeScanMultiShaderSource(
     pushIndent,
   );
 
-  emit(`let gidx = i32(id.x);`);
+  // Declare var<private> arrays for carry snapshots
+  for (let i = 0; i < numCarry; i++) {
+    const cTy = carryTys[i] ?? resultTy;
+    const count = carryElemCounts[i];
+    emit(`var c_${i}: array<${cTy}, ${count}>;`);
+  }
+
+  // Declare var<private> arrays for internal intermediates
+  for (let i = 0; i < (internalElemCounts?.length ?? 0); i++) {
+    const count = internalElemCounts[i];
+    const ty = internalTys[i] ?? resultTy;
+    emit(`var internal_${i}: array<${ty}, ${count}>;`);
+  }
+
   emit("");
 
   // Main scan loop
@@ -2825,62 +3062,113 @@ function nativeScanMultiShaderSource(
     emit(`let dataIdx = iter;`);
   }
 
-  // Snapshot carry into local variables (avoids RAW hazard across steps)
+  // Snapshot carry into local arrays (avoids RAW hazard across steps)
   emit("");
   emit("// Snapshot carry values for this iteration");
   for (let i = 0; i < numCarry; i++) {
-    emit(`var c_${i}: ${resultTy} = ${resultTy}(0);`);
-    if (carryElemCounts[i] === maxKernelSize) {
-      // All valid threads can load — no guard needed
-      emit(`c_${i} = carry${i}[gidx];`);
+    const count = carryElemCounts[i];
+    if (count > 1) {
+      emit(
+        `for (var ci: i32 = 0; ci < ${count}; ci++) { c_${i}[ci] = carry${i}[ci]; }`,
+      );
     } else {
-      emit(`if (gidx < ${carryElemCounts[i]}) { c_${i} = carry${i}[gidx]; }`);
+      emit(`c_${i}[0] = carry${i}[0];`);
     }
   }
 
-  // Execute each step
+  // Build scan-specific resolveGlobalIndex callback
+  // gid space: [consts | carry(snapshot) | xs | internals | carry-live]
+  const numInputs = numConsts + numCarry + numX;
+  const carryLiveGidBase = numInputs + numInternal;
+  const scanResolve: ResolveGlobalIndex = (gid, idxCode, _dtype) => {
+    if (gid < numConsts) {
+      return `const${gid}[${idxCode}]`;
+    } else if (gid < numConsts + numCarry) {
+      const ci = gid - numConsts;
+      // Use carry snapshot array (value at start of iteration)
+      return `c_${ci}[${idxCode}]`;
+    } else if (gid < numConsts + numCarry + numX) {
+      const xi = gid - numConsts - numCarry;
+      const stride = xsElemStrides[xi];
+      return `xs${xi}[i32(dataIdx) * ${stride} + ${idxCode}]`;
+    } else if (gid < carryLiveGidBase) {
+      // Internal intermediate — array access with proper index
+      const ii = gid - numInputs;
+      return `internal_${ii}[${idxCode}]`;
+    } else {
+      // Carry-live: read UPDATED carry buffer (not snapshot).
+      // Used by Y-only steps that depend on carry values computed
+      // earlier in the same iteration.
+      const ci = gid - carryLiveGidBase;
+      return `carry${ci}[${idxCode}]`;
+    }
+  };
+
+  // Helper: emit store(s) for a step's computed value.
+  // A step can write to any combination of carry, Y, and internal.
+  const emitStepStore = (step: NativeScanMultiStep, valExpr: string) => {
+    if (step.outputCarryIdx >= 0) {
+      emit(`carry${step.outputCarryIdx}[eidx] = ${valExpr};`);
+    }
+    if (step.outputYIdx >= 0) {
+      const yi = step.outputYIdx;
+      const ysStride = ysElemStrides[yi] ?? 0;
+      if (ysStride > 0) {
+        emit(`ys${yi}[i32(dataIdx) * ${ysStride} + eidx] = ${valExpr};`);
+      }
+    }
+    if (step.outputInternalIdx >= 0) {
+      emit(`internal_${step.outputInternalIdx}[eidx] = ${valExpr};`);
+    }
+  };
+
+  // Execute each step using createWgslGen + eidx loops
   for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
     const step = steps[stepIdx];
     const kernel = step.kernel;
-    const tune = tuneNullopt(kernel);
-    const kernelSize = kernel.size;
+    const kernelSize = kernel.size as number;
 
-    const isCarryStep = step.outputCarryIdx >= 0;
-    const targetLabel = isCarryStep
-      ? `carry${step.outputCarryIdx}`
-      : `internal_${step.outputInternalIdx}`;
+    const targets: string[] = [];
+    if (step.outputCarryIdx >= 0) targets.push(`carry${step.outputCarryIdx}`);
+    if (step.outputYIdx >= 0) targets.push(`ys${step.outputYIdx}`);
+    if (step.outputInternalIdx >= 0)
+      targets.push(`internal_${step.outputInternalIdx}`);
 
     emit("");
-    emit(`// Step ${stepIdx}: writes to ${targetLabel}`);
+    emit(`// Step ${stepIdx}: writes to ${targets.join(", ")}`);
 
-    // Declare result outside if-block so internal assignments can reference it
-    const needsOuterDecl = !isCarryStep;
-    if (needsOuterDecl) {
-      emit(`var result_val_${stepIdx}: ${resultTy} = ${resultTy}(0);`);
-    }
-
-    emit(`if (gidx < ${kernelSize}) {`);
-    emit(pushIndent);
+    const gidxOverride = AluExp.special(DType.Int32, "eidx", kernelSize);
+    const gen = createWgslGen({
+      kernel,
+      prefix: `sc_s${stepIdx}`,
+      resolveGlobalIndex: scanResolve,
+      emit,
+      blockSize: maxKernelSize,
+      gidxOverride,
+    });
 
     const re = kernel.outputs[0].reduction;
+    const outDtype = kernel.outputs[0].dtype;
     if (re) {
-      // Reduction kernel: inner ridx loop + epilogue
-      const accTy = dtypeToWgsl(re.dtype, true);
-      emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
-      emit(
-        `for (var ridx: i32 = 0; ridx < ${tune.size.reduce}; ridx++) {`,
-        pushIndent,
-      );
+      // Reduction kernel: eidx loop × ridx loop
+      // Use non-storage type for accumulator (bool stays bool during computation)
+      const accTy = dtypeToWgsl(re.dtype);
+      const redSize =
+        typeof re.size === "number"
+          ? re.size
+          : (re.concreteHint ?? Number(re.size));
 
-      const expCode = genScanExpressionWithRidx(
-        tune.exp,
-        dtype,
-        numConsts,
-        numCarry,
-        xsElemStrides,
-        carryElemCounts,
-      );
-      emit(`let val = ${expCode};`);
+      if (kernelSize > 1) {
+        emit(
+          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+          pushIndent,
+        );
+      } else {
+        emit(`{`, pushIndent, `let eidx: i32 = 0;`);
+      }
+      emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
+      emit(`for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`, pushIndent);
+      emit(`let val = ${strip1(gen(kernel.outputs[0].exp))};`);
 
       if (re.op === AluOp.Add) emit(`acc = acc + val;`);
       else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
@@ -2890,62 +3178,28 @@ function nativeScanMultiShaderSource(
 
       emit(popIndent, "}");
 
-      const epilogueCode = genScanExpressionWithRidx(
-        tune.epilogue!,
-        dtype,
-        numConsts,
-        numCarry,
-        xsElemStrides,
-        carryElemCounts,
+      // Epilogue + store (convert bool→i32 for storage buffers)
+      const epilogueVal = wgslToStorage(
+        strip1(gen(kernel.outputs[0].reduction!.epilogue)),
+        outDtype,
       );
-      if (needsOuterDecl) {
-        emit(`result_val_${stepIdx} = ${epilogueCode};`);
-      } else {
-        emit(`let result_val_${stepIdx}: ${resultTy} = ${epilogueCode};`);
-      }
+      emitStepStore(step, epilogueVal);
+      emit(popIndent, "}");
     } else {
       // Elementwise kernel
-      const expCode = genScanExpressionWithRidx(
-        tune.exp,
-        dtype,
-        numConsts,
-        numCarry,
-        xsElemStrides,
-        carryElemCounts,
-      );
-      if (needsOuterDecl) {
-        emit(`result_val_${stepIdx} = ${expCode};`);
-      } else {
-        emit(`let result_val_${stepIdx}: ${resultTy} = ${expCode};`);
-      }
-    }
-
-    if (isCarryStep) {
-      const carryIdx = step.outputCarryIdx;
-      const ysElemStride = ysStrides[carryIdx]
-        ? ysStrides[carryIdx] / elemSize
-        : 0;
-
-      // Write to ysStacked at dataIdx * stride + gidx
-      if (numY > 0 && carryIdx < numY && ysElemStride > 0) {
+      if (kernelSize > 1) {
         emit(
-          `ys${carryIdx}[i32(dataIdx) * ${ysElemStride} + gidx] = result_val_${stepIdx};`,
+          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
+          pushIndent,
         );
+      } else {
+        emit(`{`, pushIndent, `let eidx: i32 = 0;`);
       }
 
-      // Update carry buffer for next iteration
-      emit(`carry${carryIdx}[gidx] = result_val_${stepIdx};`);
-    }
-
-    emit(popIndent, "}");
-
-    // For internal steps, the var was declared before the if-block
-    // so it's now accessible to subsequent steps
-    if (!isCarryStep) {
-      // Alias to internal_N for readability in subsequent step expressions
-      emit(
-        `var internal_${step.outputInternalIdx}: ${resultTy} = result_val_${stepIdx};`,
-      );
+      // Convert bool→i32 for storage buffers
+      const val = wgslToStorage(strip1(gen(kernel.outputs[0].exp)), outDtype);
+      emitStepStore(step, val);
+      emit(popIndent, "}");
     }
   }
 
@@ -2962,429 +3216,6 @@ function nativeScanMultiShaderSource(
     hasUniform: false,
     passes: [{ grid: [gridX, gridY] }],
   };
-}
-
-// ---------------------------------------------------------------------------
-// Fused associative scan shader (WebGPU Kogge-Stone)
-// ---------------------------------------------------------------------------
-
-/**
- * Generate a WGSL expression for an associative scan body kernel step.
- *
- * Maps GlobalIndex gids to:
- *   - gid < numConsts         → const{gid}[idx]
- *   - gid ∈ [numConsts, numConsts+numLeaves)  → "a" leaf: ping at position (gidx - stride)
- *   - gid ∈ [numConsts+numLeaves, numConsts+2*numLeaves) → "b" leaf: ping at position gidx
- *   - gid ≥ numInputs         → internal_N[idx] (private array)
- *
- * Ping buffer layout: [leaf0: N * elemCount0][leaf1: N * elemCount1]...
- * Leaf k at position j, sub-index idx: ping[leafStart_k * uniforms.N + j * elemCount_k + idx]
- */
-function genAssocScanExpression(
-  exp: AluExp,
-  _dtype: DType,
-  numConsts: number,
-  numLeaves: number,
-  leafElemCounts: number[],
-  _internalElemCounts: number[],
-): string {
-  const numInputs = numConsts + 2 * numLeaves;
-
-  // Compute prefix sums for leaf start offsets (in typed elements relative to N=1).
-  // leafStarts[k] = sum of leafElemCounts[0..k-1]
-  const leafStarts: number[] = [0];
-  for (let k = 1; k < numLeaves; k++) {
-    leafStarts[k] = leafStarts[k - 1] + leafElemCounts[k - 1];
-  }
-
-  const gen = (e: AluExp): string => {
-    const { op, src, dtype: eDtype, arg } = e;
-
-    if (op === AluOp.GlobalIndex) {
-      const gid = arg[0] as number;
-      const idxCode = gen(src[0]);
-
-      if (gid < numConsts) {
-        // Constant buffer
-        const access = `const${gid}[${idxCode}]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else if (gid < numConsts + numLeaves) {
-        // "a" leaf — read from ping at position (gidx - stride)
-        const leafIdx = gid - numConsts;
-        const elemCount = leafElemCounts[leafIdx];
-        const start = leafStarts[leafIdx];
-        const access = `ping[${start}u * uniforms.N + u32(a_pos) * ${elemCount}u + u32(${idxCode})]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else if (gid < numInputs) {
-        // "b" leaf — read from ping at position gidx
-        const leafIdx = gid - numConsts - numLeaves;
-        const elemCount = leafElemCounts[leafIdx];
-        const start = leafStarts[leafIdx];
-        const access = `ping[${start}u * uniforms.N + u32(gidx) * ${elemCount}u + u32(${idxCode})]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      } else {
-        // Internal buffer (var<private>)
-        const intIdx = gid - numInputs;
-        const access = `internal_${intIdx}[${idxCode}]`;
-        return eDtype === DType.Bool ? `(${access} != 0)` : access;
-      }
-    }
-
-    if (op === AluOp.Const) return constToWgsl(eDtype, arg);
-
-    if (op === AluOp.Special) {
-      const name = Array.isArray(arg) ? arg[0] : arg;
-      if (name === "gidx") return "gidx";
-      if (name === "ridx") return "ridx";
-      return name as string;
-    }
-
-    if (op === AluOp.Variable) {
-      if (arg === "acc") return "acc";
-      if (arg === "gidx") return "gidx";
-      if (arg === "ridx") return "ridx";
-      return arg as string;
-    }
-
-    if (op === AluOp.Erf || op === AluOp.Erfc) {
-      const funcName = op === AluOp.Erf ? "erf" : "erfc";
-      const a = strip1(gen(src[0]));
-      if (eDtype !== DType.Float32) {
-        return `${dtypeToWgsl(eDtype)}(${funcName}(f32(${a})))`;
-      }
-      return `${funcName}(${a})`;
-    }
-
-    if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
-      const a = gen(src[0]);
-      const b = gen(src[1]);
-      if (op === AluOp.Add) {
-        return eDtype === DType.Bool ? `(${a} || ${b})` : `(${a} + ${b})`;
-      }
-      if (op === AluOp.Sub) return `(${a} - ${b})`;
-      if (op === AluOp.Mul) {
-        return eDtype === DType.Bool ? `(${a} && ${b})` : `(${a} * ${b})`;
-      }
-      if (op === AluOp.Idiv) {
-        return isFloatDtype(eDtype) ? `trunc(${a} / ${b})` : `(${a} / ${b})`;
-      }
-      if (op === AluOp.Mod) return `(${a} % ${b})`;
-      if (op === AluOp.Min) {
-        return eDtype === DType.Bool
-          ? `(${a} && ${b})`
-          : `min(${strip1(a)}, ${strip1(b)})`;
-      }
-      if (op === AluOp.Max) {
-        return eDtype === DType.Bool
-          ? `(${a} || ${b})`
-          : `max(${strip1(a)}, ${strip1(b)})`;
-      }
-      if (op === AluOp.Cmplt) return `(${a} < ${b})`;
-      if (op === AluOp.Cmpne) return `(${a} != ${b})`;
-    }
-
-    if (AluGroup.Unary.has(op)) {
-      const a = gen(src[0]);
-      if (op === AluOp.Sin) return `sin(${strip1(a)})`;
-      if (op === AluOp.Cos) return `cos(${strip1(a)})`;
-      if (op === AluOp.Asin) return `asin(${strip1(a)})`;
-      if (op === AluOp.Atan) return `atan(${strip1(a)})`;
-      if (op === AluOp.Exp) return `exp(${strip1(a)})`;
-      if (op === AluOp.Log) return `log(${strip1(a)})`;
-      if (op === AluOp.Sqrt) return `sqrt(${strip1(a)})`;
-      if (op === AluOp.Reciprocal) return `(1.0 / ${a})`;
-      if (op === AluOp.Floor) return `floor(${strip1(a)})`;
-      if (op === AluOp.Ceil) return `ceil(${strip1(a)})`;
-      if (op === AluOp.Cast) return `${dtypeToWgsl(eDtype)}(${strip1(a)})`;
-      if (op === AluOp.Bitcast) {
-        return `bitcast<${dtypeToWgsl(eDtype)}>(${strip1(a)})`;
-      }
-    }
-
-    if (op === AluOp.Where) {
-      return `select(${strip1(gen(src[2]))}, ${strip1(gen(src[1]))}, ${strip1(gen(src[0]))})`;
-    }
-
-    throw new Error(`genAssocScanExpression: unsupported op ${AluOp[op]}`);
-  };
-
-  return strip1(gen(exp));
-}
-
-/**
- * Generate WGSL shader source for one Kogge-Stone round of a fused
- * associative scan. Each GPU thread processes one element position:
- *
- *   if gidx >= stride:
- *     result = fn(ping[gidx - stride], ping[gidx])
- *     pong[gidx] = result
- *   else:
- *     pong[gidx] = ping[gidx]  (copy)
- *
- * Buffer layout (ping and pong):
- *   [leaf0: N * elemCount0 | leaf1: N * elemCount1 | ...]
- *
- * Bindings:
- *   group(0) binding(0):     ping (storage, read)
- *   group(0) binding(1):     pong (storage, read_write)
- *   group(0) binding(2..2+K): const0..constK (storage, read)
- *   group(1) binding(0):     uniforms { stride: u32, N: u32 }
- */
-function assocScanFusedShaderSource(
-  device: GPUDevice,
-  params: WebGPUAssocScanParams,
-): { code: string; workgroupSize: number } {
-  const {
-    numConsts,
-    numLeaves,
-    leafElemCounts,
-    steps,
-    internalElemCounts,
-    leafToInternalIdx,
-    dtype,
-  } = params;
-
-  const resultTy = dtypeToWgsl(dtype, true);
-
-  // Compute max per-position elements across all leaves for thread count
-  // Compute leaf start offsets (prefix sum of elemCounts)
-  const leafStarts: number[] = [0];
-  for (let k = 1; k < numLeaves; k++) {
-    leafStarts[k] = leafStarts[k - 1] + leafElemCounts[k - 1];
-  }
-
-  const { emit, pushIndent, popIndent, getCode } = createShaderEmitter();
-
-  if (dtype === DType.Float16) {
-    if (!device.features.has("shader-f16")) {
-      throw new Error("WebGPU device does not support shader-f16 feature");
-    }
-    emit("enable f16;");
-  }
-
-  emit(headerWgsl);
-
-  // Collect ops that need global function definitions
-  const allDistinctOps = new Set<AluOp>();
-  for (const step of steps) {
-    const tune = tuneNullopt(step.kernel);
-    for (const [op] of tune.exp.distinctOps()) allDistinctOps.add(op);
-    if (tune.epilogue) {
-      for (const [op] of tune.epilogue.distinctOps()) allDistinctOps.add(op);
-    }
-  }
-  if (allDistinctOps.has(AluOp.Threefry2x32)) emit(threefrySrc);
-  if (allDistinctOps.has(AluOp.Erf) || allDistinctOps.has(AluOp.Erfc)) {
-    emit(erfSrc);
-  }
-
-  emit("");
-
-  // Uniform struct
-  emit("struct AssocScanUniforms {");
-  emit("  stride: u32,");
-  emit("  N: u32,");
-  emit("}");
-  emit("");
-
-  // Buffer bindings
-  emit(`@group(0) @binding(0) var<storage, read> ping: array<${resultTy}>;`);
-  emit(
-    `@group(0) @binding(1) var<storage, read_write> pong: array<${resultTy}>;`,
-  );
-  for (let i = 0; i < numConsts; i++) {
-    emit(
-      `@group(0) @binding(${i + 2}) var<storage, read> const${i}: array<${resultTy}>;`,
-    );
-  }
-  emit("@group(1) @binding(0) var<uniform> uniforms: AssocScanUniforms;");
-  emit("");
-
-  // Compute shader
-  // Each thread handles one "position" in the scan, but iterates over
-  // all sub-elements within that position (multiple leaves, each with
-  // multiple typed elements).
-  const workgroupSize = 256;
-
-  emit(`@compute @workgroup_size(${workgroupSize})`);
-  emit("fn main(@builtin(global_invocation_id) id: vec3<u32>) {");
-  emit(pushIndent);
-  emit("let gidx = i32(id.x);");
-  emit("if (u32(gidx) >= uniforms.N) { return; }");
-  emit("");
-
-  // Declare private internal buffers for intermediate step results
-  for (let i = 0; i < internalElemCounts.length; i++) {
-    const count = internalElemCounts[i];
-    emit(`var internal_${i}: array<${resultTy}, ${count}>;`);
-  }
-
-  emit("");
-  emit("let a_pos = gidx - i32(uniforms.stride);");
-  emit("");
-
-  emit("if (a_pos >= 0) {");
-  emit(pushIndent);
-
-  // Execute all body steps — this is the fused fn(a, b) computation
-  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
-    const step = steps[stepIdx];
-    const kernel = step.kernel;
-    const tune = tuneNullopt(kernel);
-    const kernelSize =
-      typeof kernel.size === "number"
-        ? kernel.size
-        : (kernel.concreteSizeHint ?? 1);
-
-    emit(`// Step ${stepIdx}`);
-
-    // After tuneNullopt, the expression uses AluOp.Special("gidx") for the
-    // output element index. In the fused scan shader, `gidx` is the scan
-    // position (thread ID). We must rewrite Special("gidx") → Special("eidx")
-    // so the expression indexes the per-position output element, not the scan
-    // position. `substitute()` only matches AluOp.Variable — it won't touch
-    // AluOp.Special nodes. Use `rewrite()` instead.
-    const eidxVar = AluExp.special(DType.Int32, "eidx", kernelSize);
-    const rewriteGidxToEidx = (exp: AluExp): AluExp =>
-      exp.rewrite((node) => {
-        if (node.op === AluOp.Special) {
-          const name = Array.isArray(node.arg) ? node.arg[0] : node.arg;
-          if (name === "gidx") return eidxVar;
-        }
-      });
-
-    const re = kernel.outputs[0].reduction;
-    if (re) {
-      // Reduction kernel — must iterate over output elements (eidx)
-      // just like elementwise kernels. Each output element has its own
-      // reduction accumulator. For kernelSize=1 (scalar reduction) the
-      // loop body runs once; for kernelSize>1 (e.g. matmul output) it
-      // runs once per output element.
-      const accTy = dtypeToWgsl(re.dtype, true);
-      const redSize =
-        typeof tune.size.reduce === "number"
-          ? tune.size.reduce
-          : (re.concreteHint ?? Number(tune.size.reduce));
-
-      const substExp = rewriteGidxToEidx(tune.exp);
-      const substEpilogue = rewriteGidxToEidx(tune.epilogue!);
-
-      if (kernelSize > 1) {
-        emit(
-          `for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`,
-          pushIndent,
-        );
-      } else {
-        emit(`{`);
-        emit(pushIndent);
-        emit(`let eidx: i32 = 0;`);
-      }
-      emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
-      emit(`for (var ridx: i32 = 0; ridx < ${redSize}; ridx++) {`, pushIndent);
-
-      const expCode = genAssocScanExpression(
-        substExp,
-        dtype,
-        numConsts,
-        numLeaves,
-        leafElemCounts,
-        internalElemCounts,
-      );
-      emit(`let val = ${expCode};`);
-
-      if (re.op === AluOp.Add) emit(`acc = acc + val;`);
-      else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
-      else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
-      else if (re.op === AluOp.Max) emit(`acc = max(acc, val);`);
-      else throw new Error(`Unsupported reduction op: ${re.op}`);
-
-      emit(popIndent, "}");
-
-      const epilogueCode = genAssocScanExpression(
-        substEpilogue,
-        dtype,
-        numConsts,
-        numLeaves,
-        leafElemCounts,
-        internalElemCounts,
-      );
-      emit(`internal_${step.outputInternalIdx}[eidx] = ${epilogueCode};`);
-      emit(popIndent, "}");
-    } else {
-      // Elementwise kernel — iterate over sub-elements
-      if (kernelSize > 1) {
-        emit(`for (var eidx: i32 = 0; eidx < ${kernelSize}; eidx++) {`);
-        emit(pushIndent);
-
-        const substExp = rewriteGidxToEidx(tune.exp);
-        const expCode = genAssocScanExpression(
-          substExp,
-          dtype,
-          numConsts,
-          numLeaves,
-          leafElemCounts,
-          internalElemCounts,
-        );
-        emit(`internal_${step.outputInternalIdx}[eidx] = ${expCode};`);
-        emit(popIndent, "}");
-      } else {
-        const expCode = genAssocScanExpression(
-          tune.exp,
-          dtype,
-          numConsts,
-          numLeaves,
-          leafElemCounts,
-          internalElemCounts,
-        );
-        emit(`internal_${step.outputInternalIdx}[0] = ${expCode};`);
-      }
-    }
-    emit("");
-  }
-
-  // Write results from internal buffers to pong
-  for (let k = 0; k < numLeaves; k++) {
-    const intIdx = leafToInternalIdx[k];
-    const elemCount = leafElemCounts[k];
-    const start = leafStarts[k];
-    if (elemCount > 1) {
-      emit(`for (var wi: u32 = 0u; wi < ${elemCount}u; wi++) {`);
-      emit(pushIndent);
-      emit(
-        `pong[${start}u * uniforms.N + u32(gidx) * ${elemCount}u + wi] = internal_${intIdx}[wi];`,
-      );
-      emit(popIndent, "}");
-    } else {
-      emit(`pong[${start}u * uniforms.N + u32(gidx)] = internal_${intIdx}[0];`);
-    }
-  }
-
-  emit(popIndent, "} else {");
-  emit(pushIndent);
-
-  // Copy: pong[gidx] = ping[gidx] for all leaf elements
-  emit("// Copy: position before stride, no fn application");
-  for (let k = 0; k < numLeaves; k++) {
-    const elemCount = leafElemCounts[k];
-    const start = leafStarts[k];
-    if (elemCount > 1) {
-      emit(`for (var ci: u32 = 0u; ci < ${elemCount}u; ci++) {`);
-      emit(pushIndent);
-      emit(
-        `pong[${start}u * uniforms.N + u32(gidx) * ${elemCount}u + ci] = ping[${start}u * uniforms.N + u32(gidx) * ${elemCount}u + ci];`,
-      );
-      emit(popIndent, "}");
-    } else {
-      emit(
-        `pong[${start}u * uniforms.N + u32(gidx)] = ping[${start}u * uniforms.N + u32(gidx)];`,
-      );
-    }
-  }
-
-  emit(popIndent, "}");
-  emit(popIndent, "}");
-
-  return { code: getCode(), workgroupSize };
 }
 
 function pipelineSubmit(

@@ -4,52 +4,84 @@ export async function benchFlops(
   n: number,
   device: Device,
   dtype: DType,
-): Promise<number> {
+  timeoutMs = 8000,
+): Promise<number | undefined> {
+  // Race the actual benchmark against a timeout so weak GPUs that trigger
+  // TDR (GPU timeout / device-lost) don't hang the page.
+  return Promise.race([
+    benchFlopsInner(n, device, dtype),
+    new Promise<undefined>((resolve) =>
+      setTimeout(() => resolve(undefined), timeoutMs),
+    ),
+  ]);
+}
+
+async function benchFlopsInner(
+  n: number,
+  device: Device,
+  dtype: DType,
+): Promise<number | undefined> {
   try {
     const jax = await import("@hamk-uas/jax-js-nonconsuming");
     await jax.init(device);
     jax.defaultDevice(device);
 
     const np = jax.numpy;
+    const lax = jax.lax;
 
+    // JIT-compile matmul — on WebGPU this uses tiledMatmul with
+    // GPU-adaptive tile config.  The first call compiles; we exclude it.
+    const matmulFn =
+      device === "webgpu"
+        ? jax.jit((a: any, b: any) => lax.tiledMatmul(a, b))
+        : jax.jit((a: any, b: any) => np.matmul(a, b));
+
+    // Allocate inputs once, reuse across all iterations
+    using key = jax.random.key(0);
+    const [k1, k2] = jax.random.split(key, 2);
+    using A = jax.random.uniform(k1, [n, n]).astype(dtype);
+    using B = jax.random.uniform(k2, [n, n]).astype(dtype);
+    k1.dispose();
+    k2.dispose();
+    await jax.blockUntilReady([A, B]);
+
+    // Warmup: triggers JIT compilation + pipeline creation (not timed)
+    {
+      using C = matmulFn(A, B);
+      await jax.blockUntilReady(C);
+      const sample = (await C.data())[0];
+      if (!Number.isFinite(sample))
+        throw new Error("GPU produced non-finite result");
+    }
+
+    // Timed runs
     const measurements: number[] = [];
-
-    // 1 warmup + 2 timed runs
     for (let i = 0; i < 3; i++) {
-      using key = jax.random.key(0);
-      const [k1, k2] = jax.random.split(key, 2);
-
-      using A = jax.random.uniform(k1, [n, n]).astype(dtype);
-      using B = jax.random.uniform(k2, [n, n]).astype(dtype);
-      k1.dispose();
-      k2.dispose();
-      await jax.blockUntilReady([A, B]);
-
       const start = performance.now();
-      using C = np.matmul(A, B);
+      using C = matmulFn(A, B);
       await jax.blockUntilReady(C);
       const end = performance.now();
-
-      if (i > 0) {
-        measurements.push((end - start) / 1000);
-      }
+      measurements.push((end - start) / 1000);
     }
+
+    matmulFn.dispose();
 
     const gflops = (2 * n * n * n) / 1e9;
     const seconds =
       measurements.reduce((a, b) => a + b, 0) / measurements.length;
+    const result = gflops / seconds;
 
-    return gflops / seconds;
+    return Number.isFinite(result) && result > 0 ? result : undefined;
   } catch (error: any) {
     console.error("Benchmark error:", error);
-    return 0;
+    return undefined;
   }
 }
 
 export interface PerfResults {
   flops: {
-    Wasm: number;
-    WebGPU: number;
+    Wasm: number | undefined;
+    WebGPU: number | undefined;
     "WebGPU-fp16": number | undefined;
   };
   browser: string;
@@ -80,7 +112,15 @@ export async function measurePerf(): Promise<PerfResults> {
   const isApple = /iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent);
   const isMobile = /Mobi/.test(navigator.userAgent);
   const isNvidia = /NVIDIA/i.test(adapter.info.vendor);
+  const isIntel = /intel/i.test(adapter.info.vendor);
   const isGoodGpu = /NVIDIA|AMD|Qualcomm|ARM/i.test(adapter.info.vendor);
+  // Intel Arc (xe-lpg, xe-hpg, …) is a discrete-class GPU; older Intel
+  // UHD/Iris iGPUs have much less compute and can trigger TDR at large N.
+  const isIntelArc =
+    isIntel &&
+    /xe-[lh]pg|alchemist|arc/i.test(
+      `${adapter.info.architecture} ${adapter.info.description}`,
+    );
 
   let gpuDim: number;
   if (isApple) {
@@ -89,8 +129,14 @@ export async function measurePerf(): Promise<PerfResults> {
     gpuDim = 4096;
   } else if (isGoodGpu) {
     gpuDim = isMobile ? 1024 : 2048;
+  } else if (isIntelArc) {
+    // Intel Arc (xe-lpg, xe-hpg) handles 2048 comfortably (~25ms/iter).
+    gpuDim = isMobile ? 1024 : 2048;
+  } else if (isIntel) {
+    // Intel UHD / Iris iGPUs — keep it light to avoid device-lost.
+    gpuDim = 512;
   } else {
-    gpuDim = 1024;
+    gpuDim = 512;
   }
 
   return {

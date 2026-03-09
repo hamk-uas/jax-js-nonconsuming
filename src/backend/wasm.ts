@@ -121,6 +121,38 @@ export interface NativeScanGeneralParams {
   routineInfos?: ScanRoutineInfo[];
 }
 
+/** Parameters for the compiled block-map WASM codegen. */
+export interface BlockMapWasmParams {
+  numConsts: number;
+  numInputs: number;
+  numOutputs: number;
+  gridRank: number;
+  gridShape: number[];
+  blockShape: number[];
+  /** [numInputs][gridRank] — which input dim maps to each grid dim, or null. */
+  inAxes: (number | null)[][];
+  /** [numOutputs][gridRank] — which output dim maps to each grid dim, or null. */
+  outAxes: (number | null)[][];
+  inputShapes: number[][];
+  outputShapes: number[][];
+  /** Byte sizes of each constant buffer. */
+  constSizes: number[];
+  /** Byte sizes of each body-input block buffer (block-shaped). */
+  blockInputSizes: number[];
+  /** Byte sizes of each body-output block buffer (block-shaped). */
+  blockOutputSizes: number[];
+  /** Internal scratch buffer sizes produced by body kernel steps. */
+  internalSizes: number[];
+  /** Reindexed body kernel steps. */
+  steps: GeneralScanStep[];
+  /** Map from body output index to the producing internal buffer index. */
+  outputSources: number[];
+  /** Strides (in bytes) per dimension for each input. */
+  inputStrides: number[][];
+  /** Strides (in bytes) per dimension for each output. */
+  outputStrides: number[][];
+}
+
 const moduleCache = new Map<string, WebAssembly.Module>();
 
 // ---------------------------------------------------------------------------
@@ -140,10 +172,11 @@ export class WasmBackend implements Backend {
   readonly maxArgs = 64; // Arbitrary choice
   readonly capabilities: BackendCapabilities = {
     atomicF32Add: false,
+    shaderF16: false,
     // SharedArrayBuffer is available when either:
     //   (a) crossOriginIsolated is true (COOP + COEP headers), or
     //   (b) the browser enables it unconditionally (e.g., Chromium
-    //       --enable-features=SharedArrayBuffer; Deno; Node.js)
+    //       --enable-features=SharedArrayBuffer; Node.js)
     // We test constructability rather than relying on crossOriginIsolated
     // so that the Chromium flag and non-browser runtimes work too.
     sharedMemory: (() => {
@@ -172,7 +205,7 @@ export class WasmBackend implements Backend {
    * causing deadlock.  This affects **all** browser engines (Chrome, Firefox,
    * Safari) running on the main thread.
    *
-   * On Deno and Node.js, `Atomics.wait` works on the main thread and message
+   * On Node.js, `Atomics.wait` works on the main thread and message
    * delivery is independent of the event loop, so spin-waits work correctly.
    *
    * We detect this by probing `Atomics.wait` — if it throws, we're on a
@@ -911,53 +944,43 @@ export class WasmBackend implements Backend {
   }
 
   // -------------------------------------------------------------------------
-  // Native associative scan (Kogge-Stone, M7.2)
+  // Blocked associative scan (Phase 5)
   // -------------------------------------------------------------------------
 
-  /**
-   * Compile a native associative scan WASM module.
-   * Returns an Executable whose data is a WasmProgram.
-   *
-   * The compiled module takes N as a runtime i32 parameter, so a single
-   * compilation can be reused for different input lengths.
-   */
-  prepareNativeAssociativeScan(
-    params: NativeAssocScanParams,
+  prepareBlockedAssociativeScan(
+    params: NativeAssocScanBlockedParams,
   ): Executable<WasmProgram> {
-    const bytes = codegenNativeAssociativeScan(params);
+    const bytes = codegenBlockedAssociativeScan(params);
     const module = new WebAssembly.Module(bytes);
     return new Executable(null as any, { module });
   }
 
-  /**
-   * Dispatch a compiled associative scan WASM module.
-   *
-   * @param exe       Compiled WASM module from prepareNativeAssociativeScan
-   * @param params    Original compilation params (for buffer sizes)
-   * @param N         Length of the scan (runtime value)
-   * @param constSlots Constant input slots
-   * @param inputLeafSlots Input leaf slots (N elements each along scan axis)
-   * @param outputLeafSlots Output leaf slots (pre-allocated, same size as inputs)
-   */
-  dispatchNativeAssociativeScan(
+  dispatchBlockedAssociativeScan(
     exe: Executable<WasmProgram>,
-    params: NativeAssocScanParams,
+    params: NativeAssocScanBlockedParams,
     N: number,
     constSlots: Slot[],
     inputLeafSlots: Slot[],
     outputLeafSlots: Slot[],
   ): void {
-    if (N === 0) return; // nothing to do
+    if (N === 0) return;
 
-    const { leafElemSizes, internalSizes } = params;
+    const { leafElemSizes, internalSizes, blockSize: B } = params;
     const totalLeafElemSize = leafElemSizes.reduce((a, b) => a + b, 0);
+    const M = Math.ceil(N / B);
     const pingPongSize = totalLeafElemSize * N;
+    const summarySize = totalLeafElemSize * M;
 
-    // Allocate ping/pong scratch buffers
     const pingPtr = this.#allocator.malloc(pingPongSize);
     const pongPtr = this.#allocator.malloc(pingPongSize);
+    const sPingPtr = this.#allocator.malloc(summarySize);
+    const sPongPtr = this.#allocator.malloc(summarySize);
 
-    // Get or create WASM instance (shared between monolithic and parallel paths)
+    const internalPtrs: number[] = [];
+    for (const size of internalSizes) {
+      internalPtrs.push(this.#allocator.malloc(size));
+    }
+
     let instance = this.#instanceCache.get(exe.data.module);
     if (!instance) {
       const imports: WebAssembly.Imports = { env: { memory: this.#memory } };
@@ -965,196 +988,23 @@ export class WasmBackend implements Backend {
       this.#instanceCache.set(exe.data.module, instance);
     }
 
-    // M7.3: Parallel path — use WasmWorkerPool for inner-round dispatch
-    // when pool available, module registered, and N is large enough.
-    // The kernel uses per-j indexed internal buffers (j * internalSize[i])
-    // so workers access non-overlapping regions — no race conditions.
-    const pool = this.#workerPool ?? null;
-    if (
-      pool &&
-      N >= PARALLEL_THRESHOLD &&
-      pool.isModuleReady(exe.data.module)
-    ) {
-      // Allocate internal buffers × N for per-element isolation
-      const internalPtrs: number[] = [];
-      for (const size of internalSizes) {
-        internalPtrs.push(this.#allocator.malloc(size * N));
-      }
+    const args: number[] = [N];
+    for (const slot of constSlots) args.push(this.#getPtr(slot));
+    for (const slot of inputLeafSlots) args.push(this.#getPtr(slot));
+    for (const slot of outputLeafSlots) args.push(this.#getPtr(slot));
+    args.push(pingPtr, pongPtr, sPingPtr, sPongPtr);
+    args.push(...internalPtrs);
 
-      this.#dispatchParallelAssociativeScan(
-        exe,
-        params,
-        N,
-        constSlots,
-        inputLeafSlots,
-        outputLeafSlots,
-        pingPtr,
-        pongPtr,
-        internalPtrs,
-        instance,
-        pool,
-      );
+    const scanFunc = instance.exports.blocked_assoc_scan as (
+      ...args: number[]
+    ) => void;
+    scanFunc(...args);
 
-      for (const ptr of internalPtrs) this.#allocator.free(ptr);
-    } else {
-      // Kick off async registration for next time (if pool exists and N qualifies)
-      if (
-        pool &&
-        N >= PARALLEL_THRESHOLD &&
-        !pool.isModuleReady(exe.data.module)
-      ) {
-        pool.registerModule(exe.data.module).catch(() => {});
-      }
-
-      // Allocate single-element internal scratch buffers (monolithic)
-      const internalPtrs: number[] = [];
-      for (const size of internalSizes) {
-        internalPtrs.push(this.#allocator.malloc(size));
-      }
-
-      // Monolithic path: entire Kogge-Stone loop runs in WASM
-      const args: number[] = [N];
-      for (const slot of constSlots) args.push(this.#getPtr(slot));
-      for (const slot of inputLeafSlots) args.push(this.#getPtr(slot));
-      for (const slot of outputLeafSlots) args.push(this.#getPtr(slot));
-      args.push(pingPtr, pongPtr);
-      args.push(...internalPtrs);
-
-      const scanFunc = instance.exports.assoc_scan as (
-        ...args: number[]
-      ) => void;
-      scanFunc(...args);
-
-      for (const ptr of internalPtrs) this.#allocator.free(ptr);
-    }
-  }
-
-  /**
-   * M7.3: Parallel inner-round dispatch for associative scan.
-   *
-   * Instead of running the entire Kogge-Stone ladder inside a monolithic WASM
-   * function, this orchestrates the stride-doubling loop in JS, dispatching
-   * each round's inner loop across workers via WasmWorkerPool.dispatchSync().
-   *
-   * For each round (stride = 1, 2, 4, ...):
-   *   1. Fan out inner loop [0, N-stride) across workers + main thread.
-   *      Each element j computes fn(ping[j], ping[j+stride]) → pong[j+stride].
-   *   2. Prefix copy: ping[0..stride-1] → pong[0..stride-1] (on main thread).
-   *   3. Swap ping/pong pointers.
-   */
-  #dispatchParallelAssociativeScan(
-    exe: Executable<WasmProgram>,
-    params: NativeAssocScanParams,
-    N: number,
-    constSlots: Slot[],
-    inputLeafSlots: Slot[],
-    outputLeafSlots: Slot[],
-    pingPtr: number,
-    pongPtr: number,
-    internalPtrs: number[],
-    instance: WebAssembly.Instance,
-    pool: WasmWorkerPool,
-  ): void {
-    const { numLeaves, leafElemSizes, reverse } = params;
-
-    // Precompute leaf byte offsets (same as codegen)
-    const leafElemOffsets: number[] = [];
-    let offset = 0;
-    for (let k = 0; k < numLeaves; k++) {
-      leafElemOffsets.push(offset);
-      offset += leafElemSizes[k];
-    }
-
-    // Access WASM memory as a typed array for direct copies
-    const mem = new Uint8Array(this.#memory.buffer);
-
-    // Step 1: Copy inputs to ping buffer
-    for (let k = 0; k < numLeaves; k++) {
-      const inputPtr = this.#getPtr(inputLeafSlots[k]);
-      const dst = pingPtr + leafElemOffsets[k] * N;
-      const size = N * leafElemSizes[k];
-      mem.copyWithin(dst, inputPtr, inputPtr + size);
-    }
-
-    // If reverse, reverse each leaf in the ping buffer in-place
-    if (reverse) {
-      for (let k = 0; k < numLeaves; k++) {
-        const bw = leafElemSizes[k];
-        const base = pingPtr + leafElemOffsets[k] * N;
-        // Swap elements j and N-1-j for j = 0..N/2-1
-        for (let j = 0; j < Math.floor(N / 2); j++) {
-          const leftAddr = base + j * bw;
-          const rightAddr = base + (N - 1 - j) * bw;
-          // Swap via temporary bytes
-          const tmp = mem.slice(leftAddr, leftAddr + bw);
-          mem.copyWithin(leftAddr, rightAddr, rightAddr + bw);
-          mem.set(tmp, rightAddr);
-        }
-      }
-    }
-
-    // Build constant and internal pointer args for the kernel
-    const constPtrs: number[] = [];
-    for (const slot of constSlots) constPtrs.push(this.#getPtr(slot));
-
-    let curPing = pingPtr;
-    let curPong = pongPtr;
-
-    // Step 2: Kogge-Stone stride-doubling loop
-    const moduleId = pool.getModuleId(exe.data.module)!;
-    for (let stride = 1; stride < N; stride *= 2) {
-      const totalSize = N - stride;
-
-      // Dispatch inner loop across workers:
-      // kernel(start, end, N, stride, pingPtr, pongPtr, ...consts, ...internals)
-      const kernelArgs = [
-        N,
-        stride,
-        curPing,
-        curPong,
-        ...constPtrs,
-        ...internalPtrs,
-      ];
-
-      pool.dispatchSync(moduleId, instance, totalSize, kernelArgs);
-
-      // Prefix copy: ping[0..stride-1] → pong[0..stride-1] for all leaves
-      for (let k = 0; k < numLeaves; k++) {
-        const bw = leafElemSizes[k];
-        const srcBase = curPing + leafElemOffsets[k] * N;
-        const dstBase = curPong + leafElemOffsets[k] * N;
-        const copySize = stride * bw;
-        mem.copyWithin(dstBase, srcBase, srcBase + copySize);
-      }
-
-      // Swap ping ↔ pong
-      const tmp = curPing;
-      curPing = curPong;
-      curPong = tmp;
-    }
-
-    // Step 3: Copy results from curPing to output buffers
-    if (reverse) {
-      // Reverse: output[k][j] = curPing[k][N-1-j]
-      for (let k = 0; k < numLeaves; k++) {
-        const bw = leafElemSizes[k];
-        const outputPtr = this.#getPtr(outputLeafSlots[k]);
-        const srcBase = curPing + leafElemOffsets[k] * N;
-        for (let j = 0; j < N; j++) {
-          const src = srcBase + (N - 1 - j) * bw;
-          const dst = outputPtr + j * bw;
-          mem.copyWithin(dst, src, src + bw);
-        }
-      }
-    } else {
-      // Forward: bulk copy each leaf
-      for (let k = 0; k < numLeaves; k++) {
-        const outputPtr = this.#getPtr(outputLeafSlots[k]);
-        const srcBase = curPing + leafElemOffsets[k] * N;
-        const size = N * leafElemSizes[k];
-        mem.copyWithin(outputPtr, srcBase, srcBase + size);
-      }
-    }
+    for (const ptr of internalPtrs) this.#allocator.free(ptr);
+    this.#allocator.free(sPongPtr);
+    this.#allocator.free(sPingPtr);
+    this.#allocator.free(pongPtr);
+    this.#allocator.free(pingPtr);
   }
 
   // ---------------------------------------------------------------------------
@@ -1363,6 +1213,7 @@ export class WasmBackend implements Backend {
    */
   shouldUseParallelMegaModule(megaModule: WasmMegaModule): boolean {
     if (
+      !megaModule.canParallelize ||
       !this.capabilities.sharedMemory ||
       typeof Worker === "undefined" ||
       !this.#canSpinWaitWorkers
@@ -1372,6 +1223,88 @@ export class WasmBackend implements Backend {
     return megaModule.stepInfos.some(
       (s) => s.type === "kernel" && s.kernelSize >= PARALLEL_THRESHOLD,
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // Compiled block-map loop
+  // -------------------------------------------------------------------------
+
+  /**
+   * Compile a block-map loop into a single WASM module.
+   * Returns an Executable whose data is a WasmProgram, or null if the body
+   * cannot be compiled (e.g. contains routines or unsupported steps).
+   */
+  prepareBlockMapWasm(
+    params: BlockMapWasmParams,
+  ): Executable<WasmProgram> | null {
+    try {
+      const bytes = codegenBlockMapLoop(params);
+      const module = new WebAssembly.Module(bytes);
+      return new Executable(null as any, { module });
+    } catch (e) {
+      if (DEBUG >= 2) console.warn("[wasm-block-map] codegen failed:", e);
+      return null;
+    }
+  }
+
+  /**
+   * Dispatch a compiled block-map WASM module.
+   *
+   * Allocates internal scratch buffers and block-input/output scratch buffers,
+   * runs the compiled loop, then frees scratch.
+   */
+  dispatchBlockMapWasm(
+    exe: Executable<WasmProgram>,
+    params: BlockMapWasmParams,
+    constSlots: Slot[],
+    inputSlots: Slot[],
+    outputSlots: Slot[],
+  ): void {
+    const { blockInputSizes, blockOutputSizes, internalSizes } = params;
+
+    // Allocate scratch buffers for block inputs (body reads from these)
+    const scratchInputPtrs: number[] = [];
+    for (const size of blockInputSizes) {
+      scratchInputPtrs.push(this.#allocator.malloc(size));
+    }
+
+    // Allocate scratch buffers for block outputs (body writes to these)
+    const scratchOutputPtrs: number[] = [];
+    for (const size of blockOutputSizes) {
+      scratchOutputPtrs.push(this.#allocator.malloc(size));
+    }
+
+    // Allocate internal scratch buffers (kernel intermediates)
+    const internalPtrs: number[] = [];
+    for (const size of internalSizes) {
+      internalPtrs.push(this.#allocator.malloc(size));
+    }
+
+    // Build args: [consts, inputs, outputs, scratchInputs, scratchOutputs, internals]
+    const args: number[] = [];
+    for (const slot of constSlots) args.push(this.#getPtr(slot));
+    for (const slot of inputSlots) args.push(this.#getPtr(slot));
+    for (const slot of outputSlots) args.push(this.#getPtr(slot));
+    args.push(...scratchInputPtrs);
+    args.push(...scratchOutputPtrs);
+    args.push(...internalPtrs);
+
+    // Instantiate and run
+    let instance = this.#instanceCache.get(exe.data.module);
+    if (!instance) {
+      const imports: WebAssembly.Imports = { env: { memory: this.#memory } };
+      instance = new WebAssembly.Instance(exe.data.module, imports);
+      this.#instanceCache.set(exe.data.module, instance);
+    }
+    const blockMapFunc = instance.exports.block_map_loop as (
+      ...args: number[]
+    ) => void;
+    blockMapFunc(...args);
+
+    // Free scratch
+    for (const ptr of scratchInputPtrs) this.#allocator.free(ptr);
+    for (const ptr of scratchOutputPtrs) this.#allocator.free(ptr);
+    for (const ptr of internalPtrs) this.#allocator.free(ptr);
   }
 }
 
@@ -3009,6 +2942,351 @@ function codegenNativeScanGeneral(
 }
 
 // ---------------------------------------------------------------------------
+// Compiled block-map loop codegen (WASM)
+// ---------------------------------------------------------------------------
+
+/** Context for block-map WASM expression translation. */
+interface BlockMapContext {
+  gidx: number;
+  ridx: number;
+  acc?: number;
+  constsBase: number;
+  numConsts: number;
+  scratchInputsBase: number;
+  numInputs: number;
+  internalsBase: number;
+  numInternal: number;
+}
+
+/**
+ * Translate an AluExp to WASM code within a block-map context.
+ * Body kernels have GIDs mapped as:
+ *   [0..numConsts) → constants
+ *   [numConsts..numConsts+numInputs) → scratch block-input buffers
+ *   [numConsts+numInputs..) → internal buffers
+ */
+function translateExpWithBlockMapContext(
+  cg: CodeGenerator,
+  funcs: Record<string, number>,
+  exp: AluExp,
+  ctx: BlockMapContext,
+) {
+  translateExpCore(cg, funcs, exp, {
+    getVariable: (name) => {
+      if (name === "gidx") return ctx.gidx;
+      if (name === "ridx") {
+        if (ctx.ridx < 0)
+          throw new Error("ridx used but not in reduction context");
+        return ctx.ridx;
+      }
+      if (name === "acc") {
+        if (ctx.acc === undefined)
+          throw new Error("acc used but not in epilogue context");
+        return ctx.acc;
+      }
+      return undefined;
+    },
+    handleGlobalIndex: (cg, gen, gid, _len, indexExp, dtype) => {
+      const bw = byteWidth(dtype);
+
+      if (gid < ctx.numConsts) {
+        // Constant input
+        cg.local.get(ctx.constsBase + gid);
+      } else if (gid < ctx.numConsts + ctx.numInputs) {
+        // Block input (scratch buffer — already sliced)
+        cg.local.get(ctx.scratchInputsBase + (gid - ctx.numConsts));
+      } else {
+        // Internal buffer
+        const intIdx = gid - ctx.numConsts - ctx.numInputs;
+        cg.local.get(ctx.internalsBase + intIdx);
+      }
+
+      // Add element index offset
+      gen(indexExp);
+      cg.i32.const(bw);
+      cg.i32.mul();
+      cg.i32.add();
+
+      // Load the value
+      dty(cg, AluOp.GlobalIndex, dtype).load(Math.log2(bw));
+    },
+  });
+}
+
+/**
+ * Generate a WASM module for a compiled block-map loop.
+ *
+ * The generated module exports a single `block_map_loop` function that
+ * iterates over all blocks, copies input slices into scratch buffers,
+ * executes inlined body kernels, and copies outputs into the result buffers.
+ *
+ * Function arguments:
+ *   [...constPtrs, ...inputPtrs, ...outputPtrs,
+ *    ...scratchInputPtrs, ...scratchOutputPtrs, ...internalPtrs]
+ */
+function codegenBlockMapLoop(
+  params: BlockMapWasmParams,
+): Uint8Array<ArrayBuffer> {
+  const {
+    numConsts,
+    numInputs,
+    numOutputs,
+    gridRank,
+    gridShape,
+    blockShape,
+    inAxes,
+    outAxes,
+    inputShapes,
+    outputShapes,
+    blockInputSizes,
+    blockOutputSizes,
+    internalSizes,
+    steps,
+    outputSources,
+    inputStrides,
+    outputStrides,
+  } = params;
+  const numInternal = internalSizes.length;
+  const numBlocks = gridShape.reduce((a, b) => a * b, 1);
+
+  // ---- Code generation ----
+  const cg = new CodeGenerator();
+  configureMemoryImport(cg);
+
+  // Collect all helper functions needed by body kernels
+  const allOps = new Set<AluOp>();
+  for (const step of steps) {
+    if (step.source instanceof Kernel) {
+      const tune = tuneNullopt(step.source);
+      for (const op of tune.exp.distinctOps().keys()) allOps.add(op);
+      if (tune.epilogue) {
+        for (const op of tune.epilogue.distinctOps().keys()) allOps.add(op);
+      }
+    }
+  }
+  const funcs = importWasmHelperFuncs(cg, allOps);
+
+  // Function arguments layout:
+  //   [consts(numConsts), inputs(numInputs), outputs(numOutputs),
+  //    scratchInputs(numInputs), scratchOutputs(numOutputs), internals(numInternal)]
+  const numArgs =
+    numConsts + numInputs + numOutputs + numInputs + numOutputs + numInternal;
+
+  const constsBase = 0;
+  const inputsBase = numConsts;
+  const outputsBase = numConsts + numInputs;
+  const scratchInputsBase = numConsts + numInputs + numOutputs;
+  const _scratchOutputsBase = numConsts + numInputs + numOutputs + numInputs;
+  const internalsBase =
+    numConsts + numInputs + numOutputs + numInputs + numOutputs;
+
+  const mainFunc = cg.function(rep(numArgs, cg.i32), [], () => {
+    // Local variables
+    const flatIdx = cg.local.declare(cg.i32);
+    const gidx = cg.local.declare(cg.i32);
+    // Block coordinates (one per grid rank)
+    const blockCoords: number[] = [];
+    for (let g = 0; g < gridRank; g++) {
+      blockCoords.push(cg.local.declare(cg.i32));
+    }
+    const remaining = cg.local.declare(cg.i32);
+    // Temp locals for byte offsets
+    const srcOffset = cg.local.declare(cg.i32);
+    const dstOffset = cg.local.declare(cg.i32);
+    const copySize = cg.local.declare(cg.i32);
+
+    // Main loop: for flatIdx = 0 to numBlocks - 1
+    cg.i32.const(0);
+    cg.local.set(flatIdx);
+
+    cg.loop(cg.void);
+    {
+      cg.block(cg.void);
+      cg.local.get(flatIdx);
+      cg.i32.const(numBlocks);
+      cg.i32.ge_u();
+      cg.br_if(0);
+
+      // Decompose flatIdx to grid coordinates (row-major: last dim fastest)
+      cg.local.get(flatIdx);
+      cg.local.set(remaining);
+      for (let g = gridRank - 1; g >= 0; g--) {
+        cg.local.get(remaining);
+        cg.i32.const(gridShape[g]);
+        cg.i32.rem_u();
+        cg.local.set(blockCoords[g]);
+        cg.local.get(remaining);
+        cg.i32.const(gridShape[g]);
+        cg.i32.div_u();
+        cg.local.set(remaining);
+      }
+
+      // ---- Step 1: Copy input slices into scratch buffers ----
+      for (let i = 0; i < numInputs; i++) {
+        const axes = inAxes[i];
+        const inputShape = inputShapes[i];
+        const iStrides = inputStrides[i];
+
+        // Zero the scratch buffer (handles boundary padding)
+        cg.local.get(scratchInputsBase + i);
+        cg.i32.const(0);
+        cg.i32.const(blockInputSizes[i]);
+        cg.memory.fill();
+
+        // Compute source byte offset: sum over grid dims
+        // offset = sum_g(blockCoord[g] * blockShape[g] * stride[axes[g]])
+        cg.i32.const(0);
+        cg.local.set(srcOffset);
+        for (let g = 0; g < gridRank; g++) {
+          if (axes[g] !== null) {
+            const ax = axes[g]!;
+            cg.local.get(srcOffset);
+            cg.local.get(blockCoords[g]);
+            cg.i32.const(blockShape[g] * iStrides[ax]);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.set(srcOffset);
+          }
+        }
+
+        // Compute valid copy size. For interior blocks, it's blockInputSizes[i].
+        // For boundary blocks (last on any mapped axis), clamp to available data.
+        // We emit a conservative loop: copy min(blockDim, available) on each
+        // mapped axis. For 1D (gridRank=1): copySize = min(blockShape*bw, (inputDim - start)*bw).
+        // For multi-dim we need row-by-row copy unless contiguous.
+        //
+        // Simplification: we only handle the contiguous case (1D or leading-axis).
+        // The contiguity is checked at prepare time so we can just do a single memory.copy.
+        // The copy length is min(blockInputSizes[i], totalInputBytes - srcOffset).
+        cg.local.get(scratchInputsBase + i); // dst
+        cg.local.get(inputsBase + i); // src base
+        cg.local.get(srcOffset);
+        cg.i32.add(); // src = inputPtr + srcOffset
+
+        // copySize = min(blockInputSizes[i], inputTotalBytes - srcOffset)
+        const inputTotalBytes = inputShape.reduce((a, b) => a * b, 1);
+        const elemBytes = iStrides[inputShape.length - 1]; // innermost stride = elemBytes
+        const totalBytes = inputTotalBytes * elemBytes;
+        cg.i32.const(totalBytes);
+        cg.local.get(srcOffset);
+        cg.i32.sub(); // available = totalBytes - srcOffset
+        // clamp to blockInputSizes[i]
+        cg.local.tee(copySize);
+        cg.i32.const(blockInputSizes[i]);
+        cg.i32.gt_u();
+        cg.if(cg.void);
+        cg.i32.const(blockInputSizes[i]);
+        cg.local.set(copySize);
+        cg.end();
+
+        cg.local.get(copySize);
+        cg.memory.copy(); // memory.copy(dst, src, len) — but WASM memory.copy is (dst, src, len)
+      }
+
+      // ---- Step 2: Execute body kernel steps ----
+      for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+        const step = steps[stepIdx];
+        if (step.source instanceof Kernel) {
+          const kernel = step.source;
+          const internalIdx = step.outputInternalIdx;
+          const bw = byteWidth(kernel.outputs[0].dtype);
+
+          emitKernelBody({
+            cg,
+            funcs,
+            kernel,
+            gidx,
+            emitOutputAddr: () => {
+              cg.local.get(internalsBase + internalIdx);
+              cg.local.get(gidx);
+              cg.i32.const(bw);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+            emitExp: (exp, extra) => {
+              const ctx: BlockMapContext = {
+                gidx,
+                ridx: -1,
+                constsBase,
+                numConsts,
+                scratchInputsBase,
+                numInputs,
+                internalsBase,
+                numInternal,
+              };
+              if (extra.ridx !== undefined) ctx.ridx = extra.ridx;
+              if (extra.acc !== undefined) ctx.acc = extra.acc;
+              translateExpWithBlockMapContext(cg, funcs, exp, ctx);
+            },
+          });
+        }
+      }
+
+      // ---- Step 3: Copy body outputs to the result buffers ----
+      for (let o = 0; o < numOutputs; o++) {
+        const axes = outAxes[o];
+        const outputShape = outputShapes[o];
+        const oStrides = outputStrides[o];
+        const srcInternalIdx = outputSources[o];
+
+        // Compute destination byte offset
+        cg.i32.const(0);
+        cg.local.set(dstOffset);
+        for (let g = 0; g < gridRank; g++) {
+          if (axes[g] !== null) {
+            const ax = axes[g]!;
+            cg.local.get(dstOffset);
+            cg.local.get(blockCoords[g]);
+            cg.i32.const(blockShape[g] * oStrides[ax]);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.set(dstOffset);
+          }
+        }
+
+        // Copy from internal buffer to output, clamping at boundary
+        cg.local.get(outputsBase + o); // dst base
+        cg.local.get(dstOffset);
+        cg.i32.add(); // dst = outputPtr + dstOffset
+
+        cg.local.get(internalsBase + srcInternalIdx); // src = internal buffer
+
+        // copySize = min(blockOutputSizes[o], outputTotalBytes - dstOffset)
+        const outElemBytes = oStrides[outputShape.length - 1];
+        const outTotalBytes =
+          outputShape.reduce((a, b) => a * b, 1) * outElemBytes;
+        cg.i32.const(outTotalBytes);
+        cg.local.get(dstOffset);
+        cg.i32.sub(); // available
+        cg.local.tee(copySize);
+        cg.i32.const(blockOutputSizes[o]);
+        cg.i32.gt_u();
+        cg.if(cg.void);
+        cg.i32.const(blockOutputSizes[o]);
+        cg.local.set(copySize);
+        cg.end();
+
+        cg.local.get(copySize);
+        cg.memory.copy();
+      }
+
+      // flatIdx++
+      cg.local.get(flatIdx);
+      cg.i32.const(1);
+      cg.i32.add();
+      cg.local.set(flatIdx);
+
+      cg.br(1); // continue loop
+      cg.end();
+    }
+    cg.end();
+  });
+
+  cg.export(mainFunc, "block_map_loop");
+  return cg.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Type helpers
 // ---------------------------------------------------------------------------
 
@@ -3076,41 +3354,53 @@ export interface NativeAssocScanParams {
   leafToInternalIdx: number[];
 }
 
+// ---------------------------------------------------------------------------
+// Blocked associative scan (Phase 5)
+// ---------------------------------------------------------------------------
+
 /**
- * Generate a WASM module for a native associative scan (Kogge-Stone).
+ * Params for the blocked associative scan WASM module.
+ * Same body kernel steps as the flat version, plus a block size.
+ */
+export interface NativeAssocScanBlockedParams extends NativeAssocScanParams {
+  /** Block size for the blocked Kogge-Stone decomposition. */
+  blockSize: number;
+}
+
+/**
+ * Generate a WASM module for a blocked associative scan.
+ *
+ * Three-level algorithm:
+ *   Level 1: Per-block prefix scans (Kogge-Stone with stride < B)
+ *   Level 2: Flat Kogge-Stone on M block summaries
+ *   Level 3: Apply scanned summaries to blocks 1..M-1
  *
  * Function signature:
  *   (N: i32, ...constPtrs, ...inputLeafPtrs, ...outputLeafPtrs,
- *    pingPtr: i32, pongPtr: i32, ...internalPtrs) -> ()
- *
- * N is a runtime parameter — the same compiled module works for any length.
- * The ping/pong buffers are caller-allocated scratch space, each of size
- * sum(leafElemSizes) * N bytes. Internal buffers hold per-element temporaries
- * for multi-step bodies.
- *
- * Algorithm:
- *   1. Copy inputs to ping buffer
- *   2. For stride = 1, 2, 4, ... while stride < N:
- *      a. For i = stride..N-1: apply body fn(ping[i-stride], ping[i]) → pong[i]
- *      b. For i = 0..stride-1: copy ping[i] → pong[i]
- *      c. Swap ping ↔ pong
- *   3. If reverse: reverse the ping buffer into outputs
- *      Else: copy ping to outputs
+ *    pingPtr, pongPtr, summaryPingPtr, summaryPongPtr, ...internalPtrs) -> ()
  */
-function codegenNativeAssociativeScan(
-  params: NativeAssocScanParams,
+function codegenBlockedAssociativeScan(
+  params: NativeAssocScanBlockedParams,
 ): Uint8Array<ArrayBuffer> {
   const {
     numConsts,
-    constSizes: _constSizes,
     numLeaves,
     leafElemSizes,
     steps,
     internalSizes,
     reverse,
+    blockSize: B,
   } = params;
   const numInternal = internalSizes.length;
-  void _constSizes;
+  const numInputs = numConsts + 2 * numLeaves;
+
+  // Precompute leaf byte offsets within ping/pong buffers
+  const leafElemOffsets: number[] = [];
+  let offset = 0;
+  for (let k = 0; k < numLeaves; k++) {
+    leafElemOffsets.push(offset);
+    offset += leafElemSizes[k];
+  }
 
   // Collect all ops for helper function imports
   const allOps = new Set<AluOp>();
@@ -3128,88 +3418,187 @@ function codegenNativeAssociativeScan(
   configureMemoryImport(cg);
   const funcs = importWasmHelperFuncs(cg, allOps);
 
-  // Function arguments layout:
-  //   N: i32,
-  //   ...constPtrs (numConsts),
-  //   ...inputLeafPtrs (numLeaves),
-  //   ...outputLeafPtrs (numLeaves),
-  //   pingPtr: i32,
-  //   pongPtr: i32,
-  //   ...internalPtrs (numInternal)
-  const numArgs = 1 + numConsts + numLeaves + numLeaves + 2 + numInternal;
-
+  // Arguments: (N, ...consts, ...inputs, ...outputs, ping, pong, sPing, sPong, ...internals)
   const NArg = 0;
   const constsBase = 1;
   const inputsBase = 1 + numConsts;
   const outputsBase = 1 + numConsts + numLeaves;
   const pingArg = 1 + numConsts + numLeaves + numLeaves;
   const pongArg = pingArg + 1;
-  const internalsBase = pongArg + 1;
+  const sPingArg = pongArg + 1;
+  const sPongArg = sPingArg + 1;
+  const internalsBase = sPongArg + 1;
+  const numArgs = internalsBase + numInternal;
 
-  // Precompute leaf byte offsets within the ping/pong buffer.
-  // Layout: [leaf0: N*size0 bytes][leaf1: N*size1 bytes][...]
-  // Offset of leaf k = sum(leafElemSizes[0..k-1]) * N
-  // Since N is runtime, we store the per-element offset (sum of preceding sizes)
-  // and multiply by N at runtime.
-  const leafElemOffsets: number[] = [];
-  let offset = 0;
-  for (let k = 0; k < numLeaves; k++) {
-    leafElemOffsets.push(offset);
-    offset += leafElemSizes[k];
+  // Helper: emit the body kernel steps for a single element combine.
+  // `emitAAddr(leafIdx)` pushes the base address of the a-operand for leaf k.
+  // `emitBAddr(leafIdx)` pushes the base address of the b-operand for leaf k.
+  // `emitOutAddr(leafIdx)` pushes the base address of the output for leaf k.
+  // After calling, internal buffers hold intermediate results too.
+  function emitCombineAndCopy(
+    gidx: number,
+    emitALeafAddr: (k: number) => void,
+    emitBLeafAddr: (k: number) => void,
+    emitCopyDstAddr: (k: number) => void,
+  ) {
+    for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+      const step = steps[stepIdx];
+      if (!(step.source instanceof Kernel)) {
+        throw new Error("blocked assoc_scan: only Kernel steps supported");
+      }
+      const kernel = step.source;
+      const internalIdx = step.outputInternalIdx;
+      const bw = byteWidth(kernel.outputs[0].dtype);
+
+      emitKernelBody({
+        cg,
+        funcs,
+        kernel,
+        gidx,
+        emitOutputAddr: () => {
+          cg.local.get(internalsBase + internalIdx);
+          cg.local.get(gidx);
+          cg.i32.const(bw);
+          cg.i32.mul();
+          cg.i32.add();
+        },
+        emitExp: (exp, extra) => {
+          translateExpCore(cg, funcs, exp, {
+            getVariable: (name) => {
+              if (name === "gidx") return gidx;
+              if (name === "ridx" && extra.ridx !== undefined)
+                return extra.ridx;
+              if (name === "acc" && extra.acc !== undefined) return extra.acc;
+              return undefined;
+            },
+            handleGlobalIndex: (cg, gen, gid, _len, indexExp, dtype) => {
+              const elemBw = byteWidth(dtype);
+              if (gid < numConsts) {
+                cg.local.get(constsBase + gid);
+              } else if (gid < numConsts + numLeaves) {
+                // a-leaf
+                emitALeafAddr(gid - numConsts);
+              } else if (gid < numInputs) {
+                // b-leaf
+                emitBLeafAddr(gid - numConsts - numLeaves);
+              } else {
+                // internal buffer
+                cg.local.get(internalsBase + (gid - numInputs));
+              }
+              gen(indexExp);
+              cg.i32.const(elemBw);
+              cg.i32.mul();
+              cg.i32.add();
+              dty(cg, AluOp.GlobalIndex, dtype).load(Math.log2(elemBw));
+            },
+          });
+        },
+      });
+    }
+    // Copy from internal buffers to output
+    for (let k = 0; k < numLeaves; k++) {
+      emitCopyDstAddr(k);
+      cg.local.get(internalsBase + params.leafToInternalIdx[k]);
+      emitCopy(leafElemSizes[k]);
+    }
   }
 
-  const scanFunc = cg.function(rep(numArgs, cg.i32), [], () => {
-    // Local variables
+  // Helper: emit an inline byte copy for small compile-time-known sizes.
+  // Expects [dst, src] on the WASM operand stack. Uses i32/v128 load/store
+  // (not f32) for bit-exact raw copies that preserve all bit patterns.
+  let tmpCopyDst: number | undefined;
+  let tmpCopySrc: number | undefined;
+  function emitCopy(size: number) {
+    if (size === 4) {
+      cg.i32.load(2, 0);
+      cg.i32.store(2, 0);
+    } else if (size === 16) {
+      cg.v128.load(2, 0);
+      cg.v128.store(2, 0);
+    } else if (size === 8) {
+      tmpCopyDst ??= cg.local.declare(cg.i32);
+      tmpCopySrc ??= cg.local.declare(cg.i32);
+      cg.local.set(tmpCopySrc);
+      cg.local.tee(tmpCopyDst);
+      cg.local.get(tmpCopySrc);
+      cg.i32.load(2, 0);
+      cg.i32.store(2, 0);
+      cg.local.get(tmpCopyDst);
+      cg.local.get(tmpCopySrc);
+      cg.i32.load(2, 4);
+      cg.i32.store(2, 4);
+    } else if (size === 32) {
+      tmpCopyDst ??= cg.local.declare(cg.i32);
+      tmpCopySrc ??= cg.local.declare(cg.i32);
+      cg.local.set(tmpCopySrc);
+      cg.local.tee(tmpCopyDst);
+      cg.local.get(tmpCopySrc);
+      cg.v128.load(2, 0);
+      cg.v128.store(2, 0);
+      cg.local.get(tmpCopyDst);
+      cg.local.get(tmpCopySrc);
+      cg.v128.load(2, 16);
+      cg.v128.store(2, 16);
+    } else {
+      cg.i32.const(size);
+      cg.memory.copy();
+    }
+  }
+
+  const mainFunc = cg.function(rep(numArgs, cg.i32), [], () => {
     const stride = cg.local.declare(cg.i32);
     const i = cg.local.declare(cg.i32);
     const gidx = cg.local.declare(cg.i32);
     const curPing = cg.local.declare(cg.i32);
     const curPong = cg.local.declare(cg.i32);
+    const curSPing = cg.local.declare(cg.i32);
+    const curSPong = cg.local.declare(cg.i32);
     const tmp = cg.local.declare(cg.i32);
+    const M = cg.local.declare(cg.i32); // number of blocks
+    const posInBlock = cg.local.declare(cg.i32);
 
-    // Initialize curPing = pingArg, curPong = pongArg
+    // Initialize pointers
     cg.local.get(pingArg);
     cg.local.set(curPing);
     cg.local.get(pongArg);
     cg.local.set(curPong);
+    cg.local.get(sPingArg);
+    cg.local.set(curSPing);
+    cg.local.get(sPongArg);
+    cg.local.set(curSPong);
 
-    // Step 1: Copy inputs to ping buffer.
-    // For each leaf k, copy N * leafElemSizes[k] bytes from inputLeafPtrs[k]
-    // to ping + leafElemOffsets[k] * N.
+    // M = ceil(N / B) = (N + B - 1) / B
+    cg.local.get(NArg);
+    cg.i32.const(B - 1);
+    cg.i32.add();
+    cg.i32.const(B);
+    cg.i32.div_u();
+    cg.local.set(M);
+
+    // ---- Copy inputs → ping ----
     for (let k = 0; k < numLeaves; k++) {
-      // dst = curPing + leafElemOffsets[k] * N
       cg.local.get(curPing);
       cg.i32.const(leafElemOffsets[k]);
       cg.local.get(NArg);
       cg.i32.mul();
       cg.i32.add();
-      // src = inputLeafPtrs[k]
       cg.local.get(inputsBase + k);
-      // size = N * leafElemSizes[k]
       cg.local.get(NArg);
       cg.i32.const(leafElemSizes[k]);
       cg.i32.mul();
       cg.memory.copy();
     }
 
-    // If reverse, reverse each leaf in the ping buffer in-place.
-    // Reverse leaf k: for j = 0..N/2-1: swap ping[k][j] ↔ ping[k][N-1-j]
+    // ---- If reverse: reverse each leaf in ping ----
     if (reverse) {
       const j = cg.local.declare(cg.i32);
       const halfN = cg.local.declare(cg.i32);
-      const swapTmp = cg.local.declare(cg.i32);
-
-      // halfN = N / 2
       cg.local.get(NArg);
       cg.i32.const(1);
       cg.i32.shr_u();
       cg.local.set(halfN);
-
       for (let k = 0; k < numLeaves; k++) {
         const bw = leafElemSizes[k];
-        // For element-sized swaps, we do byte-level swap via a temp buffer.
-        // For bw <= 8, use locals; for larger, use memory.copy with tmp area.
-        // Simple approach: use memory.copy for each swap.
         cg.i32.const(0);
         cg.local.set(j);
         cg.loop(cg.void);
@@ -3219,11 +3608,7 @@ function codegenNativeAssociativeScan(
           cg.local.get(halfN);
           cg.i32.ge_u();
           cg.br_if(0);
-
-          // addr_left = curPing + leafElemOffsets[k] * N + j * bw
-          // addr_right = curPing + leafElemOffsets[k] * N + (N-1-j) * bw
-
-          // Save left address in tmp
+          // addr_left = curPing + leafOffset*N + j*bw
           cg.local.get(curPing);
           cg.i32.const(leafElemOffsets[k]);
           cg.local.get(NArg);
@@ -3233,9 +3618,8 @@ function codegenNativeAssociativeScan(
           cg.i32.const(bw);
           cg.i32.mul();
           cg.i32.add();
-          cg.local.set(tmp); // tmp = addr_left
-
-          // Compute addr_right
+          cg.local.set(tmp);
+          // addr_right = curPing + leafOffset*N + (N-1-j)*bw
           cg.local.get(curPing);
           cg.i32.const(leafElemOffsets[k]);
           cg.local.get(NArg);
@@ -3249,25 +3633,17 @@ function codegenNativeAssociativeScan(
           cg.i32.const(bw);
           cg.i32.mul();
           cg.i32.add();
-          cg.local.set(swapTmp); // swapTmp = addr_right
-
-          // Use pong buffer temporarily for swap:
-          // pong[0..bw] = left; left = right; right = pong[0..bw]
-          cg.local.get(curPong); // dst = pong (temp)
-          cg.local.get(tmp); // src = addr_left
-          cg.i32.const(bw);
-          cg.memory.copy();
-
-          cg.local.get(tmp); // dst = addr_left
-          cg.local.get(swapTmp); // src = addr_right
-          cg.i32.const(bw);
-          cg.memory.copy();
-
-          cg.local.get(swapTmp); // dst = addr_right
-          cg.local.get(curPong); // src = pong (temp)
-          cg.i32.const(bw);
-          cg.memory.copy();
-
+          cg.local.set(posInBlock); // reuse as temp
+          // swap via pong temp
+          cg.local.get(curPong);
+          cg.local.get(tmp);
+          emitCopy(bw);
+          cg.local.get(tmp);
+          cg.local.get(posInBlock);
+          emitCopy(bw);
+          cg.local.get(posInBlock);
+          cg.local.get(curPong);
+          emitCopy(bw);
           cg.local.get(j);
           cg.i32.const(1);
           cg.i32.add();
@@ -3279,215 +3655,112 @@ function codegenNativeAssociativeScan(
       }
     }
 
-    // Step 2: Kogge-Stone stride-doubling loop.
-    // stride = 1
+    // ==== LEVEL 1: Block-local Kogge-Stone (stride < B) ====
     cg.i32.const(1);
     cg.local.set(stride);
 
-    cg.loop(cg.void); // outer loop: while stride < N
+    cg.loop(cg.void);
     {
       cg.block(cg.void);
       cg.local.get(stride);
-      cg.local.get(NArg);
+      cg.i32.const(B);
       cg.i32.ge_u();
-      cg.br_if(0); // break if stride >= N
+      cg.br_if(0); // break if stride >= B
 
-      // Step 2a: For i = stride..N-1, apply body fn.
-      // For each element position i, compute fn(ping[i-stride], ping[i]) → pong[i]
-      cg.local.get(stride);
+      // Inner loop: for i = 0..N-1
+      cg.i32.const(0);
       cg.local.set(i);
-
-      cg.loop(cg.void); // inner loop: for i = stride..N-1
+      cg.loop(cg.void);
       {
         cg.block(cg.void);
         cg.local.get(i);
         cg.local.get(NArg);
         cg.i32.ge_u();
-        cg.br_if(0); // break if i >= N
+        cg.br_if(0);
 
-        // Execute each kernel step for this element position
-        for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
-          const step = steps[stepIdx];
-          if (!(step.source instanceof Kernel)) {
-            throw new Error(
-              "assoc_scan compiled-loop: only Kernel steps supported",
-            );
-          }
-          const kernel = step.source;
-          const internalIdx = step.outputInternalIdx;
-          const bw = byteWidth(kernel.outputs[0].dtype);
+        // posInBlock = i % B
+        cg.local.get(i);
+        cg.i32.const(B);
+        cg.i32.rem_u();
+        cg.local.set(posInBlock);
 
-          // The body jaxpr has inputs: [consts..., a_leaves..., b_leaves...]
-          // In Kogge-Stone context:
-          //   consts (gid < numConsts)       → constPtrs[gid]
-          //   a-leaves (numConsts ≤ gid < numConsts+numLeaves)
-          //       → ping + leafElemOffset[gid-numConsts] * N + (i-stride) * leafElemSize[gid-numConsts]
-          //   b-leaves (numConsts+numLeaves ≤ gid < numConsts+2*numLeaves)
-          //       → ping + leafElemOffset[gid-numConsts-numLeaves] * N + i * leafElemSize[gid-numConsts-numLeaves]
-          //   internal (gid ≥ numInputs) → internalPtrs[gid - numInputs]
-
-          const numInputs = numConsts + 2 * numLeaves;
-
-          emitKernelBody({
-            cg,
-            funcs,
-            kernel,
+        // if posInBlock >= stride → combine; else → copy
+        cg.local.get(posInBlock);
+        cg.local.get(stride);
+        cg.i32.ge_u();
+        cg.if(cg.void);
+        {
+          // Combine: fn(ping[i-stride], ping[i]) → internal → pong[i]
+          emitCombineAndCopy(
             gidx,
-            emitOutputAddr: () => {
-              // Output goes to internal buffer (or pong directly for last step mapping output leaves)
-              cg.local.get(internalsBase + internalIdx);
-              cg.local.get(gidx);
-              cg.i32.const(bw);
+            (k) => {
+              // a-leaf addr: curPing + leafOffset*N + (i-stride)*leafElemSize
+              cg.local.get(curPing);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(NArg);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.local.get(stride);
+              cg.i32.sub();
+              cg.i32.const(leafElemSizes[k]);
               cg.i32.mul();
               cg.i32.add();
             },
-            emitExp: (exp, extra) => {
-              translateExpCore(cg, funcs, exp, {
-                getVariable: (name) => {
-                  if (name === "gidx") return gidx;
-                  if (name === "ridx" && extra.ridx !== undefined)
-                    return extra.ridx;
-                  if (name === "acc" && extra.acc !== undefined)
-                    return extra.acc;
-                  return undefined;
-                },
-                handleGlobalIndex: (cg, gen, gid, _len, indexExp, dtype) => {
-                  const elemBw = byteWidth(dtype);
-
-                  if (gid < numConsts) {
-                    // Constant: just use const ptr
-                    cg.local.get(constsBase + gid);
-                  } else if (gid < numConsts + numLeaves) {
-                    // a-leaf: ping[leafOffset * N + (i-stride) * leafElemSize]
-                    const leafIdx = gid - numConsts;
-                    cg.local.get(curPing);
-                    cg.i32.const(leafElemOffsets[leafIdx]);
-                    cg.local.get(NArg);
-                    cg.i32.mul();
-                    cg.i32.add();
-                    // + (i - stride) * leafElemSize
-                    cg.local.get(i);
-                    cg.local.get(stride);
-                    cg.i32.sub();
-                    cg.i32.const(leafElemSizes[leafIdx]);
-                    cg.i32.mul();
-                    cg.i32.add();
-                  } else if (gid < numInputs) {
-                    // b-leaf: ping[leafOffset * N + i * leafElemSize]
-                    const leafIdx = gid - numConsts - numLeaves;
-                    cg.local.get(curPing);
-                    cg.i32.const(leafElemOffsets[leafIdx]);
-                    cg.local.get(NArg);
-                    cg.i32.mul();
-                    cg.i32.add();
-                    // + i * leafElemSize
-                    cg.local.get(i);
-                    cg.i32.const(leafElemSizes[leafIdx]);
-                    cg.i32.mul();
-                    cg.i32.add();
-                  } else {
-                    // Internal buffer
-                    const intIdx = gid - numInputs;
-                    cg.local.get(internalsBase + intIdx);
-                  }
-
-                  // Add element-level index offset
-                  gen(indexExp);
-                  cg.i32.const(elemBw);
-                  cg.i32.mul();
-                  cg.i32.add();
-
-                  // Load
-                  dty(cg, AluOp.GlobalIndex, dtype).load(Math.log2(elemBw));
-                },
-              });
+            (k) => {
+              // b-leaf addr: curPing + leafOffset*N + i*leafElemSize
+              cg.local.get(curPing);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(NArg);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.i32.const(leafElemSizes[k]);
+              cg.i32.mul();
+              cg.i32.add();
             },
-          });
+            (k) => {
+              // output addr: curPong + leafOffset*N + i*leafElemSize
+              cg.local.get(curPong);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(NArg);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.i32.const(leafElemSizes[k]);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+          );
         }
-
-        // Copy kernel outputs (from internal buffers) to pong at position i
-        // For each output leaf, the last step that writes to it determines
-        // the internal buffer index. The body outputs map to leaves 0..numLeaves-1.
-        // We use the bodyProgram's output mapping (step outputs correspond to
-        // body jaxpr outBinders).
-        for (let k = 0; k < numLeaves; k++) {
-          const size = leafElemSizes[k];
-          // Find which internal produced output leaf k
-          // The body jaxpr outputs are the first numLeaves outBinders.
-          // In the compiled steps, the step output indices map back to the body jaxpr.
-          // The steps array was built from GeneralScanStep which tracks outputInternalIdx.
-          // For assoc_scan, the step that produces leaf k is the one whose
-          // output maps to body jaxpr out[k].
-          // For now, assume the last step outputs map directly to leaves.
-          // This works for simple single-step and multi-step bodies where
-          // outputInternalIdx for the k-th output leaf is k.
-          // (This is validated during planning.)
-
-          // dst = curPong + leafElemOffsets[k] * N + i * size
-          cg.local.get(curPong);
-          cg.i32.const(leafElemOffsets[k]);
-          cg.local.get(NArg);
-          cg.i32.mul();
-          cg.i32.add();
-          cg.local.get(i);
-          cg.i32.const(size);
-          cg.i32.mul();
-          cg.i32.add();
-          // src = internalsBase + outputInternalForLeaf[k]
-          // For now we pass a leafToInternalIdx mapping in params
-          cg.local.get(internalsBase + params.leafToInternalIdx![k]);
-          cg.i32.const(size);
-          cg.memory.copy();
+        cg.else();
+        {
+          // Copy: pong[i] = ping[i] for all leaves
+          for (let k = 0; k < numLeaves; k++) {
+            const size = leafElemSizes[k];
+            cg.local.get(curPong);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(NArg);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(size);
+            cg.i32.mul();
+            cg.i32.add();
+            // src
+            cg.local.get(curPing);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(NArg);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(size);
+            cg.i32.mul();
+            cg.i32.add();
+            emitCopy(size);
+          }
         }
-
-        // i++
-        cg.local.get(i);
-        cg.i32.const(1);
-        cg.i32.add();
-        cg.local.set(i);
-        cg.br(1);
         cg.end();
-      }
-      cg.end();
-
-      // Step 2b: For i = 0..stride-1, copy ping[i] → pong[i] (prefix unchanged)
-      cg.i32.const(0);
-      cg.local.set(i);
-
-      cg.loop(cg.void);
-      {
-        cg.block(cg.void);
-        cg.local.get(i);
-        cg.local.get(stride);
-        cg.i32.ge_u();
-        cg.br_if(0); // break if i >= stride
-
-        // Copy all leaves at position i from ping to pong
-        for (let k = 0; k < numLeaves; k++) {
-          const size = leafElemSizes[k];
-          // dst = curPong + leafElemOffsets[k] * N + i * size
-          cg.local.get(curPong);
-          cg.i32.const(leafElemOffsets[k]);
-          cg.local.get(NArg);
-          cg.i32.mul();
-          cg.i32.add();
-          cg.local.get(i);
-          cg.i32.const(size);
-          cg.i32.mul();
-          cg.i32.add();
-          // src = curPing + leafElemOffsets[k] * N + i * size
-          cg.local.get(curPing);
-          cg.i32.const(leafElemOffsets[k]);
-          cg.local.get(NArg);
-          cg.i32.mul();
-          cg.i32.add();
-          cg.local.get(i);
-          cg.i32.const(size);
-          cg.i32.mul();
-          cg.i32.add();
-          cg.i32.const(size);
-          cg.memory.copy();
-        }
 
         cg.local.get(i);
         cg.i32.const(1);
@@ -3498,7 +3771,7 @@ function codegenNativeAssociativeScan(
       }
       cg.end();
 
-      // Step 2c: Swap ping ↔ pong
+      // Swap ping/pong
       cg.local.get(curPing);
       cg.local.set(tmp);
       cg.local.get(curPong);
@@ -3511,16 +3784,326 @@ function codegenNativeAssociativeScan(
       cg.i32.const(1);
       cg.i32.shl();
       cg.local.set(stride);
-
       cg.br(1);
       cg.end();
     }
     cg.end();
 
-    // Step 3: Copy results from ping to output buffers.
-    // If reverse, we need to reverse the order when copying out.
+    // After Level 1, curPing has per-block prefix sums.
+    // Skip Levels 2-3 if M <= 1.
+    cg.local.get(M);
+    cg.i32.const(1);
+    cg.i32.gt_u();
+    cg.if(cg.void);
+    {
+      // ==== LEVEL 2: Extract summaries + flat Kogge-Stone on M elements ====
+
+      // Extract: for b = 0..M-1, summary[b] = ping[last element of block b]
+      // last element of block b = min((b+1)*B, N) - 1
+      cg.i32.const(0);
+      cg.local.set(i); // reuse i as b
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(i);
+        cg.local.get(M);
+        cg.i32.ge_u();
+        cg.br_if(0);
+
+        for (let k = 0; k < numLeaves; k++) {
+          const size = leafElemSizes[k];
+          // dst = curSPing + leafOffset*M + b*size
+          cg.local.get(curSPing);
+          cg.i32.const(leafElemOffsets[k]);
+          cg.local.get(M);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.get(i);
+          cg.i32.const(size);
+          cg.i32.mul();
+          cg.i32.add();
+          // src = curPing + leafOffset*N + (min((b+1)*B, N) - 1)*size
+          // Compute min((b+1)*B, N): (b+1)*B
+          cg.local.get(curPing);
+          cg.i32.const(leafElemOffsets[k]);
+          cg.local.get(NArg);
+          cg.i32.mul();
+          cg.i32.add();
+          // index = min((i+1)*B, N) - 1
+          cg.local.get(i);
+          cg.i32.const(1);
+          cg.i32.add();
+          cg.i32.const(B);
+          cg.i32.mul();
+          cg.local.set(tmp); // tmp = (b+1)*B
+          // min with N
+          cg.local.get(tmp);
+          cg.local.get(NArg);
+          cg.i32.gt_u();
+          cg.if(cg.void);
+          cg.local.get(NArg);
+          cg.local.set(tmp);
+          cg.end();
+          // index = tmp - 1
+          cg.local.get(tmp);
+          cg.i32.const(1);
+          cg.i32.sub();
+          cg.i32.const(size);
+          cg.i32.mul();
+          cg.i32.add();
+          emitCopy(size);
+        }
+
+        cg.local.get(i);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(i);
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+
+      // Flat Kogge-Stone on summaries: stride = 1..M-1
+      cg.i32.const(1);
+      cg.local.set(stride);
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(stride);
+        cg.local.get(M);
+        cg.i32.ge_u();
+        cg.br_if(0);
+
+        // Combine: for b = stride..M-1
+        cg.local.get(stride);
+        cg.local.set(i);
+        cg.loop(cg.void);
+        {
+          cg.block(cg.void);
+          cg.local.get(i);
+          cg.local.get(M);
+          cg.i32.ge_u();
+          cg.br_if(0);
+
+          emitCombineAndCopy(
+            gidx,
+            (k) => {
+              // a-leaf: curSPing + leafOffset*M + (b-stride)*size
+              cg.local.get(curSPing);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(M);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.local.get(stride);
+              cg.i32.sub();
+              cg.i32.const(leafElemSizes[k]);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+            (k) => {
+              // b-leaf: curSPing + leafOffset*M + b*size
+              cg.local.get(curSPing);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(M);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.i32.const(leafElemSizes[k]);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+            (k) => {
+              // output: curSPong + leafOffset*M + b*size
+              cg.local.get(curSPong);
+              cg.i32.const(leafElemOffsets[k]);
+              cg.local.get(M);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(i);
+              cg.i32.const(leafElemSizes[k]);
+              cg.i32.mul();
+              cg.i32.add();
+            },
+          );
+
+          cg.local.get(i);
+          cg.i32.const(1);
+          cg.i32.add();
+          cg.local.set(i);
+          cg.br(1);
+          cg.end();
+        }
+        cg.end();
+
+        // Copy prefix: for b = 0..stride-1
+        cg.i32.const(0);
+        cg.local.set(i);
+        cg.loop(cg.void);
+        {
+          cg.block(cg.void);
+          cg.local.get(i);
+          cg.local.get(stride);
+          cg.i32.ge_u();
+          cg.br_if(0);
+          for (let k = 0; k < numLeaves; k++) {
+            const size = leafElemSizes[k];
+            cg.local.get(curSPong);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(M);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(size);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(curSPing);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(M);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(size);
+            cg.i32.mul();
+            cg.i32.add();
+            emitCopy(size);
+          }
+          cg.local.get(i);
+          cg.i32.const(1);
+          cg.i32.add();
+          cg.local.set(i);
+          cg.br(1);
+          cg.end();
+        }
+        cg.end();
+
+        // Swap summary ping/pong
+        cg.local.get(curSPing);
+        cg.local.set(tmp);
+        cg.local.get(curSPong);
+        cg.local.set(curSPing);
+        cg.local.get(tmp);
+        cg.local.set(curSPong);
+
+        cg.local.get(stride);
+        cg.i32.const(1);
+        cg.i32.shl();
+        cg.local.set(stride);
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+
+      // ==== LEVEL 3: Apply scanned summaries to blocks 1..M-1 ====
+      // For i = B..N-1: pong[i] = fn(summary[(i/B)-1], ping[i])
+      // For i = 0..B-1: pong[i] = ping[i]
+
+      // Copy block 0 as-is
+      for (let k = 0; k < numLeaves; k++) {
+        const size = leafElemSizes[k];
+        // dst = curPong + leafOffset*N
+        cg.local.get(curPong);
+        cg.i32.const(leafElemOffsets[k]);
+        cg.local.get(NArg);
+        cg.i32.mul();
+        cg.i32.add();
+        // src = curPing + leafOffset*N
+        cg.local.get(curPing);
+        cg.i32.const(leafElemOffsets[k]);
+        cg.local.get(NArg);
+        cg.i32.mul();
+        cg.i32.add();
+        // min(B, N) * size
+        cg.i32.const(B);
+        cg.local.get(NArg);
+        cg.i32.gt_u();
+        cg.if(cg.i32);
+        cg.local.get(NArg);
+        cg.else();
+        cg.i32.const(B);
+        cg.end();
+        cg.i32.const(size);
+        cg.i32.mul();
+        cg.memory.copy();
+      }
+
+      // Apply summaries to remaining elements
+      cg.i32.const(B);
+      cg.local.set(i);
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(i);
+        cg.local.get(NArg);
+        cg.i32.ge_u();
+        cg.br_if(0);
+
+        // block_idx = i / B; summary index = block_idx - 1
+        emitCombineAndCopy(
+          gidx,
+          (k) => {
+            // a-leaf: curSPing + leafOffset*M + (i/B - 1)*size
+            cg.local.get(curSPing);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(M);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(B);
+            cg.i32.div_u();
+            cg.i32.const(1);
+            cg.i32.sub();
+            cg.i32.const(leafElemSizes[k]);
+            cg.i32.mul();
+            cg.i32.add();
+          },
+          (k) => {
+            // b-leaf: curPing + leafOffset*N + i*size
+            cg.local.get(curPing);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(NArg);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(leafElemSizes[k]);
+            cg.i32.mul();
+            cg.i32.add();
+          },
+          (k) => {
+            // output: curPong + leafOffset*N + i*size
+            cg.local.get(curPong);
+            cg.i32.const(leafElemOffsets[k]);
+            cg.local.get(NArg);
+            cg.i32.mul();
+            cg.i32.add();
+            cg.local.get(i);
+            cg.i32.const(leafElemSizes[k]);
+            cg.i32.mul();
+            cg.i32.add();
+          },
+        );
+
+        cg.local.get(i);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(i);
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+
+      // Swap ping/pong so curPing has the final result
+      cg.local.get(curPing);
+      cg.local.set(tmp);
+      cg.local.get(curPong);
+      cg.local.set(curPing);
+      cg.local.get(tmp);
+      cg.local.set(curPong);
+    }
+    cg.end(); // end if M > 1
+
+    // ---- Copy results to output ----
     if (reverse) {
-      // Reverse: output[k][j] = ping[k][N-1-j] for j = 0..N-1
       const j = cg.local.declare(cg.i32);
       for (let k = 0; k < numLeaves; k++) {
         const bw = leafElemSizes[k];
@@ -3533,14 +4116,11 @@ function codegenNativeAssociativeScan(
           cg.local.get(NArg);
           cg.i32.ge_u();
           cg.br_if(0);
-
-          // dst = outputLeafPtrs[k] + j * bw
           cg.local.get(outputsBase + k);
           cg.local.get(j);
           cg.i32.const(bw);
           cg.i32.mul();
           cg.i32.add();
-          // src = curPing + leafElemOffsets[k] * N + (N-1-j) * bw
           cg.local.get(curPing);
           cg.i32.const(leafElemOffsets[k]);
           cg.local.get(NArg);
@@ -3554,9 +4134,7 @@ function codegenNativeAssociativeScan(
           cg.i32.const(bw);
           cg.i32.mul();
           cg.i32.add();
-          cg.i32.const(bw);
-          cg.memory.copy();
-
+          emitCopy(bw);
           cg.local.get(j);
           cg.i32.const(1);
           cg.i32.add();
@@ -3567,17 +4145,13 @@ function codegenNativeAssociativeScan(
         cg.end();
       }
     } else {
-      // Forward: bulk copy each leaf
       for (let k = 0; k < numLeaves; k++) {
-        // dst = outputLeafPtrs[k]
         cg.local.get(outputsBase + k);
-        // src = curPing + leafElemOffsets[k] * N
         cg.local.get(curPing);
         cg.i32.const(leafElemOffsets[k]);
         cg.local.get(NArg);
         cg.i32.mul();
         cg.i32.add();
-        // size = N * leafElemSizes[k]
         cg.local.get(NArg);
         cg.i32.const(leafElemSizes[k]);
         cg.i32.mul();
@@ -3586,185 +4160,7 @@ function codegenNativeAssociativeScan(
     }
   });
 
-  cg.export(scanFunc, "assoc_scan");
-
-  // -------------------------------------------------------------------------
-  // M7.3: Export a parallel inner-round kernel for WasmWorkerPool dispatch.
-  //
-  // Signature: kernel(start: i32, end: i32, N: i32, stride: i32,
-  //                    pingPtr: i32, pongPtr: i32,
-  //                    ...constPtrs, ...internalPtrs)
-  //
-  // For each j in [start, end):
-  //   a_leaf[k] = ping[leafOffset_k * N + j * elemSize_k]
-  //   b_leaf[k] = ping[leafOffset_k * N + (j + stride) * elemSize_k]
-  //   result → pong[leafOffset_k * N + (j + stride) * elemSize_k]
-  // -------------------------------------------------------------------------
-  const kernelNumArgs = 4 + numConsts + numInternal; // N, stride, ping, pong, consts, internals
-  const kernelFunc = cg.function(
-    rep(2 + kernelNumArgs, cg.i32), // (start, end, N, stride, ping, pong, ...consts, ...internals)
-    [],
-    () => {
-      // Argument mapping (after start=0, end=1 from dispatchSync pattern)
-      const kStart = 0;
-      const kEnd = 1;
-      const kN = 2;
-      const kStride = 3;
-      const kPing = 4;
-      const kPong = 5;
-      const kConstsBase = 6;
-      const kInternalsBase = 6 + numConsts;
-
-      const kJ = cg.local.declare(cg.i32);
-      const kGidx = cg.local.declare(cg.i32);
-
-      // for j = start..end-1
-      cg.local.get(kStart);
-      cg.local.set(kJ);
-
-      cg.loop(cg.void);
-      {
-        cg.block(cg.void);
-        cg.local.get(kJ);
-        cg.local.get(kEnd);
-        cg.i32.ge_u();
-        cg.br_if(0); // break if j >= end
-
-        // Execute each kernel step for this element position
-        for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
-          const step = steps[stepIdx];
-          if (!(step.source instanceof Kernel)) {
-            throw new Error(
-              "assoc_scan parallel kernel: only Kernel steps supported",
-            );
-          }
-          const kernel = step.source;
-          const internalIdx = step.outputInternalIdx;
-          const bw = byteWidth(kernel.outputs[0].dtype);
-          const numInputs = numConsts + 2 * numLeaves;
-
-          emitKernelBody({
-            cg,
-            funcs,
-            kernel,
-            gidx: kGidx,
-            emitOutputAddr: () => {
-              cg.local.get(kInternalsBase + internalIdx);
-              // Per-j offset for thread safety: j * internalSizes[intIdx]
-              cg.local.get(kJ);
-              cg.i32.const(internalSizes[internalIdx]);
-              cg.i32.mul();
-              cg.i32.add();
-              cg.local.get(kGidx);
-              cg.i32.const(bw);
-              cg.i32.mul();
-              cg.i32.add();
-            },
-            emitExp: (exp, extra) => {
-              translateExpCore(cg, funcs, exp, {
-                getVariable: (name) => {
-                  if (name === "gidx") return kGidx;
-                  if (name === "ridx" && extra.ridx !== undefined)
-                    return extra.ridx;
-                  if (name === "acc" && extra.acc !== undefined)
-                    return extra.acc;
-                  return undefined;
-                },
-                handleGlobalIndex: (cg, gen, gid, _len, indexExp, dtype) => {
-                  const elemBw = byteWidth(dtype);
-
-                  if (gid < numConsts) {
-                    // Constant
-                    cg.local.get(kConstsBase + gid);
-                  } else if (gid < numConsts + numLeaves) {
-                    // a-leaf: ping[leafOffset * N + j * leafElemSize]
-                    const leafIdx = gid - numConsts;
-                    cg.local.get(kPing);
-                    cg.i32.const(leafElemOffsets[leafIdx]);
-                    cg.local.get(kN);
-                    cg.i32.mul();
-                    cg.i32.add();
-                    cg.local.get(kJ);
-                    cg.i32.const(leafElemSizes[leafIdx]);
-                    cg.i32.mul();
-                    cg.i32.add();
-                  } else if (gid < numInputs) {
-                    // b-leaf: ping[leafOffset * N + (j + stride) * leafElemSize]
-                    const leafIdx = gid - numConsts - numLeaves;
-                    cg.local.get(kPing);
-                    cg.i32.const(leafElemOffsets[leafIdx]);
-                    cg.local.get(kN);
-                    cg.i32.mul();
-                    cg.i32.add();
-                    cg.local.get(kJ);
-                    cg.local.get(kStride);
-                    cg.i32.add();
-                    cg.i32.const(leafElemSizes[leafIdx]);
-                    cg.i32.mul();
-                    cg.i32.add();
-                  } else {
-                    // Internal buffer (per-j offset for thread safety)
-                    const intIdx = gid - numInputs;
-                    cg.local.get(kInternalsBase + intIdx);
-                    cg.local.get(kJ);
-                    cg.i32.const(internalSizes[intIdx]);
-                    cg.i32.mul();
-                    cg.i32.add();
-                  }
-
-                  // Add element-level index offset
-                  gen(indexExp);
-                  cg.i32.const(elemBw);
-                  cg.i32.mul();
-                  cg.i32.add();
-
-                  // Load
-                  dty(cg, AluOp.GlobalIndex, dtype).load(Math.log2(elemBw));
-                },
-              });
-            },
-          });
-        }
-
-        // Copy kernel outputs to pong at position (j + stride)
-        for (let k = 0; k < numLeaves; k++) {
-          const size = leafElemSizes[k];
-          // dst = pong + leafElemOffsets[k] * N + (j + stride) * size
-          cg.local.get(kPong);
-          cg.i32.const(leafElemOffsets[k]);
-          cg.local.get(kN);
-          cg.i32.mul();
-          cg.i32.add();
-          cg.local.get(kJ);
-          cg.local.get(kStride);
-          cg.i32.add();
-          cg.i32.const(size);
-          cg.i32.mul();
-          cg.i32.add();
-          // src = internal[leafToInternalIdx[k]] + j * internalSizes[intIdx]
-          cg.local.get(kInternalsBase + params.leafToInternalIdx![k]);
-          cg.local.get(kJ);
-          cg.i32.const(internalSizes[params.leafToInternalIdx![k]]);
-          cg.i32.mul();
-          cg.i32.add();
-          cg.i32.const(size);
-          cg.memory.copy();
-        }
-
-        // j++
-        cg.local.get(kJ);
-        cg.i32.const(1);
-        cg.i32.add();
-        cg.local.set(kJ);
-        cg.br(1);
-        cg.end();
-      }
-      cg.end();
-    },
-  );
-
-  cg.export(kernelFunc, "kernel");
-
+  cg.export(mainFunc, "blocked_assoc_scan");
   return cg.finish();
 }
 

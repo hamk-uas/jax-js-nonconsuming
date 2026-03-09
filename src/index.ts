@@ -11,6 +11,7 @@ import type {
   PullbackArtifact,
   ResidualPack,
 } from "./frontend/artifacts";
+import { _fusedCacheCompileCount } from "./frontend/block-map-executor";
 import {
   type CacheSizes,
   checkLeaks,
@@ -19,7 +20,7 @@ import {
   type LeakReport,
   type SnapshotEntry,
 } from "./frontend/check-leaks";
-import { scatterAdd } from "./frontend/core";
+import { reverse, scatterAdd } from "./frontend/core";
 import * as jaxprModule from "./frontend/jaxpr";
 import {
   _setDebugAnonymousConsts,
@@ -66,6 +67,7 @@ export {
   devices,
   DType,
   type EffectVerificationResult,
+  _fusedCacheCompileCount,
   getBackend,
   getCacheSizes,
   hasSymbolicDims,
@@ -86,6 +88,7 @@ export {
   type PullbackArtifact,
   random,
   type ResidualPack,
+  reverse,
   scatterAdd,
   _setVerifyEffects,
   _setDebugAnonymousConsts,

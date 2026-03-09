@@ -3,7 +3,10 @@
 
   import { getWebgpuDevice, importTfjs, runBenchmark } from "$lib/benchmark";
 
-  import { createJaxJsMatmulStrategy } from "./jaxStrategy";
+  import {
+    createJaxJsMatmulStrategy,
+    createJaxJsTiledMatmulStrategy,
+  } from "./jaxStrategy";
 
   const n = 4096;
 
@@ -857,6 +860,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     new TfjsStrategy(true),
     createJaxJsMatmulStrategy(n, randomBuffer, printBufferItems),
     createJaxJsMatmulStrategy(n, randomBuffer, printBufferItems, true),
+    createJaxJsTiledMatmulStrategy(n, randomBuffer, printBufferItems),
+    createJaxJsTiledMatmulStrategy(n, randomBuffer, printBufferItems, true),
   ];
 
   const strategies = Object.fromEntries(strategiesList.map((s) => [s.name, s]));
@@ -891,6 +896,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     <li>"onnx" runs a <code>MatMul</code> node in onnxruntime-web</li>
     <li>"tfjs" runs <code>tf.matMul()</code></li>
     <li>"jax-js-nonconsuming" runs <code>jax.numpy.dot()</code></li>
+    <li>
+      "jax-js-tiled" runs <code>jit(lax.tiledMatmul())</code> — shared-memory tiled
+      kernel via blockMap
+    </li>
   </ul>
 
   <div class="flex flex-wrap gap-2 mb-4">

@@ -15,6 +15,7 @@ import {
   unflatten as treeUnflatten,
 } from "../tree";
 import {
+  DEBUG,
   deepEqual,
   FpHash,
   FpHashable,
@@ -386,6 +387,16 @@ export class JaxprEqn {
   }
 }
 
+/**
+ * JSON.stringify replacer that substitutes Jaxpr objects with their stable hash.
+ * This ensures that `JSON.stringify(eqn.params, _jaxprHashReplacer)` produces
+ * deterministic output across different tracings of the same function.
+ */
+function _jaxprHashReplacer(_key: string, value: unknown): unknown {
+  if (value instanceof Jaxpr) return `jaxpr#${value.getHash()}`;
+  return value;
+}
+
 /** Typed intermediate representation for traced computations. */
 export class Jaxpr implements FpHashable {
   #hash?: bigint;
@@ -458,7 +469,7 @@ export class Jaxpr implements FpHashable {
       hasher.update(eqn.inputs.length);
       for (const x of eqn.inputs)
         hasher.update(x instanceof Var ? vi(x) : x.value);
-      hasher.update(JSON.stringify(eqn.params));
+      hasher.update(JSON.stringify(eqn.params, _jaxprHashReplacer));
       hasher.update(eqn.outBinders.length);
       for (const x of eqn.outBinders) hasher.update(vi(x));
       // Include effect annotations in hash when present
@@ -1241,7 +1252,7 @@ function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
       try {
         data = ar.dataSync();
       } catch {
-        // Sync readback not available (e.g., Deno WebGPU without OffscreenCanvas)
+        // Sync readback not available (e.g., WebGPU without OffscreenCanvas)
         // — keep as const instead of inlining as Lit
         constBinders.push(jaxpr.inBinders[i]);
         newConsts.push(consts[i]);
@@ -1481,6 +1492,9 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
   [Primitive.Flip]([x], _) {
     return [ShapedArray.fromAval(x)];
   },
+  [Primitive.Reverse]([x], _) {
+    return [ShapedArray.fromAval(x)];
+  },
   [Primitive.Shrink]([x], { slice }) {
     const newShape: Dim[] = slice.map((s) => s[1] - s[0]);
     return [new ShapedArray(newShape, x.dtype, x.weakType)];
@@ -1661,6 +1675,173 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
 
     // Output shapes = input elem shapes (prefix scan preserves shape)
     return args.slice(numConsts);
+  },
+
+  [Primitive.BlockIndex]() {
+    return [new ShapedArray([], DType.Int32, false)];
+  },
+
+  [Primitive.BlockMap](
+    args,
+    {
+      jaxpr: bodyJaxpr,
+      blockShape,
+      inAxes,
+      outAxes,
+      numConsts,
+      numInputs,
+      gridShape: explicitGridShape,
+    },
+  ) {
+    // Args layout: [...consts, ...inputs]
+    // bodyJaxpr operates on block-shaped slices; outputs are block-shaped.
+    // Full output shapes: restore the original array dimensions along outAxes.
+    const { outTypes } = typecheckJaxpr(bodyJaxpr);
+
+    if (bodyJaxpr.inBinders.length !== numConsts + numInputs) {
+      throw new TypeError(
+        `BlockMap body jaxpr expects ${bodyJaxpr.inBinders.length} inputs, got ${numConsts + numInputs}`,
+      );
+    }
+
+    // Compute grid shape from inputs + inAxes, or use explicit gridShape
+    const inputs = args.slice(numConsts);
+    const gridShape: number[] = explicitGridShape
+      ? [...explicitGridShape]
+      : new globalThis.Array(blockShape.length).fill(0);
+    if (!explicitGridShape) {
+      for (let i = 0; i < inputs.length; i++) {
+        const axes = inAxes[i];
+        for (let g = 0; g < blockShape.length; g++) {
+          if (axes[g] !== null) {
+            const dim = inputs[i].shape[axes[g]!] as number;
+            gridShape[g] = Math.ceil(dim / blockShape[g]);
+          }
+        }
+      }
+    }
+
+    // Output shapes: body output shapes with mapped dims set to original
+    // input dimensions (not padded). The last block may be partial — the
+    // executor handles this by only copying the valid portion.
+    // Build a map from grid axis → original input dimension.
+    const origDims: number[] = new globalThis.Array(blockShape.length).fill(0);
+    for (let i = 0; i < inputs.length; i++) {
+      const axes = inAxes[i];
+      for (let g = 0; g < blockShape.length; g++) {
+        if (axes[g] !== null) {
+          origDims[g] = inputs[i].shape[axes[g]!] as number;
+        }
+      }
+    }
+    // When explicit gridShape is provided and no mapped input contributes
+    // the original dimension, use gridShape[g] * blockShape[g].
+    if (explicitGridShape) {
+      for (let g = 0; g < blockShape.length; g++) {
+        if (origDims[g] === 0) {
+          origDims[g] = explicitGridShape[g] * blockShape[g];
+        }
+      }
+    }
+
+    return outTypes.map((bodyOutAval, oi) => {
+      const axes = outAxes[oi];
+      const fullShape = [...bodyOutAval.shape];
+      for (let g = 0; g < blockShape.length; g++) {
+        if (axes[g] !== null) {
+          fullShape[axes[g]!] = origDims[g];
+        }
+      }
+      return new ShapedArray(
+        fullShape,
+        bodyOutAval.dtype,
+        bodyOutAval.weakType,
+      );
+    });
+  },
+
+  [Primitive.ForiLoop](
+    args,
+    { jaxpr, numConsts, lower: _lower, upper: _upper },
+  ) {
+    const { outTypes } = typecheckJaxpr(jaxpr);
+    // Body signature: (i: int32, carry...) => carry...
+    const numCarry = args.length - numConsts;
+    if (jaxpr.inBinders.length !== numConsts + 1 + numCarry) {
+      throw new TypeError(
+        `ForiLoop body expects ${jaxpr.inBinders.length} inputs, got ${numConsts + 1 + numCarry}`,
+      );
+    }
+    if (outTypes.length !== numCarry) {
+      throw new TypeError(
+        `ForiLoop body returns ${outTypes.length} outputs, expected ${numCarry} carry outputs`,
+      );
+    }
+    // Output is the final carry
+    return args.slice(numConsts);
+  },
+
+  [Primitive.WorkgroupAssociativeScan](args, { jaxpr, numConsts }) {
+    // Args: [...consts, elem]
+    // Body jaxpr: (consts..., a_scalar, b_scalar) => result_scalar
+    // Output: same shape as elem (prefix scan preserves shape)
+    const { outTypes } = typecheckJaxpr(jaxpr);
+    const numElems = args.length - numConsts;
+    if (jaxpr.inBinders.length !== numConsts + numElems * 2) {
+      throw new TypeError(
+        `WorkgroupAssociativeScan body expects ${jaxpr.inBinders.length} inputs, got ${numConsts + numElems * 2}`,
+      );
+    }
+    if (outTypes.length !== numElems) {
+      throw new TypeError(
+        `WorkgroupAssociativeScan body returns ${outTypes.length} outputs, expected ${numElems}`,
+      );
+    }
+    return args.slice(numConsts);
+  },
+
+  [Primitive.DynamicSlice](args, { sliceSizes }) {
+    const operand = args[0];
+    const numIndices = args.length - 1;
+    if (numIndices !== operand.shape.length) {
+      throw new TypeError(
+        `DynamicSlice expected ${operand.shape.length} start indices, got ${numIndices}`,
+      );
+    }
+    for (let i = 1; i < args.length; i++) {
+      if (args[i].shape.length !== 0) {
+        throw new TypeError(
+          `DynamicSlice start indices must be scalars, got shape ${args[i].shape}`,
+        );
+      }
+    }
+    return [new ShapedArray(sliceSizes, operand.dtype, operand.weakType)];
+  },
+  [Primitive.UncheckedDynamicSlice](args, { sliceSizes }) {
+    const operand = args[0];
+    const numIndices = args.length - 1;
+    if (numIndices !== operand.shape.length) {
+      throw new TypeError(
+        `UncheckedDynamicSlice expected ${operand.shape.length} start indices, got ${numIndices}`,
+      );
+    }
+    for (let i = 1; i < args.length; i++) {
+      if (args[i].shape.length !== 0) {
+        throw new TypeError(
+          `UncheckedDynamicSlice start indices must be scalars, got shape ${args[i].shape}`,
+        );
+      }
+    }
+    if (DEBUG >= 2) {
+      for (let k = 0; k < operand.shape.length; k++) {
+        if ((sliceSizes[k] as number) > (operand.shape[k] as number)) {
+          throw new Error(
+            `UncheckedDynamicSlice: slice[${k}]=${sliceSizes[k]} > shape[${k}]=${operand.shape[k]}`,
+          );
+        }
+      }
+    }
+    return [new ShapedArray(sliceSizes, operand.dtype, operand.weakType)];
   },
 };
 

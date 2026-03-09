@@ -20,12 +20,22 @@ export type Device = "cpu" | "wasm" | "webgpu" | "webgl";
 export interface BackendCapabilities {
   /** WebGPU: true if shader-f32-atomic-add extension is available. */
   readonly atomicF32Add: boolean;
+  /** WebGPU: true if shader-f16 extension is available. */
+  readonly shaderF16: boolean;
+  /** WebGPU: true if subgroups extension is available. */
+  readonly subgroups?: boolean;
   /** Wasm: true if crossOriginIsolated (SharedArrayBuffer available). */
   readonly sharedMemory: boolean;
   /** Whether the backend supports multi-output kernel dispatch. */
   readonly multiOutputKernel: boolean;
   /** WebGPU: maximum workgroup size along X (from device.limits). */
   readonly maxComputeWorkgroupSizeX?: number;
+  /** WebGPU: max threads per workgroup (from device.limits). */
+  readonly maxComputeInvocationsPerWorkgroup?: number;
+  /** WebGPU: max shared memory bytes per workgroup (from device.limits). */
+  readonly maxComputeWorkgroupStorageSize?: number;
+  /** WebGPU: adapter architecture string (e.g. "gen-9", "xe-lpg"). */
+  readonly adapterArchitecture?: string;
 }
 export const devices: Device[] = ["cpu", "wasm", "webgpu", "webgl"];
 
@@ -111,6 +121,7 @@ async function createBackend(device: Device): Promise<Backend | null> {
     const requestedFeatures: GPUFeatureName[] = [
       "shader-f16", // "enable f16;" feature support for f16 data type
       "timestamp-query", // Performance timing queries.
+      "subgroups" as GPUFeatureName, // SIMD-width operations (shuffle, reduce within wave).
     ];
 
     try {
@@ -280,6 +291,19 @@ export interface Backend {
     axis: number,
     targetShape: number[],
     updatesLen: number,
+    dtype: DType,
+  ): void;
+
+  /**
+   * Optional: reverse a buffer along a single axis.
+   * Copies `axisSize` contiguous slices of `innerBytes` in reverse order
+   * from `input` to `output`.
+   */
+  reverseBuffer?(
+    input: Slot,
+    output: Slot,
+    axisSize: number,
+    innerBytes: number,
     dtype: DType,
   ): void;
 }

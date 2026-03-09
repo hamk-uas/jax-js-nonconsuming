@@ -1,3 +1,4 @@
+import { DType } from "../alu";
 import { AluOp, isFloatDtype } from "../alu";
 import { Pair } from "../shape";
 import {
@@ -61,6 +62,7 @@ import {
   reciprocal,
   reduce,
   scatterAdd,
+  ShapedArray,
   sin,
   sqrt,
   Trace,
@@ -371,6 +373,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Dot]: bilinearTangentsJvp(Primitive.Dot),
   [Primitive.Conv]: bilinearTangentsJvp(Primitive.Conv),
   [Primitive.Compare]: zeroTangentsJvp(Primitive.Compare),
+  [Primitive.BlockIndex]: zeroTangentsJvp(Primitive.BlockIndex),
   [Primitive.Where]([cond, x, y], [_dcond, dx, dy]) {
     return [[where(cond, x, y)], [where(cond, dx, dy)]];
   },
@@ -402,6 +405,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Broadcast]: linearTangentsJvp(Primitive.Broadcast),
   [Primitive.Reshape]: linearTangentsJvp(Primitive.Reshape),
   [Primitive.Flip]: linearTangentsJvp(Primitive.Flip),
+  [Primitive.Reverse]: linearTangentsJvp(Primitive.Reverse),
   [Primitive.Shrink]: linearTangentsJvp(Primitive.Shrink),
   [Primitive.Pad]: linearTangentsJvp(Primitive.Pad),
   [Primitive.Sort]([x], [dx]) {
@@ -879,6 +883,254 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
 
     return [primalsOut, tangentsOut];
   },
+  [Primitive.BlockMap](primals, tangents, params) {
+    const { jaxpr, numConsts, blockShape, inAxes, outAxes, numInputs } = params;
+    const jvpBody = jvpJaxpr(jaxpr);
+
+    const constsP = primals.slice(0, numConsts);
+    const constsT = tangents.slice(0, numConsts);
+    const inputsP = primals.slice(numConsts);
+    const inputsT = tangents.slice(numConsts);
+
+    const doubleAxes = (axes: (number | null)[][]) => [...axes, ...axes];
+    const jvpInAxes = doubleAxes(inAxes);
+    const jvpOutAxes = doubleAxes(outAxes);
+
+    // jvpBody expects [jvpConsts, allPrimals, allTangents] where
+    // allPrimals = [constsP, inputsP] and allTangents = [constsT, inputsT].
+    // BlockMap groups as [consts (not tiled), inputs (tiled)], so we must
+    // wrap the jvpBody to remap [constsP, constsT, inputsP, inputsT] →
+    // [constsP, inputsP, constsT, inputsT] before calling jvpBody.
+    const nJvp = jvpBody.consts.length;
+    const nC = numConsts;
+    const nI = numInputs;
+    const wrapperInAvals = [
+      ...jvpBody.jaxpr.inBinders.slice(0, nJvp).map((v) => v.aval),
+      ...constsP.map((_, i) => jaxpr.inBinders[i].aval),
+      ...constsT.map((_, i) => jaxpr.inBinders[i].aval),
+      ...inputsP.map((_, i) => jaxpr.inBinders[numConsts + i].aval),
+      ...inputsT.map((_, i) => jaxpr.inBinders[numConsts + i].aval),
+    ];
+    const { jaxpr: wrappedBody } = makeJaxpr(
+      (...args: Tracer[]): Tracer[] => {
+        // args order: [jvpConsts, constsP, constsT, inputsP, inputsT]
+        const jc = args.slice(0, nJvp);
+        const cP = args.slice(nJvp, nJvp + nC);
+        const cT = args.slice(nJvp + nC, nJvp + nC * 2);
+        const iP = args.slice(nJvp + nC * 2, nJvp + nC * 2 + nI);
+        const iT = args.slice(nJvp + nC * 2 + nI);
+        // jvpBody expects: [jvpConsts, constsP, inputsP, constsT, inputsT]
+        return evalJaxpr(jvpBody.jaxpr, [...jc, ...cP, ...iP, ...cT, ...iT]);
+      },
+      { validateRefs: false },
+    )(...wrapperInAvals);
+
+    const doubledConsts = [...wrappedBody.consts, ...constsP, ...constsT];
+
+    const doubledOut = bind(
+      Primitive.BlockMap,
+      [...doubledConsts, ...inputsP, ...inputsT],
+      {
+        jaxpr: wrappedBody.jaxpr,
+        numConsts: doubledConsts.length,
+        numInputs: numInputs * 2,
+        blockShape,
+        inAxes: jvpInAxes,
+        outAxes: jvpOutAxes,
+        threadTile: params.threadTile,
+        isJvpTransformed: true,
+      },
+    );
+
+    // wrappedBody.jaxpr is stored in the BlockMap params and may be used as
+    // a transposeJaxprCache key by the transpose rule. Do NOT dispose — let
+    // the cache cleanup handle it when the Jaxpr becomes unreachable.
+
+    const numOutP = doubledOut.length / 2;
+    return [doubledOut.slice(0, numOutP), doubledOut.slice(numOutP)];
+  },
+  [Primitive.WorkgroupAssociativeScan](
+    primals,
+    tangents,
+    { jaxpr, numConsts },
+  ) {
+    // JVP of WorkgroupAssociativeScan: double the body like AssociativeScan.
+    // Original body: (consts, a, b) -> result
+    // JVP body expects: [constsP, aP, bP, constsT, aT, bT] -> [resultP, resultT]
+    // Doubled scan feeds: [constsP, constsT, aP, aT, bP, bT]
+    // Wrapper reorders scan order -> jvp order.
+
+    const numElems = primals.length - numConsts;
+    const jvpBody = jvpJaxpr(jaxpr);
+    const numJvpConsts = jvpBody.consts.length;
+    const numBodyInputs = numConsts + numElems * 2; // consts + a + b
+
+    const jvpOrderAvals = jvpBody.jaxpr.inBinders
+      .slice(numJvpConsts)
+      .map((v) => v.aval);
+
+    const constsP_avals = jvpOrderAvals.slice(0, numConsts);
+    const aP_avals = jvpOrderAvals.slice(numConsts, numConsts + numElems);
+    const bP_avals = jvpOrderAvals.slice(numConsts + numElems, numBodyInputs);
+    const constsT_avals = jvpOrderAvals.slice(
+      numBodyInputs,
+      numBodyInputs + numConsts,
+    );
+    const aT_avals = jvpOrderAvals.slice(
+      numBodyInputs + numConsts,
+      numBodyInputs + numConsts + numElems,
+    );
+    const bT_avals = jvpOrderAvals.slice(numBodyInputs + numConsts + numElems);
+
+    const wrapperInAvals = [
+      ...constsP_avals,
+      ...constsT_avals,
+      ...aP_avals,
+      ...aT_avals,
+      ...bP_avals,
+      ...bT_avals,
+    ];
+
+    const { jaxpr: wrapperJaxpr } = makeJaxpr(
+      (...scanOrderArgs: Tracer[]): Tracer[] => {
+        // scanOrderArgs: [constsP, constsT, aP, aT, bP, bT]
+        const cP = scanOrderArgs.slice(0, numConsts);
+        const cT = scanOrderArgs.slice(numConsts, numConsts * 2);
+        const aP = scanOrderArgs.slice(numConsts * 2, numConsts * 2 + numElems);
+        const aT = scanOrderArgs.slice(
+          numConsts * 2 + numElems,
+          numConsts * 2 + numElems * 2,
+        );
+        const bP = scanOrderArgs.slice(
+          numConsts * 2 + numElems * 2,
+          numConsts * 2 + numElems * 2 + numElems,
+        );
+        const bT = scanOrderArgs.slice(numConsts * 2 + numElems * 2 + numElems);
+
+        const jvpOrderArgs = [...cP, ...aP, ...bP, ...cT, ...aT, ...bT];
+        return evalJaxpr(jvpBody.jaxpr, [...jvpBody.consts, ...jvpOrderArgs]);
+      },
+    )(...wrapperInAvals);
+
+    const constsP = primals.slice(0, numConsts);
+    const elemsP = primals.slice(numConsts);
+    const constsT = tangents.slice(0, numConsts);
+    const elemsT = tangents.slice(numConsts);
+
+    const results = bind(
+      Primitive.WorkgroupAssociativeScan,
+      [...wrapperJaxpr.consts, ...constsP, ...constsT, ...elemsP, ...elemsT],
+      {
+        jaxpr: wrapperJaxpr.jaxpr,
+        numConsts: wrapperJaxpr.consts.length + numConsts * 2,
+      },
+    );
+
+    wrapperJaxpr.dispose();
+
+    const primalsOut = results.slice(0, numElems);
+    const tangentsOut = results.slice(numElems);
+    return [primalsOut, tangentsOut];
+  },
+  [Primitive.DynamicSlice](primals, tangents, { sliceSizes }) {
+    const operandT = tangents[0];
+    const startsP = primals.slice(1);
+    const outP = bind1(Primitive.DynamicSlice, primals, { sliceSizes });
+    const outT = bind1(Primitive.DynamicSlice, [operandT, ...startsP], {
+      sliceSizes,
+    });
+    return [[outP], [outT]];
+  },
+  [Primitive.UncheckedDynamicSlice](primals, tangents, { sliceSizes }) {
+    const operandT = tangents[0];
+    const startsP = primals.slice(1);
+    const outP = bind1(Primitive.UncheckedDynamicSlice, primals, {
+      sliceSizes,
+    });
+    const outT = bind1(
+      Primitive.UncheckedDynamicSlice,
+      [operandT, ...startsP],
+      {
+        sliceSizes,
+      },
+    );
+    return [[outP], [outT]];
+  },
+  [Primitive.ForiLoop](primals, tangents, { jaxpr, numConsts, lower, upper }) {
+    const numCarry = primals.length - numConsts;
+    const jvpBody = jvpJaxpr(jaxpr);
+
+    // Original jaxpr expects [consts, i, carry]
+    const dummyI = new ShapedArray([], DType.Int32, false);
+
+    const { jaxpr: wrapperClosedJaxpr } = makeJaxpr((...args: Tracer[]) => {
+      // args: [constsP, constsT, i, carryP, carryT]
+      const constsP = args.slice(0, numConsts);
+      const constsT = args.slice(numConsts, numConsts * 2);
+      const i = args[numConsts * 2];
+      const carryP = args.slice(
+        numConsts * 2 + 1,
+        numConsts * 2 + 1 + numCarry,
+      );
+      const carryT = args.slice(numConsts * 2 + 1 + numCarry);
+
+      // jvpBody expects: [...jvpConsts, constsP, iP, carryP, constsT, iT, carryT]
+      const jvpConsts = jvpBody.consts;
+      const iP = i;
+      const iT = zerosLike(i);
+
+      const callArgs = [
+        ...jvpConsts,
+        ...constsP,
+        iP,
+        ...carryP,
+        ...constsT,
+        iT,
+        ...carryT,
+      ];
+      const result = evalJaxpr(jvpBody.jaxpr, callArgs);
+
+      // iT is the zero tangent for the loop counter — always dead in the
+      // JVP'd body (loop counters don't participate in differentiation).
+      // makeJaxpr resets _peArrayCreationTracker to null, so iT is not
+      // tracked by the PE collector. If the JaxprBuilder never captures it
+      // (dead input), the anonymous const lifecycle won't dispose it.
+      // Remove from anonymous set and dispose explicitly to prevent leak.
+      if (iT instanceof Array) {
+        anonymousConstArrays.delete(iT);
+        iT.dispose();
+      }
+
+      return result;
+    })(
+      ...primals.slice(0, numConsts),
+      ...tangents.slice(0, numConsts),
+      dummyI,
+      ...primals.slice(numConsts),
+      ...tangents.slice(numConsts),
+    );
+
+    const scanArgs = [
+      ...wrapperClosedJaxpr.consts,
+      ...primals.slice(0, numConsts),
+      ...tangents.slice(0, numConsts),
+      ...primals.slice(numConsts),
+      ...tangents.slice(numConsts),
+    ];
+
+    const results = bind(Primitive.ForiLoop, scanArgs, {
+      jaxpr: wrapperClosedJaxpr.jaxpr,
+      numConsts: wrapperClosedJaxpr.consts.length + numConsts * 2,
+      lower,
+      upper,
+      isJvpTransformed: true,
+    });
+
+    // We created an anonymous jaxpr, its consts are bound as primals to the outer trace/eager. We must dispose the wrapper to balance refcounts.
+    wrapperClosedJaxpr.dispose();
+
+    return [results.slice(0, numCarry), results.slice(numCarry)];
+  },
 };
 
 const jvpJaxprCache = new Map<Jaxpr, ClosedJaxpr>();
@@ -970,15 +1222,17 @@ function jvpFlat(
         a[Symbol.dispose]?.();
       }
     }
-    // Dispose zero tangents created by JVPTrace.lift() for lifted inputs.
-    // These are created when fullRaise lifts a lower-level tracer (e.g.,
-    // a captured constant) into the JVP trace. The zero Array is not
-    // tracked in intermediates and would leak if not disposed here.
-    // Skip zeros that are in the output tangents (identity/passthrough).
+  }
+  // Dispose zero tangents created by JVPTrace.lift() for lifted inputs.
+  // These are freshly created by the JVP trace (not owned by PE or other
+  // abstract traces), so they must be cleaned up unconditionally.
+  // Use .dispose() instead of [Symbol.dispose]() because the latter is
+  // suppressed during PE scope (_peArrayCreationTracker guard).
+  {
     const outputTangents = new Set<Tracer>(result[1]);
     for (const z of jvpData.liftedTangents) {
       if (!outputTangents.has(z) && z.refCount > 0) {
-        z[Symbol.dispose]?.();
+        z.dispose();
       }
     }
   }

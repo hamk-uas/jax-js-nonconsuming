@@ -564,7 +564,7 @@ describe("extracted kernel functions (M6.2a)", () => {
 // Orchestrator tests require both SharedArrayBuffer (crossOriginIsolated) AND
 // main-thread spin-wait support (Atomics.wait must not throw).  Browser main
 // threads forbid Atomics.wait and don't deliver postMessage during spin-loops,
-// so the orchestrator can only work in Deno/Node.js.
+// so the orchestrator can only work in Node.js or dedicated Workers.
 const canSpinWait = (() => {
   try {
     if (!globalThis.crossOriginIsolated) return false;

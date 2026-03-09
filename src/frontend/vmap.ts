@@ -1,5 +1,6 @@
+import { DType } from "../alu";
 import { assertNonNull, checkAxis, range, rep, unzip2, zip } from "../utils";
-import { arange, eye, pureArray } from "./array";
+import { arange, eye, fullInternal, pureArray } from "./array";
 import {
   AbstractValue,
   bind,
@@ -22,6 +23,7 @@ import {
   randomBits,
   reduce,
   reshape,
+  reverse,
   scatterAdd,
   ShapedArray,
   shrink,
@@ -278,6 +280,36 @@ function lastDimsBatcher<P extends Primitive>(
 }
 
 const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
+  [Primitive.BlockMap](axisSize, args, dims, params) {
+    const { jaxpr, numConsts, blockShape, inAxes, outAxes, numInputs } = params;
+
+    const newInAxes = inAxes.map((axes, i) => {
+      const bdim = dims[numConsts + i];
+      return axes.map((axis) =>
+        axis === null ? null : bdim !== null && bdim <= axis ? axis + 1 : axis,
+      );
+    });
+
+    const newOutAxes = outAxes.map((axes) =>
+      axes.map((axis) => (axis === null ? null : axis >= 0 ? axis + 1 : axis)),
+    );
+
+    const outBdims = [];
+    const bdim = dims.find((d) => d !== null) ?? 0;
+    for (let i = 0; i < outAxes.length; i++) outBdims.push(bdim);
+
+    const res = bind(Primitive.BlockMap, args, {
+      jaxpr,
+      numConsts,
+      numInputs,
+      blockShape,
+      inAxes: newInAxes,
+      outAxes: newOutAxes,
+      threadTile: params.threadTile,
+    });
+
+    return [res, outBdims];
+  },
   [Primitive.Add]: broadcastBatcher(Primitive.Add),
   [Primitive.Mul]: broadcastBatcher(Primitive.Mul),
   [Primitive.Idiv]: broadcastBatcher(Primitive.Idiv),
@@ -289,6 +321,10 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.Floor]: unopBatcher(Primitive.Floor),
   [Primitive.Ceil]: unopBatcher(Primitive.Ceil),
   [Primitive.StopGradient]: unopBatcher(Primitive.StopGradient),
+  [Primitive.BlockIndex]() {
+    // BlockIndex is body-local (inside block_map); not batched by vmap.
+    return [[bind1(Primitive.BlockIndex, [], {})], [null]];
+  },
   [Primitive.Cast]: unopBatcher(Primitive.Cast),
   [Primitive.Bitcast]: unopBatcher(Primitive.Bitcast),
   [Primitive.Sin]: unopBatcher(Primitive.Sin),
@@ -476,6 +512,11 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     assertNonNull(xBdim);
     const newAxis = axis.map((ax) => ax + (xBdim <= ax ? 1 : 0));
     return [[flip(x, newAxis)], [xBdim]];
+  },
+  [Primitive.Reverse](axisSize, [x], [xBdim], { axis }) {
+    assertNonNull(xBdim);
+    const newAxis = axis + (xBdim <= axis ? 1 : 0);
+    return [[reverse(x, newAxis)], [xBdim]];
   },
   [Primitive.Shrink](axisSize, [x], [xBdim], { slice }) {
     assertNonNull(xBdim);
@@ -667,10 +708,14 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     ];
 
     // Run the scan
+    // numConsts must include BOTH the vmapJaxpr's own consts AND the original
+    // scan consts (movedConsts). The vmapped body jaxpr still expects the
+    // original consts as its first N inputs — these must remain const (not
+    // evolve as carry) in the scan.
     const results = bind(Primitive.Scan, scanArgs, {
       jaxpr: vmappedBody.jaxpr,
       numCarry,
-      numConsts: vmappedBody.consts.length,
+      numConsts: vmappedBody.consts.length + numConsts,
       length,
       reverse,
     });
@@ -758,6 +803,104 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     // Results have batch at axis 0
     return [results, rep(numLeaves, 0)];
   },
+  [Primitive.DynamicSlice](axisSize, args, dims, { sliceSizes }) {
+    const [xBdim, ...idxBdims] = dims;
+    if (idxBdims.some((d) => d !== null)) {
+      throw new Error(
+        "vmap(dynamicSlice): batched start indices not supported",
+      );
+    }
+    assertNonNull(xBdim);
+    const origX = args[0];
+    const x = moveBatchAxis(axisSize, xBdim, 0, origX);
+    // Zero index for the inserted batch dimension — always in-bounds
+    using zero = fullInternal(new ShapedArray([], DType.Int32, false), 0);
+    const result = bind1(Primitive.DynamicSlice, [x, zero, ...args.slice(1)], {
+      sliceSizes: [axisSize, ...sliceSizes],
+    });
+    if (x !== origX) x[Symbol.dispose]();
+    return [[result], [0]];
+  },
+  [Primitive.UncheckedDynamicSlice](axisSize, args, dims, { sliceSizes }) {
+    const [xBdim, ...idxBdims] = dims;
+    if (idxBdims.some((d) => d !== null)) {
+      throw new Error(
+        "vmap(uncheckedDynamicSlice): batched start indices not supported",
+      );
+    }
+    assertNonNull(xBdim);
+    const origX = args[0];
+    const x = moveBatchAxis(axisSize, xBdim, 0, origX);
+    // Zero index for the batch dimension — in-bounds by construction (0 + B == B)
+    using zero = fullInternal(new ShapedArray([], DType.Int32, false), 0);
+    const result = bind1(
+      Primitive.UncheckedDynamicSlice,
+      [x, zero, ...args.slice(1)],
+      { sliceSizes: [axisSize, ...sliceSizes] },
+    );
+    if (x !== origX) x[Symbol.dispose]();
+    return [[result], [0]];
+  },
+  [Primitive.ForiLoop](
+    axisSize,
+    args,
+    dims,
+    { jaxpr, numConsts, lower, upper, isJvpTransformed },
+  ) {
+    // vmap of fori_loop: batch over independent loops
+    //
+    // ForiLoop args layout: [...consts, ...carry]
+    // Body takes: [i, ...carry] -> [...newCarry]
+    // The loop index `i` is scalar int32, NOT batched.
+    const numCarry = args.length - numConsts;
+
+    const consts = args.slice(0, numConsts);
+    const initCarry = args.slice(numConsts);
+
+    const constDims = dims.slice(0, numConsts);
+    const carryDims = dims.slice(numConsts);
+
+    // Move batch dims to axis 0
+    const movedConsts = consts.map((c, i) =>
+      moveBatchAxis(axisSize, constDims[i], 0, c),
+    );
+    const movedCarry = initCarry.map((c, i) =>
+      moveBatchAxis(axisSize, carryDims[i], 0, c),
+    );
+
+    // Body dims: [0, ..., 0 (consts batched), null (i not batched), 0, ..., 0 (carry batched)]
+    // Body jaxpr inBinders: [const_0, ..., const_k, i, carry_0, ..., carry_n]
+    const bodyDims: (number | null)[] = [
+      ...rep(numConsts, 0),
+      null,
+      ...rep(numCarry, 0),
+    ];
+
+    const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims);
+
+    const foriArgs = [...vmappedBody.consts, ...movedConsts, ...movedCarry];
+
+    const results = bind(Primitive.ForiLoop, foriArgs, {
+      jaxpr: vmappedBody.jaxpr,
+      numConsts: vmappedBody.consts.length + numConsts,
+      lower,
+      upper,
+      ...(isJvpTransformed ? { isJvpTransformed } : {}),
+    });
+
+    // Dispose intermediates from moveBatchAxis
+    for (let i = 0; i < movedConsts.length; i++) {
+      if (movedConsts[i] !== consts[i]) movedConsts[i][Symbol.dispose]();
+    }
+    for (let i = 0; i < movedCarry.length; i++) {
+      if (movedCarry[i] !== initCarry[i]) movedCarry[i][Symbol.dispose]();
+    }
+
+    return [results, rep(numCarry, 0)];
+  },
+  [Primitive.WorkgroupAssociativeScan]() {
+    throw new Error("vmap for WorkgroupAssociativeScan not implemented");
+  },
 };
 
 const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
@@ -775,7 +918,7 @@ _registerCacheSizeGetter("vmapJaxpr", () => {
   return total;
 });
 
-function vmapJaxpr(
+export function vmapJaxpr(
   jaxpr: Jaxpr,
   axisSize: number,
   dims: (number | null)[],

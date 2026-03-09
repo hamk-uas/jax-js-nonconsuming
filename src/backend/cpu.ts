@@ -10,6 +10,7 @@ export class CpuBackend implements Backend {
   readonly maxArgs = Infinity;
   readonly capabilities: BackendCapabilities = {
     atomicF32Add: false,
+    shaderF16: false,
     sharedMemory: false,
     multiOutputKernel: true,
   };

@@ -2,7 +2,7 @@
 // jax-js-lint: allow-ref — .ref is the core ownership mechanism in autodiff internals
 
 import { AluOp, type DType, isFloatDtype } from "../alu";
-import { concreteDim, type Dim } from "../dim";
+import { type Dim, dimSub, hasSymbolicDims } from "../dim";
 import {
   dispose as treeDispose,
   flatten as treeFlatten,
@@ -52,6 +52,8 @@ import {
   fullRaise,
   gather,
   insideAbstractTrace,
+  max,
+  min,
   mul,
   ndim,
   neg,
@@ -61,6 +63,7 @@ import {
   PrimitiveParams,
   reduce,
   reshape,
+  reverse,
   scatterAdd,
   ShapedArray,
   shrink,
@@ -89,12 +92,18 @@ import {
   Var,
 } from "./jaxpr";
 import { jvp, lowerAux } from "./jvp";
-import { ScanBackwardSpec, ScanPullbackArtifact } from "./scan-backward";
 import { jacfwd, moveaxis, vmap } from "./vmap";
 
-/** Internal zeros allocation (marking handled by fullInternal). */
-const zerosInternal = (shape: Dim[] | number[], dtype: DType) =>
-  fullInternal({ shape, dtype, weakType: false }, 0);
+/** Internal zeros allocation (marking handled by fullInternal).
+ * For symbolic shapes during tracing, broadcasts a scalar zero. */
+const zerosInternal = (shape: Dim[] | number[], dtype: DType) => {
+  if (hasSymbolicDims(shape as Dim[])) {
+    const scalar = fullInternal({ shape: [], dtype, weakType: false }, 0);
+    const axis = range(shape.length);
+    return broadcast(scalar, shape as Dim[], axis);
+  }
+  return fullInternal({ shape, dtype, weakType: false }, 0);
+};
 
 /** Array value that can either be known or unknown. */
 class PartialVal {
@@ -655,6 +664,9 @@ class PartialEvalTrace extends Trace {
         params as PrimitiveParams<Primitive.Jit>;
       return this.#partialEvalJaxpr(name, jaxpr, numConsts, tracers);
     }
+    if (primitive === Primitive.ForiLoop) {
+      return this.#partialEvalForiLoop(params as PrimitiveParams<any>, tracers);
+    }
     if (primitive === Primitive.Scan) {
       // Special case for JVP'd scan: primal outputs depend only on primal inputs
       return this.#partialEvalScan(
@@ -665,6 +677,12 @@ class PartialEvalTrace extends Trace {
     if (primitive === Primitive.AssociativeScan) {
       return this.#partialEvalAssociativeScan(
         params as PrimitiveParams<Primitive.AssociativeScan>,
+        tracers,
+      );
+    }
+    if (primitive === Primitive.BlockMap) {
+      return this.#partialEvalBlockMap(
+        params as PrimitiveParams<Primitive.BlockMap>,
         tracers,
       );
     }
@@ -758,6 +776,90 @@ class PartialEvalTrace extends Trace {
    *   from tangent (unknown) outputs
    * - Otherwise, mark all outputs as unknown
    */
+  #partialEvalForiLoop(params: any, tracers: PartialEvalTracer[]): Tracer[] {
+    const isKnown = tracers.map((t) => t.pval.isKnown);
+    const hasUnknown = isKnown.some((k) => !k);
+
+    if (!hasUnknown) {
+      const inputs = tracers.map((t) => t.fullLower());
+      return bind(Primitive.ForiLoop, inputs, params);
+    }
+
+    const { isJvpTransformed, numConsts: _numConsts } = params;
+    if (!isJvpTransformed) {
+      throw new Error(
+        "Backward pass or partial eval of ForiLoop with unknown inputs requires isJvpTransformed flag",
+      );
+    }
+
+    // Evaluate full loop with zeros for tangents
+    const synthesizedZeroInputs: Tracer[] = [];
+    const fullInputs = tracers.map((t) => {
+      if (t.pval.isKnown) {
+        return (t.pval.val as Tracer).ref;
+      } else {
+        const z = zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
+        synthesizedZeroInputs.push(z);
+        return z;
+      }
+    });
+
+    const fullOuts = bind(Primitive.ForiLoop, fullInputs, params);
+
+    const tracersIn = tracers.map((t) => this.instantiateConst(t));
+    const avalsIn = tracersIn.map((t) => t.pval.aval);
+    const avalsOut = abstractEvalRules[Primitive.ForiLoop](avalsIn, params);
+
+    const recipe: JaxprRecipe = {
+      type: "JaxprEqn",
+      prim: Primitive.ForiLoop,
+      tracersIn,
+      params,
+      avalsOut,
+      tracerRefsOut: [],
+    };
+
+    const tracersOut: PartialEvalTracer[] = [];
+    const numCarry = avalsOut.length / 2; // isJvpTransformed means numCarry is doubled
+
+    // Primals out (first half) are known from full execution
+    for (let i = 0; i < numCarry; i++) {
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.known(fullOuts[i]), recipe),
+      );
+    }
+
+    // Tangents out (second half) are unknown
+    for (let i = numCarry; i < 2 * numCarry; i++) {
+      fullOuts[i].dispose(); // Tangents evaluated with zeros are garbage - dispose them
+      tracersIn.forEach((t) => t.ref);
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.unknown(avalsOut[i]), recipe),
+      );
+    }
+
+    recipe.tracerRefsOut = tracersOut.map((t) => new WeakRef(t));
+
+    const retainedKnownOutputs = new Set<Tracer>();
+    for (let i = 0; i < numCarry; i++) {
+      retainedKnownOutputs.add(fullOuts[i]);
+    }
+
+    const synthesizedSet = new Set(synthesizedZeroInputs);
+    for (const inp of fullInputs) {
+      // Dispose the .ref() taken at fullInputs creation. Skip synthesized
+      // zeros (disposed by PE collector) and retained outputs (still alive).
+      // Don't guard on inp.refCount — non-Array tracers (BatchTracer, etc.)
+      // report refCount=0 from the base Tracer class, but their .dispose()
+      // correctly cascades to the inner value.
+      if (!retainedKnownOutputs.has(inp) && !synthesizedSet.has(inp)) {
+        inp.dispose();
+      }
+    }
+
+    return tracersOut;
+  }
+
   #partialEvalScan(
     params: PrimitiveParams<Primitive.Scan>,
     tracers: PartialEvalTracer[],
@@ -1006,6 +1108,129 @@ class PartialEvalTrace extends Trace {
     );
     // Same fix as #partialEvalScan: don't dispose synthesized zeros that
     // may have been captured by an outer JaxprTrace builder.
+    const synthesizedSet = new Set(synthesizedZeroInputs);
+    for (const inp of fullInputs) {
+      if (
+        !retainedKnownOutputs.has(inp) &&
+        !synthesizedSet.has(inp) &&
+        inp.refCount > 0
+      ) {
+        inp.dispose();
+      }
+    }
+
+    recipe.tracerRefsOut = tracersOut.map((t) =>
+      t.pval.isKnown ? (null as any) : new WeakRef(t),
+    );
+
+    return tracersOut;
+  }
+
+  /**
+   * Partial eval for BlockMap primitive.
+   *
+   * Same approach as scan/fori PE: if JVP-doubled, run the full block_map
+   * concretely (zeros for unknowns), mark primal outputs as known and
+   * tangent outputs as unknown for the residual jaxpr.
+   */
+  #partialEvalBlockMap(
+    params: PrimitiveParams<Primitive.BlockMap>,
+    tracers: PartialEvalTracer[],
+  ): Tracer[] {
+    const isKnown = tracers.map((t) => t.pval.isKnown);
+    const hasUnknown = isKnown.some((k) => !k);
+
+    if (!hasUnknown) {
+      const inputs = tracers.map((t) => t.fullLower());
+      const results = bind(Primitive.BlockMap, inputs, params);
+      for (const r of results) this.knownIntermediates.push(r);
+      return results;
+    }
+
+    const isJvp = params.isJvpTransformed ?? false;
+    if (!isJvp) {
+      // Non-JVP BlockMap with some unknown inputs: all outputs unknown.
+      const tracersIn = tracers.map((t) => this.instantiateConst(t));
+      const avalsIn = tracersIn.map((t) => t.pval.aval);
+      const avalsOut = abstractEvalRules[Primitive.BlockMap](avalsIn, params);
+      const recipe: JaxprRecipe = {
+        type: "JaxprEqn",
+        prim: Primitive.BlockMap,
+        tracersIn,
+        params,
+        avalsOut,
+        tracerRefsOut: [],
+      };
+      const tracersOut = avalsOut.map((aval, i) => {
+        if (i > 0) tracersIn.forEach((t) => t.ref);
+        return new PartialEvalTracer(this, PartialVal.unknown(aval), recipe);
+      });
+      recipe.tracerRefsOut = tracersOut.map((t) => new WeakRef(t));
+      return tracersOut;
+    }
+
+    // JVP-doubled BlockMap: outputs = [primalOuts..., tangentOuts...]
+    // Primal outputs are known, tangent outputs are unknown.
+    const numOutputs = abstractEvalRules[Primitive.BlockMap](
+      tracers.map((t) => t.pval.aval),
+      params,
+    ).length;
+    const numPrimalOuts = numOutputs / 2;
+
+    // Run full block_map with zeros substituted for unknown inputs.
+    const synthesizedZeroInputs: Tracer[] = [];
+    const fullInputs = tracers.map((t) => {
+      if (t.pval.isKnown) {
+        return (t.pval.val as Tracer).ref;
+      } else {
+        const z = zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
+        synthesizedZeroInputs.push(z);
+        return z;
+      }
+    });
+
+    const fullOuts = bind(Primitive.BlockMap, fullInputs, params);
+
+    // Build residual jaxpr recipe for tangent computation.
+    const tracersIn = tracers.map((t) => this.instantiateConst(t));
+    const avalsOut = abstractEvalRules[Primitive.BlockMap](
+      tracersIn.map((t) => t.pval.aval),
+      params,
+    );
+
+    const recipe: JaxprRecipe = {
+      type: "JaxprEqn",
+      prim: Primitive.BlockMap,
+      tracersIn,
+      params,
+      avalsOut,
+      tracerRefsOut: [],
+    };
+
+    const tracersOut: PartialEvalTracer[] = [];
+
+    // Primal outputs are known from the concrete execution.
+    for (let i = 0; i < numPrimalOuts; i++) {
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.known(fullOuts[i]), null),
+      );
+    }
+
+    // Tangent outputs are unknown — part of the residual jaxpr.
+    let isFirstUnknown = true;
+    for (let i = numPrimalOuts; i < numOutputs; i++) {
+      fullOuts[i].dispose();
+      if (!isFirstUnknown) tracersIn.forEach((t) => t.ref);
+      isFirstUnknown = false;
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.unknown(avalsOut[i]), recipe),
+      );
+    }
+
+    // Clean up: dispose .ref'd inputs that aren't retained as known outputs.
+    const retainedKnownOutputs = new Set<Tracer>(
+      fullOuts.slice(0, numPrimalOuts),
+    );
     const synthesizedSet = new Set(synthesizedZeroInputs);
     for (const inp of fullInputs) {
       if (
@@ -1540,7 +1765,7 @@ function unbroadcast(x: Tracer, target: UndefPrimal): Tracer {
   let result = x.sum(reductionDims);
   if (!deepEqual(result.shape, shape)) {
     const sumResult = result;
-    result = broadcast(sumResult, shape as number[], unsqueeze); // keep dims selectively
+    result = broadcast(sumResult, shape, unsqueeze); // keep dims selectively
     sumResult.dispose();
   }
   return result;
@@ -1565,6 +1790,71 @@ type TransposeRule<P extends Primitive> = (
 // This computes a backward pass, so it pulls back cotangents to the inputs of p
 // that are UndefPrimal (i.e., tangents that weren't sent forward).
 const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
+  [Primitive.BlockMap](cts, args, params) {
+    const {
+      jaxpr,
+      numConsts,
+      blockShape,
+      inAxes,
+      outAxes,
+      numInputs: _numInputs,
+    } = params;
+    const undefMask = args.map((x) => x instanceof UndefPrimal);
+    const bodyUndefPrimals = jaxpr.inBinders.map((_, i) => undefMask[i]);
+    const transposedBody = transposeJaxpr(jaxpr, bodyUndefPrimals);
+
+    const constResiduals = args
+      .slice(0, numConsts)
+      .filter((_, i) => !undefMask[i]) as Tracer[];
+    const argResiduals = args
+      .slice(numConsts)
+      .filter((_, i) => !undefMask[numConsts + i]) as Tracer[];
+
+    const residualAxes = inAxes.filter((_, i) => !undefMask[numConsts + i]);
+    const transposeInAxes = [...residualAxes, ...outAxes];
+
+    const nullOutAxis = Array(blockShape.length).fill(null);
+    const constOutAxes = args
+      .slice(0, numConsts)
+      .filter((_, i) => undefMask[i])
+      .map(() => nullOutAxis);
+
+    const argOutAxes = inAxes.filter((_, i) => undefMask[numConsts + i]);
+    const transposeOutAxes = [...constOutAxes, ...argOutAxes];
+
+    const jaxprConsts = transposedBody.consts;
+    const allConsts = [...jaxprConsts, ...constResiduals];
+
+    const transposedOut = bind(
+      Primitive.BlockMap,
+      [...allConsts, ...argResiduals, ...(cts as Tracer[])],
+      {
+        jaxpr: transposedBody.jaxpr,
+        blockShape,
+        inAxes: transposeInAxes,
+        outAxes: transposeOutAxes,
+        numConsts: allConsts.length,
+        numInputs: argResiduals.length + cts.length,
+        threadTile: params.threadTile,
+      },
+    );
+
+    transposedBody.dispose();
+
+    const numUndefConsts = constOutAxes.length;
+    const constCts = transposedOut.slice(0, numUndefConsts);
+    const argCts = transposedOut.slice(numUndefConsts);
+
+    const outVals = [];
+    let constIdx = 0,
+      argIdx = 0;
+    for (let i = 0; i < args.length; i++) {
+      if (!undefMask[i]) outVals.push(null);
+      else if (i < numConsts) outVals.push(constCts[constIdx++]);
+      else outVals.push(argCts[argIdx++]);
+    }
+    return outVals;
+  },
   [Primitive.Mul]([ct], [x, y]) {
     // TODO: For transpose rules on operations that have type promotion rules,
     // make sure the gradient is cast back to the correct dtype.
@@ -1814,6 +2104,11 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Flip);
     return [flip(ct, axis)];
   },
+  [Primitive.Reverse]([ct], [x], { axis }) {
+    if (!(x instanceof UndefPrimal))
+      throw new NonlinearError(Primitive.Reverse);
+    return [reverse(ct, axis)];
+  },
   [Primitive.Shrink]([ct], [x], { slice }) {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Shrink);
     const width = slice.map(
@@ -1916,15 +2211,15 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       numConsts,
       length: lengthDim,
       reverse,
-      checkpoint,
+      checkpoint: _checkpoint,
       isJvpTransformed,
     },
   ) {
     // Scan transpose rule for backward pass through scan.
     //
-    // Delegates to ScanPullbackArtifact after building the backward spec
-    // (forward jaxpr, tangent body, transposed body, dimension info).
-    const length = concreteDim(lengthDim, "scan transpose rule");
+    // Emits two in-graph Primitive.Scan calls (forward + backward) rather
+    // than imperative JS loop unrolling, so the backend compiler handles
+    // iteration.  This supports dynamic/symbolic scan lengths.
 
     const numX = args.length - numConsts - numCarry;
     const numY = cts.length - numCarry;
@@ -2098,50 +2393,284 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
     const actualUndefMask = args.map((x) => x instanceof UndefPrimal);
 
-    // ---- Create artifact and delegate ----
-    const spec: ScanBackwardSpec = {
-      primalForwardJaxpr,
-      tangentBody,
-      transposedBody,
-      numConsts,
-      numCarry,
-      numY,
-      numPrimalCarry,
-      numPrimalY,
-      numPrimalX,
-      numTangentConsts,
-      numTangentCarry,
-      numTangentX,
-      length,
-      reverse,
-      checkpoint,
-      undefMask,
-      actualUndefMask,
-    };
+    // ---- Forward Scan: replay primal forward, stacking carries as ys ----
+    //
+    // The backward step at iteration k needs primalCarry[k] (carry BEFORE
+    // step k).  We emit a forward Scan whose ys capture those snapshots.
+    //
+    // Body signature: (carry=primalCarry, x=xSlice) → (newCarry, oldCarry)
+    //   consts = [primalForwardJaxpr.consts, constResiduals]   (captured)
+    //   carry  = primalCarry  (size numPrimalCarry)
+    //   xs     = xsResiduals  (sliced per iteration)
+    //   ys     = oldCarry snapshot  (stacked, for backward)
 
-    using artifact = new ScanPullbackArtifact(
-      spec,
-      constResiduals,
-      carryResiduals,
-      xsResiduals,
+    const fwdBodyInAvals = [
+      ...carryResiduals.map((t) => t.aval),
+      ...xsResiduals.map(
+        (t) => new ShapedArray(t.shape.slice(1), t.dtype, false),
+      ),
+    ];
+
+    const { jaxpr: fwdScanBody } = makeJaxpr(
+      (...fwdArgs: Tracer[]): Tracer[] => {
+        const carryIn = fwdArgs.slice(0, carryResiduals.length);
+        const xIn = fwdArgs.slice(carryResiduals.length);
+
+        // Build full primal input for primalForwardJaxpr
+        const fwdFullInputs: Tracer[] = [];
+        const fwdDisposables: Tracer[] = [];
+        let constIdx = 0;
+        let carryIdx = 0;
+        let xIdx = 0;
+        for (let i = 0; i < jaxpr.inBinders.length; i++) {
+          if (bodyUndefPrimals[i]) {
+            const aval = jaxpr.inBinders[i].aval;
+            const z = zerosInternal(aval.shape, aval.dtype);
+            fwdFullInputs.push(z);
+            fwdDisposables.push(z);
+          } else if (i < numConsts) {
+            fwdFullInputs.push(constResiduals[constIdx++]);
+          } else if (i < numConsts + numCarry) {
+            fwdFullInputs.push(carryIn[carryIdx++]);
+          } else {
+            fwdFullInputs.push(xIn[xIdx++]);
+          }
+        }
+
+        const fwdOuts = evalJaxpr(jaxpr, fwdFullInputs);
+        const newCarry = fwdOuts.slice(0, numPrimalCarry);
+        // Dispose tangent carry and all ys (not needed)
+        for (let i = numPrimalCarry; i < fwdOuts.length; i++)
+          fwdOuts[i].dispose();
+        for (const d of fwdDisposables) d.dispose();
+
+        // carry output = newCarry, ys = oldCarry (snapshot before this step)
+        return [...newCarry, ...carryIn];
+      },
+      { validateRefs: false },
+    )(...fwdBodyInAvals);
+
+    const fwdScanOuts = bind(
+      Primitive.Scan,
+      [...fwdScanBody.consts, ...carryResiduals, ...xsResiduals],
+      {
+        jaxpr: fwdScanBody.jaxpr,
+        numConsts: fwdScanBody.consts.length,
+        numCarry: carryResiduals.length,
+        length: lengthDim,
+        reverse,
+      },
+    ) as Tracer[];
+
+    // ys = stacked old carries (one per iteration)
+    const stackedPrimalCarries = fwdScanOuts.slice(carryResiduals.length);
+    // Dispose final carry (not needed)
+    for (let i = 0; i < carryResiduals.length; i++) fwdScanOuts[i].dispose();
+
+    // ---- Backward Scan: accumulate cotangents in reverse ----
+    //
+    // Body signature:
+    //   carry = [ctConstsAccum..., ctCarryRunning...]
+    //   xs    = [primalCarry_k, xSlice_k, ctY_k]       (per-iteration)
+    //   ys    = [ctXStep_k]                              (stacked)
+    //
+    // Runs transposedBody per step, accumulates const cotangents.
+
+    const ctCarryAll = cts.slice(0, numCarry);
+    const ctYsAll = cts.slice(numCarry);
+    // In JVP-doubled scan, first half of carry cts are primal (dispose)
+    const ctCarryInit = ctCarryAll.slice(numPrimalCarry);
+    for (let i = 0; i < numPrimalCarry; i++) ctCarryAll[i].dispose();
+    // Tangent ys are the second half
+    const numYPrimal = Math.floor(numY / 2);
+    const tangentCtYs = ctYsAll.slice(numYPrimal);
+    for (let i = 0; i < numYPrimal; i++) ctYsAll[i].dispose();
+
+    // Tangent const avals (for zero-init of accumulator)
+    const numPrimalInputs = jaxpr.inBinders.filter(
+      (_, i) => !bodyUndefPrimals[i],
+    ).length;
+    const tangentConstsAvals = tangentBodyInAvals.slice(
+      numPrimalInputs,
+      numPrimalInputs + numTangentConsts,
+    );
+    const ctConstsZeroInit = Array.from({ length: numTangentConsts }, (_, i) =>
+      zerosInternal(tangentConstsAvals[i].shape, tangentConstsAvals[i].dtype),
+    );
+    const ctCarrySafeInit = ctCarryInit.map(
+      (c, i) =>
+        c ||
+        zerosInternal(
+          carryResiduals[carryResiduals.length - numTangentCarry + i].shape,
+          carryResiduals[carryResiduals.length - numTangentCarry + i].dtype,
+        ),
     );
 
-    return artifact.run(cts);
+    // Build backward scan body avals
+    const bwdCarryAvals = [
+      ...ctConstsZeroInit.map((t) => t.aval),
+      ...ctCarrySafeInit.map((t) => t.aval),
+    ];
+    const bwdXsAvals = [
+      ...stackedPrimalCarries.map(
+        (t) => new ShapedArray(t.shape.slice(1), t.dtype, false),
+      ),
+      ...xsResiduals.map(
+        (t) => new ShapedArray(t.shape.slice(1), t.dtype, false),
+      ),
+      ...tangentCtYs.map(
+        (t) => new ShapedArray(t.shape.slice(1), t.dtype, false),
+      ),
+    ];
+    const bwdBodyInAvals = [...bwdCarryAvals, ...bwdXsAvals];
+
+    const { jaxpr: bwdScanBody } = makeJaxpr(
+      (...bwdArgs: Tracer[]): Tracer[] => {
+        // Unpack carry
+        const ctConstsIn = bwdArgs.slice(0, numTangentConsts);
+        const ctCarryIn = bwdArgs.slice(
+          numTangentConsts,
+          numTangentConsts + numTangentCarry,
+        );
+
+        // Unpack xs
+        let off = numTangentConsts + numTangentCarry;
+        const primalCarry_k = bwdArgs.slice(off, off + carryResiduals.length);
+        off += carryResiduals.length;
+        const xSlice_k = bwdArgs.slice(off, off + xsResiduals.length);
+        off += xsResiduals.length;
+        const ctY_k = bwdArgs.slice(off);
+
+        // Build transposedBody input: [tb.consts, constResiduals, primalCarry_k, xSlice_k, ctCarryIn, ctY_k]
+        const transposedInputs = [
+          ...transposedBody.consts,
+          ...constResiduals,
+          ...primalCarry_k,
+          ...xSlice_k,
+          ...ctCarryIn,
+          ...ctY_k,
+        ];
+        const transposedOuts = evalJaxpr(
+          transposedBody.jaxpr,
+          transposedInputs,
+        );
+
+        // Extract cotangents from transposed outputs
+        const ctConstsStep = transposedOuts.slice(0, numTangentConsts);
+        const ctCarryNext = transposedOuts.slice(
+          numTangentConsts,
+          numTangentConsts + numTangentCarry,
+        );
+        const ctXStep = transposedOuts.slice(
+          numTangentConsts + numTangentCarry,
+        );
+
+        // Accumulate const cotangents
+        const ctConstsOut = ctConstsIn.map((c, i) => {
+          const sum = bind(Primitive.Add, [c, ctConstsStep[i]])[0];
+          ctConstsStep[i].dispose();
+          return sum;
+        });
+
+        // carry = [ctConstsOut, ctCarryNext], ys = [ctXStep]
+        return [...ctConstsOut, ...ctCarryNext, ...ctXStep];
+      },
+      { validateRefs: false },
+    )(...bwdBodyInAvals);
+
+    const bwdScanOuts = bind(
+      Primitive.Scan,
+      [
+        ...bwdScanBody.consts,
+        ...ctConstsZeroInit,
+        ...ctCarrySafeInit,
+        ...stackedPrimalCarries,
+        ...xsResiduals,
+        ...tangentCtYs,
+      ],
+      {
+        jaxpr: bwdScanBody.jaxpr,
+        numConsts: bwdScanBody.consts.length,
+        numCarry: numTangentConsts + numTangentCarry,
+        length: lengthDim,
+        reverse: !reverse,
+      },
+    ) as Tracer[];
+
+    // Extract results from backward scan
+    const finalCtConsts = bwdScanOuts.slice(0, numTangentConsts);
+    const finalCtCarry = bwdScanOuts.slice(
+      numTangentConsts,
+      numTangentConsts + numTangentCarry,
+    );
+    const ctXsStacked = bwdScanOuts.slice(numTangentConsts + numTangentCarry);
+
+    // ---- Assemble output cotangents ----
+    const result: (Tracer | null)[] = [];
+    let ctConstIdx = 0;
+    let ctCarryIdx = 0;
+    let ctXIdx = 0;
+
+    for (let i = 0; i < actualUndefMask.length; i++) {
+      const isJvpTangent = undefMask[i];
+
+      if (!actualUndefMask[i]) {
+        if (isJvpTangent) {
+          if (i < numConsts) {
+            finalCtConsts[ctConstIdx++].dispose();
+          } else if (i < numConsts + numCarry) {
+            finalCtCarry[ctCarryIdx++].dispose();
+          } else {
+            ctXsStacked[ctXIdx++].dispose();
+          }
+        }
+        result.push(null);
+      } else if (i < numConsts) {
+        result.push(finalCtConsts[ctConstIdx++]);
+      } else if (i < numConsts + numCarry) {
+        result.push(finalCtCarry[ctCarryIdx++]);
+      } else {
+        result.push(ctXsStacked[ctXIdx++]);
+      }
+    }
+
+    // Dispose remaining (unused indices)
+    for (let i = ctConstIdx; i < finalCtConsts.length; i++)
+      finalCtConsts[i].dispose();
+    for (let i = ctCarryIdx; i < finalCtCarry.length; i++)
+      finalCtCarry[i].dispose();
+    for (let i = ctXIdx; i < ctXsStacked.length; i++) ctXsStacked[i].dispose();
+
+    // Dispose intermediate arrays consumed by the backward scan
+    for (const t of stackedPrimalCarries) t.dispose();
+    for (const t of tangentCtYs) t.dispose();
+    for (const t of ctConstsZeroInit) t.dispose();
+    for (const t of ctCarrySafeInit) t.dispose();
+
+    // Clean up owned jaxprs
+    tangentBody.dispose();
+    fwdScanBody.dispose();
+    bwdScanBody.dispose();
+    primalForwardJaxpr.dispose();
+
+    return result;
   },
   [Primitive.AssociativeScan](cts, args, params) {
-    // AssociativeScan transpose: reverse sequential recurrence.
+    // AssociativeScan transpose: reverse sequential recurrence via Scan.
     //
-    // Forward:  y[0] = x[0],  y[i] = body(y[i-1], x[i])  for i=1..N-1
-    // Backward: iterate N-1..1, transposing body at each position.
-    //   ct_carry += ct_y[i]; [ct_a, ct_b] = body_T(ct_carry, residuals_i)
-    //   ct_x[i] = ct_b; ct_carry = ct_a
-    //   ct_x[0] = ct_carry + ct_y[0]
+    // Instead of O(N) loop unrolling (creating huge jaxprs and O(N) dispatch
+    // steps), this uses two Primitive.Scan calls:
+    //   1. Forward scan to recompute prefix results (stacked as ys)
+    //   2. Backward scan (reverse=true) to compute cotangents
+    //
+    // This produces a compact jaxpr with two Scan equations, enabling
+    // compiled-loop execution (constant-size program, O(1) JIT steps).
 
     const {
       jaxpr: bodyJaxpr,
       numLeaves,
       axis: _axis,
-      reverse,
+      reverse: assocReverse,
     } = params as PrimitiveParams<Primitive.AssociativeScan>;
     const numConsts = args.length - numLeaves;
     const numOrigLeaves = numLeaves / 2;
@@ -2175,17 +2704,393 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       numConsts + numOrigLeaves,
     ) as Tracer[];
 
-    const N = primalElems[0].shape[0]; // axis is always 0
+    const N = primalElems[0].shape[0] as number; // axis is always 0
 
-    // For reverse= true, flip primal elems and cotangents so backward
-    // loop works in "forward order".
-    if (reverse) {
+    // For reverse=true, flip primal elems so forward recompute and backward
+    // loop work in "forward order".
+    if (assocReverse) {
       primalElems = primalElems.map((e) => flip(e, [0]));
     }
 
-    // ----- Recompute forward primals y_P[0..N-1] -----
+    // Helper: slice arr[idx] removing leading dim
+    const sliceAt = (arr: Tracer, idx: number): Tracer => {
+      const ranges: [number, number][] = [[idx, idx + 1]];
+      for (let d = 1; d < arr.ndim; d++)
+        ranges.push([0, arr.shape[d] as number]);
+      const sl = shrink(arr, ranges);
+      const r = reshape(sl, arr.shape.slice(1) as number[]);
+      sl.dispose();
+      return r;
+    };
 
-    // Helper: slice a leaf array at position idx along axis 0
+    // Helper: slice arr[from:] along axis 0
+    const sliceFrom = (arr: Tracer, from: number): Tracer => {
+      const ranges: [number, number][] = [[from, arr.shape[0] as number]];
+      for (let d = 1; d < arr.ndim; d++)
+        ranges.push([0, arr.shape[d] as number]);
+      return shrink(arr, ranges);
+    };
+
+    // ----- Forward Scan: recompute prefix results as stacked ys -----
+    //
+    // Carry = prev_y (numOrigLeaves)
+    // Xs = primalElems[1:] per step (N-1 iterations)
+    // Body: (prev_y, x_i) => [new_y=body(prev_y,x_i), ys=prev_y_snapshot]
+    //   ys capture the carry BEFORE each step (needed by backward)
+
+    const fwdInitCarry = primalElems.map((e) => sliceAt(e, 0));
+    const fwdXs = primalElems.map((e) => sliceFrom(e, 1)); // [N-1, ...]
+
+    const fwdBodyInAvals = [
+      ...fwdInitCarry.map((t) => t.aval), // carry avals
+      ...fwdXs.map(
+        (t) => new ShapedArray(t.shape.slice(1) as number[], t.dtype, false),
+      ), // x per step avals
+    ];
+
+    const { jaxpr: fwdBody } = makeJaxpr(
+      (...fwdArgs: Tracer[]): Tracer[] => {
+        const carry = fwdArgs.slice(0, numOrigLeaves);
+        const xSlice = fwdArgs.slice(numOrigLeaves);
+
+        // Evaluate primal body: newY = body(carry, xSlice) with zero tangents
+        const bodyArgs: Tracer[] = [];
+        const disposables: Tracer[] = [];
+        let cri = 0;
+        for (let i = 0; i < numConsts; i++) {
+          if (bodyUndefPrimals[i]) {
+            const z = zerosInternal(
+              bodyJaxpr.inBinders[i].aval.shape,
+              bodyJaxpr.inBinders[i].aval.dtype,
+            );
+            bodyArgs.push(z);
+            disposables.push(z);
+          } else {
+            bodyArgs.push(constResiduals[cri++]);
+          }
+        }
+        for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(carry[i]);
+        for (let i = numOrigLeaves; i < numLeaves; i++) {
+          const z = zerosInternal(
+            bodyJaxpr.inBinders[numConsts + i].aval.shape,
+            bodyJaxpr.inBinders[numConsts + i].aval.dtype,
+          );
+          bodyArgs.push(z);
+          disposables.push(z);
+        }
+        for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(xSlice[i]);
+        for (let i = numOrigLeaves; i < numLeaves; i++) {
+          const z = zerosInternal(
+            bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.shape,
+            bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.dtype,
+          );
+          bodyArgs.push(z);
+          disposables.push(z);
+        }
+
+        const outs = evalJaxpr(bodyJaxpr, bodyArgs);
+        for (const d of disposables) d.dispose();
+        const primalOuts = outs.slice(0, numOrigLeaves);
+        for (let i = numOrigLeaves; i < outs.length; i++) outs[i].dispose();
+
+        // carry = newY, ys = newY passthrough (enables compiled-loop)
+        return [...primalOuts, ...primalOuts];
+      },
+      { validateRefs: false },
+    )(...fwdBodyInAvals);
+
+    const fwdScanOuts = bind(
+      Primitive.Scan,
+      [...fwdBody.consts, ...fwdInitCarry, ...fwdXs],
+      {
+        jaxpr: fwdBody.jaxpr,
+        numConsts: fwdBody.consts.length,
+        numCarry: numOrigLeaves,
+        length: N - 1,
+        reverse: false,
+      },
+    ) as Tracer[];
+
+    // Stacked Ys are [y[1], ..., y[N-1]] (carry output at each iteration).
+    // We need stackedPrevYs = [y[0], ..., y[N-2]] (carry input at each step).
+    // Reconstruct by prepending initCarry and removing the last element.
+    const stackedAfterYs = fwdScanOuts.slice(numOrigLeaves);
+    for (let i = 0; i < numOrigLeaves; i++) fwdScanOuts[i].dispose();
+
+    const stackedPrevYs: Tracer[] = [];
+    for (let j = 0; j < numOrigLeaves; j++) {
+      const leafShape = fwdInitCarry[j].shape as number[];
+      const y0 = broadcast(fwdInitCarry[j], [1, ...leafShape], [0]);
+      const rest = shrink(stackedAfterYs[j], [
+        [0, N - 2],
+        ...leafShape.map((s) => [0, s] as [number, number]),
+      ]);
+      const prev = concatenate([y0, rest], 0);
+      y0.dispose();
+      rest.dispose();
+      stackedAfterYs[j].dispose();
+      stackedPrevYs.push(prev);
+    }
+
+    // ----- Split cotangents -----
+    const ctPrimal = cts.slice(0, numOrigLeaves);
+    let ctTangent = cts.slice(numOrigLeaves);
+    const disposedCts = new Set<Tracer>();
+    for (const c of ctPrimal) {
+      if (!disposedCts.has(c)) {
+        disposedCts.add(c);
+        c.dispose();
+      }
+    }
+    if (assocReverse) {
+      ctTangent = ctTangent.map((c) => flip(c, [0]));
+    }
+
+    // ----- Backward Scan: accumulate cotangents in reverse -----
+    //
+    // Carry = [ctConstsAccum (numTangentConsts), ctCarry (numOrigLeaves)]
+    // Xs = [stackedPrevYs[k], primalElems[1:][k], ctTangent[1:][k]]
+    //   k=0..N-2 → original positions 1..N-1
+    // reverse=true: processes from position N-1 down to 1
+    // Ys = [ctBIter (numOrigLeaves)] per step
+
+    const bwdPrimalSliced = primalElems.map((e) => sliceFrom(e, 1));
+    const bwdCtSliced = ctTangent.map((c) => sliceFrom(c, 1));
+
+    // Leaf element shapes (carry shapes) — from forward init carry
+    const leafElemAvals = fwdBodyInAvals.slice(0, numOrigLeaves);
+
+    // Tangent const shapes from transposed body output layout
+    const ctConstsAvals: ShapedArray[] = [];
+    for (let j = 0; j < numTangentConsts; j++) {
+      ctConstsAvals.push(transposedBody.jaxpr.outs[j].aval);
+    }
+
+    const ctConstsZeroInit = ctConstsAvals.map((a) =>
+      zerosInternal(a.shape, a.dtype),
+    );
+    const ctCarryInit = leafElemAvals.map((a) =>
+      zerosInternal(a.shape, a.dtype),
+    );
+
+    const bwdCarryAvals = [
+      ...ctConstsZeroInit.map((t) => t.aval),
+      ...ctCarryInit.map((t) => t.aval),
+    ];
+    const bwdXsAvals = [
+      ...stackedPrevYs.map(
+        (t) => new ShapedArray(t.shape.slice(1) as number[], t.dtype, false),
+      ),
+      ...bwdPrimalSliced.map(
+        (t) => new ShapedArray(t.shape.slice(1) as number[], t.dtype, false),
+      ),
+      ...bwdCtSliced.map(
+        (t) => new ShapedArray(t.shape.slice(1) as number[], t.dtype, false),
+      ),
+    ];
+
+    const { jaxpr: bwdBody } = makeJaxpr(
+      (...bwdArgs: Tracer[]): Tracer[] => {
+        // Unpack carry
+        const ctConstsIn = bwdArgs.slice(0, numTangentConsts);
+        const ctCarryIn = bwdArgs.slice(
+          numTangentConsts,
+          numTangentConsts + numOrigLeaves,
+        );
+
+        // Unpack xs
+        let off = numTangentConsts + numOrigLeaves;
+        const yPrev = bwdArgs.slice(off, off + numOrigLeaves);
+        off += numOrigLeaves;
+        const xPi = bwdArgs.slice(off, off + numOrigLeaves);
+        off += numOrigLeaves;
+        const ctYi = bwdArgs.slice(off, off + numOrigLeaves);
+
+        // Effective cotangent = ctCarry + ctYi
+        const ctEff = ctCarryIn.map((c, j) => add(c, ctYi[j]));
+
+        // Build transposed body inputs:
+        // [tb.consts, constResiduals, yPrev, xPi, zeros_primal_ct, ctEff]
+        const tbInputs: Tracer[] = [
+          ...transposedBody.consts,
+          ...constResiduals,
+        ];
+        const tbDisposables: Tracer[] = [];
+        for (const y of yPrev) tbInputs.push(y);
+        for (const x of xPi) tbInputs.push(x);
+        for (let j = 0; j < numOrigLeaves; j++) {
+          const z = zerosInternal(
+            leafElemAvals[j].shape,
+            leafElemAvals[j].dtype,
+          );
+          tbInputs.push(z);
+          tbDisposables.push(z);
+        }
+        for (const c of ctEff) tbInputs.push(c);
+
+        const tbOuts = evalJaxpr(transposedBody.jaxpr, tbInputs);
+        for (const d of tbDisposables) d.dispose();
+        for (const c of ctEff) c.dispose();
+
+        // Extract: [ctConstsI, ctANew, ctBIter]
+        let oi = 0;
+        const ctConstsStep: Tracer[] = [];
+        for (let j = 0; j < numTangentConsts; j++)
+          ctConstsStep.push(tbOuts[oi++]);
+        const ctANew: Tracer[] = [];
+        for (let j = 0; j < numOrigLeaves; j++) ctANew.push(tbOuts[oi++]);
+        const ctBIter: Tracer[] = [];
+        for (let j = 0; j < numOrigLeaves; j++) ctBIter.push(tbOuts[oi++]);
+
+        // Accumulate const cotangents
+        const ctConstsOut = ctConstsIn.map((c, i) => {
+          const s = add(c, ctConstsStep[i]);
+          ctConstsStep[i].dispose();
+          return s;
+        });
+
+        // carry = [ctConstsOut, ctANew], ys = [ctBIter]
+        return [...ctConstsOut, ...ctANew, ...ctBIter];
+      },
+      { validateRefs: false },
+    )(...[...bwdCarryAvals, ...bwdXsAvals]);
+
+    const bwdScanOuts = bind(
+      Primitive.Scan,
+      [
+        ...bwdBody.consts,
+        ...ctConstsZeroInit,
+        ...ctCarryInit,
+        ...stackedPrevYs,
+        ...bwdPrimalSliced,
+        ...bwdCtSliced,
+      ],
+      {
+        jaxpr: bwdBody.jaxpr,
+        numConsts: bwdBody.consts.length,
+        numCarry: numTangentConsts + numOrigLeaves,
+        length: N - 1,
+        reverse: true,
+      },
+    ) as Tracer[];
+
+    // Extract backward scan results
+    const finalCtConsts = bwdScanOuts.slice(0, numTangentConsts);
+    const finalCtCarry = bwdScanOuts.slice(
+      numTangentConsts,
+      numTangentConsts + numOrigLeaves,
+    );
+    // bwdYsStacked[j] shape [N-1, ...leaf_j] — cts for positions 1..N-1
+    const bwdYsStacked = bwdScanOuts.slice(numTangentConsts + numOrigLeaves);
+
+    // Position 0: ctX0 = finalCtCarry + ctY0
+    const ctY0 = ctTangent.map((c) => sliceAt(c, 0));
+    const ctX0 = finalCtCarry.map((c, j) => {
+      const s = add(c, ctY0[j]);
+      c.dispose();
+      ctY0[j].dispose();
+      return s;
+    });
+
+    // Stack: prepend ctX0 to backward ys for full [N, ...] result
+    const ctXsStacked: Tracer[] = [];
+    for (let j = 0; j < numOrigLeaves; j++) {
+      const x0Exp = broadcast(ctX0[j], [1, ...ctX0[j].shape], [0]);
+      let stacked = concatenate([x0Exp, bwdYsStacked[j]], 0);
+      if (assocReverse) {
+        const flipped = flip(stacked, [0]);
+        stacked.dispose();
+        stacked = flipped;
+      }
+      x0Exp.dispose();
+      ctX0[j].dispose();
+      bwdYsStacked[j].dispose();
+      ctXsStacked.push(stacked);
+    }
+
+    // Dispose intermediates
+    for (const t of stackedPrevYs) t.dispose();
+    for (const t of bwdPrimalSliced) t.dispose();
+    for (const t of bwdCtSliced) t.dispose();
+    for (const t of ctConstsZeroInit) t.dispose();
+    for (const t of ctCarryInit) t.dispose();
+    for (const x of fwdXs) x.dispose();
+    for (const c of fwdInitCarry) c.dispose();
+    for (const ct of ctTangent) {
+      if (!disposedCts.has(ct)) {
+        disposedCts.add(ct);
+        ct.dispose();
+      }
+    }
+    if (assocReverse) for (const e of primalElems) e.dispose();
+
+    // Clean up owned jaxprs
+    fwdBody.dispose();
+    bwdBody.dispose();
+
+    // Assemble output: null for known primals, cotangent for unknowns.
+    const result: (Tracer | null)[] = [];
+    let ctCI = 0;
+    for (let i = 0; i < args.length; i++) {
+      if (!(args[i] instanceof UndefPrimal)) {
+        result.push(null);
+      } else if (i < numConsts) {
+        result.push(finalCtConsts[ctCI++]);
+      } else {
+        // Tangent leaf at structural index within the elems
+        const tangentLeafIdx = i - numConsts - numOrigLeaves;
+        result.push(ctXsStacked[tangentLeafIdx]);
+      }
+    }
+
+    // Dispose unused ctXsStacked entries
+    const consumedIdxs = new Set<number>();
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] instanceof UndefPrimal && i >= numConsts) {
+        consumedIdxs.add(i - numConsts - numOrigLeaves);
+      }
+    }
+    for (let j = 0; j < ctXsStacked.length; j++) {
+      if (!consumedIdxs.has(j)) ctXsStacked[j].dispose();
+    }
+    // Dispose unused finalCtConsts
+    for (let j = ctCI; j < finalCtConsts.length; j++)
+      finalCtConsts[j].dispose();
+
+    return result;
+  },
+  [Primitive.WorkgroupAssociativeScan](cts, args, params) {
+    // WorkgroupAssociativeScan transpose: same reverse sequential recurrence
+    // as AssociativeScan but simpler (no axis/reverse, single-leaf groups).
+    // This runs inside a BlockMap body during grad.
+    //
+    // Forward:  y[0] = x[0],  y[i] = body(y[i-1], x[i])  for i=1..N-1
+    // Backward: iterate N-1..1, transposing body at each position.
+
+    const { jaxpr: bodyJaxpr, numConsts } =
+      params as PrimitiveParams<Primitive.WorkgroupAssociativeScan>;
+    const numElems = (args.length - numConsts) / 2;
+    const numOrigElems = numElems; // numElems is already halved after JVP doubling
+
+    const undefMask = args.map((x) => x instanceof UndefPrimal);
+    const bodyUndefPrimals = bodyJaxpr.inBinders.map((_, i) => undefMask[i]);
+
+    const numTangentConsts = bodyUndefPrimals
+      .slice(0, numConsts)
+      .filter((x) => x).length;
+
+    const transposedBody = transposeJaxpr(bodyJaxpr, bodyUndefPrimals);
+
+    const constResiduals = args
+      .slice(0, numConsts)
+      .filter((_, i) => !undefMask[i]) as Tracer[];
+    const primalElems = args.slice(
+      numConsts,
+      numConsts + numOrigElems,
+    ) as Tracer[];
+
+    const N = primalElems[0].shape[0]; // axis always 0
+
     const sliceAt = (arr: Tracer, idx: number): Tracer => {
       const ranges: [number, number][] = [[idx, idx + 1]];
       for (let d = 1; d < arr.ndim; d++) ranges.push([0, arr.shape[d]]);
@@ -2195,10 +3100,10 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       return r;
     };
 
-    // Primal-only evaluation of body (evalJaxpr is non-consuming).
+    // Primal-only evaluation of body
     const evalPrimalBody = (aLeaves: Tracer[], bLeaves: Tracer[]): Tracer[] => {
       const bodyArgs: Tracer[] = [];
-      const disposables: Tracer[] = []; // temporary zeros to dispose after eval
+      const disposables: Tracer[] = [];
       let cri = 0;
       for (let i = 0; i < numConsts; i++) {
         if (bodyUndefPrimals[i]) {
@@ -2212,8 +3117,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
           bodyArgs.push(constResiduals[cri++]);
         }
       }
-      for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(aLeaves[i]);
-      for (let i = numOrigLeaves; i < numLeaves; i++) {
+      for (const a of aLeaves) bodyArgs.push(a);
+      // Zero tangent "a" slots
+      for (let i = numOrigElems; i < numElems * 2; i++) {
         const z = zerosInternal(
           bodyJaxpr.inBinders[numConsts + i].aval.shape,
           bodyJaxpr.inBinders[numConsts + i].aval.dtype,
@@ -2221,23 +3127,24 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         bodyArgs.push(z);
         disposables.push(z);
       }
-      for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(bLeaves[i]);
-      for (let i = numOrigLeaves; i < numLeaves; i++) {
+      for (const b of bLeaves) bodyArgs.push(b);
+      // Zero tangent "b" slots
+      for (let i = numOrigElems; i < numElems * 2; i++) {
         const z = zerosInternal(
-          bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.shape,
-          bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.dtype,
+          bodyJaxpr.inBinders[numConsts + numElems * 2 + i].aval.shape,
+          bodyJaxpr.inBinders[numConsts + numElems * 2 + i].aval.dtype,
         );
         bodyArgs.push(z);
         disposables.push(z);
       }
       const outs = evalJaxpr(bodyJaxpr, bodyArgs);
       for (const d of disposables) d.dispose();
-      const pOuts = outs.slice(0, numOrigLeaves);
-      for (let i = numOrigLeaves; i < outs.length; i++) outs[i].dispose();
+      const pOuts = outs.slice(0, numOrigElems);
+      for (let i = numOrigElems; i < outs.length; i++) outs[i].dispose();
       return pOuts;
     };
 
-    // allYP[i] = primal prefix result at position i   (indexed 0..N-1)
+    // Recompute forward primals
     const allYP: Tracer[][] = [];
     allYP.push(primalElems.map((e) => sliceAt(e, 0)));
     for (let i = 1; i < N; i++) {
@@ -2247,13 +3154,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       allYP.push(newY);
     }
 
-    // ----- Backward loop -----
-
-    // Split cotangents: first numOrigLeaves are primal (zero), rest tangent.
-    // Cotangents may be aliased (e.g., add transpose returns [ct, ct]), so
-    // use a Set to avoid double-free.
-    const ctPrimal = cts.slice(0, numOrigLeaves);
-    let ctTangent = cts.slice(numOrigLeaves);
+    // Backward loop
+    const ctPrimal = cts.slice(0, numOrigElems);
+    const ctTangent = cts.slice(numOrigElems);
     const disposedCts = new Set<Tracer>();
     for (const c of ctPrimal) {
       if (!disposedCts.has(c)) {
@@ -2262,41 +3165,30 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       }
     }
 
-    if (reverse) {
-      ctTangent = ctTangent.map((c) => flip(c, [0]));
-    }
-
-    // Initialize carry cotangent to zeros
     let ctCarry: Tracer[] = allYP[0].map((y) =>
       zerosInternal(y.shape, y.dtype),
     );
     let ctConstsAccum: Tracer[] | null = null;
     const ctXsPerLeaf: Tracer[][] = Array.from(
-      { length: numOrigLeaves },
+      { length: numOrigElems },
       () => [],
     );
 
     for (let i = N - 1; i >= 1; i--) {
-      // Slice tangent cotangent at position i
       const ctYi = ctTangent.map((c) => sliceAt(c, i));
-      // Effective cotangent = ctCarry + ctYi
       const ctEff = ctCarry.map((c, j) => add(c, ctYi[j]));
       for (const c of ctCarry) c.dispose();
       for (const c of ctYi) c.dispose();
 
-      // Slice primal x at position i
       const xPi = primalElems.map((e) => sliceAt(e, i));
-      // Primal y at position i-1
       const yPrev = allYP[i - 1];
 
-      // Build transposed body inputs: [consts, residuals, cotangents]
-      // evalJaxpr is non-consuming — no .ref needed.
       const tbInputs: Tracer[] = [...transposedBody.consts, ...constResiduals];
-      const tbDisposables: Tracer[] = []; // temporary zeros
+      const tbDisposables: Tracer[] = [];
       for (const y of yPrev) tbInputs.push(y);
       for (const x of xPi) tbInputs.push(x);
-      // Cotangents for body outputs: zero for primal, ctEff for tangent
-      for (let j = 0; j < numOrigLeaves; j++) {
+      // Zero cotangents for primal outputs
+      for (let j = 0; j < numOrigElems; j++) {
         const z = zerosInternal(allYP[0][j].shape, allYP[0][j].dtype);
         tbInputs.push(z);
         tbDisposables.push(z);
@@ -2306,28 +3198,20 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       const tbOuts = evalJaxpr(transposedBody.jaxpr, tbInputs);
       for (const d of tbDisposables) d.dispose();
 
-      // Extract: [ct_constT, ct_aT, ct_bT]
-      // IMPORTANT: transposed body may return aliased outputs (e.g., add's
-      // transpose sends cotangent to both inputs → same array for ct_a and ct_b).
-      // We .ref any ctBIter entry that aliases ctANew (ctCarry), since ctCarry
-      // will be disposed later and ctBIter must survive for stacking.
       let oi = 0;
       const ctConstsI: Tracer[] = [];
       for (let j = 0; j < numTangentConsts; j++) ctConstsI.push(tbOuts[oi++]);
       const ctANew: Tracer[] = [];
-      for (let j = 0; j < numOrigLeaves; j++) ctANew.push(tbOuts[oi++]);
+      for (let j = 0; j < numOrigElems; j++) ctANew.push(tbOuts[oi++]);
       const ctBIter: Tracer[] = [];
-      for (let j = 0; j < numOrigLeaves; j++) {
+      for (let j = 0; j < numOrigElems; j++) {
         const ct = tbOuts[oi++];
-        // If this output aliases a ctANew entry, .ref it so dispose of
-        // ctCarry (= ctANew) doesn't kill it.
         if (ctANew.includes(ct)) ct.ref; // jax-js-lint: allow-ref
         ctBIter.push(ct);
       }
 
       ctCarry = ctANew;
 
-      // Accumulate const cotangents
       if (ctConstsAccum === null) {
         ctConstsAccum = ctConstsI;
       } else {
@@ -2339,13 +3223,12 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         }
       }
 
-      for (let j = 0; j < numOrigLeaves; j++) ctXsPerLeaf[j].push(ctBIter[j]);
-
+      for (let j = 0; j < numOrigElems; j++) ctXsPerLeaf[j].push(ctBIter[j]);
       for (const x of xPi) x.dispose();
       for (const c of ctEff) c.dispose();
     }
 
-    // Position 0: ct_xT[0] = ctCarry + ct_y_T[0]
+    // Position 0
     const ctY0 = ctTangent.map((c) => sliceAt(c, 0));
     const ctX0 = ctCarry.map((c, j) => {
       const s = add(c, ctY0[j]);
@@ -2353,31 +3236,23 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       ctY0[j].dispose();
       return s;
     });
-    for (let j = 0; j < numOrigLeaves; j++) ctXsPerLeaf[j].push(ctX0[j]);
+    for (let j = 0; j < numOrigElems; j++) ctXsPerLeaf[j].push(ctX0[j]);
 
-    // Dispose forward primals
+    // Cleanup
     for (const yp of allYP) for (const y of yp) y.dispose();
-    // Dispose tangent cts (may be aliased — deduplicate)
     for (const ct of ctTangent) {
       if (!disposedCts.has(ct)) {
         disposedCts.add(ct);
         ct.dispose();
       }
     }
-    // Dispose flipped primal elems if reverse
-    if (reverse) for (const e of primalElems) e.dispose();
 
-    // Stack per-position x cotangents (collected in reverse order)
+    // Stack per-position cotangents
     const ctXsStacked: Tracer[] = [];
-    for (let j = 0; j < numOrigLeaves; j++) {
+    for (let j = 0; j < numOrigElems; j++) {
       const perPos = ctXsPerLeaf[j].reverse();
       const expanded = perPos.map((ct) => broadcast(ct, [1, ...ct.shape], [0]));
-      let stacked = concatenate(expanded, 0);
-      if (reverse) {
-        const flipped = flip(stacked, [0]);
-        stacked.dispose();
-        stacked = flipped;
-      }
+      const stacked = concatenate(expanded, 0);
       const disposed = new Set<Tracer>();
       for (const ct of expanded) {
         if (!disposed.has(ct)) {
@@ -2394,14 +3269,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       ctXsStacked.push(stacked);
     }
 
-    // Assemble output: null for known primals, cotangent for unknowns.
-    //
-    // Key subtlety: some tangent inputs may be known (concrete zeros, because
-    // their primal doesn't depend on the grad argument). These are NOT
-    // UndefPrimal in `args`, so they must get null. But ctXsStacked is indexed
-    // by structural tangent leaf position (0..numOrigLeaves-1), not by a
-    // running counter over UndefPrimal args. Use the structural index
-    // (i - numConsts - numOrigLeaves) to pick the right ctXsStacked entry.
+    // Assemble output
     const result: (Tracer | null)[] = [];
     let ctCI = 0;
     for (let i = 0; i < args.length; i++) {
@@ -2410,18 +3278,15 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       } else if (i < numConsts) {
         result.push(ctConstsAccum![ctCI++]);
       } else {
-        // Tangent leaf at structural index within the elems
-        const tangentLeafIdx = i - numConsts - numOrigLeaves;
+        const tangentLeafIdx = i - numConsts - numOrigElems;
         result.push(ctXsStacked[tangentLeafIdx]);
       }
     }
 
-    // Dispose unused ctXsStacked entries (for tangent leaves that were known,
-    // not UndefPrimal, so their ctXsStacked wasn't consumed above).
     const consumedIdxs = new Set<number>();
     for (let i = 0; i < args.length; i++) {
       if (args[i] instanceof UndefPrimal && i >= numConsts) {
-        consumedIdxs.add(i - numConsts - numOrigLeaves);
+        consumedIdxs.add(i - numConsts - numOrigElems);
       }
     }
     for (let j = 0; j < ctXsStacked.length; j++) {
@@ -2429,6 +3294,406 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     }
 
     return result;
+  },
+  [Primitive.DynamicSlice]([ct], primals, { sliceSizes }) {
+    const origShape = (
+      primals[0] instanceof UndefPrimal
+        ? primals[0].aval.shape
+        : (primals[0] as Tracer).shape
+    ) as number[];
+    const starts = primals.slice(1) as Tracer[];
+
+    let curr = ct;
+    const currShape = [...sliceSizes];
+    for (let ax = starts.length - 1; ax >= 0; ax--) {
+      if (sliceSizes[ax] === origShape[ax]) continue;
+
+      currShape[ax] = origShape[ax];
+      // Note: fullInternal from array.ts takes (shape, fillValue, dtype)
+      using target = fullInternal(
+        new ShapedArray(currShape, (ct as Tracer).dtype, false),
+        0,
+      );
+
+      const maxStart = (origShape[ax] as number) - sliceSizes[ax];
+      using zeroArr = array(0, { dtype: starts[ax].dtype });
+      using maxArr = array(maxStart, { dtype: starts[ax].dtype });
+
+      const clampedStart1 = min(starts[ax], maxArr) as Tracer;
+      const start = max(zeroArr, clampedStart1) as Tracer;
+
+      using indicesBase = array(new Int32Array(range(sliceSizes[ax])), {
+        dtype: starts[ax].dtype,
+      });
+      const indices = add(indicesBase, start);
+
+      const nextCurr = scatterAdd(target, indices, curr, ax) as Tracer;
+
+      clampedStart1.dispose();
+      start.dispose();
+      indices.dispose();
+      if (curr !== ct) curr.dispose();
+      curr = nextCurr;
+    }
+
+    return [curr, ...starts.map(() => null)];
+  },
+  // UncheckedDynamicSlice adjoint: same as DynamicSlice (indices in-bounds
+  // by construction, clamping is a harmless no-op in the backward pass)
+  [Primitive.UncheckedDynamicSlice]([ct], primals, { sliceSizes }) {
+    const origShape = (
+      primals[0] instanceof UndefPrimal
+        ? primals[0].aval.shape
+        : (primals[0] as Tracer).shape
+    ) as number[];
+    const starts = primals.slice(1) as Tracer[];
+
+    let curr = ct;
+    const currShape = [...sliceSizes];
+    for (let ax = starts.length - 1; ax >= 0; ax--) {
+      if (sliceSizes[ax] === origShape[ax]) continue;
+
+      currShape[ax] = origShape[ax];
+      using target = fullInternal(
+        new ShapedArray(currShape, (ct as Tracer).dtype, false),
+        0,
+      );
+
+      const maxStart = (origShape[ax] as number) - sliceSizes[ax];
+      using zeroArr = array(0, { dtype: starts[ax].dtype });
+      using maxArr = array(maxStart, { dtype: starts[ax].dtype });
+
+      const clampedStart1 = min(starts[ax], maxArr) as Tracer;
+      const start = max(zeroArr, clampedStart1) as Tracer;
+
+      using indicesBase = array(new Int32Array(range(sliceSizes[ax])), {
+        dtype: starts[ax].dtype,
+      });
+      const indices = add(indicesBase, start);
+
+      const nextCurr = scatterAdd(target, indices, curr, ax) as Tracer;
+
+      clampedStart1.dispose();
+      start.dispose();
+      indices.dispose();
+      if (curr !== ct) curr.dispose();
+      curr = nextCurr;
+    }
+
+    return [curr, ...starts.map(() => null)];
+  },
+  [Primitive.ForiLoop](
+    cts,
+    args,
+    { jaxpr, numConsts, lower: lowerDim, upper: upperDim, isJvpTransformed },
+  ) {
+    // ForiLoop backward pass: unrolled forward + backward.
+    //
+    // After JVP+PE the fori_loop carries both primal and tangent halves.
+    // The backward pass builds compile-time jaxprs (primal forward, tangent
+    // body, transposed tangent body), then:
+    //   1. Runs primal forward N times to collect intermediate primal carries
+    //   2. Runs transposed tangent body N times in reverse via evalJaxpr
+    //
+    // This mirrors the scan backward approach: evalJaxpr returns fresh arrays,
+    // avoiding aliasing complications from evalJaxprTransposed.
+
+    if (!isJvpTransformed) {
+      throw new Error(
+        "ForiLoop backward pass requires isJvpTransformed (from JVP rule). " +
+          "Use jit(grad(f)) instead of grad(jit(f)).",
+      );
+    }
+
+    const N = dimSub(upperDim, lowerDim);
+    const numCarryTotal = args.length - numConsts;
+    const numCarryHalf = numCarryTotal / 2;
+
+    // Body invars: [consts(numConsts), i, carry(numCarryTotal)]
+    const iDtype = jaxpr.inBinders[numConsts].aval.dtype;
+
+    // ---- Identify unknown (tangent) positions ----
+    const bodyUndefPrimals: boolean[] = [];
+    for (let i = 0; i < jaxpr.inBinders.length; i++) {
+      if (i < numConsts) {
+        bodyUndefPrimals.push(args[i] instanceof UndefPrimal);
+      } else if (i === numConsts) {
+        bodyUndefPrimals.push(false); // i: always known
+      } else {
+        const carryIdx = i - numConsts - 1;
+        bodyUndefPrimals.push(carryIdx >= numCarryHalf);
+      }
+    }
+
+    const numTangentConsts = args
+      .slice(0, numConsts)
+      .filter((a) => a instanceof UndefPrimal).length;
+
+    // ---- Build primal forward jaxpr ----
+    const primalForwardInTypes = jaxpr.inBinders
+      .filter((_, i) => !bodyUndefPrimals[i])
+      .map((v) => v.aval);
+
+    const { jaxpr: primalForwardJaxpr } = makeJaxpr(
+      (...primalInputs: Tracer[]): Tracer[] => {
+        const fullInputs: Tracer[] = [];
+        let primalIdx = 0;
+        for (let i = 0; i < jaxpr.inBinders.length; i++) {
+          if (bodyUndefPrimals[i]) {
+            fullInputs.push(
+              zerosInternal(
+                jaxpr.inBinders[i].aval.shape,
+                jaxpr.inBinders[i].aval.dtype,
+              ),
+            );
+          } else {
+            fullInputs.push(primalInputs[primalIdx++]);
+          }
+        }
+        const outs = evalJaxpr(jaxpr, fullInputs);
+        const primalOuts = outs.slice(0, numCarryHalf);
+        for (let i = numCarryHalf; i < outs.length; i++) outs[i].dispose();
+        return primalOuts;
+      },
+      { validateRefs: false },
+    )(...primalForwardInTypes);
+
+    // ---- Build tangent body jaxpr ----
+    const tangentBodyInAvals = [
+      ...jaxpr.inBinders
+        .filter((_, i) => !bodyUndefPrimals[i])
+        .map((v) => v.aval),
+      ...jaxpr.inBinders
+        .filter((_, i) => bodyUndefPrimals[i])
+        .map((v) => v.aval),
+    ];
+
+    const numTangentCarry = numCarryHalf;
+
+    const { jaxpr: tangentBody } = makeJaxpr(
+      (...tangentBodyArgs: Tracer[]): Tracer[] => {
+        const numPrimalInputs = jaxpr.inBinders.filter(
+          (_, i) => !bodyUndefPrimals[i],
+        ).length;
+        const primalResiduals = tangentBodyArgs.slice(0, numPrimalInputs);
+        const tangentInputs = tangentBodyArgs.slice(numPrimalInputs);
+
+        const fullInputs: Tracer[] = [];
+        let primalIdx = 0;
+        let tangentIdx = 0;
+        for (let i = 0; i < jaxpr.inBinders.length; i++) {
+          if (bodyUndefPrimals[i]) {
+            fullInputs.push(tangentInputs[tangentIdx++]);
+          } else {
+            fullInputs.push(primalResiduals[primalIdx++]);
+          }
+        }
+
+        const fullOuts = evalJaxpr(jaxpr, fullInputs);
+        // Extract tangent carry outputs (second half)
+        const tangentOuts = fullOuts.slice(numCarryHalf);
+        for (let i = 0; i < numCarryHalf; i++) fullOuts[i].dispose();
+        return tangentOuts;
+      },
+      { validateRefs: false },
+    )(...tangentBodyInAvals);
+
+    // ---- Transpose the tangent body (cache-owned) ----
+    const tangentBodyUndefPrimals = [
+      ...Array(
+        tangentBody.jaxpr.inBinders.length -
+          (numTangentConsts + numTangentCarry),
+      ).fill(false),
+      ...Array(numTangentConsts + numTangentCarry).fill(true),
+    ];
+
+    const transposedBody = transposeJaxpr(
+      tangentBody.jaxpr,
+      tangentBodyUndefPrimals,
+    );
+
+    // ---- Forward pass: collect primal carry at each step via Scan ----
+    const constResiduals = args
+      .slice(0, numConsts)
+      .filter((_, i) => !bodyUndefPrimals[i]) as Tracer[];
+    const primalCarryInit = args.slice(
+      numConsts,
+      numConsts + numCarryHalf,
+    ) as Tracer[];
+
+    // Build Forward Scan body:
+    // Takes: [i, ...primalCarry]
+    // Returns: [iNext, ...nextPrimalCarry, i, ...primalCarry]  <- stacked ys are the history
+    const { jaxpr: fwdScanBody } = makeJaxpr(
+      (iIn: Tracer, ...carryIn: Tracer[]) => {
+        const forwardOuts = evalJaxpr(primalForwardJaxpr.jaxpr, [
+          ...primalForwardJaxpr.consts,
+          ...constResiduals,
+          iIn,
+          ...carryIn,
+        ]);
+        const iNext = bind(Primitive.Add, [
+          iIn,
+          array(1, { dtype: iDtype }),
+        ])[0];
+        return [iNext, ...forwardOuts, iIn, ...carryIn];
+      },
+    )(
+      new ShapedArray([], iDtype, false) as any,
+      ...primalCarryInit.map((c) => c.aval as any),
+    );
+
+    const initialILoc = typeof lowerDim === "number" ? lowerDim : 0;
+    const initialIArr = array(initialILoc, { dtype: iDtype });
+    const fwdScanOuts = bind(
+      Primitive.Scan,
+      [...fwdScanBody.consts, initialIArr, ...primalCarryInit],
+      {
+        jaxpr: fwdScanBody.jaxpr,
+        numConsts: fwdScanBody.consts.length,
+        numCarry: 1 + numCarryHalf,
+        length: N,
+        reverse: false,
+      },
+    ) as Tracer[];
+
+    // Dispose forward scan carry outputs (final i + final primal carries)
+    const ysStart = 1 + numCarryHalf;
+    for (let i = 0; i < ysStart; i++) fwdScanOuts[i].dispose();
+    initialIArr.dispose();
+    const historyI = fwdScanOuts[ysStart];
+    const historyPrimals = fwdScanOuts.slice(ysStart + 1);
+
+    // ---- Backward pass via Scan ----
+    const ctCarryInit = cts.slice(numCarryHalf);
+
+    const tangentConstsAvals = tangentBodyInAvals.slice(0, numTangentConsts);
+
+    const { jaxpr: bwdScanBody } = makeJaxpr((...bwdArgs: Tracer[]) => {
+      const ctConstsIn = bwdArgs.slice(0, numTangentConsts);
+      const ctCarryIn = bwdArgs.slice(
+        numTangentConsts,
+        numTangentConsts + numTangentCarry,
+      );
+      const iArr_k = bwdArgs[numTangentConsts + numTangentCarry];
+      const primals_k = bwdArgs.slice(numTangentConsts + numTangentCarry + 1);
+
+      const transposedInputs = [
+        ...transposedBody.consts,
+        ...constResiduals,
+        iArr_k,
+        ...primals_k,
+        ...ctCarryIn,
+      ];
+
+      const transposedOuts = evalJaxpr(transposedBody.jaxpr, transposedInputs);
+
+      const ctConstsStep = transposedOuts.slice(0, numTangentConsts);
+      const ctCarryStep = transposedOuts.slice(
+        numTangentConsts,
+        numTangentConsts + numTangentCarry,
+      );
+
+      const ctConstsOut = ctConstsIn.map(
+        (c, idx) => bind(Primitive.Add, [c, ctConstsStep[idx]])[0],
+      );
+
+      return [...ctConstsOut, ...ctCarryStep];
+    })(
+      ...Array.from(
+        { length: numTangentConsts },
+        (_, i) =>
+          new ShapedArray(
+            tangentConstsAvals[i].shape,
+            tangentConstsAvals[i].dtype,
+            false,
+          ) as any,
+      ),
+      ...ctCarryInit.map((c, i) =>
+        c
+          ? (c.aval as any)
+          : (new ShapedArray(
+              primalCarryInit[i].shape,
+              primalCarryInit[i].dtype,
+              false,
+            ) as any),
+      ),
+      new ShapedArray([], iDtype, false) as any,
+      ...primalCarryInit.map((c) => c.aval as any),
+    );
+
+    const ctConstsZeros = Array.from({ length: numTangentConsts }, (_, i) =>
+      zerosInternal(tangentConstsAvals[i].shape, tangentConstsAvals[i].dtype),
+    );
+    const ctCarrySafeInit = ctCarryInit.map(
+      (c, i) =>
+        c || zerosInternal(primalCarryInit[i].shape, primalCarryInit[i].dtype),
+    );
+
+    const bwdScanOuts = bind(
+      Primitive.Scan,
+      [
+        ...bwdScanBody.consts,
+        ...ctConstsZeros,
+        ...ctCarrySafeInit,
+        historyI,
+        ...historyPrimals,
+      ],
+      {
+        jaxpr: bwdScanBody.jaxpr,
+        numConsts: bwdScanBody.consts.length,
+        numCarry: numTangentConsts + numTangentCarry,
+        length: N,
+        reverse: true,
+      },
+    ) as Tracer[];
+
+    const ctConstsFinal = bwdScanOuts.slice(0, numTangentConsts);
+    const ctCarryFinal = bwdScanOuts.slice(
+      numTangentConsts,
+      numTangentConsts + numTangentCarry,
+    );
+
+    const resultCts: (Tracer | null)[] = [];
+    let ctConstsIdx = 0;
+    for (let i = 0; i < numConsts; i++) {
+      resultCts.push(bodyUndefPrimals[i] ? ctConstsFinal[ctConstsIdx++] : null);
+    }
+
+    let ctCarryIdx = 0;
+    for (let i = 0; i < numCarryTotal; i++) {
+      if (i < numCarryHalf) {
+        resultCts.push(null);
+      } else if (args[numConsts + i] instanceof UndefPrimal) {
+        resultCts.push(ctCarryFinal[ctCarryIdx++]);
+      } else {
+        // JVP tangent carry that isn't actually UndefPrimal (e.g., zero init
+        // created inside the function) — dispose computed ct, return null.
+        ctCarryFinal[ctCarryIdx++].dispose();
+        resultCts.push(null);
+      }
+    }
+
+    // Dispose intermediate arrays (only locally-created ones)
+    historyI.dispose();
+    for (const t of historyPrimals) t.dispose();
+    for (const t of ctConstsZeros) t.dispose();
+    // Only dispose zeros we created, not caller-owned cts
+    for (let i = 0; i < ctCarrySafeInit.length; i++) {
+      if (ctCarrySafeInit[i] !== ctCarryInit[i]) ctCarrySafeInit[i].dispose();
+    }
+
+    // Dispose locally-created ClosedJaxpr objects. Their consts were .ref'd
+    // by the scan body builders; disposing balances those refs. In tracing
+    // mode the outer builder also .ref'd them, so they survive; in eager
+    // mode the scans have finished and the consts are freed.
+    // transposedBody is cache-owned (transposeJaxprCache) — do NOT dispose.
+    primalForwardJaxpr.dispose();
+    tangentBody.dispose();
+    fwdScanBody.dispose();
+    bwdScanBody.dispose();
+
+    return resultCts;
   },
 };
 
@@ -2439,7 +3704,14 @@ const transposeJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
 _registerJitCacheDisposer(() => {
   for (const inner of transposeJaxprCache.values()) {
     for (const cj of inner.values()) {
-      cj.dispose();
+      // Guard against consts already disposed by earlier cache cleaners
+      // (e.g., jvpJaxprCache cleaned first, sharing underlying Literal
+      // arrays with transposed body consts).
+      try {
+        cj.dispose();
+      } catch {
+        // Already disposed — tolerate during bulk cleanup.
+      }
     }
   }
   transposeJaxprCache.clear();
@@ -2572,11 +3844,9 @@ function vjpFlat(
   // Phase 3: Call-time transposition.
   //
   // evalJaxprTransposed runs with concrete arrays when fVjp is invoked.
-  // For scan-containing jaxprs, the scan transpose rule creates
-  // ScanPullbackArtifact and runs the checkpoint-based backward pass.
-  // For non-scan jaxprs, evalJaxprTransposed applies per-equation
-  // transpose rules directly. In both cases, evalJaxprTransposed
-  // preserves caller-owned args and cotangents (no .ref needed).
+  // The scan transpose rule emits in-graph Primitive.Scan calls for the
+  // backward pass.  evalJaxprTransposed applies per-equation transpose
+  // rules directly and preserves caller-owned args and cotangents.
   const fVjp = (...cotangents: Tracer[]) => {
     const transposeInputs = [
       ...forwardJaxpr.consts,

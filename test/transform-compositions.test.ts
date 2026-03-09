@@ -388,6 +388,11 @@ suite("depth-4 compositions", () => {
     expect(r).toBeAllclose(F2);
   });
 
+  // FIXME: grad⁴(x³) causes use-after-free in the autodiff transpose pass.
+  // The polynomial AD path (mul → add chains) doesn't correctly retain
+  // intermediates at nesting depth 4. grad⁴(sin) works fine because sin's
+  // AD decomposition avoids the problematic mul-transpose ownership pattern.
+  // Until fixed, depth-4 derivatives use jvp(grad³(f)) instead of grad⁴(f).
   // --- vjp at depth 3 (depth 4 causes UAF — known framework limitation) ---
   test("vjp(grad(grad(f))) — depth 3 agreement", () => {
     const [y, backward] = vjp(grad(grad(fn)), [X]);
@@ -533,6 +538,7 @@ suite("regression: transform composition edge cases", () => {
     using r3 = grad(grad(grad(sinFn)))(x);
     expect(r3).toBeAllclose(-cosX, { atol: 1e-4 });
 
+    // FIXME: uses jvp to avoid depth-4 grad leak (see FIXME in depth-4 suite)
     // f⁴(sin) = sin(x) — compute via jvp to avoid depth-4 leak
     const [, dy] = jvp(grad(grad(grad(sinFn))), [x], [1]);
     using _dy = dy;
@@ -926,7 +932,7 @@ suite("vjp as inner layer", () => {
 // ============================================================
 suite("depth-5 stress tests", () => {
   test("f⁴ = 0 via jvp(grad(grad(grad(f)))) for x³", () => {
-    // Use jvp to get the 4th derivative without depth-4 grad chain
+    // FIXME: uses jvp to avoid depth-4 grad leak (see FIXME in depth-4 suite)
     const [y, dy] = jvp(grad(grad(grad(fn))), [X], [1]);
     using _y = y;
     using _dy = dy;

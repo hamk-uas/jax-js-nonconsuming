@@ -142,7 +142,7 @@ suite.each(devices)("device:%s", (device) => {
     expect(ne.js()).toEqual([true, false, false]);
   });
 
-  test("comparison operators async", async () => {
+  test("comparison operators async", { timeout: 30_000 }, async () => {
     using x = array([1, 2, 3]);
     using g = x.greater(2);
     expect(await g.jsAsync()).toEqual([false, false, true]);

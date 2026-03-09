@@ -38,6 +38,22 @@ export function hasSymbolicDims(shape: readonly Dim[]): boolean {
 }
 
 /**
+ * Subtract two dimensions: `a - b`.
+ * Returns a concrete number when both are concrete, the `Dim` `a` when
+ * `b === 0`, or `0` when `a` and `b` are the same symbolic dim.
+ * Throws if the subtraction cannot be resolved symbolically.
+ */
+export function dimSub(a: Dim, b: Dim): Dim {
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  if (typeof b === "number" && b === 0) return a;
+  if (a instanceof SymDim && b instanceof SymDim && a.name === b.name) return 0;
+  throw new Error(
+    `Cannot compute symbolic dimension subtraction: ${a} - ${b}. ` +
+      `foriLoop transpose requires lower=0 or both bounds concrete.`,
+  );
+}
+
+/**
  * Assert that a dimension is concrete, returning the number.
  * Throws if the dimension is symbolic.
  */

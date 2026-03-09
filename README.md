@@ -489,9 +489,150 @@ pnpm exec playwright install
 pnpm test
 pnpm run test:policy:strict  # Strict mode: no expected-failure debt
 pnpm run test:arch           # Architectural mode: failures gated by manifest
-pnpm run test:deno           # Deno WebGPU tests (isolated files)
 pnpm run test:website:smoke  # Website build + smoke checks
 ```
+
+#### Headless Chromium WebGPU setup
+
+Tests run in headless Chromium via Playwright with full WebGPU support. This requires a working
+Vulkan GPU driver on the host. Verify with:
+
+```bash
+vulkaninfo --summary   # Should show your GPU device
+```
+
+**Key requirements:**
+
+1. **Vulkan driver** — the headless Chrome flags in `vitest.config.ts` use `--use-angle=vulkan` to
+   route WebGPU through the host GPU. Without a working Vulkan driver, WebGPU tests will be skipped.
+2. **Playwright browsers** — `pnpm exec playwright install` downloads a bundled Chromium that
+   includes the Dawn WebGPU implementation.
+3. **Secure context** — WebGPU requires `isSecureContext === true`. Vitest's dev server serves on
+   `localhost`, which qualifies automatically. Direct `about:blank` navigation would not.
+4. **Display server** — even in headless mode, Chrome needs access to a display for GPU
+   initialization. On Linux, ensure `DISPLAY` is set (X11) or a Wayland session is active. The
+   config passes `DISPLAY` and `XAUTHORITY` from the environment.
+5. **No root / no sandbox** — the `--no-sandbox` flag avoids permission issues in containers or
+   non-root environments.
+
+The full set of Chrome flags used (configured in `vitest.config.ts`):
+
+```
+--no-sandbox --headless=new --use-angle=vulkan --enable-features=Vulkan
+--disable-vulkan-surface --enable-unsafe-webgpu
+```
+
+**Troubleshooting:**
+
+- If WebGPU tests are skipped, check `vulkaninfo --summary` and ensure your GPU driver is installed.
+- On headless servers (no display), use `Xvfb` or a virtual framebuffer.
+- COOP/COEP headers (required for `SharedArrayBuffer`) are configured in `vitest.config.ts`.
+
+#### Using this config in downstream libraries
+
+Libraries that depend on `@hamk-uas/jax-js-nonconsuming` (e.g. dlm-js) can reuse the same headless
+WebGPU setup. Install the required dev dependencies:
+
+```bash
+pnpm add -D vitest @vitest/browser-playwright playwright
+pnpm exec playwright install
+```
+
+Then create a `vitest.config.ts` with the same Chromium flags and COOP/COEP headers:
+
+```ts
+import { defineConfig } from "vitest/config";
+import { playwright } from "vitest/browser";
+
+export default defineConfig({
+  server: {
+    headers: {
+      "Cross-Origin-Embedder-Policy": "require-corp",
+      "Cross-Origin-Opener-Policy": "same-origin",
+    },
+  },
+  test: {
+    browser: {
+      enabled: true,
+      headless: true,
+      provider: playwright({
+        launchOptions: {
+          args: [
+            "--no-sandbox",
+            "--headless=new",
+            "--use-angle=vulkan",
+            "--enable-features=Vulkan",
+            "--disable-vulkan-surface",
+            "--enable-unsafe-webgpu",
+          ],
+          env: {
+            DISPLAY: process.env.DISPLAY ?? ":0",
+            XAUTHORITY:
+              process.env.XAUTHORITY ?? `/run/user/${process.getuid?.() ?? 1000}/gdm/Xauthority`,
+          },
+        },
+      }),
+      instances: [{ browser: "chromium" }],
+    },
+  },
+});
+```
+
+The Chrome flags route WebGPU through your host Vulkan driver in headless mode.
+
+#### Cross-origin isolation (required for full performance)
+
+Browsers gate `SharedArrayBuffer` behind
+[cross-origin isolation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer#security_requirements).
+Without it, the WASM worker pool cannot dispatch in parallel and several WebGPU features are
+unavailable. **This applies to production deployments, not just tests.**
+
+Your server must send two HTTP response headers on every page that uses jax-js:
+
+| Header                         | Value          |
+| ------------------------------ | -------------- |
+| `Cross-Origin-Embedder-Policy` | `require-corp` |
+| `Cross-Origin-Opener-Policy`   | `same-origin`  |
+
+The Vitest config above already sets these for the dev server. For production, configure your
+hosting platform. Examples:
+
+**Vercel** (`vercel.json` — this repo's own config):
+
+```json
+{
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "Cross-Origin-Embedder-Policy", "value": "require-corp" },
+        { "key": "Cross-Origin-Opener-Policy", "value": "same-origin" }
+      ]
+    }
+  ]
+}
+```
+
+**Nginx:**
+
+```nginx
+add_header Cross-Origin-Embedder-Policy "require-corp" always;
+add_header Cross-Origin-Opener-Policy   "same-origin"  always;
+```
+
+**Netlify** (`_headers`):
+
+```
+/*
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Opener-Policy: same-origin
+```
+
+> **Side effect:** `require-corp` means every sub-resource (image, script, iframe) must either be
+> same-origin or served with a `Cross-Origin-Resource-Policy: cross-origin` header. If your page
+> loads third-party assets without that header, they will be blocked. See the
+> [MDN guide](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Cross-Origin_Resource_Policy)
+> for details.
 
 Architectural mode is intended for large refactors and uses `.ci/expected-failures.json` as an
 explicit, expiring debt ledger. See `docs/testing-policy.md` for workflow details.
@@ -520,7 +661,6 @@ Pre-commit is branch-aware and runs via `scripts/precommit.sh`.
 - **Full profile** (default on `main`, `master`, `release/*`, `hotfix/*`):
   - everything in feature profile
   - `test:policy:strict`
-  - `test:deno`
   - `test:website:smoke`
 
 This keeps day-to-day feature iteration fast while enforcing release-grade checks when committing on
@@ -573,7 +713,6 @@ This section is for maintainers who create releases.
 pnpm build
 pnpm check
 pnpm run test:policy:strict
-pnpm run test:deno
 pnpm run test:website:smoke
 pnpm run test:eslint-plugin
 pnpm run lint:ownership:internal
@@ -662,7 +801,7 @@ continues independently.
 Before submitting a PR, run the full CI checks locally:
 
 ```bash
-pnpm build && pnpm check && pnpm run test:policy:strict && pnpm run test:deno && pnpm run test:website:smoke && pnpm run test:eslint-plugin && pnpm run lint:ownership:internal && pnpm run lint:ownership:website
+pnpm build && pnpm check && pnpm run test:policy:strict && pnpm run test:website:smoke && pnpm run test:eslint-plugin && pnpm run lint:ownership:internal && pnpm run lint:ownership:website
 ```
 
 ## Differences from upstream
@@ -793,5 +932,5 @@ incorrectly or awkwardly in the other, especially around `.ref` and disposal dis
 ### AI-assisted development
 
 This fork is developed primarily using AI coding agents (GitHub Copilot, Claude, GPT, Gemini) with
-gentle human supervision. All changes go through the full CI pipeline (`pnpm test`, `pnpm check`,
-`pnpm run test:deno`) and the pre-commit hook runs the complete test suite before every commit.
+gentle human supervision. All changes go through the full CI pipeline (`pnpm test`, `pnpm check`)
+and the pre-commit hook runs the complete test suite before every commit.

@@ -4,9 +4,8 @@
  * Two benchmark categories:
  * 1. Large elementwise operations — measures single-thread throughput.
  *    Note: WasmWorkerPool parallel dispatch requires SharedArrayBuffer
- *    (COOP/COEP headers or Deno), which is unavailable in Vitest's iframe
- *    runner. These benchmarks establish single-thread baselines; parallel
- *    speedup is measured in Deno tests (test/deno/orchestrator.test.ts).
+ *    (COOP/COEP headers), which is unavailable in Vitest's iframe
+ *    runner. These benchmarks establish single-thread baselines.
  *
  * 2. Variable-length JIT — verifies that dynamic_axes avoids recompilation
  *    when input sizes change on the dynamic axis.

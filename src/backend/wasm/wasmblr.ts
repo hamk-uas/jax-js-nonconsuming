@@ -161,6 +161,24 @@ class Memory {
     cg._emit(0x00); // src memory index
   }
 
+  /**
+   * Bulk memory fill: fills `n` bytes at `dst` with the given byte value.
+   * Stack: [dst: i32, val: i32, n: i32] → []
+   * Part of the bulk memory operations proposal (supported in all modern runtimes).
+   */
+  fill() {
+    const cg = this.cg;
+    const n = cg._pop();
+    const val = cg._pop();
+    const dst = cg._pop();
+    assert(n.typeId === cg.i32.typeId, "memory.fill: expected i32 length");
+    assert(val.typeId === cg.i32.typeId, "memory.fill: expected i32 value");
+    assert(dst.typeId === cg.i32.typeId, "memory.fill: expected i32 dst");
+    cg._emit(0xfc); // prefix byte
+    cg._emit(encodeUnsigned(0x0b)); // memory.fill opcode
+    cg._emit(0x00); // memory index
+  }
+
   get isImport(): boolean {
     return this.aString.length > 0 && this.bString.length > 0;
   }

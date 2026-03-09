@@ -91,11 +91,23 @@ ${outputIndices ? `var<workgroup> shared_idx: array<i32, ${workgroupSize * 2}>;`
 
 fn compare(a: ${ty}, b: ${ty}) -> bool {
 ${
-  // Roundabout way to handle NaNs, they sort to end
+  // NaN sorts to end: non-NaN < NaN, NaN is never less than anything.
+  // WGSL NaN comparison behavior is implementation-defined (x != x can return
+  // false on some backends like wgpu-rs/Vulkan). Must use IEEE 754 bitcast.
   isFloatDtype(dtype)
-    ? `
-  let min_value = min(a, b);
-  return a == min_value && b != min_value;`
+    ? dtype === DType.Float16
+      ? `
+  let a_bits = bitcast<u32>(vec2<f16>(a, f16(0.0))) & 0xFFFFu;
+  let b_bits = bitcast<u32>(vec2<f16>(b, f16(0.0))) & 0xFFFFu;
+  let a_nan = (a_bits & 0x7C00u) == 0x7C00u && (a_bits & 0x03FFu) != 0u;
+  let b_nan = (b_bits & 0x7C00u) == 0x7C00u && (b_bits & 0x03FFu) != 0u;
+  return !a_nan && (b_nan || a < b);`
+      : `
+  let a_bits = bitcast<u32>(a);
+  let b_bits = bitcast<u32>(b);
+  let a_nan = (a_bits & 0x7F800000u) == 0x7F800000u && (a_bits & 0x007FFFFFu) != 0u;
+  let b_nan = (b_bits & 0x7F800000u) == 0x7F800000u && (b_bits & 0x007FFFFFu) != 0u;
+  return !a_nan && (b_nan || a < b);`
     : "  return a < b;"
 }
 }

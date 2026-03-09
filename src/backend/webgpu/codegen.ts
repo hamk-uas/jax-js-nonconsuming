@@ -87,6 +87,37 @@ export function constToWgsl(dtype: DType, value: any): string {
   throw new Error(`Unsupported const dtype: ${dtype}`);
 }
 
+/**
+ * Emit a WGSL saturating cast from float→int, matching WASM trunc_sat semantics.
+ *
+ * WGSL `i32(float)` is implementation-defined for out-of-range values.
+ * WASM `i32.trunc_sat_f32_s` saturates to INT32_MIN/MAX. We match that.
+ *
+ * For in-range float→int or any int→int/float→float, returns a plain cast.
+ */
+export function castSaturateWgsl(
+  value: string,
+  fromDtype: DType,
+  toDtype: DType,
+): string {
+  const isFromFloat =
+    fromDtype === DType.Float32 || fromDtype === DType.Float16;
+  const target = dtypeToWgsl(toDtype);
+
+  if (isFromFloat && toDtype === DType.Int32) {
+    // f32 can't represent 2147483647; 2147483648.0 is exact (2^31).
+    // select(falseVal, trueVal, cond): cond ? trueVal : falseVal
+    return `select(select(${target}(${value}), 2147483647, ${value} >= 2147483648.0), -2147483648, ${value} < -2147483648.0)`;
+  }
+
+  if (isFromFloat && toDtype === DType.Uint32) {
+    // 4294967296.0 is exact (2^32). Negative → 0.
+    return `select(select(${target}(${value}), 4294967295u, ${value} >= 4294967296.0), 0u, ${value} < 0.0)`;
+  }
+
+  return `${target}(${value})`;
+}
+
 export const gridOffsetY = 16384;
 
 export function calculateGrid(gridSize: number): [number, number] {

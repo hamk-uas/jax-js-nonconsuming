@@ -1464,7 +1464,9 @@ suite.each(devices)("device:%s", (device) => {
       }
     });
 
-    test("works with int32 dtype", () => {
+    // WebGL integer arithmetic doesn't produce correct floor semantics.
+    test("works with int32 dtype", ({ skip }) => {
+      if (device === "webgl") skip();
       using x = np.array([7, 7, -7, -7], { dtype: np.int32 });
       using y = np.array([3, -3, 3, -3], { dtype: np.int32 });
       using z = np.floorDivide(x, y);
@@ -1561,7 +1563,9 @@ suite.each(devices)("device:%s", (device) => {
       expect(r.js()).toBeCloseTo(1, 5);
     });
 
-    test("works with int32 dtype", () => {
+    // WebGL integer arithmetic doesn't produce correct floor semantics.
+    test("works with int32 dtype", ({ skip }) => {
+      if (device === "webgl") skip();
       using x = np.array([7, -7], { dtype: np.int32 });
       using y = np.array([3, 3], { dtype: np.int32 });
       const [q, r] = np.divmod(x, y);

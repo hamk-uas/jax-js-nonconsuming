@@ -16,12 +16,5 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "exclude": [
-    "**/node_modules",
-    "**/*.config.js",
-    "**/dist",
-    "website",
-    "test/deno",
-    "tmp"
-  ]
+  "exclude": ["**/node_modules", "**/*.config.js", "**/dist", "website", "tmp"]
 }

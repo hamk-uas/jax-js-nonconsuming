@@ -119,4 +119,30 @@ describe("associativeScan vs scan (WASM)", () => {
   bench("scan cumprod N=1024", () => {
     seqCumprod(xsProd).dispose();
   });
+
+  // --- Reverse cumulative sum N=1024 ---
+  const assocCumsumRev1k = jit((xs: any) =>
+    lax.associativeScan((a: any, b: any) => np.add(a, b), xs, {
+      reverse: true,
+    }),
+  );
+  assocCumsumRev1k(xs1k).dispose();
+  afterAll(() => assocCumsumRev1k.dispose());
+
+  bench("associativeScan cumsum reverse N=1024", () => {
+    assocCumsumRev1k(xs1k).dispose();
+  });
+
+  // --- Reverse cumulative sum N=4096 ---
+  const assocCumsumRev4k = jit((xs: any) =>
+    lax.associativeScan((a: any, b: any) => np.add(a, b), xs, {
+      reverse: true,
+    }),
+  );
+  assocCumsumRev4k(xs4k).dispose();
+  afterAll(() => assocCumsumRev4k.dispose());
+
+  bench("associativeScan cumsum reverse N=4096", () => {
+    assocCumsumRev4k(xs4k).dispose();
+  });
 });

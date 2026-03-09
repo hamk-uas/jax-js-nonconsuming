@@ -183,12 +183,6 @@ export default defineConfig([
     files: ["test/**/*.{js,mjs,cjs,ts}"],
     ...(jaxJsPlugin.configs!.invariance as any),
   },
-  // Deno tests use URL imports (https://deno.land/...) and dist/ imports that
-  // typescript-eslint's project service can't resolve. Disable type-checked rules.
-  {
-    files: ["test/deno/**/*.ts"],
-    ...ts.configs.disableTypeChecked,
-  },
   {
     files: ["scripts/**/*.mjs"],
     languageOptions: { globals: globals.node },

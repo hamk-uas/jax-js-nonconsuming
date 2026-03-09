@@ -19,12 +19,9 @@ import {
 import { PPrint } from "../pprint";
 import { Routine } from "../routine";
 import {
-  concreteDim,
-  concreteShape,
   type Dim,
   dimProduct,
   hasSymbolicDims,
-  isSymbolicDim,
   isSymbolicSize,
   Pair,
   resolveDim,
@@ -45,26 +42,81 @@ import {
   range,
   rep,
 } from "../utils";
-import { aluCompare, Array as JaxArray, PendingExecute } from "./array";
+import { aluCompare, PendingExecute } from "./array";
+import { executeBlockMap } from "./block-map-executor";
 import {
   _registerCacheSizeGetter,
   _registerJitCacheDisposer,
 } from "./check-leaks";
 import { pool, poolTranspose, prepareConv } from "./convolution";
 import {
-  _associativeScanCoreImpl,
   Primitive,
   PrimitiveParams,
   promoteAvals,
   routinePrimitives,
   ShapedArray,
 } from "./core";
-import { Jaxpr, Lit, Var } from "./jaxpr";
-import { executeScan } from "./scan-executor";
+import { type Atom, Jaxpr, JaxprEqn, Lit, Var } from "./jaxpr";
+import { executeAssociativeScan, executeScan } from "./scan-executor";
 import type { AssocScanPlan, ScanPlan } from "./scan-plan";
 import { planAssociativeScan, planScan } from "./scan-plan";
-import type { WebGPUBackend } from "../backend/webgpu";
 import type { ScanPath } from "../utils";
+
+/**
+ * Rewrite a body jaxpr: replace all `Primitive.BlockIndex` equations with a
+ * reference to a new synthetic input (appended as the last inBinder).
+ * Returns the original jaxpr unchanged if no BlockIndex is present.
+ */
+function rewriteBlockIndex(jaxpr: Jaxpr): {
+  jaxpr: Jaxpr;
+  hasBlockIndex: boolean;
+} {
+  const biEqns: number[] = [];
+  for (let i = 0; i < jaxpr.eqns.length; i++) {
+    if (jaxpr.eqns[i].primitive === Primitive.BlockIndex) biEqns.push(i);
+  }
+  if (biEqns.length === 0) return { jaxpr, hasBlockIndex: false };
+
+  // Create synthetic inBinder for the block index
+  const biVar = new Var(new ShapedArray([], DType.Int32, false));
+
+  // Map old BlockIndex output Vars → biVar
+  const varMap = new Map<Var, Var>();
+  for (const idx of biEqns) {
+    for (const outBinder of jaxpr.eqns[idx].outBinders) {
+      varMap.set(outBinder, biVar);
+    }
+  }
+
+  // Remap atom references
+  const remapAtom = (a: Atom): Atom =>
+    a instanceof Var ? (varMap.get(a) ?? a) : a;
+
+  // Filter out BlockIndex eqns and remap Var references in remaining eqns
+  const newEqns: JaxprEqn[] = [];
+  for (let i = 0; i < jaxpr.eqns.length; i++) {
+    if (jaxpr.eqns[i].primitive === Primitive.BlockIndex) continue;
+    const eqn = jaxpr.eqns[i];
+    const newInputs = eqn.inputs.map(remapAtom);
+    const needsRemap = newInputs.some((a, j) => a !== eqn.inputs[j]);
+    if (needsRemap) {
+      const newEqn = new JaxprEqn(
+        eqn.primitive,
+        newInputs,
+        eqn.params,
+        eqn.outBinders,
+      );
+      newEqn.copyEffectsFrom(eqn);
+      newEqns.push(newEqn);
+    } else {
+      newEqns.push(eqn);
+    }
+  }
+
+  const newOuts = jaxpr.outs.map(remapAtom);
+  const newJaxpr = new Jaxpr([...jaxpr.inBinders, biVar], newEqns, newOuts);
+  return { jaxpr: newJaxpr, hasBlockIndex: true };
+}
 
 export type JitId = number;
 
@@ -115,9 +167,12 @@ export type JitStep =
       dst: JitId; // the destination buffer (mutated via Mutate effect)
       src: JitId; // the source slice to copy
       output: JitId; // the result (same slot as dst if recycled, else separate)
-      offsetBytes: number; // byte offset into dst where src is written
-      sliceBytes: SizeExpr; // byte size of the src slice
+      offsetBytes: number; // per-fiber byte offset into dst where src is written
+      sliceBytes: SizeExpr; // byte size of the src slice (axis=0 fast path)
       dstSizeBytes: SizeExpr; // total byte size of dst (= output size)
+      outerFibers: number; // product(shape[0:axis]), 1 for axis=0
+      srcFiberBytes: number; // bytes per fiber in src (stride between fibers)
+      dstFiberBytes: number; // bytes per fiber in dst (stride between fibers)
     }
   | {
       type: "scatter_add";
@@ -128,6 +183,16 @@ export type JitStep =
       axis: number;
       targetShape: number[];
       updatesLen: number; // number of updates along the scatter axis
+      dtype: DType;
+    }
+  | {
+      type: "reverse";
+      input: JitId;
+      output: JitId;
+      axis: number;
+      axisSize: Dim;
+      innerBytes: number;
+      totalBytes: SizeExpr;
       dtype: DType;
     }
   | {
@@ -144,6 +209,52 @@ export type JitStep =
       constAvals: ShapedArray[];
       elemAvals: ShapedArray[];
       outputs: JitId[];
+    }
+  | {
+      type: "block_map";
+      bodyProgram: JitProgram;
+      bodyJaxpr: Jaxpr;
+      blockShape: number[];
+      inAxes: (number | null)[][];
+      outAxes: (number | null)[][];
+      numConsts: number;
+      numInputs: number;
+      /** Potentially symbolic — must be resolved via dimBindings at execution. */
+      inputShapes: Dim[][];
+      /** Potentially symbolic — must be resolved via dimBindings at execution. */
+      outputShapes: Dim[][];
+      consts: JitId[];
+      inputs: JitId[];
+      outputs: JitId[];
+      threadTile?: number[];
+      /** Explicit grid shape from BlockMap params. */
+      explicitGridShape?: number[];
+      /** Body uses BlockIndex: the compiled body program has one extra input (block index scalar). */
+      hasBlockIndex?: boolean;
+    }
+  | {
+      type: "fori_loop";
+      bodyProgram: JitProgram;
+      bodyJaxpr: Jaxpr;
+      lower: number | Dim;
+      upper: number | Dim;
+      numConsts: number;
+      consts: JitId[];
+      initCarries: JitId[];
+      outputs: JitId[];
+      /** Byte size of each carry buffer (for copy at end of loop). */
+      carrySizeBytes: number[];
+    }
+  | {
+      type: "workgroup_assoc_scan";
+      bodyProgram: JitProgram;
+      bodyJaxpr: Jaxpr;
+      numConsts: number;
+      numElems: number;
+      consts: JitId[];
+      elems: JitId[];
+      outputs: JitId[];
+      elemAvals: ShapedArray[];
     };
 
 /** Per-type step counts from {@link JitProgram.stepCounts}. */
@@ -156,7 +267,11 @@ export interface JitStepCounts {
   scan: number;
   dus: number;
   scatter_add: number;
+  reverse: number;
   assoc_scan: number;
+  block_map: number;
+  fori_loop: number;
+  workgroup_assoc_scan: number;
 }
 
 /**
@@ -226,9 +341,22 @@ function computePoolHints(steps: JitStep[]): PoolHints {
   return { peakBytes, mallocSizes };
 }
 
+/** Compute slotCount from steps when not provided by the builder. */
+function computeSlotCount(steps: JitStep[], inputs: JitId[]): number {
+  let max = 0;
+  for (const id of inputs) if (id >= max) max = id + 1;
+  for (const step of steps) {
+    if (step.type === "malloc" && step.output >= max) max = step.output + 1;
+    if (step.type === "recycle" && step.output >= max) max = step.output + 1;
+  }
+  return max;
+}
+
 /** Result of compiling a Jaxpr. Can be evaluated on a series of inputs. */
 export class JitProgram {
   readonly poolHints: PoolHints;
+  /** Total number of distinct JitIds (for fast Slot[] scope). */
+  readonly slotCount: number;
   /** Cached mega-module: undefined = not attempted, null = unsupported. */
   private _megaModule?: WasmMegaModule | null;
   /** M6.2c: worker pool registration state for parallel mega-module dispatch.
@@ -240,8 +368,10 @@ export class JitProgram {
     readonly steps: JitStep[],
     readonly inputs: JitId[],
     readonly outputs: JitId[],
+    slotCount?: number,
   ) {
     this.poolHints = computePoolHints(steps);
+    this.slotCount = slotCount ?? computeSlotCount(steps, inputs);
   }
 
   pprint(): PPrint {
@@ -286,10 +416,26 @@ export class JitProgram {
           return PPrint.pp(
             `%${step.output} = scatter_add %${step.target} %${step.indices} %${step.updates} axis=${step.axis}`,
           );
+        case "reverse":
+          return PPrint.pp(
+            `%${step.output} = reverse %${step.input} axis=${step.axis} axisSize=${step.axisSize}`,
+          );
         case "assoc_scan":
           return PPrint.pp(
             `assoc_scan [${step.plan.path}] numLeaves=${step.numLeaves} numConsts=${step.numConsts} axis=${step.axis}` +
               (step.reverse ? " reverse" : ""),
+          );
+        case "block_map":
+          return PPrint.pp(
+            `block_map blockShape=[${step.blockShape}] numConsts=${step.numConsts} numInputs=${step.numInputs} inputShapes=[${step.inputShapes.map((s) => `[${s}]`).join(",")}]`,
+          );
+        case "fori_loop":
+          return PPrint.pp(
+            `fori_loop lower=${step.lower} upper=${step.upper} numConsts=${step.numConsts}`,
+          );
+        case "workgroup_assoc_scan":
+          return PPrint.pp(
+            `workgroup_assoc_scan numElems=${step.numElems} numConsts=${step.numConsts}`,
           );
       }
     });
@@ -326,7 +472,11 @@ export class JitProgram {
       scan: 0,
       dus: 0,
       scatter_add: 0,
+      reverse: 0,
       assoc_scan: 0,
+      block_map: 0,
+      fori_loop: 0,
+      workgroup_assoc_scan: 0,
     };
     for (const step of this.steps) {
       counts[step.type]++;
@@ -400,27 +550,65 @@ export class JitProgram {
       }
     }
 
-    const scope = new Map<JitId, Slot>();
+    const scope: Slot[] = new globalThis.Array(this.slotCount);
     if (inputs.length !== this.inputs.length) {
       throw new TypeError(
         `Expected ${this.inputs.length} inputs, got ${inputs.length}`,
       );
     }
-    for (const [i, id] of this.inputs.entries()) {
-      scope.set(id, inputs[i]);
+    for (let i = 0; i < this.inputs.length; i++) {
+      scope[this.inputs[i]] = inputs[i];
     }
-    const pending: PendingExecute[] = [];
+
+    // Batch direct dispatch: collect execute steps and flush as a single
+    // beginBatch/endBatch block.  Avoids PendingExecute object allocation
+    // and Map overhead while preserving ref-count safety.
+    type BatchEntry = {
+      source: Kernel | Routine;
+      inputs: Slot[];
+      outputs: Slot[];
+      dynamicParams?: number[];
+    };
+    const batch: BatchEntry[] = [];
+
+    const flushBatch = () => {
+      if (batch.length === 0) return;
+      this.backend.beginBatch?.();
+      try {
+        for (let i = 0; i < batch.length; i++) {
+          const e = batch[i];
+          const exe =
+            e.source instanceof Kernel
+              ? this.backend.prepareKernelSync(e.source)
+              : this.backend.prepareRoutineSync(e.source);
+          this.backend.dispatch(exe, e.inputs, e.outputs, e.dynamicParams);
+          for (const s of e.inputs) this.backend.decRef(s);
+          for (const s of e.outputs) this.backend.decRef(s);
+        }
+      } finally {
+        this.backend.endBatch?.();
+      }
+      batch.length = 0;
+    };
+
+    const flushSubPending = (sub: PendingExecute[]) => {
+      if (sub.length === 0) return;
+      flushPendingBatched(sub, this.backend);
+    };
     for (const step of this.steps) {
       switch (step.type) {
         case "execute": {
-          const inputs = step.inputs.map((id) => scope.get(id)!);
-          const outputs = step.outputs.map((id) => scope.get(id)!);
-          if (
-            inputs.some((s) => s === undefined) ||
-            outputs.some((s) => s === undefined)
-          ) {
-            throw new Error(`internal: JitProgram scope undefined`);
-          }
+          const si = step.inputs;
+          const so = step.outputs;
+          const ins: Slot[] = new globalThis.Array(si.length);
+          for (let j = 0; j < si.length; j++) ins[j] = scope[si[j]];
+          const outs: Slot[] = new globalThis.Array(so.length);
+          for (let j = 0; j < so.length; j++) outs[j] = scope[so[j]];
+
+          // Hold refs to prevent premature freeing by interleaved free steps
+          for (const s of ins) this.backend.incRef(s);
+          for (const s of outs) this.backend.incRef(s);
+
           // Compute dynamicParams for kernels with symbolic dimensions
           let dynamicParams: number[] | undefined;
           if (
@@ -428,24 +616,19 @@ export class JitProgram {
             step.source.needsDynamicParams &&
             dimBindings
           ) {
-            // dynamicParams[0]: resolved total size (concrete or symbolic)
             const resolvedSize = resolveSizeExpr(step.source.size, dimBindings);
             dynamicParams = [resolvedSize];
-            // dynamicParams[1]: resolved reduction size (when symbolic)
             const re = step.source.outputs[0].reduction;
             if (re && isSymbolicSize(re.size)) {
               dynamicParams.push(resolveSizeExpr(re.size, dimBindings));
             }
           }
-          pending.push(
-            new PendingExecute(
-              this.backend,
-              step.source,
-              inputs,
-              outputs,
-              dynamicParams,
-            ),
-          );
+          batch.push({
+            source: step.source,
+            inputs: ins,
+            outputs: outs,
+            dynamicParams,
+          });
           break;
         }
         case "malloc": {
@@ -453,37 +636,30 @@ export class JitProgram {
             typeof step.size === "number"
               ? step.size
               : resolveSizeExpr(step.size, dimBindings!);
-          const slot = this.backend.malloc(concreteSize);
-          scope.set(step.output, slot);
+          scope[step.output] = this.backend.malloc(concreteSize);
           break;
         }
         case "incref": {
-          const slot = scope.get(step.input)!;
-          this.backend.incRef(slot);
+          this.backend.incRef(scope[step.input]);
           break;
         }
         case "free": {
-          const slot = scope.get(step.input)!;
-          this.backend.decRef(slot);
-          scope.delete(step.input);
+          this.backend.decRef(scope[step.input]);
           break;
         }
         case "recycle": {
-          // Reuse the same backend Slot for a new JitId — zero backend calls.
-          const slot = scope.get(step.input)!;
-          scope.delete(step.input);
-          scope.set(step.output, slot);
+          scope[step.output] = scope[step.input];
           break;
         }
         case "scan": {
-          // Flush pending ops before scan — scan needs materialized inputs
-          flushPendingBatched(pending, this.backend);
+          // Flush batched dispatches before scan — scan needs materialized inputs
+          flushBatch();
 
           // Resolve slots from scope
-          const constSlots = step.consts.map((id) => scope.get(id)!);
-          const initCarrySlots = step.initCarry.map((id) => scope.get(id)!);
-          const xsSlots = step.xs.map((id) => scope.get(id)!);
-          const outputSlots = step.outputs.map((id) => scope.get(id)!);
+          const constSlots = step.consts.map((id) => scope[id]);
+          const initCarrySlots = step.initCarry.map((id) => scope[id]);
+          const xsSlots = step.xs.map((id) => scope[id]);
+          const outputSlots = step.outputs.map((id) => scope[id]);
 
           // IncRef consts and xs — executeScan borrows them
           for (const s of constSlots) this.backend.incRef(s);
@@ -508,28 +684,29 @@ export class JitProgram {
             xsSlots,
             xsAvals: step.xsAvals,
             outputSlots,
+            dimBindings,
           });
 
           // DecRef borrowed consts and xs
           for (const s of constSlots) this.backend.decRef(s);
           for (const s of xsSlots) this.backend.decRef(s);
 
-          // Propagate scan pending ops
-          pending.push(...result.pending);
+          // Flush sub-executor pending ops immediately
+          flushSubPending(result.pending);
 
           // Update scope with output slots
           for (let oi = 0; oi < step.outputs.length; oi++) {
-            scope.set(step.outputs[oi], result.outputs[oi]);
+            scope[step.outputs[oi]] = result.outputs[oi];
           }
           break;
         }
         case "dus": {
-          // Flush pending ops — DUS needs materialized inputs
-          flushPendingBatched(pending, this.backend);
+          // Flush batched dispatches — DUS needs materialized inputs
+          flushBatch();
 
-          const dstSlot = scope.get(step.dst)!;
-          const srcSlot = scope.get(step.src)!;
-          const outSlot = scope.get(step.output)!;
+          const dstSlot = scope[step.dst];
+          const srcSlot = scope[step.src];
+          const outSlot = scope[step.output];
 
           // Zero-copy: if effectDrivenAllocate recycled dst → output,
           // skip the full copy (they share the same buffer).
@@ -537,10 +714,6 @@ export class JitProgram {
             typeof step.dstSizeBytes === "number"
               ? step.dstSizeBytes
               : resolveSizeExpr(step.dstSizeBytes, dimBindings!);
-          const concreteSliceSize =
-            typeof step.sliceBytes === "number"
-              ? step.sliceBytes
-              : resolveSizeExpr(step.sliceBytes, dimBindings!);
 
           if (dstSlot !== outSlot) {
             this.backend.copyBufferToBuffer!(
@@ -551,24 +724,42 @@ export class JitProgram {
               concreteDstSize,
             );
           }
-          // Copy src slice into output at the byte offset
-          this.backend.copyBufferToBuffer!(
-            srcSlot,
-            0,
-            outSlot,
-            step.offsetBytes,
-            concreteSliceSize,
-          );
+          // Copy src slice into output — fiber loop for axis > 0
+          if (step.outerFibers === 1) {
+            // Contiguous fast path (axis=0)
+            const concreteSliceSize =
+              typeof step.sliceBytes === "number"
+                ? step.sliceBytes
+                : resolveSizeExpr(step.sliceBytes, dimBindings!);
+            this.backend.copyBufferToBuffer!(
+              srcSlot,
+              0,
+              outSlot,
+              step.offsetBytes,
+              concreteSliceSize,
+            );
+          } else {
+            // Fiber-by-fiber copy for non-contiguous axis > 0
+            for (let i = 0; i < step.outerFibers; i++) {
+              this.backend.copyBufferToBuffer!(
+                srcSlot,
+                i * step.srcFiberBytes,
+                outSlot,
+                i * step.dstFiberBytes + step.offsetBytes,
+                step.srcFiberBytes,
+              );
+            }
+          }
           break;
         }
         case "scatter_add": {
-          // Flush pending ops — scatter_add needs materialized inputs
-          flushPendingBatched(pending, this.backend);
+          // Flush batched dispatches — scatter_add needs materialized inputs
+          flushBatch();
 
-          const targetSlot = scope.get(step.target)!;
-          const indicesSlot = scope.get(step.indices)!;
-          const updatesSlot = scope.get(step.updates)!;
-          const outSlot = scope.get(step.output)!;
+          const targetSlot = scope[step.target];
+          const indicesSlot = scope[step.indices];
+          const updatesSlot = scope[step.updates];
+          const outSlot = scope[step.output];
 
           // Copy target to output if not already recycled
           const targetBytes = prod(step.targetShape) * byteWidth(step.dtype);
@@ -594,137 +785,298 @@ export class JitProgram {
           );
           break;
         }
-        case "assoc_scan": {
-          // Flush pending ops — assoc_scan needs materialized inputs
-          flushPendingBatched(pending, this.backend);
+        case "reverse": {
+          // Flush batched dispatches — reverse needs materialized input
+          flushBatch();
 
-          if (step.plan.path === "compiled-loop") {
-            // Native WASM compiled-loop path: entire Kogge-Stone loop runs
-            // in a single WASM invocation. N is a runtime parameter,
-            // enabling polymorphic shapes (same compiled module for any N).
-            const nDim = step.elemAvals[0].shape[step.axis];
-            const N = isSymbolicDim(nDim)
-              ? concreteDim(
-                  resolveShape([nDim], dimBindings!)[0],
-                  "assoc_scan N",
-                )
-              : (nDim as number);
+          const inputSlot = scope[step.input];
+          const outSlot = scope[step.output];
+          const concreteAxisSize =
+            typeof step.axisSize === "number"
+              ? step.axisSize
+              : dimBindings!.get(
+                  (step.axisSize as import("../dim").SymDim).name,
+                )!;
 
-            const constSlots = step.consts.map((id) => scope.get(id)!);
-            const elemSlots = step.elems.map((id) => scope.get(id)!);
-            const outputSlots = step.outputs.map((id) => scope.get(id)!);
-
-            (this.backend as WasmBackend).dispatchNativeAssociativeScan(
-              step.plan.executable,
-              step.plan.params,
-              N,
-              constSlots,
-              elemSlots,
-              outputSlots,
-            );
-          } else if (step.plan.path === "webgpu-fused") {
-            // WebGPU fused path: entire Kogge-Stone ladder runs with
-            // one GPU dispatch per round (all body steps fused into
-            // a single WGSL shader). Ping-pong buffers swap each round.
-            const nDim = step.elemAvals[0].shape[step.axis];
-            const N = isSymbolicDim(nDim)
-              ? concreteDim(
-                  resolveShape([nDim], dimBindings!)[0],
-                  "assoc_scan N",
-                )
-              : (nDim as number);
-
-            const constSlots = step.consts.map((id) => scope.get(id)!);
-            const elemSlots = step.elems.map((id) => scope.get(id)!);
-            const outputSlots = step.outputs.map((id) => scope.get(id)!);
-
-            (this.backend as WebGPUBackend).dispatchAssocScan(
-              step.plan.prepared,
-              step.plan.params,
-              constSlots,
-              elemSlots,
-              outputSlots,
-              N,
-              step.reverse,
+          if (this.backend.reverseBuffer) {
+            this.backend.reverseBuffer(
+              inputSlot,
+              outSlot,
+              concreteAxisSize,
+              step.innerBytes,
+              step.dtype,
             );
           } else {
-            // Fallback: JS Kogge-Stone loop via vmap + evalJaxpr
-            // Create Array wrappers from input slots.
-            // Resolve symbolic shapes at execution time via dimBindings.
-            const resolveAvalShape = (shape: Dim[]): number[] =>
-              hasSymbolicDims(shape)
-                ? concreteShape(resolveShape(shape, dimBindings!))
-                : (shape as number[]);
+            // Generic fallback: copy slices in reverse order
+            for (let i = 0; i < concreteAxisSize; i++) {
+              this.backend.copyBufferToBuffer(
+                inputSlot,
+                i * step.innerBytes,
+                outSlot,
+                (concreteAxisSize - 1 - i) * step.innerBytes,
+                step.innerBytes,
+              );
+            }
+          }
+          break;
+        }
+        case "assoc_scan": {
+          // Flush batched dispatches — assoc_scan needs materialized inputs
+          flushBatch();
 
-            const constSlots = step.consts.map((id) => scope.get(id)!);
-            const constArrays = constSlots.map((slot, i) => {
-              this.backend.incRef(slot);
-              const aval = step.constAvals[i];
-              return new JaxArray({
-                source: slot,
-                st: ShapeTracker.fromShape(resolveAvalShape(aval.shape)),
-                dtype: aval.dtype,
-                weakType: aval.weakType,
-                backend: this.backend,
-                committed: false,
-              });
-            });
+          const constSlots = step.consts.map((id) => scope[id]);
+          const elemSlots = step.elems.map((id) => scope[id]);
+          const outputSlots = step.outputs.map((id) => scope[id]);
 
-            const elemSlots = step.elems.map((id) => scope.get(id)!);
-            const elemArrays = elemSlots.map((slot, i) => {
-              this.backend.incRef(slot);
-              const aval = step.elemAvals[i];
-              return new JaxArray({
-                source: slot,
-                st: ShapeTracker.fromShape(resolveAvalShape(aval.shape)),
-                dtype: aval.dtype,
-                weakType: aval.weakType,
-                backend: this.backend,
-                committed: false,
-              });
-            });
+          const assocResult = executeAssociativeScan({
+            backend: this.backend,
+            plan: step.plan,
+            bodyJaxpr: step.bodyJaxpr,
+            numLeaves: step.numLeaves,
+            numConsts: step.numConsts,
+            axis: step.axis,
+            reverse: step.reverse,
+            constSlots,
+            elemSlots,
+            constAvals: step.constAvals,
+            elemAvals: step.elemAvals,
+            outputSlots,
+            dimBindings,
+          });
 
-            // Call Kogge-Stone core impl with body jaxpr + consts.
-            // The core impl uses vmap internally to vectorize the element-level
-            // body jaxpr over the batch dimension.
-            const results = _associativeScanCoreImpl!(
-              step.bodyJaxpr,
-              constArrays,
-              elemArrays,
-              step.numLeaves,
-              step.axis,
-              step.reverse,
+          // Update scope with result slots (may differ from pre-allocated
+          // output slots when the fallback path replaces them).
+          for (let i = 0; i < step.numLeaves; i++) {
+            scope[step.outputs[i]] = assocResult.outputs[i];
+          }
+          flushSubPending(assocResult.pending);
+          break;
+        }
+        case "block_map": {
+          // Flush batched dispatches — block_map needs materialized inputs
+          flushBatch();
+
+          const constSlots = step.consts.map((id) => scope[id]);
+          const inputSlots = step.inputs.map((id) => scope[id]);
+          const outputSlots = step.outputs.map((id) => scope[id]);
+
+          // Resolve potentially-symbolic shapes to concrete numbers.
+          const inputShapes = step.inputShapes.map((s) =>
+            dimBindings ? resolveShape(s, dimBindings) : (s as number[]),
+          );
+          const outputShapes = step.outputShapes.map((s) =>
+            dimBindings ? resolveShape(s, dimBindings) : (s as number[]),
+          );
+
+          // Compute gridShape from explicit params or resolved input shapes.
+          const gridRank = step.blockShape.length;
+          const gridShape: number[] = step.explicitGridShape
+            ? [...step.explicitGridShape]
+            : new globalThis.Array(gridRank).fill(0);
+          if (!step.explicitGridShape) {
+            for (let ii = 0; ii < step.numInputs; ii++) {
+              const axes = step.inAxes[ii];
+              for (let g = 0; g < gridRank; g++) {
+                if (axes[g] !== null) {
+                  const dim = inputShapes[ii][axes[g]!];
+                  gridShape[g] = Math.ceil(dim / step.blockShape[g]);
+                }
+              }
+            }
+          }
+
+          const bmResult = executeBlockMap({
+            backend: this.backend,
+            bodyProgram: step.bodyProgram,
+            bodyJaxpr: step.bodyJaxpr,
+            blockShape: step.blockShape,
+            inAxes: step.inAxes,
+            outAxes: step.outAxes,
+            numConsts: step.numConsts,
+            numInputs: step.numInputs,
+            gridShape,
+            inputShapes,
+            outputShapes,
+            constSlots,
+            inputSlots,
+            outputSlots,
+            threadTile: step.threadTile,
+            hasBlockIndex: step.hasBlockIndex,
+          });
+
+          for (let i = 0; i < step.outputs.length; i++) {
+            scope[step.outputs[i]] = bmResult.outputs[i];
+          }
+          flushSubPending(bmResult.pending);
+          break;
+        }
+        case "fori_loop": {
+          // Flush batched dispatches — fori_loop needs materialized inputs
+          flushBatch();
+
+          const lower =
+            typeof step.lower === "number"
+              ? step.lower
+              : resolveDim(step.lower, dimBindings!);
+          const upper =
+            typeof step.upper === "number"
+              ? step.upper
+              : resolveDim(step.upper, dimBindings!);
+
+          const constSlots = step.consts.map((id) => scope[id]);
+          let carrySlots = step.initCarries.map((id) => scope[id]);
+          let ownsCarry = false; // first iteration uses parent-owned init carries
+
+          for (let i = lower; i < upper; i++) {
+            // Create scalar int32 index slot
+            const idxData = new Int32Array([i]);
+            const idxSlot = this.backend.malloc(
+              4,
+              new Uint8Array(idxData.buffer),
             );
 
-            // Extract slots from results and store in output scope.
-            // Must flush pending ops first — result arrays from associativeScanCore
-            // have PendingExecute items (from concat/kernels) that haven't been
-            // submitted yet. Without flushing, the slot buffer contains zeros.
-            for (let i = 0; i < step.numLeaves; i++) {
-              const resultArr = results[i] as JaxArray;
-              resultArr._flushPendingSync();
-              const slot = resultArr._realizeSource();
-              this.backend.incRef(slot);
-              // Free the pre-allocated output buffer before overwriting scope
-              const oldSlot = scope.get(step.outputs[i]);
-              if (oldSlot !== undefined) this.backend.decRef(oldSlot);
-              scope.set(step.outputs[i], slot);
-              resultArr.dispose();
+            // IncRef consts (body borrows them)
+            for (const s of constSlots) this.backend.incRef(s);
+
+            const bodyInputs = [...constSlots, idxSlot, ...carrySlots];
+            const bodyResult = step.bodyProgram.execute(
+              bodyInputs,
+              dimBindings,
+            );
+            flushPendingBatched(bodyResult.pending, this.backend);
+
+            // DecRef consts and index
+            for (const s of constSlots) this.backend.decRef(s);
+            this.backend.decRef(idxSlot);
+
+            // Release previous carry if we own it (body outputs from prior iterations)
+            if (ownsCarry) {
+              for (const s of carrySlots) this.backend.decRef(s);
+            }
+            carrySlots = bodyResult.outputs;
+            ownsCarry = true;
+          }
+
+          // Write final carries to output slots
+          for (let k = 0; k < step.outputs.length; k++) {
+            const outSlot = scope[step.outputs[k]];
+            const carrySlot = carrySlots[k];
+            this.backend.copyBufferToBuffer(
+              carrySlot,
+              0,
+              outSlot,
+              0,
+              step.carrySizeBytes[k],
+            );
+            if (ownsCarry) this.backend.decRef(carrySlot);
+          }
+          break;
+        }
+        case "workgroup_assoc_scan": {
+          // Fallback: run as sequential associative scan on the block data.
+          // Flush batched dispatches first.
+          flushBatch();
+
+          const constSlots = step.consts.map((id) => scope[id]);
+          const elemSlots = step.elems.map((id) => scope[id]);
+          const outputSlots = step.outputs.map((id) => scope[id]);
+
+          const N = step.elemAvals[0].shape[0] as number;
+          const numElems = step.numElems;
+
+          // Sequential prefix scan: y[0] = x[0], y[i] = body(y[i-1], x[i])
+          // We run evalJaxpr for each position, slicing/concatenating.
+          // For the fallback path inside block_map, N = blockSize (small).
+          const elemBytes = step.elemAvals.map(
+            (a) => (a.size / (a.shape[0] as number)) * byteWidth(a.dtype),
+          );
+
+          // Read initial elements at position 0 → carry
+          let carrySlots: Slot[] = [];
+          for (let e = 0; e < numElems; e++) {
+            const slotBytes = elemBytes[e];
+            const carry = this.backend.malloc(slotBytes);
+            this.backend.copyBufferToBuffer(
+              elemSlots[e],
+              0,
+              carry,
+              0,
+              slotBytes,
+            );
+            carrySlots.push(carry);
+            // Write to output position 0
+            this.backend.copyBufferToBuffer(
+              carry,
+              0,
+              outputSlots[e],
+              0,
+              slotBytes,
+            );
+          }
+
+          for (let i = 1; i < N; i++) {
+            // Slice element at position i
+            const bSlots: Slot[] = [];
+            for (let e = 0; e < numElems; e++) {
+              const slotBytes = elemBytes[e];
+              const b = this.backend.malloc(slotBytes);
+              this.backend.copyBufferToBuffer(
+                elemSlots[e],
+                i * slotBytes,
+                b,
+                0,
+                slotBytes,
+              );
+              bSlots.push(b);
             }
 
-            // Dispose input Array wrappers
-            for (const a of constArrays) a.dispose();
-            for (const a of elemArrays) a.dispose();
+            // IncRef consts for body
+            for (const s of constSlots) this.backend.incRef(s);
+
+            // Body inputs: [consts, a (carry), b (current)]
+            const bodyInputs = [...constSlots, ...carrySlots, ...bSlots];
+            const bodyResult = step.bodyProgram.execute(bodyInputs);
+            flushPendingBatched(bodyResult.pending, this.backend);
+
+            // DecRef consts
+            for (const s of constSlots) this.backend.decRef(s);
+
+            // Release old carry and b slots
+            for (const s of carrySlots) this.backend.decRef(s);
+            for (const s of bSlots) this.backend.decRef(s);
+
+            // New carry = body outputs
+            carrySlots = bodyResult.outputs;
+
+            // Write carry to output position i
+            for (let e = 0; e < numElems; e++) {
+              const slotBytes = elemBytes[e];
+              this.backend.copyBufferToBuffer(
+                carrySlots[e],
+                0,
+                outputSlots[e],
+                i * slotBytes,
+                slotBytes,
+              );
+            }
           }
+
+          // Release final carry
+          for (const s of carrySlots) this.backend.decRef(s);
           break;
         }
         default:
           step satisfies never;
       }
     }
+    flushBatch();
+    const outputSlots: Slot[] = new globalThis.Array(this.outputs.length);
+    for (let i = 0; i < this.outputs.length; i++) {
+      outputSlots[i] = scope[this.outputs[i]];
+    }
     return {
-      outputs: this.outputs.map((id) => scope.get(id)!),
-      pending,
+      outputs: outputSlots,
+      pending: [] as PendingExecute[],
     };
   }
 }
@@ -770,7 +1122,27 @@ function stepUsesId(step: JitStep, id: JitId): boolean {
         step.updates === id ||
         step.output === id
       );
+    case "reverse":
+      return step.input === id || step.output === id;
     case "assoc_scan":
+      return (
+        step.outputs.includes(id) ||
+        step.consts.includes(id) ||
+        step.elems.includes(id)
+      );
+    case "block_map":
+      return (
+        step.outputs.includes(id) ||
+        step.consts.includes(id) ||
+        step.inputs.includes(id)
+      );
+    case "fori_loop":
+      return (
+        step.outputs.includes(id) ||
+        step.consts.includes(id) ||
+        step.initCarries.includes(id)
+      );
+    case "workgroup_assoc_scan":
       return (
         step.outputs.includes(id) ||
         step.consts.includes(id) ||
@@ -785,6 +1157,11 @@ class JitProgramBuilder {
   backend: Backend;
   #nextId: number;
   steps: JitStep[];
+
+  /** Number of distinct JitIds allocated (for sizing Slot[] scope). */
+  get slotCount(): number {
+    return this.#nextId;
+  }
 
   constructor(backend: Backend, nargs: number) {
     this.backend = backend;
@@ -1005,11 +1382,13 @@ export function jitCompile(
   const cached = jitCompileCache.get(cacheKey);
   if (cached) return cached;
 
-  // Set module-level dim bindings for jitRules to resolve symbolic shapes
-  // to concrete values in ShapeTracker operations.
+  // Save/restore dim bindings for nested jitCompile calls (e.g., grad(foriLoop)
+  // creates Scan body that contains ForiLoop, each triggering jitCompile).
+  const prevDimBindings = _currentDimBindings;
   _currentDimBindings = dimBindings;
 
   try {
+    const _jitT0 = performance.now();
     if (DEBUG >= 1) {
       console.info("=========== JIT Compile ===========\n" + jaxpr.toString());
     }
@@ -1198,7 +1577,7 @@ export function jitCompile(
         }
 
         // Compile body jaxpr
-        const bodyProgram = jitCompile(backend, bodyJaxpr);
+        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
 
         // Determine scan plan
         const scanPlan = planScan(
@@ -1212,6 +1591,7 @@ export function jitCompile(
           numY,
           reverse,
           acceptPath as ScanPath | ScanPath[] | undefined,
+          _currentDimBindings,
         );
 
         // Compute per-slice xsAvals (without leading length dimension)
@@ -1249,12 +1629,6 @@ export function jitCompile(
         >;
         const { offset, axis } = params;
 
-        if (axis !== 0) {
-          throw new Error(
-            "DynamicUpdateSlice JIT: only axis=0 is currently supported",
-          );
-        }
-
         // Resolve input JitIds
         const dstInput = eqn.inputs[0];
         const srcInput = eqn.inputs[1];
@@ -1284,11 +1658,27 @@ export function jitCompile(
         const outVar = eqn.outBinders[0];
         const elemBytes = byteWidth(outVar.aval.dtype);
         const innerSize = (outVar.aval.shape as number[])
-          .slice(1)
+          .slice(axis + 1)
           .reduce((a, b) => a * b, 1);
         const offsetBytes = offset * innerSize * elemBytes;
         const sliceBytes = sizeExprMul(srcInput.aval.sizeExpr, elemBytes);
         const dstSizeBytes = sizeExprMul(outVar.aval.sizeExpr, elemBytes);
+
+        // Fiber loop data for axis > 0 (non-contiguous slices)
+        const outerFibers =
+          axis === 0
+            ? 1
+            : (srcInput.aval.shape as number[])
+                .slice(0, axis)
+                .reduce((a, b) => a * b, 1);
+        const srcFiberBytes =
+          axis === 0
+            ? 0
+            : (srcInput.aval.shape[axis] as number) * innerSize * elemBytes;
+        const dstFiberBytes =
+          axis === 0
+            ? 0
+            : (outVar.aval.shape[axis] as number) * innerSize * elemBytes;
 
         // Allocate output buffer (same size as dst — recycling may reclaim dst)
         const outId = builder.pushBuffer(dstSizeBytes);
@@ -1302,6 +1692,9 @@ export function jitCompile(
           offsetBytes,
           sliceBytes,
           dstSizeBytes,
+          outerFibers,
+          srcFiberBytes,
+          dstFiberBytes,
         });
         continue;
       }
@@ -1353,7 +1746,7 @@ export function jitCompile(
         }
 
         // Compile the body jaxpr → JitProgram (for fallback path)
-        const bodyProgram = jitCompile(backend, bodyJaxpr);
+        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
 
         // Plan the assoc scan — try compiled-loop (WASM), fallback otherwise
         const assocPlan = planAssociativeScan(
@@ -1362,7 +1755,9 @@ export function jitCompile(
           bodyJaxpr,
           numLeaves,
           numConsts,
+          axis,
           reverse,
+          _currentDimBindings,
         );
 
         builder.steps.push({
@@ -1432,6 +1827,255 @@ export function jitCompile(
           targetShape,
           updatesLen,
           dtype,
+        });
+        continue;
+      }
+
+      // Handle Primitive.Reverse — compile to a reverse JitStep.
+      // Unlike Flip (which uses reshapeJit/ShapeTracker), Reverse materializes
+      // the reversal at execution time, supporting polymorphic lengths.
+      if (eqn.primitive === Primitive.Reverse) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<typeof Primitive.Reverse>;
+        const { axis } = params;
+
+        // Resolve input JitId
+        const input = eqn.inputs[0];
+        let inputId: JitId;
+        if (input instanceof Var) {
+          const jv = ctx.get(input)!;
+          if (jv.type !== "imm") {
+            throw new Error("jit: Reverse input is not imm");
+          }
+          inputId = jv.arg;
+        } else {
+          inputId = builder.pushLit(input as Lit);
+        }
+
+        const outVar = eqn.outBinders[0];
+        const dtype = outVar.aval.dtype;
+        const shape = input.aval.shape;
+        const axisSize = shape[axis]; // may be Dim (symbolic)
+        // innerBytes: product of all dimensions after the reversed axis × byteWidth
+        const trailingShape = (shape as Dim[]).slice(axis + 1);
+        const innerBytes =
+          (trailingShape.length > 0
+            ? (trailingShape as number[]).reduce((a, b) => a * b, 1)
+            : 1) * byteWidth(dtype);
+        const totalBytes = sizeExprMul(outVar.aval.sizeExpr, byteWidth(dtype));
+
+        const outId = builder.pushBuffer(totalBytes);
+        ctx.set(outVar, { type: "imm", arg: outId });
+
+        builder.steps.push({
+          type: "reverse",
+          input: inputId,
+          output: outId,
+          axis,
+          axisSize,
+          innerBytes,
+          totalBytes,
+          dtype,
+        });
+        continue;
+      }
+
+      // Handle Primitive.BlockMap — compile the body jaxpr and emit a
+      // "block_map" JitStep that iterates over the grid of blocks.
+      if (eqn.primitive === Primitive.BlockMap) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<typeof Primitive.BlockMap>;
+        const {
+          jaxpr: bodyJaxpr,
+          blockShape,
+          inAxes,
+          outAxes,
+          numConsts,
+          numInputs,
+          threadTile,
+          gridShape: explicitGridShape,
+        } = params;
+
+        // Rewrite body jaxpr: replace BlockIndex equations with extra input.
+        const { jaxpr: compiledBodyJaxpr, hasBlockIndex } =
+          rewriteBlockIndex(bodyJaxpr);
+
+        // Resolve input JitIds
+        const allInputIds: JitId[] = [];
+        for (const input of eqn.inputs) {
+          if (input instanceof Var) {
+            const jv = ctx.get(input)!;
+            if (jv.type !== "imm") {
+              throw new Error("jit: BlockMap primitive input is not imm");
+            }
+            allInputIds.push(jv.arg);
+          } else if (input instanceof Lit) {
+            allInputIds.push(builder.pushLit(input));
+          }
+        }
+
+        const constsIds = allInputIds.slice(0, numConsts);
+        const inputIds = allInputIds.slice(numConsts, numConsts + numInputs);
+
+        // Store raw (possibly symbolic) input/output shapes.
+        // gridShape is computed at execution time from resolved shapes.
+        const inputAvals = eqn.inputs
+          .slice(numConsts, numConsts + numInputs)
+          .map((v) => v.aval);
+
+        // Allocate output buffers
+        const outputIds: JitId[] = [];
+        for (const outVar of eqn.outBinders) {
+          const outId = builder.pushBuffer(
+            sizeExprMul(outVar.aval.sizeExpr, byteWidth(outVar.aval.dtype)),
+          );
+          outputIds.push(outId);
+          ctx.set(outVar, { type: "imm", arg: outId });
+        }
+
+        // Compile body jaxpr (rewritten if BlockIndex was present)
+        const bodyProgram = jitCompile(
+          backend,
+          compiledBodyJaxpr,
+          _currentDimBindings,
+        );
+
+        const inputShapes: Dim[][] = inputAvals.map((a) => [...a.shape]);
+        const outputShapes: Dim[][] = eqn.outBinders.map((v) => [
+          ...v.aval.shape,
+        ]);
+
+        builder.steps.push({
+          type: "block_map",
+          bodyProgram,
+          bodyJaxpr: compiledBodyJaxpr,
+          blockShape,
+          inAxes,
+          outAxes,
+          numConsts,
+          numInputs,
+          inputShapes,
+          outputShapes,
+          consts: constsIds,
+          inputs: inputIds,
+          outputs: outputIds,
+          threadTile,
+          explicitGridShape,
+          hasBlockIndex,
+        });
+        continue;
+      }
+
+      // Handle Primitive.WorkgroupAssociativeScan — compile the scan body
+      // and emit a "workgroup_assoc_scan" JitStep. Inside a block_map body,
+      // the fused shader compiler emits inlined Kogge-Stone WGSL. In the
+      // fallback path, the executor runs the body program sequentially.
+      if (eqn.primitive === Primitive.WorkgroupAssociativeScan) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<
+          typeof Primitive.WorkgroupAssociativeScan
+        >;
+        const { jaxpr: bodyJaxpr, numConsts } = params;
+        const numElems = eqn.inputs.length - numConsts;
+
+        const allInputIds: JitId[] = [];
+        for (const input of eqn.inputs) {
+          if (input instanceof Var) {
+            const jv = ctx.get(input)!;
+            if (jv.type !== "imm") {
+              throw new Error(
+                "jit: WorkgroupAssociativeScan primitive input is not imm",
+              );
+            }
+            allInputIds.push(jv.arg);
+          } else if (input instanceof Lit) {
+            allInputIds.push(builder.pushLit(input));
+          }
+        }
+
+        const constsIds = allInputIds.slice(0, numConsts);
+        const elemsIds = allInputIds.slice(numConsts);
+        const elemAvals = eqn.inputs
+          .slice(numConsts)
+          .map((v) => v.aval as ShapedArray);
+
+        const outputIds: JitId[] = [];
+        for (const outVar of eqn.outBinders) {
+          const outId = builder.pushBuffer(
+            sizeExprMul(outVar.aval.sizeExpr, byteWidth(outVar.aval.dtype)),
+          );
+          outputIds.push(outId);
+          ctx.set(outVar, { type: "imm", arg: outId });
+        }
+
+        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
+
+        builder.steps.push({
+          type: "workgroup_assoc_scan",
+          bodyProgram,
+          bodyJaxpr,
+          numConsts,
+          numElems,
+          consts: constsIds,
+          elems: elemsIds,
+          outputs: outputIds,
+          elemAvals,
+        });
+        continue;
+      }
+
+      // Handle Primitive.ForiLoop — compile the body jaxpr and emit a
+      // "fori_loop" JitStep that iterates from lower to upper.
+      if (eqn.primitive === Primitive.ForiLoop) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<typeof Primitive.ForiLoop>;
+        const { jaxpr: bodyJaxpr, numConsts, lower, upper } = params;
+
+        // Resolve input JitIds: [consts..., initCarries...]
+        const allInputIds: JitId[] = [];
+        for (const input of eqn.inputs) {
+          if (input instanceof Var) {
+            const jv = ctx.get(input)!;
+            if (jv.type !== "imm") {
+              throw new Error("jit: ForiLoop primitive input is not imm");
+            }
+            allInputIds.push(jv.arg);
+          } else if (input instanceof Lit) {
+            allInputIds.push(builder.pushLit(input));
+          }
+        }
+
+        const constsIds = allInputIds.slice(0, numConsts);
+        const initCarryIds = allInputIds.slice(numConsts);
+
+        // Allocate output buffers (same shape/dtype as carries)
+        const outputIds: JitId[] = [];
+        for (const outVar of eqn.outBinders) {
+          const outId = builder.pushBuffer(
+            sizeExprMul(outVar.aval.sizeExpr, byteWidth(outVar.aval.dtype)),
+          );
+          outputIds.push(outId);
+          ctx.set(outVar, { type: "imm", arg: outId });
+        }
+
+        // Compile body jaxpr
+        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
+
+        const carrySizeBytes = eqn.outBinders.map(
+          (v) => (v.aval.size as number) * byteWidth(v.aval.dtype),
+        );
+
+        builder.steps.push({
+          type: "fori_loop",
+          bodyProgram,
+          bodyJaxpr,
+          lower,
+          upper,
+          numConsts,
+          consts: constsIds,
+          initCarries: initCarryIds,
+          outputs: outputIds,
+          carrySizeBytes,
         });
         continue;
       }
@@ -1655,12 +2299,17 @@ export function jitCompile(
       builder.steps,
       range(0, nargs),
       outputIds,
+      builder.slotCount,
     );
     if (DEBUG >= 4) console.info(jp.toString());
+    if (DEBUG >= 1)
+      console.info(
+        `[jitCompile] ${(performance.now() - _jitT0).toFixed(1)}ms, ${builder.steps.length} steps, ${jaxpr.eqns.length} eqns`,
+      );
     jitCompileCache.set(cacheKey, jp);
     return jp;
   } finally {
-    _currentDimBindings = undefined;
+    _currentDimBindings = prevDimBindings;
   }
 }
 
@@ -1972,10 +2621,20 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     return { exp: [x.substitute({ gidx: index })] };
   },
   [Primitive.Transpose]: reshapeJit((st, { perm }) => st.permute(perm)),
-  [Primitive.Broadcast]: reshapeJit((st, { shape, axis }) =>
-    st.broadcast(shape, axis),
-  ),
-  [Primitive.Reshape]: reshapeJit((st, { shape }) => st.reshape(shape)),
+  [Primitive.Broadcast]: reshapeJit((st, { shape, axis }) => {
+    const concreteShape =
+      _currentDimBindings && hasSymbolicDims(shape)
+        ? resolveShape(shape, _currentDimBindings)
+        : (shape as number[]);
+    return st.broadcast(concreteShape, axis);
+  }),
+  [Primitive.Reshape]: reshapeJit((st, { shape }) => {
+    const concreteShape =
+      _currentDimBindings && hasSymbolicDims(shape)
+        ? resolveShape(shape, _currentDimBindings)
+        : (shape as number[]);
+    return st.reshape(concreteShape);
+  }),
   [Primitive.Flip]: reshapeJit((st, { axis }) => {
     const arg = rep(st.shape.length, false);
     for (const ax of axis) arg[ax] = true;
@@ -2007,10 +2666,89 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   [Primitive.ScatterAdd]() {
     throw new Error("internal: ScatterAdd is handled specially in jitCompile");
   },
+  [Primitive.Reverse]() {
+    throw new Error("internal: Reverse is handled specially in jitCompile");
+  },
   [Primitive.AssociativeScan]() {
     throw new Error(
       "internal: AssociativeScan is handled specially in jitCompile",
     );
+  },
+  [Primitive.BlockMap]() {
+    throw new Error("internal: BlockMap is handled specially in jitCompile");
+  },
+  [Primitive.BlockIndex]() {
+    throw new Error(
+      "internal: BlockIndex should be rewritten by rewriteBlockIndex before jitCompile",
+    );
+  },
+  [Primitive.ForiLoop]() {
+    throw new Error("internal: ForiLoop is handled specially in jitCompile");
+  },
+  [Primitive.WorkgroupAssociativeScan]() {
+    throw new Error(
+      "internal: WorkgroupAssociativeScan is handled specially in jitCompile",
+    );
+  },
+  [Primitive.DynamicSlice](exps, avals, { sliceSizes }) {
+    const operandExp = exps[0];
+    const startExps = exps.slice(1);
+    const operandShape = avals[0].shape as number[];
+    const ndim = operandShape.length;
+
+    // Build multi-dim output indices by unraveling gidx over sliceSizes
+    const outIndices = unravelAlu(sliceSizes, AluVar.gidx);
+
+    // Clamp each start index to [0, dim_k - sliceSize_k] and add output coord
+    const readIndices: AluExp[] = [];
+    for (let k = 0; k < ndim; k++) {
+      const maxStart = (operandShape[k] as number) - sliceSizes[k];
+      let start = AluExp.cast(DType.Int32, startExps[k]);
+      start = AluExp.max(start, AluExp.i32(0));
+      start = AluExp.min(start, AluExp.i32(maxStart));
+      readIndices.push(AluExp.add(start, outIndices[k]));
+    }
+
+    // If the operand is a GlobalView, directly replace its indices to avoid
+    // an unravel→ravel roundtrip that creates unsimplifiable expressions.
+    if (operandExp.op === AluOp.GlobalView) {
+      const [gid, st] = operandExp.arg as [number, ShapeTracker];
+      return {
+        exp: [AluExp.globalView(operandExp.dtype, gid, st, readIndices)],
+      };
+    }
+
+    // Fallback: convert multi-dim read indices to flat index and substitute
+    const [index] = ShapeTracker.fromShape(operandShape).toAluExp(readIndices);
+    return { exp: [operandExp.substitute({ gidx: index })] };
+  },
+  [Primitive.UncheckedDynamicSlice](exps, avals, { sliceSizes }) {
+    const operandExp = exps[0];
+    const startExps = exps.slice(1);
+    const operandShape = avals[0].shape as number[];
+    const ndim = operandShape.length;
+
+    const outIndices = unravelAlu(sliceSizes, AluVar.gidx);
+
+    // No clamping — caller guarantees in-bounds
+    const readIndices: AluExp[] = [];
+    for (let k = 0; k < ndim; k++) {
+      const start = AluExp.cast(DType.Int32, startExps[k]);
+      readIndices.push(AluExp.add(start, outIndices[k]));
+    }
+
+    // If the operand is a GlobalView, directly replace its indices to avoid
+    // an unravel→ravel roundtrip that creates unsimplifiable expressions.
+    if (operandExp.op === AluOp.GlobalView) {
+      const [gid, st] = operandExp.arg as [number, ShapeTracker];
+      return {
+        exp: [AluExp.globalView(operandExp.dtype, gid, st, readIndices)],
+      };
+    }
+
+    // Fallback: convert multi-dim read indices to flat index and substitute
+    const [index] = ShapeTracker.fromShape(operandShape).toAluExp(readIndices);
+    return { exp: [operandExp.substitute({ gidx: index })] };
   },
 };
 
@@ -2161,6 +2899,8 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     // multiple views in the expression with different indexing.
     Primitive.RandomBits,
     Primitive.Gather,
+    Primitive.DynamicSlice,
+    Primitive.UncheckedDynamicSlice,
   ];
   const needsCleanShapePrimitives = [
     // Concatenate is based on Pad internally.
@@ -2178,6 +2918,9 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     Primitive.DynamicUpdateSlice,
     Primitive.ScatterAdd,
     Primitive.AssociativeScan,
+    Primitive.Reverse,
+    Primitive.BlockMap,
+    Primitive.ForiLoop,
   ];
   for (let i = jaxpr.eqns.length - 1; i >= 0; i--) {
     const eqn = jaxpr.eqns[i];

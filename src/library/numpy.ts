@@ -1,6 +1,7 @@
 // Port of the `jax.numpy` module, typically imported as `np`.
 
 import { AluOp, DType, isFloatDtype, promoteTypes } from "../alu";
+import { defaultDevice } from "../backend";
 import type { Dim } from "../dim";
 import {
   arange,
@@ -1124,6 +1125,28 @@ export function matmul(x: ArrayLike, y: ArrayLike): Array {
   const yBatch = y.shape.slice(0, -2);
   const batchShape = broadcastShapes(xBatch, yBatch);
   const numBatchDims = batchShape.length;
+
+  // Route unbatched 2D float matmul through tiledMatmul on WebGPU inside JIT.
+  // In eager mode, blockMap iterates block-by-block in JS which is very slow
+  // for large matrices; only the fused shader path (JIT) is fast.
+  if (
+    core.insideTrace() &&
+    numBatchDims === 0 &&
+    x.dtype === y.dtype &&
+    isFloatDtype(x.dtype) &&
+    defaultDevice() === "webgpu" &&
+    typeof x.shape[0] === "number" &&
+    typeof x.shape[1] === "number" &&
+    typeof y.shape[1] === "number" &&
+    Math.min(
+      x.shape[0] as number,
+      x.shape[1] as number,
+      y.shape[1] as number,
+    ) >= 512
+  ) {
+    return lax.tiledMatmul(x, y);
+  }
+
   // Broadcast batch dims if needed (O(1) ShapeTracker views, no allocation)
   const xTarget = [...batchShape, x.shape.at(-2)!, x.shape.at(-1)!];
   const yTarget = [...batchShape, y.shape.at(-2)!, y.shape.at(-1)!];

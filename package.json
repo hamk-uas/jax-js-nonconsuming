@@ -72,11 +72,14 @@
     "test:arch:record": "pnpm run test:report && node scripts/record-expected-failures.mjs --report tmp/vitest-report.json --manifest .ci/expected-failures.json",
     "test:arch:record:custom": "pnpm run test:report && node scripts/record-expected-failures.mjs",
     "test:eslint-plugin": "tsx --test packages/eslint-plugin/test/*.node.ts",
-    "test:all": "scripts/test-all.sh",
     "test:website:smoke": "pnpm -C website build && vitest run --config test/vitest.website-smoke.config.ts",
-    "test:deno": "DENO_JOBS=1 $HOME/.deno/bin/deno test --no-check --unstable-webgpu --allow-read --allow-env test/deno/webgpu.test.ts && DENO_JOBS=1 $HOME/.deno/bin/deno test --no-check --unstable-webgpu --allow-read --allow-env test/deno/pool-memory.test.ts && DENO_JOBS=1 $HOME/.deno/bin/deno test --no-check --unstable-webgpu --allow-read --allow-env test/deno/scan.test.ts && DENO_JOBS=1 $HOME/.deno/bin/deno test --no-check --unstable-webgpu --allow-read --allow-env test/deno/associative-scan-perf.test.ts && DENO_JOBS=1 $HOME/.deno/bin/deno test --no-check --unstable-webgpu --allow-read --allow-env test/deno/assoc-scan-reduction.test.ts && DENO_JOBS=1 $HOME/.deno/bin/deno test --no-check --allow-read --allow-env test/deno/orchestrator.test.ts && DENO_JOBS=1 $HOME/.deno/bin/deno test --no-check --allow-read --allow-env test/deno/parallel-assoc-scan.test.ts",
-    "bench:deno": "$HOME/.deno/bin/deno bench --no-check --unstable-webgpu --allow-read --allow-env test/deno/scan.bench.ts",
     "test:coverage": "vitest run --coverage && open coverage/index.html",
+    "test:gpu": "bash scripts/gpu-test.sh run",
+    "test:gpu:nvidia": "GPU=nvidia bash scripts/gpu-test.sh run",
+    "test:gpu:intel": "GPU=intel bash scripts/gpu-test.sh run",
+    "bench:gpu": "bash scripts/gpu-test.sh bench",
+    "bench:gpu:nvidia": "GPU=nvidia bash scripts/gpu-test.sh bench",
+    "bench:gpu:intel": "GPU=intel bash scripts/gpu-test.sh bench",
     "lint:ownership:website": "pnpm exec eslint --no-ignore --rule 'jax-js/require-using:error' --rule 'jax-js/no-use-after-dispose:error' --rule 'jax-js/require-scan-result-dispose:error' website/src/routes/repl/*.ts",
     "lint:scan-dispose:website": "pnpm exec eslint --no-ignore --rule 'jax-js/require-scan-result-dispose:error' website/src/routes/**/*.ts",
     "lint:ownership:internal": "pnpm exec eslint --no-ignore --rule 'jax-js/require-retained-release:warn' --rule 'jax-js/require-try-finally-symmetry:warn' --rule 'jax-js/require-wrapper-dispose-symmetry:warn' src/frontend/{jaxpr,jit,jvp,linearize,vmap}.ts",
@@ -94,7 +97,7 @@
     "globals": "^16.0.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.7",
-    "playwright": "~1.52.0",
+    "playwright": "~1.58.2",
     "prettier": "^3.6.2",
     "prettier-plugin-svelte": "^3.4.0",
     "tsdown": "0.13.2",
@@ -107,8 +110,8 @@
   },
   "optionalDependencies": {
     "@bufbuild/protobuf": "^2.10.2",
-    "sentencepiece-buf": "^0.2.1-0",
-    "onnx-buf": "^1.20.0-1"
+    "onnx-buf": "^1.20.0-1",
+    "sentencepiece-buf": "^0.2.1-0"
   },
   "packageManager": "pnpm@10.22.0",
   "engines": {

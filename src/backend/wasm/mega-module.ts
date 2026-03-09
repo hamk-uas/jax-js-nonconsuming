@@ -105,6 +105,12 @@ export interface WasmMegaModule {
    * that holds that output pointer after execution completes.
    */
   readonly outputLocalIdxs: number[];
+  /**
+   * Whether the mega-module can be dispatched via the parallel stepInfos path.
+   * False when the program contains steps (e.g., fori_loop) that are only
+   * handled by mega_execute and have no parallel stepInfos representation.
+   */
+  readonly canParallelize: boolean;
 }
 
 /**
@@ -141,10 +147,20 @@ export function canCompileToMegaModule(steps: JitStep[]): boolean {
         if (step.source instanceof Kernel && step.source.hasSymbolicReduction)
           return false;
         break;
+      case "fori_loop": {
+        // Accept fori_loop if bounds are concrete and body is mega-module-eligible.
+        if (typeof step.lower !== "number" || typeof step.upper !== "number")
+          return false;
+        if (!canCompileToMegaModule(step.bodyProgram.steps)) return false;
+        break;
+      }
       case "scan":
       case "dus":
       case "scatter_add":
+      case "reverse":
       case "assoc_scan":
+      case "block_map":
+      case "workgroup_assoc_scan":
         return false;
       default:
         return false;
@@ -196,6 +212,12 @@ export function compileToMegaModule(
         for (const id of step.inputs) allJitIds.add(id);
         for (const id of step.outputs) allJitIds.add(id);
         break;
+      case "fori_loop":
+        for (const id of step.consts) allJitIds.add(id);
+        for (const id of step.initCarries) allJitIds.add(id);
+        for (const id of step.outputs) allJitIds.add(id);
+        // Body JitIds are handled separately (different namespace)
+        break;
     }
   }
 
@@ -236,20 +258,28 @@ export function compileToMegaModule(
   // Collect all distinct AluOps across all kernels for importing helpers
   let allOps: Map<AluOp, Set<DType>> = new Map();
 
-  for (let i = 0; i < steps.length; i++) {
-    const step = steps[i];
-    if (step.type === "execute" && step.source instanceof Kernel) {
-      const kernel = step.source;
-      for (const out of kernel.outputs) {
-        const tune = tuneNullopt(
-          Kernel.single(kernel.nargs, kernel.size, out.exp, out.reduction),
-        );
-        allOps = mapSetUnion(allOps, tune.exp.distinctOps());
-        if (tune.epilogue)
-          allOps = mapSetUnion(allOps, tune.epilogue.distinctOps());
+  const collectKernelOps = (stepList: JitStep[]) => {
+    for (const s of stepList) {
+      if (s.type === "execute" && s.source instanceof Kernel) {
+        for (const out of s.source.outputs) {
+          const tune = tuneNullopt(
+            Kernel.single(
+              s.source.nargs,
+              s.source.size,
+              out.exp,
+              out.reduction,
+            ),
+          );
+          allOps = mapSetUnion(allOps, tune.exp.distinctOps());
+          if (tune.epilogue)
+            allOps = mapSetUnion(allOps, tune.epilogue.distinctOps());
+        }
+      } else if (s.type === "fori_loop") {
+        collectKernelOps(s.bodyProgram.steps);
       }
     }
-  }
+  };
+  collectKernelOps(steps);
 
   // --- Generate WASM module ---
   const cg = new CodeGenerator();
@@ -264,52 +294,70 @@ export function compileToMegaModule(
   // Import math helper functions (reuse shared helper from wasm.ts)
   const funcs = importWasmHelperFuncs(cg, allOps);
 
-  // --- M6.2a: Extract non-reduction kernels into separate WASM functions ---
+  // --- M6.2a: Extract kernels into separate WASM functions ---
   // Each extracted function has signature: (start: i32, end: i32, ...bufs: i32[]) => void
   // mega_execute calls them via direct `call` with (0, size, ...bufLocals).
   // V8's TurboFan inlines these back in the serial path (zero overhead).
   // The exports enable M6.2b/c to call them from workers with sub-ranges.
-  const extractedForStep = new Map<
-    number,
-    { funcRef: number; exportName: string; nInputs: number; nOutputs: number }
-  >();
+  type ExtractedFunc = {
+    funcRef: number;
+    exportName: string;
+    nInputs: number;
+    nOutputs: number;
+  };
+  const extractedForStep = new Map<number, ExtractedFunc>();
+  // Body kernel extractions keyed by fori_loop step index, then body step index.
+  const extractedForBodyStep = new Map<number, Map<number, ExtractedFunc>>();
   const kernelExports: ExtractedKernelInfo[] = [];
   let kernelCounter = 0;
+
+  const extractKernel = (
+    kernel: Kernel,
+    nInputs: number,
+    nOutputs: number,
+  ): ExtractedFunc => {
+    const isReduction = kernel.hasReduction;
+    const kernelSize = kernel.size as number;
+    const exportName = `kernel_${kernelCounter}`;
+    const funcRef = emitExtractedKernelFunc(
+      cg,
+      funcs,
+      kernel,
+      nInputs,
+      nOutputs,
+    );
+    cg.export(funcRef, exportName);
+    kernelExports.push({
+      name: exportName,
+      size: kernelSize,
+      isReduction,
+      nInputs,
+      nOutputs,
+    });
+    kernelCounter++;
+    return { funcRef, exportName, nInputs, nOutputs };
+  };
 
   for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
     const step = steps[stepIdx];
     if (step.type === "execute" && step.source instanceof Kernel) {
-      const kernel = step.source;
-      const isReduction = kernel.hasReduction;
-      const kernelSize = kernel.size as number;
-      const exportName = `kernel_${kernelCounter}`;
-
-      // M6.2c: extract ALL kernels (including reductions) into separate
-      // WASM functions with (start, end, ...bufs) signatures.
-      // Reductions are parallelizable by output element (gidx range).
-      const funcRef = emitExtractedKernelFunc(
-        cg,
-        funcs,
-        kernel,
-        step.inputs.length,
-        step.outputs.length,
+      extractedForStep.set(
+        stepIdx,
+        extractKernel(step.source, step.inputs.length, step.outputs.length),
       );
-      cg.export(funcRef, exportName);
-      extractedForStep.set(stepIdx, {
-        funcRef,
-        exportName,
-        nInputs: step.inputs.length,
-        nOutputs: step.outputs.length,
-      });
-
-      kernelExports.push({
-        name: exportName,
-        size: kernelSize,
-        isReduction,
-        nInputs: step.inputs.length,
-        nOutputs: step.outputs.length,
-      });
-      kernelCounter++;
+    } else if (step.type === "fori_loop") {
+      const bodyMap = new Map<number, ExtractedFunc>();
+      const bodySteps = step.bodyProgram.steps;
+      for (let bsi = 0; bsi < bodySteps.length; bsi++) {
+        const bs = bodySteps[bsi];
+        if (bs.type === "execute" && bs.source instanceof Kernel) {
+          bodyMap.set(
+            bsi,
+            extractKernel(bs.source, bs.inputs.length, bs.outputs.length),
+          );
+        }
+      }
+      extractedForBodyStep.set(stepIdx, bodyMap);
     }
   }
 
@@ -397,6 +445,19 @@ export function compileToMegaModule(
               );
             }
           }
+          break;
+        }
+
+        case "fori_loop": {
+          emitForiLoop(
+            cg,
+            funcs,
+            step,
+            jitIdLocals,
+            extractedForBodyStep.get(stepIdx)!,
+            allocFunc,
+            freeFunc,
+          );
           break;
         }
       }
@@ -496,10 +557,22 @@ export function compileToMegaModule(
           stepKernelCounter++;
         }
         break;
+      case "fori_loop":
+        // fori_loop is inherently sequential — no parallel step metadata.
+        // Advance kernel counter past body kernels so indices stay correct.
+        for (const bs of step.bodyProgram.steps) {
+          if (bs.type === "execute" && bs.source instanceof Kernel)
+            stepKernelCounter++;
+        }
+        break;
     }
   }
 
   const outputLocalIdxs = outputIds.map((id) => jitIdToIdx.get(id)!);
+
+  // fori_loop steps are only handled by mega_execute (not stepInfos-driven
+  // parallel dispatch), so disable the parallel path if any are present.
+  const hasForiLoop = steps.some((s) => s.type === "fori_loop");
 
   return {
     module,
@@ -511,7 +584,246 @@ export function compileToMegaModule(
     stepInfos,
     numLocals,
     outputLocalIdxs,
+    canParallelize: !hasForiLoop,
   };
+}
+
+// ---------------------------------------------------------------------------
+// ForiLoop emission
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit a WASM loop implementing a fori_loop step.
+ *
+ * The loop runs from `lower` to `upper`, executing the body program's steps
+ * each iteration. Body inputs are mapped to outer-scope locals (consts, idx
+ * buffer, carry buffers). After each iteration, old carry buffers are freed
+ * and carry locals updated to the body's outputs.
+ *
+ * At loop exit, final carries are memory.copy'd into the pre-allocated
+ * output buffers, and the last iteration's carry buffers are freed.
+ */
+function emitForiLoop(
+  cg: CodeGenerator,
+  funcs: Record<string, number>,
+  step: Extract<JitStep, { type: "fori_loop" }>,
+  outerLocals: Map<JitId, number>,
+  bodyExtracted: Map<
+    number,
+    { funcRef: number; nInputs: number; nOutputs: number }
+  >,
+  allocFunc: number,
+  freeFunc: number,
+): void {
+  const bodyProg = step.bodyProgram;
+  const lower = step.lower as number;
+  const upper = step.upper as number;
+  const numConsts = step.numConsts;
+  const numCarry = step.initCarries.length;
+
+  // --- Allocate index buffer (4 bytes for i32 scalar) ---
+  const idxBufLocal = cg.local.declare(cg.i32);
+  cg.i32.const(4);
+  cg.call(allocFunc);
+  cg.local.set(idxBufLocal);
+
+  // --- Carry tracking locals (hold current carry buffer pointers) ---
+  const carryLocals: number[] = [];
+  for (let k = 0; k < numCarry; k++) {
+    const cl = cg.local.declare(cg.i32);
+    cg.local.get(outerLocals.get(step.initCarries[k])!);
+    cg.local.set(cl);
+    carryLocals.push(cl);
+  }
+
+  // Old-carry locals (for freeing after body runs)
+  const oldCarryLocals: number[] = [];
+  for (let k = 0; k < numCarry; k++) {
+    oldCarryLocals.push(cg.local.declare(cg.i32));
+  }
+
+  // ownsCarry flag: 0 = initial carries (parent-owned), 1 = body-allocated
+  const ownsCarryLocal = cg.local.declare(cg.i32);
+  cg.i32.const(0);
+  cg.local.set(ownsCarryLocal);
+
+  // --- Create WASM locals for all body JitIds ---
+  const bodyLocals = new Map<JitId, number>();
+
+  // Body input layout: [consts..., idx, carries...]
+  // Map const inputs to outer's const locals
+  for (let k = 0; k < numConsts; k++) {
+    bodyLocals.set(bodyProg.inputs[k], outerLocals.get(step.consts[k])!);
+  }
+  // Map idx input to idxBufLocal
+  bodyLocals.set(bodyProg.inputs[numConsts], idxBufLocal);
+  // Map carry inputs to carryLocals
+  for (let k = 0; k < numCarry; k++) {
+    bodyLocals.set(bodyProg.inputs[numConsts + 1 + k], carryLocals[k]);
+  }
+
+  // Declare locals for non-input body JitIds
+  const bodyAllIds = new Set<JitId>();
+  for (const id of bodyProg.inputs) bodyAllIds.add(id);
+  for (const id of bodyProg.outputs) bodyAllIds.add(id);
+  for (const bs of bodyProg.steps) {
+    switch (bs.type) {
+      case "malloc":
+        bodyAllIds.add(bs.output);
+        break;
+      case "free":
+        bodyAllIds.add(bs.input);
+        break;
+      case "recycle":
+        bodyAllIds.add(bs.input);
+        bodyAllIds.add(bs.output);
+        break;
+      case "execute":
+        for (const id of bs.inputs) bodyAllIds.add(id);
+        for (const id of bs.outputs) bodyAllIds.add(id);
+        break;
+    }
+  }
+  for (const id of bodyAllIds) {
+    if (!bodyLocals.has(id)) {
+      bodyLocals.set(id, cg.local.declare(cg.i32));
+    }
+  }
+
+  // --- Loop counter ---
+  const iLocal = cg.local.declare(cg.i32);
+  cg.i32.const(lower);
+  cg.local.set(iLocal);
+
+  // --- WASM loop ---
+  cg.loop(cg.void);
+  {
+    cg.block(cg.void);
+    // if (i >= upper) break
+    cg.local.get(iLocal);
+    cg.i32.const(upper);
+    cg.i32.ge_s();
+    cg.br_if(0);
+
+    // Store loop index to idx buffer
+    cg.local.get(idxBufLocal);
+    cg.local.get(iLocal);
+    cg.i32.store(2); // align=4
+
+    // Update body carry-input locals from current carry locals
+    // (needed because carryLocals are updated at end of each iteration)
+    for (let k = 0; k < numCarry; k++) {
+      cg.local.get(carryLocals[k]);
+      cg.local.set(bodyLocals.get(bodyProg.inputs[numConsts + 1 + k])!);
+    }
+
+    // Save old carry pointers before body executes
+    for (let k = 0; k < numCarry; k++) {
+      cg.local.get(carryLocals[k]);
+      cg.local.set(oldCarryLocals[k]);
+    }
+
+    // --- Emit body steps ---
+    for (let bsi = 0; bsi < bodyProg.steps.length; bsi++) {
+      const bs = bodyProg.steps[bsi];
+      switch (bs.type) {
+        case "malloc": {
+          const size = bs.size as number;
+          cg.i32.const(size);
+          cg.call(allocFunc);
+          cg.local.set(bodyLocals.get(bs.output)!);
+          break;
+        }
+        case "free": {
+          cg.local.get(bodyLocals.get(bs.input)!);
+          cg.call(freeFunc);
+          break;
+        }
+        case "recycle": {
+          cg.local.get(bodyLocals.get(bs.input)!);
+          cg.local.set(bodyLocals.get(bs.output)!);
+          break;
+        }
+        case "execute": {
+          if (bs.source instanceof Kernel) {
+            const extracted = bodyExtracted.get(bsi);
+            if (extracted) {
+              const kernelSize = bs.source.size as number;
+              cg.i32.const(0);
+              cg.i32.const(kernelSize);
+              for (const id of bs.inputs) {
+                cg.local.get(bodyLocals.get(id)!);
+              }
+              for (const id of bs.outputs) {
+                cg.local.get(bodyLocals.get(id)!);
+              }
+              cg.call(extracted.funcRef);
+            } else {
+              emitInlinedKernel(
+                cg,
+                funcs,
+                bs.source,
+                bs.inputs.map((id) => bodyLocals.get(id)!),
+                bs.outputs.map((id) => bodyLocals.get(id)!),
+              );
+            }
+          }
+          break;
+        }
+      }
+    }
+
+    // Free old carries if owned (skip first iteration — parent-owned)
+    cg.local.get(ownsCarryLocal);
+    cg.if(cg.void);
+    for (let k = 0; k < numCarry; k++) {
+      cg.local.get(oldCarryLocals[k]);
+      cg.call(freeFunc);
+    }
+    cg.end();
+
+    // Update carry locals to body's output pointers
+    for (let k = 0; k < numCarry; k++) {
+      cg.local.get(bodyLocals.get(bodyProg.outputs[k])!);
+      cg.local.set(carryLocals[k]);
+    }
+
+    // Mark carries as owned after first iteration
+    cg.i32.const(1);
+    cg.local.set(ownsCarryLocal);
+
+    // i++
+    cg.local.get(iLocal);
+    cg.i32.const(1);
+    cg.i32.add();
+    cg.local.set(iLocal);
+
+    cg.br(1); // continue loop
+    cg.end(); // end block
+  }
+  cg.end(); // end loop
+
+  // --- Copy final carries to pre-allocated output buffers ---
+  for (let k = 0; k < numCarry; k++) {
+    // memory.copy(dst, src, len)
+    cg.local.get(outerLocals.get(step.outputs[k])!); // dst
+    cg.local.get(carryLocals[k]); // src
+    cg.i32.const(step.carrySizeBytes[k]); // len
+    cg.memory.copy();
+  }
+
+  // Free last iteration's carry buffers (if loop executed at least once)
+  cg.local.get(ownsCarryLocal);
+  cg.if(cg.void);
+  for (let k = 0; k < numCarry; k++) {
+    cg.local.get(carryLocals[k]);
+    cg.call(freeFunc);
+  }
+  cg.end();
+
+  // Free index buffer
+  cg.local.get(idxBufLocal);
+  cg.call(freeFunc);
 }
 
 // ---------------------------------------------------------------------------

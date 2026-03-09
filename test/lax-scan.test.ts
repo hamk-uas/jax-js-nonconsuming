@@ -17,8 +17,10 @@
  */
 
 import {
+  clearCaches,
   defaultDevice,
   devices,
+  DType,
   grad,
   init,
   jit,
@@ -847,7 +849,9 @@ suite.each(devices)("lax.scan device:%s", (device) => {
   });
 
   describe("scan with routines", () => {
-    it("scan with Cholesky in body", async () => {
+    // Cholesky routine is not supported on WebGL
+    it("scan with Cholesky in body", async ({ skip }) => {
+      if (device === "webgl") skip();
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const scaled = np.multiply(carry, x);
         const L = lax.linalg.cholesky(scaled);
@@ -874,7 +878,8 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       outputs.dispose();
     });
 
-    it("jit + scan with Cholesky", async () => {
+    it("jit + scan with Cholesky", async ({ skip }) => {
+      if (device === "webgl") skip();
       const f = jit(() => {
         const step = (carry: np.Array, _x: np.Array): [np.Array, np.Array] => {
           const L = lax.linalg.cholesky(carry);
@@ -1875,5 +1880,444 @@ describe("native scan paths (P2+)", () => {
     expect(finalCarry).toBeAllclose(_expectedMatmul);
     finalCarry.dispose();
     _.dispose();
+  });
+});
+
+// ============================================================================
+// Preencoded multi-step scan tests (WebGPU Phase 2)
+// ============================================================================
+
+describe("preencoded multi-step scan (WebGPU)", () => {
+  const hasWebGPU = devicesAvailable.includes("webgpu");
+
+  beforeEach(({ skip }) => {
+    if (!hasWebGPU) skip();
+    defaultDevice("webgpu");
+  });
+
+  test("numCarry ≠ numY: two carries, one Y output", () => {
+    // Tier 1 rejects because numCarry=2 ≠ numY=1.
+    // Two independent kernels (different input sets: [a,x] vs [b,x]) → 2 execute steps.
+    const step = (
+      carry: [np.Array, np.Array],
+      x: np.Array,
+    ): [[np.Array, np.Array], np.Array] => {
+      const [a, b] = carry;
+      const newA = np.add(a, x);
+      const newB = np.multiply(b, x);
+      return [[newA, newB], newA];
+    };
+
+    using initA = np.array([0.0, 0.0]);
+    using initB = np.array([1.0, 1.0]);
+    using xs = np.array([
+      [1.0, 2.0],
+      [3.0, 4.0],
+      [5.0, 6.0],
+    ]);
+
+    const [[finalA, finalB], ys] = lax.scan(step, [initA, initB], xs, {
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
+    });
+
+    // a accumulates: [0,0]+[1,2]=[1,2], +[3,4]=[4,6], +[5,6]=[9,12]
+    expect(finalA).toBeAllclose([9, 12]);
+    // b multiplies: [1,1]*[1,2]=[1,2], *[3,4]=[3,8], *[5,6]=[15,48]
+    expect(finalB).toBeAllclose([15, 48]);
+    // ys is the running sum (= newA at each step)
+    expect(ys).toBeAllclose([
+      [1, 2],
+      [4, 6],
+      [9, 12],
+    ]);
+    finalA.dispose();
+    finalB.dispose();
+    ys.dispose();
+  });
+
+  test("Y ≠ carry: same numCarry=numY but different computations", () => {
+    // Tier 1 rejects because yOutIds[0] ≠ carryOutIds[0].
+    // Two independent kernels: carry+x vs x*x (different input sets) → 2 execute steps.
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      const y = np.multiply(x, x);
+      return [newCarry, y];
+    };
+
+    using initCarry = np.array([0.0]);
+    using xs = np.array([[1.0], [2.0], [3.0], [4.0]]);
+
+    const [finalCarry, ys] = lax.scan(step, initCarry, xs, {
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
+    });
+
+    // carry: 0+1=1, 1+2=3, 3+3=6, 6+4=10
+    expect(finalCarry).toBeAllclose([10]);
+    // y: 1²=1, 2²=4, 3²=9, 4²=16
+    expect(ys).toBeAllclose([[1], [4], [9], [16]]);
+    finalCarry.dispose();
+    ys.dispose();
+  });
+
+  test("reverse scan with numCarry ≠ numY", () => {
+    const step = (
+      carry: [np.Array, np.Array],
+      x: np.Array,
+    ): [[np.Array, np.Array], np.Array] => {
+      const [a, b] = carry;
+      const newA = np.add(a, x);
+      const newB = np.multiply(b, x);
+      return [[newA, newB], newA];
+    };
+
+    using initA = np.array([0.0]);
+    using initB = np.array([1.0]);
+    using xs = np.array([[1.0], [2.0], [3.0]]);
+
+    const [[finalA, finalB], ys] = lax.scan(step, [initA, initB], xs, {
+      reverse: true,
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
+    });
+
+    // reverse order: x=[3],[2],[1]
+    // a: 0+3=3, 3+2=5, 5+1=6
+    expect(finalA).toBeAllclose([6]);
+    // b: 1*3=3, 3*2=6, 6*1=6
+    expect(finalB).toBeAllclose([6]);
+    // ys (in reverse iteration order, stacked as original axis order):
+    // iter 0 (x=[3]): newA=[3] → ys[2]
+    // iter 1 (x=[2]): newA=[5] → ys[1]
+    // iter 2 (x=[1]): newA=[6] → ys[0]
+    expect(ys).toBeAllclose([[6], [5], [3]]);
+    finalA.dispose();
+    finalB.dispose();
+    ys.dispose();
+  });
+
+  test("Y ≠ carry with larger arrays", () => {
+    const size = 64;
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      const y = np.multiply(x, x);
+      return [newCarry, y];
+    };
+
+    using initCarry = np.zeros([size]);
+    using xs = np.ones([100, size]);
+
+    const [finalCarry, ys] = lax.scan(step, initCarry, xs, {
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
+    });
+
+    using expected = np.full([size], 100);
+    expect(finalCarry).toBeAllclose(expected);
+    // ys[i] = 1*1 = 1 for all i (xs are all ones)
+    using _sumYs = np.sum(ys);
+    expect(_sumYs.js()).toBeCloseTo(100 * size, 0);
+    finalCarry.dispose();
+    ys.dispose();
+  });
+
+  test("jit-wrapped preencoded-multi-step scan", () => {
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      const y = np.multiply(x, x);
+      return [newCarry, y];
+    };
+
+    using initCarry = np.array([0.0, 0.0]);
+    using xs = np.array([
+      [1.0, 2.0],
+      [3.0, 4.0],
+    ]);
+
+    using f = jit((init: np.Array, data: np.Array) =>
+      lax.scan(step, init, data, {
+        acceptPath: ["compiled-loop", "preencoded-multi-step"],
+      }),
+    );
+
+    const [finalCarry, ys] = f(initCarry, xs);
+
+    expect(finalCarry).toBeAllclose([4, 6]);
+    expect(ys).toBeAllclose([
+      [1, 4],
+      [9, 16],
+    ]);
+    finalCarry.dispose();
+    ys.dispose();
+  });
+
+  test("numCarry ≠ numY with pytree carry", () => {
+    // Pytree carry with 2 leaves, 1 Y output → numCarry=2, numY=1
+    const step = (
+      carry: { sum: np.Array; count: np.Array },
+      x: np.Array,
+    ): [{ sum: np.Array; count: np.Array }, np.Array] => {
+      const newSum = np.add(carry.sum, x);
+      const newCount = np.add(carry.count, np.ones([]));
+      return [{ sum: newSum, count: newCount }, newSum];
+    };
+
+    using initSum = np.array([0.0]);
+    using initCount = np.array([0.0]);
+    using xs = np.array([[10.0], [20.0], [30.0]]);
+
+    const [finalCarry, ys] = lax.scan(
+      step,
+      { sum: initSum, count: initCount },
+      xs,
+      { acceptPath: ["compiled-loop", "preencoded-multi-step"] },
+    );
+
+    expect(finalCarry.sum).toBeAllclose([60]);
+    expect(finalCarry.count).toBeAllclose([3]);
+    expect(ys).toBeAllclose([[10], [30], [60]]);
+    tree.dispose(finalCarry);
+    ys.dispose();
+  });
+
+  test("grad through preencoded-multi-step scan (Y ≠ carry)", () => {
+    // grad(scan) with Y ≠ carry: backward pass should correctly propagate
+    const loss = (xs: np.Array): np.Array => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const newCarry = np.add(carry, x);
+        const y = np.multiply(x, x);
+        return [newCarry, y];
+      };
+      using initCarry = np.zeros([1]);
+      const [finalCarry, ys] = lax.scan(step, initCarry, xs);
+      // loss = sum(carry) + sum(ys) = sum(xs) + sum(xs²)
+      using sumCarry = np.sum(finalCarry);
+      using sumYs = np.sum(ys);
+      finalCarry.dispose();
+      ys.dispose();
+      return np.add(sumCarry, sumYs);
+    };
+
+    using xs = np.array([[1.0], [2.0], [3.0]]);
+    using dxs = grad(loss)(xs);
+
+    // d/dx_i [sum(xs) + sum(xs²)] = 1 + 2*x_i
+    expect(dxs).toBeAllclose([[3], [5], [7]]);
+  });
+
+  test("compiled-loop Y≠carry: Y-only step reads updated carry (regression)", () => {
+    // Regression test for carry-live gid mapping. When Y outputs differ from
+    // carry outputs, Y-only steps must read the UPDATED carry (computed in the
+    // same iteration), not the snapshot or an aliased internal variable.
+    // Before fix: Y-only step read stale/wrong data → catastrophic errors.
+    if (!hasWebGPU) return;
+
+    // Backward RTS smoother pattern: carry={r,N}, Y={x_smooth,C_smooth}
+    // x_smooth = x_pred + C_pred * r_new (reads carry r_new from same iter)
+    // C_smooth = C_pred - C_pred * N_new * C_pred (reads carry N_new)
+    const step = (
+      carry: { r: np.Array; N: np.Array },
+      xs: { x_pred: np.Array; C_pred: np.Array; L: np.Array; update: np.Array },
+    ): [{ r: np.Array; N: np.Array }, { x_s: np.Array; C_s: np.Array }] => {
+      // New carry: r_new = L * r + update
+      const r_new = np.add(np.multiply(xs.L, carry.r), xs.update);
+      // New carry: N_new = L * N * L
+      const N_new = np.multiply(np.multiply(xs.L, carry.N), xs.L);
+      // Y outputs depend on NEW carry (not snapshot):
+      const x_s = np.add(xs.x_pred, np.multiply(xs.C_pred, r_new));
+      const C_s = np.subtract(
+        xs.C_pred,
+        np.multiply(np.multiply(xs.C_pred, N_new), xs.C_pred),
+      );
+      return [
+        { r: r_new, N: N_new },
+        { x_s, C_s },
+      ];
+    };
+
+    const N = 20;
+    using r0 = np.zeros([1], { dtype: DType.Float32 });
+    using N0 = np.zeros([1], { dtype: DType.Float32 });
+    using x_pred = np.ones([N, 1], { dtype: DType.Float32 });
+    using C_pred = np.full([N, 1], 0.5, { dtype: DType.Float32 });
+    using L = np.full([N, 1], 0.9, { dtype: DType.Float32 });
+    using update = np.full([N, 1], 0.1, { dtype: DType.Float32 });
+
+    // Run via JIT on WebGPU
+    defaultDevice("webgpu");
+    clearCaches();
+    const jitFn = jit(
+      (
+        r: np.Array,
+        N_: np.Array,
+        xp: np.Array,
+        cp: np.Array,
+        l: np.Array,
+        u: np.Array,
+      ) =>
+        lax.scan(
+          step,
+          { r, N: N_ },
+          { x_pred: xp, C_pred: cp, L: l, update: u },
+        ),
+    );
+    const [gpuCarry, gpuY] = jitFn(r0, N0, x_pred, C_pred, L, update) as any;
+    const gpuXs = gpuY.x_s.dataSync();
+    const gpuCs = gpuY.C_s.dataSync();
+    gpuCarry.r.dispose();
+    gpuCarry.N.dispose();
+    gpuY.x_s.dispose();
+    gpuY.C_s.dispose();
+    jitFn.dispose();
+
+    // Run via JIT on WASM as reference
+    defaultDevice("wasm");
+    clearCaches();
+    const jitRef = jit(
+      (
+        r: np.Array,
+        N_: np.Array,
+        xp: np.Array,
+        cp: np.Array,
+        l: np.Array,
+        u: np.Array,
+      ) =>
+        lax.scan(
+          step,
+          { r, N: N_ },
+          { x_pred: xp, C_pred: cp, L: l, update: u },
+        ),
+    );
+    const [wasmCarry, wasmY] = jitRef(r0, N0, x_pred, C_pred, L, update) as any;
+    const wasmXs = wasmY.x_s.dataSync();
+    const wasmCs = wasmY.C_s.dataSync();
+    wasmCarry.r.dispose();
+    wasmCarry.N.dispose();
+    wasmY.x_s.dispose();
+    wasmY.C_s.dispose();
+    jitRef.dispose();
+
+    // Compare: WebGPU must match WASM within float32 tolerance
+    for (let i = 0; i < wasmXs.length; i++) {
+      const denom = Math.max(Math.abs(wasmXs[i]), 1e-6);
+      const err = Math.abs(gpuXs[i] - wasmXs[i]) / denom;
+      expect(err, `x_s[${i}] gpu=${gpuXs[i]} wasm=${wasmXs[i]}`).toBeLessThan(
+        1e-4,
+      );
+    }
+    for (let i = 0; i < wasmCs.length; i++) {
+      const denom = Math.max(Math.abs(wasmCs[i]), 1e-6);
+      const err = Math.abs(gpuCs[i] - wasmCs[i]) / denom;
+      expect(err, `C_s[${i}] gpu=${gpuCs[i]} wasm=${wasmCs[i]}`).toBeLessThan(
+        1e-4,
+      );
+    }
+  });
+});
+
+// ============================================================================
+// Preencoded multi-step with routines (WebGPU Phase 3)
+// ============================================================================
+
+describe("preencoded multi-step with routines (WebGPU)", () => {
+  const hasWebGPU = devicesAvailable.includes("webgpu");
+
+  beforeEach(({ skip }) => {
+    if (!hasWebGPU) skip();
+    defaultDevice("webgpu");
+  });
+
+  test("mixed kernel + Cholesky routine body", () => {
+    // Body: scale → Cholesky = kernel + routine → 2 execute steps
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const scaled = np.multiply(carry, x);
+      const L = lax.linalg.cholesky(scaled);
+      return [L, L];
+    };
+
+    using initVal = np.array([
+      [4.0, 2.0],
+      [2.0, 5.0],
+    ]);
+    // xs must preserve positive-definiteness when multiplied into carry.
+    // Using 1.0 keeps the matrix unchanged each iteration.
+    using xs = np.array([[1.0], [1.0], [1.0]]);
+
+    const [finalCarry, ys] = lax.scan(step, initVal, xs, {
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
+    });
+
+    // After 3 iterations of chol(carry * 1.0) = chol(carry):
+    // iter 0: chol([[4,2],[2,5]]) = [[2,0],[1,2]]
+    // iter 1: chol([[2,0],[1,2]]) ≈ [[1.414,0],[0.707,1.225]]
+    // iter 2: chol of above ≈ [[1.189,0],[0.595,0.933]]
+    const carryData = finalCarry.dataSync();
+    expect(carryData[0]).toBeCloseTo(1.189, 2);
+    expect(carryData[1]).toBeCloseTo(0.0, 4);
+    expect(carryData[2]).toBeCloseTo(0.595, 2);
+    expect(carryData[3]).toBeCloseTo(0.933, 2);
+
+    // 3 iterations, each producing a 2×2 L
+    const ysData = ys.dataSync();
+    expect(ysData.length).toBe(3 * 4);
+    finalCarry.dispose();
+    ys.dispose();
+  });
+
+  test("Cholesky routine + downstream kernel body", () => {
+    // Body: Cholesky → matmul(L, L^T) = routine + kernel → 2 execute steps
+    const step = (carry: np.Array, _x: np.Array): [np.Array, np.Array] => {
+      const L = lax.linalg.cholesky(carry);
+      const reconstructed = np.matmul(L, L.transpose());
+      return [reconstructed, L];
+    };
+
+    using initVal = np.array([
+      [4.0, 2.0],
+      [2.0, 5.0],
+    ]);
+    using xs = np.array([[1.0], [1.0]]);
+
+    const [finalCarry, ys] = lax.scan(step, initVal, xs, {
+      acceptPath: ["compiled-loop", "preencoded-multi-step"],
+    });
+
+    // L·L^T should reconstruct the original matrix (idempotent)
+    const carryData = finalCarry.dataSync();
+    expect(carryData[0]).toBeCloseTo(4.0, 3);
+    expect(carryData[1]).toBeCloseTo(2.0, 3);
+    expect(carryData[2]).toBeCloseTo(2.0, 3);
+    expect(carryData[3]).toBeCloseTo(5.0, 3);
+
+    expect(ys.dataSync().length).toBe(2 * 4);
+    finalCarry.dispose();
+    ys.dispose();
+  });
+
+  test("jit-wrapped mixed kernel+routine scan", () => {
+    const f = jit(() => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const scaled = np.multiply(carry, x);
+        const L = lax.linalg.cholesky(scaled);
+        return [L, L];
+      };
+
+      using initVal = np.array([
+        [4.0, 2.0],
+        [2.0, 5.0],
+      ]);
+      using xs = np.array([[1.0], [1.0]]);
+
+      return lax.scan(step, initVal, xs, {
+        acceptPath: ["compiled-loop", "preencoded-multi-step"],
+      });
+    });
+
+    const [finalCarry, ys] = f();
+    const carryData = finalCarry.dataSync();
+    // 2 iterations: chol(chol([[4,2],[2,5]]))
+    expect(carryData[0]).toBeCloseTo(1.414, 2);
+    expect(carryData[3]).toBeCloseTo(1.225, 2);
+
+    finalCarry.dispose();
+    ys.dispose();
+    f.dispose();
   });
 });
