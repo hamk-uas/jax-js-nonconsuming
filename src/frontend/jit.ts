@@ -1337,6 +1337,7 @@ export function jitCompile(
   _currentDimBindings = dimBindings;
 
   try {
+    const _jitT0 = performance.now();
     if (DEBUG >= 1) {
       console.info("=========== JIT Compile ===========\n" + jaxpr.toString());
     }
@@ -2249,6 +2250,10 @@ export function jitCompile(
       outputIds,
     );
     if (DEBUG >= 4) console.info(jp.toString());
+    if (DEBUG >= 1)
+      console.info(
+        `[jitCompile] ${(performance.now() - _jitT0).toFixed(1)}ms, ${builder.steps.length} steps, ${jaxpr.eqns.length} eqns`,
+      );
     jitCompileCache.set(cacheKey, jp);
     return jp;
   } finally {

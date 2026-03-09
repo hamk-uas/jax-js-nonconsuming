@@ -387,6 +387,16 @@ export class JaxprEqn {
   }
 }
 
+/**
+ * JSON.stringify replacer that substitutes Jaxpr objects with their stable hash.
+ * This ensures that `JSON.stringify(eqn.params, _jaxprHashReplacer)` produces
+ * deterministic output across different tracings of the same function.
+ */
+function _jaxprHashReplacer(_key: string, value: unknown): unknown {
+  if (value instanceof Jaxpr) return `jaxpr#${value.getHash()}`;
+  return value;
+}
+
 /** Typed intermediate representation for traced computations. */
 export class Jaxpr implements FpHashable {
   #hash?: bigint;
@@ -459,7 +469,7 @@ export class Jaxpr implements FpHashable {
       hasher.update(eqn.inputs.length);
       for (const x of eqn.inputs)
         hasher.update(x instanceof Var ? vi(x) : x.value);
-      hasher.update(JSON.stringify(eqn.params));
+      hasher.update(JSON.stringify(eqn.params, _jaxprHashReplacer));
       hasher.update(eqn.outBinders.length);
       for (const x of eqn.outBinders) hasher.update(vi(x));
       // Include effect annotations in hash when present
