@@ -1502,10 +1502,15 @@ export function planAssociativeScan(
     if (!(source instanceof Kernel)) continue; // already checked above
     const internalIdx = internalSizes.length;
     stepToInternalBase.set(i, internalIdx);
-    slotToInternal.set(step.outputs[0], internalIdx);
-    internalSizes.push(
-      (source.size as number) * byteWidth(source.outputs[0].dtype),
-    );
+    // Map ALL outputs of multi-output kernels, not just the first
+    for (let oi = 0; oi < source.numOutputs; oi++) {
+      slotToInternal.set(step.outputs[oi], internalIdx + oi);
+    }
+    for (let oi = 0; oi < source.numOutputs; oi++) {
+      internalSizes.push(
+        (source.size as number) * byteWidth(source.outputs[oi].dtype),
+      );
+    }
   }
 
   // Determine leaf-to-internal mapping (which internal produced each output leaf)
@@ -1556,28 +1561,58 @@ export function planAssociativeScan(
 
     // Reindex kernel expression GlobalIndex IDs
     const reindexMap = inputSlots;
-    const reindexedExp = source.outputs[0].exp.reindexGids(reindexMap);
-    const reindexedReduction = source.outputs[0].reduction
-      ? new Reduction(
-          source.outputs[0].reduction.dtype,
-          source.outputs[0].reduction.op,
-          source.outputs[0].reduction.size,
-          source.outputs[0].reduction.epilogue.reindexGids(reindexMap),
-        )
-      : undefined;
-    const reindexedKernel = Kernel.single(
-      numInputs + internalSizes.length,
-      source.size,
-      reindexedExp,
-      reindexedReduction,
-    );
-
     const internalBase = stepToInternalBase.get(i)!;
-    steps.push({
-      source: reindexedKernel,
-      inputSlots,
-      outputInternalIdx: internalBase,
-    });
+
+    if (source.numOutputs > 1) {
+      // Multi-output kernel: reindex all outputs
+      const reindexedOutputs = source.outputs.map((out) => ({
+        exp: out.exp.reindexGids(reindexMap),
+        reduction: out.reduction
+          ? new Reduction(
+              out.reduction.dtype,
+              out.reduction.op,
+              out.reduction.size,
+              out.reduction.epilogue.reindexGids(reindexMap),
+            )
+          : undefined,
+        dtype: out.dtype,
+      }));
+      const reindexedKernel = Kernel.multi(
+        numInputs + internalSizes.length,
+        source.size,
+        reindexedOutputs,
+      );
+      const indices: number[] = [];
+      for (let oi = 0; oi < source.numOutputs; oi++)
+        indices.push(internalBase + oi);
+      steps.push({
+        source: reindexedKernel,
+        inputSlots,
+        outputInternalIdx: internalBase,
+        outputInternalIndices: indices,
+      });
+    } else {
+      const reindexedExp = source.outputs[0].exp.reindexGids(reindexMap);
+      const reindexedReduction = source.outputs[0].reduction
+        ? new Reduction(
+            source.outputs[0].reduction.dtype,
+            source.outputs[0].reduction.op,
+            source.outputs[0].reduction.size,
+            source.outputs[0].reduction.epilogue.reindexGids(reindexMap),
+          )
+        : undefined;
+      const reindexedKernel = Kernel.single(
+        numInputs + internalSizes.length,
+        source.size,
+        reindexedExp,
+        reindexedReduction,
+      );
+      steps.push({
+        source: reindexedKernel,
+        inputSlots,
+        outputInternalIdx: internalBase,
+      });
+    }
   }
 
   // Build per-element leaf sizes (bytes) for WASM
@@ -1595,31 +1630,53 @@ export function planAssociativeScan(
   }
 
   // --- WebGPU block-map path ---
+  // Guard: storage buffer bindings must fit inside the per-stage limit.
+  // The fused shader needs numConsts + numLeaves (inputs) + numLeaves (outputs)
+  // bindings. This is block-size-independent, so check once before the loop.
   if (backend.type === "webgpu") {
-    try {
-      const BLOCK_SIZE = 256;
-      const blockMapPlan = tryBuildBlockMapAssocScanPlan(
-        backend,
-        bodyProgram,
-        bodyJaxpr,
-        numLeaves,
-        numConsts,
-        axis,
-        reverse,
-        BLOCK_SIZE,
-        dimBindings,
-      );
-      if (blockMapPlan) {
-        if (DEBUG >= 1) {
-          console.log(
-            `[assoc-scan] SUCCESS! Using WebGPU block-map path (B=${BLOCK_SIZE})`,
+    const maxBindings = backend.maxArgs + 1; // maxStorageBuffersPerShaderStage
+    const neededBindings = numConsts + 2 * numLeaves;
+    if (neededBindings > maxBindings) {
+      if (DEBUG >= 1) {
+        console.log(
+          `[assoc-scan] block-map rejected: ${neededBindings} bindings > device max ${maxBindings}`,
+        );
+      }
+      return { path: "fallback" };
+    }
+
+    // Try progressively smaller block sizes until the fused shader fits in
+    // shared memory. The fused shader's shmem usage scales linearly with
+    // blockSize (ping-pong + reduction workspaces), so halving B roughly
+    // halves shmem. Minimum B=32 keeps the Kogge-Stone round count ≤5.
+    for (const BLOCK_SIZE of [256, 128, 64, 32]) {
+      try {
+        const blockMapPlan = tryBuildBlockMapAssocScanPlan(
+          backend,
+          bodyProgram,
+          bodyJaxpr,
+          numLeaves,
+          numConsts,
+          axis,
+          reverse,
+          BLOCK_SIZE,
+          dimBindings,
+        );
+        if (blockMapPlan) {
+          if (DEBUG >= 1) {
+            console.log(
+              `[assoc-scan] SUCCESS! Using WebGPU block-map path (B=${BLOCK_SIZE})`,
+            );
+          }
+          return blockMapPlan;
+        }
+      } catch (e) {
+        if (DEBUG >= 2) {
+          console.warn(
+            `[assoc-scan] WebGPU block-map compilation failed (B=${BLOCK_SIZE}):`,
+            e,
           );
         }
-        return blockMapPlan;
-      }
-    } catch (e) {
-      if (DEBUG >= 2) {
-        console.warn("[assoc-scan] WebGPU block-map compilation failed:", e);
       }
     }
     return { path: "fallback" };
@@ -1754,6 +1811,49 @@ function tryBuildBlockMapAssocScanPlan(
     if (DEBUG >= 1) {
       console.log(
         "[assoc-scan] block-map path: body has no workgroup_assoc_scan step",
+      );
+    }
+    return null;
+  }
+
+  // --- Pre-estimate fused shader shmem to reject block sizes that overflow ---
+  // This mirrors the accounting in blockMapFusedShaderSource: top-level mallocs
+  // + WAS ping-pong + WAS body mallocs + reduction workspaces.
+  const maxShmem = backend.capabilities.maxComputeWorkgroupStorageSize ?? 16384;
+  let estimatedShmem = 0;
+  for (const step of localScanBodyProgram.steps) {
+    if (step.type === "malloc" && typeof step.size === "number") {
+      estimatedShmem += step.size;
+    } else if (step.type === "workgroup_assoc_scan") {
+      // Ping-pong arrays: 2 × blockSize × elemCount × byteWidth per element
+      for (const aval of step.elemAvals) {
+        const elemCount = aval.size / (aval.shape[0] as number);
+        estimatedShmem += blockSize * elemCount * byteWidth(aval.dtype) * 2;
+      }
+      // WAS body mallocs + reduction workspaces
+      for (const bs of step.bodyProgram.steps) {
+        if (bs.type === "malloc" && typeof bs.size === "number") {
+          estimatedShmem += bs.size;
+        } else if (bs.type === "execute" && bs.source instanceof Kernel) {
+          for (const out of bs.source.outputs) {
+            if (out.reduction) {
+              estimatedShmem += blockSize * byteWidth(out.reduction.dtype);
+            }
+          }
+        }
+      }
+    } else if (step.type === "execute" && step.source instanceof Kernel) {
+      for (const out of step.source.outputs) {
+        if (out.reduction) {
+          estimatedShmem += blockSize * byteWidth(out.reduction.dtype);
+        }
+      }
+    }
+  }
+  if (estimatedShmem > maxShmem) {
+    if (DEBUG >= 1) {
+      console.log(
+        `[assoc-scan] block-map B=${blockSize}: shmem ~${estimatedShmem} > limit ${maxShmem}, trying smaller`,
       );
     }
     return null;

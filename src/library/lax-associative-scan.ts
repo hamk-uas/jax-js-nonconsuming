@@ -54,6 +54,7 @@ import { moveaxis, vmap } from "../frontend/vmap";
 import * as tree from "../tree";
 import type { JsTree } from "../tree";
 import { checkAxis } from "../utils";
+import { DEBUG } from "../utils";
 
 /**
  * Options for {@link associativeScan}.
@@ -343,6 +344,14 @@ export function associativeScan<T extends JsTree<Array>>(
     // This unrolls the algorithm into the current trace (jit/grad), which
     // produces a larger graph but works with compose fns that explicitly
     // reference the batch dimension.
+    if (DEBUG >= 1) {
+      console.warn(
+        "[associativeScan] Per-element body tracing failed — falling back to " +
+          "unrolled Kogge-Stone (slower on GPU). If your compose function uses " +
+          'batch-explicit ops like einsum("nij,njk->nik"), replace them with ' +
+          "np.matmul / np.swapaxes to enable the fused scan path.",
+      );
+    }
     for (let i = 0; i < movedElems.length; i++) {
       if (movedOwned[i]) movedElems[i].dispose();
     }
