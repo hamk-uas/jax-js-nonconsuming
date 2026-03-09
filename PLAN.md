@@ -236,14 +236,17 @@ support would both be needed. This is out of scope for now.
 
 ### Benchmark targets (Nile order=1, m=2, warm)
 
-| Metric             | Current   | After Phase 1 (target) |
-| ------------------ | --------- | ---------------------- |
-| WebGPU warm N=100  | ~126 ms   | ≤15 ms                 |
-| WebGPU warm N=3200 | ~1,561 ms | ≤50 ms                 |
-| GPU/WASM ratio     | 19–450×   | ≤2×                    |
+| Metric             | Before    | Phase 1 only | Phase 1 + batch |
+| ------------------ | --------- | ------------ | --------------- |
+| WebGPU warm N=100  | ~126 ms   | ~123 ms      | TBD             |
+| WebGPU warm N=3200 | ~1,561 ms | TBD          | TBD             |
+| GPU/WASM ratio     | 19–450×   | 13–63×       | TBD             |
 
-These targets assume block-map fusion collapses each Kogge-Stone round to 1 dispatch. Valid for m≤4
-where `inv` uses analytical Cramer's rule (pure kernels). For m≥5, LU Routine blocks fusion.
+Phase 1 alone (uniform constants) only reduced the ratio by ~20%. The remaining overhead was
+unbatched `queue.submit()` calls: each `dispatchBlockMapFused` and `copyBufferToBuffer` inside
+`executeAssocScanBlockMap` created its own command encoder. For N=3200 (M=13), this produced ~78
+submits. Fix: wrap entire `executeAssocScanBlockMap` in `beginBatch()/endBatch()` so all GPU
+operations (dispatches + copies + gathers) go in a single `queue.submit()`.
 
 ---
 

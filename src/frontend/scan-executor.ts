@@ -574,6 +574,27 @@ export function executeAssociativeScan(
 function executeAssocScanBlockMap(
   params: ExecuteAssocScanParams,
 ): ExecuteAssocScanResult {
+  const { backend, plan } = params;
+
+  if (plan.path !== "webgpu-block-map") {
+    throw new Error("executeAssocScanBlockMap: expected webgpu-block-map plan");
+  }
+
+  // Batch all GPU operations (dispatches + buffer copies) into a single
+  // queue.submit(). Without this, each dispatchBlockMapFused /
+  // copyBufferToBuffer creates its own command encoder + submit, causing
+  // massive overhead (e.g., 78 submits for N=3200).
+  backend.beginBatch?.();
+  try {
+    return executeAssocScanBlockMapInner(params);
+  } finally {
+    backend.endBatch?.();
+  }
+}
+
+function executeAssocScanBlockMapInner(
+  params: ExecuteAssocScanParams,
+): ExecuteAssocScanResult {
   const {
     backend,
     plan,
@@ -598,8 +619,6 @@ function executeAssocScanBlockMap(
     numConsts,
     applyVmapProgram,
   } = plan;
-
-  // Resolve N at runtime
   const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
   const M = Math.ceil(N / B);
 
