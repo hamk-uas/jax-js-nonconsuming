@@ -198,17 +198,19 @@ Phase 2 is insurance for the future and can be deferred until a real 6+ tuple us
 
 ## Downstream: dlm-js integration (from `issues/jax-js-webgpu-block-map-perf-regression.md`)
 
-### Current state
+### Current state (post-`2554290`)
 
 `dlmFit(algorithm: 'assoc')` runs two `associativeScan` calls:
 
 1. **Forward Kalman filter** — 5-tuple `{A, b, C, eta, J}` with `np.linalg.inv` and
-   `np.einsum`/`np.matmul`. 11 bindings → WebGPU fallback.
-2. **Backward RTS smoother** — 3-tuple `{A, b, S}`, 0 constants, 6 bindings → **already fits within
-   the WebGPU limit**. Uses the 3-operand einsum `"nij,njk,nlk->nil"` (in fast path).
+   `np.einsum`/`np.matmul`. ~~11 bindings → WebGPU fallback.~~ Now 10 bindings via uniform constants
+   → **block-map fused path activates** ✅
+2. **Backward RTS smoother** — 3-tuple `{A, b, S}`, 0 constants, 6 bindings → **block-map fused path
+   activates** ✅
 
-WebGPU `dlmFit` is currently 19–450× slower than WASM depending on N, entirely due to dispatch
-overhead in the Kogge-Stone fallback.
+Both scans use the fused WebGPU shader path. Correctness verified (var<private> fix in `2554290`).
+The remaining performance gap is from the 373 kernel dispatches outside the scans (element
+construction + diagnostics), not from the scans themselves.
 
 ### What Phase 1 unblocks for dlm-js
 
@@ -227,26 +229,98 @@ support would both be needed. This is out of scope for now.
   investigate whether the 3-operand einsum `"nij,njk,nlk->nil"` (lowered to 2 sequential matmuls by
   the fast path) prevents single-kernel fusion.
 
-### Action items for dlm-js
+### Action items for dlm-js — ✅ Complete
 
-- After Phase 1 lands in jax-js, update dlm-js to latest jax-js dependency
-- Verify forward scan (m=2) activates block-map path (check with `setDebug(1)`)
-- Re-run `issues/repro-webgpu-block-map-perf.ts` and update the benchmark table
-- Target: WebGPU/WASM ratio ≤ 2× for warm runs at m=2 (currently 19× at N=100)
+- ~~After Phase 1 lands in jax-js, update dlm-js to latest jax-js dependency~~
+- ~~Verify forward scan (m=2) activates block-map path (check with `setDebug(1)`)~~
+- ~~Re-run `issues/repro-webgpu-block-map-perf.ts` and update the benchmark table~~
 
-### Benchmark targets (Nile order=1, m=2, warm)
+Both forward 5-tuple and backward 3-tuple activate the WebGPU block-map fused path.
 
-| Metric             | Before    | Phase 1 only | Phase 1 + batch |
-| ------------------ | --------- | ------------ | --------------- |
-| WebGPU warm N=100  | ~126 ms   | ~123 ms      | TBD             |
-| WebGPU warm N=3200 | ~1,561 ms | TBD          | TBD             |
-| GPU/WASM ratio     | 19–450×   | 13–63×       | TBD             |
+### Benchmark results (Nile order=1, m=2, warm, RTX 4070 eGPU)
 
-Phase 1 alone (uniform constants) only reduced the ratio by ~20%. The remaining overhead was
-unbatched `queue.submit()` calls: each `dispatchBlockMapFused` and `copyBufferToBuffer` inside
-`executeAssocScanBlockMap` created its own command encoder. For N=3200 (M=13), this produced ~78
-submits. Fix: wrap entire `executeAssocScanBlockMap` in `beginBatch()/endBatch()` so all GPU
-operations (dispatches + copies + gathers) go in a single `queue.submit()`.
+| Metric             | Before    | Phase 1 only | All fixes (2554290) |
+| ------------------ | --------- | ------------ | ------------------- |
+| WebGPU warm N=100  | ~126 ms   | ~123 ms      | ~124 ms             |
+| WebGPU warm N=800  | —         | —            | ~416 ms             |
+| WebGPU warm N=3200 | ~1,561 ms | —            | ~1,429 ms           |
+| GPU/WASM ratio     | 19–450×   | 13–63×       | 19–154×             |
+
+**Commits applied:** `10ae2aa` (uniform constants), `cd8d47a` (einsum cleanup), `a2062fa` (dispatch
+batching), `2554290` (var<private> fix). All correctness issues resolved.
+
+### Root cause analysis: 764 kernel dispatches
+
+**Critical finding:** On this hardware (RTX 4070 via Deno),
+`maxStorageBuffersPerShaderStage = 1,048,576`, so `maxArgs = 1,048,575`. The P2 (forward
+binding-limit) pass in `splitGraphDataflow` **never fires**. All 764 kernel dispatches are caused by
+**P1 rules** (backward black-node identification):
+
+| P1 Rule             | Description                               | Approximate contribution |
+| ------------------- | ----------------------------------------- | ------------------------ |
+| Reduction endpoints | Each matmul/dot forces a kernel boundary  | 288 dispatches (38%)     |
+| Diamond heuristic   | Node reaching 2+ black nodes materializes | ~200 dispatches (26%)    |
+| Jaxpr outputs       | Final outputs must materialize            | ~40 dispatches (5%)      |
+| Clean-shape inputs  | Pad/Concat need clean inputs              | ~30 dispatches (4%)      |
+| Heterogeneous views | Gather/DynamicSlice force materialization | ~20 dispatches (3%)      |
+| Constant fills      | Zero-arg identity/zero fills              | 37 dispatches (5%)       |
+| Other (cascade)     | Already-black outputs trigger cascade     | ~145 dispatches (19%)    |
+
+Full `dlmFit` dispatches (2 passes × 382 per pass = 764 total):
+
+| Kernel property      | Count | Notes                                            |
+| -------------------- | ----- | ------------------------------------------------ |
+| With reduction       | 288   | Matmul/dot — inherent dispatch boundaries        |
+| Without reduction    | 476   | Elementwise ops materialized by P1 rules         |
+| Size ≤ 4             | 86    | Scalar/tiny — pure overhead, negligible GPU work |
+| Size 5-100           | 189   | Small matrix ops                                 |
+| Size 101-400         | 489   | Full-size ops (N×m² where m=2)                   |
+| Multi-output kernels | 26    | Already fused (2-4 outputs each)                 |
+
+**Overhead breakdown (warm, N=100):**
+
+| Component                                                             | Time       | % of total |
+| --------------------------------------------------------------------- | ---------- | ---------- |
+| `queue.submit()`                                                      | 22ms       | 18%        |
+| `createBindGroup()`                                                   | 6ms        | 5%         |
+| `prepareKernelSync()`                                                 | 1ms        | 1%         |
+| JIT loop overhead (scope, refcount, batch assembly, command encoding) | ~95ms      | 76%        |
+| **Total**                                                             | **~124ms** | 100%       |
+
+The bottleneck is **JS-side overhead in the JIT execution loop**, not GPU compute or even WebGPU API
+calls. Each of the 764 dispatches costs ~132µs in the loop: array allocations for `ins[]` /
+`outs[]`, scope lookups, `incRef`/`decRef` refcounting, batch object creation, and command encoder
+recording. WASM avoids all of this via mega-module compilation (entire program → single native
+function call, 6ms total).
+
+**Scaling:** At N=3200 (M=13 blocks), each assocScan adds ~40 extra block-map dispatches. Combined
+with GPU compute time scaling linearly with N, the total reaches ~1,429ms.
+
+**Browser note:** In Chrome, `maxStorageBuffersPerShaderStage` is typically **8-10** (spec minimum).
+On Chrome, the P2 pass would additionally fragment the dependency graph, producing even more
+dispatches than the 764 seen here. The analysis above represents the **best case** (Deno with
+driver-level limits).
+
+### Remaining optimization opportunities (jax-js)
+
+| ID  | Approach                                                                           | Impact                                                      | Effort                                                                      |
+| --- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------- |
+| O1  | **Diamond heuristic relaxation: allow recomputation for cheap ops**                | High — could reduce 476 non-reduction dispatches by ~40-60% | Medium — modify P1 in `splitGraphDataflow`                                  |
+| O2  | **Scalar promotion: compute size ≤ 4 kernels on CPU, pass as constants**           | Low-Medium — eliminates 86 tiny dispatches (~14ms)          | Medium — needs CPU fallback for tiny kernels in JIT                         |
+| O3  | **Bind group caching for JIT programs with stable pipeline→slot mappings**         | Low — `createBindGroup` is only 6ms/764 calls               | Medium — cache keyed by (pipeline, slot[])                                  |
+| O4  | **Single-pass dlmFit: merge Pass 1 + Pass 2 into one jit call**                    | Medium — eliminates ~382 dispatches + 1 readback            | Medium — downstream restructuring                                           |
+| O5  | **Pre-encoded command buffer: record commands once, replay with buffer rebind**    | High — eliminates per-dispatch loop overhead (~95ms)        | Large — needs WebGPU "render bundle" equivalent for compute (not available) |
+| O6  | **Multi-reduction kernel: fuse chains of matmul+elementwise into single dispatch** | High — could merge pairs of dot→elemwise→dot→elemwise       | Very Large — fundamentally new codegen                                      |
+
+O1 (diamond relaxation) is the highest-impact feasible optimization. The diamond heuristic currently
+forces materialization whenever a node's output reaches 2+ distinct black nodes. For cheap
+operations (unary, binary with small literal), the recomputation cost is negligible compared to the
+dispatch overhead (~132µs). Allowing such recomputation would let these ops fuse into their
+downstream reduction epilogues instead of becoming separate dispatches.
+
+O5 (pre-encoded commands) is the theoretical ideal — it would eliminate the 95ms JS loop overhead
+entirely — but WebGPU has no equivalent of Vulkan's secondary command buffers or Metal's indirect
+command buffers for compute dispatches. This is a WebGPU API limitation.
 
 ---
 
@@ -258,3 +332,14 @@ operations (dispatches + copies + gathers) go in a single `queue.submit()`.
   Fixing the general parser would be a separate, lower-priority effort.
 - **Multiple bind groups for overflow:** WebGPU supports up to 4 bind groups, but storage bindings
   per shader stage is a global limit — splitting across groups doesn't help.
+- **GPU/WASM ratio ≤ 2× target:** Not achievable for small-matrix DLM (m=2) at small N without
+  fundamentally reducing dispatch count. The bottleneck is pure JS-side overhead in the JIT
+  execution loop (95ms of 124ms total). WASM's mega-module avoids this entirely by compiling all
+  steps into a single native function. WebGPU has no equivalent mechanism — each dispatch requires
+  JS-side command encoding. For large-matrix workloads (matmul 4096×4096), WebGPU already achieves
+  53.7% peak.
+- **Binding limit optimization on high-limit hardware:** On Deno/NVIDIA with `maxArgs = 1,048,575`,
+  the P2 pass has no effect. All dispatch fragmentation comes from P1 structural rules (reduction
+  boundaries, diamond heuristic). Browser deployments with Chrome's `maxArgs ≈ 9` will see
+  additional P2-caused fragmentation — but optimizing for Chrome's low limit would require a
+  different approach (e.g., leaf packing) that doesn't address the P1 structural issue.

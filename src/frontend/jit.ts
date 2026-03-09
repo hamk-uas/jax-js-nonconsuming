@@ -2753,7 +2753,31 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
 };
 
 /** Determines how to split the Jaxpr into kernels via dataflow analysis. */
+let _splitStats = {
+  total: 0,
+  reductions: 0,
+  heterogeneous: 0,
+  routines: 0,
+  special: 0,
+  cascade: 0,
+  diamonds: 0,
+  cleanShape: 0,
+  p2: 0,
+};
 function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
+  if (DEBUG >= 1) {
+    _splitStats = {
+      total: 0,
+      reductions: 0,
+      heterogeneous: 0,
+      routines: 0,
+      special: 0,
+      cascade: 0,
+      diamonds: 0,
+      cleanShape: 0,
+      p2: 0,
+    };
+  }
   const varToDefn = new Map<Var, number>(); // Var -> eqn index of definition
   const varToUsages: Map<Var, number[]> = new Map(); // Var -> eqn indices of usages
   for (let i = 0; i < jaxpr.eqns.length; i++) {
@@ -2883,15 +2907,16 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
   // - Inputs to Pad operations, which need clean inputs
   //
   // Also, mark a node black if there are at least two black nodes that can be
-  // reached from it, while only going through non-black nodes.
-  //
-  // TODO: Don't do the above for 'simple' nodes: reshape, cast, etc.
+  // reached from it, while only going through non-black nodes. View ops
+  // (reshape, shrink, transpose, broadcast, flip, pad, pool, split) are exempt
+  // from this diamond rule because they have zero compute cost so duplicating
+  // them into multiple kernels is free.
   const blackNodes = new Set<Var>();
-  const p1NextBlack = new Map<Var, Var>();
+  const p1NextBlack = new Map<Var, Set<Var>>();
   for (const v of jaxpr.outs) {
     if (v instanceof Var) {
       blackNodes.add(v);
-      p1NextBlack.set(v, v);
+      p1NextBlack.set(v, new Set([v]));
     }
   }
   const heterogeneousViewPrimitives = [
@@ -2931,9 +2956,18 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
       specialBlackPrimitives.includes(eqn.primitive) ||
       eqn.outBinders.some((v) => blackNodes.has(v))
     ) {
+      if (DEBUG >= 1) {
+        if (reductionEndpointEqns.has(i)) _splitStats.reductions++;
+        else if (heterogeneousViewPrimitives.includes(eqn.primitive))
+          _splitStats.heterogeneous++;
+        else if (routinePrimitives.has(eqn.primitive)) _splitStats.routines++;
+        else if (specialBlackPrimitives.includes(eqn.primitive))
+          _splitStats.special++;
+        else _splitStats.cascade++;
+      }
       for (const v of eqn.outBinders) {
         blackNodes.add(v);
-        p1NextBlack.set(v, v);
+        p1NextBlack.set(v, new Set([v]));
       }
       continue;
     }
@@ -2950,19 +2984,33 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
           break outer;
         }
         for (const o of jaxpr.eqns[j].outBinders) {
-          const u = p1NextBlack.get(o);
-          if (u) reach.add(u);
+          const us = p1NextBlack.get(o);
+          if (us) for (const u of us) reach.add(u);
         }
       }
     }
-    if (reach.size > 1 || needsCleanOutput) {
+    // View ops: zero-cost index transforms that can be freely duplicated
+    // into multiple kernels without any compute overhead.
+    const isViewOp =
+      eqn.primitive === Primitive.Reshape ||
+      eqn.primitive === Primitive.Shrink ||
+      eqn.primitive === Primitive.Transpose ||
+      eqn.primitive === Primitive.Broadcast ||
+      eqn.primitive === Primitive.Flip ||
+      eqn.primitive === Primitive.Split;
+    if (needsCleanOutput || (reach.size > 1 && !isViewOp)) {
+      if (DEBUG >= 1) {
+        if (reach.size > 1) _splitStats.diamonds++;
+        if (needsCleanOutput) _splitStats.cleanShape++;
+      }
       for (const v of eqn.outBinders) {
         blackNodes.add(v);
-        p1NextBlack.set(v, v);
+        p1NextBlack.set(v, new Set([v]));
       }
-    } else if (reach.size === 1) {
-      const b = reach.values().next().value!;
-      for (const v of eqn.outBinders) p1NextBlack.set(v, b);
+    } else if (reach.size >= 1) {
+      // Propagate all reachable black nodes through this node. For view ops
+      // this preserves the fan-out so upstream nodes see the diamond correctly.
+      for (const v of eqn.outBinders) p1NextBlack.set(v, new Set(reach));
     }
   }
 
@@ -3038,6 +3086,7 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
       }
       const assocVar = eqn.inputs[assocInput] as Var;
       p2idx = varToDefn.get(assocVar)!; // backtrack to that equation
+      if (DEBUG >= 1) _splitStats.p2++;
       for (const out of jaxpr.eqns[p2idx++].outBinders) {
         blackNodes.add(out);
       }
@@ -3052,5 +3101,15 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     }
   }
 
+  if (DEBUG >= 1) {
+    _splitStats.total = blackNodes.size;
+    console.log(
+      `splitGraphDataflow: ${blackNodes.size} black / ${jaxpr.eqns.length} eqns` +
+        ` (reductions=${_splitStats.reductions} cascade=${_splitStats.cascade}` +
+        ` diamonds=${_splitStats.diamonds} cleanShape=${_splitStats.cleanShape}` +
+        ` heterogeneous=${_splitStats.heterogeneous} routines=${_splitStats.routines}` +
+        ` special=${_splitStats.special} p2=${_splitStats.p2})`,
+    );
+  }
   return blackNodes;
 }
