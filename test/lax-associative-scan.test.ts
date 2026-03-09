@@ -1468,6 +1468,69 @@ describe("lax.associativeScan — WebGPU fused shader regression", () => {
       }
     }
   });
+
+  // ------------------------------------------------------------------
+  // Pytree compose with reduction body intermediates — regression for
+  // the var<workgroup> race condition bug where body intermediates
+  // (matmul results between compose steps) were shared across all
+  // workgroup threads instead of being per-thread.
+  // ------------------------------------------------------------------
+  it("pytree (A,S) compose with matmul + triple product (N=50)", async ({
+    skip,
+  }) => {
+    if (!available) skip();
+    const N = 50;
+    const aData = new Float32Array(N * 4);
+    const sData = new Float32Array(N * 4);
+    for (let i = 0; i < N; i++) {
+      const t = i / N;
+      aData[i * 4 + 0] = 0.95 + 0.01 * t;
+      aData[i * 4 + 1] = 0.02 * t;
+      aData[i * 4 + 2] = 0;
+      aData[i * 4 + 3] = 0.98 + 0.01 * t;
+      sData[i * 4 + 0] = 1 + 0.5 * t;
+      sData[i * 4 + 1] = 0;
+      sData[i * 4 + 2] = 0;
+      sData[i * 4 + 3] = 1 + 0.3 * t;
+    }
+
+    function compose(
+      a: { A: np.Array; S: np.Array },
+      b: { A: np.Array; S: np.Array },
+    ) {
+      const A = np.matmul(b.A, a.A) as np.Array;
+      using bAT = np.swapaxes(b.A, -2, -1) as np.Array;
+      using tmp = np.matmul(b.A, a.S) as np.Array;
+      using triple = np.matmul(tmp, bAT) as np.Array;
+      const S = np.add(triple, b.S) as np.Array;
+      return { A, S };
+    }
+
+    using aFlat = np.array(aData, { dtype: DType.Float32 });
+    using aArr = aFlat.reshape([N, 2, 2]);
+    using sFlat = np.array(sData, { dtype: DType.Float32 });
+    using sArr = sFlat.reshape([N, 2, 2]);
+
+    using f = jit((A: np.Array, S: np.Array) =>
+      lax.associativeScan(compose, { A, S }),
+    );
+    const rawResult = f(aArr, sArr) as { A: np.Array; S: np.Array };
+    using _d = tree.makeDisposable(rawResult);
+    const sOut = await rawResult.S.data();
+
+    // Extract S[0,0] and verify no stride-32 boundary discontinuity
+    const s00: number[] = [];
+    for (let i = 0; i < N; i++) s00.push(sOut[i * 4]);
+
+    // Boundary at stride 32: step should be comparable to neighbours
+    const boundaryStep = Math.abs(s00[32] - s00[31]);
+    const avgStep =
+      (Math.abs(s00[31] - s00[30]) + Math.abs(s00[33] - s00[32])) / 2;
+    expect(boundaryStep / avgStep).toBeLessThan(5);
+    // Absolute value sanity — S should grow (not collapse to ~1)
+    expect(s00[31]).toBeGreaterThan(10);
+    expect(s00[32]).toBeGreaterThan(10);
+  });
 });
 
 // ============================================================================

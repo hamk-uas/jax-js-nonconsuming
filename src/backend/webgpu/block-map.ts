@@ -1225,7 +1225,11 @@ export function blockMapFusedShaderSource(
     }
     for (const [, info] of was.bodyShmemMap) {
       const ty = dtypeToWgsl(info.dtype, false);
-      emit(`var<workgroup> ${info.name}: array<${ty}, ${info.elemCount}>;`);
+      // Body intermediates are per-thread (each thread computes its own
+      // compose result), so use var<private> — NOT var<workgroup>.
+      // Using var<workgroup> with per-element sizes causes a race condition
+      // where all threads write to the same few shared positions.
+      emit(`var<private> ${info.name}: array<${ty}, ${info.elemCount}>;`);
     }
   }
 
