@@ -106,3 +106,59 @@ suite("Array.consumeData", () => {
     expect(x.refCount).toBe(0);
   });
 });
+
+suite("tree.data", () => {
+  test("reads all leaves in parallel", async () => {
+    using a = np.array([1, 2, 3]);
+    using b = np.array([4, 5]);
+    const result = await tree.data({ a, b });
+    expect([...result.a]).toEqual([1, 2, 3]);
+    expect([...result.b]).toEqual([4, 5]);
+    // Arrays should still be alive
+    expect(a.refCount).toBeGreaterThan(0);
+    expect(b.refCount).toBeGreaterThan(0);
+  });
+
+  test("handles nested pytree", async () => {
+    using x = np.array([10]);
+    using y = np.array([20, 30]);
+    const result = await tree.data({ carry: x, ys: [y] });
+    expect([...result.carry]).toEqual([10]);
+    expect([...result.ys[0]]).toEqual([20, 30]);
+  });
+
+  test("handles tuple pytree", async () => {
+    using a = np.array([1]);
+    using b = np.array([2]);
+    const result = await tree.data([a, b]);
+    expect([...result[0]]).toEqual([1]);
+    expect([...result[1]]).toEqual([2]);
+  });
+});
+
+suite("tree.consumeData", () => {
+  test("reads all leaves and disposes them", async () => {
+    // eslint-disable-next-line jax-js/require-using -- testing consumeData disposal
+    const a = np.array([1, 2, 3]);
+    // eslint-disable-next-line jax-js/require-using -- testing consumeData disposal
+    const b = np.array([4, 5]);
+    const result = await tree.consumeData({ a, b });
+    expect([...result.a]).toEqual([1, 2, 3]);
+    expect([...result.b]).toEqual([4, 5]);
+    // Arrays should be disposed
+    expect(a.refCount).toBe(0);
+    expect(b.refCount).toBe(0);
+  });
+
+  test("reads nested pytree and disposes", async () => {
+    // eslint-disable-next-line jax-js/require-using -- testing consumeData disposal
+    const x = np.array([10]);
+    // eslint-disable-next-line jax-js/require-using -- testing consumeData disposal
+    const y = np.array([20, 30]);
+    const result = await tree.consumeData({ carry: x, ys: [y] });
+    expect([...result.carry]).toEqual([10]);
+    expect([...result.ys[0]]).toEqual([20, 30]);
+    expect(x.refCount).toBe(0);
+    expect(y.refCount).toBe(0);
+  });
+});

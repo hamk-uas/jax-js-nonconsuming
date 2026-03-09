@@ -189,6 +189,12 @@ must be ownership-correct in both modes.
 - `vjpFn.dispose()` / `jitFn.dispose()` — free captured intermediates/constants
 - `tree.dispose(obj)` or `tree.makeDisposable(obj)` for pytree cleanup
 - `consumeData()` = read + dispose in one call
+- `tree.data(pytree)` = read all leaves in parallel (overlapping `mapAsync` calls)
+- `tree.consumeData(pytree)` = read all leaves in parallel + dispose
+
+**GPU readback latency:** Each `GPUBuffer.mapAsync()` round-trip costs ~12ms on eGPU (TB4). When
+reading multiple outputs, use `tree.data()` / `tree.consumeData()` or `Promise.all()` to overlap
+readbacks. Sequential readback of N outputs costs ~12ms × N; parallel costs ~12ms total.
 
 **Leak detection:** `checkLeaks.start()` / `checkLeaks.stop()` — snapshots slot counts, tracks
 creations. Used in `test/setup.ts` to wrap every test.
@@ -343,6 +349,8 @@ runtime i32 param).
 - Mega-module: symbolic sizes silently encode as 0 via NaN coercion — guards exist
 - `no-unnecessary-ref` autofix is unsafe for internal tracer `.ref` propagation (e.g.,
   `BatchTracer.ref` must call `this.val.ref`)
+- Sequential `.data()` calls on WebGPU: each `mapAsync` costs ~12ms on eGPU. Use `tree.data()` /
+  `tree.consumeData()` / `Promise.all()` to overlap readbacks
 
 ## Adding new primitives (checklist)
 
@@ -778,3 +786,4 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Axis-aware blocked-data-movement helpers          | `gatherAxisPoints`/`copyAxisRange`/`mapOverBlocks` accept `axis` param; generic stride math |
 | WASM assocScan boundary transpose for axis > 0    | Strided gather/scatter around contiguous WASM core; avoids modifying codegen                |
 | WebGPU assocScan axis-aware via inAxes/outAxes    | Block-map body always sees B at block dim; `inAxes`/`outAxes` map to source axis            |
+| `tree.data()`/`tree.consumeData()` parallel read  | Overlap `mapAsync` calls via `Promise.all`; 13.2× faster for 15 outputs on eGPU             |

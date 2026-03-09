@@ -1,5 +1,6 @@
 // Utilities for working with tree-like container data structures ("pytrees").
 
+import type { DataArray } from "./alu";
 import type { Array } from "./frontend/array";
 import { Tracer } from "./frontend/core";
 import { deepEqual, unzip2 } from "./utils";
@@ -236,5 +237,62 @@ export function makeDisposable<T extends object>(obj: T): T & Disposable {
     [Symbol.dispose]() {
       dispose(obj as any);
     },
+  });
+}
+
+/**
+ * Read the data from every `Array` leaf in a pytree, **in parallel**.
+ *
+ * On WebGPU this is dramatically faster than reading each leaf sequentially
+ * because all `GPUBuffer.mapAsync()` calls overlap (one GPU round-trip
+ * instead of N).
+ *
+ * ```ts
+ * const result = jit(f)(x);          // { a: Array, b: Array }
+ * const data = await tree.data(result);  // { a: Float32Array, b: Float32Array }
+ * ```
+ */
+export function data<Tree extends JsTree<any>>(
+  tree: Tree,
+): Promise<MapJsTree<Tree, Array, DataArray>> {
+  const leafArr = leaves(tree as JsTree<any>);
+  const promises = leafArr.map((x) =>
+    x instanceof Tracer ? (x as unknown as Array).data() : Promise.resolve(x),
+  );
+  return Promise.all(promises).then(
+    (resolvedLeaves) =>
+      unflatten(structure(tree as JsTree<any>), resolvedLeaves) as MapJsTree<
+        Tree,
+        Array,
+        DataArray
+      >,
+  );
+}
+
+/**
+ * Read and dispose every `Array` leaf in a pytree, **in parallel**.
+ *
+ * Equivalent to `tree.data(t)` followed by `tree.dispose(t)` but issues
+ * all GPU reads before disposing, maximising overlap.
+ *
+ * ```ts
+ * const result = jit(f)(x);
+ * const data = await tree.consumeData(result);
+ * // all Array leaves are now disposed
+ * ```
+ */
+export function consumeData<Tree extends JsTree<any>>(
+  tree: Tree,
+): Promise<MapJsTree<Tree, Array, DataArray>> {
+  const leafArr = leaves(tree as JsTree<any>);
+  const promises = leafArr.map((x) =>
+    x instanceof Tracer ? (x as unknown as Array).data() : Promise.resolve(x),
+  );
+  return Promise.all(promises).then((resolvedLeaves) => {
+    dispose(tree);
+    return unflatten(
+      structure(tree as JsTree<any>),
+      resolvedLeaves,
+    ) as MapJsTree<Tree, Array, DataArray>;
   });
 }
