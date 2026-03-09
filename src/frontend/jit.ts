@@ -341,9 +341,22 @@ function computePoolHints(steps: JitStep[]): PoolHints {
   return { peakBytes, mallocSizes };
 }
 
+/** Compute slotCount from steps when not provided by the builder. */
+function computeSlotCount(steps: JitStep[], inputs: JitId[]): number {
+  let max = 0;
+  for (const id of inputs) if (id >= max) max = id + 1;
+  for (const step of steps) {
+    if (step.type === "malloc" && step.output >= max) max = step.output + 1;
+    if (step.type === "recycle" && step.output >= max) max = step.output + 1;
+  }
+  return max;
+}
+
 /** Result of compiling a Jaxpr. Can be evaluated on a series of inputs. */
 export class JitProgram {
   readonly poolHints: PoolHints;
+  /** Total number of distinct JitIds (for fast Slot[] scope). */
+  readonly slotCount: number;
   /** Cached mega-module: undefined = not attempted, null = unsupported. */
   private _megaModule?: WasmMegaModule | null;
   /** M6.2c: worker pool registration state for parallel mega-module dispatch.
@@ -355,8 +368,10 @@ export class JitProgram {
     readonly steps: JitStep[],
     readonly inputs: JitId[],
     readonly outputs: JitId[],
+    slotCount?: number,
   ) {
     this.poolHints = computePoolHints(steps);
+    this.slotCount = slotCount ?? computeSlotCount(steps, inputs);
   }
 
   pprint(): PPrint {
@@ -535,27 +550,65 @@ export class JitProgram {
       }
     }
 
-    const scope = new Map<JitId, Slot>();
+    const scope: Slot[] = new globalThis.Array(this.slotCount);
     if (inputs.length !== this.inputs.length) {
       throw new TypeError(
         `Expected ${this.inputs.length} inputs, got ${inputs.length}`,
       );
     }
-    for (const [i, id] of this.inputs.entries()) {
-      scope.set(id, inputs[i]);
+    for (let i = 0; i < this.inputs.length; i++) {
+      scope[this.inputs[i]] = inputs[i];
     }
-    const pending: PendingExecute[] = [];
+
+    // Batch direct dispatch: collect execute steps and flush as a single
+    // beginBatch/endBatch block.  Avoids PendingExecute object allocation
+    // and Map overhead while preserving ref-count safety.
+    type BatchEntry = {
+      source: Kernel | Routine;
+      inputs: Slot[];
+      outputs: Slot[];
+      dynamicParams?: number[];
+    };
+    const batch: BatchEntry[] = [];
+
+    const flushBatch = () => {
+      if (batch.length === 0) return;
+      this.backend.beginBatch?.();
+      try {
+        for (let i = 0; i < batch.length; i++) {
+          const e = batch[i];
+          const exe =
+            e.source instanceof Kernel
+              ? this.backend.prepareKernelSync(e.source)
+              : this.backend.prepareRoutineSync(e.source);
+          this.backend.dispatch(exe, e.inputs, e.outputs, e.dynamicParams);
+          for (const s of e.inputs) this.backend.decRef(s);
+          for (const s of e.outputs) this.backend.decRef(s);
+        }
+      } finally {
+        this.backend.endBatch?.();
+      }
+      batch.length = 0;
+    };
+
+    const flushSubPending = (sub: PendingExecute[]) => {
+      if (sub.length === 0) return;
+      flushPendingBatched(sub, this.backend);
+    };
     for (const step of this.steps) {
       switch (step.type) {
         case "execute": {
-          const inputs = step.inputs.map((id) => scope.get(id)!);
-          const outputs = step.outputs.map((id) => scope.get(id)!);
-          if (
-            inputs.some((s) => s === undefined) ||
-            outputs.some((s) => s === undefined)
-          ) {
-            throw new Error(`internal: JitProgram scope undefined`);
-          }
+          const si = step.inputs;
+          const so = step.outputs;
+          const ins: Slot[] = new globalThis.Array(si.length);
+          for (let j = 0; j < si.length; j++) ins[j] = scope[si[j]];
+          const outs: Slot[] = new globalThis.Array(so.length);
+          for (let j = 0; j < so.length; j++) outs[j] = scope[so[j]];
+
+          // Hold refs to prevent premature freeing by interleaved free steps
+          for (const s of ins) this.backend.incRef(s);
+          for (const s of outs) this.backend.incRef(s);
+
           // Compute dynamicParams for kernels with symbolic dimensions
           let dynamicParams: number[] | undefined;
           if (
@@ -563,24 +616,19 @@ export class JitProgram {
             step.source.needsDynamicParams &&
             dimBindings
           ) {
-            // dynamicParams[0]: resolved total size (concrete or symbolic)
             const resolvedSize = resolveSizeExpr(step.source.size, dimBindings);
             dynamicParams = [resolvedSize];
-            // dynamicParams[1]: resolved reduction size (when symbolic)
             const re = step.source.outputs[0].reduction;
             if (re && isSymbolicSize(re.size)) {
               dynamicParams.push(resolveSizeExpr(re.size, dimBindings));
             }
           }
-          pending.push(
-            new PendingExecute(
-              this.backend,
-              step.source,
-              inputs,
-              outputs,
-              dynamicParams,
-            ),
-          );
+          batch.push({
+            source: step.source,
+            inputs: ins,
+            outputs: outs,
+            dynamicParams,
+          });
           break;
         }
         case "malloc": {
@@ -588,37 +636,30 @@ export class JitProgram {
             typeof step.size === "number"
               ? step.size
               : resolveSizeExpr(step.size, dimBindings!);
-          const slot = this.backend.malloc(concreteSize);
-          scope.set(step.output, slot);
+          scope[step.output] = this.backend.malloc(concreteSize);
           break;
         }
         case "incref": {
-          const slot = scope.get(step.input)!;
-          this.backend.incRef(slot);
+          this.backend.incRef(scope[step.input]);
           break;
         }
         case "free": {
-          const slot = scope.get(step.input)!;
-          this.backend.decRef(slot);
-          scope.delete(step.input);
+          this.backend.decRef(scope[step.input]);
           break;
         }
         case "recycle": {
-          // Reuse the same backend Slot for a new JitId — zero backend calls.
-          const slot = scope.get(step.input)!;
-          scope.delete(step.input);
-          scope.set(step.output, slot);
+          scope[step.output] = scope[step.input];
           break;
         }
         case "scan": {
-          // Flush pending ops before scan — scan needs materialized inputs
-          flushPendingBatched(pending, this.backend);
+          // Flush batched dispatches before scan — scan needs materialized inputs
+          flushBatch();
 
           // Resolve slots from scope
-          const constSlots = step.consts.map((id) => scope.get(id)!);
-          const initCarrySlots = step.initCarry.map((id) => scope.get(id)!);
-          const xsSlots = step.xs.map((id) => scope.get(id)!);
-          const outputSlots = step.outputs.map((id) => scope.get(id)!);
+          const constSlots = step.consts.map((id) => scope[id]);
+          const initCarrySlots = step.initCarry.map((id) => scope[id]);
+          const xsSlots = step.xs.map((id) => scope[id]);
+          const outputSlots = step.outputs.map((id) => scope[id]);
 
           // IncRef consts and xs — executeScan borrows them
           for (const s of constSlots) this.backend.incRef(s);
@@ -650,22 +691,22 @@ export class JitProgram {
           for (const s of constSlots) this.backend.decRef(s);
           for (const s of xsSlots) this.backend.decRef(s);
 
-          // Propagate scan pending ops
-          pending.push(...result.pending);
+          // Flush sub-executor pending ops immediately
+          flushSubPending(result.pending);
 
           // Update scope with output slots
           for (let oi = 0; oi < step.outputs.length; oi++) {
-            scope.set(step.outputs[oi], result.outputs[oi]);
+            scope[step.outputs[oi]] = result.outputs[oi];
           }
           break;
         }
         case "dus": {
-          // Flush pending ops — DUS needs materialized inputs
-          flushPendingBatched(pending, this.backend);
+          // Flush batched dispatches — DUS needs materialized inputs
+          flushBatch();
 
-          const dstSlot = scope.get(step.dst)!;
-          const srcSlot = scope.get(step.src)!;
-          const outSlot = scope.get(step.output)!;
+          const dstSlot = scope[step.dst];
+          const srcSlot = scope[step.src];
+          const outSlot = scope[step.output];
 
           // Zero-copy: if effectDrivenAllocate recycled dst → output,
           // skip the full copy (they share the same buffer).
@@ -712,13 +753,13 @@ export class JitProgram {
           break;
         }
         case "scatter_add": {
-          // Flush pending ops — scatter_add needs materialized inputs
-          flushPendingBatched(pending, this.backend);
+          // Flush batched dispatches — scatter_add needs materialized inputs
+          flushBatch();
 
-          const targetSlot = scope.get(step.target)!;
-          const indicesSlot = scope.get(step.indices)!;
-          const updatesSlot = scope.get(step.updates)!;
-          const outSlot = scope.get(step.output)!;
+          const targetSlot = scope[step.target];
+          const indicesSlot = scope[step.indices];
+          const updatesSlot = scope[step.updates];
+          const outSlot = scope[step.output];
 
           // Copy target to output if not already recycled
           const targetBytes = prod(step.targetShape) * byteWidth(step.dtype);
@@ -745,11 +786,11 @@ export class JitProgram {
           break;
         }
         case "reverse": {
-          // Flush pending ops — reverse needs materialized input
-          flushPendingBatched(pending, this.backend);
+          // Flush batched dispatches — reverse needs materialized input
+          flushBatch();
 
-          const inputSlot = scope.get(step.input)!;
-          const outSlot = scope.get(step.output)!;
+          const inputSlot = scope[step.input];
+          const outSlot = scope[step.output];
           const concreteAxisSize =
             typeof step.axisSize === "number"
               ? step.axisSize
@@ -780,12 +821,12 @@ export class JitProgram {
           break;
         }
         case "assoc_scan": {
-          // Flush pending ops — assoc_scan needs materialized inputs
-          flushPendingBatched(pending, this.backend);
+          // Flush batched dispatches — assoc_scan needs materialized inputs
+          flushBatch();
 
-          const constSlots = step.consts.map((id) => scope.get(id)!);
-          const elemSlots = step.elems.map((id) => scope.get(id)!);
-          const outputSlots = step.outputs.map((id) => scope.get(id)!);
+          const constSlots = step.consts.map((id) => scope[id]);
+          const elemSlots = step.elems.map((id) => scope[id]);
+          const outputSlots = step.outputs.map((id) => scope[id]);
 
           const assocResult = executeAssociativeScan({
             backend: this.backend,
@@ -806,18 +847,18 @@ export class JitProgram {
           // Update scope with result slots (may differ from pre-allocated
           // output slots when the fallback path replaces them).
           for (let i = 0; i < step.numLeaves; i++) {
-            scope.set(step.outputs[i], assocResult.outputs[i]);
+            scope[step.outputs[i]] = assocResult.outputs[i];
           }
-          pending.push(...assocResult.pending);
+          flushSubPending(assocResult.pending);
           break;
         }
         case "block_map": {
-          // Flush pending ops — block_map needs materialized inputs
-          flushPendingBatched(pending, this.backend);
+          // Flush batched dispatches — block_map needs materialized inputs
+          flushBatch();
 
-          const constSlots = step.consts.map((id) => scope.get(id)!);
-          const inputSlots = step.inputs.map((id) => scope.get(id)!);
-          const outputSlots = step.outputs.map((id) => scope.get(id)!);
+          const constSlots = step.consts.map((id) => scope[id]);
+          const inputSlots = step.inputs.map((id) => scope[id]);
+          const outputSlots = step.outputs.map((id) => scope[id]);
 
           // Resolve potentially-symbolic shapes to concrete numbers.
           const inputShapes = step.inputShapes.map((s) =>
@@ -864,14 +905,14 @@ export class JitProgram {
           });
 
           for (let i = 0; i < step.outputs.length; i++) {
-            scope.set(step.outputs[i], bmResult.outputs[i]);
+            scope[step.outputs[i]] = bmResult.outputs[i];
           }
-          pending.push(...bmResult.pending);
+          flushSubPending(bmResult.pending);
           break;
         }
         case "fori_loop": {
-          // Flush pending ops — fori_loop needs materialized inputs
-          flushPendingBatched(pending, this.backend);
+          // Flush batched dispatches — fori_loop needs materialized inputs
+          flushBatch();
 
           const lower =
             typeof step.lower === "number"
@@ -882,8 +923,8 @@ export class JitProgram {
               ? step.upper
               : resolveDim(step.upper, dimBindings!);
 
-          const constSlots = step.consts.map((id) => scope.get(id)!);
-          let carrySlots = step.initCarries.map((id) => scope.get(id)!);
+          const constSlots = step.consts.map((id) => scope[id]);
+          let carrySlots = step.initCarries.map((id) => scope[id]);
           let ownsCarry = false; // first iteration uses parent-owned init carries
 
           for (let i = lower; i < upper; i++) {
@@ -918,7 +959,7 @@ export class JitProgram {
 
           // Write final carries to output slots
           for (let k = 0; k < step.outputs.length; k++) {
-            const outSlot = scope.get(step.outputs[k])!;
+            const outSlot = scope[step.outputs[k]];
             const carrySlot = carrySlots[k];
             this.backend.copyBufferToBuffer(
               carrySlot,
@@ -933,12 +974,12 @@ export class JitProgram {
         }
         case "workgroup_assoc_scan": {
           // Fallback: run as sequential associative scan on the block data.
-          // Flush pending ops first.
-          flushPendingBatched(pending, this.backend);
+          // Flush batched dispatches first.
+          flushBatch();
 
-          const constSlots = step.consts.map((id) => scope.get(id)!);
-          const elemSlots = step.elems.map((id) => scope.get(id)!);
-          const outputSlots = step.outputs.map((id) => scope.get(id)!);
+          const constSlots = step.consts.map((id) => scope[id]);
+          const elemSlots = step.elems.map((id) => scope[id]);
+          const outputSlots = step.outputs.map((id) => scope[id]);
 
           const N = step.elemAvals[0].shape[0] as number;
           const numElems = step.numElems;
@@ -1028,9 +1069,14 @@ export class JitProgram {
           step satisfies never;
       }
     }
+    flushBatch();
+    const outputSlots: Slot[] = new globalThis.Array(this.outputs.length);
+    for (let i = 0; i < this.outputs.length; i++) {
+      outputSlots[i] = scope[this.outputs[i]];
+    }
     return {
-      outputs: this.outputs.map((id) => scope.get(id)!),
-      pending,
+      outputs: outputSlots,
+      pending: [] as PendingExecute[],
     };
   }
 }
@@ -1111,6 +1157,11 @@ class JitProgramBuilder {
   backend: Backend;
   #nextId: number;
   steps: JitStep[];
+
+  /** Number of distinct JitIds allocated (for sizing Slot[] scope). */
+  get slotCount(): number {
+    return this.#nextId;
+  }
 
   constructor(backend: Backend, nargs: number) {
     this.backend = backend;
@@ -2248,6 +2299,7 @@ export function jitCompile(
       builder.steps,
       range(0, nargs),
       outputIds,
+      builder.slotCount,
     );
     if (DEBUG >= 4) console.info(jp.toString());
     if (DEBUG >= 1)
