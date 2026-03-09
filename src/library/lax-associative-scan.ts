@@ -347,9 +347,7 @@ export function associativeScan<T extends JsTree<Array>>(
     if (DEBUG >= 1) {
       console.warn(
         "[associativeScan] Per-element body tracing failed — falling back to " +
-          "unrolled Kogge-Stone (slower on GPU). If your compose function uses " +
-          'batch-explicit ops like einsum("nij,njk->nik"), replace them with ' +
-          "np.matmul / np.swapaxes to enable the fused scan path.",
+          "unrolled Kogge-Stone (slower on GPU).",
       );
     }
     for (let i = 0; i < movedElems.length; i++) {

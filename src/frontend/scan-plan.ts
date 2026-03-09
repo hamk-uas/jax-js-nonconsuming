@@ -818,16 +818,24 @@ function tryPrepareWebGPUNativeScan(
   }
 
   // Build scan gid mapping: body JitId → scan gid space.
-  // Gid space: [0..numConsts) const, [numConsts..+numCarry) carry,
-  // [+numCarry..+numX) xs, [+numX..+numInternal) internal
+  // Gid space: [0..numConsts) const, [numConsts..+numCarry) carry (snapshot),
+  // [+numCarry..+numX) xs, [+numX..+numInternal) internal,
+  // [+numInternal..+numCarry) carry-live (updated value from this iteration)
   const jitIdToScanGid = new Map<JitId, number>();
-  // Body inputs map directly
+  // Body inputs map directly (carry inputs → snapshot reads)
   for (let i = 0; i < numInputs; i++) {
     jitIdToScanGid.set(bodyProgram.inputs[i], i);
   }
   // Internal intermediates
   for (const [jitId, internalIdx] of jitIdToInternalIdx) {
     jitIdToScanGid.set(jitId, numInputs + internalIdx);
+  }
+  // Carry output JitIds → "carry-live" gids (reads the UPDATED carry buffer,
+  // not the snapshot). Y-only steps depend on the carry value computed in
+  // this iteration, so they must read from carry{ci} not c_{ci}.
+  const carryLiveGidBase = numInputs + numInternal;
+  for (const [jitId, ci] of jitIdToCarryIdx) {
+    jitIdToScanGid.set(jitId, carryLiveGidBase + ci);
   }
 
   // Build NativeScanMultiStep[] from ALL step outputs, in dependency order

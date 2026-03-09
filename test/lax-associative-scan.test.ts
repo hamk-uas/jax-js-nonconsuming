@@ -652,6 +652,46 @@ describe("parallel Kalman filter via associativeScan", () => {
     }
   });
 
+  test("batch-explicit einsum in compose body works via fast path", () => {
+    // einsum("nij,njk->nik") with per-element tracers (shape [2,2]) succeeds
+    // because einsumFastPath catches it and lowers to matmul before parsing.
+    const N = 6;
+    using As = np.full([N, 2, 2], 0.9);
+    using bs = np.full([N, 2, 1], 0.1);
+
+    const compose = (
+      p: { A: np.Array; b: np.Array },
+      q: { A: np.Array; b: np.Array },
+    ) => {
+      using Ab = np.einsum("nij,njk->nik", q.A, p.b) as np.Array;
+      return {
+        A: np.einsum("nij,njk->nik", q.A, p.A) as np.Array,
+        b: Ab.add(q.b) as np.Array,
+      };
+    };
+
+    const eager = lax.associativeScan(compose, { A: As, b: bs }) as {
+      A: np.Array;
+      b: np.Array;
+    };
+
+    const fn = jit((A: np.Array, b: np.Array) =>
+      lax.associativeScan(compose, { A, b }),
+    );
+    let compiled: { A: np.Array; b: np.Array } | null = null;
+    try {
+      compiled = fn(As, bs) as { A: np.Array; b: np.Array };
+      expect(compiled.A).toBeAllclose(eager.A, { atol: 1e-5, rtol: 1e-5 });
+      expect(compiled.b).toBeAllclose(eager.b, { atol: 1e-5, rtol: 1e-5 });
+    } finally {
+      eager.A.dispose();
+      eager.b.dispose();
+      compiled?.A.dispose();
+      compiled?.b.dispose();
+      fn.dispose();
+    }
+  });
+
   test("jit(grad(assocScan)) with 3-tuple compose doesn't exceed WebGPU buffer limit (regression)", () => {
     // Regression test for: "Too many buffers (9) for WebGPU pipeline (max: 8)"
     // when jit(grad/valueAndGrad of assocScan) uses a 3-tuple compose. The P2

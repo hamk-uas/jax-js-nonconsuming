@@ -2919,6 +2919,7 @@ function nativeScanMultiShaderSource(
     numCarry,
     numX,
     numY,
+    numInternal,
     reverse,
     internalElemCounts,
     internalDtypes,
@@ -3076,23 +3077,30 @@ function nativeScanMultiShaderSource(
   }
 
   // Build scan-specific resolveGlobalIndex callback
-  // gid space: [consts | carry | xs | internals]
+  // gid space: [consts | carry(snapshot) | xs | internals | carry-live]
   const numInputs = numConsts + numCarry + numX;
+  const carryLiveGidBase = numInputs + numInternal;
   const scanResolve: ResolveGlobalIndex = (gid, idxCode, _dtype) => {
     if (gid < numConsts) {
       return `const${gid}[${idxCode}]`;
     } else if (gid < numConsts + numCarry) {
       const ci = gid - numConsts;
-      // Use carry snapshot array
+      // Use carry snapshot array (value at start of iteration)
       return `c_${ci}[${idxCode}]`;
     } else if (gid < numConsts + numCarry + numX) {
       const xi = gid - numConsts - numCarry;
       const stride = xsElemStrides[xi];
       return `xs${xi}[i32(dataIdx) * ${stride} + ${idxCode}]`;
-    } else {
+    } else if (gid < carryLiveGidBase) {
       // Internal intermediate — array access with proper index
       const ii = gid - numInputs;
       return `internal_${ii}[${idxCode}]`;
+    } else {
+      // Carry-live: read UPDATED carry buffer (not snapshot).
+      // Used by Y-only steps that depend on carry values computed
+      // earlier in the same iteration.
+      const ci = gid - carryLiveGidBase;
+      return `carry${ci}[${idxCode}]`;
     }
   };
 

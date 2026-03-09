@@ -17,8 +17,10 @@
  */
 
 import {
+  clearCaches,
   defaultDevice,
   devices,
+  DType,
   grad,
   init,
   jit,
@@ -2098,6 +2100,115 @@ describe("preencoded multi-step scan (WebGPU)", () => {
 
     // d/dx_i [sum(xs) + sum(xs²)] = 1 + 2*x_i
     expect(dxs).toBeAllclose([[3], [5], [7]]);
+  });
+
+  test("compiled-loop Y≠carry: Y-only step reads updated carry (regression)", () => {
+    // Regression test for carry-live gid mapping. When Y outputs differ from
+    // carry outputs, Y-only steps must read the UPDATED carry (computed in the
+    // same iteration), not the snapshot or an aliased internal variable.
+    // Before fix: Y-only step read stale/wrong data → catastrophic errors.
+    if (!hasWebGPU) return;
+
+    // Backward RTS smoother pattern: carry={r,N}, Y={x_smooth,C_smooth}
+    // x_smooth = x_pred + C_pred * r_new (reads carry r_new from same iter)
+    // C_smooth = C_pred - C_pred * N_new * C_pred (reads carry N_new)
+    const step = (
+      carry: { r: np.Array; N: np.Array },
+      xs: { x_pred: np.Array; C_pred: np.Array; L: np.Array; update: np.Array },
+    ): [{ r: np.Array; N: np.Array }, { x_s: np.Array; C_s: np.Array }] => {
+      // New carry: r_new = L * r + update
+      const r_new = np.add(np.multiply(xs.L, carry.r), xs.update);
+      // New carry: N_new = L * N * L
+      const N_new = np.multiply(np.multiply(xs.L, carry.N), xs.L);
+      // Y outputs depend on NEW carry (not snapshot):
+      const x_s = np.add(xs.x_pred, np.multiply(xs.C_pred, r_new));
+      const C_s = np.subtract(
+        xs.C_pred,
+        np.multiply(np.multiply(xs.C_pred, N_new), xs.C_pred),
+      );
+      return [
+        { r: r_new, N: N_new },
+        { x_s, C_s },
+      ];
+    };
+
+    const N = 20;
+    using r0 = np.zeros([1], { dtype: DType.Float32 });
+    using N0 = np.zeros([1], { dtype: DType.Float32 });
+    using x_pred = np.ones([N, 1], { dtype: DType.Float32 });
+    using C_pred = np.full([N, 1], 0.5, { dtype: DType.Float32 });
+    using L = np.full([N, 1], 0.9, { dtype: DType.Float32 });
+    using update = np.full([N, 1], 0.1, { dtype: DType.Float32 });
+
+    // Run via JIT on WebGPU
+    defaultDevice("webgpu");
+    clearCaches();
+    const jitFn = jit(
+      (
+        r: np.Array,
+        N_: np.Array,
+        xp: np.Array,
+        cp: np.Array,
+        l: np.Array,
+        u: np.Array,
+      ) =>
+        lax.scan(
+          step,
+          { r, N: N_ },
+          { x_pred: xp, C_pred: cp, L: l, update: u },
+        ),
+    );
+    const [gpuCarry, gpuY] = jitFn(r0, N0, x_pred, C_pred, L, update) as any;
+    const gpuXs = gpuY.x_s.dataSync();
+    const gpuCs = gpuY.C_s.dataSync();
+    gpuCarry.r.dispose();
+    gpuCarry.N.dispose();
+    gpuY.x_s.dispose();
+    gpuY.C_s.dispose();
+    jitFn.dispose();
+
+    // Run via JIT on WASM as reference
+    defaultDevice("wasm");
+    clearCaches();
+    const jitRef = jit(
+      (
+        r: np.Array,
+        N_: np.Array,
+        xp: np.Array,
+        cp: np.Array,
+        l: np.Array,
+        u: np.Array,
+      ) =>
+        lax.scan(
+          step,
+          { r, N: N_ },
+          { x_pred: xp, C_pred: cp, L: l, update: u },
+        ),
+    );
+    const [wasmCarry, wasmY] = jitRef(r0, N0, x_pred, C_pred, L, update) as any;
+    const wasmXs = wasmY.x_s.dataSync();
+    const wasmCs = wasmY.C_s.dataSync();
+    wasmCarry.r.dispose();
+    wasmCarry.N.dispose();
+    wasmY.x_s.dispose();
+    wasmY.C_s.dispose();
+    jitRef.dispose();
+
+    // Compare: WebGPU must match WASM within float32 tolerance
+    for (let i = 0; i < wasmXs.length; i++) {
+      const denom = Math.max(Math.abs(wasmXs[i]), 1e-6);
+      const err = Math.abs(gpuXs[i] - wasmXs[i]) / denom;
+      expect(err, `x_s[${i}] gpu=${gpuXs[i]} wasm=${wasmXs[i]}`).toBeLessThan(
+        1e-4,
+      );
+    }
+    for (let i = 0; i < wasmCs.length; i++) {
+      const denom = Math.max(Math.abs(wasmCs[i]), 1e-6);
+      const err = Math.abs(gpuCs[i] - wasmCs[i]) / denom;
+      expect(err, `C_s[${i}] gpu=${gpuCs[i]} wasm=${wasmCs[i]}`).toBeLessThan(
+        1e-4,
+      );
+    }
   });
 });
 

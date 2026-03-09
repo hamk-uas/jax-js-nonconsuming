@@ -28,7 +28,7 @@ const compose2 = (
 };
 
 // DLM-like 5-tuple forward compose with inv (mirrors dlm-js composeForward)
-// BROKEN: uses einsum("nij,...") which fails per-element tracing → fallback
+// Uses einsum — identical to compose5 (fast path lowers einsum to matmul/swapaxes)
 const _compose5_einsum = (
   a: { A: np.Array; b: np.Array; C: np.Array; eta: np.Array; J: np.Array },
   b_elem: { A: np.Array; b: np.Array; C: np.Array; eta: np.Array; J: np.Array },
@@ -75,8 +75,7 @@ const _compose5_einsum = (
   return { A: A_comp, b: b_comp, C: C_comp, eta: eta_comp, J: J_comp };
 };
 
-// FIXED: uses np.matmul / np.swapaxes instead of batch-explicit einsum
-// This allows per-element tracing → block-map fused WAS path
+// Alternative: uses np.matmul / np.swapaxes directly (equivalent to einsum fast path)
 const compose5 = (
   a: { A: np.Array; b: np.Array; C: np.Array; eta: np.Array; J: np.Array },
   b_elem: { A: np.Array; b: np.Array; C: np.Array; eta: np.Array; J: np.Array },
