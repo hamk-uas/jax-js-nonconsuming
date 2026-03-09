@@ -642,6 +642,7 @@ function executeAssocScanBlockMap(
     constSlots,
     inputSlots: elemSlots,
     outputSlots: localScanSlots,
+    constInfos: localScan.constInfos,
   };
 
   const bmResult = executeBlockMap(blockMapParams);

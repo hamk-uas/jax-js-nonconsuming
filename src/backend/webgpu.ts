@@ -1756,23 +1756,72 @@ export class WebGPUBackend implements Backend {
   /**
    * Dispatch a fused block_map shader.
    * Buffer binding order: [bodyInputs (consts + block inputs), outputs]
+   *
+   * When the shader uses uniform constants (numUniformConsts > 0), the first
+   * N input buffers are bound to @group(1) as uniform buffers instead of
+   * @group(0) storage. The remaining inputs + outputs go to @group(0).
    */
   dispatchBlockMapFused(
     exe: Executable<ShaderDispatch[]>,
     inputs: Slot[],
     outputs: Slot[],
   ): void {
-    const inputBuffers = inputs.map((slot) => this.#getBuffer(slot).buffer);
-    const outputBuffers = outputs.map((slot) => this.#getBuffer(slot).buffer);
-    pipelineSubmit(
-      this.device,
-      exe.data,
-      inputBuffers,
-      outputBuffers,
-      undefined,
-      this.#batchEncoder ?? undefined,
-      this.#batchEncoder ? this.#batchUniformsToDestroy : undefined,
-    );
+    const shader = exe.data[0];
+    const nuc = shader.numUniformConsts ?? 0;
+    if (nuc > 0) {
+      // Split: first nuc inputs → group(1) uniform, rest → group(0) storage
+      const constBuffers = inputs
+        .slice(0, nuc)
+        .map((slot) => this.#getBuffer(slot).buffer);
+      const storageInputBuffers = inputs
+        .slice(nuc)
+        .map((slot) => this.#getBuffer(slot).buffer);
+      const outputBuffers = outputs.map((slot) => this.#getBuffer(slot).buffer);
+      const commandEncoder =
+        this.#batchEncoder ?? this.device.createCommandEncoder();
+      const bindGroup0 = this.device.createBindGroup({
+        layout: shader.pipeline.getBindGroupLayout(0),
+        entries: [
+          ...storageInputBuffers.map((buffer, i) => ({
+            binding: i,
+            resource: { buffer },
+          })),
+          ...outputBuffers.map((buffer, i) => ({
+            binding: storageInputBuffers.length + i,
+            resource: { buffer },
+          })),
+        ],
+      });
+      const bindGroup1 = this.device.createBindGroup({
+        layout: shader.pipeline.getBindGroupLayout(1),
+        entries: constBuffers.map((buffer, i) => ({
+          binding: i,
+          resource: { buffer },
+        })),
+      });
+      const grid = shader.passes[0].grid;
+      const passEncoder = commandEncoder.beginComputePass();
+      passEncoder.setPipeline(shader.pipeline);
+      passEncoder.setBindGroup(0, bindGroup0);
+      passEncoder.setBindGroup(1, bindGroup1);
+      passEncoder.dispatchWorkgroups(grid[0], grid[1]);
+      passEncoder.end();
+      if (!this.#batchEncoder) {
+        this.device.queue.submit([commandEncoder.finish()]);
+      }
+    } else {
+      const inputBuffers = inputs.map((slot) => this.#getBuffer(slot).buffer);
+      const outputBuffers = outputs.map((slot) => this.#getBuffer(slot).buffer);
+      pipelineSubmit(
+        this.device,
+        exe.data,
+        inputBuffers,
+        outputBuffers,
+        undefined,
+        this.#batchEncoder ?? undefined,
+        this.#batchEncoder ? this.#batchUniformsToDestroy : undefined,
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1987,7 +2036,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         ? GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
         : GPUBufferUsage.STORAGE |
           GPUBufferUsage.COPY_SRC |
-          GPUBufferUsage.COPY_DST,
+          GPUBufferUsage.COPY_DST |
+          GPUBufferUsage.UNIFORM,
       mappedAtCreation: mapped,
     });
     if (!read) {
@@ -3403,7 +3453,8 @@ class ShaderPipelineCache {
       );
     }
     // Cache by signature: most JIT programs share the same layout shape.
-    const key = `${shader.numInputs}:${shader.numOutputs}:${shader.hasUniform ? 1 : 0}`;
+    const nuc = shader.numUniformConsts ?? 0;
+    const key = `${shader.numInputs}:${shader.numOutputs}:${shader.hasUniform ? 1 : 0}:${nuc}`;
     const cached = this.#layoutCache.get(key);
     if (cached) return cached;
 
@@ -3418,7 +3469,19 @@ class ShaderPipelineCache {
         })),
       }),
     ];
-    if (shader.hasUniform) {
+    if (nuc > 0) {
+      // Block-map uniform constants: one uniform buffer entry per constant,
+      // no dynamic offset.
+      bindGroupLayouts.push(
+        this.device.createBindGroupLayout({
+          entries: range(nuc).map((i) => ({
+            binding: i,
+            visibility: GPUShaderStage.COMPUTE,
+            buffer: { type: "uniform" as const },
+          })),
+        }),
+      );
+    } else if (shader.hasUniform) {
       bindGroupLayouts.push(
         this.device.createBindGroupLayout({
           entries: [

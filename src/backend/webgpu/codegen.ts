@@ -28,6 +28,8 @@ export interface ShaderInfo {
   hasSymbolicReduction?: boolean;
   /** Bytes of workgroup shared memory required by the shader (0 = none). */
   sharedMemoryBytes?: number;
+  /** Number of constant inputs moved to @group(1) var<uniform> bindings. */
+  numUniformConsts?: number;
 }
 
 export const headerWgsl = String.raw`

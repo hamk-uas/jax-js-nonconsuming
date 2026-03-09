@@ -71,6 +71,8 @@ export interface BlockMapStage {
   blockShape: number[];
   numConsts: number;
   numInputs: number;
+  /** Per-constant info for uniform buffer migration. */
+  constInfos?: { elemCount: number; dtype: DType; bytes: number }[];
 }
 
 export type AssocScanPlan =
@@ -1632,18 +1634,24 @@ export function planAssociativeScan(
 
   // Build const sizes
   const constSizes: number[] = [];
+  const constInfos: { elemCount: number; dtype: DType; bytes: number }[] = [];
   for (let k = 0; k < numConsts; k++) {
     const aval = bodyJaxpr.inBinders[k].aval;
-    constSizes.push(aval.size * byteWidth(aval.dtype));
+    const bytes = aval.size * byteWidth(aval.dtype);
+    constSizes.push(bytes);
+    constInfos.push({ elemCount: aval.size, dtype: aval.dtype, bytes });
   }
 
   // --- WebGPU block-map path ---
   // Guard: storage buffer bindings must fit inside the per-stage limit.
-  // The fused shader needs numConsts + numLeaves (inputs) + numLeaves (outputs)
-  // bindings. This is block-size-independent, so check once before the loop.
+  // Constants that fit in uniform buffers (≤64KB) are moved to @group(1),
+  // freeing storage bindings.
   if (backend.type === "webgpu") {
     const maxBindings = backend.maxArgs + 1; // maxStorageBuffersPerShaderStage
-    const neededBindings = numConsts + 2 * numLeaves;
+    const uniformConsts = constInfos.every((c) => c.bytes <= 65536)
+      ? numConsts
+      : 0;
+    const neededBindings = numConsts - uniformConsts + 2 * numLeaves;
     if (neededBindings > maxBindings) {
       if (DEBUG >= 1) {
         console.log(
@@ -1911,6 +1919,17 @@ function tryBuildBlockMapAssocScanPlan(
   ];
   const outAxes: (number | null)[][] = elemAvals.map(() => [axis]);
 
+  // Build constInfos for uniform buffer migration
+  const constInfos: { elemCount: number; dtype: DType; bytes: number }[] = [];
+  for (let i = 0; i < numConsts; i++) {
+    const aval = bodyJaxpr.inBinders[i].aval;
+    constInfos.push({
+      elemCount: aval.size,
+      dtype: aval.dtype,
+      bytes: aval.size * byteWidth(aval.dtype),
+    });
+  }
+
   const localScan: BlockMapStage = {
     bodyProgram: localScanBodyProgram,
     bodyJaxpr: localScanBodyJaxpr,
@@ -1919,6 +1938,7 @@ function tryBuildBlockMapAssocScanPlan(
     blockShape: [blockSize],
     numConsts,
     numInputs: numLeaves,
+    constInfos,
   };
 
   return {

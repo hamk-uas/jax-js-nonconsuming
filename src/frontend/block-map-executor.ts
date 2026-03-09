@@ -42,6 +42,8 @@ export interface ExecuteBlockMapParams {
   threadTile?: number[];
   /** Body uses BlockIndex: compiled body has one extra input for the block index. */
   hasBlockIndex?: boolean;
+  /** Per-constant info for uniform buffer migration (one entry per numConsts input). */
+  constInfos?: { elemCount: number; dtype: DType; bytes: number }[];
 }
 
 export interface ExecuteBlockMapResult {
@@ -157,6 +159,7 @@ function tryExecuteBlockMapFused(
         outputShapes: params.outputShapes,
         threadTile: params.threadTile,
         hasBlockIndex: params.hasBlockIndex,
+        constInfos: params.constInfos,
       }) ?? null;
     inner.set(specKey, exe);
   }

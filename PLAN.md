@@ -212,21 +212,27 @@ overhead in the Kogge-Stone fallback.
 
 ### What Phase 1 unblocks for dlm-js
 
-- **Forward scan:** 11 → 10 bindings → block-map fusion activates. Each Kogge-Stone round becomes 1
-  fused dispatch instead of ~10 separate kernel dispatches.
-- **Backward scan:** Already 6 bindings — should activate block-map fusion today. Investigate why it
-  doesn't (may be a separate issue: `np.linalg.inv` or 3-operand einsum in the body preventing
-  compiled-loop analysis).
+#### Forward scan (5-tuple)
+
+For **m=2** (Nile model), `np.linalg.inv` uses the analytical `inv2x2` Cramer's rule path — all
+elementwise ops, no Routine. The body is fully kernel-fusable. The **only** blocker is the binding
+count: 1 const + 5 in + 5 out = 11 > 10. Phase 1 (constants→uniform) brings this to 10 storage
+bindings, enabling the block-map fused shader.
+
+For **m≥5**, `inv` falls through to `solve(a, eye)` which uses LU (a Routine). Routines are rejected
+by `blockMapFusedShaderSource`. Phase 1 alone is insufficient; Phase 2 (leaf packing) + Routine
+support would both be needed. This is out of scope for now.
+
+- **Backward scan (3-tuple):** Already 6 bindings → block-map path should activate. If not,
+  investigate whether the 3-operand einsum `"nij,njk,nlk->nil"` (lowered to 2 sequential matmuls by
+  the fast path) prevents single-kernel fusion.
 
 ### Action items for dlm-js
 
 - After Phase 1 lands in jax-js, update dlm-js to latest jax-js dependency
-- Verify forward scan activates block-map path (check with `setDebug(1)`)
-- Investigate backward 3-tuple: if block-map isn't activating, file a separate issue (likely the
-  3-operand einsum `"nij,njk,nlk->nil"` lowering to 2 sequential `matmul` calls, preventing
-  single-kernel fusion)
+- Verify forward scan (m=2) activates block-map path (check with `setDebug(1)`)
 - Re-run `issues/repro-webgpu-block-map-perf.ts` and update the benchmark table
-- Target: WebGPU/WASM ratio ≤ 2× for warm runs (currently 19× at N=100)
+- Target: WebGPU/WASM ratio ≤ 2× for warm runs at m=2 (currently 19× at N=100)
 
 ### Benchmark targets (Nile order=1, m=2, warm)
 
@@ -236,9 +242,8 @@ overhead in the Kogge-Stone fallback.
 | WebGPU warm N=3200 | ~1,561 ms | ≤50 ms                 |
 | GPU/WASM ratio     | 19–450×   | ≤2×                    |
 
-These targets assume block-map fusion collapses each Kogge-Stone round to 1 dispatch. If the compose
-body contains ops that prevent fusion (inv, 3-op einsum chains), the actual improvement may be less,
-but dispatch count should still drop by 5–10×.
+These targets assume block-map fusion collapses each Kogge-Stone round to 1 dispatch. Valid for m≤4
+where `inv` uses analytical Cramer's rule (pure kernels). For m≥5, LU Routine blocks fusion.
 
 ---
 

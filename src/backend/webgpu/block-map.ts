@@ -67,6 +67,8 @@ export interface BlockMapShaderParams {
   threadTile?: number[];
   /** Body uses BlockIndex: compiled body has one extra input (block index scalar). */
   hasBlockIndex?: boolean;
+  /** Per-constant info for uniform buffer migration (one entry per numConsts input). */
+  constInfos?: { elemCount: number; dtype: DType; bytes: number }[];
 }
 
 /**
@@ -800,15 +802,40 @@ export function blockMapFusedShaderSource(
   // numBodyInputs excludes the block index (it's not a storage buffer).
   const numBodyInputs = bodyInputIds.length - (hasBlockIndex ? 1 : 0);
 
+  // --- Determine which constants can move to uniform buffers ---
+  // Small constants (with constInfos provided) go to @group(1) var<uniform>,
+  // freeing storage bindings. Each constant buffer must already have
+  // GPUBufferUsage.UNIFORM. Only constants that fit in a single vec4 (≤4
+  // elements) are eligible — this ensures all in{ci}[idx] usages (including
+  // shmem initialization, which doesn't go through the resolve function)
+  // correctly perform vec4 component access (returns scalar, not vec4).
+  const constInfos = params.constInfos;
+  const numUniformConsts =
+    constInfos && numConsts > 0
+      ? constInfos.reduce(
+          (n, info) =>
+            n +
+            (info.elemCount <= 4 &&
+            info.bytes <= device.limits.maxUniformBufferBindingSize
+              ? 1
+              : 0),
+          0,
+        )
+      : 0;
+  // Note: we only support moving ALL constants to uniform (not a partial subset)
+  // to keep the binding renumbering simple.
+  const effectiveUniformConsts = numUniformConsts === numConsts ? numConsts : 0;
+
   // Total global storage bindings needed:
-  //   numConsts + numInputs (read) + numOutputs (read_write)
+  //   (numConsts - effectiveUniformConsts) + numInputs (read) + numOutputs (read_write)
   const numOutputs = bodyOutputIds.length;
-  const totalBindings = numConsts + numInputs + numOutputs;
+  const storageInputs = numBodyInputs - effectiveUniformConsts;
+  const totalBindings = storageInputs + numOutputs;
   const maxBindings = device.limits.maxStorageBuffersPerShaderStage;
   if (totalBindings > maxBindings) {
     if (DEBUG >= 1)
       console.info(
-        `block_map fused: ${totalBindings} bindings > max ${maxBindings}, fallback`,
+        `block_map fused: ${totalBindings} storage bindings > max ${maxBindings}, fallback`,
       );
     return null;
   }
@@ -1083,9 +1110,35 @@ export function blockMapFusedShaderSource(
     }
   }
 
-  for (let i = 0; i < numBodyInputs; i++) {
-    const ty = dtypeToWgsl(inputDtypes[i] ?? DType.Float32, true);
-    emit(`@group(0) @binding(${i}) var<storage, read> in${i} : array<${ty}>;`);
+  // --- Emit input bindings ---
+  // Uniform constants go to @group(1); non-const inputs go to @group(0).
+  // Variable names stay as in0, in1, ... regardless of binding group.
+  if (effectiveUniformConsts > 0) {
+    // Emit uniform constant bindings on @group(1) as vec4<T>.
+    // All uniform constants have ≤4 elements, so a single vec4 suffices.
+    // Component access via in{ci}[idx] returns the scalar type.
+    for (let ci = 0; ci < effectiveUniformConsts; ci++) {
+      const info = constInfos![ci];
+      const ty = dtypeToWgsl(inputDtypes[ci] ?? info.dtype, true);
+      emit(`@group(1) @binding(${ci}) var<uniform> in${ci} : vec4<${ty}>;`);
+    }
+    // Emit non-const input bindings on @group(0), binding indices start at 0
+    let storageIdx = 0;
+    for (let i = effectiveUniformConsts; i < numBodyInputs; i++) {
+      const ty = dtypeToWgsl(inputDtypes[i] ?? DType.Float32, true);
+      emit(
+        `@group(0) @binding(${storageIdx}) var<storage, read> in${i} : array<${ty}>;`,
+      );
+      storageIdx++;
+    }
+  } else {
+    // No uniform constants — all inputs on @group(0) as before
+    for (let i = 0; i < numBodyInputs; i++) {
+      const ty = dtypeToWgsl(inputDtypes[i] ?? DType.Float32, true);
+      emit(
+        `@group(0) @binding(${i}) var<storage, read> in${i} : array<${ty}>;`,
+      );
+    }
   }
 
   // Output bindings
@@ -1116,7 +1169,7 @@ export function blockMapFusedShaderSource(
     outputDtypes.push(dtype);
     const ty = dtypeToWgsl(dtype, true);
     emit(
-      `@group(0) @binding(${numBodyInputs + o}) var<storage, read_write> result${o} : array<${ty}>;`,
+      `@group(0) @binding(${storageInputs + o}) var<storage, read_write> result${o} : array<${ty}>;`,
     );
   }
 
@@ -1465,6 +1518,14 @@ export function blockMapFusedShaderSource(
       : "let gidx: i32 = i32(tidx);",
   );
 
+  // Helper: uniform-aware constant read.
+  // All uniform constants are declared as vec4<T>, so component access
+  // via in{ci}[idx] returns the scalar type — same as array indexing.
+  // This function is a no-op identity but documents the intent.
+  function readConst(ci: number, indexExpr: string): string {
+    return `in${ci}[${indexExpr}]`;
+  }
+
   // Phony assignments for unused inputs
   if (numBodyInputs > 0) {
     emit(
@@ -1551,7 +1612,8 @@ export function blockMapFusedShaderSource(
               ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
               : readExpr;
           } else {
-            return `${stepInputNames[bufIdx]}[${indexExpr}]`;
+            const ci = bodyInputIds.indexOf(step.inputs[bufIdx]);
+            return readConst(ci, indexExpr);
           }
         } else {
           return `${stepInputNames[bufIdx]}[${indexExpr}]`;
@@ -1580,7 +1642,8 @@ export function blockMapFusedShaderSource(
                 ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
                 : readExpr;
             } else {
-              return `${stepInputNames[bufIdx]}[${indexExpr}]`;
+              const ci = bodyInputIds.indexOf(step.inputs[bufIdx]);
+              return readConst(ci, indexExpr);
             }
           } else {
             return `${stepInputNames[bufIdx]}[${indexExpr}]`;
@@ -3295,10 +3358,12 @@ export function blockMapFusedShaderSource(
 
   return {
     code: shader.join("\n"),
-    numInputs: numBodyInputs,
+    numInputs: storageInputs,
     numOutputs,
-    hasUniform: false,
+    hasUniform: effectiveUniformConsts > 0,
     passes: [{ grid: [gridX, gridY] }],
     sharedMemoryBytes: totalShmemBytes > 0 ? totalShmemBytes : undefined,
+    numUniformConsts:
+      effectiveUniformConsts > 0 ? effectiveUniformConsts : undefined,
   };
 }

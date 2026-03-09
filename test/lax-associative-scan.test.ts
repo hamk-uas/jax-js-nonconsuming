@@ -760,6 +760,64 @@ describe("parallel Kalman filter via associativeScan", () => {
     ones_n.dispose();
     c_const.dispose();
   });
+
+  test("5-tuple matmul compose on WebGPU uses uniform constants (>10 bindings)", () => {
+    // 5-tuple pytree with matmul compose: 1 const (eye2) + 5 inputs + 5 outputs
+    // = 11 storage bindings > device max 10. Phase 1 moves the constant to
+    // @group(1) var<uniform>, reducing storage to 10 — within the limit.
+    defaultDevice("webgpu");
+    const N = 32;
+    const dtype = DType.Float32;
+
+    const compose5 = (
+      a: [np.Array, np.Array, np.Array, np.Array, np.Array],
+      b: [np.Array, np.Array, np.Array, np.Array, np.Array],
+    ): [np.Array, np.Array, np.Array, np.Array, np.Array] => [
+      np.matmul(a[0], b[0]) as np.Array,
+      np.matmul(a[1], b[1]) as np.Array,
+      np.matmul(a[2], b[2]) as np.Array,
+      np.matmul(a[3], b[3]) as np.Array,
+      np.matmul(a[4], b[4]) as np.Array,
+    ];
+
+    // Create 5 streams of 2×2 near-identity matrices
+    using eye2 = np.eye(2, { dtype });
+    const streams: np.Array[] = [];
+    for (let i = 0; i < 5; i++) {
+      using scale = np.array(0.01 * (i + 1), { dtype });
+      using flat = np.arange(N * 4).astype(dtype);
+      using reshaped = flat.reshape([N, 2, 2]);
+      using scaled = reshaped.mul(scale);
+      streams.push(scaled.add(eye2) as np.Array);
+    }
+
+    using f = jit(
+      (a: np.Array, b: np.Array, c: np.Array, d: np.Array, e: np.Array) =>
+        lax.associativeScan(compose5, [a, b, c, d, e] as [
+          np.Array,
+          np.Array,
+          np.Array,
+          np.Array,
+          np.Array,
+        ]),
+    );
+
+    // Should succeed (not fall back to JS Kogge-Stone)
+    const result = f(
+      streams[0],
+      streams[1],
+      streams[2],
+      streams[3],
+      streams[4],
+    ) as np.Array[];
+    expect(result.length).toBe(5);
+    // Verify each output has the right shape
+    for (const r of result) {
+      expect(r.shape).toEqual([N, 2, 2]);
+      r.dispose();
+    }
+    for (const s of streams) s.dispose();
+  });
 });
 
 // ============================================================================
