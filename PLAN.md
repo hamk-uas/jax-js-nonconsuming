@@ -339,6 +339,296 @@ command buffers for compute dispatches. This is a WebGPU API limitation.
 
 ---
 
+## O6: Multi-Reduction Kernel — Detailed Design
+
+### Problem
+
+Each matmul (Dot → Reduce) creates a kernel dispatch boundary. In a DLM compose body (3-tuple, m=2),
+a single `associativeScan` body iteration produces:
+
+```
+newA = dot(q.A, p.A)                    # dispatch 1: reduce(K=2)
+Ab   = dot(q.A, p.b)                    # dispatch 2: reduce(K=2)
+newB = Ab + q.b                          # fused epilogue of dispatch 2
+AS   = dot(q.A, p.S)                    # dispatch 3: reduce(K=2)
+qAT  = transpose(q.A)                   # view (zero cost)
+ASAT = dot(AS, qAT)                     # dispatch 4: reduce(K=2), reads AS from global
+newS = ASAT + q.S                        # fused epilogue of dispatch 4
+```
+
+**4 dispatches** for what is conceptually 4 independent small matmuls. Dispatches 1–3 are
+independent (no data dependencies). Dispatch 4 depends on dispatch 3's output (AS).
+
+At ~132µs per dispatch overhead (JS loop + command encoding + submission), 4 dispatches cost ~528µs
+of pure overhead for 2×2 matrices where the actual GPU compute is negligible.
+
+### Opportunity: Two independent fusion strategies
+
+**Strategy A: Multi-output reduction kernel (independent reductions)**
+
+Fuse dispatches 1, 2, 3 into a **single** dispatch that produces 3 output buffers. These share the
+same input arguments and the same reduction size. Each output has its own independent reduction
+expression + epilogue.
+
+```
+                    ┌─ out0: reduce(q.A * p.A, Add, K=2) → newA
+dispatch 1 (fused): ├─ out1: reduce(q.A * p.b, Add, K=2) → Ab + q.b → newB
+                    └─ out2: reduce(q.A * p.S, Add, K=2) → AS
+```
+
+**Strategy B: Chained reduction (dependent reductions)**
+
+Fuse dispatch 3 → dispatch 4 when the output of one reduction feeds directly into the next.
+`ASAT = dot(AS, qAT)` where `AS = dot(q.A, p.S)`. The intermediate `AS` lives in registers:
+
+```
+dispatch (chained): ridx1 loop: acc1 += q.A[gidx,ridx1] * p.S[ridx1,:]
+                    ridx2 loop: acc2 += acc1[:] * qAT[ridx2,gidx]  ← reads acc1 as input
+                    store: acc2 + q.S
+```
+
+Strategy A is **much simpler** and covers many more cases. Strategy B is theoretically more powerful
+but requires fundamentally different codegen (register-resident intermediates).
+
+### Strategy A: Multi-output reduction kernel
+
+#### Current barrier
+
+`Kernel.multi()` ([alu.ts:1569](alu.ts#L1569)) explicitly forbids reductions. This was a
+simplification: the codegen for multi-output kernels (`pipelineSourceMulti` in webgpu.ts,
+`codegenWasmMulti` in wasm.ts) doesn't handle the ridx loop / shared-memory tree.
+
+`flushPendingKernels()` ([jit.ts:1523](jit.ts#L1523)) routes all reduction entries to `soloEntries`,
+skipping multi-output grouping.
+
+#### Fusion criteria
+
+Two reduction kernel entries can fuse into a multi-output reduction kernel iff:
+
+1. **Same reduction size** — all must reduce over the same K
+2. **Same reduction op** — all must be `AluOp.Add` (or all `Mul`, etc.)
+3. **Same gidx size** — all output arrays have the same number of elements
+4. **Same input args** — shared `inputArgs` (already required for multi-output)
+5. **Independent** — no data dependency between outputs (output of one is not input to another)
+6. **Combined args within limit** — `nargs + numOutputs ≤ maxArgs`
+
+All of these are **already checked** for non-reduction multi-output kernels except (1), (2), and
+(5). Criteria (1) and (2) are new. Criterion (5) is automatically satisfied because dependent
+reductions are in separate `reductionEndpointEqns` and chained via epilogue.
+
+#### Reduction dtype matching
+
+All fused reduction outputs must share the same reduction dtype (for shared-memory workspace
+sizing). If reduction dtypes differ, fall back to solo dispatch. In practice, DLM bodies use uniform
+f32 throughout.
+
+#### Kernel type changes
+
+```typescript
+// Current (alu.ts):
+static multi(nargs, size, outputDescs: { exp, reduction? }[]): Kernel
+// throws if any reduction is present
+
+// Proposed:
+static multi(nargs, size, outputDescs: { exp, reduction? }[]): Kernel
+// ALLOW reductions IF all outputs share the same reduction op, size, and dtype
+// (or all have no reduction, as before)
+```
+
+Validation: either ALL outputs have reduction with matching `(op, size, dtype)`, or NONE have
+reduction. Mixed reduction/non-reduction outputs are not supported (different loop structures).
+
+#### WASM codegen changes (`codegenWasmMulti` → `emitKernelBody`)
+
+Current `codegenWasmMulti` generates a gidx loop that evaluates each output expression and stores.
+For multi-reduction:
+
+```
+for gidx in 0..size:
+  // Initialize N accumulators
+  acc0 = identity; acc1 = identity; acc2 = identity;
+  for ridx in 0..K:
+    val0 = exp0(gidx, ridx); acc0 = combine(acc0, val0);
+    val1 = exp1(gidx, ridx); acc1 = combine(acc1, val1);
+    val2 = exp2(gidx, ridx); acc2 = combine(acc2, val2);
+  // Apply per-output epilogues
+  out0[gidx] = epilogue0(acc0)
+  out1[gidx] = epilogue1(acc1)
+  out2[gidx] = epilogue2(acc2)
+```
+
+**Key insight:** All N accumulators share the **same ridx loop** since they have the same reduction
+size. The loop body evaluates N expressions (one per output) and accumulates into N independent
+accumulators. After the loop, each output applies its own epilogue.
+
+This is straightforward: the WASM gidx loop already exists; we add N `acc` locals, evaluate N
+expressions per ridx iteration, and store N epilogue results per gidx.
+
+Parallel dispatch (M5.3): Works unchanged — `start`/`end` locals split the gidx range across
+threads, each produces partial ranges of all N outputs.
+
+#### WebGPU codegen changes (`pipelineSourceMulti` + `pipelineSource`)
+
+The multi-output WebGPU path currently skips reductions entirely. Two sub-strategies:
+
+**Sub-A: Per-thread reduction (small K)**
+
+For small reduction sizes (K ≤ ~64), each thread can accumulate independently without shared-memory
+coordination:
+
+```wgsl
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let gidx = i32(id.x);
+  if (gidx >= SIZE) { return; }
+
+  // N independent accumulators
+  var acc0: f32 = 0.0;
+  var acc1: f32 = 0.0;
+  var acc2: f32 = 0.0;
+
+  for (var ridx: i32 = 0; ridx < K; ridx++) {
+    acc0 += exp0(gidx, ridx);
+    acc1 += exp1(gidx, ridx);
+    acc2 += exp2(gidx, ridx);
+  }
+
+  result0[gidx] = epilogue0(acc0);
+  result1[gidx] = epilogue1(acc1);
+  result2[gidx] = epilogue2(acc2);
+}
+```
+
+**When this applies:** `gidx_size ≥ workgroupSize` (enough threads to fill a workgroup without
+needing shared-memory reduction). For matmul [M,N]×[N,K], the gidx size is M×K. For 2×2 matrices:
+gidx=4, K=2 — this is the per-thread path.
+
+**Sub-B: Shared-memory reduction (large K)**
+
+When the tuner selects shared-memory reduction (workgroup cooperates on one gidx element), the
+codegen needs N separate shmem regions (one per output) and N tree-reduction passes. This increases
+shared memory by N× and adds N-1 extra workgroupBarrier() sequences.
+
+```wgsl
+var<workgroup> shmem0: array<f32, 256>;
+var<workgroup> shmem1: array<f32, 256>;
+var<workgroup> shmem2: array<f32, 256>;
+
+// ridx loop with N accumulators...
+// subgroup/tree reduction for each output...
+// thread-0 stores all N results
+```
+
+**Feasibility:** shmem is limited to ~16 KB. For f32 with groupSize=256: 1024 bytes per output. Up
+to **16 outputs** (16×1024 = 16384) fit. In practice, DLM compose produces 3-5 reduction outputs —
+easily within limits.
+
+#### Tuner changes
+
+`tuneWebgpu()` and `tuneWasm()` must handle multi-output reduction kernels. The tuning decisions
+(unroll factor, upcast, groupSize) should be uniform across all outputs since they share the ridx
+loop. Use the first output's expression for tuning decisions.
+
+#### splitGraphDataflow changes
+
+No changes needed. P1 already marks reduction endpoints as black nodes. The fusion happens in
+`flushPendingKernels`, which runs after P1.
+
+However, we need a subtle change to the **grouping key** in `flushPendingKernels`:
+
+```typescript
+// Current key for non-reductions:
+const key = `${sizeExprKey(entry.size)}:${entry.inputArgs.join(",")}`;
+
+// Proposed key for reductions (new group):
+const key = `red:${sizeExprKey(entry.size)}:${entry.inputArgs.join(",")}:${entry.reduction.op}:${sizeExprKey(entry.reduction.size)}:${entry.reduction.dtype}`;
+```
+
+Only reductions with matching `(size, inputArgs, reductionOp, reductionSize, reductionDtype)` can
+merge.
+
+#### Mega-module changes
+
+The mega-module rejects symbolic sizes but accepts concrete reduction kernels. Multi-output
+reduction kernels would need the WASM codegen changes above. Since the mega-module calls the same
+`emitKernelBody` / `codegenWasm*` functions, this should propagate naturally.
+
+### Implementation phases
+
+#### Phase A: WASM multi-output reduction (Medium effort)
+
+1. Remove `Kernel.multi()` restriction — allow uniform reductions
+2. Add reduction grouping in `flushPendingKernels` with new key
+3. Extend `codegenWasmMulti` to handle N accumulators in shared ridx loop
+4. Update tuner for multi-output reduction
+5. Tests: matmul chains produce fewer execute steps
+6. Verify mega-module compatibility
+
+**Expected impact on DLM 3-tuple (WASM, m=2):**
+
+- Body dispatches: 4 → 2 (fuse independent dots 1-3 into 1, keep dependent dot 4 solo)
+- Per-iteration overhead: ~528µs → ~264µs (2 dispatches × 132µs)
+- But in compiled-loop scan, WASM overhead is already negligible (~6ms total for N=100)
+- **Real benefit: enables mega-module to inline the fused kernel**
+
+#### Phase B: WebGPU multi-output reduction (Medium-Large effort)
+
+1. Extend `pipelineSourceMulti` to handle per-thread reduction (Sub-A)
+2. Extend `pipelineSource` to handle shared-memory multi-output reduction (Sub-B)
+3. Update ShaderInfo return for multi-output reduction metadata
+4. Tests: WebGPU dispatch count reduced for matmul chains
+
+**Expected impact on DLM 3-tuple (WebGPU, m=2):**
+
+- Saves ~2 dispatches per associativeScan body iteration
+- For N=100, M=7 Kogge-Stone rounds: saves ~14 dispatches per round × 7 rounds ≈ 98 dispatches
+- At ~132µs JS overhead per dispatch: **saves ~13ms** (10% of 124ms total)
+
+#### Phase C: Chained reduction (Strategy B) — Future
+
+Dependent reduction fusion (`dot(dot(A,B), C)` in 1 dispatch). Requires register-resident
+intermediates and nested ridx loops. Only valuable for patterns like the transpose-sandwich `A S Aᵀ`
+where the inner matmul feeds directly into the outer.
+
+**Architectural requirements:**
+
+- New AluExp nodes for "local array" (register-resident intermediate)
+- Nested reduction codegen (outer gidx loop → inner ridx1 loop → store to local → inner ridx2 loop
+  reading from local)
+- New Kernel variant or extension to represent chained reductions
+- Significant complexity; deferred until Phase A/B demonstrate value
+
+### Risk assessment
+
+| Risk                                                        | Likelihood | Mitigation                                              |
+| ----------------------------------------------------------- | ---------- | ------------------------------------------------------- |
+| Multi-output reduction increases register pressure          | Medium     | Fall back to solo for >4 outputs                        |
+| Shared-memory overflow (WebGPU Sub-B, many outputs)         | Low        | Guard: `numOutputs × groupSize × byteWidth ≤ maxShmem`  |
+| Tuning divergence across outputs (different optimal unroll) | Low        | Use uniform tuning from first output                    |
+| Interaction with O1 cheap-recompute diamond relaxation      | None       | Diamond operates on P1; fusion in `flushPendingKernels` |
+| Mega-module inline failure for multi-output reduction       | Low        | Already handles multi-output elementwise                |
+
+### Dispatch reduction estimate (DLM 3-tuple compose, m=2)
+
+| Pattern                                | Current dispatches | After Phase A | After Phase B         |
+| -------------------------------------- | ------------------ | ------------- | --------------------- |
+| 3 independent dots (newA, Ab→newB, AS) | 3                  | **1**         | **1**                 |
+| 1 dependent dot (ASAT→newS)            | 1                  | 1             | 1 (or 0 with Phase C) |
+| **Body total**                         | **4**              | **2**         | **2**                 |
+| Full dlmFit (764 dispatches, warm)     | 764                | ~700          | ~700                  |
+| Estimated time saving (WebGPU, N=100)  | —                  | ~8ms          | ~8ms                  |
+
+The savings per body iteration are modest (2 dispatches). But in `associativeScan` with Kogge-Stone
+(ceil(log₂ N) rounds, each round applies the body to O(N) blocks), the savings multiply:
+
+- N=100: 7 rounds × ~2 saved dispatches/block × ~7 blocks ≈ **98 saved dispatches**
+- N=800: 10 rounds × ~100 blocks ≈ **2000 saved dispatches** (but GPU-dominant at this N)
+
+The **primary benefit is WASM mega-module**: fusing 3 solo steps into 1 multi-output step reduces
+the loop iteration count and enables better register allocation in the compiled WASM module.
+
+---
+
 ## Non-goals
 
 - **General einsum rank-adaptation:** The general `parseEinsumExpression` still fails with
