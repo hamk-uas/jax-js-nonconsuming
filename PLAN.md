@@ -303,20 +303,26 @@ driver-level limits).
 
 ### Remaining optimization opportunities (jax-js)
 
-| ID  | Approach                                                                           | Impact                                                      | Effort                                                                      |
-| --- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------- |
-| O1  | **Diamond heuristic relaxation: allow recomputation for cheap ops**                | High — could reduce 476 non-reduction dispatches by ~40-60% | Medium — modify P1 in `splitGraphDataflow`                                  |
-| O2  | **Scalar promotion: compute size ≤ 4 kernels on CPU, pass as constants**           | Low-Medium — eliminates 86 tiny dispatches (~14ms)          | Medium — needs CPU fallback for tiny kernels in JIT                         |
-| O3  | **Bind group caching for JIT programs with stable pipeline→slot mappings**         | Low — `createBindGroup` is only 6ms/764 calls               | Medium — cache keyed by (pipeline, slot[])                                  |
-| O4  | **Single-pass dlmFit: merge Pass 1 + Pass 2 into one jit call**                    | Medium — eliminates ~382 dispatches + 1 readback            | Medium — downstream restructuring                                           |
-| O5  | **Pre-encoded command buffer: record commands once, replay with buffer rebind**    | High — eliminates per-dispatch loop overhead (~95ms)        | Large — needs WebGPU "render bundle" equivalent for compute (not available) |
-| O6  | **Multi-reduction kernel: fuse chains of matmul+elementwise into single dispatch** | High — could merge pairs of dot→elemwise→dot→elemwise       | Very Large — fundamentally new codegen                                      |
+| ID     | Approach                                                                           | Impact                                                          | Effort                                                                      |
+| ------ | ---------------------------------------------------------------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| ~~O1~~ | ~~**Diamond heuristic relaxation: allow recomputation for cheap ops**~~            | ~~High — could reduce 476 non-reduction dispatches by ~40-60%~~ | **Done** ✅                                                                 |
+| O2     | **Scalar promotion: compute size ≤ 4 kernels on CPU, pass as constants**           | Low-Medium — eliminates 86 tiny dispatches (~14ms)              | Medium — needs CPU fallback for tiny kernels in JIT                         |
+| O3     | **Bind group caching for JIT programs with stable pipeline→slot mappings**         | Low — `createBindGroup` is only 6ms/764 calls                   | Medium — cache keyed by (pipeline, slot[])                                  |
+| O4     | **Single-pass dlmFit: merge Pass 1 + Pass 2 into one jit call**                    | Medium — eliminates ~382 dispatches + 1 readback                | Medium — downstream restructuring                                           |
+| O5     | **Pre-encoded command buffer: record commands once, replay with buffer rebind**    | High — eliminates per-dispatch loop overhead (~95ms)            | Large — needs WebGPU "render bundle" equivalent for compute (not available) |
+| O6     | **Multi-reduction kernel: fuse chains of matmul+elementwise into single dispatch** | High — could merge pairs of dot→elemwise→dot→elemwise           | Very Large — fundamentally new codegen                                      |
 
-O1 (diamond relaxation) is the highest-impact feasible optimization. The diamond heuristic currently
-forces materialization whenever a node's output reaches 2+ distinct black nodes. For cheap
+~~O1 (diamond relaxation) is the highest-impact feasible optimization. The diamond heuristic
+currently forces materialization whenever a node's output reaches 2+ distinct black nodes. For cheap
 operations (unary, binary with small literal), the recomputation cost is negligible compared to the
 dispatch overhead (~132µs). Allowing such recomputation would let these ops fuse into their
-downstream reduction epilogues instead of becoming separate dispatches.
+downstream reduction epilogues instead of becoming separate dispatches.~~
+
+**O1 implemented:** The P1 diamond heuristic now exempts "cheap recompute" ops — unary elementwise
+(neg, cast, sqrt, exp, etc.), binary with at least one literal input (add(x, 1), mul(x, 0.5)), and
+Where with ≥2 literal inputs. These ops are duplicated into each downstream kernel instead of being
+materialized as separate dispatches. The criterion matches the reduction epilogue fusability rules.
+`setDebug(1)` now reports `cheapDiamonds=N` showing how many diamonds were relaxed.
 
 O5 (pre-encoded commands) is the theoretical ideal — it would eliminate the 95ms JS loop overhead
 entirely — but WebGPU has no equivalent of Vulkan's secondary command buffers or Metal's indirect

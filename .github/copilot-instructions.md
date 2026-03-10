@@ -341,6 +341,9 @@ runtime i32 param).
 - Changing WebGPU shaders without browser tests → silent breakage
 - `splitGraphDataflow` P2: `isNonKernelBlack` distinction matters — non-kernel blacks (Scan,
   Routine, DUS) are exempt from `maxArgs` check; kernel-endpoint blacks are not
+- `splitGraphDataflow` P1 diamond relaxation: unary ops and binary-with-literal ops are exempt from
+  the diamond heuristic (like view ops). They get duplicated into downstream kernels instead of
+  being materialized as separate dispatches. `setDebug(1)` reports `cheapDiamonds=N`.
 - DUS JIT step uses fiber loop for axis > 0 (`outerFibers` separate `copyBufferToBuffer` calls).
   Axis=0 fast path is a single contiguous copy.
 - ScatterAdd vmap: batched indices not supported (shared indices only)
@@ -742,7 +745,8 @@ Results saved to `docs/ULTIMATE-BENCHMARKS.md`. Bench files import from
 
 ## Before starting work
 
-1. `pnpm build` before running tests (Vitest imports from `dist/`)
+1. `pnpm build` before running benchmarks (bench files import from `dist/`). Tests resolve to source
+   via `vitest.config.ts` aliases and do NOT require a prior build.
 2. `git branch` to confirm you're on the right branch
 3. `git log --oneline -10` for recent context
 

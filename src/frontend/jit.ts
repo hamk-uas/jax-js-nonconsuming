@@ -2773,6 +2773,7 @@ let _splitStats = {
   special: 0,
   cascade: 0,
   diamonds: 0,
+  cheapDiamonds: 0,
   cleanShape: 0,
   p2: 0,
 };
@@ -2786,6 +2787,7 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
       special: 0,
       cascade: 0,
       diamonds: 0,
+      cheapDiamonds: 0,
       cleanShape: 0,
       p2: 0,
     };
@@ -3010,7 +3012,50 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
       eqn.primitive === Primitive.Broadcast ||
       eqn.primitive === Primitive.Flip ||
       eqn.primitive === Primitive.Split;
-    if (needsCleanOutput || (reach.size > 1 && !isViewOp)) {
+    // Cheap recompute ops: elementwise operations whose recomputation cost
+    // is negligible compared to the per-dispatch overhead (~100µs). Allowing
+    // these through the diamond means they get duplicated into each
+    // downstream kernel, but the extra ALU cost is minimal.
+    // For binary ops, require at least one Lit input to avoid increasing
+    // binding count in downstream kernels.
+    let isCheapRecompute = false;
+    switch (eqn.primitive) {
+      case Primitive.Neg:
+      case Primitive.Reciprocal:
+      case Primitive.Floor:
+      case Primitive.Ceil:
+      case Primitive.StopGradient:
+      case Primitive.Cast:
+      case Primitive.Bitcast:
+      case Primitive.Sin:
+      case Primitive.Cos:
+      case Primitive.Asin:
+      case Primitive.Atan:
+      case Primitive.Exp:
+      case Primitive.Log:
+      case Primitive.Erf:
+      case Primitive.Erfc:
+      case Primitive.Sqrt:
+        isCheapRecompute = true;
+        break;
+      case Primitive.Add:
+      case Primitive.Mul:
+      case Primitive.Idiv:
+      case Primitive.Mod:
+      case Primitive.Min:
+      case Primitive.Max:
+      case Primitive.Compare:
+        isCheapRecompute = eqn.inputs.some((v) => v instanceof Lit);
+        break;
+      case Primitive.Where:
+        isCheapRecompute =
+          eqn.inputs.filter((v) => v instanceof Lit).length >= 2;
+        break;
+    }
+    if (
+      needsCleanOutput ||
+      (reach.size > 1 && !isViewOp && !isCheapRecompute)
+    ) {
       if (DEBUG >= 1) {
         if (reach.size > 1) _splitStats.diamonds++;
         if (needsCleanOutput) _splitStats.cleanShape++;
@@ -3020,8 +3065,11 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
         p1NextBlack.set(v, new Set([v]));
       }
     } else if (reach.size >= 1) {
+      if (DEBUG >= 1 && reach.size > 1 && isCheapRecompute)
+        _splitStats.cheapDiamonds++;
       // Propagate all reachable black nodes through this node. For view ops
-      // this preserves the fan-out so upstream nodes see the diamond correctly.
+      // and cheap recompute ops, this preserves the fan-out so upstream
+      // nodes see the diamond correctly.
       for (const v of eqn.outBinders) p1NextBlack.set(v, new Set(reach));
     }
   }
@@ -3118,7 +3166,8 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     console.log(
       `splitGraphDataflow: ${blackNodes.size} black / ${jaxpr.eqns.length} eqns` +
         ` (reductions=${_splitStats.reductions} cascade=${_splitStats.cascade}` +
-        ` diamonds=${_splitStats.diamonds} cleanShape=${_splitStats.cleanShape}` +
+        ` diamonds=${_splitStats.diamonds} cheapDiamonds=${_splitStats.cheapDiamonds}` +
+        ` cleanShape=${_splitStats.cleanShape}` +
         ` heterogeneous=${_splitStats.heterogeneous} routines=${_splitStats.routines}` +
         ` special=${_splitStats.special} p2=${_splitStats.p2})`,
     );
