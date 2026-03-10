@@ -715,6 +715,8 @@ export class JitProgram {
               ? step.dstSizeBytes
               : resolveSizeExpr(step.dstSizeBytes, dimBindings!);
 
+          // Batch all DUS copies into a single command submission
+          this.backend.beginBatch?.();
           if (dstSlot !== outSlot) {
             this.backend.copyBufferToBuffer!(
               dstSlot,
@@ -750,6 +752,7 @@ export class JitProgram {
               );
             }
           }
+          this.backend.endBatch?.();
           break;
         }
         case "scatter_add": {
@@ -763,6 +766,8 @@ export class JitProgram {
 
           // Copy target to output if not already recycled
           const targetBytes = prod(step.targetShape) * byteWidth(step.dtype);
+          // Batch copy + dispatch into a single command submission
+          this.backend.beginBatch?.();
           if (targetSlot !== outSlot) {
             this.backend.copyBufferToBuffer!(
               targetSlot,
@@ -783,6 +788,7 @@ export class JitProgram {
             step.updatesLen,
             step.dtype,
           );
+          this.backend.endBatch?.();
           break;
         }
         case "reverse": {
@@ -808,6 +814,8 @@ export class JitProgram {
             );
           } else {
             // Generic fallback: copy slices in reverse order
+            // Batch all reverse copies into a single command submission
+            this.backend.beginBatch?.();
             for (let i = 0; i < concreteAxisSize; i++) {
               this.backend.copyBufferToBuffer(
                 inputSlot,
@@ -817,6 +825,7 @@ export class JitProgram {
                 step.innerBytes,
               );
             }
+            this.backend.endBatch?.();
           }
           break;
         }
@@ -958,6 +967,8 @@ export class JitProgram {
           }
 
           // Write final carries to output slots
+          // Batch carry copies into a single command submission
+          this.backend.beginBatch?.();
           for (let k = 0; k < step.outputs.length; k++) {
             const outSlot = scope[step.outputs[k]];
             const carrySlot = carrySlots[k];
@@ -970,6 +981,7 @@ export class JitProgram {
             );
             if (ownsCarry) this.backend.decRef(carrySlot);
           }
+          this.backend.endBatch?.();
           break;
         }
         case "workgroup_assoc_scan": {

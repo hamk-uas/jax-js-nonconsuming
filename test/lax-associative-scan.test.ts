@@ -795,7 +795,12 @@ describe("parallel Kalman filter via associativeScan", () => {
     // 5-tuple pytree with matmul compose: 1 const (eye2) + 5 inputs + 5 outputs
     // = 11 storage bindings > device max 10. Phase 1 moves the constant to
     // @group(1) var<uniform>, reducing storage to 10 — within the limit.
-    defaultDevice("webgpu");
+    let prev: ReturnType<typeof defaultDevice>;
+    try {
+      prev = defaultDevice("webgpu");
+    } catch {
+      return; // WebGPU not available in this test environment
+    }
     const N = 32;
     const dtype = DType.Float32;
 
@@ -847,6 +852,7 @@ describe("parallel Kalman filter via associativeScan", () => {
       r.dispose();
     }
     for (const s of streams) s.dispose();
+    defaultDevice(prev!);
   });
 });
 
