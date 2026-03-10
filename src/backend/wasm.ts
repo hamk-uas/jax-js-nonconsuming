@@ -1147,9 +1147,18 @@ export class WasmBackend implements Backend {
     // Walk step metadata, executing each step
     for (const step of megaModule.stepInfos) {
       switch (step.type) {
-        case "malloc":
-          locals[step.outputIdx] = this.#allocator.malloc(step.size);
+        case "malloc": {
+          const ptr = this.#allocator.malloc(step.size);
+          locals[step.outputIdx] = ptr;
+          if (step.initialData) {
+            new Uint8Array(
+              this.#memory.buffer,
+              ptr,
+              step.initialData.byteLength,
+            ).set(step.initialData);
+          }
           break;
+        }
 
         case "free":
           this.#allocator.free(locals[step.inputIdx]);

@@ -306,7 +306,7 @@ driver-level limits).
 | ID     | Approach                                                                           | Impact                                                          | Effort                                                                      |
 | ------ | ---------------------------------------------------------------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------- |
 | ~~O1~~ | ~~**Diamond heuristic relaxation: allow recomputation for cheap ops**~~            | ~~High — could reduce 476 non-reduction dispatches by ~40-60%~~ | **Done** ✅                                                                 |
-| O2     | **Scalar promotion: compute size ≤ 4 kernels on CPU, pass as constants**           | Low-Medium — eliminates 86 tiny dispatches (~14ms)              | Medium — needs CPU fallback for tiny kernels in JIT                         |
+| ~~O2~~ | ~~**Scalar promotion: compute size ≤ 4 kernels on CPU, pass as constants**~~       | ~~Low-Medium — eliminates 86 tiny dispatches (~14ms)~~          | **Done** ✅                                                                 |
 | O3     | **Bind group caching for JIT programs with stable pipeline→slot mappings**         | Low — `createBindGroup` is only 6ms/764 calls                   | Medium — cache keyed by (pipeline, slot[])                                  |
 | O4     | **Single-pass dlmFit: merge Pass 1 + Pass 2 into one jit call**                    | Medium — eliminates ~382 dispatches + 1 readback                | Medium — downstream restructuring                                           |
 | O5     | **Pre-encoded command buffer: record commands once, replay with buffer rebind**    | High — eliminates per-dispatch loop overhead (~95ms)            | Large — needs WebGPU "render bundle" equivalent for compute (not available) |
@@ -323,6 +323,14 @@ downstream reduction epilogues instead of becoming separate dispatches.~~
 Where with ≥2 literal inputs. These ops are duplicated into each downstream kernel instead of being
 materialized as separate dispatches. The criterion matches the reduction epilogue fusability rules.
 `setDebug(1)` now reports `cheapDiamonds=N` showing how many diamonds were relaxed.
+
+**O2 implemented:** `pushLit` now computes the constant scalar value on the CPU at JIT compile time
+and embeds it as `initialData` on the `malloc` step. The backend fills the buffer via
+`queue.writeBuffer` (WebGPU) or `memcpy` (WASM) instead of dispatching a zero-input kernel. This
+eliminates all constant-fill GPU dispatches (previously one shader dispatch per Lit scalar in the
+jaxpr). The mega-module emits inline `i32.store` / `i32.store16` instructions for the data. Buffers
+with `initialData` are exempt from recycling (always fresh allocation) since they're tiny (2–8
+bytes).
 
 O5 (pre-encoded commands) is the theoretical ideal — it would eliminate the 95ms JS loop overhead
 entirely — but WebGPU has no equivalent of Vulkan's secondary command buffers or Metal's indirect

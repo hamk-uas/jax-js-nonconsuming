@@ -55,7 +55,12 @@ export interface ExtractedKernelInfo {
  * parallel dispatch path can replicate it without calling mega_execute.
  */
 export type MegaStepInfo =
-  | { type: "malloc"; outputIdx: number; size: number }
+  | {
+      type: "malloc";
+      outputIdx: number;
+      size: number;
+      initialData?: Uint8Array;
+    }
   | { type: "free"; inputIdx: number }
   | { type: "recycle"; fromIdx: number; toIdx: number }
   | {
@@ -402,6 +407,32 @@ export function compileToMegaModule(
           cg.i32.const(size);
           cg.call(allocFunc);
           cg.local.set(jitIdLocals.get(step.output)!);
+
+          // If pre-filled constant data is present, emit inline i32.store
+          // instructions to write it directly into the allocated buffer.
+          // These are tiny scalar buffers (2–8 bytes), so 1–2 stores suffice.
+          if (step.initialData) {
+            const data = step.initialData;
+            const dv = new DataView(
+              data.buffer,
+              data.byteOffset,
+              data.byteLength,
+            );
+            // Write 4-byte chunks
+            for (let off = 0; off + 4 <= data.byteLength; off += 4) {
+              cg.local.get(jitIdLocals.get(step.output)!);
+              cg.i32.const(dv.getInt32(off, true));
+              cg.i32.store(2, off); // align=4
+            }
+            // Handle 2-byte remainder (Float16)
+            const rem = data.byteLength % 4;
+            if (rem === 2) {
+              const off = data.byteLength - 2;
+              cg.local.get(jitIdLocals.get(step.output)!);
+              cg.i32.const(dv.getUint16(off, true));
+              cg.i32.store16(1, off); // align=2
+            }
+          }
           break;
         }
 
@@ -530,6 +561,7 @@ export function compileToMegaModule(
           type: "malloc",
           outputIdx: jitIdToIdx.get(step.output)!,
           size: step.size as number,
+          ...(step.initialData && { initialData: step.initialData }),
         });
         break;
       case "free":
@@ -732,6 +764,26 @@ function emitForiLoop(
           cg.i32.const(size);
           cg.call(allocFunc);
           cg.local.set(bodyLocals.get(bs.output)!);
+          if (bs.initialData) {
+            const data = bs.initialData;
+            const dv = new DataView(
+              data.buffer,
+              data.byteOffset,
+              data.byteLength,
+            );
+            for (let off = 0; off + 4 <= data.byteLength; off += 4) {
+              cg.local.get(bodyLocals.get(bs.output)!);
+              cg.i32.const(dv.getInt32(off, true));
+              cg.i32.store(2, off);
+            }
+            const rem = data.byteLength % 4;
+            if (rem === 2) {
+              const off = data.byteLength - 2;
+              cg.local.get(bodyLocals.get(bs.output)!);
+              cg.i32.const(dv.getUint16(off, true));
+              cg.i32.store16(1, off);
+            }
+          }
           break;
         }
         case "free": {

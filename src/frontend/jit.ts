@@ -131,6 +131,10 @@ export type JitStep =
       type: "malloc";
       size: SizeExpr;
       output: JitId;
+      /** Pre-computed constant data to fill the buffer with at allocation time.
+       *  When present, no kernel dispatch is needed — the backend uses
+       *  writeBuffer (WebGPU) or memcpy (WASM) instead. */
+      initialData?: Uint8Array;
     }
   | {
       type: "incref";
@@ -395,7 +399,10 @@ export class JitProgram {
           }
         }
         case "malloc":
-          return PPrint.pp(`%${step.output} = malloc <${step.size} bytes>`);
+          return PPrint.pp(
+            `%${step.output} = malloc <${step.size} bytes>` +
+              (step.initialData ? " [prefilled]" : ""),
+          );
         case "incref":
           return PPrint.pp(`incref ${step.input}`);
         case "free":
@@ -636,7 +643,10 @@ export class JitProgram {
             typeof step.size === "number"
               ? step.size
               : resolveSizeExpr(step.size, dimBindings!);
-          scope[step.output] = this.backend.malloc(concreteSize);
+          scope[step.output] = this.backend.malloc(
+            concreteSize,
+            step.initialData,
+          );
           break;
         }
         case "incref": {
@@ -1182,21 +1192,42 @@ class JitProgramBuilder {
   }
 
   pushLit(lit: Lit): JitId {
-    const kernel = Kernel.single(
-      0,
-      lit.aval.size,
-      AluExp.const(lit.dtype, lit.value),
-    );
-    return this.pushKernel(kernel, []);
+    // Compute the constant value as raw bytes and embed it directly in the
+    // malloc step. This avoids dispatching a zero-input kernel (GPU shader or
+    // WASM routine) just to fill a scalar buffer with a constant.
+    const bw = byteWidth(lit.dtype);
+    const buf = new ArrayBuffer(bw);
+    const view = new DataView(buf);
+    switch (lit.dtype) {
+      case DType.Float32:
+        view.setFloat32(0, lit.value, true);
+        break;
+      case DType.Int32:
+      case DType.Bool:
+        view.setInt32(0, lit.value | 0, true);
+        break;
+      case DType.Uint32:
+        view.setUint32(0, lit.value >>> 0, true);
+        break;
+      case DType.Float16:
+        view.setFloat16(0, lit.value, true);
+        break;
+      case DType.Float64:
+        view.setFloat64(0, lit.value, true);
+        break;
+    }
+    return this.pushBuffer(bw, new Uint8Array(buf));
   }
 
-  pushBuffer(size: SizeExpr): JitId {
+  pushBuffer(size: SizeExpr, initialData?: Uint8Array): JitId {
     const id = this.#nextId++;
-    this.steps.push({
+    const step: JitStep = {
       type: "malloc",
       size,
       output: id,
-    });
+    };
+    if (initialData) step.initialData = initialData;
+    this.steps.push(step);
     return id;
   }
 
@@ -1308,19 +1339,26 @@ class JitProgramBuilder {
       const step = this.steps[i];
 
       if (step.type === "malloc") {
-        // Check free pool for a same-size buffer to recycle
-        const key = sizeExprKey(step.size);
-        const pool = freePool.get(key);
-        if (pool && pool.length > 0) {
-          const reusedId = pool.pop()!;
-          newSteps.push({
-            type: "recycle",
-            input: reusedId,
-            output: step.output,
-          });
-          recycleCount++;
-        } else {
+        // Malloc steps with initialData must always allocate fresh — a recycled
+        // buffer would contain stale data. These are tiny (scalar) buffers from
+        // pushLit, so the recycling loss is negligible.
+        if (step.initialData) {
           newSteps.push(step);
+        } else {
+          // Check free pool for a same-size buffer to recycle
+          const key = sizeExprKey(step.size);
+          const pool = freePool.get(key);
+          if (pool && pool.length > 0) {
+            const reusedId = pool.pop()!;
+            newSteps.push({
+              type: "recycle",
+              input: reusedId,
+              output: step.output,
+            });
+            recycleCount++;
+          } else {
+            newSteps.push(step);
+          }
         }
       } else {
         newSteps.push(step);
