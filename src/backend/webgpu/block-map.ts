@@ -69,6 +69,19 @@ export interface BlockMapShaderParams {
   hasBlockIndex?: boolean;
   /** Per-constant info for uniform buffer migration (one entry per numConsts input). */
   constInfos?: { elemCount: number; dtype: DType; bytes: number }[];
+  /**
+   * Point-mode inputs: one element per grid point, indexed by workgroup_id.
+   * Body sees these as broadcast (no block dimension), but each workgroup
+   * reads a different element. inputShapes for point inputs should be the
+   * per-element shape (excluding the grid-indexed dimension).
+   */
+  pointInputs?: boolean[];
+  /**
+   * Grid offset: shift mapped input/output base offsets by this many blocks.
+   * Used when the block_map operates on a sub-range of the data (e.g.,
+   * assocScan Phase 4 starts from block 1, not block 0).
+   */
+  gridOffset?: number;
 }
 
 /**
@@ -140,8 +153,12 @@ export function blockMapFusedShaderSource(
   // Per-axis: the original dimension along each grid axis (for validity checks)
   const axisDims: (number | null)[] = new Array(gridRank).fill(null);
   let hasBoundary = false;
+  const gridOffset = params.gridOffset ?? 0;
   for (let g = 0; g < gridRank; g++) {
     for (let i = 0; i < numInputs; i++) {
+      // Point inputs don't participate in axisDims/boundary detection — they
+      // have one element per grid point, not blockShape elements.
+      if (params.pointInputs?.[i]) continue;
       const axes = params.inAxes[i];
       if (axes[g] !== null) {
         const dim = params.inputShapes[i][axes[g]!];
@@ -1320,9 +1337,15 @@ export function blockMapFusedShaderSource(
     const terms: string[] = [];
     for (let g = 0; g < gridRank; g++) {
       if (axisDims[g] !== null) {
-        terms.push(
-          `(block_i${g} * ${blockShape[g]}u + tidx_${g} < ${axisDims[g]}u)`,
-        );
+        if (gridOffset > 0) {
+          terms.push(
+            `((block_i${g} + ${gridOffset}u) * ${blockShape[g]}u + tidx_${g} < ${axisDims[g]}u)`,
+          );
+        } else {
+          terms.push(
+            `(block_i${g} * ${blockShape[g]}u + tidx_${g} < ${axisDims[g]}u)`,
+          );
+        }
       }
     }
     emit(`let valid: bool = ${terms.join(" && ")};`);
@@ -1353,6 +1376,7 @@ export function blockMapFusedShaderSource(
 
   for (let i = 0; i < numInputs; i++) {
     const axes = params.inAxes[i];
+    const isPoint = params.pointInputs?.[i] ?? false;
     const inShape = params.inputShapes[i];
     const nd = inShape.length;
     // Global strides
@@ -1362,10 +1386,10 @@ export function blockMapFusedShaderSource(
       gStrides[d] = gStrides[d + 1] * inShape[d + 1];
     }
     inBufStrides.push(gStrides);
-    // Body shape: replace mapped dims with blockShape
+    // Body shape: replace mapped dims with blockShape (skip for point inputs)
     const bShape = [...inShape];
     for (let g = 0; g < gridRank; g++) {
-      if (axes[g] !== null) bShape[axes[g]!] = blockShape[g];
+      if (axes[g] !== null && !isPoint) bShape[axes[g]!] = blockShape[g];
     }
     inBodyShapes.push(bShape);
     // Body strides
@@ -1385,17 +1409,29 @@ export function blockMapFusedShaderSource(
     }
     inNeedsRemap.push(needsRemap);
 
-    // Compute base offset: sum of block_i{g} * blockShape[g] * globalStride[axes[g]]
-    const terms: string[] = [];
-    for (let g = 0; g < gridRank; g++) {
-      if (axes[g] !== null) {
-        const ax = axes[g]!;
-        const blockStride = blockShape[g] * gStrides[ax];
-        terms.push(`block_i${g} * ${blockStride}u`);
+    // Compute base offset
+    if (isPoint) {
+      // Point-mode: 1 element per grid point, indexed by block_i0.
+      // inputShapes[i] is the per-element shape (no grid dimension).
+      const elemFlatSize = inShape.reduce((a, b) => a * b, 1);
+      emit(`let in_base_${i}: u32 = block_i0 * ${elemFlatSize}u;`);
+    } else {
+      // Normal mapped: blockShape elements per grid point.
+      const terms: string[] = [];
+      for (let g = 0; g < gridRank; g++) {
+        if (axes[g] !== null) {
+          const ax = axes[g]!;
+          const blockStride = blockShape[g] * gStrides[ax];
+          if (gridOffset > 0) {
+            terms.push(`(block_i${g} + ${gridOffset}u) * ${blockStride}u`);
+          } else {
+            terms.push(`block_i${g} * ${blockStride}u`);
+          }
+        }
       }
+      const baseExpr = terms.length > 0 ? terms.join(" + ") : "0u";
+      emit(`let in_base_${i}: u32 = ${baseExpr};`);
     }
-    const baseExpr = terms.length > 0 ? terms.join(" + ") : "0u";
-    emit(`let in_base_${i}: u32 = ${baseExpr};`);
   }
 
   /**
@@ -1454,7 +1490,11 @@ export function blockMapFusedShaderSource(
       if (axes[g] !== null) {
         const ax = axes[g]!;
         const blockStride = blockShape[g] * strides[ax];
-        terms.push(`block_i${g} * ${blockStride}u`);
+        if (gridOffset > 0) {
+          terms.push(`(block_i${g} + ${gridOffset}u) * ${blockStride}u`);
+        } else {
+          terms.push(`block_i${g} * ${blockStride}u`);
+        }
       }
     }
     const baseExpr = terms.length > 0 ? terms.join(" + ") : "0u";

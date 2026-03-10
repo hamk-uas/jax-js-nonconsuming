@@ -101,6 +101,8 @@ export type AssocScanPlan =
       scanBodyJaxpr: Jaxpr;
       /** Vmapped apply body: [consts, prefix, block[B,…]] → [result[B,…]]. */
       applyVmapProgram: JitProgram;
+      /** Vmapped apply body Jaxpr (for fused block_map in Phase 4). */
+      applyVmapJaxpr: Jaxpr;
     }
   | { path: "fallback" };
 
@@ -1949,5 +1951,6 @@ function tryBuildBlockMapAssocScanPlan(
     numLeaves,
     numConsts,
     applyVmapProgram,
+    applyVmapJaxpr: applyVmapClosed.jaxpr,
   };
 }

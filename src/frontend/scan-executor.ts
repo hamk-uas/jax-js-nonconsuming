@@ -752,42 +752,113 @@ function executeAssocScanBlockMapInner(
     Math.min(B, N),
   );
 
-  const summaryShapes = resolvedElemShapes.map((s) => {
-    const shape = [...s];
-    shape[axis] = M;
-    return shape;
-  });
+  if (M > 1 && axis === 0) {
+    // Fused Phase 4: single block_map dispatch over M-1 blocks.
+    // Uses pointInputs for per-workgroup prefix access and gridOffset=1
+    // to start mapped inputs/outputs from block 1.
+    //
+    // Body signature: [consts, prefix_0..L (broadcast), block_0..L (mapped)]
+    //              -> [result_0..L]
+    // Point inputs (prefix): shape [d1,d2,...] per element, indexed by workgroup_id
+    //   - Buffer is scannedSummary[M, d1, d2, ...], workgroup i reads summary[i]
+    // Mapped inputs (block): shape [N, d1, d2, ...], gridOffset=1 shifts to block 1+
+    // Mapped outputs: shape [N, d1, d2, ...], gridOffset=1 writes from block 1+
 
-  mapOverBlocks(
-    backend,
-    applyVmapProgram,
-    constSlots,
-    [
-      {
-        slots: finalScannedSummarySlots,
-        shapes: summaryShapes,
-        dtypes,
-        mode: "point",
-        indexOffset: -1,
-      },
-      {
-        slots: localScanSlots,
-        shapes: resolvedElemShapes,
-        dtypes,
-        mode: "block",
-      },
-    ],
-    outputSlots,
-    resolvedElemShapes,
-    dtypes,
-    axis,
-    B,
-    N,
-    1,
-    M,
-    numConsts,
-    dimBindings,
-  );
+    // Per-element shapes for point inputs (prefix): strip the scan axis
+    const prefixElemShapes = resolvedElemShapes.map((s) => {
+      const shape = [...s];
+      shape.splice(axis, 1);
+      return shape;
+    });
+
+    // inAxes: consts=null, prefix leaves=null (point mode handles offset),
+    //         block leaves=mapped on axis
+    const inAxes: (number | null)[][] = [
+      ...constSlots.map(() => [null as number | null]),
+      ...prefixElemShapes.map(() => [null as number | null]),
+      ...resolvedElemShapes.map(() => [axis as number | null]),
+    ];
+    const outAxes: (number | null)[][] = resolvedElemShapes.map(() => [axis]);
+
+    // pointInputs: false for consts, true for prefix leaves, false for block leaves
+    const pointInputs = [
+      ...constSlots.map(() => false),
+      ...prefixElemShapes.map(() => true),
+      ...resolvedElemShapes.map(() => false),
+    ];
+
+    const inputShapes = [
+      ...constAvals.map((a) => a.shape as number[]),
+      ...prefixElemShapes,
+      ...resolvedElemShapes,
+    ];
+
+    const phase4Params: ExecuteBlockMapParams = {
+      backend,
+      bodyProgram: applyVmapProgram,
+      bodyJaxpr: plan.applyVmapJaxpr,
+      blockShape: [B],
+      inAxes,
+      outAxes,
+      numConsts,
+      numInputs: numLeaves * 2, // prefix + block leaves
+      gridShape: [M - 1],
+      inputShapes,
+      outputShapes: resolvedElemShapes,
+      constSlots,
+      inputSlots: [
+        ...finalScannedSummarySlots, // prefix (point-mode)
+        ...localScanSlots, // block (mapped with gridOffset)
+      ],
+      outputSlots,
+      constInfos: plan.localScan.constInfos,
+      pointInputs,
+      gridOffset: 1,
+    };
+
+    const phase4Result = executeBlockMap(phase4Params);
+    if (phase4Result.pending.length > 0) {
+      flushPending(phase4Result.pending);
+    }
+  } else if (M > 1) {
+    // axis > 0: fall back to per-block mapOverBlocks (non-contiguous data)
+    const summaryShapes = resolvedElemShapes.map((s) => {
+      const shape = [...s];
+      shape[axis] = M;
+      return shape;
+    });
+
+    mapOverBlocks(
+      backend,
+      applyVmapProgram,
+      constSlots,
+      [
+        {
+          slots: finalScannedSummarySlots,
+          shapes: summaryShapes,
+          dtypes,
+          mode: "point",
+          indexOffset: -1,
+        },
+        {
+          slots: localScanSlots,
+          shapes: resolvedElemShapes,
+          dtypes,
+          mode: "block",
+        },
+      ],
+      outputSlots,
+      resolvedElemShapes,
+      dtypes,
+      axis,
+      B,
+      N,
+      1,
+      M,
+      numConsts,
+      dimBindings,
+    );
+  }
 
   // Cleanup
   for (const s of localScanSlots) backend.decRef(s);

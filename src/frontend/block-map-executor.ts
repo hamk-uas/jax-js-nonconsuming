@@ -44,6 +44,10 @@ export interface ExecuteBlockMapParams {
   hasBlockIndex?: boolean;
   /** Per-constant info for uniform buffer migration (one entry per numConsts input). */
   constInfos?: { elemCount: number; dtype: DType; bytes: number }[];
+  /** Point-mode inputs: one element per grid point (see BlockMapShaderParams). */
+  pointInputs?: boolean[];
+  /** Grid offset for mapped input/output base offsets (see BlockMapShaderParams). */
+  gridOffset?: number;
 }
 
 export interface ExecuteBlockMapResult {
@@ -125,6 +129,8 @@ function blockMapSpecKey(params: ExecuteBlockMapParams): string {
     params.outputShapes.map((s) => s.join(",")).join(";"),
     params.threadTile?.join(",") ?? "-",
     params.hasBlockIndex ? "bi" : "-",
+    params.pointInputs?.map((p) => (p ? "P" : "-")).join("") ?? "-",
+    params.gridOffset ?? 0,
   ];
   return parts.join("|");
 }
@@ -160,6 +166,8 @@ function tryExecuteBlockMapFused(
         threadTile: params.threadTile,
         hasBlockIndex: params.hasBlockIndex,
         constInfos: params.constInfos,
+        pointInputs: params.pointInputs,
+        gridOffset: params.gridOffset,
       }) ?? null;
     inner.set(specKey, exe);
   }
