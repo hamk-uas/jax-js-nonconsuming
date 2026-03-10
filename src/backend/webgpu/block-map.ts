@@ -279,6 +279,17 @@ export function blockMapFusedShaderSource(
             console.info("block_map fused: multi-output reduction, fallback");
           return null;
         }
+        // Kernel size must be 1 (workgroup reduction) or a multiple of blockSize
+        {
+          const ks = kernel.size as number;
+          if (ks !== 1 && ks % blockSize !== 0) {
+            if (DEBUG >= 1)
+              console.info(
+                `block_map fused: kernel.size ${ks} not multiple of blockSize ${blockSize}, fallback`,
+              );
+            return null;
+          }
+        }
         const re = kernel.outputs[0]?.reduction ?? null;
         codegenEntries.push({ type: "kernel", kernelIdx: kernelSteps.length });
         kernelSteps.push({ step, kernel });
@@ -776,8 +787,9 @@ export function blockMapFusedShaderSource(
   }
 
   // --- Account for reduction workspace shmem ---
-  // Each reduction step needs a workspace array of blockSize elements for
-  // the tree reduction. This is separate from the malloc-based shmem.
+  // Tree reductions (kernel.size == 1) need a workspace array of blockSize
+  // elements. Per-element reductions (kernel.size > 1) use local accumulators
+  // and don't need workspace shmem.
   const reduceWorkspaces: {
     stepIdx: number;
     dtype: DType;
@@ -785,7 +797,7 @@ export function blockMapFusedShaderSource(
   }[] = [];
   for (let si = 0; si < kernelSteps.length; si++) {
     const re = stepReductions[si];
-    if (re) {
+    if (re && (kernelSteps[si].kernel.size as number) === 1) {
       const wsBytes = blockSize * byteWidth(re.dtype);
       reduceWorkspaces.push({
         stepIdx: si,
@@ -795,6 +807,11 @@ export function blockMapFusedShaderSource(
       totalShmemBytes += wsBytes;
     }
   }
+
+  // Track whether any kernel needs a multi-element gidx loop per thread
+  const hasMultiElemKernels = kernelSteps.some(
+    ({ kernel }) => (kernel.size as number) > blockSize,
+  );
 
   // --- Guard: shared memory budget ---
   const maxShmem = device.limits.maxComputeWorkgroupStorageSize;
@@ -1555,9 +1572,11 @@ export function blockMapFusedShaderSource(
   // Each thread processes one element: gidx = tidx.
   // O4: When register tiling is active, gidx is mutable (reassigned per-element
   // in thread-tile loops and cooperative stride loops).
+  // Multi-element kernels: gidx is mutable (reassigned per element in gidx loop).
   const hasRegisterTiling = foriLoops.some((fl) => fl.privateShmemIds.size > 0);
+  const needsMutableGidx = hasRegisterTiling || hasMultiElemKernels;
   emit(
-    hasRegisterTiling
+    needsMutableGidx
       ? "var gidx: i32 = i32(tidx);"
       : "let gidx: i32 = i32(tidx);",
   );
@@ -1645,7 +1664,11 @@ export function blockMapFusedShaderSource(
         stepInputIsBlockIndex.push(false);
       }
 
-      const gen = createGen(kernel, `s${si}`, (bufIdx, indexExpr, dtype) => {
+      const gen_resolve = (
+        bufIdx: number,
+        indexExpr: string,
+        dtype: DType,
+      ): string => {
         if (stepInputIsBlockIndex[bufIdx]) return `i32(block_idx)`;
         if (stepInputIsGlobal[bufIdx]) {
           const inputIdx = stepInputBodyIdx[bufIdx];
@@ -1662,41 +1685,24 @@ export function blockMapFusedShaderSource(
         } else {
           return `${stepInputNames[bufIdx]}[${indexExpr}]`;
         }
-      });
+      };
+
+      const gen = createGen(kernel, `s${si}`, gen_resolve);
 
       // Generate WGSL for each kernel output
       const re = stepReductions[si];
+      const kernelSize = kernel.size as number;
+      const elemsPerThread =
+        kernelSize >= blockSize ? kernelSize / blockSize : 1;
 
-      if (re) {
-        // --- Reduction kernel: tree reduction in shared memory ---
+      if (re && kernelSize === 1) {
+        // --- Workgroup tree reduction (kernel.size == 1) ---
         // Each thread evaluates the expression at its own index (ridx → gidx,
         // i.e., tidx), then threads cooperatively tree-reduce the results.
-        const reResolve = (
-          bufIdx: number,
-          indexExpr: string,
-          dtype: DType,
-        ): string => {
-          if (stepInputIsBlockIndex[bufIdx]) return `i32(block_idx)`;
-          if (stepInputIsGlobal[bufIdx]) {
-            const inputIdx = stepInputBodyIdx[bufIdx];
-            if (inputIdx >= 0) {
-              const remapped = inRemap(inputIdx, indexExpr);
-              const readExpr = `${stepInputNames[bufIdx]}[i32(in_base_${inputIdx}) + ${remapped}]`;
-              return hasBoundary
-                ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
-                : readExpr;
-            } else {
-              const ci = bodyInputIds.indexOf(step.inputs[bufIdx]);
-              return readConst(ci, indexExpr);
-            }
-          } else {
-            return `${stepInputNames[bufIdx]}[${indexExpr}]`;
-          }
-        };
         const treeGen = createGen(
           kernel,
           `s${si}`,
-          reResolve,
+          gen_resolve,
           undefined,
           undefined,
           // ridxOverride: map ridx → gidx so each thread loads its own element
@@ -1796,7 +1802,7 @@ export function blockMapFusedShaderSource(
           const epilogueGen = createGen(
             kernel,
             `s${si}_ep`,
-            reResolve,
+            gen_resolve,
             new Map([["acc", accVar]]),
           );
           finalValue = strip1(epilogueGen(re.epilogue));
@@ -1816,8 +1822,112 @@ export function blockMapFusedShaderSource(
         }
         emit(popIndent, "}");
         emit("workgroupBarrier();");
+      } else if (re) {
+        // --- Per-element reduction: gidx loop + ridx accumulation ---
+        // Each thread handles elemsPerThread output elements, each with its
+        // own reduction loop. No shared-memory tree reduction needed.
+        const outId = step.outputs[0];
+        const reDtype = re.dtype;
+        const reTy = dtypeToWgsl(reDtype, false);
+        const bodyDtype = kernel.outputs[0].dtype;
+        const reSize = re.size as number;
+        const bodyExp = kernel.outputs[0].exp;
+        const prefix = `s${si}`;
+        const isIdentityEpilogue =
+          re.epilogue.op === AluOp.Variable && re.epilogue.arg === "acc";
+
+        // Open gidx loop
+        emit(
+          `for (var _ept_${si}: i32 = 0; _ept_${si} < ${elemsPerThread}; _ept_${si}++) {`,
+          pushIndent,
+        );
+        emit(`gidx = i32(tidx) * ${elemsPerThread} + _ept_${si};`);
+
+        // Accumulator
+        const accName = `${prefix}_acc`;
+        emit(`var ${accName}: ${reTy} = ${constToWgsl(reDtype, re.identity)};`);
+
+        // Reduction loop — unroll for small sizes
+        const UNROLL_THRESHOLD = 8;
+
+        if (reSize <= UNROLL_THRESHOLD) {
+          for (let ri = 0; ri < reSize; ri++) {
+            const riGen = createGen(
+              kernel,
+              `${prefix}_r${ri}`,
+              gen_resolve,
+              undefined,
+              undefined,
+              AluExp.i32(ri),
+            );
+            const rhs = strip1(riGen(bodyExp));
+            const castRhs = wgslCastReductionRhs(rhs, bodyDtype, reDtype);
+            emit(wgslReductionAccumStmt(re.op, accName, castRhs));
+          }
+        } else {
+          const ridxGen = createGen(kernel, `${prefix}_rl`, gen_resolve);
+          emit(
+            `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
+            pushIndent,
+          );
+          const rhs = strip1(ridxGen(bodyExp));
+          const castRhs = wgslCastReductionRhs(rhs, bodyDtype, reDtype);
+          emit(wgslReductionAccumStmt(re.op, accName, castRhs));
+          emit(popIndent, "}");
+        }
+
+        // Apply epilogue
+        let finalValue: string;
+        if (isIdentityEpilogue) {
+          finalValue = accName;
+        } else {
+          const epGen = createGen(
+            kernel,
+            `${prefix}_ep`,
+            gen_resolve,
+            new Map([["acc", accName]]),
+          );
+          finalValue = strip1(epGen(re.epilogue));
+        }
+
+        // Write result
+        const resultIdx = bodyOutputIds.indexOf(outId);
+        if (resultIdx >= 0 && !passThroughOutputs.has(resultIdx)) {
+          const resultTy = dtypeToWgsl(outputDtypes[resultIdx], true);
+          const castFinal =
+            resultTy !== reTy ? `${resultTy}(${finalValue})` : finalValue;
+          if (hasBoundary) {
+            emit(`if (valid) {`, pushIndent);
+            emit(
+              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx, "u32(gidx)")})] = ${castFinal};`,
+            );
+            emit(popIndent, "}");
+          } else {
+            emit(
+              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx, "u32(gidx)")})] = ${castFinal};`,
+            );
+          }
+        } else if (idIsShmem.has(outId)) {
+          const shmemName = idToReadName.get(outId)!;
+          emit(`${shmemName}[gidx] = ${finalValue};`);
+        }
+
+        // Close gidx loop
+        emit(popIndent, "}");
+        // Barrier so all threads finish before dependent steps read
+        emit("workgroupBarrier();");
       } else {
-        // --- Elementwise kernel: each thread writes its own element ---
+        // --- Elementwise kernel ---
+        // When elemsPerThread > 1, wrap in a gidx loop.
+        const needsGidxLoop = elemsPerThread > 1;
+        if (needsGidxLoop) {
+          emit(
+            `for (var _ept_${si}: i32 = 0; _ept_${si} < ${elemsPerThread}; _ept_${si}++) {`,
+            pushIndent,
+          );
+          emit(`gidx = i32(tidx) * ${elemsPerThread} + _ept_${si};`);
+        }
+
         for (let oi = 0; oi < kernel.numOutputs; oi++) {
           const outId = step.outputs[oi];
           const rhs = strip1(gen(kernel.outputs[oi].exp));
@@ -1829,21 +1939,28 @@ export function blockMapFusedShaderSource(
               resultTy !== dtypeToWgsl(kernel.outputs[oi].exp.dtype)
                 ? `${resultTy}(${rhs})`
                 : rhs;
+            const offsetExpr = needsGidxLoop
+              ? outOffset(resultIdx, "u32(gidx)")
+              : outOffset(resultIdx);
             if (hasBoundary) {
               emit(`if (valid) {`, pushIndent);
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${castRhs};`,
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${offsetExpr})] = ${castRhs};`,
               );
               emit(popIndent, "}");
             } else {
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${castRhs};`,
+                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${offsetExpr})] = ${castRhs};`,
               );
             }
           } else if (idIsShmem.has(outId)) {
             const shmemName = idToReadName.get(outId)!;
-            emit(`${shmemName}[tidx] = ${rhs};`);
+            emit(`${shmemName}[${needsGidxLoop ? "gidx" : "tidx"}] = ${rhs};`);
           }
+        }
+
+        if (needsGidxLoop) {
+          emit(popIndent, "}");
         }
       }
     } else if (entry.type === "fori_loop") {

@@ -6,7 +6,7 @@
  * plan paths (fallback, compiled-loop, preencoded-routine).
  */
 
-import { byteWidth, Kernel } from "../alu";
+import { byteWidth } from "../alu";
 import type { Backend, Slot } from "../backend";
 import type { PendingExecute } from "./array";
 import { Array as JaxArray } from "./array";
@@ -752,18 +752,7 @@ function executeAssocScanBlockMapInner(
     Math.min(B, N),
   );
 
-  // Check if the body has per-element reduction kernels (e.g., matmul).
-  // The block_map fused shader emits workgroup-level reduction trees which
-  // are incorrect for per-element reductions — they produce a single value
-  // instead of one per output element. Use mapOverBlocks for such bodies.
-  const bodyHasReductions = applyVmapProgram.steps.some(
-    (s) =>
-      s.type === "execute" &&
-      s.source instanceof Kernel &&
-      s.source.hasReduction,
-  );
-
-  if (M > 1 && axis === 0 && !bodyHasReductions) {
+  if (M > 1 && axis === 0) {
     // Fused Phase 4: single block_map dispatch over M-1 blocks.
     // Uses pointInputs for per-workgroup prefix access and gridOffset=1
     // to start mapped inputs/outputs from block 1.
@@ -832,9 +821,7 @@ function executeAssocScanBlockMapInner(
       flushPending(phase4Result.pending);
     }
   } else if (M > 1) {
-    // Fall back to per-block mapOverBlocks for:
-    // - axis > 0 (non-contiguous data)
-    // - bodies with reduction kernels (fused shader can't handle per-element reductions)
+    // axis > 0: fall back to per-block mapOverBlocks (non-contiguous data)
     const summaryShapes = resolvedElemShapes.map((s) => {
       const shape = [...s];
       shape[axis] = M;
