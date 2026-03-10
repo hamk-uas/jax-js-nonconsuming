@@ -1,6 +1,8 @@
 # WebGPU Performance Benchmark Findings
 
 **Date:** 2026-03-02 (updated 2026-03-03)  
+**Status:** Historical — tiled matmul numbers superseded by register tiling + bank padding (see
+`.github/copilot-instructions.md` §Block Map for current 12,138 GFLOP/s at 4096×4096).  
 **Hardware:** NVIDIA RTX 4070 Ti SUPER (16 GB) via Razer Core X Chroma eGPU over Thunderbolt 3;
 Intel Arc (integrated)  
 **Driver:** 590.48.01, Vulkan 1.3.275  

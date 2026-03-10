@@ -731,8 +731,8 @@ pnpm build && pnpm vitest bench bench/<file>.bench.ts
 | `bench/sort.bench.ts`             | Sorting performance across backends                                     |
 | `bench/where-branching.bench.ts`  | WASM `AluOp.Where` branching vs branchless select                       |
 
-Results saved to `docs/ULTIMATE-BENCHMARKS.md`. Bench files import from
-`@hamk-uas/jax-js-nonconsuming` (public API via `dist/`), use `DType.Float32` / `DType.Int32` enums.
+Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`), use
+`DType.Float32` / `DType.Int32` enums.
 
 ## Future performance work
 

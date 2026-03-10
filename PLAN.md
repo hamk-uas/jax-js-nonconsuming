@@ -18,13 +18,14 @@ Verified empirically: the full 5-tuple DLM compose with einsum subscripts (`"nij
 `"nji,njk->nik"`, `"nij->nji"`) runs correctly inside `associativeScan` on WASM. The fast path
 covers every pattern used in the compose body.
 
-**Action items:**
+**Action items:** ✅ All complete
 
-- Remove the `_compose5_einsum` "BROKEN" comment in `test/bench-assoc-scale.test.ts`
-- Remove the misleading warning in `lax-associative-scan.ts` that advises against einsum
-- Add an explicit test: `einsum("nij,njk->nik")` inside `associativeScan` produces correct results
-- Add a test for a non-fast-path subscript that genuinely fails, confirming the general einsum path
-  still needs work for exotic patterns
+- ~~Remove the `_compose5_einsum` "BROKEN" comment in `test/bench-assoc-scale.test.ts`~~
+- ~~Remove the misleading warning in `lax-associative-scan.ts` that advises against einsum~~
+- ~~Add an explicit test: `einsum("nij,njk->nik")` inside `associativeScan` produces correct
+  results~~
+- ~~Add a test for a non-fast-path subscript that genuinely fails, confirming the general einsum
+  path still needs work for exotic patterns~~
 
 ---
 

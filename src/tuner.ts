@@ -322,7 +322,9 @@ export function tuneWebgpu(
   const globalViews = exp.collect((exp) => exp.op === AluOp.GlobalView);
   if (globalViews.length === 0) {
     if (DEBUG >= 4) console.info("Tuning: No GlobalView ops found in kernel.");
-    return tuneNullopt(kernel); // TODO: Nullary kernel, write opts for this.
+    // Nullary kernels (0 inputs) come from #realize() on virtual arrays
+    // (full, arange, eye). Post-O2, pushLit uses initialData instead.
+    return tuneNullopt(kernel);
   }
   const shape: number[] = globalViews[0].arg[1].shape;
   const expectedSrc = [
