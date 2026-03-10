@@ -652,6 +652,93 @@ describe("parallel Kalman filter via associativeScan", () => {
     }
   });
 
+  test("3-field DLM compose with m=5, multi-block Phase 4 (regression)", () => {
+    // N=120 with m=5 forces multiple blocks in the WebGPU block-map path,
+    // exercising Phase 4's prefix-apply dispatch with reduction kernels.
+    // Previously, the fused shader generated workgroup-level reduction trees
+    // instead of per-element reductions, corrupting blocks 2+ (4fd9f8d).
+    const N = 120;
+    const m = 5;
+
+    // Deterministic near-identity matrices
+    let seed = 42;
+    const rng = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const A_data = Array.from({ length: N }, () => {
+      const mat: number[][] = [];
+      for (let j = 0; j < m; j++) {
+        const row: number[] = [];
+        for (let k = 0; k < m; k++)
+          row.push(j === k ? 0.8 + 0.1 * rng() : 0.02 * (rng() - 0.5));
+        mat.push(row);
+      }
+      return mat;
+    });
+    const b_data = Array.from({ length: N }, () =>
+      Array.from({ length: m }, () => [rng() * 10]),
+    );
+    const S_data = Array.from({ length: N }, () => {
+      const mat: number[][] = [];
+      for (let j = 0; j < m; j++) {
+        const row: number[] = [];
+        for (let k = 0; k < m; k++)
+          row.push(j === k ? 0.5 + 0.5 * rng() : 0.01 * rng());
+        mat.push(row);
+      }
+      return mat;
+    });
+
+    const composeDlm5 = (
+      p: { A: np.Array; b: np.Array; S: np.Array },
+      q: { A: np.Array; b: np.Array; S: np.Array },
+    ) => {
+      const newA = np.einsum("ij,jk->ik", q.A, p.A) as np.Array;
+      using Ab = np.einsum("ij,jk->ik", q.A, p.b) as np.Array;
+      const newB = Ab.add(q.b) as np.Array;
+      using AS = np.einsum("ij,jk->ik", q.A, p.S) as np.Array;
+      using qAT = np.transpose(q.A, [-2, -1]) as np.Array;
+      using ASAT = np.einsum("ij,jk->ik", AS, qAT) as np.Array;
+      const newS = ASAT.add(q.S) as np.Array;
+      return { A: newA, b: newB, S: newS };
+    };
+
+    using AA = np.array(A_data, { dtype: DType.Float32 });
+    using bb = np.array(b_data, { dtype: DType.Float32 });
+    using SS = np.array(S_data, { dtype: DType.Float32 });
+
+    const eager = lax.associativeScan(composeDlm5, {
+      A: AA,
+      b: bb,
+      S: SS,
+    }) as { A: np.Array; b: np.Array; S: np.Array };
+
+    const assocJit = jit((A: np.Array, b: np.Array, S: np.Array) =>
+      lax.associativeScan(composeDlm5, { A, b, S }),
+    );
+
+    let compiled: { A: np.Array; b: np.Array; S: np.Array } | null = null;
+    try {
+      compiled = assocJit(AA, bb, SS) as {
+        A: np.Array;
+        b: np.Array;
+        S: np.Array;
+      };
+      expect(compiled.A).toBeAllclose(eager.A, { atol: 1e-4, rtol: 1e-4 });
+      expect(compiled.b).toBeAllclose(eager.b, { atol: 1e-4, rtol: 1e-4 });
+      expect(compiled.S).toBeAllclose(eager.S, { atol: 1e-4, rtol: 1e-4 });
+    } finally {
+      eager.A.dispose();
+      eager.b.dispose();
+      eager.S.dispose();
+      compiled?.A.dispose();
+      compiled?.b.dispose();
+      compiled?.S.dispose();
+      assocJit.dispose();
+    }
+  });
+
   test("batch-explicit einsum in compose body works via fast path", () => {
     // einsum("nij,njk->nik") with per-element tracers (shape [2,2]) succeeds
     // because einsumFastPath catches it and lowers to matmul before parsing.
