@@ -1624,6 +1624,117 @@ describe("lax.associativeScan — WebGPU fused shader regression", () => {
     expect(s00[31]).toBeGreaterThan(10);
     expect(s00[32]).toBeGreaterThan(10);
   });
+
+  // ------------------------------------------------------------------
+  // Reverse 3-field compose with m=5 and large N — the exact bug class
+  // from dlm-js backward smoother.  Forward scan passes but REVERSE
+  // scan produces corrupted indices 0..n-2^⌊log₂n⌋-1 when the compose
+  // body has 3 pytree fields with einsum reductions and m ≥ 5.
+  //
+  // Regression history:
+  //   - Introduced by 4fd9f8d (Phase 4 fusion)
+  //   - Fixed by 8501de9 (bodyHasReductions guard → mapOverBlocks)
+  //   - Re-introduced by 66670f4 (per-element reduction codegen
+  //     removed the guard)
+  //
+  // Key parameters that trigger the bug:
+  //   - reverse: true (forward is fine)
+  //   - 3 output fields with reduction ops (2 fields pass)
+  //   - m ≥ 5 (m=2 passes)
+  //   - N > 1 workgroup (N=120 → multi-block dispatch)
+  // ------------------------------------------------------------------
+  it("reverse 3-field DLM compose with m=5 (dlm-js smoother regression)", async ({
+    skip,
+  }) => {
+    if (!available) skip();
+    const N = 120;
+    const m = 5;
+
+    // Deterministic near-identity data (same seed as dlm-js repro)
+    let seed = 42;
+    const rng = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const A_data: number[][][] = [];
+    const b_data: number[][][] = [];
+    const S_data: number[][][] = [];
+    for (let i = 0; i < N; i++) {
+      const aRow: number[][] = [],
+        sRow: number[][] = [];
+      for (let j = 0; j < m; j++) {
+        const ar: number[] = [],
+          sr: number[] = [];
+        for (let k = 0; k < m; k++) {
+          ar.push(j === k ? 0.8 + 0.1 * rng() : 0.02 * (rng() - 0.5));
+          sr.push(j === k ? 0.5 + 0.5 * rng() : 0.01 * rng());
+        }
+        aRow.push(ar);
+        sRow.push(sr);
+      }
+      A_data.push(aRow);
+      b_data.push(Array.from({ length: m }, () => [rng() * 10]));
+      S_data.push(sRow);
+    }
+
+    const composeBackward = (
+      p: { A: np.Array; b: np.Array; S: np.Array },
+      q: { A: np.Array; b: np.Array; S: np.Array },
+    ) => {
+      const newA = np.einsum("ij,jk->ik", q.A, p.A) as np.Array;
+      using Ab = np.einsum("ij,jk->ik", q.A, p.b) as np.Array;
+      const newB = Ab.add(q.b) as np.Array;
+      using AS = np.einsum("ij,jk->ik", q.A, p.S) as np.Array;
+      using qAT = np.transpose(q.A, [-2, -1]) as np.Array;
+      using ASAT = np.einsum("ij,jk->ik", AS, qAT) as np.Array;
+      const newS = ASAT.add(q.S) as np.Array;
+      return { A: newA, b: newB, S: newS };
+    };
+
+    // WASM reference (correct)
+    const prevDev = defaultDevice("wasm");
+    using aWasm = np.array(A_data, { dtype: DType.Float32 });
+    using bWasm = np.array(b_data, { dtype: DType.Float32 });
+    using sWasm = np.array(S_data, { dtype: DType.Float32 });
+    using wasmFn = jit((A: np.Array, b: np.Array, S: np.Array) =>
+      lax.associativeScan(composeBackward, { A, b, S }, { reverse: true }),
+    );
+    const wasmResult = wasmFn(aWasm, bWasm, sWasm) as {
+      A: np.Array;
+      b: np.Array;
+      S: np.Array;
+    };
+    const wasmB = await wasmResult.b.data();
+    tree.dispose(wasmResult);
+
+    // WebGPU under test
+    defaultDevice("webgpu");
+    using aGpu = np.array(A_data, { dtype: DType.Float32 });
+    using bGpu = np.array(b_data, { dtype: DType.Float32 });
+    using sGpu = np.array(S_data, { dtype: DType.Float32 });
+    using gpuFn = jit((A: np.Array, b: np.Array, S: np.Array) =>
+      lax.associativeScan(composeBackward, { A, b, S }, { reverse: true }),
+    );
+    const gpuResult = gpuFn(aGpu, bGpu, sGpu) as {
+      A: np.Array;
+      b: np.Array;
+      S: np.Array;
+    };
+    const gpuB = await gpuResult.b.data();
+    tree.dispose(gpuResult);
+
+    defaultDevice(prevDev);
+
+    // Compare — the bug corrupts indices 0..55 (= N - 2^⌊log₂N⌋ - 1)
+    // with errors of 26–53 absolute. Tolerance is generous (1.0) to avoid
+    // float32 noise but still catch the 26+ magnitude corruption.
+    let maxDiff = 0;
+    for (let i = 0; i < N * m; i++) {
+      const diff = Math.abs(wasmB[i] - gpuB[i]);
+      if (diff > maxDiff) maxDiff = diff;
+    }
+    expect(maxDiff).toBeLessThan(1.0);
+  });
 });
 
 // ============================================================================

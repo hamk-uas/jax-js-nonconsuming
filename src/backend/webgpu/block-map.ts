@@ -1492,6 +1492,7 @@ export function blockMapFusedShaderSource(
   // (e.g. a 16×16 tile in a 32×32 output), flat tidx ≠ strided output offset.
   const outBufStrides: number[][] = [];
   const outNeedsStrided: boolean[] = [];
+  const outBodyMatchesPhysical: boolean[] = [];
   for (let o = 0; o < numOutputs; o++) {
     const axes = params.outAxes[o];
     const outShape = params.outputShapes[o];
@@ -1528,7 +1529,32 @@ export function blockMapFusedShaderSource(
       }
       innerProd *= blockShape[g];
     }
+
+    // For multi-element kernels (elemsPerThread > 1), gidx encodes ALL
+    // output dimensions (mapped + non-mapped), not just the mapped grid
+    // coordinates. Check if the body output strides match the physical
+    // buffer strides — if so, flat gidx IS the correct physical offset
+    // and we can skip the strided decomposition for multi-element writes.
+    // Body shape = outputShape with mapped axes replaced by blockShape.
+    const bodyShape = [...outShape];
+    for (let g = 0; g < gridRank; g++) {
+      if (axes[g] !== null) bodyShape[axes[g]!] = blockShape[g];
+    }
+    const bodyStrides: number[] = new Array(nd);
+    bodyStrides[nd - 1] = 1;
+    for (let d = nd - 2; d >= 0; d--) {
+      bodyStrides[d] = bodyStrides[d + 1] * bodyShape[d + 1];
+    }
+    let bodyMatchesPhysical = true;
+    for (let d = 0; d < nd; d++) {
+      if (bodyStrides[d] !== strides[d]) {
+        bodyMatchesPhysical = false;
+        break;
+      }
+    }
+
     outNeedsStrided.push(needsStrided);
+    outBodyMatchesPhysical.push(bodyMatchesPhysical);
     if (needsStrided) {
       const sTerms: string[] = [];
       for (let g = 0; g < gridRank; g++) {
@@ -1566,6 +1592,17 @@ export function blockMapFusedShaderSource(
       innerProd *= blockShape[g];
     }
     return oTerms.reverse().join(" + ");
+  }
+
+  /**
+   * Output offset for multi-element kernels (elemsPerThread > 1).
+   * When body output strides match physical buffer strides, the flat gidx
+   * IS the correct physical offset — no decomposition needed.
+   * Otherwise, falls back to the standard `outOffset` decomposition.
+   */
+  function outOffsetMultiElem(o: number, flatExpr: string): string {
+    if (outBodyMatchesPhysical[o]) return flatExpr;
+    return outOffset(o, flatExpr);
   }
 
   // Declare gidx — the body kernel expressions reference this variable.
@@ -1896,15 +1933,16 @@ export function blockMapFusedShaderSource(
           const resultTy = dtypeToWgsl(outputDtypes[resultIdx], true);
           const castFinal =
             resultTy !== reTy ? `${resultTy}(${finalValue})` : finalValue;
+          const reOutOff = outOffsetMultiElem(resultIdx, "u32(gidx)");
           if (hasBoundary) {
             emit(`if (valid) {`, pushIndent);
             emit(
-              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx, "u32(gidx)")})] = ${castFinal};`,
+              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${reOutOff})] = ${castFinal};`,
             );
             emit(popIndent, "}");
           } else {
             emit(
-              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx, "u32(gidx)")})] = ${castFinal};`,
+              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${reOutOff})] = ${castFinal};`,
             );
           }
         } else if (idIsShmem.has(outId)) {
@@ -1940,7 +1978,7 @@ export function blockMapFusedShaderSource(
                 ? `${resultTy}(${rhs})`
                 : rhs;
             const offsetExpr = needsGidxLoop
-              ? outOffset(resultIdx, "u32(gidx)")
+              ? outOffsetMultiElem(resultIdx, "u32(gidx)")
               : outOffset(resultIdx);
             if (hasBoundary) {
               emit(`if (valid) {`, pushIndent);
