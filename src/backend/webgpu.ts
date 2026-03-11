@@ -43,11 +43,7 @@ import {
   headerWgsl,
   ShaderInfo,
 } from "./webgpu/codegen";
-import {
-  computeArenaLayout,
-  type TapeOp,
-  type WebGPUCommandTape,
-} from "./webgpu/command-tape";
+import { type TapeOp, type WebGPUCommandTape } from "./webgpu/command-tape";
 import { SyncReader } from "./webgpu/reader";
 import { createRoutineShader } from "./webgpu/routines";
 import {
@@ -570,26 +566,14 @@ export class WebGPUBackend implements Backend {
     buffer: GPUBuffer,
     data: Uint8Array<ArrayBuffer>,
   ): void {
-    this.#writeBufferAtOffset(buffer, 0, data);
-  }
-
-  /**
-   * Write data to a GPU buffer at the given byte offset, handling
-   * non-4-byte-aligned sizes.  The offset must be a multiple of 4.
-   */
-  #writeBufferAtOffset(
-    buffer: GPUBuffer,
-    bufferOffset: number,
-    data: Uint8Array<ArrayBuffer>,
-  ): void {
     if (data.byteLength % 4 === 0) {
-      this.device.queue.writeBuffer(buffer, bufferOffset, data);
+      this.device.queue.writeBuffer(buffer, 0, data);
     } else {
       const aligned = data.byteLength - (data.byteLength % 4);
-      this.device.queue.writeBuffer(buffer, bufferOffset, data, 0, aligned);
+      this.device.queue.writeBuffer(buffer, 0, data, 0, aligned);
       const remainder = new Uint8Array(4);
       remainder.set(data.subarray(aligned));
-      this.device.queue.writeBuffer(buffer, bufferOffset + aligned, remainder);
+      this.device.queue.writeBuffer(buffer, aligned, remainder);
     }
   }
 
@@ -2051,35 +2035,24 @@ export class WebGPUBackend implements Backend {
       outputTableIdxs,
       allocatedIdxs,
       uniformBuffers,
-      arena: computeArenaLayout(safeOps),
     };
   }
 
   /**
    * Execute a pre-compiled command tape with the given input slots.
    *
-   * When an arena layout is available (O9a), all intermediates are sub-allocated
-   * from a single slab buffer.  Dispatches use `{ buffer, offset, size }` bind
-   * group entries, eliminating per-intermediate GPUBuffer creation.  Outputs are
-   * copied from the slab to discrete buffers (encoded in the same command buffer)
-   * so they can be independently managed after execution.
+   * Each intermediate gets its own pooled GPUBuffer. Dispatches use bind group
+   * caching (O9b) — when the pool returns the same GPUBuffer objects as the
+   * previous invocation (common with LIFO pool ordering), the cached bind
+   * group is reused, skipping `device.createBindGroup()`.
    *
-   * Without arena, falls back to per-intermediate pool allocation (O8a path).
-   *
-   * Error-safe: if any step throws, all allocated GPU buffers (slab + discrete)
-   * are cleaned up via try/finally.
+   * Error-safe: if any step throws, all allocated GPU buffers are cleaned up.
    */
   executeCommandTape(tape: WebGPUCommandTape, inputSlots: Slot[]): Slot[] {
-    const arena = tape.arena;
-
     // Parallel arrays indexed by table position:
-    //   buffers[i]   — GPUBuffer (slab for arena entries, discrete otherwise)
-    //   offsets[i]   — byte offset within buffer (0 for discrete)
-    //   bindSizes[i] — byte size for bind group entries
-    //   sizes[i]     — original (unpadded) byte size for output slot creation
+    //   buffers[i] — GPUBuffer for this table entry
+    //   sizes[i]   — original (unpadded) byte size for output slot creation
     const buffers: GPUBuffer[] = new globalThis.Array(tape.tableSize);
-    const offsets: number[] = new globalThis.Array(tape.tableSize).fill(0);
-    const bindSizes: number[] = new globalThis.Array(tape.tableSize);
     const sizes: number[] = new globalThis.Array(tape.tableSize);
 
     // Map external inputs
@@ -2087,23 +2060,11 @@ export class WebGPUBackend implements Backend {
       const { buffer, size } = this.#getBuffer(inputSlots[i]);
       const idx = tape.inputTableIdxs[i];
       buffers[idx] = buffer;
-      bindSizes[idx] = buffer.size;
       sizes[idx] = size;
     }
 
-    // Allocate slab for arena intermediates
-    let slab: GPUBuffer | null = null;
-    if (arena && arena.slabSize > 0) {
-      slab =
-        this.#poolPop(arena.slabSize) ?? this.#createBuffer(arena.slabSize);
-      // Write pre-filled constants (O2 scalar promotion) into slab
-      for (const w of arena.initialDataWrites) {
-        this.#writeBufferAtOffset(slab, w.offset, w.data);
-      }
-    }
-
-    // Track discrete buffers allocated during execution for error cleanup.
-    const discreteAllocs: GPUBuffer[] = [];
+    // Track allocated buffers for error cleanup.
+    const allocs: GPUBuffer[] = [];
     let submitted = false;
 
     try {
@@ -2115,15 +2076,7 @@ export class WebGPUBackend implements Backend {
             const m = op.malloc;
             if (m.paddedSize === 0) {
               buffers[m.tableIdx] = this.#reusableZsb;
-              bindSizes[m.tableIdx] = 4;
-            } else if (slab && arena!.entries.has(m.tableIdx)) {
-              // Arena path: point into the slab
-              const entry = arena!.entries.get(m.tableIdx)!;
-              buffers[m.tableIdx] = slab;
-              offsets[m.tableIdx] = entry.offset;
-              bindSizes[m.tableIdx] = entry.paddedSize;
             } else {
-              // Discrete path (fallback when no arena)
               let buf: GPUBuffer;
               if (m.initialData) {
                 const pooled = this.#poolPop(m.paddedSize);
@@ -2145,30 +2098,23 @@ export class WebGPUBackend implements Backend {
                   this.#createBuffer(m.paddedSize);
               }
               buffers[m.tableIdx] = buf;
-              bindSizes[m.tableIdx] = m.paddedSize;
-              discreteAllocs.push(buf);
+              allocs.push(buf);
             }
             sizes[m.tableIdx] = m.originalSize;
             break;
           }
           case "free": {
-            // Arena entries: no-op (slab is freed as a unit after execution).
-            // Discrete entries: return to pool or destroy.
-            if (!slab || buffers[op.tableIdx] !== slab) {
-              const buf = buffers[op.tableIdx];
-              if (buf && buf !== this.#reusableZsb) {
-                if (!this.#poolPush(buf)) {
-                  this.#gpuAllocatedBytes -= buf.size;
-                  buf.destroy();
-                }
+            const buf = buffers[op.tableIdx];
+            if (buf && buf !== this.#reusableZsb) {
+              if (!this.#poolPush(buf)) {
+                this.#gpuAllocatedBytes -= buf.size;
+                buf.destroy();
               }
             }
             break;
           }
           case "recycle":
             buffers[op.toIdx] = buffers[op.fromIdx];
-            offsets[op.toIdx] = offsets[op.fromIdx];
-            bindSizes[op.toIdx] = bindSizes[op.fromIdx];
             sizes[op.toIdx] = sizes[op.fromIdx];
             break;
           case "dispatch": {
@@ -2179,7 +2125,7 @@ export class WebGPUBackend implements Backend {
 
             // O9b: bind group cache — reuse when all referenced GPUBuffers
             // are the same objects as the previous invocation (common with
-            // arena slab pooling where the pool returns the same slab).
+            // pool LIFO ordering returning the same buffers).
             let bindGroup: GPUBindGroup;
             let cacheHit = false;
             const cached = d._bgCache;
@@ -2211,22 +2157,14 @@ export class WebGPUBackend implements Backend {
                 const idx = d.inputIdxs[i];
                 entries[i] = {
                   binding: i,
-                  resource: {
-                    buffer: buffers[idx],
-                    offset: offsets[idx],
-                    size: bindSizes[idx],
-                  },
+                  resource: { buffer: buffers[idx] },
                 };
               }
               for (let i = 0; i < numOut; i++) {
                 const idx = d.outputIdxs[i];
                 entries[numIn + i] = {
                   binding: numIn + i,
-                  resource: {
-                    buffer: buffers[idx],
-                    offset: offsets[idx],
-                    size: bindSizes[idx],
-                  },
+                  resource: { buffer: buffers[idx] },
                 };
               }
               bindGroup = this.device.createBindGroup({
@@ -2260,33 +2198,11 @@ export class WebGPUBackend implements Backend {
         }
       }
 
-      // Copy arena outputs to discrete buffers (same command buffer).
-      // Outputs must be independent GPUBuffers since they outlive the slab.
-      for (let i = 0; i < tape.outputTableIdxs.length; i++) {
-        const idx = tape.outputTableIdxs[i];
-        if (slab && buffers[idx] === slab) {
-          const paddedSize = Math.ceil(sizes[idx] / 4) * 4;
-          const buf =
-            this.#poolPop(paddedSize) ?? this.#createBuffer(paddedSize);
-          encoder.copyBufferToBuffer(slab, offsets[idx], buf, 0, paddedSize);
-          buffers[idx] = buf;
-          offsets[idx] = 0;
-          bindSizes[idx] = paddedSize;
-          discreteAllocs.push(buf);
-        }
-      }
-
       this.device.queue.submit([encoder.finish()]);
       submitted = true;
     } finally {
       if (!submitted) {
-        // Error path: destroy slab and all discrete buffers.
-        if (slab) {
-          this.#gpuAllocatedBytes -= slab.size;
-          slab.destroy();
-          slab = null;
-        }
-        for (const buf of discreteAllocs) {
+        for (const buf of allocs) {
           if (buf !== this.#reusableZsb) {
             this.#gpuAllocatedBytes -= buf.size;
             buf.destroy();
@@ -2295,15 +2211,7 @@ export class WebGPUBackend implements Backend {
       }
     }
 
-    // Return slab to pool (all arena data has been copied out for outputs)
-    if (slab) {
-      if (!this.#poolPush(slab)) {
-        this.#gpuAllocatedBytes -= slab.size;
-        slab.destroy();
-      }
-    }
-
-    // Create output slots (all outputs are now discrete buffers)
+    // Create output slots
     const outputs: Slot[] = new globalThis.Array(tape.outputTableIdxs.length);
     for (let i = 0; i < tape.outputTableIdxs.length; i++) {
       const idx = tape.outputTableIdxs[i];

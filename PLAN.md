@@ -1140,7 +1140,9 @@ Fallback for scalar ops). Reference: `GPUPrefixSums` by Thomas Smith.
 
 ---
 
-## O8: WebGPU Command Tape (Mega-Module Equivalent)
+## O8: WebGPU Command Tape (Mega-Module Equivalent) ✅
+
+**Status:** Implemented in commits `3ce29ae` (O8a core) and `caa3974` (tech debt fixes).
 
 ### Problem statement
 
@@ -1520,7 +1522,10 @@ statically known.
 
 ---
 
-## O9: WebGPU Arena Allocator
+## O9: WebGPU Arena Allocator ✅
+
+**Status:** O9a (arena slab) in commit `bbf08c8`, O9b (bind group caching) in commit `fc3ebfc`. O9c
+(constants slab) remains planned.
 
 ### Problem statement
 
@@ -1625,11 +1630,11 @@ Only JitProgram-internal intermediates (malloc→use→free within one execution
 
 ### Implementation phases
 
-| Phase | Scope                                          | Effort | Depends on |
-| ----- | ---------------------------------------------- | ------ | ---------- |
-| O9a   | Slab allocator for JitProgram locals           | Medium | O8a        |
-| O9b   | Pre-built bind groups for arena slots          | Small  | O9a        |
-| O9c   | Constants slab (persistent across invocations) | Small  | O9a        |
+| Phase | Scope                                          | Effort | Depends on | Status      |
+| ----- | ---------------------------------------------- | ------ | ---------- | ----------- |
+| O9a   | Slab allocator for JitProgram locals           | Medium | O8a        | **Done** ✅ |
+| O9b   | Bind group caching (GPUBuffer identity key)    | Small  | O9a        | **Done** ✅ |
+| O9c   | Constants slab (persistent across invocations) | Small  | O9a        | Planned     |
 
 ### Risks
 
@@ -1662,9 +1667,9 @@ high per-dispatch JS overhead**. The following optimizations form a coherent acc
 
 | ID       | Optimization            | Target                            | Impact estimate         | Status          |
 | -------- | ----------------------- | --------------------------------- | ----------------------- | --------------- |
-| **O8a**  | Command tape            | JS loop overhead (95ms)           | 95ms → ~2ms (**47×**)   | Planned         |
-| **O8b**  | Bind group caching      | createBindGroup (6ms)             | 6ms → ~3ms (fragile)    | Planned         |
-| **O9**   | Arena allocator         | createBindGroup + cache stability | 6ms → ~1ms (reliable)   | Planned         |
+| **O8a**  | Command tape            | JS loop overhead (95ms)           | 95ms → ~2ms (**47×**)   | **Done** ✅     |
+| **O9a**  | Arena allocator         | createBindGroup + cache stability | 6ms → ~1ms (reliable)   | **Done** ✅     |
+| **O9b**  | Bind group caching      | createBindGroup (6ms)             | 6ms → ~0ms (arena hit)  | **Done** ✅     |
 | **O6**   | Multi-reduction kernels | Dispatch count (~764)             | ~5-15% fewer dispatches | Deprioritized   |
 | **A-L**  | Analytical linalg (n≤4) | Routine fusion barriers           | Enables sqrt DLM fusion | Medium priority |
 | **T0**   | Decoupled Fallback scan | Scan dispatch count (log N → 1)   | ~0.05ms (3→1 dispatch)  | High priority   |

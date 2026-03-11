@@ -771,8 +771,8 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 | P9  | Timestamp query profiling | Medium       | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)            |
 | P10 | Decoupled Fallback scan   | **High**     | Single-dispatch O(N) prefix scan. Replaces Kogge-Stone for scalar ops. See PLAN.md P7 T0 |
 | P11 | Analytical small linalg   | **Med-High** | Cholesky/TriSolve/QR for n ≤ 4 as traced ops (not Routines). Enables sqrt DLM fusion     |
-| P12 | WebGPU command tape       | **High**     | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs       |
-| P13 | WebGPU arena allocator    | **High**     | Slab sub-allocation with 256-byte alignment. Stable bind groups for O8b. See PLAN.md O9  |
+| P12 | WebGPU command tape       | **Done** ✅  | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs       |
+| P13 | WebGPU arena allocator    | **Done** ✅  | Slab sub-allocation with 256-byte alignment. Bind group caching via GPUBuffer identity   |
 
 ---
 
