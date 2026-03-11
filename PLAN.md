@@ -1522,10 +1522,12 @@ statically known.
 
 ---
 
-## O9: WebGPU Arena Allocator ✅
+## O9: WebGPU Bind Group Caching
 
-**Status:** O9a (arena slab) in commit `bbf08c8`, O9b (bind group caching) in commit `fc3ebfc`. O9c
-(constants slab) remains planned.
+**Status:** O9a (arena slab) reverted — WebGPU spec prohibits a GPUBuffer from appearing in both
+read-only-storage and storage bindings within a single compute pass (buffer-identity-level
+validation). O9b (bind group caching via pool LIFO identity) in commit `fc3ebfc`. O9c shelved
+(depends on O9a).
 
 ### Problem statement
 
@@ -1630,11 +1632,11 @@ Only JitProgram-internal intermediates (malloc→use→free within one execution
 
 ### Implementation phases
 
-| Phase | Scope                                          | Effort | Depends on | Status      |
-| ----- | ---------------------------------------------- | ------ | ---------- | ----------- |
-| O9a   | Slab allocator for JitProgram locals           | Medium | O8a        | **Done** ✅ |
-| O9b   | Bind group caching (GPUBuffer identity key)    | Small  | O9a        | **Done** ✅ |
-| O9c   | Constants slab (persistent across invocations) | Small  | O9a        | Planned     |
+| Phase | Scope                                          | Effort | Depends on | Status                                  |
+| ----- | ---------------------------------------------- | ------ | ---------- | --------------------------------------- |
+| O9a   | Slab allocator for JitProgram locals           | Medium | O8a        | **Reverted** (WebGPU spec violation)    |
+| O9b   | Bind group caching (GPUBuffer identity key)    | Small  | Pool LIFO  | **Done** ✅                             |
+| O9c   | Constants slab (persistent across invocations) | Small  | O9a        | Shelved (blocked on O9a or double-slab) |
 
 ### Risks
 
@@ -1668,8 +1670,8 @@ high per-dispatch JS overhead**. The following optimizations form a coherent acc
 | ID       | Optimization            | Target                            | Impact estimate         | Status          |
 | -------- | ----------------------- | --------------------------------- | ----------------------- | --------------- |
 | **O8a**  | Command tape            | JS loop overhead (95ms)           | 95ms → ~2ms (**47×**)   | **Done** ✅     |
-| **O9a**  | Arena allocator         | createBindGroup + cache stability | 6ms → ~1ms (reliable)   | **Done** ✅     |
-| **O9b**  | Bind group caching      | createBindGroup (6ms)             | 6ms → ~0ms (arena hit)  | **Done** ✅     |
+| **O9a**  | Arena allocator         | createBindGroup + cache stability | 6ms → ~1ms (reliable)   | **Reverted** ⚠️ |
+| **O9b**  | Bind group caching      | createBindGroup (6ms)             | 6ms → ~3ms (pool LIFO)  | **Done** ✅     |
 | **O6**   | Multi-reduction kernels | Dispatch count (~764)             | ~5-15% fewer dispatches | Deprioritized   |
 | **A-L**  | Analytical linalg (n≤4) | Routine fusion barriers           | Enables sqrt DLM fusion | Medium priority |
 | **T0**   | Decoupled Fallback scan | Scan dispatch count (log N → 1)   | ~0.05ms (3→1 dispatch)  | High priority   |
@@ -1681,7 +1683,7 @@ high per-dispatch JS overhead**. The following optimizations form a coherent acc
 | ------------------------ | ------------- | -------------------- | --------------- |
 | Current                  | 124 ms        | ~15 ms               | ~50 ms          |
 | + O8a (command tape)     | ~30 ms        | ~5 ms                | ~15 ms          |
-| + O9 (arena)             | ~25 ms        | ~4 ms                | ~12 ms          |
+| + O9b (BG cache)         | ~27 ms        | ~4.5 ms              | ~13 ms          |
 | + Analytical linalg (≤4) | ~25 ms\*      | ~4 ms                | ~12 ms          |
 | + WMMA (future)          | ~15 ms        | ~2 ms                | ~6 ms           |
 
