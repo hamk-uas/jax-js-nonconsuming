@@ -34,6 +34,12 @@ export interface TapeDispatch {
   uniformBindGroup: GPUBindGroup | null;
   /** Uniform buffer alignment (for dynamic offset calculation). */
   uniformAlignment: number;
+  /**
+   * Mutable bind group cache (O9b).  When the same GPUBuffer objects appear
+   * at the same table indices across invocations (common with arena slab
+   * pooling), the cached bind group is reused — skipping createBindGroup().
+   */
+  _bgCache?: { key: GPUBuffer[]; value: GPUBindGroup };
 }
 
 /** Pre-resolved buffer allocation. */

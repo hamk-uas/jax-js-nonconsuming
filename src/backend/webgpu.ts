@@ -2175,35 +2175,72 @@ export class WebGPUBackend implements Backend {
             const d = op.dispatch;
             const numIn = d.inputIdxs.length;
             const numOut = d.outputIdxs.length;
-            const entries: GPUBindGroupEntry[] = new globalThis.Array(
-              numIn + numOut,
-            );
-            for (let i = 0; i < numIn; i++) {
-              const idx = d.inputIdxs[i];
-              entries[i] = {
-                binding: i,
-                resource: {
-                  buffer: buffers[idx],
-                  offset: offsets[idx],
-                  size: bindSizes[idx],
-                },
-              };
+            const totalBindings = numIn + numOut;
+
+            // O9b: bind group cache — reuse when all referenced GPUBuffers
+            // are the same objects as the previous invocation (common with
+            // arena slab pooling where the pool returns the same slab).
+            let bindGroup: GPUBindGroup;
+            let cacheHit = false;
+            const cached = d._bgCache;
+            if (cached && cached.key.length === totalBindings) {
+              cacheHit = true;
+              for (let j = 0; j < numIn; j++) {
+                if (cached.key[j] !== buffers[d.inputIdxs[j]]) {
+                  cacheHit = false;
+                  break;
+                }
+              }
+              if (cacheHit) {
+                for (let j = 0; j < numOut; j++) {
+                  if (cached.key[numIn + j] !== buffers[d.outputIdxs[j]]) {
+                    cacheHit = false;
+                    break;
+                  }
+                }
+              }
             }
-            for (let i = 0; i < numOut; i++) {
-              const idx = d.outputIdxs[i];
-              entries[numIn + i] = {
-                binding: numIn + i,
-                resource: {
-                  buffer: buffers[idx],
-                  offset: offsets[idx],
-                  size: bindSizes[idx],
-                },
-              };
+
+            if (cacheHit) {
+              bindGroup = cached!.value;
+            } else {
+              const entries: GPUBindGroupEntry[] = new globalThis.Array(
+                totalBindings,
+              );
+              for (let i = 0; i < numIn; i++) {
+                const idx = d.inputIdxs[i];
+                entries[i] = {
+                  binding: i,
+                  resource: {
+                    buffer: buffers[idx],
+                    offset: offsets[idx],
+                    size: bindSizes[idx],
+                  },
+                };
+              }
+              for (let i = 0; i < numOut; i++) {
+                const idx = d.outputIdxs[i];
+                entries[numIn + i] = {
+                  binding: numIn + i,
+                  resource: {
+                    buffer: buffers[idx],
+                    offset: offsets[idx],
+                    size: bindSizes[idx],
+                  },
+                };
+              }
+              bindGroup = this.device.createBindGroup({
+                layout: d.bindGroupLayout,
+                entries,
+              });
+
+              // Cache the bind group keyed by GPUBuffer identity
+              const key: GPUBuffer[] = new globalThis.Array(totalBindings);
+              for (let i = 0; i < numIn; i++) key[i] = buffers[d.inputIdxs[i]];
+              for (let i = 0; i < numOut; i++)
+                key[numIn + i] = buffers[d.outputIdxs[i]];
+              d._bgCache = { key, value: bindGroup };
             }
-            const bindGroup = this.device.createBindGroup({
-              layout: d.bindGroupLayout,
-              entries,
-            });
 
             for (let i = 0; i < d.passes.length; i++) {
               const pe = encoder.beginComputePass();
