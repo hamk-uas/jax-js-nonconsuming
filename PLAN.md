@@ -45,7 +45,7 @@ meeting the device limit.
 
 ### Precedent
 
-The scan-wrapper (`src/backend/webgpu/scan-wrapper.ts`) already uses
+The `lax.scan` wrapper (`src/backend/webgpu/scan-wrapper.ts`) already uses
 `@group(1) @binding(0) var<uniform> ScanOffsets` with dynamic offsets. The pattern is proven.
 
 ### Implementation steps
@@ -61,8 +61,8 @@ The scan-wrapper (`src/backend/webgpu/scan-wrapper.ts`) already uses
 2. **Pipeline layout cache key (`src/backend/webgpu.ts`)**
    - Current key: `"${numInputs}:${numOutputs}:${hasUniform ? 1 : 0}"`
    - Change: subtract `numConsts` from `numInputs` in the key since they move to group(1)
-   - The `hasUniform` flag is already true when the scan wrapper sets offsets — ensure the uniform
-     bind group layout accommodates both offset structs and constant structs
+   - The `hasUniform` flag is already true when the `lax.scan` wrapper sets offsets — ensure the
+     uniform bind group layout accommodates both offset structs and constant structs
 
 3. **Bind group creation in the executor (`src/backend/webgpu.ts`)**
    - Currently creates a single bind group with all buffers sequential
@@ -179,7 +179,7 @@ output → 2 storage bindings + 1 uniform = 3 total.
 - Integration test: 6-tuple or larger `associativeScan` on WebGPU succeeds
 - Correctness test: Packed results match unpacked results (compare against WASM baseline)
 - Alignment test: Verify 256-byte padding doesn't corrupt adjacent leaf data
-- Mixed-dtype test: f32 + i32 leaves in a single scan (separate packing per dtype)
+- Mixed-dtype test: f32 + i32 leaves in a single `associativeScan` (separate packing per dtype)
 - Gradient test: `grad(associativeScan(packed_compose))` produces correct gradients
 
 ---
@@ -215,7 +215,7 @@ construction + diagnostics), not from the scans themselves.
 
 ### What Phase 1 unblocks for dlm-js
 
-#### Forward scan (5-tuple)
+#### Forward `associativeScan` (5-tuple)
 
 For **m=2** (Nile model), `np.linalg.inv` uses the analytical `inv2x2` Cramer's rule path — all
 elementwise ops, no Routine. The body is fully kernel-fusable. The **only** blocker is the binding
@@ -654,7 +654,7 @@ large-matrix patterns** like `softmax(Q @ K^T) @ V` where the intermediate is la
    shader. The 3 dispatches for N>256 are Phase 1/3/4 of hierarchical decomposition — each runs the
    full body, not individual steps. Body complexity is irrelevant.
 
-**Where Strategy A helps (non-DLM, non-scan):**
+**Where Strategy A helps (standalone JitPrograms, no `lax.scan`/`associativeScan`):**
 
 | Scenario                                    | Current | After A   | Savings    |
 | ------------------------------------------- | ------- | --------- | ---------- |
@@ -725,7 +725,7 @@ shader level rather than the JitProgram step level.
 | DLM scan body (WASM)           | Marginal (~ns/step)       | Marginal (~ns/step)       |
 | Standalone JitProgram (WebGPU) | Helps if same inputArgs   | Helps for chained dots    |
 | Standalone JitProgram (WASM)   | Marginal                  | Marginal                  |
-| Non-scan large-matrix chains   | Moderate                  | Significant               |
+| Non-scan/assocScan chains      | Moderate                  | Significant               |
 
 **Recommendation:** Deprioritize O6. The DLM use case — the primary motivation — is already served
 by the block-map fused shader. Effort is better spent on:
@@ -1000,7 +1000,7 @@ free, leaving only 3 inter-subgroup rounds. **~40% fewer barrier-separated shade
 
 **Prerequisites:** Body function must be a simple associative op (`add` or `mul`) that maps directly
 to the hardware builtin. For pytree bodies (DLM compose), the body is a general function — the
-inclusive scan builtin doesn't help unless we can decompose it.
+inclusive scan builtin doesn't help unless we can decompose the body into scalar associative ops.
 
 **Implementation sketch:**
 
@@ -1404,8 +1404,8 @@ for (const d of tape.dispatches) {
 - If some mallocs create fresh buffers → proportionally lower hit rate
 - External inputs change between invocations → dispatches reading inputs miss
 
-For DLM where the scan runs N iterations with the same intermediate sizes, bind group caching would
-eliminate the ~6ms `createBindGroup` cost on all iterations after the first.
+For DLM where the `lax.scan` loop runs N iterations with the same intermediate sizes, bind group
+caching would eliminate the ~6ms `createBindGroup` cost on all iterations after the first.
 
 **Risk:** The `GPUBuffer` identity check is not guaranteed to be stable. Pool eviction,
 `configurePool`, or GC of pooled buffers would invalidate cached bind groups. The cache must be
@@ -1437,17 +1437,17 @@ strategy as the WASM mega-module.
 
 ### When the command tape helps
 
-| Workload                                      | Dispatches | Current (ms) | Tape (ms) | Speedup                  |
-| --------------------------------------------- | ---------- | ------------ | --------- | ------------------------ |
-| DLM `jit(core)` (764 kernel dispatches)       | 764        | ~124         | ~30       | ~4×                      |
-| Standalone `jit(() => chain_of_20_ops)`       | 20         | ~0.2         | ~0.05     | ~4×                      |
-| TTS inference pipeline (100+ ops, no scan)    | ~100       | ~1.5         | ~0.4      | ~3.5×                    |
-| `jit(f)` with scan (scan steps block tape)    | N/A        | N/A          | N/A       | Fallback                 |
-| `associativeScan` (fused into 1–3 dispatches) | 1–3        | ~3           | ~3        | 1× (overhead negligible) |
+| Workload                                         | Dispatches | Current (ms) | Tape (ms) | Speedup                  |
+| ------------------------------------------------ | ---------- | ------------ | --------- | ------------------------ |
+| DLM `jit(core)` (764 kernel dispatches)          | 764        | ~124         | ~30       | ~4×                      |
+| Standalone `jit(() => chain_of_20_ops)`          | 20         | ~0.2         | ~0.05     | ~4×                      |
+| TTS inference pipeline (100+ ops, no `lax.scan`) | ~100       | ~1.5         | ~0.4      | ~3.5×                    |
+| `jit(f)` with `lax.scan` (scan steps block tape) | N/A        | N/A          | N/A       | Fallback                 |
+| `associativeScan` (fused into 1–3 dispatches)    | 1–3        | ~3           | ~3        | 1× (overhead negligible) |
 
 The command tape targets **kernel-only JitPrograms with many steps** — the same class the WASM
-mega-module handles. Programs dominated by scan or block-map dispatches are already optimized by
-their respective fused shaders.
+mega-module handles. Programs dominated by `lax.scan` or `block_map` dispatches are already
+optimized by their respective fused shaders.
 
 ### Integration with JitProgram.execute()
 
@@ -1700,10 +1700,10 @@ Cholesky/QR/TriSolve in scan or block-map bodies.
 | ML Architecture           | Dispatch pattern                              | How this stack helps                              |
 | ------------------------- | --------------------------------------------- | ------------------------------------------------- |
 | **Transformers**          | ~10-15 dispatches/layer × 12+ layers          | O8: 4× overhead reduction on 120-180 dispatches   |
-| **RNNs/LSTMs**            | scan over T with matmul+activation per step   | Already fused via compiled-loop; no change needed |
+| **RNNs/LSTMs**            | `lax.scan` over T with matmul+activation/step | Already fused via compiled-loop; no change needed |
 | **Diffusion (U-Net)**     | 500-1000 conv2d + attention + skip dispatches | O8: 4× overhead; O9: stable bind groups           |
 | **MLP inference**         | matmul + bias + activation chains             | O8: moderate; chains already fuse well            |
-| **Kalman filters (DLM)**  | scan + hundreds of linalg dispatches per step | O8+O9: 5× total; analytical linalg: enables sqrt  |
+| **Kalman filters (DLM)**  | `assocScan` + hundreds of linalg dispatches   | O8+O9: 5× total; analytical linalg: enables sqrt  |
 | **Optimization (L-BFGS)** | Many small linalg ops per iteration           | O8: 4×; analytical linalg: fuses small-n solves   |
 
 ---

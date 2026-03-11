@@ -248,8 +248,8 @@ work around 256-byte alignment.
 | **Command batching**        | Multiple dispatches encoded before single `queue.submit()`                                      |
 | **WGSL copy shader**        | Byte-level buffer copy when alignment fails                                                     |
 | **shader-f32-atomic-add**   | Native f32 `atomicAdd` in scatter-add shader                                                    |
-| **Ping-pong buffers**       | Scan carry alternates between two buffers                                                       |
-| **Uniform buffers**         | Per-iteration offsets for scan                                                                  |
+| **Ping-pong buffers**       | `lax.scan` carry alternates between two buffers                                                 |
+| **Uniform buffers**         | Per-iteration offsets for `lax.scan`                                                            |
 | **Subgroups**               | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in assocScan |
 
 ### Features NOT exploited (opportunities)
@@ -465,7 +465,7 @@ at runtime via `dimBindings`) and compiles to native WASM loops in mega-module.
 
 | Decision                                  | Rationale                                                                     |
 | ----------------------------------------- | ----------------------------------------------------------------------------- |
-| `blockShape: number[]` + `inAxes/outAxes` | Supports 1D (scan, reduction) and 2D (matmul, attention) from day one         |
+| `blockShape: number[]` + `inAxes/outAxes` | Supports 1D (`assocScan`, reduction) and 2D (matmul, attention) from day one  |
 | Optional `gridShape` on `BlockMap`        | Enables gather (M blocks from N elements) where no mapped input determines it |
 | `threadTile` parameter                    | Register tiling: 4×4 to 8×8 outputs/thread in `var<private>`, not shmem       |
 | Phase-based barrier scheduling            | Merges independent shmem writers → 2 barriers/K-tile instead of 4             |
@@ -503,7 +503,7 @@ Tracing → JIT Compile → Block-Map Analysis →
 ### Scan reductions in WebGPU compiled-loop
 
 `nativeScanMultiShaderSource` uses `var<private>` internal arrays (not `var<workgroup>`) for
-reduction intermediates inside scan bodies. Reuses the `createWgslGen` + `ResolveGlobalIndex`
+reduction intermediates inside `lax.scan` bodies. Reuses the `createWgslGen` + `ResolveGlobalIndex`
 infrastructure from associative scan. Enables patterns like matmul-inside-scan-body to compile to a
 single fused GPU dispatch per iteration.
 
@@ -563,13 +563,13 @@ routines). Phase 3 added Cholesky/TriSolve/LU support.
 
 ### Autodiff
 
-- **JVP:** Doubled scan — primals + tangents flow together
+- **JVP:** Doubled `lax.scan` — primals + tangents flow together
 - **VJP/Grad:** JVP-transpose pattern. Forward stores √N checkpoint carries by default. Backward
   iterates reverse, recomputing from checkpoints.
-- **Vmap:** Each batch element runs independent scan
+- **Vmap:** Each batch element runs independent `lax.scan`
 
-**Transform compositions:** `jit(grad(scan))` ✅, `vmap(grad(scan))` ✅, `grad(vmap(scan))` ✅.
-`grad(jit(scan))` ❌ — use `jit(grad(scan))` instead.
+**Transform compositions:** `jit(grad(lax.scan))` ✅, `vmap(grad(lax.scan))` ✅,
+`grad(vmap(lax.scan))` ✅. `grad(jit(lax.scan))` ❌ — use `jit(grad(lax.scan))` instead.
 
 ### Debugging scan paths
 
@@ -671,17 +671,17 @@ Zeroes on free-list reuse. WebGPU pool does NOT zero pooled buffers.
 
 ## Buffer pool + recycling (WebGPU, Intel Core Ultra 5 125H)
 
-| Benchmark                     | Without | With    | Speedup  |
-| ----------------------------- | ------- | ------- | -------- |
-| jit chain x5 fused (4096)     | 10.5 µs | 1.7 µs  | **6.2×** |
-| jit 2-output same-size (4096) | 17.0 µs | 2.1 µs  | **8.1×** |
-| jit 3-output same-size (4096) | 23.6 µs | 2.7 µs  | **8.7×** |
-| jit 2× matmul 32×32           | 17.9 µs | 2.6 µs  | **6.9×** |
-| scan cumsum N=100 size=64     | 4.5 ms  | 77.6 µs | **58×**  |
-| scan cumsum N=500 size=256    | 4.4 ms  | 88.1 µs | **50×**  |
-| eager chain x5 (4096)         | 90.1 µs | 90.0 µs | ~1×      |
+| Benchmark                        | Without | With    | Speedup  |
+| -------------------------------- | ------- | ------- | -------- |
+| jit chain x5 fused (4096)        | 10.5 µs | 1.7 µs  | **6.2×** |
+| jit 2-output same-size (4096)    | 17.0 µs | 2.1 µs  | **8.1×** |
+| jit 3-output same-size (4096)    | 23.6 µs | 2.7 µs  | **8.7×** |
+| jit 2× matmul 32×32              | 17.9 µs | 2.6 µs  | **6.9×** |
+| `lax.scan` cumsum N=100 size=64  | 4.5 ms  | 77.6 µs | **58×**  |
+| `lax.scan` cumsum N=500 size=256 | 4.4 ms  | 88.1 µs | **50×**  |
+| eager chain x5 (4096)            | 90.1 µs | 90.0 µs | ~1×      |
 
-## WASM scan throughput (L=1000, compiled-loop)
+## WASM `lax.scan` throughput (L=1000, compiled-loop)
 
 | Body Pattern               | Throughput    | Notes                     |
 | -------------------------- | ------------- | ------------------------- |
@@ -690,9 +690,10 @@ Zeroes on free-list reuse. WebGPU pool does NOT zero pooled buffers.
 | Elementwise (n=4, Y=carry) | ~78M iter/sec | direct-write active       |
 | Passthrough Y (4×4)        | ~35M iter/sec | direct-write not eligible |
 
-**Scan vs jit(loop):** Compiled-loop is 84–98% faster at all tested sizes (16×16 to 128×128).
+**`lax.scan` vs jit(loop):** Compiled-loop is 84–98% faster at all tested sizes (16×16 to 128×128).
 
-**Direct-write optimization:** 40–65% speedup for small scan bodies by eliminating `memory.copy`.
+**Direct-write optimization:** 40–65% speedup for small `lax.scan` bodies by eliminating
+`memory.copy`.
 
 ## Associative scan `grad` speedup
 
@@ -714,7 +715,7 @@ _WebGPU backend (headless Chromium, Intel Core Ultra 5 125H):_
 | 1024 | 0.143 ms          | 3.831 ms     | 26.9×     |
 | 4096 | 0.194 ms          | 15.148 ms    | **78.2×** |
 
-## DLM scan throughput (2-tuple matmul compose, 2×2 matrices)
+## DLM `associativeScan` throughput (2-tuple matmul compose, 2×2 matrices)
 
 | Benchmark                      | WASM (Hz) | WebGPU (Hz) | WASM/WebGPU |
 | ------------------------------ | --------- | ----------- | ----------- |
@@ -722,9 +723,9 @@ _WebGPU backend (headless Chromium, Intel Core Ultra 5 125H):_
 | assocScan 2-tuple N=500        | 23K       | 10.1K       | 2×          |
 | assocScan 3-tuple Särkkä N=200 | 29K       | 11.8K       | 2×          |
 | assocScan 2-tuple 4×4 N=200    | 9.4K      | —           | —           |
-| scan 2-tuple N=200             | 129K      | 7.6K        | 17×         |
+| `lax.scan` 2-tuple N=200       | 129K      | 7.6K        | 17×         |
 | grad(assocScan) 2-tuple N=200  | 29K       | 3.0K        | 10×         |
-| grad(scan) 2-tuple N=200       | 51K       | —           | —           |
+| grad(`lax.scan`) 2-tuple N=200 | 51K       | —           | —           |
 
 **Key insight:** Small-matrix DLM is latency-bound on WebGPU. WASM is 2–17× faster due to zero GPU
 dispatch overhead. WebGPU `assocScan` uses a fused shared-memory shader with per-element reduction
