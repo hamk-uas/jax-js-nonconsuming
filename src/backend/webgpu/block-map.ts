@@ -34,7 +34,15 @@ import {
   wgslCastReductionRhs,
   wgslReductionAccumStmt,
 } from "./wgsl-gen";
-import { AluExp, AluOp, byteWidth, DType, Kernel, Reduction } from "../../alu";
+import {
+  AluExp,
+  AluOp,
+  byteWidth,
+  detectScalarAssocOp,
+  DType,
+  Kernel,
+  Reduction,
+} from "../../alu";
 import type { JitId, JitProgram, JitStep } from "../../frontend/jit";
 import { Routine } from "../../routine";
 import { concreteDim, isSymbolicSize } from "../../shape";
@@ -246,6 +254,13 @@ export function blockMapFusedShaderSource(
     /** Ping/pong shmem names per elem: [pingName, pongName]. */
     pingPongNames: [string, string][];
     numRounds: number;
+    /**
+     * When the body is a scalar binary Add or Mul (single kernel, single elem,
+     * elemCount=1, no reduction), this stores the op so codegen can emit
+     * `subgroupInclusiveAdd` / `subgroupInclusiveMul` instead of iterated
+     * Kogge-Stone rounds.
+     */
+    scalarOp?: AluOp.Add | AluOp.Mul;
   }
   const workgroupAssocScans: WorkgroupAssocScanInfo[] = [];
 
@@ -759,6 +774,19 @@ export function blockMapFusedShaderSource(
 
         const numRounds = Math.ceil(Math.log2(blockSize));
 
+        // Detect if body is a simple scalar Add or Mul — enables
+        // subgroupInclusiveAdd / subgroupInclusiveMul fast path.
+        let scalarOp: AluOp.Add | AluOp.Mul | undefined;
+        if (
+          numElems === 1 &&
+          elemCounts[0] === 1 &&
+          numConsts === 0 &&
+          bodyKernels.length === 1
+        ) {
+          const detected = detectScalarAssocOp(bodyKernels[0].kernel);
+          if (detected != null) scalarOp = detected;
+        }
+
         workgroupAssocScans.push({
           wasStep: step as Extract<JitStep, { type: "workgroup_assoc_scan" }>,
           bodyKernels,
@@ -772,6 +800,7 @@ export function blockMapFusedShaderSource(
           elemCounts,
           pingPongNames,
           numRounds,
+          scalarOp,
         });
         codegenEntries.push({ type: "workgroup_assoc_scan", wasIdx });
         break;
@@ -3401,125 +3430,10 @@ export function blockMapFusedShaderSource(
         }
       };
 
-      // --- Subgroup-local Kogge-Stone rounds via subgroupShuffleUp ---
-      // Up to 3 rounds (stride ≤ 4) are unrolled at codegen time.
-      // An all-or-nothing runtime guard (`sg_size >= minRequired`)
-      // ensures either all subgroup rounds execute or none do,
-      // keeping ping/pong buffer parity deterministic in both paths.
-      const sgRounds = useSubgroupShuffle ? Math.min(3, was.numRounds) : 0;
-
-      if (sgRounds > 0) {
-        // Runtime guard: require subgroup size large enough for all
-        // unrolled rounds (stride = 1 << (sgRounds-1) must be < sg_size).
-        const minSgSize = 1 << sgRounds; // e.g. 8 for 3 rounds
-        emit(`if (sg_size >= ${minSgSize}u) {`, pushIndent);
-
-        // Register variables to hold per-thread leaf values during subgroup
-        // rounds. Avoids shared-memory writes + workgroupBarrier().
-        for (let e = 0; e < was.numElems; e++) {
-          const ty = dtypeToWgsl(was.elemDtypes[e], false);
-          const ec = was.elemCounts[e];
-          const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
-          const pingName = was.pingPongNames[e][0];
-          if (ec > 1) {
-            emit(`var ${regName}: array<${ty}, ${ec}>;`);
-            for (let ei = 0; ei < ec; ei++) {
-              emit(`${regName}[${ei}u] = ${pingName}[tidx * ${ec}u + ${ei}u];`);
-            }
-          } else {
-            emit(`var ${regName}: ${ty} = ${pingName}[tidx];`);
-          }
-        }
-
-        for (let r = 0; r < sgRounds; r++) {
-          const stride = 1 << r;
-
-          // Shuffle each leaf's elements via subgroupShuffleUp
-          for (let e = 0; e < was.numElems; e++) {
-            const ty = dtypeToWgsl(was.elemDtypes[e], false);
-            const ec = was.elemCounts[e];
-            const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
-            const shName = `was_sg_a_${entry.wasIdx}_r${r}_${e}`;
-            if (ec > 1) {
-              emit(`var ${shName}: array<${ty}, ${ec}>;`);
-              for (let ei = 0; ei < ec; ei++) {
-                emit(
-                  `${shName}[${ei}u] = subgroupShuffleUp(${regName}[${ei}u], ${stride}u);`,
-                );
-              }
-            } else {
-              emit(
-                `let ${shName}: ${ty} = subgroupShuffleUp(${regName}, ${stride}u);`,
-              );
-            }
-          }
-
-          // Guard: only invocations with sg_inv_id ≥ stride apply the compose.
-          // Invocations below stride keep their register value unchanged.
-          emit(`if (sg_inv_id >= ${stride}u) {`, pushIndent);
-
-          emitWasRoundBody(
-            `was${entry.wasIdx}_sg${r}`,
-            // resolveA: read from shuffled registers
-            (elemIdx, indexExpr) => {
-              const shName = `was_sg_a_${entry.wasIdx}_r${r}_${elemIdx}`;
-              const ec = was.elemCounts[elemIdx];
-              return ec > 1 ? `${shName}[u32(${indexExpr})]` : shName;
-            },
-            // resolveB: read from current registers
-            (elemIdx, indexExpr) => {
-              const regName = `was_sg_reg_${entry.wasIdx}_${elemIdx}`;
-              const ec = was.elemCounts[elemIdx];
-              return ec > 1 ? `${regName}[u32(${indexExpr})]` : regName;
-            },
-            // writeLeaf: write to register
-            (elemIdx, ec, value, isGidx) => {
-              const regName = `was_sg_reg_${entry.wasIdx}_${elemIdx}`;
-              const cast = dtypeToWgsl(was.elemDtypes[elemIdx]);
-              if (ec > 1) {
-                emit(
-                  `${regName}[${isGidx ? "u32(gidx)" : "_was_oi"}] = ${cast}(${value});`,
-                );
-              } else {
-                emit(`${regName} = ${cast}(${value});`);
-              }
-            },
-            // multiElemResolveA: shuffled register by element index
-            (elemIdx, eiVar) =>
-              `was_sg_a_${entry.wasIdx}_r${r}_${elemIdx}[${eiVar}]`,
-            // multiElemResolveB: current register by element index
-            (elemIdx, eiVar) =>
-              `was_sg_reg_${entry.wasIdx}_${elemIdx}[${eiVar}]`,
-          );
-
-          emit(popIndent, "}"); // end if (sg_inv_id >= stride)
-        }
-
-        // Flush registers to shmem. After sgRounds rounds, the target
-        // buffer is deterministic: sgRounds even → ping, odd → pong.
-        for (let e = 0; e < was.numElems; e++) {
-          const ec = was.elemCounts[e];
-          const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
-          const flushTarget =
-            sgRounds % 2 === 0
-              ? was.pingPongNames[e][0]
-              : was.pingPongNames[e][1];
-          if (ec > 1) {
-            for (let ei = 0; ei < ec; ei++) {
-              emit(
-                `${flushTarget}[tidx * ${ec}u + ${ei}u] = ${regName}[${ei}u];`,
-              );
-            }
-          } else {
-            emit(`${flushTarget}[tidx] = ${regName};`);
-          }
-        }
-        emit("workgroupBarrier();");
-      }
-
       // --- Emit shmem rounds for a given range ---
-      // Factored out so both the subgroup-path tail and the fallback can
-      // call it with different starting round numbers.
+      // Factored out so the inclusive-scan tail, subgroup-path tail, and
+      // the pure-shmem fallback can all call it with different starting
+      // round numbers.
       const emitShmemRounds = (fromRound: number) => {
         for (let r = fromRound; r < was.numRounds; r++) {
           const stride = 1 << r;
@@ -3591,18 +3505,176 @@ export function blockMapFusedShaderSource(
         }
       };
 
-      // When sgRounds > 0, the subgroup path is guarded by a runtime check
-      // on the actual subgroup size. If sg_size is large enough for all
-      // sgRounds, use registers; otherwise fall back to pure shmem rounds.
-      // This "all-or-nothing" approach keeps ping/pong parity deterministic
-      // in both branches, avoiding unsound dynamic buffer selection.
-      if (sgRounds > 0) {
-        // Remaining shmem rounds after the subgroup path
-        emitShmemRounds(sgRounds);
-        emit(popIndent, "} else {", pushIndent); // else: sg_size too small
-        // Pure shmem fallback: all rounds via shared memory
+      // --- Subgroup shuffle rounds via subgroupShuffleUp ---
+      // Up to 3 rounds (stride ≤ 4) unrolled at codegen time into register
+      // ops, avoiding shmem writes + workgroupBarrier() for those rounds.
+      const emitSubgroupShuffleSection = () => {
+        for (let e = 0; e < was.numElems; e++) {
+          const ty = dtypeToWgsl(was.elemDtypes[e], false);
+          const ec = was.elemCounts[e];
+          const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
+          const pingName = was.pingPongNames[e][0];
+          if (ec > 1) {
+            emit(`var ${regName}: array<${ty}, ${ec}>;`);
+            for (let ei = 0; ei < ec; ei++) {
+              emit(`${regName}[${ei}u] = ${pingName}[tidx * ${ec}u + ${ei}u];`);
+            }
+          } else {
+            emit(`var ${regName}: ${ty} = ${pingName}[tidx];`);
+          }
+        }
+
+        for (let r = 0; r < sgShuffleRounds; r++) {
+          const stride = 1 << r;
+
+          // Shuffle each leaf's elements via subgroupShuffleUp
+          for (let e = 0; e < was.numElems; e++) {
+            const ty = dtypeToWgsl(was.elemDtypes[e], false);
+            const ec = was.elemCounts[e];
+            const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
+            const shName = `was_sg_a_${entry.wasIdx}_r${r}_${e}`;
+            if (ec > 1) {
+              emit(`var ${shName}: array<${ty}, ${ec}>;`);
+              for (let ei = 0; ei < ec; ei++) {
+                emit(
+                  `${shName}[${ei}u] = subgroupShuffleUp(${regName}[${ei}u], ${stride}u);`,
+                );
+              }
+            } else {
+              emit(
+                `let ${shName}: ${ty} = subgroupShuffleUp(${regName}, ${stride}u);`,
+              );
+            }
+          }
+
+          // Guard: only invocations with sg_inv_id >= stride apply the compose.
+          // Invocations below stride keep their register value unchanged.
+          emit(`if (sg_inv_id >= ${stride}u) {`, pushIndent);
+
+          emitWasRoundBody(
+            `was${entry.wasIdx}_sg${r}`,
+            // resolveA: read from shuffled registers
+            (elemIdx, indexExpr) => {
+              const shName = `was_sg_a_${entry.wasIdx}_r${r}_${elemIdx}`;
+              const ec = was.elemCounts[elemIdx];
+              return ec > 1 ? `${shName}[u32(${indexExpr})]` : shName;
+            },
+            // resolveB: read from current registers
+            (elemIdx, indexExpr) => {
+              const regName = `was_sg_reg_${entry.wasIdx}_${elemIdx}`;
+              const ec = was.elemCounts[elemIdx];
+              return ec > 1 ? `${regName}[u32(${indexExpr})]` : regName;
+            },
+            // writeLeaf: write to register
+            (elemIdx, ec, value, isGidx) => {
+              const regName = `was_sg_reg_${entry.wasIdx}_${elemIdx}`;
+              const cast = dtypeToWgsl(was.elemDtypes[elemIdx]);
+              if (ec > 1) {
+                emit(
+                  `${regName}[${isGidx ? "u32(gidx)" : "_was_oi"}] = ${cast}(${value});`,
+                );
+              } else {
+                emit(`${regName} = ${cast}(${value});`);
+              }
+            },
+            (elemIdx, eiVar) =>
+              `was_sg_a_${entry.wasIdx}_r${r}_${elemIdx}[${eiVar}]`,
+            (elemIdx, eiVar) =>
+              `was_sg_reg_${entry.wasIdx}_${elemIdx}[${eiVar}]`,
+          );
+
+          emit(popIndent, "}"); // end if (sg_inv_id >= stride)
+        }
+
+        // Flush registers to shmem. Target is deterministic by parity.
+        for (let e = 0; e < was.numElems; e++) {
+          const ec = was.elemCounts[e];
+          const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
+          const flushTarget =
+            sgShuffleRounds % 2 === 0
+              ? was.pingPongNames[e][0]
+              : was.pingPongNames[e][1];
+          if (ec > 1) {
+            for (let ei = 0; ei < ec; ei++) {
+              emit(
+                `${flushTarget}[tidx * ${ec}u + ${ei}u] = ${regName}[${ei}u];`,
+              );
+            }
+          } else {
+            emit(`${flushTarget}[tidx] = ${regName};`);
+          }
+        }
+        emit("workgroupBarrier();");
+      };
+
+      // --- Subgroup inclusive scan via subgroupInclusiveAdd/Mul ---
+      // For scalar Add or Mul bodies, a single hardware instruction
+      // replaces all intra-subgroup Kogge-Stone rounds.
+      const emitInclusiveScanSection = () => {
+        const ty = dtypeToWgsl(was.elemDtypes[0], false);
+        const ping = was.pingPongNames[0][0];
+        const builtinName =
+          was.scalarOp === AluOp.Add
+            ? "subgroupInclusiveAdd"
+            : "subgroupInclusiveMul";
+        const regName = `was_sg_inc_${entry.wasIdx}`;
+        emit(`var ${regName}: ${ty} = ${ping}[tidx];`);
+        emit(`${regName} = ${builtinName}(${regName});`);
+        // After sgInclusiveRounds virtual rounds, the next shmem round reads
+        // from: even→ping, odd→pong. Write the result there.
+        const target =
+          sgInclusiveRounds % 2 === 0
+            ? was.pingPongNames[0][0]
+            : was.pingPongNames[0][1];
+        emit(`${target}[tidx] = ${regName};`);
+        emit("workgroupBarrier();");
+      };
+
+      // --- Determine subgroup optimization levels ---
+      // sgInclusiveRounds: for scalar add/mul, hardware inclusive scan
+      //   replaces up to 5 rounds (sg_size ≥ 32).
+      // sgShuffleRounds: for general bodies, register shuffles replace
+      //   up to 3 rounds (sg_size ≥ 8).
+      const sgShuffleRounds = useSubgroupShuffle
+        ? Math.min(3, was.numRounds)
+        : 0;
+      const sgInclusiveRounds =
+        was.scalarOp != null && useSubgroupShuffle
+          ? Math.min(5, was.numRounds)
+          : 0;
+
+      // Emit the appropriate branch structure. All branches keep ping/pong
+      // parity deterministic by pairing shmem rounds with a fixed starting
+      // round number.
+      if (sgInclusiveRounds > 0) {
+        if (DEBUG >= 1)
+          console.info(
+            `block_map fused: workgroup_assoc_scan using subgroupInclusive${was.scalarOp === AluOp.Add ? "Add" : "Mul"} (${sgInclusiveRounds} rounds replaced, ${was.numRounds - sgInclusiveRounds} shmem rounds remaining)`,
+          );
+        // 3-way branch: inclusive scan → shuffle fallback → pure shmem
+        emit(`if (sg_size >= 32u) {`, pushIndent);
+        emitInclusiveScanSection();
+        emitShmemRounds(sgInclusiveRounds);
+        if (sgShuffleRounds > 0) {
+          emit(
+            popIndent,
+            `} else if (sg_size >= ${1 << sgShuffleRounds}u) {`,
+            pushIndent,
+          );
+          emitSubgroupShuffleSection();
+          emitShmemRounds(sgShuffleRounds);
+        }
+        emit(popIndent, "} else {", pushIndent);
         emitShmemRounds(0);
-        emit(popIndent, "}"); // end if (sg_size >= ...)
+        emit(popIndent, "}");
+      } else if (sgShuffleRounds > 0) {
+        // 2-way branch: shuffle → pure shmem
+        emit(`if (sg_size >= ${1 << sgShuffleRounds}u) {`, pushIndent);
+        emitSubgroupShuffleSection();
+        emitShmemRounds(sgShuffleRounds);
+        emit(popIndent, "} else {", pushIndent);
+        emitShmemRounds(0);
+        emit(popIndent, "}");
       } else {
         emitShmemRounds(0);
       }

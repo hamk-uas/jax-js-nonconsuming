@@ -237,32 +237,31 @@ work around 256-byte alignment.
 
 ### Features exploited
 
-| Feature                     | Usage                                                                                           |
-| --------------------------- | ----------------------------------------------------------------------------------------------- |
-| **shader-f16**              | Float16 dtype support                                                                           |
-| **Workgroup shared memory** | Sort, JIT cooperative reductions                                                                |
-| **workgroupBarrier()**      | Sort, shared-memory reduction tree                                                              |
-| **storageBarrier()**        | Memory fence in Sort, Cholesky, LU                                                              |
-| **Pipeline caching**        | Compiled pipelines stored by shader hash                                                        |
-| **Pipeline layout caching** | Cached by `numInputs:numOutputs:hasUniform` signature                                           |
-| **Command batching**        | Multiple dispatches encoded before single `queue.submit()`                                      |
-| **WGSL copy shader**        | Byte-level buffer copy when alignment fails                                                     |
-| **shader-f32-atomic-add**   | Native f32 `atomicAdd` in scatter-add shader                                                    |
-| **Ping-pong buffers**       | `lax.scan` carry alternates between two buffers                                                 |
-| **Uniform buffers**         | Per-iteration offsets for `lax.scan`                                                            |
-| **Subgroups**               | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in assocScan |
-| **Atomic CAS + Store**      | Decoupled Fallback scan: inter-workgroup prefix propagation via bounded-spin + CAS fallback     |
+| Feature                     | Usage                                                                                                                                              |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **shader-f16**              | Float16 dtype support                                                                                                                              |
+| **Workgroup shared memory** | Sort, JIT cooperative reductions                                                                                                                   |
+| **workgroupBarrier()**      | Sort, shared-memory reduction tree                                                                                                                 |
+| **storageBarrier()**        | Memory fence in Sort, Cholesky, LU                                                                                                                 |
+| **Pipeline caching**        | Compiled pipelines stored by shader hash                                                                                                           |
+| **Pipeline layout caching** | Cached by `numInputs:numOutputs:hasUniform` signature                                                                                              |
+| **Command batching**        | Multiple dispatches encoded before single `queue.submit()`                                                                                         |
+| **WGSL copy shader**        | Byte-level buffer copy when alignment fails                                                                                                        |
+| **shader-f32-atomic-add**   | Native f32 `atomicAdd` in scatter-add shader                                                                                                       |
+| **Ping-pong buffers**       | `lax.scan` carry alternates between two buffers                                                                                                    |
+| **Uniform buffers**         | Per-iteration offsets for `lax.scan`                                                                                                               |
+| **Subgroups**               | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in assocScan, `subgroupInclusiveAdd`/`Mul` for scalar assocScan |
+| **Atomic CAS + Store**      | Decoupled Fallback scan: inter-workgroup prefix propagation via bounded-spin + CAS fallback                                                        |
 
 ### Features NOT exploited (opportunities)
 
-| Feature                       | What it enables                     | Why not used / status                                 |
-| ----------------------------- | ----------------------------------- | ----------------------------------------------------- |
-| **Indirect dispatch**         | GPU-driven workgroup counts         | No dynamic control flow needs it yet                  |
-| **Texture sampling**          | Hardware-accelerated interpolation  | All ops use storage buffers                           |
-| **Atomic operations**         | Lock-free reductions, histograms    | Used by Decoupled Fallback scan (P10) and scatter-add |
-| **timestamp-query**           | GPU-side profiling                  | Not wired up yet; planned (P9)                        |
-| **subgroupInclusiveAdd/Mul**  | Hardware prefix sum within subgroup | Planned for assocScan (P8); Chrome 134+               |
-| **Cooperative matrix (WMMA)** | Hardware tensor core matmul         | WGSL spec not stable; Dawn experimental; ~2026 (P7)   |
+| Feature                       | What it enables                    | Why not used / status                                 |
+| ----------------------------- | ---------------------------------- | ----------------------------------------------------- |
+| **Indirect dispatch**         | GPU-driven workgroup counts        | No dynamic control flow needs it yet                  |
+| **Texture sampling**          | Hardware-accelerated interpolation | All ops use storage buffers                           |
+| **Atomic operations**         | Lock-free reductions, histograms   | Used by Decoupled Fallback scan (P10) and scatter-add |
+| **timestamp-query**           | GPU-side profiling                 | Not wired up yet; planned (P9)                        |
+| **Cooperative matrix (WMMA)** | Hardware tensor core matmul        | WGSL spec not stable; Dawn experimental; ~2026 (P7)   |
 
 ### WASM feature opportunities
 
@@ -770,7 +769,7 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 | P5  | Subgroup reductions       | **Done** ✅ | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions                          |
 | P6  | Benchmark validation      | Medium      | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions                 |
 | P7  | Cooperative matrix (WMMA) | Blocked     | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable; ~2026 earliest  |
-| P8  | Subgroup scan builtins    | In progress | `subgroupShuffleUp` in assocScan **Done** ✅. `subgroupInclusiveAdd` remaining         |
+| P8  | Subgroup scan builtins    | **Done** ✅ | `subgroupShuffleUp` (general bodies) + `subgroupInclusiveAdd`/`Mul` (scalar add/mul)   |
 | P9  | Timestamp query profiling | Medium      | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)          |
 | P10 | Decoupled Fallback scan   | **Done** ✅ | Single-dispatch O(N) prefix scan (Phase 1: f32 scalar ops). See PLAN.md P7 T0          |
 | P11 | Analytical small linalg   | **Done** ✅ | Cholesky (n≤4), TriSolve (n≤8), QR (n≤8) as traced ops. Enables sqrt DLM fusion        |

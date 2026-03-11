@@ -995,30 +995,34 @@ This achieves **single-dispatch, memory-bandwidth-saturating performance** on al
 
 ### Tier 1: Remaining subgroup builtins (available now, Chrome 134+)
 
-#### 1a. `subgroupInclusiveAdd` / `subgroupInclusiveMul` for associative scan
+#### 1a. `subgroupInclusiveAdd` / `subgroupInclusiveMul` for associative scan — **Done** ✅
 
 **What:** Replace the innermost Kogge-Stone rounds within a subgroup with a single hardware
 instruction. For `subgroup_size = 32`, the first 5 rounds of Kogge-Stone (doubling 1→2→4→8→16→32)
 are replaced by one `subgroupInclusiveAdd()` call.
 
-**Where:** `associativeScan` WebGPU fused shader — the per-round Kogge-Stone loop in
-`nativeScanMultiShaderSource` / block-map fused path.
+**Where:** `associativeScan` WebGPU fused shader — the per-round Kogge-Stone loop in the block-map
+fused path.
 
 **Impact:** For cumulative sum/product with N=1024, blockSize=256: each block has 8 subgroups of 32.
-Currently 8 Kogge-Stone rounds per block (log₂ 256). With subgroup inclusive scan, rounds 0–4 are
-free, leaving only 3 inter-subgroup rounds. **~40% fewer barrier-separated shader rounds.**
+With subgroup inclusive scan, rounds 0–4 are free, leaving only 3 inter-subgroup shmem rounds.
+**~40% fewer barrier-separated shader rounds.**
 
 **Prerequisites:** Body function must be a simple associative op (`add` or `mul`) that maps directly
 to the hardware builtin. For pytree bodies (DLM compose), the body is a general function — the
 inclusive scan builtin doesn't help unless we can decompose the body into scalar associative ops.
 
-**Implementation sketch:**
+**Implementation (completed):**
 
-1. In `runFusedPlan` Phase 1, detect if the body is pure `add` or `mul`
-2. If so, emit `subgroupInclusiveAdd(val)` for the first log₂(subgroup_size) rounds
-3. After the intra-subgroup prefix, the last invocation in each subgroup writes its result to shmem
-4. Continue normal inter-subgroup Kogge-Stone for the remaining rounds
-5. Requires `enable subgroups;` already present
+1. `WorkgroupAssocScanInfo.scalarOp` detects scalar `Add` or `Mul` bodies at analysis time (single
+   kernel, single elem, elemCount=1, no reduction, no constants)
+2. `emitInclusiveScanSection()` emits `subgroupInclusiveAdd(val)` / `subgroupInclusiveMul(val)` for
+   the first 5 rounds (assuming sg_size ≥ 32)
+3. 3-way runtime branch: `sg_size >= 32` → inclusive scan, `sg_size >= 8` → shuffle fallback, else
+   pure shmem. All branches keep ping/pong parity deterministic.
+4. After the intra-subgroup prefix, the result is written to the correct shmem buffer and normal
+   inter-subgroup Kogge-Stone continues for the remaining rounds
+5. Applies to all numeric dtypes (f32, f16, i32, u32) — broader than DF which is f32 only
 
 #### 1b. `subgroupShuffle` / `subgroupShuffleUp` for associative scan (general bodies) — **Done** ✅
 

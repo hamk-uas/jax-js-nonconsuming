@@ -2,7 +2,14 @@
  * @file Scan plan construction — determines the execution strategy for a scan.
  */
 
-import { AluOp, byteWidth, DType, Kernel, Reduction } from "../alu";
+import {
+  AluOp,
+  byteWidth,
+  detectScalarAssocOp,
+  DType,
+  Kernel,
+  Reduction,
+} from "../alu";
 import type { Backend, Executable } from "../backend";
 import {
   getScanRoutineInfo,
@@ -329,13 +336,6 @@ export function classifyBodySteps(
 // Decoupled Fallback detection
 // ---------------------------------------------------------------------------
 
-/** Supported scalar binary ops for the Decoupled Fallback scan. */
-const DF_SUPPORTED_OPS = new Set<AluOp>([
-  AluOp.Add,
-  AluOp.Mul,
-  AluOp.Min,
-  AluOp.Max,
-]);
 const DF_SUPPORTED_DTYPES = new Set<DType>([
   DType.Float32,
   // DType.Uint32 excluded: 30-bit descriptor packing silently truncates
@@ -376,25 +376,30 @@ function detectDecoupledFallbackOp(
   if (!(step.source instanceof Kernel)) return null;
 
   const kernel = step.source;
-  if (kernel.numOutputs !== 1) return null;
-  if (kernel.size !== 1) return null; // must be scalar
-  if (kernel.outputs[0].reduction) return null;
 
+  // Use shared detection for Add/Mul (also used by subgroupInclusiveAdd path).
+  // DF also supports Min/Max, so check those separately.
+  const assocOp = detectScalarAssocOp(kernel);
+  if (assocOp != null) {
+    if (!DF_SUPPORTED_DTYPES.has(kernel.outputs[0].dtype)) return null;
+    return { op: assocOp, dtype: kernel.outputs[0].dtype };
+  }
+
+  // Min/Max: not in detectScalarAssocOp (only Add/Mul have subgroup builtins)
+  if (kernel.numOutputs !== 1 || kernel.size !== 1) return null;
+  if (kernel.outputs[0].reduction) return null;
   const exp = kernel.outputs[0].exp;
-  if (!DF_SUPPORTED_OPS.has(exp.op)) return null;
+  if (exp.op !== AluOp.Min && exp.op !== AluOp.Max) return null;
   if (exp.src.length !== 2) return null;
   if (!DF_SUPPORTED_DTYPES.has(exp.dtype)) return null;
-
-  // Both sources must be GlobalIndex referring to the two input leaves
   if (
     exp.src[0].op !== AluOp.GlobalIndex ||
     exp.src[1].op !== AluOp.GlobalIndex
   )
     return null;
-
-  const gids = new Set<number>([exp.src[0].arg[0], exp.src[1].arg[0]]);
-  if (!gids.has(0) || !gids.has(1)) return null;
-
+  const g0 = exp.src[0].arg[0] as number;
+  const g1 = exp.src[1].arg[0] as number;
+  if (!((g0 === 0 && g1 === 1) || (g0 === 1 && g1 === 0))) return null;
   return { op: exp.op, dtype: exp.dtype };
 }
 
