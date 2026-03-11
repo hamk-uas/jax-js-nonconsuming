@@ -337,9 +337,9 @@ modules use WASM imports to call routines from separate wasmblr modules.
 **Analytical small-matrix fast paths:** `np.linalg.inv` has non-Routine Cramer's rule
 implementations for n ≤ 4 (`inv2x2`, `inv3x3`, `inv4x4` in `numpy-linalg.ts`). These trace to
 fusable Kernel ops, enabling DLM compose bodies to fuse into block-map shaders for m ≤ 4. For n ≥ 5,
-inv falls through to LU (Routine) → fusion blocked. Cholesky, TriangularSolve, and QR are always
-Routines — the sqrt DLM variant can't fuse at any matrix size. See PLAN.md "Analytical Small-Matrix
-Linalg" for the plan to extend this pattern to cholesky/trisolve/QR.
+inv falls through to LU (Routine) → fusion blocked. Cholesky (n ≤ 4), TriangularSolve (n ≤ 8), and
+QR (n ≤ 8) also have analytical (jaxpr-traceable) paths gated by `inMakeJaxprBody()`, enabling sqrt
+DLM variant fusion. See PLAN.md "Analytical Small-Matrix Linalg" for details.
 
 ## Codegen architecture
 
@@ -758,21 +758,21 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 
 ## Future performance work
 
-| ID  | Title                     | Priority     | Description                                                                              |
-| --- | ------------------------- | ------------ | ---------------------------------------------------------------------------------------- |
-| P1  | ~~Tiled matmul (WebGPU)~~ | **Done** ✅  | 53.7% peak FP32 at 4096×4096 (12,138 GFLOP/s). Implemented via `block_map`               |
-| P2  | Relaxed SIMD FMA          | Medium       | `f32x4.relaxed_madd` for 2× dot-product throughput. Safari doesn't support               |
-| P3  | i64 in wasmblr            | Medium       | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins                    |
-| P4  | Conv2d tuning             | Medium       | Benchmark now (tiled matmul gives free improvement). Specialized WGSL for 3×3, 5×5       |
-| P5  | Subgroup reductions       | **Done** ✅  | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in AS |
-| P6  | Benchmark validation      | Medium       | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions                   |
-| P7  | Cooperative matrix (WMMA) | Blocked      | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable; ~2026 earliest    |
-| P8  | Subgroup scan builtins    | Medium       | `subgroupInclusiveAdd`/`subgroupShuffleUp` in assocScan. Available now (Chrome 134+)     |
-| P9  | Timestamp query profiling | Medium       | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)            |
-| P10 | Decoupled Fallback scan   | **High**     | Single-dispatch O(N) prefix scan. Replaces Kogge-Stone for scalar ops. See PLAN.md P7 T0 |
-| P11 | Analytical small linalg   | **Med-High** | Cholesky/TriSolve/QR for n ≤ 4 as traced ops (not Routines). Enables sqrt DLM fusion     |
-| P12 | WebGPU command tape       | **Done** ✅  | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs       |
-| P13 | WebGPU bind group cache   | **Done** ✅  | Bind group caching via GPUBuffer identity (pool LIFO). Arena reverted (spec violation)   |
+| ID  | Title                     | Priority    | Description                                                                              |
+| --- | ------------------------- | ----------- | ---------------------------------------------------------------------------------------- |
+| P1  | ~~Tiled matmul (WebGPU)~~ | **Done** ✅ | 53.7% peak FP32 at 4096×4096 (12,138 GFLOP/s). Implemented via `block_map`               |
+| P2  | Relaxed SIMD FMA          | Medium      | `f32x4.relaxed_madd` for 2× dot-product throughput. Safari doesn't support               |
+| P3  | i64 in wasmblr            | Medium      | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins                    |
+| P4  | Conv2d tuning             | Medium      | Benchmark now (tiled matmul gives free improvement). Specialized WGSL for 3×3, 5×5       |
+| P5  | Subgroup reductions       | **Done** ✅ | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in AS |
+| P6  | Benchmark validation      | Medium      | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions                   |
+| P7  | Cooperative matrix (WMMA) | Blocked     | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable; ~2026 earliest    |
+| P8  | Subgroup scan builtins    | Medium      | `subgroupInclusiveAdd`/`subgroupShuffleUp` in assocScan. Available now (Chrome 134+)     |
+| P9  | Timestamp query profiling | Medium      | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)            |
+| P10 | Decoupled Fallback scan   | **High**    | Single-dispatch O(N) prefix scan. Replaces Kogge-Stone for scalar ops. See PLAN.md P7 T0 |
+| P11 | Analytical small linalg   | **Done** ✅ | Cholesky (n≤4), TriSolve (n≤8), QR (n≤8) as traced ops. Enables sqrt DLM fusion          |
+| P12 | WebGPU command tape       | **Done** ✅ | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs       |
+| P13 | WebGPU bind group cache   | **Done** ✅ | Bind group caching via GPUBuffer identity (pool LIFO). Arena reverted (spec violation)   |
 
 ---
 
@@ -838,4 +838,4 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Analytical inv for n ≤ 4 (Cramer's rule)           | Jaxpr-traceable: fuses in block-map. Routines break fusion. Pattern extends to cholesky/QR/trisolve           |
 | WebGPU command tape over step-by-step              | Pre-resolved pipelines + flat buffer table eliminates ~76% of JS-side JIT loop overhead                       |
 | Bind group cache over arena sub-allocation         | Arena reverted: WebGPU spec forbids mixed read/write bindings to same buffer. Pool LIFO gives stable identity |
-| Targeted jaxprification over general               | Only Cholesky/TriSolve/QR for n≤4. Sort/Argsort/LU are fundamentally non-jaxprifiable                         |
+| Targeted jaxprification over general               | Cholesky (n≤4), TriSolve/QR (n≤8) traced to fusable ops. Sort/Argsort/LU are non-jaxprifiable                 |

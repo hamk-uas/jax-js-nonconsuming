@@ -135,6 +135,118 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
     });
   });
 
+  suite("analytical cholesky (n ≤ 4, jit path)", () => {
+    test.each([2, 3, 4])("jit(cholesky) n=%i matches eager", (n) => {
+      // Create a positive-definite matrix: A^T A + I
+      using key = random.key(42 + n);
+      using rawA = random.uniform(key, [n, n]);
+      using At = rawA.transpose();
+      using AtA = np.matmul(At, rawA);
+      using eye = np.eye(n);
+      using A = AtA.add(eye);
+
+      // Eager (routine path)
+      using L_eager = lax.linalg.cholesky(A);
+
+      // JIT (analytical path for n ≤ 4)
+      const f = jit(lax.linalg.cholesky);
+      using L_jit = f(A);
+      f.dispose();
+
+      expect(L_jit).toBeAllclose(L_eager, { rtol: 1e-5, atol: 1e-5 });
+
+      // Verify L @ L^T = A
+      using Lt = L_jit.transpose();
+      using reconstructed = np.matmul(L_jit, Lt);
+      expect(reconstructed).toBeAllclose(A, { rtol: 1e-5, atol: 1e-5 });
+    });
+
+    test("jit(cholesky) 4x4 upper=true", () => {
+      using A = np.array([
+        [10, 3, 1, 0.5],
+        [3, 8, 2, 1],
+        [1, 2, 6, 1.5],
+        [0.5, 1, 1.5, 5],
+      ]);
+      const f = jit((x: np.Array) => lax.linalg.cholesky(x, { upper: true }));
+      using U = f(A);
+      f.dispose();
+
+      // Verify U^T @ U = A
+      using Ut = U.transpose();
+      using reconstructed = np.matmul(Ut, U);
+      expect(reconstructed).toBeAllclose(A, { rtol: 1e-5, atol: 1e-5 });
+    });
+
+    test("jit(cholesky) batched [2, 3, 3]", () => {
+      using A1 = np.array([
+        [5, 2, 1],
+        [2, 6, 2],
+        [1, 2, 7],
+      ]);
+      using A2 = np.array([
+        [4, 1, 0.5],
+        [1, 5, 1],
+        [0.5, 1, 6],
+      ]);
+      using batch = np.stack([A1, A2]);
+
+      const f = jit(lax.linalg.cholesky);
+      using L_batch = f(batch);
+      f.dispose();
+
+      // Each L[i] @ L[i]^T should equal batch[i]
+      for (let i = 0; i < 2; i++) {
+        using Li = np.array(L_batch.js()[i] as number[][]);
+        using Ai = np.array(batch.js()[i] as number[][]);
+        using Lit = Li.transpose();
+        using rec = np.matmul(Li, Lit);
+        expect(rec).toBeAllclose(Ai, { rtol: 1e-4, atol: 1e-4 });
+      }
+    });
+
+    test("grad through jit(cholesky) n=3", () => {
+      using x = np.array([
+        [5, 2, 1],
+        [2, 6, 2],
+        [1, 2, 7],
+      ]);
+
+      const f = (x: np.Array) => {
+        using xt = x.transpose();
+        using xPlusXt = x.add(xt);
+        using sym = xPlusXt.mul(0.5);
+        using L = lax.linalg.cholesky(sym);
+        using sq = np.square(L);
+        return sq.sum();
+      };
+
+      // grad via JIT (analytical cholesky inside grad trace)
+      using dx = grad(f)(x);
+
+      // Finite differences
+      const eps = 1e-4;
+      const xData = x.js() as number[][];
+      const expected: number[][] = xData.map((r) => r.map(() => 0));
+      for (let i = 0; i < 3; i++) {
+        for (let j = 0; j < 3; j++) {
+          const xp = xData.map((row) => [...row]);
+          const xm = xData.map((row) => [...row]);
+          xp[i][j] += eps;
+          xm[i][j] -= eps;
+          using arrP = np.array(xp);
+          using fpArr = f(arrP);
+          const fp = fpArr.js() as number;
+          using arrM = np.array(xm);
+          using fmArr = f(arrM);
+          const fm = fmArr.js() as number;
+          expected[i][j] = (fp - fm) / (2 * eps);
+        }
+      }
+      expect(dx).toBeAllclose(expected, { rtol: 1e-2, atol: 1e-3 });
+    });
+  });
+
   suite("jax.lax.linalg.lu()", () => {
     test("example with partial pivoting", () => {
       using A = np.array([

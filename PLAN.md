@@ -757,10 +757,10 @@ expressed as jaxpr-traceable ops for small matrices, enabling fusion?
 | Routine              | Algorithm for small n                  | Ops used                                | Complexity (n=4) | Feasible?                                                         |
 | -------------------- | -------------------------------------- | --------------------------------------- | ---------------- | ----------------------------------------------------------------- |
 | **inv** (n ≤ 4)      | Cramer's rule (adjugate/det)           | mul, sub, neg, reciprocal, stack        | ~120 mul+add     | **Done** ✅                                                       |
-| **cholesky** (n ≤ 4) | Cholesky-Banachiewicz, unrolled        | mul, sub, div, sqrt                     | ~30 ops          | **Yes**                                                           |
-| **trisolve** (n ≤ 4) | Back/forward substitution, unrolled    | mul, sub, div                           | ~20 ops          | **Yes**                                                           |
+| **cholesky** (n ≤ 4) | Cholesky-Banachiewicz, unrolled        | mul, sub, div, sqrt                     | ~30 ops          | **Done** ✅                                                       |
+| **trisolve** (n ≤ 4) | Back/forward substitution, unrolled    | mul, sub, div                           | ~20 ops          | **Done** ✅ (limit=8)                                             |
 | **LU** (n ≤ 4)       | Gaussian elimination with pivoting     | mul, sub, div, argmax, swap             | ~40 ops          | **Tricky** — pivoting requires data-dependent control flow        |
-| **QR** (n ≤ 4)       | Householder reflections, unrolled      | mul, sub, div, sqrt, dot, outer product | ~60 ops          | **Yes** (no data-dependent branching for thin QR)                 |
+| **QR** (n ≤ 4)       | Householder reflections, unrolled      | mul, sub, div, sqrt, dot, outer product | ~60 ops          | **Done** ✅ (limit=8)                                             |
 | **inv** (n = 5)      | Cramer's rule (5×5 cofactor expansion) | mul, sub, neg, reciprocal, stack        | ~720 terms       | **Marginal** — large trace graph, may exceed JIT cache efficiency |
 
 **LU is the hardest** because partial pivoting (`argmax` + row swap) introduces data-dependent
@@ -770,11 +770,11 @@ variant uses QR + TriangularSolve, not LU.
 
 ### Impact on DLM variants
 
-| DLM variant            | Linalg ops in compose body | Current state                      | With analytical paths |
-| ---------------------- | -------------------------- | ---------------------------------- | --------------------- |
-| Standard (5-tuple)     | `np.linalg.inv`            | **Fuses for m ≤ 4** (already done) | No change needed      |
-| Sqrt forward (3-tuple) | QR + trisolve              | **Never fuses** (Routines)         | **Fuses for m ≤ 4**   |
-| Sqrt backward          | QR                         | **Never fuses** (Routine)          | **Fuses for m ≤ 4**   |
+| DLM variant            | Linalg ops in compose body | Current state                      | With analytical paths     |
+| ---------------------- | -------------------------- | ---------------------------------- | ------------------------- |
+| Standard (5-tuple)     | `np.linalg.inv`            | **Fuses for m ≤ 4** (already done) | No change needed          |
+| Sqrt forward (3-tuple) | QR + trisolve              | **Fuses for m ≤ 8** (done)         | All paths fusable for m≤4 |
+| Sqrt backward          | QR                         | **Fuses for m ≤ 8** (done)         | All paths fusable for m≤4 |
 
 The sqrt DLM variant (`composeSqrtForward`, `composeSqrtBackward`) is numerically more stable than
 the standard variant for poorly conditioned systems. Enabling it to fuse on WebGPU for small m
