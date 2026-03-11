@@ -36,6 +36,8 @@ export interface BackendCapabilities {
   readonly maxComputeWorkgroupStorageSize?: number;
   /** WebGPU: adapter architecture string (e.g. "gen-9", "xe-lpg"). */
   readonly adapterArchitecture?: string;
+  /** WebGPU: true if timestamp-query feature is available. */
+  readonly timestampQuery?: boolean;
 }
 export const devices: Device[] = ["cpu", "wasm", "webgpu", "webgl"];
 
@@ -320,6 +322,27 @@ export interface Backend {
     dtype: DType,
     blockSize: number,
   ): void;
+
+  /**
+   * Optional: begin GPU timestamp profiling.
+   * Subsequent compute passes will record per-pass timestamps.
+   * Call `stopProfiling()` to retrieve timing data.
+   */
+  startProfiling?(): void;
+
+  /**
+   * Optional: stop GPU timestamp profiling and return timing results.
+   * Resolves timestamps, reads them back, and returns per-pass GPU timing.
+   */
+  stopProfiling?(): Promise<GpuTimingResult>;
+}
+
+/** GPU timing data returned by `profileGpu`. */
+export interface GpuTimingResult {
+  /** Per-compute-pass GPU duration (nanosecond precision). */
+  passes: { durationMs: number }[];
+  /** Wall-clock GPU time from first pass start to last pass end. */
+  totalMs: number;
 }
 
 export class Executable<T = any> {

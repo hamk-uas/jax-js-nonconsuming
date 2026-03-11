@@ -1,6 +1,6 @@
 import { DType } from "./alu";
 import { defaultDevice, Device, devices, getBackend, init } from "./backend";
-import type { BackendCapabilities } from "./backend";
+import type { BackendCapabilities, GpuTimingResult } from "./backend";
 import { type Dim, hasSymbolicDims, isSymbolicDim, SymDim } from "./dim";
 import { Array, ArrayLike } from "./frontend/array";
 import { aotLinearize } from "./frontend/artifacts";
@@ -57,6 +57,7 @@ export {
   type BackendCapabilities,
   type CacheSizes,
   type Dim,
+  type GpuTimingResult,
   init,
   Array,
   checkLeaks,
@@ -435,4 +436,31 @@ export async function devicePut<T extends JsTree<any>>(
     }),
   );
   return tree.unflatten(structure, yflat) as any;
+}
+
+/**
+ * Profile GPU compute passes executed by `fn`.
+ *
+ * Requires the WebGPU backend with `timestamp-query` support.
+ * Returns the function's result alongside per-pass GPU timing data.
+ */
+export async function profileGpu<T>(
+  fn: () => T | Promise<T>,
+): Promise<{ result: T; timing: GpuTimingResult }> {
+  const backend = getBackend();
+  if (!backend.startProfiling || !backend.stopProfiling) {
+    throw new Error(
+      "profileGpu requires a backend with timestamp-query support (WebGPU)",
+    );
+  }
+  backend.startProfiling();
+  let result: T;
+  try {
+    result = await fn();
+  } catch (e) {
+    await backend.stopProfiling();
+    throw e;
+  }
+  const timing = await backend.stopProfiling();
+  return { result, timing };
 }

@@ -12,6 +12,7 @@ import {
   type BackendCapabilities,
   Device,
   Executable,
+  type GpuTimingResult,
   Slot,
   SlotError,
   UnsupportedOpError,
@@ -263,6 +264,31 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // --- GPU dispatch counter (module-level for pipelineSubmit access) ---
 let _dispatchCount = 0;
 
+// --- GPU timestamp profiling state (module-level for pipelineSubmit access) ---
+let _profilingQuerySet: GPUQuerySet | null = null;
+let _profilingPassIdx = 0;
+const _MAX_PROFILING_PASSES = 4096;
+
+/** Return timestampWrites descriptor for the current pass, or undefined. */
+function _profilingTimestampWrites():
+  | GPUComputePassTimestampWrites
+  | undefined {
+  if (!_profilingQuerySet || _profilingPassIdx >= _MAX_PROFILING_PASSES)
+    return undefined;
+  const idx = _profilingPassIdx++;
+  return {
+    querySet: _profilingQuerySet,
+    beginningOfPassWriteIndex: idx * 2,
+    endOfPassWriteIndex: idx * 2 + 1,
+  };
+}
+
+/** Begin a compute pass with optional profiling timestamps. */
+function _beginComputePass(encoder: GPUCommandEncoder): GPUComputePassEncoder {
+  const tsw = _profilingTimestampWrites();
+  return encoder.beginComputePass(tsw ? { timestampWrites: tsw } : undefined);
+}
+
 /** Implementation of `Backend` that uses WebGPU in browsers. */
 export class WebGPUBackend implements Backend {
   readonly type: Device = "webgpu";
@@ -351,6 +377,7 @@ export class WebGPUBackend implements Backend {
         device.limits.maxComputeInvocationsPerWorkgroup,
       maxComputeWorkgroupStorageSize:
         device.limits.maxComputeWorkgroupStorageSize,
+      timestampQuery: device.features.has("timestamp-query"),
     };
     this.pipelines = new ShaderPipelineCache(device);
     this.syncReader = new SyncReader(device);
@@ -402,6 +429,74 @@ export class WebGPUBackend implements Backend {
   /** Reset the dispatch counter to zero. */
   resetDispatchCount(): void {
     _dispatchCount = 0;
+  }
+
+  // ---------------------------------------------------------------------------
+  // GPU timestamp profiling (T3/P9)
+  // ---------------------------------------------------------------------------
+
+  /** Begin GPU timestamp profiling. Requires `timestamp-query` feature. */
+  startProfiling(): void {
+    if (!this.device.features.has("timestamp-query")) {
+      throw new Error("timestamp-query feature not available on this device");
+    }
+    if (_profilingQuerySet) {
+      throw new Error("Profiling already active — call stopProfiling() first");
+    }
+    _profilingQuerySet = this.device.createQuerySet({
+      type: "timestamp",
+      count: _MAX_PROFILING_PASSES * 2,
+    });
+    _profilingPassIdx = 0;
+  }
+
+  /** Stop profiling and return per-pass GPU timing results. */
+  async stopProfiling(): Promise<GpuTimingResult> {
+    const querySet = _profilingQuerySet;
+    const passCount = _profilingPassIdx;
+    _profilingQuerySet = null;
+    _profilingPassIdx = 0;
+
+    if (!querySet || passCount === 0) {
+      querySet?.destroy();
+      return { passes: [], totalMs: 0 };
+    }
+
+    const entryCount = passCount * 2;
+    const resolveSize = entryCount * 8; // BigUint64 = 8 bytes each
+
+    const resolveBuffer = this.device.createBuffer({
+      size: resolveSize,
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    });
+    const readBuffer = this.device.createBuffer({
+      size: resolveSize,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+
+    const encoder = this.device.createCommandEncoder();
+    encoder.resolveQuerySet(querySet, 0, entryCount, resolveBuffer, 0);
+    encoder.copyBufferToBuffer(resolveBuffer, 0, readBuffer, 0, resolveSize);
+    this.device.queue.submit([encoder.finish()]);
+
+    await readBuffer.mapAsync(GPUMapMode.READ);
+    const timestamps = new BigUint64Array(readBuffer.getMappedRange());
+
+    const passes: { durationMs: number }[] = [];
+    for (let i = 0; i < passCount; i++) {
+      const startNs = timestamps[i * 2];
+      const endNs = timestamps[i * 2 + 1];
+      passes.push({ durationMs: Number(endNs - startNs) / 1_000_000 });
+    }
+    const wallNs = timestamps[entryCount - 1] - timestamps[0];
+    const totalMs = Number(wallNs) / 1_000_000;
+
+    readBuffer.unmap();
+    readBuffer.destroy();
+    resolveBuffer.destroy();
+    querySet.destroy();
+
+    return { passes, totalMs };
   }
 
   /** Buffer pool diagnostic: pooled buffer count, pooled bytes, and byte budget. */
@@ -723,7 +818,7 @@ export class WebGPUBackend implements Backend {
 
       for (const { grid } of shader.passes) {
         if (prod(grid) === 0) continue;
-        const passEncoder = commandEncoder.beginComputePass();
+        const passEncoder = _beginComputePass(commandEncoder);
         passEncoder.setPipeline(pipeline);
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.dispatchWorkgroups(grid[0], grid[1]);
@@ -794,7 +889,7 @@ export class WebGPUBackend implements Backend {
       entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
     });
 
-    const passEncoder = commandEncoder.beginComputePass();
+    const passEncoder = _beginComputePass(commandEncoder);
     passEncoder.setPipeline(pipeline);
     passEncoder.setBindGroup(0, storageBindGroup);
     passEncoder.setBindGroup(1, uniformBindGroup);
@@ -1099,7 +1194,7 @@ export class WebGPUBackend implements Backend {
         const storageBindGroup = iter % 2 === 0 ? pingBindGroup : pongBindGroup;
 
         for (const { grid } of filteredPasses) {
-          const passEncoder = commandEncoder.beginComputePass();
+          const passEncoder = _beginComputePass(commandEncoder);
           passEncoder.setPipeline(pipeline);
           passEncoder.setBindGroup(0, storageBindGroup);
           passEncoder.setBindGroup(1, uniformBindGroup, [
@@ -1560,7 +1655,7 @@ export class WebGPUBackend implements Backend {
         for (const dispatch of entry.dispatches) {
           for (const { grid } of dispatch.passes) {
             if (grid[0] === 0 || grid[1] === 0) continue;
-            const pass = commandEncoder.beginComputePass();
+            const pass = _beginComputePass(commandEncoder);
             pass.setPipeline(dispatch.pipeline);
             pass.setBindGroup(0, storageBG);
             if (ubg) {
@@ -1837,7 +1932,7 @@ export class WebGPUBackend implements Backend {
         })),
       });
       const grid = shader.passes[0].grid;
-      const passEncoder = commandEncoder.beginComputePass();
+      const passEncoder = _beginComputePass(commandEncoder);
       passEncoder.setPipeline(shader.pipeline);
       passEncoder.setBindGroup(0, bindGroup0);
       passEncoder.setBindGroup(1, bindGroup1);
@@ -2203,7 +2298,7 @@ export class WebGPUBackend implements Backend {
             }
 
             for (let i = 0; i < d.passes.length; i++) {
-              const pe = encoder.beginComputePass();
+              const pe = _beginComputePass(encoder);
               pe.setPipeline(d.pipeline);
               pe.setBindGroup(0, bindGroup);
               if (d.uniformBindGroup) {
@@ -2415,7 +2510,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         { binding: 2, resource: { buffer: updBuf } },
       ],
     });
-    const pass = commandEncoder.beginComputePass();
+    const pass = _beginComputePass(commandEncoder);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(gridX, gridY);
@@ -2513,7 +2608,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         { binding: 3, resource: { buffer: uniformBuf, size: 256 } },
       ],
     });
-    const pass = commandEncoder.beginComputePass();
+    const pass = _beginComputePass(commandEncoder);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(M);
@@ -3880,7 +3975,7 @@ function pipelineSubmit(
 
     for (let i = 0; i < filteredPasses.length; i++) {
       const grid = symbolicGrid ?? filteredPasses[i].grid;
-      const passEncoder = commandEncoder.beginComputePass();
+      const passEncoder = _beginComputePass(commandEncoder);
       passEncoder.setPipeline(pipeline);
       passEncoder.setBindGroup(0, bindGroup);
       if (uniformBindGroup)

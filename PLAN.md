@@ -1134,43 +1134,33 @@ throughput increase.**
 5. **Fallback:** Keep current scalar tiled matmul as fallback when cooperative matrix is
    unavailable.
 
-### Tier 3: Timestamp queries for profiling
+### Tier 3: Timestamp queries for profiling ✅
 
 **What:** `timestamp-query` feature allows GPU-side timing of compute passes. Already in WebGPU spec
-(Chrome 121+), not yet wired up in jax-js.
+(Chrome 121+).
 
-**Where:** `pipelineSubmit` / `commandEncoder.beginComputePass` — record timestamps before/after
-each dispatch.
-
-**Impact:** Enables accurate per-kernel GPU timing without CPU round-trip overhead. Critical for
-validating that subgroup/WMMA optimizations actually improve wall-clock GPU time (vs just reducing
-dispatch count). Would replace the indirect "dispatch count" proxy we currently use for WebGPU
-performance analysis.
-
-**Implementation:** Add `profiling: boolean` option to `JitProgram.execute()`. When enabled, insert
-timestamp queries around each dispatch, readback the query buffer after execution, and return
-per-step timing data.
+**Implementation:** Module-level profiling state (`_profilingQuerySet`, `_profilingPassIdx`) with
+`_beginComputePass()` wrapper injects `timestampWrites` into all 9 compute pass creation sites.
+`WebGPUBackend.startProfiling()` / `stopProfiling()` manage the query set lifecycle. Public API:
+`profileGpu(fn)` returns `{ result, timing: GpuTimingResult }` with per-pass `durationMs` and
+wall-clock `totalMs`. Zero overhead when not profiling (`_profilingTimestampWrites()` returns
+`undefined`).
 
 ### Priority ordering
 
 | ID  | Feature                           | Availability | Impact        | Effort      |
 | --- | --------------------------------- | ------------ | ------------- | ----------- |
-| T0  | Decoupled Fallback prefix scan    | Now          | **Very High** | High        |
-| T3  | Timestamp queries                 | Now          | Diagnostic    | Low         |
+| T0  | Decoupled Fallback prefix scan    | Now          | **Very High** | **Done** ✅ |
+| T3  | Timestamp queries                 | Now          | Diagnostic    | **Done** ✅ |
 | 1b  | `subgroupShuffleUp` in assocScan  | Now          | Medium        | **Done** ✅ |
-| 1a  | `subgroupInclusive*` in assocScan | Now          | Medium        | Medium      |
+| 1a  | `subgroupInclusive*` in assocScan | Now          | Medium        | **Done** ✅ |
 | 1c  | `subgroupBroadcast` cleanup       | Now          | Low           | Low         |
 | 2   | Cooperative matrix tiled matmul   | ~2026        | **Very High** | High        |
 
-**Priority rationale:** Decoupled Fallback (T0) is the highest-impact item because it reduces
-associative scan from O(N log N) to O(N) work and from O(log N) to O(1) dispatches. For large N this
-is transformative. Timestamp queries (T3) are low-effort and provide the diagnostic infrastructure
-to validate T0's impact. The subgroup shuffle optimizations (1a, 1b) become less critical once
-Decoupled Fallback replaces the Kogge-Stone inner loop — but remain valuable for the
-within-workgroup raking scan phase of the Decoupled Fallback itself.
+**Priority rationale:** Decoupled Fallback (T0), subgroup scan builtins (1a, 1b), and timestamp
+queries (T3) are complete. T3 provides `profileGpu()` for per-pass GPU timing validation.
 
-**Next action:** Implement T3 (timestamp queries) for accurate GPU profiling, then T0 (Decoupled
-Fallback for scalar ops). Reference: `GPUPrefixSums` by Thomas Smith.
+**Next action:** 1c (`subgroupBroadcast`) is the remaining low priority/low impact cleanup item.
 
 ---
 

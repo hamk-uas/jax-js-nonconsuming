@@ -252,6 +252,7 @@ work around 256-byte alignment.
 | **Uniform buffers**         | Per-iteration offsets for `lax.scan`                                                                                                               |
 | **Subgroups**               | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in assocScan, `subgroupInclusiveAdd`/`Mul` for scalar assocScan |
 | **Atomic CAS + Store**      | Decoupled Fallback scan: inter-workgroup prefix propagation via bounded-spin + CAS fallback                                                        |
+| **timestamp-query**         | `profileGpu()` API via `_beginComputePass()` wrapper (P9) ✅                                                                                       |
 
 ### Features NOT exploited (opportunities)
 
@@ -260,7 +261,6 @@ work around 256-byte alignment.
 | **Indirect dispatch**         | GPU-driven workgroup counts        | No dynamic control flow needs it yet                  |
 | **Texture sampling**          | Hardware-accelerated interpolation | All ops use storage buffers                           |
 | **Atomic operations**         | Lock-free reductions, histograms   | Used by Decoupled Fallback scan (P10) and scatter-add |
-| **timestamp-query**           | GPU-side profiling                 | Not wired up yet; planned (P9)                        |
 | **Cooperative matrix (WMMA)** | Hardware tensor core matmul        | WGSL spec not stable; Dawn experimental; ~2026 (P7)   |
 
 ### WASM feature opportunities
@@ -407,7 +407,7 @@ runtime i32 param).
 All public symbols must be exported from `src/index.ts`. Key exports: `jit`, `grad`, `valueAndGrad`,
 `jvp`, `vjp`, `vmap`, `jacfwd`, `jacrev`, `hessian`, `linearize`, `makeJaxpr`, `init`,
 `defaultDevice`, `devicePut`, `blockUntilReady`, `scatterAdd`, `clearCaches`, `checkLeaks`, `numpy`,
-`lax`, `nn`, `random`, `scipySpecial`, `scipyLinalg`, `tree`, `ScanPath`.
+`lax`, `nn`, `random`, `scipySpecial`, `scipyLinalg`, `tree`, `ScanPath`, `profileGpu`.
 
 ## Commit checklist
 
@@ -760,21 +760,21 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 
 ## Future performance work
 
-| ID  | Title                     | Priority    | Description                                                                            |
-| --- | ------------------------- | ----------- | -------------------------------------------------------------------------------------- |
-| P1  | ~~Tiled matmul (WebGPU)~~ | **Done** ✅ | 53.7% peak FP32 at 4096×4096 (12,138 GFLOP/s). Implemented via `block_map`             |
-| P2  | Relaxed SIMD FMA          | Medium      | `f32x4.relaxed_madd` for 2× dot-product throughput. Safari doesn't support             |
-| P3  | i64 in wasmblr            | Medium      | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins                  |
-| P4  | Conv2d tuning             | Medium      | Benchmark now (tiled matmul gives free improvement). Specialized WGSL for 3×3, 5×5     |
-| P5  | Subgroup reductions       | **Done** ✅ | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions                          |
-| P6  | Benchmark validation      | Medium      | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions                 |
-| P7  | Cooperative matrix (WMMA) | Blocked     | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable; ~2026 earliest  |
-| P8  | Subgroup scan builtins    | **Done** ✅ | `subgroupShuffleUp` (general bodies) + `subgroupInclusiveAdd`/`Mul` (scalar add/mul)   |
-| P9  | Timestamp query profiling | Medium      | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)          |
-| P10 | Decoupled Fallback scan   | **Done** ✅ | Single-dispatch O(N) prefix scan (Phase 1: f32 scalar ops). See PLAN.md P7 T0          |
-| P11 | Analytical small linalg   | **Done** ✅ | Cholesky (n≤4), TriSolve (n≤8), QR (n≤8) as traced ops. Enables sqrt DLM fusion        |
-| P12 | WebGPU command tape       | **Done** ✅ | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs     |
-| P13 | WebGPU bind group cache   | **Done** ✅ | Bind group caching via GPUBuffer identity (pool LIFO). Arena reverted (spec violation) |
+| ID  | Title                     | Priority    | Description                                                                                 |
+| --- | ------------------------- | ----------- | ------------------------------------------------------------------------------------------- |
+| P1  | ~~Tiled matmul (WebGPU)~~ | **Done** ✅ | 53.7% peak FP32 at 4096×4096 (12,138 GFLOP/s). Implemented via `block_map`                  |
+| P2  | Relaxed SIMD FMA          | Medium      | `f32x4.relaxed_madd` for 2× dot-product throughput. Safari doesn't support                  |
+| P3  | i64 in wasmblr            | Medium      | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins                       |
+| P4  | Conv2d tuning             | Medium      | Benchmark now (tiled matmul gives free improvement). Specialized WGSL for 3×3, 5×5          |
+| P5  | Subgroup reductions       | **Done** ✅ | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions                               |
+| P6  | Benchmark validation      | Medium      | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions                      |
+| P7  | Cooperative matrix (WMMA) | Blocked     | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable; ~2026 earliest       |
+| P8  | Subgroup scan builtins    | **Done** ✅ | `subgroupShuffleUp` (general bodies) + `subgroupInclusiveAdd`/`Mul` (scalar add/mul)        |
+| P9  | Timestamp query profiling | **Done** ✅ | `profileGpu(fn)` returns per-pass `durationMs` + wall-clock `totalMs` via `timestamp-query` |
+| P10 | Decoupled Fallback scan   | **Done** ✅ | Single-dispatch O(N) prefix scan (Phase 1: f32 scalar ops). See PLAN.md P7 T0               |
+| P11 | Analytical small linalg   | **Done** ✅ | Cholesky (n≤4), TriSolve (n≤8), QR (n≤8) as traced ops. Enables sqrt DLM fusion             |
+| P12 | WebGPU command tape       | **Done** ✅ | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs          |
+| P13 | WebGPU bind group cache   | **Done** ✅ | Bind group caching via GPUBuffer identity (pool LIFO). Arena reverted (spec violation)      |
 
 ---
 
