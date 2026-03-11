@@ -1282,6 +1282,10 @@ export function blockMapFusedShaderSource(
   if (wgSizeY > 1 || wgSizeZ > 1) wgSizeStr += `, ${wgSizeY}`;
   if (wgSizeZ > 1) wgSizeStr += `, ${wgSizeZ}`;
 
+  // Determine if we can use subgroupShuffleUp for assocScan Kogge-Stone rounds.
+  // Conservative: 3 rounds (stride ≤ 4) guaranteed within any subgroup (min sg_size=8).
+  const useSubgroupShuffle = hasSubgroups && workgroupAssocScans.length > 0;
+
   emit("", `@compute @workgroup_size(${wgSizeStr})`);
   if (hasSubgroups) {
     emit(
@@ -1289,6 +1293,9 @@ export function blockMapFusedShaderSource(
       `  @builtin(local_invocation_index) tidx: u32,`,
       `  @builtin(workgroup_id) wg_id: vec3<u32>,`,
       `  @builtin(subgroup_size) sg_size: u32,`,
+      ...(useSubgroupShuffle
+        ? [`  @builtin(subgroup_invocation_id) sg_inv_id: u32,`]
+        : []),
       ") {",
       pushIndent,
     );
@@ -3172,10 +3179,308 @@ export function blockMapFusedShaderSource(
       }
       emit("workgroupBarrier();");
 
-      // Unrolled Kogge-Stone rounds
+      // --- Subgroup-local Kogge-Stone rounds via subgroupShuffleUp ---
+      // Conservative: 3 rounds (stride ≤ 4) guaranteed within any subgroup
+      // (all known hardware has sg_size ≥ 8). For rounds where stride ≥ sg_size,
+      // the sg_inv_id guard prevents undefined shuffled values from being used,
+      // making those rounds harmless no-ops.
+      const sgRounds = useSubgroupShuffle ? Math.min(3, was.numRounds) : 0;
+
+      if (sgRounds > 0) {
+        // Register variables to hold per-thread leaf values during subgroup
+        // rounds. Avoids shared-memory writes + workgroupBarrier().
+        for (let e = 0; e < was.numElems; e++) {
+          const ty = dtypeToWgsl(was.elemDtypes[e], false);
+          const ec = was.elemCounts[e];
+          const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
+          const pingName = was.pingPongNames[e][0];
+          if (ec > 1) {
+            emit(`var ${regName}: array<${ty}, ${ec}>;`);
+            for (let ei = 0; ei < ec; ei++) {
+              emit(`${regName}[${ei}u] = ${pingName}[tidx * ${ec}u + ${ei}u];`);
+            }
+          } else {
+            emit(`var ${regName}: ${ty} = ${pingName}[tidx];`);
+          }
+        }
+
+        for (let r = 0; r < sgRounds; r++) {
+          const stride = 1 << r;
+
+          // Shuffle each leaf's elements via subgroupShuffleUp
+          for (let e = 0; e < was.numElems; e++) {
+            const ty = dtypeToWgsl(was.elemDtypes[e], false);
+            const ec = was.elemCounts[e];
+            const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
+            const shName = `was_sg_a_${entry.wasIdx}_r${r}_${e}`;
+            if (ec > 1) {
+              emit(`var ${shName}: array<${ty}, ${ec}>;`);
+              for (let ei = 0; ei < ec; ei++) {
+                emit(
+                  `${shName}[${ei}u] = subgroupShuffleUp(${regName}[${ei}u], ${stride}u);`,
+                );
+              }
+            } else {
+              emit(
+                `let ${shName}: ${ty} = subgroupShuffleUp(${regName}, ${stride}u);`,
+              );
+            }
+          }
+
+          // Guard: only invocations with sg_inv_id ≥ stride apply the compose.
+          // Invocations below stride keep their register value unchanged.
+          emit(`if (sg_inv_id >= ${stride}u) {`, pushIndent);
+
+          // Emit body kernels with register-based resolution
+          for (let bsi = 0; bsi < was.bodyKernels.length; bsi++) {
+            const { step: bStep, kernel: bKernel } = was.bodyKernels[bsi];
+
+            // Build per-step input resolution (same as shmem path)
+            const bStepInputKind: ("const" | "a" | "b" | "shmem")[] = [];
+            const bStepInputElemIdx: number[] = [];
+            for (let j = 0; j < bStep.inputs.length; j++) {
+              const jitId = bStep.inputs[j];
+              const biIdx = was.bodyInputIds.indexOf(jitId);
+              if (biIdx >= 0 && biIdx < numBodyConsts) {
+                bStepInputKind.push("const");
+                bStepInputElemIdx.push(-1);
+              } else if (
+                biIdx >= numBodyConsts &&
+                biIdx < numBodyConsts + was.numElems
+              ) {
+                bStepInputKind.push("a");
+                bStepInputElemIdx.push(biIdx - numBodyConsts);
+              } else if (biIdx >= numBodyConsts + was.numElems) {
+                bStepInputKind.push("b");
+                bStepInputElemIdx.push(biIdx - numBodyConsts - was.numElems);
+              } else {
+                bStepInputKind.push("shmem");
+                bStepInputElemIdx.push(-1);
+              }
+            }
+
+            // Resolve reads from shuffled registers (a) and current registers (b)
+            const sgResolve: ResolveGlobalIndex = (
+              bufIdx,
+              indexExpr,
+              dtype,
+            ) => {
+              const kind = bStepInputKind[bufIdx];
+              if (kind === "const") {
+                const biIdx2 = was.bodyInputIds.indexOf(bStep.inputs[bufIdx]);
+                const inf = bodyInputInfo[biIdx2];
+                if (inf.name === BLOCK_IDX_SENTINEL) return `i32(block_idx)`;
+                if (inf.isGlobal) {
+                  if (inf.parentInputIdx >= 0) {
+                    const remapped = inRemap(inf.parentInputIdx, indexExpr);
+                    const readExpr = `${inf.name}[i32(in_base_${inf.parentInputIdx}) + ${remapped}]`;
+                    return hasBoundary
+                      ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
+                      : readExpr;
+                  }
+                  return `${inf.name}[${indexExpr}]`;
+                }
+                return `${inf.name}[${indexExpr}]`;
+              } else if (kind === "a") {
+                const e = bStepInputElemIdx[bufIdx];
+                const shName = `was_sg_a_${entry.wasIdx}_r${r}_${e}`;
+                const ec = was.elemCounts[e];
+                return ec > 1 ? `${shName}[u32(${indexExpr})]` : shName;
+              } else if (kind === "b") {
+                const e = bStepInputElemIdx[bufIdx];
+                const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
+                const ec = was.elemCounts[e];
+                return ec > 1 ? `${regName}[u32(${indexExpr})]` : regName;
+              }
+              // shmem intermediate (var<private>)
+              const sname = bodyIdToName.get(bStep.inputs[bufIdx]);
+              return `${sname ?? "__unknown"}[${indexExpr}]`;
+            };
+
+            const gen = createGen(
+              bKernel,
+              `was${entry.wasIdx}_sg${r}_s${bsi}`,
+              sgResolve,
+            );
+
+            for (let oi = 0; oi < bKernel.numOutputs; oi++) {
+              const outId = bStep.outputs[oi];
+
+              // --- Reduction kernel: gidx loop + ridx accumulation ---
+              const bRe = bKernel.outputs[oi]?.reduction ?? null;
+              if (bRe) {
+                const reDtype = bRe.dtype;
+                const reTy = dtypeToWgsl(reDtype, false);
+                const bodyDtype = bKernel.outputs[oi].dtype;
+                const reSize = bRe.size as number;
+                const bodyExp = bKernel.outputs[oi].exp;
+                const kernelSize = bKernel.size as number;
+                const prefix = `was${entry.wasIdx}_sg${r}_s${bsi}`;
+                const isIdentityEpilogue =
+                  bRe.epilogue.op === AluOp.Variable &&
+                  bRe.epilogue.arg === "acc";
+
+                emit(
+                  `for (var gidx: i32 = 0; gidx < ${kernelSize}; gidx++) {`,
+                  pushIndent,
+                );
+                const accName = `${prefix}_acc`;
+                emit(
+                  `var ${accName}: ${reTy} = ${constToWgsl(reDtype, bRe.identity)};`,
+                );
+                const UNROLL_THRESHOLD = 8;
+                const emitAccum = (rhs: string) => {
+                  const castRhs = wgslCastReductionRhs(rhs, bodyDtype, reDtype);
+                  emit(wgslReductionAccumStmt(bRe.op, accName, castRhs));
+                };
+                if (reSize <= UNROLL_THRESHOLD) {
+                  for (let ri = 0; ri < reSize; ri++) {
+                    const riGen = createGen(
+                      bKernel,
+                      `${prefix}_r${ri}`,
+                      sgResolve,
+                      undefined,
+                      undefined,
+                      AluExp.i32(ri),
+                    );
+                    emitAccum(strip1(riGen(bodyExp)));
+                  }
+                } else {
+                  emit(
+                    `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
+                    pushIndent,
+                  );
+                  emitAccum(strip1(gen(bodyExp)));
+                  emit(popIndent, "}");
+                }
+                let finalValue: string;
+                if (isIdentityEpilogue) {
+                  finalValue = accName;
+                } else {
+                  const epGen = createGen(
+                    bKernel,
+                    `${prefix}_ep`,
+                    sgResolve,
+                    new Map([["acc", accName]]),
+                  );
+                  finalValue = strip1(epGen(bRe.epilogue));
+                }
+                // Write to register
+                const bodyOutIdx = was.bodyOutputIds.indexOf(outId);
+                if (bodyOutIdx >= 0) {
+                  const e = bodyOutIdx;
+                  const ec = was.elemCounts[e];
+                  const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
+                  if (ec > 1) {
+                    emit(
+                      `${regName}[u32(gidx)] = ${dtypeToWgsl(was.elemDtypes[e])}(${finalValue});`,
+                    );
+                  } else {
+                    emit(
+                      `${regName} = ${dtypeToWgsl(was.elemDtypes[e])}(${finalValue});`,
+                    );
+                  }
+                } else {
+                  const sname = bodyIdToName.get(outId);
+                  if (sname) emit(`${sname}[gidx] = ${finalValue};`);
+                }
+                emit(popIndent, "}"); // end gidx loop
+                continue;
+              }
+
+              // --- Elementwise kernel ---
+              const bodyOutIdx = was.bodyOutputIds.indexOf(outId);
+              if (bodyOutIdx >= 0) {
+                const e = bodyOutIdx;
+                const ec = was.elemCounts[e];
+                const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
+                if (ec > 1) {
+                  emit(
+                    `for (var _was_oi: u32 = 0u; _was_oi < ${ec}u; _was_oi++) {`,
+                    pushIndent,
+                  );
+                  const genEi = createGen(
+                    bKernel,
+                    `was${entry.wasIdx}_sg${r}_s${bsi}_ei`,
+                    (bufIdx2, _indexExpr, dtype2) => {
+                      const kind2 = bStepInputKind[bufIdx2];
+                      if (kind2 === "const") {
+                        const biIdx2 = was.bodyInputIds.indexOf(
+                          bStep.inputs[bufIdx2],
+                        );
+                        const inf2 = bodyInputInfo[biIdx2];
+                        if (inf2.name === BLOCK_IDX_SENTINEL)
+                          return `i32(block_idx)`;
+                        if (inf2.isGlobal && inf2.parentInputIdx >= 0) {
+                          const remapped2 = inRemap(
+                            inf2.parentInputIdx,
+                            "i32(_was_oi)",
+                          );
+                          const readExpr2 = `${inf2.name}[i32(in_base_${inf2.parentInputIdx}) + ${remapped2}]`;
+                          return hasBoundary
+                            ? `select(${dtypeToWgsl(dtype2)}(0), ${readExpr2}, valid)`
+                            : readExpr2;
+                        }
+                        return `${inf2.name}[i32(_was_oi)]`;
+                      } else if (kind2 === "a") {
+                        const e2 = bStepInputElemIdx[bufIdx2];
+                        return `was_sg_a_${entry.wasIdx}_r${r}_${e2}[_was_oi]`;
+                      } else if (kind2 === "b") {
+                        const e2 = bStepInputElemIdx[bufIdx2];
+                        return `was_sg_reg_${entry.wasIdx}_${e2}[_was_oi]`;
+                      }
+                      const sname = bodyIdToName.get(bStep.inputs[bufIdx2]);
+                      return `${sname ?? "__unknown"}[i32(_was_oi)]`;
+                    },
+                  );
+                  const rhsEi = strip1(genEi(bKernel.outputs[oi].exp));
+                  emit(`${regName}[_was_oi] = ${rhsEi};`);
+                  emit(popIndent, "}");
+                } else {
+                  const rhs = strip1(gen(bKernel.outputs[oi].exp));
+                  emit(`${regName} = ${rhs};`);
+                }
+              } else {
+                // Body intermediate → write to var<private>
+                const rhs = strip1(gen(bKernel.outputs[oi].exp));
+                const sname = bodyIdToName.get(outId);
+                if (sname) {
+                  emit(
+                    `${sname}[${bKernel.numOutputs > 1 ? `i32(tidx) * ${bKernel.numOutputs} + ${oi}` : "tidx"}] = ${rhs};`,
+                  );
+                }
+              }
+            }
+          }
+
+          emit(popIndent, "}"); // end if (sg_inv_id >= stride)
+        }
+
+        // Flush registers to the shmem buffer that the first shmem round will
+        // read from: readBuf[sgRounds] = sgRounds % 2 === 0 ? ping : pong.
+        const flushNames = was.pingPongNames.map(([ping, pong]) =>
+          sgRounds % 2 === 0 ? ping : pong,
+        );
+        for (let e = 0; e < was.numElems; e++) {
+          const ec = was.elemCounts[e];
+          const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
+          if (ec > 1) {
+            for (let ei = 0; ei < ec; ei++) {
+              emit(
+                `${flushNames[e]}[tidx * ${ec}u + ${ei}u] = ${regName}[${ei}u];`,
+              );
+            }
+          } else {
+            emit(`${flushNames[e]}[tidx] = ${regName};`);
+          }
+        }
+        emit("workgroupBarrier();");
+      }
+
+      // Unrolled Kogge-Stone shmem rounds (inter-subgroup communication)
       // Even rounds: read from ping, write to pong
       // Odd rounds: read from pong, write to ping
-      for (let r = 0; r < was.numRounds; r++) {
+      for (let r = sgRounds; r < was.numRounds; r++) {
         const stride = 1 << r;
         const readNames = was.pingPongNames.map(([ping, pong]) =>
           r % 2 === 0 ? ping : pong,

@@ -1020,7 +1020,7 @@ inclusive scan builtin doesn't help unless we can decompose the body into scalar
 4. Continue normal inter-subgroup Kogge-Stone for the remaining rounds
 5. Requires `enable subgroups;` already present
 
-#### 1b. `subgroupShuffle` / `subgroupShuffleUp` for associative scan (general bodies)
+#### 1b. `subgroupShuffle` / `subgroupShuffleUp` for associative scan (general bodies) — **Done** ✅
 
 **What:** For general associative bodies (not just add/mul), replace `var<workgroup>` reads within a
 Kogge-Stone round with register-to-register shuffles. Each thread gets its neighbor's value via
@@ -1032,14 +1032,18 @@ Kogge-Stone round with register-to-register shuffles. Each thread gets its neigh
 (1 dispatch, 1 block), this removes 5 of 8 shmem barrier pairs. The shmem barrier cost is small
 relative to the actual compute, but for small bodies this could yield **10–20% improvement**.
 
-**Implementation sketch:**
+**Implementation (completed):**
 
-1. For rounds where `offset < subgroup_size`, emit `subgroupShuffleUp` instead of shmem write+read
-2. The body function operates on register-resident values — no shmem allocation needed for these
-   rounds
-3. After subgroup-local rounds complete, fall back to shmem path for inter-subgroup communication
-4. `subgroupShuffleUp(val, offset)` requires `offset` to be dynamically uniform or compile-time
-   constant — in Kogge-Stone, the offset per round is a constant power of 2, so this works
+1. Conservative approach: 3 unconditional subgroup rounds (stride 1, 2, 4 — safe for minimum
+   subgroup size of 8 across all WebGPU hardware)
+2. Register variables (`var<private>`) hold leaf values during subgroup phase
+3. `subgroupShuffleUp(val, stride)` per leaf sub-element per round, guarded by `sg_inv_id >= stride`
+4. Compose body called with register-based resolution (`sgResolve`) — "a" reads shuffled registers,
+   "b" reads current registers
+5. After subgroup rounds: flush registers to shmem + single `workgroupBarrier()`
+6. Remaining rounds use existing shmem Kogge-Stone path (starting from round `sgRounds`)
+7. Both reduction kernel (gidx loop + ridx accumulation) and elementwise kernel paths supported
+8. `@builtin(subgroup_invocation_id) sg_inv_id: u32` added to entry point when active
 
 #### 1c. `subgroupBroadcast` for scan carry / block-map constants
 
@@ -1129,14 +1133,14 @@ per-step timing data.
 
 ### Priority ordering
 
-| ID  | Feature                           | Availability | Impact        | Effort |
-| --- | --------------------------------- | ------------ | ------------- | ------ |
-| T0  | Decoupled Fallback prefix scan    | Now          | **Very High** | High   |
-| T3  | Timestamp queries                 | Now          | Diagnostic    | Low    |
-| 1b  | `subgroupShuffleUp` in assocScan  | Now          | Medium        | Medium |
-| 1a  | `subgroupInclusive*` in assocScan | Now          | Medium        | Medium |
-| 1c  | `subgroupBroadcast` cleanup       | Now          | Low           | Low    |
-| 2   | Cooperative matrix tiled matmul   | ~2026        | **Very High** | High   |
+| ID  | Feature                           | Availability | Impact        | Effort      |
+| --- | --------------------------------- | ------------ | ------------- | ----------- |
+| T0  | Decoupled Fallback prefix scan    | Now          | **Very High** | High        |
+| T3  | Timestamp queries                 | Now          | Diagnostic    | Low         |
+| 1b  | `subgroupShuffleUp` in assocScan  | Now          | Medium        | **Done** ✅ |
+| 1a  | `subgroupInclusive*` in assocScan | Now          | Medium        | Medium      |
+| 1c  | `subgroupBroadcast` cleanup       | Now          | Low           | Low         |
+| 2   | Cooperative matrix tiled matmul   | ~2026        | **Very High** | High        |
 
 **Priority rationale:** Decoupled Fallback (T0) is the highest-impact item because it reduces
 associative scan from O(N log N) to O(N) work and from O(log N) to O(1) dispatches. For large N this
