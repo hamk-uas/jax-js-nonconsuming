@@ -253,6 +253,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `.trim();
 
+// --- GPU dispatch counter (module-level for pipelineSubmit access) ---
+let _dispatchCount = 0;
+
 /** Implementation of `Backend` that uses WebGPU in browsers. */
 export class WebGPUBackend implements Backend {
   readonly type: Device = "webgpu";
@@ -382,6 +385,16 @@ export class WebGPUBackend implements Backend {
   /** Reset the peak memory watermark to the current allocation level. */
   resetPeakGpuAllocatedBytes(): void {
     this.#gpuPeakBytes = this.#gpuAllocatedBytes;
+  }
+
+  /** Number of GPU compute dispatches since last reset. */
+  get dispatchCount(): number {
+    return _dispatchCount;
+  }
+
+  /** Reset the dispatch counter to zero. */
+  resetDispatchCount(): void {
+    _dispatchCount = 0;
   }
 
   /** Buffer pool diagnostic: pooled buffer count, pooled bytes, and byte budget. */
@@ -704,6 +717,7 @@ export class WebGPUBackend implements Backend {
         passEncoder.setPipeline(pipeline);
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.dispatchWorkgroups(grid[0], grid[1]);
+        _dispatchCount++;
         passEncoder.end();
       }
     }
@@ -775,6 +789,7 @@ export class WebGPUBackend implements Backend {
     passEncoder.setBindGroup(0, storageBindGroup);
     passEncoder.setBindGroup(1, uniformBindGroup);
     passEncoder.dispatchWorkgroups(gridX, gridY);
+    _dispatchCount++;
     passEncoder.end();
 
     return uniformBuffer;
@@ -1081,6 +1096,7 @@ export class WebGPUBackend implements Backend {
             iter * offsetAlignment,
           ]);
           passEncoder.dispatchWorkgroups(grid[0], grid[1]);
+          _dispatchCount++;
           passEncoder.end();
         }
 
@@ -1541,6 +1557,7 @@ export class WebGPUBackend implements Backend {
               pass.setBindGroup(1, ubg, [iter * entry.offsetAlignment]);
             }
             pass.dispatchWorkgroups(grid[0], grid[1]);
+            _dispatchCount++;
             pass.end();
           }
         }
@@ -1805,6 +1822,7 @@ export class WebGPUBackend implements Backend {
       passEncoder.setBindGroup(0, bindGroup0);
       passEncoder.setBindGroup(1, bindGroup1);
       passEncoder.dispatchWorkgroups(grid[0], grid[1]);
+      _dispatchCount++;
       passEncoder.end();
       if (!this.#batchEncoder) {
         this.device.queue.submit([commandEncoder.finish()]);
@@ -2019,6 +2037,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(gridX, gridY);
+    _dispatchCount++;
     pass.end();
     this.device.queue.submit([commandEncoder.finish()]);
   }
@@ -3383,6 +3402,7 @@ function pipelineSubmit(
       if (uniformBindGroup)
         passEncoder.setBindGroup(1, uniformBindGroup, [i * uniformAlignment]);
       passEncoder.dispatchWorkgroups(grid[0], grid[1]);
+      _dispatchCount++;
       passEncoder.end();
     }
   }
