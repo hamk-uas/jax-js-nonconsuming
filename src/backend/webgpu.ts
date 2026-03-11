@@ -2070,6 +2070,10 @@ export class WebGPUBackend implements Backend {
 
     // Track allocated buffers for error cleanup.
     const allocs: GPUBuffer[] = [];
+    // Buffers freed mid-tape must NOT be destroyed until after queue.submit()
+    // because earlier dispatches in the same GPUCommandEncoder still reference
+    // them.  Defer destruction to post-submit.
+    const deferredDestroys: GPUBuffer[] = [];
     let submitted = false;
 
     try {
@@ -2084,19 +2088,18 @@ export class WebGPUBackend implements Backend {
             } else {
               let buf: GPUBuffer;
               if (m.initialData) {
-                const pooled = this.#poolPop(m.paddedSize);
-                if (pooled) {
-                  buf = pooled;
-                  this.#writeBufferUnaligned(buf, m.initialData);
-                } else {
-                  buf = this.#createBuffer(m.paddedSize, { mapped: true });
-                  new Uint8Array(
-                    buf.getMappedRange(),
-                    0,
-                    m.initialData.byteLength,
-                  ).set(m.initialData);
-                  buf.unmap();
-                }
+                // Always create fresh mapped buffers for initialData: a pooled
+                // buffer may have been written by an earlier dispatch in this
+                // same encoder, and queue.writeBuffer() executes BEFORE the
+                // encoder's dispatches — so the dispatch would overwrite the
+                // constant data.
+                buf = this.#createBuffer(m.paddedSize, { mapped: true });
+                new Uint8Array(
+                  buf.getMappedRange(),
+                  0,
+                  m.initialData.byteLength,
+                ).set(m.initialData);
+                buf.unmap();
               } else {
                 buf =
                   this.#poolPop(m.paddedSize) ??
@@ -2112,8 +2115,7 @@ export class WebGPUBackend implements Backend {
             const buf = buffers[op.tableIdx];
             if (buf && buf !== this.#reusableZsb) {
               if (!this.#poolPush(buf)) {
-                this.#gpuAllocatedBytes -= buf.size;
-                buf.destroy();
+                deferredDestroys.push(buf);
               }
             }
             break;
@@ -2214,6 +2216,13 @@ export class WebGPUBackend implements Backend {
           }
         }
       }
+    }
+
+    // Now safe to destroy buffers that couldn't fit in the pool — the command
+    // buffer has been submitted, so references are no longer live.
+    for (const buf of deferredDestroys) {
+      this.#gpuAllocatedBytes -= buf.size;
+      buf.destroy();
     }
 
     // Create output slots

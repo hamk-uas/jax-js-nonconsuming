@@ -1,4 +1,5 @@
 import { byteWidth, DType, isFloatDtype } from "../alu";
+import { defaultDevice } from "../backend";
 import { PPrint } from "../pprint";
 import {
   concreteDim,
@@ -2027,9 +2028,14 @@ export function jit<F extends (...args: any[]) => any>(
 
     const avalsIn = treeUnflatten(inTree, avalsForCache) as any[];
     const jaxprArgs = joinIdx(args.length, staticArgs, avalsIn, staticArgnums);
-    const { jaxpr, treedef: outTree } = runWithCache(cache, jaxprArgs, () => {
-      return makeJaxpr(f, opts)(...jaxprArgs);
-    });
+    // Include backend type: ClosedJaxpr consts are concrete arrays living on
+    // whichever device was active at first trace. Cross-device reuse would
+    // read stale data from the wrong backend.
+    const { jaxpr, treedef: outTree } = runWithCache(
+      cache,
+      [defaultDevice(), ...jaxprArgs],
+      () => makeJaxpr(f, opts)(...jaxprArgs),
+    );
 
     const outs = bind(Primitive.Jit, [...jaxpr.consts, ...argsFlat], {
       name: f.name || "closure",

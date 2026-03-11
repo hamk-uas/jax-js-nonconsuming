@@ -1,4 +1,5 @@
 import { DType } from "../alu";
+import { defaultDevice } from "../backend";
 import { assertNonNull, checkAxis, range, rep, unzip2, zip } from "../utils";
 import { arange, eye, fullInternal, pureArray } from "./array";
 import {
@@ -923,7 +924,10 @@ export function vmapJaxpr(
   axisSize: number,
   dims: (number | null)[],
 ): ClosedJaxpr {
-  const cacheKey = JSON.stringify([axisSize, dims]); // deterministic
+  // Include backend type: consts in the cached ClosedJaxpr are concrete arrays
+  // living on whichever device was active at first vmap. Cross-device reuse
+  // would read stale data from the wrong backend.
+  const cacheKey = defaultDevice() + "," + JSON.stringify([axisSize, dims]);
   const prevResult = vmapJaxprCache.get(jaxpr)?.get(cacheKey);
   if (prevResult) return prevResult;
 

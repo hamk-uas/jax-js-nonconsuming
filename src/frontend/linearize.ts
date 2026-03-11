@@ -2,6 +2,7 @@
 // jax-js-lint: allow-ref — .ref is the core ownership mechanism in autodiff internals
 
 import { AluOp, type DType, isFloatDtype } from "../alu";
+import { defaultDevice } from "../backend";
 import { type Dim, dimSub, hasSymbolicDims } from "../dim";
 import {
   dispose as treeDispose,
@@ -3723,7 +3724,10 @@ _registerCacheSizeGetter("transposeJaxpr", () => {
 });
 
 function transposeJaxpr(jaxpr: Jaxpr, undefPrimals: boolean[]): ClosedJaxpr {
-  const cacheKey = JSON.stringify(undefPrimals); // deterministic
+  // Include backend type: consts in the cached ClosedJaxpr are concrete arrays
+  // living on whichever device was active at first transpose. Cross-device reuse
+  // would read stale data from the wrong backend.
+  const cacheKey = defaultDevice() + "," + JSON.stringify(undefPrimals);
   const prevResult = transposeJaxprCache.get(jaxpr)?.get(cacheKey);
   if (prevResult) return prevResult;
 

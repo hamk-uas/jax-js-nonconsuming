@@ -1,5 +1,6 @@
 import { DType } from "../alu";
 import { AluOp, isFloatDtype } from "../alu";
+import { defaultDevice } from "../backend";
 import { Pair } from "../shape";
 import {
   JsTree,
@@ -1133,22 +1134,27 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   },
 };
 
-const jvpJaxprCache = new Map<Jaxpr, ClosedJaxpr>();
+const jvpJaxprCacheByBackend = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
 
 // Register for cleanup during checkLeaks.stop() to avoid leaking
 // ClosedJaxpr consts (e.g., zerosLike tangents) across test boundaries.
 _registerJitCacheDisposer(() => {
-  for (const cj of jvpJaxprCache.values()) {
-    cj.dispose();
+  for (const inner of jvpJaxprCacheByBackend.values()) {
+    for (const cj of inner.values()) {
+      cj.dispose();
+    }
   }
-  jvpJaxprCache.clear();
+  jvpJaxprCacheByBackend.clear();
 });
-_registerCacheSizeGetter("jvpJaxpr", () => jvpJaxprCache.size);
+_registerCacheSizeGetter("jvpJaxpr", () => jvpJaxprCacheByBackend.size);
 
 function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
-  if (jvpJaxprCache.has(jaxpr)) {
-    return jvpJaxprCache.get(jaxpr)!;
-  }
+  // Include backend type: consts in the cached ClosedJaxpr (e.g. zero tangents)
+  // are concrete arrays on whichever device was active at first JVP. Cross-device
+  // reuse would read stale data from the wrong backend.
+  const backendKey = defaultDevice();
+  const cached = jvpJaxprCacheByBackend.get(jaxpr)?.get(backendKey);
+  if (cached) return cached;
 
   // Note: Following the implementation in Autodidax, consts in the Jaxpr become
   // real inputs after JVP transformation, since they are part of the primals
@@ -1163,7 +1169,12 @@ function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
       jvpFlat(jaxprAsFun(jaxpr), primals, tangents),
   )(inAvals, inAvals);
 
-  jvpJaxprCache.set(jaxpr, newJaxpr);
+  let inner = jvpJaxprCacheByBackend.get(jaxpr);
+  if (!inner) {
+    inner = new Map();
+    jvpJaxprCacheByBackend.set(jaxpr, inner);
+  }
+  inner.set(backendKey, newJaxpr);
   return newJaxpr;
 }
 
