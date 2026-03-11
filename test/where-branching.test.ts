@@ -8,27 +8,12 @@
  * These tests verify correctness of the branching codegen, including edge
  * cases around shared subexpressions (CSE) between arms.
  */
-import {
-  defaultDevice,
-  devices,
-  grad,
-  init,
-  jit,
-  lax,
-  nn,
-  numpy as np,
-} from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { grad, jit, lax, nn, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { expect, suite, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
 
-suite.each(devices)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite(() => {
   suite("where branching correctness", () => {
     test("where with exp in one arm (ELU pattern)", () => {
       // elu(x) = where(x > 0, x, alpha * (exp(x) - 1))

@@ -1,25 +1,16 @@
 // Tests for functions in `jax.scipySpecial`.
 
 import {
-  defaultDevice,
-  devices,
   grad,
-  init,
   numpy as np,
   scipySpecial as special,
   vmap,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { expect, suite, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
 
-suite.each(devices)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite(() => {
   suite("jax.scipySpecial.erf()", () => {
     const erfValues = [
       [-10, -5, -1, -0.5, 0, 0.001, 0.1, 1, 5, 10],

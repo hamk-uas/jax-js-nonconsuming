@@ -1033,6 +1033,19 @@ Kogge-Stone round with register-to-register shuffles. Each thread gets its neigh
 barrier cost is small relative to the actual compute, but for small bodies this could yield **10–20%
 improvement**.
 
+**Measured impact (dlm-js Nile m=2 model, RTX 4070 Ti SUPER):**
+
+| N         | v0.8.2 baseline (ms) | 59f03a6 + subgroups (ms) | Δ     |
+| --------- | -------------------- | ------------------------ | ----- |
+| 100       | 1,275                | 1,286                    | +0.9% |
+| 102,400   | 2,462                | 2,464                    | +0.1% |
+| 819,200   | 6,087                | 5,997                    | −1.5% |
+| 1,638,400 | 9,886                | 9,918                    | +0.3% |
+
+No measurable speedup. For the Nile m=2 model the compose body is so small that shmem barriers
+aren't the bottleneck — dispatch overhead and compilation time dominate. Subgroups may show more
+benefit on larger state dimensions (m ≥ 5) where the compose body is heavier.
+
 **Implementation (completed):**
 
 1. All-or-nothing runtime guard: `if (sg_size >= 8u)` wraps the entire subgroup path. Either all 3

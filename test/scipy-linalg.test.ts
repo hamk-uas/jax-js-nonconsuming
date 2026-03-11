@@ -1,23 +1,16 @@
 import {
-  defaultDevice,
-  Device,
+  type Device,
   grad,
-  init,
   numpy as np,
   scipyLinalg,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { expect, suite, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
+
 const devicesWithLinalg: Device[] = ["cpu", "wasm", "webgpu"];
 
-suite.each(devicesWithLinalg)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite(() => {
   suite("scipy.linalg.solveTriangular()", () => {
     test("solves lower triangular system", () => {
       using L = np.array([
@@ -131,4 +124,4 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       expect(reconstructed).toBeAllclose(A, { atol: 1e-5 });
     });
   });
-});
+}, devicesWithLinalg);

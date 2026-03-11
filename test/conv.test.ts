@@ -1,26 +1,17 @@
 // Tests for convolution-related operations.
 
 import {
-  defaultDevice,
-  devices,
   grad,
-  init,
   jit,
   lax,
   numpy as np,
   vmap,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { expect, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
 
-suite.each(devices)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite(() => {
   test("1d convolution", () => {
     using x = np.array([[[1, 2, 3, 4, 5]]]);
     using y = np.array([[[2, 0.5, -1]]]);

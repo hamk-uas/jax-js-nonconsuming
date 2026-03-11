@@ -1,20 +1,9 @@
-import {
-  defaultDevice,
-  devices,
-  init,
-  numpy as np,
-} from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { expect, suite, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
 
-suite.each(devices)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite(() => {
   suite("jax.numpy.fft.fft()", () => {
     test("computes FFT of a simple real input", async () => {
       using real = np.array([0, 1, 2, 3]);

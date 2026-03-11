@@ -1,8 +1,6 @@
 import {
-  defaultDevice,
-  Device,
+  type Device,
   grad,
-  init,
   jit,
   jvp,
   lax,
@@ -10,18 +8,13 @@ import {
   random,
   vmap,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { expect, suite, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
+
 const devicesWithLinalg: Device[] = ["cpu", "wasm", "webgpu"];
 
-suite.each(devicesWithLinalg)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite((device) => {
   suite("jax.lax.linalg.cholesky()", () => {
     test("computes lower Cholesky decomposition for 2x2 matrix", () => {
       using x = np.array([
@@ -963,4 +956,4 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       expect(dA_reconstructed).toBeAllclose(dA, { atol: 1e-4 });
     });
   });
-});
+}, devicesWithLinalg);
