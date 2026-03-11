@@ -258,7 +258,7 @@ work around 256-byte alignment.
 | ----------------------------- | ----------------------------------- | --------------------------------------------------- |
 | **Indirect dispatch**         | GPU-driven workgroup counts         | No dynamic control flow needs it yet                |
 | **Texture sampling**          | Hardware-accelerated interpolation  | All ops use storage buffers                         |
-| **Atomic operations**         | Lock-free reductions, histograms    | Reductions via shader accumulation                  |
+| **Atomic operations**         | Lock-free reductions, histograms    | Planned for Decoupled Fallback scan (P10)           |
 | **timestamp-query**           | GPU-side profiling                  | Not wired up yet; planned (P9)                      |
 | **subgroupInclusiveAdd/Mul**  | Hardware prefix sum within subgroup | Planned for assocScan (P8); Chrome 134+             |
 | **subgroupShuffleUp**         | Register-to-register scan neighbors | Planned for assocScan (P8); Chrome 134+             |
@@ -576,6 +576,10 @@ const result = lax.associativeScan(fn, elems, { axis?, reverse? });
 
 Uses Kogge-Stone doubling: O(N log N) work, O(log N) depth. ceil(log₂ N) parallel rounds.
 
+**Future:** Decoupled Fallback (P10) will replace Kogge-Stone on WebGPU for scalar associative ops
+(add/mul/min/max), achieving O(N) work in a single dispatch via atomic inter-workgroup communication
+with bounded spin + work-stealing fallback (FPG-safe). See PLAN.md P7 Tier 0.
+
 **Backend behavior:**
 
 | Backend    | Strategy                                                                       |
@@ -750,6 +754,7 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 | P7  | Cooperative matrix (WMMA) | Blocked     | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable; ~2026 earliest    |
 | P8  | Subgroup scan builtins    | Medium      | `subgroupInclusiveAdd`/`subgroupShuffleUp` in assocScan. Available now (Chrome 134+)     |
 | P9  | Timestamp query profiling | Medium      | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)            |
+| P10 | Decoupled Fallback scan   | **High**    | Single-dispatch O(N) prefix scan. Replaces Kogge-Stone for scalar ops. See PLAN.md P7 T0 |
 
 ---
 
@@ -798,6 +803,7 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Phase 3 preencoded routine support                 | Non-Sort routines in preencoded-multi-step                                                      |
 | GPU config factory (`gpu-config.ts`)               | DRY NVIDIA/Intel configs; thin wrappers over shared launch args                                 |
 | Self-similar plan recursion                        | `runFusedPlan` uses same primitives for assocScan and block_map                                 |
+| Kogge-Stone over Decoupled Lookback (current)      | No FPG in WebGPU; Decoupled Fallback (bounded spin + CAS) planned as P10                        |
 | `Primitive.Reverse` over flip/view                 | Materialized reverse is polymorphic-safe; views need concrete strides                           |
 | Shared blocked-data-movement primitives            | `gatherAxisPoints`/`copyAxisRange`/`mapOverBlocks` replace bespoke types (-1761 LOC)            |
 | Register tiling (`threadTile`) over scalar         | 4×4–8×8 outputs/thread in `var<private>` → 4× fewer shmem reads                                 |

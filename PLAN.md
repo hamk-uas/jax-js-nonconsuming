@@ -773,6 +773,94 @@ the origin trial (Chrome 128–131).
 **Pattern:** Subgroup reduce → SG leaders write to `var<workgroup>` → inter-subgroup tree in shmem.
 Fallback: standard shared-memory tree reduction when `subgroups` feature unavailable.
 
+### Tier 0: Decoupled Fallback — single-dispatch prefix scan (available now)
+
+Our current associative scan uses **Kogge-Stone doubling**: O(N log N) work, O(log N) depth,
+ceil(log₂ N) barrier-separated rounds. On WebGPU, this manifests as:
+
+- **Within a workgroup** (N ≤ blockSize=256): all rounds in one dispatch via `workgroupBarrier()`
+- **Across workgroups** (N > 256): 3-level hierarchical recursion = 3 dispatches
+
+Kogge-Stone was chosen because WebGPU lacks a **cross-workgroup barrier** within a single dispatch.
+However, the state-of-the-art has moved beyond this constraint.
+
+#### The Decoupled Fallback algorithm
+
+**Decoupled Lookback** (Merrill & Garland, 2016) achieves O(N) work in a single dispatch by having
+each workgroup atomically publish its local reduction, then "look back" through prior workgroups'
+published values to compute its prefix. However, standard Decoupled Lookback uses unbounded
+spin-wait loops — if a prior workgroup hasn't been scheduled yet, the waiting workgroup spins
+forever. This works on NVIDIA (which guarantees **Forward Progress** — all scheduled workgroups
+eventually complete), but **deadlocks on other hardware** (Apple Silicon via Metal, some Intel
+iGPUs) where the scheduler can't guarantee forward progress.
+
+**Decoupled Fallback** (Smith, Levien, & Owens) solves this portably:
+
+1. **Bounded spin:** Each lookback subgroup polls prior blocks for a fixed number of cycles
+2. **Work-stealing fallback:** If the timeout fires, assume the prior block is stalled in the
+   scheduler. Fetch the raw input data and compute the missing reduction locally
+3. **Atomic CAS consistency:** Use `atomicCompareExchangeWeak` to publish the computed value,
+   ensuring correctness even if multiple blocks fall back simultaneously
+
+This achieves **single-dispatch, memory-bandwidth-saturating performance** on all WebGPU backends.
+
+#### Key WebGPU-specific requirements
+
+| Requirement                        | Why                                                                                                                                                       |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Single-field atomic descriptor** | WebGPU lacks global acquire-release fences. Pack status + value into one `atomic<u32>` with bit-masking to prevent compiler reordering                    |
+| **No unbounded spin-wait**         | WebGPU has no Forward Progress Guarantee (FPG). Unbounded `while` loops deadlock on Metal/some Intel                                                      |
+| **Subgroup operations**            | Use `requires subgroup_id; requires subgroup_uniformity;` for SIMD raking within workgroups. Native subgroups (Chrome 134+) make this safe and performant |
+| **Atomic f32 or bit-packing**      | For f32 prefix sums, either use `atomicAdd` (if `shader-f32-atomic-add` available) or pack f32 into u32 bits within the descriptor                        |
+
+#### Complexity comparison
+
+| Algorithm                 | Work       | Dispatches      | Global sync                   | FPG required?         |
+| ------------------------- | ---------- | --------------- | ----------------------------- | --------------------- |
+| **Kogge-Stone** (current) | O(N log N) | O(log N) or 1–3 | None (multi-dispatch)         | No                    |
+| Decoupled Lookback        | O(N)       | **1**           | Atomic lookback               | **Yes** (NVIDIA only) |
+| **Decoupled Fallback**    | O(N)       | **1**           | Bounded atomic + CAS fallback | **No** ✅             |
+
+#### Impact on jax-js
+
+**For simple associative ops** (cumsum, cumprod, cummax — scalar `add`/`mul`/`max`):
+
+- Replaces Kogge-Stone entirely for the WebGPU path
+- Single dispatch regardless of N
+- O(N) work instead of O(N log N) — significant for large N
+- Memory-bandwidth saturating performance (vs current compute-bound Kogge-Stone)
+
+**For general associative bodies** (DLM pytree compose):
+
+- The lookback phase requires the body function to be applied during work-stealing. This is feasible
+  but complex: the fallback subgroup must be able to invoke the user's body `fn` on raw input tiles
+  from a prior block
+- The body must also produce a reduction value that can be packed into an atomic descriptor. For
+  pytree bodies with multiple leaves, this requires a packed representation or a multi-field
+  descriptor scheme
+- **Initial implementation should target scalar ops only.** General bodies can follow via a
+  "reduction descriptor buffer" approach (one atomic per block, separate from data)
+
+#### Implementation strategy
+
+1. **Reference:** Start from Thomas Smith's `GPUPrefixSums` WGSL implementation (MIT license). Adapt
+   the Decoupled Fallback shader structure to our codegen pipeline.
+2. **Phase 1 — scalar ops:** Implement for `add`, `mul`, `min`, `max` on f32/i32/u32.
+   Single-dispatch kernel with workgroup-local raking scan → atomic publish → bounded lookback →
+   apply prefix. Detect eligible ops in `prepareAssocScanPlan`.
+3. **Phase 2 — general bodies:** Extend to arbitrary associative functions using a per-block
+   descriptor buffer. The lookback subgroup fetches raw input tiles and re-evaluates the body
+   function when fallback triggers.
+4. **Integration:** Add `"decoupled-fallback"` as a new `AssocScanPath`. Keep Kogge-Stone as
+   fallback for bodies that can't be adapted or for backends without atomics.
+
+#### References
+
+- Paper: Smith, Levien, & Owens — "Decoupled Fallback" (2024)
+  https://github.com/b0nes164/Decoupled-Fallback-Paper
+- Implementation: GPUPrefixSums — production WGSL implementation
+  https://github.com/b0nes164/GPUPrefixSums
+
 ### Tier 1: Remaining subgroup builtins (available now, Chrome 134+)
 
 #### 1a. `subgroupInclusiveAdd` / `subgroupInclusiveMul` for associative scan
@@ -911,14 +999,22 @@ per-step timing data.
 
 | ID  | Feature                           | Availability | Impact        | Effort |
 | --- | --------------------------------- | ------------ | ------------- | ------ |
+| T0  | Decoupled Fallback prefix scan    | Now          | **Very High** | High   |
+| T3  | Timestamp queries                 | Now          | Diagnostic    | Low    |
 | 1b  | `subgroupShuffleUp` in assocScan  | Now          | Medium        | Medium |
 | 1a  | `subgroupInclusive*` in assocScan | Now          | Medium        | Medium |
-| T3  | Timestamp queries                 | Now          | Diagnostic    | Low    |
 | 1c  | `subgroupBroadcast` cleanup       | Now          | Low           | Low    |
 | 2   | Cooperative matrix tiled matmul   | ~2026        | **Very High** | High   |
 
-**Next action:** Implement Tier 1b (`subgroupShuffleUp` in associative scan) and T3 (timestamp
-queries). These are available today and unblock accurate performance measurement for future work.
+**Priority rationale:** Decoupled Fallback (T0) is the highest-impact item because it reduces
+associative scan from O(N log N) to O(N) work and from O(log N) to O(1) dispatches. For large N this
+is transformative. Timestamp queries (T3) are low-effort and provide the diagnostic infrastructure
+to validate T0's impact. The subgroup shuffle optimizations (1a, 1b) become less critical once
+Decoupled Fallback replaces the Kogge-Stone inner loop — but remain valuable for the
+within-workgroup raking scan phase of the Decoupled Fallback itself.
+
+**Next action:** Implement T3 (timestamp queries) for accurate GPU profiling, then T0 (Decoupled
+Fallback for scalar ops). Reference: `GPUPrefixSums` by Thomas Smith.
 
 ---
 
