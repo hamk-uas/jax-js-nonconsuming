@@ -343,24 +343,33 @@ command buffers for compute dispatches. This is a WebGPU API limitation.
 
 ### Problem
 
-Each matmul (Dot → Reduce) creates a kernel dispatch boundary. In a DLM compose body (3-tuple, m=2),
-a single `associativeScan` body iteration produces:
+Each matmul (Dot → Reduce) creates a kernel dispatch boundary in the **standalone JitProgram
+execution loop**. In a DLM compose body (3-tuple, m=2), the matmul steps are:
 
 ```
-newA = dot(q.A, p.A)                    # dispatch 1: reduce(K=2)
-Ab   = dot(q.A, p.b)                    # dispatch 2: reduce(K=2)
-newB = Ab + q.b                          # fused epilogue of dispatch 2
-AS   = dot(q.A, p.S)                    # dispatch 3: reduce(K=2)
+newA = dot(q.A, p.A)                    # reduce(K=2), inputArgs=[q.A, p.A]
+Ab   = dot(q.A, p.b)                    # reduce(K=2), inputArgs=[q.A, p.b]
+newB = Ab + q.b                          # fused epilogue of Ab
+AS   = dot(q.A, p.S)                    # reduce(K=2), inputArgs=[q.A, p.S]
 qAT  = transpose(q.A)                   # view (zero cost)
-ASAT = dot(AS, qAT)                     # dispatch 4: reduce(K=2), reads AS from global
-newS = ASAT + q.S                        # fused epilogue of dispatch 4
+ASAT = dot(AS, qAT)                     # reduce(K=2), inputArgs=[AS, qAT]
+newS = ASAT + q.S                        # fused epilogue of ASAT
 ```
 
-**4 dispatches** for what is conceptually 4 independent small matmuls. Dispatches 1–3 are
-independent (no data dependencies). Dispatch 4 depends on dispatch 3's output (AS).
+**4 reduction dispatches** in the standalone JIT execution loop.
 
-At ~132µs per dispatch overhead (JS loop + command encoding + submission), 4 dispatches cost ~528µs
-of pure overhead for 2×2 matrices where the actual GPU compute is negligible.
+**Important caveat — associativeScan WebGPU already fuses these.** On WebGPU, `associativeScan`
+compiles the compose body into a **block-map fused WGSL shader**. All 4 matmul reductions execute as
+sequential inline code within one shader dispatch (per-element ridx loops with `var<private>`
+accumulators, barriers between steps, intermediates in `var<workgroup>`). The total dispatch count
+for `associativeScan(compose3, elems)` with N=100, blockSize=32 is **3 dispatches** (Phase 1 local
+scan + Phase 3 recursive prefix scan + Phase 4 apply), regardless of how many body steps exist.
+
+**O6's target audience is therefore:**
+
+1. **Standalone JitProgram execution** — matmul chains NOT inside scan/associativeScan
+2. **WASM compiled-loop / mega-module** — tighter inner loop from fewer kernel steps
+3. **Fallback scan paths** — when the block-map fused shader can't be generated
 
 ### Opportunity: Two independent fusion strategies
 
@@ -415,6 +424,22 @@ Two reduction kernel entries can fuse into a multi-output reduction kernel iff:
 All of these are **already checked** for non-reduction multi-output kernels except (1), (2), and
 (5). Criteria (1) and (2) are new. Criterion (5) is automatically satisfied because dependent
 reductions are in separate `reductionEndpointEqns` and chained via epilogue.
+
+**Critical limitation — DLM compose does NOT satisfy criterion (4).** In the 3-tuple body:
+
+- Dot 1 (`q.A × p.A`): `inputArgs = [jitIdOf(q.A), jitIdOf(p.A)]`
+- Dot 2 (`q.A × p.b`): `inputArgs = [jitIdOf(q.A), jitIdOf(p.b)]`
+- Dot 3 (`q.A × p.S`): `inputArgs = [jitIdOf(q.A), jitIdOf(p.S)]`
+
+Each dot reads a different second operand → different `inputArgs` → different grouping keys → **zero
+fusions under Strategy A**. The same applies to the 5-tuple compose (every dot reads a unique input
+combination).
+
+**Relaxation: input-arg union.** To fuse dots 1-3, the kernel would need the union of their inputs:
+`[q.A, p.A, p.b, p.S]` = 4 inputs + 3 outputs = 7 bindings. Each output's `exp` and `reduction`
+would index into this union via remapped GlobalView gid references. This is a larger design change
+than originally planned (requires gid reindexing in AluExp trees) and still wouldn't help on WebGPU
+where the body is already fused by block-map.
 
 #### Reduction dtype matching
 
@@ -578,19 +603,17 @@ reduction kernels would need the WASM codegen changes above. Since the mega-modu
 3. Update ShaderInfo return for multi-output reduction metadata
 4. Tests: WebGPU dispatch count reduced for matmul chains
 
-**Expected impact on DLM 3-tuple (WebGPU, m=2):**
+**Expected impact:** Only affects standalone JitProgram execution (not scan/associativeScan bodies,
+which are already fused by block-map). Benefits matmul chains outside of scan. Does NOT help DLM.
 
-- Saves ~2 dispatches per associativeScan body iteration
-- For N=100, M=7 Kogge-Stone rounds: saves ~14 dispatches per round × 7 rounds ≈ 98 dispatches
-- At ~132µs JS overhead per dispatch: **saves ~13ms** (10% of 124ms total)
-
-#### Phase C: Chained reduction (Strategy B) — Future
+#### Phase C: Chained reduction (Strategy B) — Deprioritized
 
 Dependent reduction fusion (`dot(dot(A,B), C)` in 1 dispatch). Requires register-resident
-intermediates and nested ridx loops. Only valuable for patterns like the transpose-sandwich `A S Aᵀ`
-where the inner matmul feeds directly into the outer.
+intermediates and nested ridx loops. As analyzed above, this does **not** help DLM on WebGPU
+(block-map fused shader already chains through shmem). Only valuable for **standalone JitProgram
+large-matrix patterns** like `softmax(Q @ K^T) @ V` where the intermediate is large.
 
-**Architectural requirements:**
+**Architectural requirements** (unchanged):
 
 - New AluExp nodes for "local array" (register-resident intermediate)
 - Nested reduction codegen (outer gidx loop → inner ridx1 loop → store to local → inner ridx2 loop
@@ -608,24 +631,99 @@ where the inner matmul feeds directly into the outer.
 | Interaction with O1 cheap-recompute diamond relaxation      | None       | Diamond operates on P1; fusion in `flushPendingKernels` |
 | Mega-module inline failure for multi-output reduction       | Low        | Already handles multi-output elementwise                |
 
-### Dispatch reduction estimate (DLM 3-tuple compose, m=2)
+### Dispatch reduction estimate (corrected)
 
-| Pattern                                | Current dispatches | After Phase A | After Phase B         |
-| -------------------------------------- | ------------------ | ------------- | --------------------- |
-| 3 independent dots (newA, Ab→newB, AS) | 3                  | **1**         | **1**                 |
-| 1 dependent dot (ASAT→newS)            | 1                  | 1             | 1 (or 0 with Phase C) |
-| **Body total**                         | **4**              | **2**         | **2**                 |
-| Full dlmFit (764 dispatches, warm)     | 764                | ~700          | ~700                  |
-| Estimated time saving (WebGPU, N=100)  | —                  | ~8ms          | ~8ms                  |
+**Strategy A does NOT accelerate DLM on WebGPU** for two independent reasons:
 
-The savings per body iteration are modest (2 dispatches). But in `associativeScan` with Kogge-Stone
-(ceil(log₂ N) rounds, each round applies the body to O(N) blocks), the savings multiply:
+1. **inputArgs mismatch** — The 3 independent dots in the 3-tuple compose each read a different
+   second operand (`p.A`, `p.b`, `p.S`). `flushPendingKernels` groups by `size:inputArgs.join(",")`
+   → different keys → no fusion. The 5-tuple is worse: ~15 dots, each with a unique input pair. Even
+   with input-arg union relaxation, the optimization is moot because:
 
-- N=100: 7 rounds × ~2 saved dispatches/block × ~7 blocks ≈ **98 saved dispatches**
-- N=800: 10 rounds × ~100 blocks ≈ **2000 saved dispatches** (but GPU-dominant at this N)
+2. **Block-map fused shader** — On WebGPU, `associativeScan` compiles the entire compose body into a
+   single WGSL shader. All 4 matmul reductions execute as sequential inline `ridx` loops within one
+   dispatch. The total dispatch count for N=100 is **3** (hierarchical recursion: local scan,
+   recursive prefix, apply), independent of body complexity.
 
-The **primary benefit is WASM mega-module**: fusing 3 solo steps into 1 multi-output step reduces
-the loop iteration count and enables better register allocation in the compiled WASM module.
+**Where Strategy A helps (non-DLM, non-scan):**
+
+| Scenario                                    | Current | After A   | Savings    |
+| ------------------------------------------- | ------- | --------- | ---------- |
+| Standalone `jit(() => { 3× matmul chain })` | 3       | 1 (maybe) | 2 dispatch |
+| General JitProgram with N same-input dots   | N       | 1         | N-1        |
+
+These require the "same inputArgs" criterion or the input-arg union relaxation. The value is narrow:
+same-input independent reductions are uncommon in real workloads.
+
+**Strategy A for WASM:** Fusible independent reductions sharing inputs would produce a tighter
+compiled-loop / mega-module inner kernel. The benefit is marginal (native function call overhead is
+~ns, not ~µs). The primary remaining value of Strategy A is **architectural cleanliness** — lifting
+the Kernel.multi() restriction and letting the compiler fuse what it can.
+
+### Strategy B: chained reduction — WebGPU DLM analysis
+
+**Strategy B also does NOT accelerate DLM on WebGPU.**
+
+Within the block-map fused shader, dependent reductions already chain through `var<workgroup>`:
+
+```wgsl
+// Step 2: AS = dot(q.A, p.S) — writes to shmem pingPong[outputSlot]
+for (var gidx: i32 = 0; gidx < 4; gidx++) {
+  var acc: f32 = 0.0;
+  for (var ridx: i32 = 0; ridx < 2; ridx++) {
+    acc += qA[tidx * 4 + ...] * pS[tidx * 4 + ...];
+  }
+  pingPong_out[tidx * 4 + gidx] = acc;
+}
+workgroupBarrier();
+
+// Step 3: ASAT = dot(AS, qAT) — reads AS from shmem, no extra dispatch
+for (var gidx: i32 = 0; gidx < 4; gidx++) {
+  var acc: f32 = 0.0;
+  for (var ridx: i32 = 0; ridx < 2; ridx++) {
+    acc += pingPong_out[tidx * 4 + ridx * ...] * qAT[tidx * 4 + ...];
+  }
+  pingPong_out[tidx * 4 + gidx] = acc + qS[tidx * 4 + gidx]; // epilogue
+}
+workgroupBarrier();
+```
+
+The dependent chain (dot 2 → dot 3) is **already sequential within the fused shader**. The
+intermediate `AS` lives in `var<workgroup>` shared memory — one shmem write + one shmem read of 4
+floats (16 bytes) per thread. Strategy B's register-resident intermediates (`var<private>`) would
+save this shmem round-trip, but for 2×2 matrices the savings are negligible (~16 bytes at shared
+memory bandwidth ~100+ GB/s). The bottleneck is the Kogge-Stone ping-pong pattern and global memory
+gathers, not inter-step shmem traffic.
+
+**Where Strategy B could help (non-DLM):**
+
+- Large matrices (e.g., 128×128) in standalone JitProgram where the chained reduction would save a
+  full GPU dispatch and a global memory round-trip of the intermediate
+- Patterns like `softmax(Q @ K^T) @ V` where QK^T is large and immediate consumption avoids
+  materializing it to global memory
+
+### Conclusion: O6 scope revision
+
+O6 as designed targets a bottleneck that **does not exist on WebGPU for associativeScan workloads**.
+The block-map fused shader already achieves the fusion that Strategy A and B aim for, but at the
+shader level rather than the JitProgram step level.
+
+**Remaining value:**
+
+| Target                         | Strategy A                | Strategy B                |
+| ------------------------------ | ------------------------- | ------------------------- |
+| DLM scan body (WebGPU)         | No effect (already fused) | No effect (already fused) |
+| DLM scan body (WASM)           | Marginal (~ns/step)       | Marginal (~ns/step)       |
+| Standalone JitProgram (WebGPU) | Helps if same inputArgs   | Helps for chained dots    |
+| Standalone JitProgram (WASM)   | Marginal                  | Marginal                  |
+| Non-scan large-matrix chains   | Moderate                  | Significant               |
+
+**Recommendation:** Deprioritize O6. The DLM use case — the primary motivation — is already served
+by the block-map fused shader. Effort is better spent on:
+
+- Subgroup matrix ops (WMMA) for hardware tensor cores in tiled matmul (P7)
+- Conv2d tuning (P4)
+- Relaxed SIMD FMA for WASM matmul (P2)
 
 ---
 
