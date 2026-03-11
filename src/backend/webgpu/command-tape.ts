@@ -5,6 +5,10 @@
 // and pre-built uniform bind groups. This eliminates per-step JS overhead
 // (scope lookups, array allocation, refcounting, pipeline cache lookups)
 // while producing a tight command-encoding loop over a flat GPUBuffer[] table.
+//
+// Ops are stored in original step order so that frees return buffers to the
+// pool *before* subsequent mallocs, reducing peak VRAM compared to the
+// bulk-malloc-then-bulk-free approach.
 
 import { Kernel } from "../../alu";
 import type { JitStep } from "../../frontend/jit";
@@ -44,22 +48,25 @@ export interface TapeMalloc {
   initialData: Uint8Array<ArrayBuffer> | null;
 }
 
+/** A single tape operation in execution order. */
+export type TapeOp =
+  | { type: "malloc"; malloc: TapeMalloc }
+  | { type: "free"; tableIdx: number }
+  | { type: "recycle"; fromIdx: number; toIdx: number }
+  | { type: "dispatch"; dispatch: TapeDispatch };
+
 /** A pre-compiled dispatch sequence for a kernel-only JitProgram. */
 export interface WebGPUCommandTape {
-  /** One entry per shader dispatch (may be >1 per execute step for routines). */
-  dispatches: TapeDispatch[];
-  /** Bulk malloc plan in step order. */
-  mallocs: TapeMalloc[];
-  /** Recycle plan: [fromIdx, toIdx][] — pointer copy in flat table. */
-  recycles: [number, number][];
-  /** Table indices to free after all dispatches complete. */
-  frees: number[];
+  /** Operations in original step order (malloc/free/recycle/dispatch). */
+  ops: TapeOp[];
   /** Number of entries in the flat buffer table. */
   tableSize: number;
   /** Mapping: external input position → table index. */
   inputTableIdxs: number[];
   /** Mapping: external output position → table index. */
   outputTableIdxs: number[];
+  /** Table indices that own allocated buffers (for cleanup on error). */
+  allocatedIdxs: number[];
   /** Uniform buffers owned by this tape (kept alive for bind group references). */
   uniformBuffers: GPUBuffer[];
 }

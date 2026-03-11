@@ -43,11 +43,7 @@ import {
   headerWgsl,
   ShaderInfo,
 } from "./webgpu/codegen";
-import {
-  type TapeDispatch,
-  type TapeMalloc,
-  type WebGPUCommandTape,
-} from "./webgpu/command-tape";
+import { type TapeOp, type WebGPUCommandTape } from "./webgpu/command-tape";
 import { SyncReader } from "./webgpu/reader";
 import { createRoutineShader } from "./webgpu/routines";
 import {
@@ -433,15 +429,7 @@ export class WebGPUBackend implements Backend {
       const pooled = this.#poolPop(paddedSize);
       if (pooled) {
         buffer = pooled;
-        if (initialData.byteLength % 4 === 0) {
-          this.device.queue.writeBuffer(buffer, 0, initialData);
-        } else {
-          const aligned = initialData.byteLength - (initialData.byteLength % 4);
-          this.device.queue.writeBuffer(buffer, 0, initialData, 0, aligned);
-          const remainder = new Uint8Array(4);
-          remainder.set(initialData.subarray(aligned));
-          this.device.queue.writeBuffer(buffer, aligned, remainder);
-        }
+        this.#writeBufferUnaligned(buffer, initialData);
       } else if (initialData.byteLength < 4096) {
         buffer = this.#createBuffer(paddedSize, { mapped: true });
         new Uint8Array(buffer.getMappedRange(), 0, size).set(initialData);
@@ -449,16 +437,7 @@ export class WebGPUBackend implements Backend {
       } else {
         // getMappedRange() seems slower for large buffers, use writeBuffer() instead.
         buffer = this.#createBuffer(paddedSize);
-        if (initialData.byteLength % 4 === 0) {
-          this.device.queue.writeBuffer(buffer, 0, initialData);
-        } else {
-          // Copy all but the last few bytes, then copy 4 bytes as remainder.
-          const aligned = initialData.byteLength - (initialData.byteLength % 4);
-          this.device.queue.writeBuffer(buffer, 0, initialData, 0, aligned);
-          const remainder = new Uint8Array(4);
-          remainder.set(initialData.subarray(aligned));
-          this.device.queue.writeBuffer(buffer, aligned, remainder);
-        }
+        this.#writeBufferUnaligned(buffer, initialData);
       }
     } else {
       // No initial data — try the pool first.
@@ -575,6 +554,26 @@ export class WebGPUBackend implements Backend {
         // Defer uniform buffer destruction until batch ends
         this.#batchUniformsToDestroy.push(uniformBuf);
       }
+    }
+  }
+
+  /**
+   * Write data to a GPU buffer, handling non-4-byte-aligned sizes.
+   * WebGPU's writeBuffer requires 4-byte-aligned size; this pads the
+   * trailing bytes when necessary.
+   */
+  #writeBufferUnaligned(
+    buffer: GPUBuffer,
+    data: Uint8Array<ArrayBuffer>,
+  ): void {
+    if (data.byteLength % 4 === 0) {
+      this.device.queue.writeBuffer(buffer, 0, data);
+    } else {
+      const aligned = data.byteLength - (data.byteLength % 4);
+      this.device.queue.writeBuffer(buffer, 0, data, 0, aligned);
+      const remainder = new Uint8Array(4);
+      remainder.set(data.subarray(aligned));
+      this.device.queue.writeBuffer(buffer, aligned, remainder);
     }
   }
 
@@ -1913,15 +1912,15 @@ export class WebGPUBackend implements Backend {
       inputTableIdxs.push(idToIdx.get(id)!);
     }
 
-    // 2. Walk steps and build tape
-    const dispatches: TapeDispatch[] = [];
-    const mallocs: TapeMalloc[] = [];
-    const recycles: [number, number][] = [];
-    const frees: number[] = [];
+    // 2. Walk steps in order, emitting TapeOps that preserve the original
+    //    malloc/free/recycle/dispatch interleaving.  This lets freed buffers
+    //    return to the pool *before* subsequent mallocs, reducing peak VRAM.
+    const ops: TapeOp[] = [];
+    const allocatedIdxs: number[] = [];
     const uniformBuffers: GPUBuffer[] = [];
-    // Track known byte sizes for table entries (from mallocs/recycles)
     const knownSizes = new Map<number, number>();
 
+    // Indices that must not be freed (external inputs + final outputs)
     const inputIdxSet = new Set(inputTableIdxs);
 
     for (const step of steps) {
@@ -1968,14 +1967,17 @@ export class WebGPUBackend implements Backend {
               });
             }
 
-            dispatches.push({
-              pipeline,
-              bindGroupLayout,
-              inputIdxs,
-              outputIdxs,
-              passes: filteredPasses.map((p) => ({ grid: p.grid })),
-              uniformBindGroup,
-              uniformAlignment,
+            ops.push({
+              type: "dispatch",
+              dispatch: {
+                pipeline,
+                bindGroupLayout,
+                inputIdxs,
+                outputIdxs,
+                passes: filteredPasses.map((p) => ({ grid: p.grid })),
+                uniformBindGroup,
+                uniformAlignment,
+              },
             });
           }
           break;
@@ -1986,17 +1988,25 @@ export class WebGPUBackend implements Backend {
           const size = step.size as number;
           const paddedSize = Math.ceil(size / 4) * 4;
           knownSizes.set(idx, size);
-          mallocs.push({
-            tableIdx: idx,
-            paddedSize,
-            originalSize: size,
-            initialData: (step.initialData as Uint8Array<ArrayBuffer>) ?? null,
+          allocatedIdxs.push(idx);
+          ops.push({
+            type: "malloc",
+            malloc: {
+              tableIdx: idx,
+              paddedSize,
+              originalSize: size,
+              initialData:
+                (step.initialData as Uint8Array<ArrayBuffer>) ?? null,
+            },
           });
           break;
         }
         case "free": {
           const idx = idToIdx.get(step.input)!;
-          frees.push(idx);
+          // Don't free external inputs or outputs
+          if (!inputIdxSet.has(idx)) {
+            ops.push({ type: "free", tableIdx: idx });
+          }
           break;
         }
         case "recycle": {
@@ -2005,29 +2015,25 @@ export class WebGPUBackend implements Backend {
           idToIdx.set(step.output, toIdx);
           const fromSize = knownSizes.get(fromIdx);
           if (fromSize !== undefined) knownSizes.set(toIdx, fromSize);
-          recycles.push([fromIdx, toIdx]);
+          ops.push({ type: "recycle", fromIdx, toIdx });
           break;
         }
       }
     }
 
-    // 3. Build output mapping
+    // 3. Build output mapping and filter out output frees from ops
     const outputTableIdxs = outputIds.map((id) => idToIdx.get(id)!);
-
-    // 4. Safety: filter out frees that target inputs or outputs
     const outputIdxSet = new Set(outputTableIdxs);
-    const safeFrees = frees.filter(
-      (idx) => !inputIdxSet.has(idx) && !outputIdxSet.has(idx),
+    const safeOps = ops.filter(
+      (op) => op.type !== "free" || !outputIdxSet.has(op.tableIdx),
     );
 
     return {
-      dispatches,
-      mallocs,
-      recycles,
-      frees: safeFrees,
+      ops: safeOps,
       tableSize: nextIdx,
       inputTableIdxs,
       outputTableIdxs,
+      allocatedIdxs,
       uniformBuffers,
     };
   }
@@ -2035,111 +2041,136 @@ export class WebGPUBackend implements Backend {
   /**
    * Execute a pre-compiled command tape with the given input slots.
    *
-   * Builds a flat GPUBuffer[] table, bulk-allocates intermediates, encodes
-   * all dispatches into a single command encoder, and returns output Slots.
+   * Walks tape ops in original step order: mallocs and frees are interleaved
+   * with dispatches so freed buffers return to the pool immediately and can
+   * be reused by later mallocs (reducing peak VRAM).  All dispatches are
+   * encoded into a single command encoder; only the submit is deferred.
+   *
+   * Error-safe: if any step throws, all tape-allocated GPU buffers are
+   * cleaned up via try/finally.
    */
   executeCommandTape(tape: WebGPUCommandTape, inputSlots: Slot[]): Slot[] {
     const table: GPUBuffer[] = new globalThis.Array(tape.tableSize);
     const sizes: number[] = new globalThis.Array(tape.tableSize);
 
-    // 1. Map external inputs
+    // Map external inputs
     for (let i = 0; i < inputSlots.length; i++) {
       const { buffer, size } = this.#getBuffer(inputSlots[i]);
       table[tape.inputTableIdxs[i]] = buffer;
       sizes[tape.inputTableIdxs[i]] = size;
     }
 
-    // 2. Bulk malloc all intermediates
-    for (const m of tape.mallocs) {
-      let buf: GPUBuffer;
-      if (m.paddedSize === 0) {
-        buf = this.#reusableZsb;
-      } else if (m.initialData) {
-        // Try pool first; otherwise create mapped buffer for small data
-        const pooled = this.#poolPop(m.paddedSize);
-        if (pooled) {
-          buf = pooled;
-          if (m.initialData.byteLength % 4 === 0) {
-            this.device.queue.writeBuffer(buf, 0, m.initialData);
-          } else {
-            const aligned =
-              m.initialData.byteLength - (m.initialData.byteLength % 4);
-            this.device.queue.writeBuffer(buf, 0, m.initialData, 0, aligned);
-            const remainder = new Uint8Array(4);
-            remainder.set(m.initialData.subarray(aligned));
-            this.device.queue.writeBuffer(buf, aligned, remainder);
+    // Track which table indices were allocated by this execution so we can
+    // clean up on error.  Output indices are excluded from cleanup since
+    // they become the caller's responsibility on success.
+    const outputIdxSet = new Set(tape.outputTableIdxs);
+    let submitted = false;
+
+    try {
+      const encoder = this.device.createCommandEncoder();
+
+      for (const op of tape.ops) {
+        switch (op.type) {
+          case "malloc": {
+            const m = op.malloc;
+            let buf: GPUBuffer;
+            if (m.paddedSize === 0) {
+              buf = this.#reusableZsb;
+            } else if (m.initialData) {
+              const pooled = this.#poolPop(m.paddedSize);
+              if (pooled) {
+                buf = pooled;
+                this.#writeBufferUnaligned(buf, m.initialData);
+              } else {
+                buf = this.#createBuffer(m.paddedSize, { mapped: true });
+                new Uint8Array(
+                  buf.getMappedRange(),
+                  0,
+                  m.initialData.byteLength,
+                ).set(m.initialData);
+                buf.unmap();
+              }
+            } else {
+              buf =
+                this.#poolPop(m.paddedSize) ?? this.#createBuffer(m.paddedSize);
+            }
+            table[m.tableIdx] = buf;
+            sizes[m.tableIdx] = m.originalSize;
+            break;
           }
-        } else {
-          buf = this.#createBuffer(m.paddedSize, { mapped: true });
-          new Uint8Array(buf.getMappedRange(), 0, m.initialData.byteLength).set(
-            m.initialData,
-          );
-          buf.unmap();
-        }
-      } else {
-        buf = this.#poolPop(m.paddedSize) ?? this.#createBuffer(m.paddedSize);
-      }
-      table[m.tableIdx] = buf;
-      sizes[m.tableIdx] = m.originalSize;
-    }
+          case "free": {
+            const buf = table[op.tableIdx];
+            if (buf && buf !== this.#reusableZsb) {
+              if (!this.#poolPush(buf)) {
+                this.#gpuAllocatedBytes -= buf.size;
+                buf.destroy();
+              }
+            }
+            table[op.tableIdx] = undefined!;
+            break;
+          }
+          case "recycle":
+            table[op.toIdx] = table[op.fromIdx];
+            sizes[op.toIdx] = sizes[op.fromIdx];
+            break;
+          case "dispatch": {
+            const d = op.dispatch;
+            const numIn = d.inputIdxs.length;
+            const numOut = d.outputIdxs.length;
+            const entries: GPUBindGroupEntry[] = new globalThis.Array(
+              numIn + numOut,
+            );
+            for (let i = 0; i < numIn; i++) {
+              entries[i] = {
+                binding: i,
+                resource: { buffer: table[d.inputIdxs[i]] },
+              };
+            }
+            for (let i = 0; i < numOut; i++) {
+              entries[numIn + i] = {
+                binding: numIn + i,
+                resource: { buffer: table[d.outputIdxs[i]] },
+              };
+            }
+            const bindGroup = this.device.createBindGroup({
+              layout: d.bindGroupLayout,
+              entries,
+            });
 
-    // 3. Apply recycling (pointer copy)
-    for (const [from, to] of tape.recycles) {
-      table[to] = table[from];
-      sizes[to] = sizes[from];
-    }
-
-    // 4. Encode all dispatches in a single command encoder
-    const encoder = this.device.createCommandEncoder();
-    for (const d of tape.dispatches) {
-      // Build storage bind group from flat table
-      const numIn = d.inputIdxs.length;
-      const numOut = d.outputIdxs.length;
-      const entries: GPUBindGroupEntry[] = new globalThis.Array(numIn + numOut);
-      for (let i = 0; i < numIn; i++) {
-        entries[i] = {
-          binding: i,
-          resource: { buffer: table[d.inputIdxs[i]] },
-        };
-      }
-      for (let i = 0; i < numOut; i++) {
-        entries[numIn + i] = {
-          binding: numIn + i,
-          resource: { buffer: table[d.outputIdxs[i]] },
-        };
-      }
-      const bindGroup = this.device.createBindGroup({
-        layout: d.bindGroupLayout,
-        entries,
-      });
-
-      for (let i = 0; i < d.passes.length; i++) {
-        const pass = d.passes[i];
-        const pe = encoder.beginComputePass();
-        pe.setPipeline(d.pipeline);
-        pe.setBindGroup(0, bindGroup);
-        if (d.uniformBindGroup) {
-          pe.setBindGroup(1, d.uniformBindGroup, [i * d.uniformAlignment]);
-        }
-        pe.dispatchWorkgroups(pass.grid[0], pass.grid[1]);
-        _dispatchCount++;
-        pe.end();
-      }
-    }
-    this.device.queue.submit([encoder.finish()]);
-
-    // 5. Free intermediates (return to pool or destroy)
-    for (const idx of tape.frees) {
-      const buf = table[idx];
-      if (buf !== this.#reusableZsb) {
-        if (!this.#poolPush(buf)) {
-          this.#gpuAllocatedBytes -= buf.size;
-          buf.destroy();
+            for (let i = 0; i < d.passes.length; i++) {
+              const pe = encoder.beginComputePass();
+              pe.setPipeline(d.pipeline);
+              pe.setBindGroup(0, bindGroup);
+              if (d.uniformBindGroup) {
+                pe.setBindGroup(1, d.uniformBindGroup, [
+                  i * d.uniformAlignment,
+                ]);
+              }
+              pe.dispatchWorkgroups(d.passes[i].grid[0], d.passes[i].grid[1]);
+              _dispatchCount++;
+              pe.end();
+            }
+            break;
+          }
         }
       }
+
+      this.device.queue.submit([encoder.finish()]);
+      submitted = true;
+    } finally {
+      if (!submitted) {
+        // Error path: destroy all tape-allocated buffers that aren't outputs.
+        for (const idx of tape.allocatedIdxs) {
+          const buf = table[idx];
+          if (buf && buf !== this.#reusableZsb && !outputIdxSet.has(idx)) {
+            this.#gpuAllocatedBytes -= buf.size;
+            buf.destroy();
+          }
+        }
+      }
     }
 
-    // 6. Create output slots
+    // Create output slots
     const outputs: Slot[] = new globalThis.Array(tape.outputTableIdxs.length);
     for (let i = 0; i < tape.outputTableIdxs.length; i++) {
       const idx = tape.outputTableIdxs[i];
