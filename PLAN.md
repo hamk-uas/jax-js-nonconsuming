@@ -736,6 +736,120 @@ by the block-map fused shader. Effort is better spent on:
 
 ---
 
+## Analytical Small-Matrix Linalg (Jaxpr-Expressible Routines)
+
+### Background
+
+The Routine system (`Sort`, `Cholesky`, `TriangularSolve`, `LU`, `QR`) provides backend-specific
+implementations for ops that "can't be fused." On WebGPU, any Routine in a block-map body forces
+fallback to per-round multi-dispatch execution — a single Routine breaks fusion for the entire body.
+
+`np.linalg.inv` already has **analytical (non-Routine) fast paths for n ≤ 4**: Cramer's rule
+(adjugate / determinant) using only elementwise ops (`mul`, `sub`, `neg`, `reciprocal`, `stack`).
+These trace to fusable Kernel steps, enabling the DLM 5-tuple compose body (which calls `inv` on m×m
+matrices) to fuse into the block-map shader for m ≤ 4.
+
+The question: can the remaining linalg Routines (Cholesky, TriangularSolve, QR, LU) also be
+expressed as jaxpr-traceable ops for small matrices, enabling fusion?
+
+### Feasibility analysis
+
+| Routine              | Algorithm for small n                  | Ops used                                | Complexity (n=4) | Feasible?                                                         |
+| -------------------- | -------------------------------------- | --------------------------------------- | ---------------- | ----------------------------------------------------------------- |
+| **inv** (n ≤ 4)      | Cramer's rule (adjugate/det)           | mul, sub, neg, reciprocal, stack        | ~120 mul+add     | **Done** ✅                                                       |
+| **cholesky** (n ≤ 4) | Cholesky-Banachiewicz, unrolled        | mul, sub, div, sqrt                     | ~30 ops          | **Yes**                                                           |
+| **trisolve** (n ≤ 4) | Back/forward substitution, unrolled    | mul, sub, div                           | ~20 ops          | **Yes**                                                           |
+| **LU** (n ≤ 4)       | Gaussian elimination with pivoting     | mul, sub, div, argmax, swap             | ~40 ops          | **Tricky** — pivoting requires data-dependent control flow        |
+| **QR** (n ≤ 4)       | Householder reflections, unrolled      | mul, sub, div, sqrt, dot, outer product | ~60 ops          | **Yes** (no data-dependent branching for thin QR)                 |
+| **inv** (n = 5)      | Cramer's rule (5×5 cofactor expansion) | mul, sub, neg, reciprocal, stack        | ~720 terms       | **Marginal** — large trace graph, may exceed JIT cache efficiency |
+
+**LU is the hardest** because partial pivoting (`argmax` + row swap) introduces data-dependent
+control flow that doesn't trace well. However, LU is not used directly in DLM compose bodies — it's
+only used internally by `np.linalg.inv` for n ≥ 5 and by `np.linalg.det`/`slogdet`. The DLM sqrt
+variant uses QR + TriangularSolve, not LU.
+
+### Impact on DLM variants
+
+| DLM variant            | Linalg ops in compose body | Current state                      | With analytical paths |
+| ---------------------- | -------------------------- | ---------------------------------- | --------------------- |
+| Standard (5-tuple)     | `np.linalg.inv`            | **Fuses for m ≤ 4** (already done) | No change needed      |
+| Sqrt forward (3-tuple) | QR + trisolve              | **Never fuses** (Routines)         | **Fuses for m ≤ 4**   |
+| Sqrt backward          | QR                         | **Never fuses** (Routine)          | **Fuses for m ≤ 4**   |
+
+The sqrt DLM variant (`composeSqrtForward`, `composeSqrtBackward`) is numerically more stable than
+the standard variant for poorly conditioned systems. Enabling it to fuse on WebGPU for small m
+widens the set of models that can run efficiently on GPU.
+
+### Implementation approach
+
+Add threshold-based dispatch to the library functions: when the matrix dimension n ≤ threshold (4),
+trace an unrolled analytical path instead of calling the Routine. This mirrors the existing pattern
+in `np.linalg.inv`:
+
+```typescript
+// numpy-linalg.ts — existing pattern:
+export function inv(a) {
+  const n = checkSquare("inv", a);
+  if (n === 1) return np.reciprocal(a);
+  if (n === 2) return inv2x2(a);
+  if (n === 3) return inv3x3(a);
+  if (n === 4) return inv4x4(a);
+  // n ≥ 5: falls through to LU Routine
+  return solve(a, np.eye(n, { dtype: a.dtype }));
+}
+```
+
+Apply the same pattern to:
+
+1. **`lax.linalg.cholesky`** — n ≤ 4: unrolled Cholesky-Banachiewicz using `mul`, `sub`, `div`,
+   `sqrt`. Lower-triangular output via `stack`. The algorithm is O(n³/6) — for n=4 that's ~11
+   multiply-accumulate steps.
+2. **`lax.linalg.triangularSolve`** — n ≤ 4: unrolled back/forward substitution. For a single RHS
+   vector: n(n+1)/2 multiply-accumulate steps. For batched matrix RHS: iterate over columns.
+3. **`lax.linalg.qr`** — n ≤ 4: unrolled Householder reflections. Each reflection is a rank-1
+   update: compute householder vector v, then `H = I - 2vvᵀ/‖v‖²`, apply `H @ A_remaining`. For n=4:
+   4 reflections, each involving a norm computation + outer product + matrix subtraction.
+
+**Autodiff:** All analytical paths use standard ops (mul, sub, div, sqrt, stack) that already have
+JVP and transpose rules. No custom JVP/transpose rules are needed — AD "just works" through the
+traced ops. This is a key advantage over the Routine path, which requires hand-written JVP rules.
+
+### Considerations
+
+- **Trace graph size:** The 4×4 inv generates ~300 traced ops. Cholesky 4×4 would be ~50. QR 4×4
+  would be ~200. These are modest — the JIT handles them easily. But for n=5+ the graph grows fast
+  (inv 5×5 ≈ 720 terms).
+- **Threshold selection:** n ≤ 4 is the sweet spot balancing trace size vs fusion benefit. The DLM
+  use case has m=2–5; m ≤ 4 covers most practical models. For m=5, we could evaluate whether the
+  inv5x5 trace graph (if implemented) is worth the compilation cost.
+- **Testing:** Each analytical path must be tested against the Routine path for numerical agreement
+  across all n ≤ threshold. The existing inv analytical paths have tests in `numpy-linalg.test.ts`.
+- **Batched support:** The analytical paths must handle batched inputs (`[..., n, n]`) via the same
+  `idx2d` / `stack` pattern used by `inv2x2`/`inv3x3`/`inv4x4`.
+
+### Priority
+
+**Medium.** The standard DLM 5-tuple variant already fuses for m ≤ 4 (inv analytical path + Phase 1
+uniform constants). The sqrt variant is secondary. Implement when:
+
+- A real use case needs sqrt variant fusion on WebGPU with m ≤ 4
+- Or when adding these paths enables a broader set of models to fuse
+
+### Comparison: "eliminate Routines" vs "improve scan algorithm"
+
+| Optimization                | Target                                   | Impact on DLM (m=2)                                                                     |
+| --------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------- |
+| Analytical linalg (this)    | Routine-blocked fusion in assocScan body | Already solved for standard variant (inv ≤ 4)                                           |
+| Decoupled Fallback (P10)    | Scan dispatch count (O(log N) → O(1))    | Saves ~0.05ms (3 dispatches → 1)                                                        |
+| JIT loop overhead reduction | 764 non-scan dispatches in DLM pipeline  | **95ms** of the 124ms warm total                                                        |
+| Mega-module for WebGPU      | Eliminate JS-side dispatch overhead      | Would require WebGPU indirect dispatch or command buffer reuse — not currently feasible |
+
+The dominant DLM bottleneck is **JS-side JIT loop overhead for 764 non-scan dispatches** (element
+construction + diagnostics), not the scan algorithm or scan body fusion. The scans themselves
+already fuse into 1–3 dispatches for m ≤ 4.
+
+---
+
 ## P7: Subgroups & Cooperative Matrix — Forward-Looking Plan
 
 ### Overview
