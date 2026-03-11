@@ -837,12 +837,12 @@ uniform constants). The sqrt variant is secondary. Implement when:
 
 ### Comparison: "eliminate Routines" vs "improve scan algorithm"
 
-| Optimization                | Target                                   | Impact on DLM (m=2)                                                                     |
-| --------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------- |
-| Analytical linalg (this)    | Routine-blocked fusion in assocScan body | Already solved for standard variant (inv ≤ 4)                                           |
-| Decoupled Fallback (P10)    | Scan dispatch count (O(log N) → O(1))    | Saves ~0.05ms (3 dispatches → 1)                                                        |
-| JIT loop overhead reduction | 764 non-scan dispatches in DLM pipeline  | **95ms** of the 124ms warm total                                                        |
-| Mega-module for WebGPU      | Eliminate JS-side dispatch overhead      | Would require WebGPU indirect dispatch or command buffer reuse — not currently feasible |
+| Optimization                | Target                                   | Impact on DLM (m=2)                                                   |
+| --------------------------- | ---------------------------------------- | --------------------------------------------------------------------- |
+| Analytical linalg (this)    | Routine-blocked fusion in assocScan body | Already solved for standard variant (inv ≤ 4)                         |
+| Decoupled Fallback (P10)    | Scan dispatch count (O(log N) → O(1))    | Saves ~0.05ms (3 dispatches → 1)                                      |
+| JIT loop overhead reduction | 764 non-scan dispatches in DLM pipeline  | **95ms** of the 124ms warm total                                      |
+| Mega-module for WebGPU      | Eliminate JS-side dispatch overhead      | Command tape (O8): ~4× JS overhead reduction for kernel-only programs |
 
 The dominant DLM bottleneck is **JS-side JIT loop overhead for 764 non-scan dispatches** (element
 construction + diagnostics), not the scan algorithm or scan body fusion. The scans themselves
@@ -1132,6 +1132,370 @@ Fallback for scalar ops). Reference: `GPUPrefixSums` by Thomas Smith.
 
 ---
 
+## O8: WebGPU Command Tape (Mega-Module Equivalent)
+
+### Problem statement
+
+The WASM mega-module compiles an entire `JitProgram`'s step list into a single WASM function,
+eliminating all JS↔WASM boundary crossings. A DLM `jit(core)` call with 764 dispatches costs ~6ms
+on WASM mega-module but **~124ms on WebGPU** because each dispatch incurs JS-side overhead.
+
+**Measured WebGPU overhead breakdown (DLM Nile m=2, N=100, warm):**
+
+| Component                   | Time (ms) | % of total |
+| --------------------------- | --------- | ---------- |
+| JIT execution loop overhead | ~95       | 76%        |
+| `queue.submit()`            | ~22       | 18%        |
+| `createBindGroup()`         | ~6        | 5%         |
+| `prepareKernelSync()`       | ~1        | 1%         |
+| **Total**                   | **~124**  | 100%       |
+
+The 95ms loop overhead at 764 steps is **~124µs per step**, comprising:
+
+- Scope array lookups (JitId → Slot)
+- `new Array(N)` allocation for `ins[]` / `outs[]`
+- `incRef` / `decRef` loops (Map lookups per input/output)
+- `prepareKernelSync` (hash + Map.get)
+- `dispatch()` buffer extraction (`inputs.map(slot => getBuffer(slot).buffer)`)
+- Batch entry object creation (`{ source, inputs, outputs, dynamicParams }`)
+- GC pressure from ~764 temporary objects per invocation
+
+The WASM mega-module avoids all of this — JitIds are WASM locals, buffers are i32 pointers, no
+refcounting, no temporary objects. WebGPU cannot compile GPU dispatches into native code (each
+kernel is a separate shader), but it CAN eliminate the JS overhead by pre-compiling the dispatch
+sequence into a tight command-encoding loop.
+
+### Design: Command Tape
+
+A **command tape** is a flattened, pre-resolved representation of a JitProgram's step list.
+Pipelines are resolved once at compile time. Per-step buffer assignments are encoded as indices into
+a flat `GPUBuffer[]` table, eliminating per-step scope lookup, array allocation, and refcounting.
+
+#### Compilation phase (once per JitProgram)
+
+```typescript
+interface WebGPUCommandTape {
+  // --- Pre-resolved at compile time ---
+
+  /** One entry per dispatch (execute step). */
+  dispatches: TapeDispatch[];
+
+  /** Bulk malloc plan: [jitIdIdx, paddedSize, initialData?][] in step order. */
+  mallocs: TapeMalloc[];
+
+  /** Recycle plan: [fromIdx, toIdx][] — pointer copy in flat table. */
+  recycles: [number, number][];
+
+  /** Free plan: jitIdIdxs to free after all dispatches complete. */
+  frees: number[];
+
+  /** Number of entries in the flat buffer table (inputs + intermediates + outputs). */
+  tableSize: number;
+
+  /** Mapping: external input position → table index. */
+  inputTableIdxs: number[];
+
+  /** Mapping: external output position → table index. */
+  outputTableIdxs: number[];
+
+  /** Per-output byte size (for creating backend Slots). */
+  outputSizes: number[];
+}
+
+interface TapeDispatch {
+  /** Pre-compiled GPU pipeline. */
+  pipeline: GPUComputePipeline;
+
+  /** Bind group layout (from pipeline.getBindGroupLayout(0)). */
+  bindGroupLayout: GPUBindGroupLayout;
+
+  /** Indices into the flat buffer table for inputs. */
+  inputIdxs: number[];
+
+  /** Indices into the flat buffer table for outputs. */
+  outputIdxs: number[];
+
+  /** Pre-computed grid dimensions. */
+  grid: [number, number];
+
+  /** Pre-computed uniform bind group (null if no uniforms). Static uniforms only. */
+  uniformBindGroup: GPUBindGroup | null;
+
+  /** Dynamic uniform offset (for multi-pass shaders). */
+  uniformOffset: number;
+}
+
+interface TapeMalloc {
+  /** Index in the flat buffer table. */
+  tableIdx: number;
+
+  /** Buffer size in bytes (padded to 4-byte alignment). */
+  paddedSize: number;
+
+  /** Pre-filled constant data (for O2 scalar promotion). */
+  initialData: Uint8Array | null;
+}
+```
+
+**Compilation steps:**
+
+1. Walk all steps, assign sequential table indices to each JitId
+2. For each `execute` step:
+   - Call `prepareKernelSync(kernel)` → resolve pipeline
+   - Pre-extract `pipeline.getBindGroupLayout(0)` (avoids per-dispatch lookup)
+   - Record input/output table indices (integers, not Slot refs)
+   - Pre-compute grid dimensions from concrete kernel size
+   - Pre-build static uniform bind groups (for non-symbolic uniforms)
+3. For `malloc` steps: record size + initialData
+4. For `recycle` steps: record (from, to) index pairs
+5. For `free` steps: record indices (all frees deferred to post-dispatch)
+6. Reject programs with step types that require complex coordination: `scan`, `dus`, `scatter_add`,
+   `assoc_scan`, `block_map`, `workgroup_assoc_scan`, `reverse`, `incref`
+
+The eligibility check mirrors `canCompileToMegaModule()` from the WASM path. `fori_loop` with
+concrete bounds can be supported by unrolling into the dispatch sequence (each iteration produces N
+dispatches). Routines ARE supported — they are also GPU dispatches with pre-resolved pipelines.
+
+#### Execution phase (per invocation)
+
+```typescript
+executeTape(tape: WebGPUCommandTape, inputSlots: Slot[]): Slot[] {
+  // 1. Build flat buffer table (one array, no per-step allocation)
+  const table: GPUBuffer[] = new Array(tape.tableSize);
+
+  // Map external inputs
+  for (let i = 0; i < inputSlots.length; i++) {
+    table[tape.inputTableIdxs[i]] = this.#getBuffer(inputSlots[i]).buffer;
+  }
+
+  // Bulk malloc all intermediates
+  for (const m of tape.mallocs) {
+    const buf = this.#poolPop(m.paddedSize) ?? this.#createBuffer(m.paddedSize);
+    if (m.initialData) this.device.queue.writeBuffer(buf, 0, m.initialData);
+    table[m.tableIdx] = buf;
+  }
+
+  // Apply recycling (just pointer copy)
+  for (const [from, to] of tape.recycles) table[to] = table[from];
+
+  // 2. Encode all dispatches in a single encoder
+  const encoder = this.device.createCommandEncoder();
+  for (const d of tape.dispatches) {
+    const entries = new Array(d.inputIdxs.length + d.outputIdxs.length);
+    for (let i = 0; i < d.inputIdxs.length; i++) {
+      entries[i] = { binding: i, resource: { buffer: table[d.inputIdxs[i]] } };
+    }
+    for (let i = 0; i < d.outputIdxs.length; i++) {
+      entries[d.inputIdxs.length + i] = {
+        binding: d.inputIdxs.length + i,
+        resource: { buffer: table[d.outputIdxs[i]] },
+      };
+    }
+
+    const bindGroup = this.device.createBindGroup({
+      layout: d.bindGroupLayout,
+      entries,
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(d.pipeline);
+    pass.setBindGroup(0, bindGroup);
+    if (d.uniformBindGroup) pass.setBindGroup(1, d.uniformBindGroup, [d.uniformOffset]);
+    pass.dispatchWorkgroups(d.grid[0], d.grid[1]);
+    pass.end();
+  }
+  this.device.queue.submit([encoder.finish()]);
+
+  // 3. Return to pool / free
+  for (const idx of tape.frees) {
+    const buf = table[idx];
+    if (!this.#poolPush(buf)) {
+      this.#gpuAllocatedBytes -= buf.size;
+      buf.destroy();
+    }
+  }
+
+  // 4. Create output slots
+  const outputs: Slot[] = new Array(tape.outputTableIdxs.length);
+  for (let i = 0; i < tape.outputTableIdxs.length; i++) {
+    const slot = this.nextSlot++;
+    this.buffers.set(slot, {
+      buffer: table[tape.outputTableIdxs[i]],
+      size: tape.outputSizes[i],
+      ref: 1,
+    });
+    outputs[i] = slot;
+  }
+  return outputs;
+}
+```
+
+### Overhead elimination analysis
+
+| Source                         | Step-by-Step (current) | Command Tape              | Saved?      |
+| ------------------------------ | ---------------------- | ------------------------- | ----------- |
+| Scope lookup per step          | ~0.1µs × N             | 0 (flat table)            | ✅          |
+| `ins[]`/`outs[]` array alloc   | ~0.5µs × N             | 0 (pre-computed indices)  | ✅          |
+| `incRef`/`decRef` per step     | ~0.5µs × N             | 0 (tape-managed lifetime) | ✅          |
+| `prepareKernelSync` per step   | ~1µs × N               | 0 (pre-resolved)          | ✅          |
+| `dispatch()` buffer extraction | ~0.2µs × N             | 0 (direct table index)    | ✅          |
+| Batch entry object creation    | ~0.3µs × N             | 0 (no objects)            | ✅          |
+| GC pressure (temp arrays)      | ~100ms for 764 steps   | ~0 (one array, reused)    | ✅          |
+| `createBindGroup` per dispatch | ~2µs × N               | ~2µs × N                  | Unavoidable |
+| Compute pass encoding          | ~0.5µs × N             | ~0.5µs × N                | Unavoidable |
+| `queue.submit`                 | ~22ms × 1              | ~22ms × 1                 | Unavoidable |
+
+**Conservative estimate for DLM (764 dispatches):**
+
+- Current: ~124ms (95ms JS loop + 22ms submit + 6ms bind groups + 1ms prepare)
+- Command tape: ~30ms (22ms submit + 6ms bind groups + 2ms tape loop)
+- **Speedup: ~4×**
+
+**Optimistic estimate (bind group overhead measured lower in practice):**
+
+- Current: ~124ms
+- Command tape: ~25ms
+- **Speedup: ~5×**
+
+The 22ms `queue.submit` is the GPU-side scheduling cost for encoding 764 dispatches into a single
+command buffer. This is a hardware/driver cost that cannot be reduced without reducing the number of
+dispatches.
+
+### Bind group caching (O8b, aggressive optimization)
+
+Bind groups reference GPUBuffers by identity. If the buffer pool returns the **same GPUBuffer
+objects** across invocations (LIFO pool for same-sized mallocs in same order), then bind groups from
+the previous execution are still valid and can be reused.
+
+**Approach:** Cache bind groups keyed by `(dispatch_index, buffer_identity_tuple)`:
+
+```typescript
+// Per-dispatch bind group cache
+interface CachedBindGroup {
+  fingerprint: number;  // hash of GPUBuffer object identities
+  bindGroup: GPUBindGroup;
+}
+
+// During execution:
+for (const d of tape.dispatches) {
+  const fp = hashBufferIds(d.inputIdxs, d.outputIdxs, table);
+  if (d.cachedBG?.fingerprint === fp) {
+    // Reuse!
+    pass.setBindGroup(0, d.cachedBG.bindGroup);
+  } else {
+    const bg = device.createBindGroup({ ... });
+    d.cachedBG = { fingerprint: fp, bindGroup: bg };
+    pass.setBindGroup(0, bg);
+  }
+}
+```
+
+**Hit rate:** For a program that runs repeatedly with a steady-state buffer pool:
+
+- If all mallocs hit the pool and pool is LIFO → ~100% hit rate
+- If some mallocs create fresh buffers → proportionally lower hit rate
+- External inputs change between invocations → dispatches reading inputs miss
+
+For DLM where the scan runs N iterations with the same intermediate sizes, bind group caching would
+eliminate the ~6ms `createBindGroup` cost on all iterations after the first.
+
+**Risk:** The `GPUBuffer` identity check is not guaranteed to be stable. Pool eviction,
+`configurePool`, or GC of pooled buffers would invalidate cached bind groups. The cache must be
+invalidated when the pool is reconfigured.
+
+**Priority:** O8b is secondary. O8a (basic command tape) delivers the majority of the benefit.
+
+### Supported step types
+
+| Step type              | Supported? | Notes                                                    |
+| ---------------------- | ---------- | -------------------------------------------------------- |
+| `execute` (Kernel)     | ✅         | Pre-resolved pipeline, pre-computed grid                 |
+| `execute` (Routine)    | ✅         | Same as Kernel — routines are also GPU dispatches        |
+| `malloc`               | ✅         | Bulk alloc into flat table                               |
+| `free`                 | ✅         | Deferred to post-submit                                  |
+| `recycle`              | ✅         | Table index copy (zero-cost)                             |
+| `fori_loop` (concrete) | ✅         | Unroll iterations into dispatch sequence                 |
+| `incref`               | ❌         | Requires refcount tracking during encode                 |
+| `scan`                 | ❌         | Requires nested execution with complex coordination      |
+| `dus`                  | ⚠️         | Could support via pre-encoded `copyBufferToBuffer` calls |
+| `scatter_add`          | ⚠️         | Could support via pre-resolved scatter dispatch          |
+| `assoc_scan`           | ❌         | Multi-phase dispatch with dynamic buffer management      |
+| `block_map`            | ❌         | Complex shader generation and buffer management          |
+| `workgroup_assoc_scan` | ❌         | Nested inside block_map                                  |
+| `reverse`              | ⚠️         | Could support via pre-encoded copy shader                |
+
+**Programs with unsupported steps fall back to current step-by-step execution.** This is the same
+strategy as the WASM mega-module.
+
+### When the command tape helps
+
+| Workload                                      | Dispatches | Current (ms) | Tape (ms) | Speedup                  |
+| --------------------------------------------- | ---------- | ------------ | --------- | ------------------------ |
+| DLM `jit(core)` (764 kernel dispatches)       | 764        | ~124         | ~30       | ~4×                      |
+| Standalone `jit(() => chain_of_20_ops)`       | 20         | ~0.2         | ~0.05     | ~4×                      |
+| TTS inference pipeline (100+ ops, no scan)    | ~100       | ~1.5         | ~0.4      | ~3.5×                    |
+| `jit(f)` with scan (scan steps block tape)    | N/A        | N/A          | N/A       | Fallback                 |
+| `associativeScan` (fused into 1–3 dispatches) | 1–3        | ~3           | ~3        | 1× (overhead negligible) |
+
+The command tape targets **kernel-only JitPrograms with many steps** — the same class the WASM
+mega-module handles. Programs dominated by scan or block-map dispatches are already optimized by
+their respective fused shaders.
+
+### Integration with JitProgram.execute()
+
+Mirror the WASM mega-module integration point:
+
+```typescript
+// In JitProgram.execute():
+if (this.backend.type === "webgpu") {
+  if (this._commandTape === undefined) {
+    this._commandTape = canCompileToCommandTape(this.steps)
+      ? compileCommandTape(this.backend, this.steps, this.inputs, this.outputs)
+      : null;
+  }
+  if (this._commandTape) {
+    const outputSlots = this.backend.executeTape(this._commandTape, inputs);
+    return { outputs: outputSlots, pending: [] };
+  }
+}
+// Fall through to step-by-step execution
+```
+
+The tape is compiled on first invocation and cached on the `JitProgram` instance, matching the
+`_megaModule` lazy compilation pattern.
+
+### Implementation phases
+
+| Phase | Scope                                           | Effort | Impact                                  |
+| ----- | ----------------------------------------------- | ------ | --------------------------------------- |
+| O8a   | Basic command tape (kernel+malloc+free+recycle) | Medium | ~4× for kernel-only programs            |
+| O8b   | Bind group caching                              | Small  | Additional ~20% on repeated invocations |
+| O8c   | DUS + scatter_add + reverse support             | Small  | Expands tape eligibility                |
+| O8d   | fori_loop unrolling into tape                   | Medium | Handles loop-containing programs        |
+
+### Comparison with alternatives
+
+| Approach                       | Feasibility       | Impact vs current                                          |
+| ------------------------------ | ----------------- | ---------------------------------------------------------- |
+| **Command tape (this)**        | **Available now** | **~4× JS overhead reduction**                              |
+| WebGPU indirect dispatch       | Available         | Doesn't help (1 dispatch at a time)                        |
+| WebGPU compute bundles         | Not in spec       | Would be ideal; no timeline                                |
+| Command buffer reuse           | Not in spec       | GPUCommandBuffer is consumed on submit                     |
+| Uber-shader (all kernels in 1) | Not viable        | Different bindings, grid sizes, workgroup sizes per kernel |
+| Move encoding to Worker        | Available         | Hides latency but doesn't reduce work                      |
+
+### Risks
+
+| Risk                                             | Likelihood | Mitigation                                                  |
+| ------------------------------------------------ | ---------- | ----------------------------------------------------------- |
+| GC of cached pipelines invalidates tape          | Low        | Tape holds strong refs to pipelines                         |
+| Buffer pool behavior changes tape correctness    | None       | Tape allocates fresh each time; pool is optimization only   |
+| Programs with `incref` steps are ineligible      | Medium     | `jitCompile` avoids `incref` when possible; fallback exists |
+| Initial compilation cost (pipeline resolution)   | Low        | Pipelines are already cached; tape compilation is once      |
+| Large number of dispatches exceeds Chrome limits | Low        | Chrome handles 1000+ dispatches per submit in practice      |
+
+---
+
 ## Non-goals
 
 - **General einsum rank-adaptation:** The general `parseEinsumExpression` still fails with
@@ -1140,12 +1504,11 @@ Fallback for scalar ops). Reference: `GPUPrefixSums` by Thomas Smith.
   Fixing the general parser would be a separate, lower-priority effort.
 - **Multiple bind groups for overflow:** WebGPU supports up to 4 bind groups, but storage bindings
   per shader stage is a global limit — splitting across groups doesn't help.
-- **GPU/WASM ratio ≤ 2× target:** Not achievable for small-matrix DLM (m=2) at small N without
-  fundamentally reducing dispatch count. The bottleneck is pure JS-side overhead in the JIT
-  execution loop (95ms of 124ms total). WASM's mega-module avoids this entirely by compiling all
-  steps into a single native function. WebGPU has no equivalent mechanism — each dispatch requires
-  JS-side command encoding. For large-matrix workloads (matmul 4096×4096), WebGPU already achieves
-  53.7% peak.
+- **GPU/WASM ratio ≤ 2× target:** Not achievable for small-matrix DLM (m=2) at small N. The
+  bottleneck is JS-side JIT loop overhead (~95ms of 124ms for 764 dispatches). The WebGPU command
+  tape (O8) reduces this to ~30ms (~4× improvement) but cannot match WASM mega-module's ~6ms due to
+  irreducible GPU API costs (`createBindGroup`, `queue.submit`). For large-matrix workloads (matmul
+  4096×4096), WebGPU already achieves 53.7% peak.
 - **Binding limit optimization on high-limit hardware:** On Deno/NVIDIA with `maxArgs = 1,048,575`,
   the P2 pass has no effect. All dispatch fragmentation comes from P1 structural rules (reduction
   boundaries, diamond heuristic). Browser deployments with Chrome's `maxArgs ≈ 9` will see

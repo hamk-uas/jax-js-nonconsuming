@@ -312,6 +312,13 @@ compiled to native WASM loop.
 Shares `WebAssembly.Memory` via `SharedArrayBuffer` for zero-copy. Browser main threads can't
 spin-wait (`Atomics.wait` blocked) — detected at construction, falls back to direct execution.
 
+**Command tape (WebGPU):** Pre-compiles a `JitProgram`'s step list into a flattened dispatch
+sequence with pre-resolved pipelines, pre-computed buffer indices, and pre-built uniform bind
+groups. Eliminates per-step JS overhead (scope lookups, array allocation, refcounting, pipeline
+cache lookups) by replacing the generic step loop with a tight command-encoding loop over a flat
+`GPUBuffer[]` table. ~4× reduction in JS-side overhead for kernel-only programs. Same eligibility as
+WASM mega-module (rejects scan, DUS, scatter_add, assoc_scan, block_map). See PLAN.md O8.
+
 **Effect system:** `MemoryEffect` enum (`Alloc`, `Borrow`, `Consume`, `Mutate`) on Jaxpr equations.
 `effectDrivenAllocate` uses annotations for sound buffer recycling including DUS/ScatterAdd
 zero-copy.
@@ -763,6 +770,7 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 | P9  | Timestamp query profiling | Medium      | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)            |
 | P10 | Decoupled Fallback scan   | **High**    | Single-dispatch O(N) prefix scan. Replaces Kogge-Stone for scalar ops. See PLAN.md P7 T0 |
 | P11 | Analytical small linalg   | Medium      | Cholesky/TriSolve/QR for n ≤ 4 as traced ops (not Routines). Enables sqrt DLM fusion     |
+| P12 | WebGPU command tape       | **High**    | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs       |
 
 ---
 
@@ -794,7 +802,7 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 ## Key architecture decisions
 
 | Decision                                           | Rationale                                                                                           |
-| -------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------- | --- | ------------------------------------- | --------------------------------------------------------------------------------------- |
 | Non-consuming ownership model                      | Eliminates `UseAfterFreeError`; trades for silent leaks + linting                                   |
 | Concrete compilation + symbolic cache              | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                  |
 | `effectDrivenAllocate` over two-pass               | Single-pass liveness; DUS zero-copy from `Mutate` effect                                            |
@@ -825,4 +833,4 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | WebGPU assocScan axis-aware via inAxes/outAxes     | Block-map body always sees B at block dim; `inAxes`/`outAxes` map to source axis                    |
 | `tree.data()`/`tree.consumeData()` parallel read   | Overlap `mapAsync` calls via `Promise.all`; 13.2× faster for 15 outputs on eGPU                     |
 | Scalar promotion (`pushLit` → `initialData`)       | Lit scalars encoded to bytes at compile time; `writeBuffer`/`memcpy` instead of kernel dispatch     |
-| Analytical inv for n ≤ 4 (Cramer's rule)           | Jaxpr-traceable: fuses in block-map. Routines break fusion. Pattern extends to cholesky/QR/trisolve |
+| Analytical inv for n ≤ 4 (Cramer's rule)           | Jaxpr-traceable: fuses in block-map. Routines break fusion. Pattern extends to cholesky/QR/trisolve |     | WebGPU command tape over step-by-step | Pre-resolved pipelines + flat buffer table eliminates ~76% of JS-side JIT loop overhead |
