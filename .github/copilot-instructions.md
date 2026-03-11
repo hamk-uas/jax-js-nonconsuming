@@ -757,20 +757,21 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 
 ## Future performance work
 
-| ID  | Title                     | Priority    | Description                                                                              |
-| --- | ------------------------- | ----------- | ---------------------------------------------------------------------------------------- |
-| P1  | ~~Tiled matmul (WebGPU)~~ | **Done** ✅ | 53.7% peak FP32 at 4096×4096 (12,138 GFLOP/s). Implemented via `block_map`               |
-| P2  | Relaxed SIMD FMA          | Medium      | `f32x4.relaxed_madd` for 2× dot-product throughput. Safari doesn't support               |
-| P3  | i64 in wasmblr            | Medium      | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins                    |
-| P4  | Conv2d tuning             | Medium      | Benchmark now (tiled matmul gives free improvement). Specialized WGSL for 3×3, 5×5       |
-| P5  | Subgroup reductions       | **Done** ✅ | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in AS |
-| P6  | Benchmark validation      | Medium      | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions                   |
-| P7  | Cooperative matrix (WMMA) | Blocked     | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable; ~2026 earliest    |
-| P8  | Subgroup scan builtins    | Medium      | `subgroupInclusiveAdd`/`subgroupShuffleUp` in assocScan. Available now (Chrome 134+)     |
-| P9  | Timestamp query profiling | Medium      | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)            |
-| P10 | Decoupled Fallback scan   | **High**    | Single-dispatch O(N) prefix scan. Replaces Kogge-Stone for scalar ops. See PLAN.md P7 T0 |
-| P11 | Analytical small linalg   | Medium      | Cholesky/TriSolve/QR for n ≤ 4 as traced ops (not Routines). Enables sqrt DLM fusion     |
-| P12 | WebGPU command tape       | **High**    | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs       |
+| ID  | Title                     | Priority     | Description                                                                              |
+| --- | ------------------------- | ------------ | ---------------------------------------------------------------------------------------- |
+| P1  | ~~Tiled matmul (WebGPU)~~ | **Done** ✅  | 53.7% peak FP32 at 4096×4096 (12,138 GFLOP/s). Implemented via `block_map`               |
+| P2  | Relaxed SIMD FMA          | Medium       | `f32x4.relaxed_madd` for 2× dot-product throughput. Safari doesn't support               |
+| P3  | i64 in wasmblr            | Medium       | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins                    |
+| P4  | Conv2d tuning             | Medium       | Benchmark now (tiled matmul gives free improvement). Specialized WGSL for 3×3, 5×5       |
+| P5  | Subgroup reductions       | **Done** ✅  | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in AS |
+| P6  | Benchmark validation      | Medium       | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions                   |
+| P7  | Cooperative matrix (WMMA) | Blocked      | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable; ~2026 earliest    |
+| P8  | Subgroup scan builtins    | Medium       | `subgroupInclusiveAdd`/`subgroupShuffleUp` in assocScan. Available now (Chrome 134+)     |
+| P9  | Timestamp query profiling | Medium       | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)            |
+| P10 | Decoupled Fallback scan   | **High**     | Single-dispatch O(N) prefix scan. Replaces Kogge-Stone for scalar ops. See PLAN.md P7 T0 |
+| P11 | Analytical small linalg   | **Med-High** | Cholesky/TriSolve/QR for n ≤ 4 as traced ops (not Routines). Enables sqrt DLM fusion     |
+| P12 | WebGPU command tape       | **High**     | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs       |
+| P13 | WebGPU arena allocator    | **High**     | Slab sub-allocation with 256-byte alignment. Stable bind groups for O8b. See PLAN.md O9  |
 
 ---
 
@@ -802,7 +803,7 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 ## Key architecture decisions
 
 | Decision                                           | Rationale                                                                                           |
-| -------------------------------------------------- | --------------------------------------------------------------------------------------------------- | --- | ------------------------------------- | --------------------------------------------------------------------------------------- |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | Non-consuming ownership model                      | Eliminates `UseAfterFreeError`; trades for silent leaks + linting                                   |
 | Concrete compilation + symbolic cache              | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                  |
 | `effectDrivenAllocate` over two-pass               | Single-pass liveness; DUS zero-copy from `Mutate` effect                                            |
@@ -833,4 +834,7 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | WebGPU assocScan axis-aware via inAxes/outAxes     | Block-map body always sees B at block dim; `inAxes`/`outAxes` map to source axis                    |
 | `tree.data()`/`tree.consumeData()` parallel read   | Overlap `mapAsync` calls via `Promise.all`; 13.2× faster for 15 outputs on eGPU                     |
 | Scalar promotion (`pushLit` → `initialData`)       | Lit scalars encoded to bytes at compile time; `writeBuffer`/`memcpy` instead of kernel dispatch     |
-| Analytical inv for n ≤ 4 (Cramer's rule)           | Jaxpr-traceable: fuses in block-map. Routines break fusion. Pattern extends to cholesky/QR/trisolve |     | WebGPU command tape over step-by-step | Pre-resolved pipelines + flat buffer table eliminates ~76% of JS-side JIT loop overhead |
+| Analytical inv for n ≤ 4 (Cramer's rule)           | Jaxpr-traceable: fuses in block-map. Routines break fusion. Pattern extends to cholesky/QR/trisolve |
+| WebGPU command tape over step-by-step              | Pre-resolved pipelines + flat buffer table eliminates ~76% of JS-side JIT loop overhead             |
+| Arena allocator over discrete buffer pool          | Slab sub-allocation → stable bind groups. 256-byte alignment overhead negligible vs VRAM            |
+| Targeted jaxprification over general               | Only Cholesky/TriSolve/QR for n≤4. Sort/Argsort/LU are fundamentally non-jaxprifiable               |

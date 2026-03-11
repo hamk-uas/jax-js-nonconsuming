@@ -829,11 +829,19 @@ traced ops. This is a key advantage over the Routine path, which requires hand-w
 
 ### Priority
 
-**Medium.** The standard DLM 5-tuple variant already fuses for m ≤ 4 (inv analytical path + Phase 1
-uniform constants). The sqrt variant is secondary. Implement when:
+**Medium-High.** Upgraded from Medium based on the Dispatch Acceleration Roadmap analysis. The
+standard DLM 5-tuple variant already fuses for m ≤ 4 (inv analytical path + Phase 1 uniform
+constants). Adding Cholesky + TriangularSolve analytical paths unlocks the sqrt DLM variant, which
+is numerically superior for poorly conditioned systems. QR completes the backward pass path.
 
-- A real use case needs sqrt variant fusion on WebGPU with m ≤ 4
-- Or when adding these paths enables a broader set of models to fuse
+Implement alongside O8/O9 (independent, no dependency):
+
+- Cholesky + TriSolve: enables sqrt DLM forward fusion for m ≤ 4
+- QR: enables sqrt DLM backward fusion for m ≤ 4
+- Combined: the entire sqrt DLM pipeline fuses for m ≤ 4 on WebGPU
+
+See "Routine Jaxprification Analysis" below for the broader assessment of which Routines should and
+should not be converted.
 
 ### Comparison: "eliminate Routines" vs "improve scan algorithm"
 
@@ -1478,11 +1486,27 @@ The tape is compiled on first invocation and cached on the `JitProgram` instance
 | Approach                       | Feasibility       | Impact vs current                                          |
 | ------------------------------ | ----------------- | ---------------------------------------------------------- |
 | **Command tape (this)**        | **Available now** | **~4× JS overhead reduction**                              |
-| WebGPU indirect dispatch       | Available         | Doesn't help (1 dispatch at a time)                        |
-| WebGPU compute bundles         | Not in spec       | Would be ideal; no timeline                                |
+| Arena allocator (O9)           | Available now     | Enables stable bind groups → O8b reliable. See O9 below    |
+| WebGPU indirect dispatch       | Available         | Doesn't help (1 dispatch at a time, not a sequence)        |
+| WebGPU compute bundles         | Not in spec       | Would be ideal; tape is the prerequisite (see below)       |
 | Command buffer reuse           | Not in spec       | GPUCommandBuffer is consumed on submit                     |
 | Uber-shader (all kernels in 1) | Not viable        | Different bindings, grid sizes, workgroup sizes per kernel |
 | Move encoding to Worker        | Available         | Hides latency but doesn't reduce work                      |
+
+**Compute bundles as endgame.** `GPURenderBundle` exists for pre-recorded render command sequences.
+A hypothetical `GPUComputeBundle` would allow pre-recording the entire dispatch tape as a native GPU
+command sequence, replayed in a single call with zero JS overhead per dispatch. The tape's data
+structures (pre-resolved pipelines, pre-computed bind groups, pre-computed grids) map 1:1 to what a
+compute bundle API would need. If/when the W3C introduces compute bundles, O8 becomes the natural
+compilation target — no architectural changes required, only a new execution backend for the same
+tape IR.
+
+**Indirect dispatch opportunities.** `dispatchWorkgroupsIndirect(buffer, offset)` lets the GPU
+determine dispatch sizes. This is useful for data-dependent grid sizes (e.g., dynamic sparsity,
+variable-length sequences), but doesn't reduce the number of dispatches in a fixed-topology
+JitProgram. It could become valuable for future dynamic control flow (while-loop conditions, early
+exit) without round-tripping to JS. Not a priority for current DLM/ML patterns where all sizes are
+statically known.
 
 ### Risks
 
@@ -1493,6 +1517,248 @@ The tape is compiled on first invocation and cached on the `JitProgram` instance
 | Programs with `incref` steps are ineligible      | Medium     | `jitCompile` avoids `incref` when possible; fallback exists |
 | Initial compilation cost (pipeline resolution)   | Low        | Pipelines are already cached; tape compilation is once      |
 | Large number of dispatches exceeds Chrome limits | Low        | Chrome handles 1000+ dispatches per submit in practice      |
+
+---
+
+## O9: WebGPU Arena Allocator
+
+### Problem statement
+
+The command tape (O8) eliminates most JS-side overhead, but `device.createBindGroup()` remains at
+~6ms for 764 dispatches (~8µs per call). This cost is irreducible under the current discrete buffer
+pool because every JIT invocation allocates different `GPUBuffer` objects, forcing fresh bind group
+creation every time. O8b bind group caching is fragile because pool LIFO order isn't guaranteed
+across invocations.
+
+The root cause: **discrete per-allocation buffers** mean bind groups (which reference buffer
+identities) can never be stable.
+
+### Design: slab sub-allocation
+
+Instead of `device.createBuffer()` per malloc, allocate from a small number of large **slab
+buffers**. Each intermediate gets a (slab, offset, size) triple instead of its own `GPUBuffer`.
+
+WebGPU storage buffer bindings support sub-range binding:
+
+```typescript
+{
+  binding: 0,
+  resource: { buffer: slab, offset: 1024, size: 256 },
+}
+```
+
+This is valid WebGPU — the spec allows explicit `offset` and `size` on storage buffer resource
+entries. The constraint: **offsets must be aligned to `minStorageBufferOffsetAlignment`** (256 bytes
+on all current hardware).
+
+### Allocation scheme
+
+For a JitProgram with known intermediate sizes (all concrete at tape compile time):
+
+1. **Layout phase:** Walk all malloc/free/recycle steps. Compute peak live set. Assign each
+   intermediate a (slabIndex, offset) pair using a linear bump allocator within each slab, with
+   256-byte alignment on all offsets.
+2. **Slab sizing:** Sum all peak-live intermediate sizes (with 256-byte alignment padding). Round up
+   to the next power-of-2 slab size. Typical DLM program: ~50KB of intermediates → 1 slab of 64KB.
+3. **Bind group pre-build:** Because slab identity and offsets are fixed at compile time, bind
+   groups can be pre-built once and reused indefinitely (O8b becomes trivial).
+4. **Input/output handling:** External inputs and outputs cannot be arena-allocated (they have
+   independent lifetimes). The bind group entries for external buffers change per invocation — only
+   dispatches using exclusively internal buffers get fully cached bind groups.
+
+### 256-byte alignment overhead
+
+| Buffer logical size | Padded (256-byte aligned) | Waste   | Typical count in DLM |
+| ------------------- | ------------------------- | ------- | -------------------- |
+| 4 bytes (scalar)    | 256 bytes                 | 252B    | ~100                 |
+| 16 bytes (2×2 f32)  | 256 bytes                 | 240B    | ~200                 |
+| 64 bytes (4×4 f32)  | 256 bytes                 | 192B    | ~50                  |
+| 256+ bytes          | size rounded to 256       | ≤255B   | ~10                  |
+| **Total DLM slab**  |                           | ~100 KB | (fits in L1 cache)   |
+
+For DLM (m=2, 764 dispatches): ~360 intermediates × 256 bytes = ~90 KB slab. This is negligible —
+GPU VRAM has GBs of headroom. The L1/L2 cache benefit of spatial locality may actually improve
+performance.
+
+For large-matrix ML (1024×1024 intermediates at 4 MB each): alignment waste is <0.01%. Arena is
+overwhelmingly beneficial.
+
+### Mixed strategy: arena + discrete pool
+
+Small constant buffers with `initialData` (O2 scalar promotion, typically 4–8 bytes) are write-once.
+These can be arena-allocated in a separate **constants slab** that persists across invocations
+(never freed, never reallocated). This eliminates `writeBuffer` calls on warm invocations for
+constants that don't change.
+
+Large external inputs/outputs that outlive the JitProgram execution remain in the discrete pool.
+Only JitProgram-internal intermediates (malloc→use→free within one execution) go in the arena.
+
+### Impact on bind group caching
+
+| Scenario                     | Without arena (O8b) | With arena (O9)                |
+| ---------------------------- | ------------------- | ------------------------------ |
+| Internal-only dispatches     | ~60% cache hit      | **100% cache hit** (permanent) |
+| Dispatches reading inputs    | ~0% cache hit       | ~0% (input buffers vary)       |
+| Repeated invocations (DLM)   | **Fragile** (LIFO)  | **Guaranteed stable**          |
+| createBindGroup cost (764 d) | ~6ms → ~3ms (50%)   | ~6ms → ~1ms (85%)              |
+
+### Impact on overall DLM execution
+
+| Component              | Current | O8 tape | O8 + O9 arena |
+| ---------------------- | ------- | ------- | ------------- |
+| JS loop overhead       | 95 ms   | ~2 ms   | ~2 ms         |
+| createBindGroup        | 6 ms    | 6 ms    | **~1 ms**     |
+| queue.submit           | 22 ms   | 22 ms   | 22 ms         |
+| prepareKernelSync      | 1 ms    | 0       | 0             |
+| **Total**              | 124 ms  | ~30 ms  | **~25 ms**    |
+| **Speedup vs current** | 1×      | ~4×     | **~5×**       |
+
+### WebGPU spec constraints
+
+| Constraint                          | Value     | Impact                                         |
+| ----------------------------------- | --------- | ---------------------------------------------- |
+| `minStorageBufferOffsetAlignment`   | 256 bytes | All sub-allocations must be 256-byte aligned   |
+| `maxStorageBufferBindingSize`       | 128 MB+   | Single slab can be very large                  |
+| `maxBufferSize`                     | 256 MB+   | Ample headroom for any program                 |
+| Buffer usage flags must be superset | Spec req  | Slab must have STORAGE \| COPY_SRC \| COPY_DST |
+| `copyBufferToBuffer` 4-byte aligned | Spec req  | DUS/scatter within slab needs 4-byte offsets   |
+
+### Implementation phases
+
+| Phase | Scope                                          | Effort | Depends on |
+| ----- | ---------------------------------------------- | ------ | ---------- |
+| O9a   | Slab allocator for JitProgram locals           | Medium | O8a        |
+| O9b   | Pre-built bind groups for arena slots          | Small  | O9a        |
+| O9c   | Constants slab (persistent across invocations) | Small  | O9a        |
+
+### Risks
+
+| Risk                                    | Likelihood | Mitigation                                                |
+| --------------------------------------- | ---------- | --------------------------------------------------------- |
+| 256-byte alignment wastes memory        | Certain    | ~90 KB for DLM — negligible vs GPU VRAM                   |
+| Slab fragmentation on varying programs  | Medium     | Per-JitProgram slab; freed as unit                        |
+| Slab too small for unexpected program   | Low        | Fallback to discrete alloc for overflow                   |
+| `copyBufferToBuffer` within same buffer | N/A        | WebGPU spec permits same-buffer copies (non-overlapping)  |
+| External inputs can't be arena'd        | By design  | Only internal intermediates use arena; inputs stay pooled |
+
+---
+
+## Dispatch Acceleration Roadmap
+
+The dominant bottleneck for DLM and ML inference workloads on WebGPU is **excessive dispatches with
+high per-dispatch JS overhead**. The following optimizations form a coherent acceleration stack:
+
+### Measured baseline (DLM Nile m=2, N=100, 764 dispatches, RTX 4070 eGPU)
+
+| Component         | Time (ms) | % of total |
+| ----------------- | --------- | ---------- |
+| JS loop overhead  | 95        | 76%        |
+| queue.submit      | 22        | 18%        |
+| createBindGroup   | 6         | 5%         |
+| prepareKernelSync | 1         | 1%         |
+| **Total**         | **124**   | 100%       |
+
+### Optimization stack
+
+| ID       | Optimization            | Target                            | Impact estimate         | Status          |
+| -------- | ----------------------- | --------------------------------- | ----------------------- | --------------- |
+| **O8a**  | Command tape            | JS loop overhead (95ms)           | 95ms → ~2ms (**47×**)   | Planned         |
+| **O8b**  | Bind group caching      | createBindGroup (6ms)             | 6ms → ~3ms (fragile)    | Planned         |
+| **O9**   | Arena allocator         | createBindGroup + cache stability | 6ms → ~1ms (reliable)   | Planned         |
+| **O6**   | Multi-reduction kernels | Dispatch count (~764)             | ~5-15% fewer dispatches | Deprioritized   |
+| **A-L**  | Analytical linalg (n≤4) | Routine fusion barriers           | Enables sqrt DLM fusion | Medium priority |
+| **T0**   | Decoupled Fallback scan | Scan dispatch count (log N → 1)   | ~0.05ms (3→1 dispatch)  | High priority   |
+| **P7-2** | WMMA cooperative matrix | Per-dispatch throughput           | 2-4× matmul GFLOP/s     | Blocked (~2026) |
+
+### Projected wall-clock improvement
+
+| Configuration            | DLM m=2 N=100 | Transformer 12-layer | Diffusion U-Net |
+| ------------------------ | ------------- | -------------------- | --------------- |
+| Current                  | 124 ms        | ~15 ms               | ~50 ms          |
+| + O8a (command tape)     | ~30 ms        | ~5 ms                | ~15 ms          |
+| + O9 (arena)             | ~25 ms        | ~4 ms                | ~12 ms          |
+| + Analytical linalg (≤4) | ~25 ms\*      | ~4 ms                | ~12 ms          |
+| + WMMA (future)          | ~15 ms        | ~2 ms                | ~6 ms           |
+
+\* Analytical linalg doesn't reduce dispatch count for standard DLM (already fusing via inv
+analytical paths). It unlocks the **sqrt DLM variant** and any other workload with small-matrix
+Cholesky/QR/TriSolve in scan or block-map bodies.
+
+### Sequencing rationale
+
+1. **O8a first** — eliminates the 76% JS overhead. Largest single improvement. All other
+   optimizations compound on top of the lower baseline.
+2. **O9 after O8a** — requires O8a's flat buffer table; eliminates the next bottleneck
+   (createBindGroup) and makes O8b reliable.
+3. **Analytical linalg in parallel** — independent of O8/O9. Unblocks sqrt DLM and broadens the set
+   of fusable ML patterns.
+4. **WMMA when available** — hardware dependent. The tape + arena infrastructure is already the
+   right execution model for WMMA dispatches.
+
+### Who benefits beyond DLM
+
+| ML Architecture           | Dispatch pattern                              | How this stack helps                              |
+| ------------------------- | --------------------------------------------- | ------------------------------------------------- |
+| **Transformers**          | ~10-15 dispatches/layer × 12+ layers          | O8: 4× overhead reduction on 120-180 dispatches   |
+| **RNNs/LSTMs**            | scan over T with matmul+activation per step   | Already fused via compiled-loop; no change needed |
+| **Diffusion (U-Net)**     | 500-1000 conv2d + attention + skip dispatches | O8: 4× overhead; O9: stable bind groups           |
+| **MLP inference**         | matmul + bias + activation chains             | O8: moderate; chains already fuse well            |
+| **Kalman filters (DLM)**  | scan + hundreds of linalg dispatches per step | O8+O9: 5× total; analytical linalg: enables sqrt  |
+| **Optimization (L-BFGS)** | Many small linalg ops per iteration           | O8: 4×; analytical linalg: fuses small-n solves   |
+
+---
+
+## Routine Jaxprification Analysis
+
+### Question: should we generally convert Routines to jaxpr-traced ops?
+
+The 6 current Routines are: **Sort**, **Argsort**, **Cholesky**, **TriangularSolve**, **LU**,
+**QR**. Each Routine in a block-map body forces fallback to per-block multi-dispatch execution,
+breaking fusion. In scan bodies, Routines are supported via preencoded-multi-step (Phase 3) but
+cannot fuse into the compiled-loop shader.
+
+### Per-Routine assessment
+
+| Routine             | Jaxprifiable (n≤4)? | Algorithm                           | Trace graph (n=4) | Worth it?                                                     |
+| ------------------- | ------------------- | ----------------------------------- | ----------------- | ------------------------------------------------------------- |
+| **inv** (done)      | ✅ Done             | Cramer's rule                       | ~300 ops          | Already ships. Enables DLM 5-tuple fusion.                    |
+| **Cholesky**        | ✅ Yes              | Cholesky-Banachiewicz, unrolled     | ~50 ops           | **Yes** — enables sqrt DLM. Simple, small graph.              |
+| **TriangularSolve** | ✅ Yes              | Back/forward substitution, unrolled | ~20 ops           | **Yes** — enables sqrt DLM. Tiny graph.                       |
+| **QR**              | ✅ Yes              | Householder reflections, unrolled   | ~200 ops          | **Maybe** — enables sqrt DLM backward. Moderate graph size.   |
+| **LU**              | ⚠️ Tricky           | Gaussian elim with pivoting         | ~40 ops + control | **No** — pivoting needs data-dependent branching. Not in DLM. |
+| **Sort**            | ❌ No               | Comparison-based, O(n log n)        | N/A               | **No** — fundamentally data-dependent. Not ML-critical.       |
+| **Argsort**         | ❌ No               | Comparison-based, O(n log n)        | N/A               | **No** — fundamentally data-dependent. Used in topK only.     |
+
+### Recommendation: targeted, not general
+
+**Jaxprify Cholesky + TriangularSolve for n ≤ 4.** These are the two ops blocking sqrt DLM fusion,
+both have small and simple trace graphs, and AD "just works" through the traced ops (no custom JVP
+rules needed). Optionally add QR for n ≤ 4 to complete the sqrt DLM backward path.
+
+**Do NOT attempt general jaxprification.** Sort/Argsort are fundamentally comparison-based and
+cannot be expressed as fixed arithmetic traces. LU requires data-dependent pivoting. For n ≥ 5, the
+trace graphs grow rapidly (inv 5×5 ≈ 720 terms, QR 5×5 ≈ 500+ terms) and the JIT compilation cost
+makes them unsuitable for inner loops.
+
+**Do NOT jaxprify large-n operations.** The backend-optimized WASM (wasmblr) and WebGPU (WGSL)
+Routine implementations use parallelism, shared memory, and hardware-specific tricks that a traced
+elementwise graph can never match. For n ≥ 8, a hand-written Routine will always outperform an
+unrolled trace.
+
+### Actionable scope
+
+This analysis aligns with and reinforces the existing "Analytical Small-Matrix Linalg" section
+above. The concrete next steps:
+
+1. **Cholesky n ≤ 4:** Unrolled Cholesky-Banachiewicz in `lax-linalg.ts`. Pattern: threshold check →
+   analytical path → fall through to Routine for n ≥ 5. Identical to existing `inv()` pattern.
+2. **TriangularSolve n ≤ 4:** Unrolled back/forward substitution. Needs to handle both upper and
+   lower triangular, single and batched RHS.
+3. **QR n ≤ 4 (optional):** Unrolled Householder. Moderate effort due to reflector computation.
+4. **Testing:** Each path tested against Routine output for numerical agreement at all n ≤ 4.
+
+Priority: **Medium-High** (upgraded from Medium). The sqrt DLM variant is numerically superior for
+poorly conditioned systems. Enabling it to fuse for m ≤ 4 on WebGPU is a concrete, achievable goal.
 
 ---
 
