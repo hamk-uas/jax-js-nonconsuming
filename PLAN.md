@@ -361,9 +361,18 @@ newS = ASAT + q.S                        # fused epilogue of ASAT
 **Important caveat — associativeScan WebGPU already fuses these.** On WebGPU, `associativeScan`
 compiles the compose body into a **block-map fused WGSL shader**. All 4 matmul reductions execute as
 sequential inline code within one shader dispatch (per-element ridx loops with `var<private>`
-accumulators, barriers between steps, intermediates in `var<workgroup>`). The total dispatch count
-for `associativeScan(compose3, elems)` with N=100, blockSize=32 is **3 dispatches** (Phase 1 local
-scan + Phase 3 recursive prefix scan + Phase 4 apply), regardless of how many body steps exist.
+accumulators, barriers between steps, intermediates in `var<workgroup>`).
+
+**Measured dispatch counts** (NVIDIA RTX 4070 Ti SUPER, Chromium headless, `dispatchCount` counter):
+
+| N         | 2-tuple dispatches | 3-tuple dispatches |
+| --------- | ------------------ | ------------------ |
+| 1–256     | **1**              | **1**              |
+| 257–10000 | **3**              | **3**              |
+
+Crossover at N=257 (blockSize=256). Below blockSize, a single fused shader handles everything.
+Above, 3 dispatches: Phase 1 (local scan) + Phase 3 (recursive prefix) + Phase 4 (apply). **Body
+complexity has zero effect on dispatch count** — 2-tuple and 3-tuple are identical.
 
 **O6's target audience is therefore:**
 
@@ -631,7 +640,7 @@ large-matrix patterns** like `softmax(Q @ K^T) @ V` where the intermediate is la
 | Interaction with O1 cheap-recompute diamond relaxation      | None       | Diamond operates on P1; fusion in `flushPendingKernels` |
 | Mega-module inline failure for multi-output reduction       | Low        | Already handles multi-output elementwise                |
 
-### Dispatch reduction estimate (corrected)
+### Dispatch reduction estimate (measured)
 
 **Strategy A does NOT accelerate DLM on WebGPU** for two independent reasons:
 
@@ -640,10 +649,10 @@ large-matrix patterns** like `softmax(Q @ K^T) @ V` where the intermediate is la
    → different keys → no fusion. The 5-tuple is worse: ~15 dots, each with a unique input pair. Even
    with input-arg union relaxation, the optimization is moot because:
 
-2. **Block-map fused shader** — On WebGPU, `associativeScan` compiles the entire compose body into a
-   single WGSL shader. All 4 matmul reductions execute as sequential inline `ridx` loops within one
-   dispatch. The total dispatch count for N=100 is **3** (hierarchical recursion: local scan,
-   recursive prefix, apply), independent of body complexity.
+2. **Block-map fused shader** — Measured: **1 dispatch** for N≤256, **3 dispatches** for N>256. The
+   entire compose body (all 4 matmul reductions + elementwise ops) compiles into a single fused WGSL
+   shader. The 3 dispatches for N>256 are Phase 1/3/4 of hierarchical decomposition — each runs the
+   full body, not individual steps. Body complexity is irrelevant.
 
 **Where Strategy A helps (non-DLM, non-scan):**
 
@@ -724,6 +733,192 @@ by the block-map fused shader. Effort is better spent on:
 - Subgroup matrix ops (WMMA) for hardware tensor cores in tiled matmul (P7)
 - Conv2d tuning (P4)
 - Relaxed SIMD FMA for WASM matmul (P2)
+
+---
+
+## P7: Subgroups & Cooperative Matrix — Forward-Looking Plan
+
+### Overview
+
+Subgroup operations are the single most impactful GPU feature for jax-js performance. They expose
+SIMD-level (SIMT) parallelism — threads within a hardware "wave" (NVIDIA warp = 32 threads, Intel EU
+= 8–32 threads) can communicate via registers without shared memory. This is strictly cheaper than
+`var<workgroup>` paths.
+
+### Chrome subgroups timeline
+
+| Chrome  | Feature                                                                                        | Status        |
+| ------- | ---------------------------------------------------------------------------------------------- | ------------- |
+| 125     | Subgroups announced (feature in development)                                                   | Experimental  |
+| 128     | Origin trial: `subgroupBallot`, `subgroupBroadcast`, `subgroup_invocation_id`, `subgroup_size` | Experimental  |
+| 129     | Expanded: `subgroupAdd`, `subgroupAll`, `subgroupShuffle`, etc.                                | Experimental  |
+| 131     | `subgroupInclusiveAdd`, `subgroupInclusiveMul`                                                 | Experimental  |
+| 132     | Extended subgroups experimentation                                                             | Experimental  |
+| 133     | Experimental subgroup features cleanup                                                         | Cleanup       |
+| **134** | **Subgroups shipped as standard feature**                                                      | **Stable** ✅ |
+| 144     | `subgroup_id` extension                                                                        | Stable        |
+| 145     | `subgroup_uniformity` extension                                                                | Stable        |
+
+Google Meet reported **2.3–2.9× speedup** using subgroups for matrix-vector multiply shaders during
+the origin trial (Chrome 128–131).
+
+### What we already use (P5 — Done)
+
+| Feature                   | Where                              | Impact                          |
+| ------------------------- | ---------------------------------- | ------------------------------- |
+| `subgroupAdd/Mul/Min/Max` | JIT reduction (webgpu.ts)          | Fewer shmem steps               |
+| `subgroupAdd/Mul/Min/Max` | block-map reduction (block-map.ts) | Fewer shmem steps               |
+| Three-phase tree pattern  | Both paths                         | Correct for any `subgroup_size` |
+
+**Pattern:** Subgroup reduce → SG leaders write to `var<workgroup>` → inter-subgroup tree in shmem.
+Fallback: standard shared-memory tree reduction when `subgroups` feature unavailable.
+
+### Tier 1: Remaining subgroup builtins (available now, Chrome 134+)
+
+#### 1a. `subgroupInclusiveAdd` / `subgroupInclusiveMul` for associative scan
+
+**What:** Replace the innermost Kogge-Stone rounds within a subgroup with a single hardware
+instruction. For `subgroup_size = 32`, the first 5 rounds of Kogge-Stone (doubling 1→2→4→8→16→32)
+are replaced by one `subgroupInclusiveAdd()` call.
+
+**Where:** `associativeScan` WebGPU fused shader — the per-round Kogge-Stone loop in
+`nativeScanMultiShaderSource` / block-map fused path.
+
+**Impact:** For cumulative sum/product with N=1024, blockSize=256: each block has 8 subgroups of 32.
+Currently 8 Kogge-Stone rounds per block (log₂ 256). With subgroup inclusive scan, rounds 0–4 are
+free, leaving only 3 inter-subgroup rounds. **~40% fewer barrier-separated shader rounds.**
+
+**Prerequisites:** Body function must be a simple associative op (`add` or `mul`) that maps directly
+to the hardware builtin. For pytree bodies (DLM compose), the body is a general function — the
+inclusive scan builtin doesn't help unless we can decompose it.
+
+**Implementation sketch:**
+
+1. In `runFusedPlan` Phase 1, detect if the body is pure `add` or `mul`
+2. If so, emit `subgroupInclusiveAdd(val)` for the first log₂(subgroup_size) rounds
+3. After the intra-subgroup prefix, the last invocation in each subgroup writes its result to shmem
+4. Continue normal inter-subgroup Kogge-Stone for the remaining rounds
+5. Requires `enable subgroups;` already present
+
+#### 1b. `subgroupShuffle` / `subgroupShuffleUp` for associative scan (general bodies)
+
+**What:** For general associative bodies (not just add/mul), replace `var<workgroup>` reads within a
+Kogge-Stone round with register-to-register shuffles. Each thread gets its neighbor's value via
+`subgroupShuffleUp(val, offset)` instead of writing to shmem → barrier → reading from shmem.
+
+**Where:** Same as 1a, but applicable to ALL associative scan bodies including DLM compose.
+
+**Impact:** Eliminates shmem traffic for the first log₂(subgroup_size) rounds. For DLM 2-tuple N=100
+(1 dispatch, 1 block), this removes 5 of 8 shmem barrier pairs. The shmem barrier cost is small
+relative to the actual compute, but for small bodies this could yield **10–20% improvement**.
+
+**Implementation sketch:**
+
+1. For rounds where `offset < subgroup_size`, emit `subgroupShuffleUp` instead of shmem write+read
+2. The body function operates on register-resident values — no shmem allocation needed for these
+   rounds
+3. After subgroup-local rounds complete, fall back to shmem path for inter-subgroup communication
+4. `subgroupShuffleUp(val, offset)` requires `offset` to be dynamically uniform or compile-time
+   constant — in Kogge-Stone, the offset per round is a constant power of 2, so this works
+
+#### 1c. `subgroupBroadcast` for scan carry / block-map constants
+
+**What:** Broadcast a value from one invocation to all others in the subgroup without shmem.
+
+**Where:** Block-map Phase 4 (apply-prefix) where the scanned carry is broadcast to all threads in a
+workgroup. Also useful for broadcasting uniform values like block indices.
+
+**Impact:** Minor — the broadcast step is a small fraction of total compute. Clean architectural
+improvement.
+
+### Tier 2: Cooperative Matrix / WMMA (not yet available in Chrome)
+
+#### What is cooperative matrix?
+
+Cooperative matrix (the WebGPU equivalent of NVIDIA's WMMA / Tensor Core, Intel's XMX / AMX)
+provides hardware-accelerated small matrix multiply-accumulate operations. A subgroup collectively
+owns matrix fragments; a single instruction like `cooperativeMatrixMultiplyAdd(A, B, C)` performs
+`C += A × B` for hardware-native tile sizes (e.g., 16×16×16 f16 or 8×8×4 f32 on NVIDIA).
+
+#### Spec status
+
+| Layer  | Status (as of mid-2025)                                                  |
+| ------ | ------------------------------------------------------------------------ |
+| Vulkan | `VK_KHR_cooperative_matrix` — ratified KHR extension, widely supported   |
+| SPIR-V | `SPV_KHR_cooperative_matrix` — stable                                    |
+| Dawn   | Experimental `chromium-experimental-cooperative-matrix` behind flags     |
+| WGSL   | Proposal in gpuweb/gpuweb repo, not yet in standard grammar              |
+| Chrome | **Not shipped.** No origin trial announced. Requires WGSL spec stability |
+
+**Realistic timeline:** Given the ~18-month subgroups arc (Chrome 125 proposal → Chrome 134 stable),
+cooperative matrix is likely **2026** at the earliest for Chrome stable.
+
+#### Impact on jax-js tiled matmul
+
+Our current tiled matmul (via `block_map`) achieves **53.7% of peak FP32** at 4096×4096 on RTX 4070
+Ti SUPER. The bottleneck is the software dot-product K-tile loop — each thread computes `threadTile`
+(4×4 or 8×8) output elements using scalar `f32` multiply-accumulate.
+
+With cooperative matrix:
+
+- The K-tile inner loop would call `cooperativeMatrixMultiplyAdd(A_frag, B_frag, C_frag)` once per
+  K-tile instead of a manual ridx unroll
+- Hardware tensor cores deliver 2–4× the FLOP/s of scalar FP32
+- Expected: **70–85% of peak FP32** (limited by shmem load bandwidth, not ALU)
+- For FP16 (`shader-f16`): tensor cores are 4–8× faster than scalar f16, reaching near-peak
+
+#### Impact on DLM
+
+Small-matrix DLM (2×2, 4×4) would not benefit from cooperative matrix — the matrix sizes are below
+the hardware tile size (typically 8×8 minimum). The cooperative matrix overhead would exceed the
+scalar computation cost. **DLM improvement requires latency reduction (fewer dispatches), not
+throughput increase.**
+
+#### Implementation strategy (when WGSL spec stabilizes)
+
+1. **Feature detection:** Add `"cooperative-matrix"` to `BackendCapabilities`, request feature from
+   adapter. Query supported matrix sizes via adapter limits.
+2. **block-map codegen:** In Phase 4 WGSL generation, detect tiled matmul pattern (two shmem inputs,
+   one output, ridx accumulation). Replace the manual dot-product loop with cooperative matrix load
+   → MMA → store.
+3. **Tile size adaptation:** Hardware dictates tile shapes (e.g., 16×16×16 for f16, 16×8×8 for f32
+   on NVIDIA). The `threadTile` parameter must map to these hardware native shapes. May require a
+   tuner or size-specific code paths.
+4. **f16 fast path:** Cooperative matrix f16 is ~4× faster than f32 on NVIDIA. For models that
+   tolerate f16 precision (most ML inference), emit f16 cooperative matrix by default when
+   `shader-f16` is available.
+5. **Fallback:** Keep current scalar tiled matmul as fallback when cooperative matrix is
+   unavailable.
+
+### Tier 3: Timestamp queries for profiling
+
+**What:** `timestamp-query` feature allows GPU-side timing of compute passes. Already in WebGPU spec
+(Chrome 121+), not yet wired up in jax-js.
+
+**Where:** `pipelineSubmit` / `commandEncoder.beginComputePass` — record timestamps before/after
+each dispatch.
+
+**Impact:** Enables accurate per-kernel GPU timing without CPU round-trip overhead. Critical for
+validating that subgroup/WMMA optimizations actually improve wall-clock GPU time (vs just reducing
+dispatch count). Would replace the indirect "dispatch count" proxy we currently use for WebGPU
+performance analysis.
+
+**Implementation:** Add `profiling: boolean` option to `JitProgram.execute()`. When enabled, insert
+timestamp queries around each dispatch, readback the query buffer after execution, and return
+per-step timing data.
+
+### Priority ordering
+
+| ID  | Feature                           | Availability | Impact        | Effort |
+| --- | --------------------------------- | ------------ | ------------- | ------ |
+| 1b  | `subgroupShuffleUp` in assocScan  | Now          | Medium        | Medium |
+| 1a  | `subgroupInclusive*` in assocScan | Now          | Medium        | Medium |
+| T3  | Timestamp queries                 | Now          | Diagnostic    | Low    |
+| 1c  | `subgroupBroadcast` cleanup       | Now          | Low           | Low    |
+| 2   | Cooperative matrix tiled matmul   | ~2026        | **Very High** | High   |
+
+**Next action:** Implement Tier 1b (`subgroupShuffleUp` in associative scan) and T3 (timestamp
+queries). These are available today and unblock accurate performance measurement for future work.
 
 ---
 

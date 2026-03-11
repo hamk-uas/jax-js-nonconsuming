@@ -254,12 +254,15 @@ work around 256-byte alignment.
 
 ### Features NOT exploited (opportunities)
 
-| Feature               | What it enables                    | Why not used                         |
-| --------------------- | ---------------------------------- | ------------------------------------ |
-| **Indirect dispatch** | GPU-driven workgroup counts        | No dynamic control flow needs it yet |
-| **Texture sampling**  | Hardware-accelerated interpolation | All ops use storage buffers          |
-| **Atomic operations** | Lock-free reductions, histograms   | Reductions via shader accumulation   |
-| **timestamp-query**   | GPU-side profiling                 | Not wired up yet                     |
+| Feature                       | What it enables                     | Why not used / status                               |
+| ----------------------------- | ----------------------------------- | --------------------------------------------------- |
+| **Indirect dispatch**         | GPU-driven workgroup counts         | No dynamic control flow needs it yet                |
+| **Texture sampling**          | Hardware-accelerated interpolation  | All ops use storage buffers                         |
+| **Atomic operations**         | Lock-free reductions, histograms    | Reductions via shader accumulation                  |
+| **timestamp-query**           | GPU-side profiling                  | Not wired up yet; planned (P9)                      |
+| **subgroupInclusiveAdd/Mul**  | Hardware prefix sum within subgroup | Planned for assocScan (P8); Chrome 134+             |
+| **subgroupShuffleUp**         | Register-to-register scan neighbors | Planned for assocScan (P8); Chrome 134+             |
+| **Cooperative matrix (WMMA)** | Hardware tensor core matmul         | WGSL spec not stable; Dawn experimental; ~2026 (P7) |
 
 ### WASM feature opportunities
 
@@ -736,15 +739,17 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 
 ## Future performance work
 
-| ID  | Title                      | Priority    | Description                                                                              |
-| --- | -------------------------- | ----------- | ---------------------------------------------------------------------------------------- |
-| P1  | ~~Tiled matmul (WebGPU)~~  | **Done** ✅ | 53.7% peak FP32 at 4096×4096 (12,138 GFLOP/s). Implemented via `block_map`               |
-| P2  | Relaxed SIMD FMA           | Medium      | `f32x4.relaxed_madd` for 2× dot-product throughput. Safari doesn't support               |
-| P3  | i64 in wasmblr             | Medium      | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins                    |
-| P4  | Conv2d tuning              | Medium      | Benchmark now (tiled matmul gives free improvement). Specialized WGSL for 3×3, 5×5       |
-| P5  | Subgroup reductions        | **Done** ✅ | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in AS |
-| P6  | Benchmark validation       | Medium      | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions                   |
-| P7  | Subgroup matrix ops (WMMA) | Low         | Hardware tensor cores for 2–4× tiled matmul. Chrome 144+ spec stability required         |
+| ID  | Title                     | Priority    | Description                                                                              |
+| --- | ------------------------- | ----------- | ---------------------------------------------------------------------------------------- |
+| P1  | ~~Tiled matmul (WebGPU)~~ | **Done** ✅ | 53.7% peak FP32 at 4096×4096 (12,138 GFLOP/s). Implemented via `block_map`               |
+| P2  | Relaxed SIMD FMA          | Medium      | `f32x4.relaxed_madd` for 2× dot-product throughput. Safari doesn't support               |
+| P3  | i64 in wasmblr            | Medium      | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins                    |
+| P4  | Conv2d tuning             | Medium      | Benchmark now (tiled matmul gives free improvement). Specialized WGSL for 3×3, 5×5       |
+| P5  | Subgroup reductions       | **Done** ✅ | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in AS |
+| P6  | Benchmark validation      | Medium      | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions                   |
+| P7  | Cooperative matrix (WMMA) | Blocked     | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable; ~2026 earliest    |
+| P8  | Subgroup scan builtins    | Medium      | `subgroupInclusiveAdd`/`subgroupShuffleUp` in assocScan. Available now (Chrome 134+)     |
+| P9  | Timestamp query profiling | Medium      | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)            |
 
 ---
 
