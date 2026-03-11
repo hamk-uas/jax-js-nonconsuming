@@ -55,6 +55,101 @@ export type TapeOp =
   | { type: "recycle"; fromIdx: number; toIdx: number }
   | { type: "dispatch"; dispatch: TapeDispatch };
 
+// ---------------------------------------------------------------------------
+// Arena layout (O9a: slab sub-allocation)
+// ---------------------------------------------------------------------------
+
+/** Per-entry arena placement: offset within the slab + padded size. */
+export interface ArenaEntry {
+  /** 256-byte-aligned offset within the slab buffer. */
+  offset: number;
+  /** 4-byte-aligned allocation size (for bind group `size` parameter). */
+  paddedSize: number;
+}
+
+/** Pre-computed slab layout for a tape's intermediates. */
+export interface ArenaLayout {
+  /** Total slab size in bytes (all entries 256-byte-aligned). */
+  slabSize: number;
+  /** Table index → arena entry for each eligible malloc. */
+  entries: Map<number, ArenaEntry>;
+  /** Initial data writes to the slab (for O2 scalar promotion constants). */
+  initialDataWrites: { offset: number; data: Uint8Array<ArrayBuffer> }[];
+}
+
+/**
+ * Compute offline arena layout by simulating the malloc/free pattern.
+ *
+ * Every non-zero-size malloc gets assigned a 256-byte-aligned offset within a
+ * single slab buffer.  Freed regions are reclaimed by later mallocs (best-fit).
+ * Recycles inherit their source entry's offset.  Returns null when there are
+ * no arena-eligible allocations.
+ */
+export function computeArenaLayout(ops: TapeOp[]): ArenaLayout | null {
+  const ALIGNMENT = 256;
+  const entries = new Map<number, ArenaEntry>();
+  const initialDataWrites: { offset: number; data: Uint8Array<ArrayBuffer> }[] =
+    [];
+
+  // Free list for region reuse (best-fit allocation).
+  const freeList: { offset: number; size: number }[] = [];
+  let slabSize = 0;
+
+  for (const op of ops) {
+    if (op.type === "malloc") {
+      const m = op.malloc;
+      if (m.paddedSize === 0) continue; // handled by reusable ZSB
+
+      const alignedSize = Math.ceil(m.paddedSize / ALIGNMENT) * ALIGNMENT;
+
+      // Best-fit search
+      let bestIdx = -1;
+      let bestWaste = Infinity;
+      for (let i = 0; i < freeList.length; i++) {
+        const waste = freeList[i].size - alignedSize;
+        if (waste >= 0 && waste < bestWaste) {
+          bestIdx = i;
+          bestWaste = waste;
+          if (waste === 0) break;
+        }
+      }
+
+      let offset: number;
+      if (bestIdx >= 0) {
+        const region = freeList[bestIdx];
+        offset = region.offset;
+        if (region.size === alignedSize) {
+          freeList.splice(bestIdx, 1);
+        } else {
+          region.offset += alignedSize;
+          region.size -= alignedSize;
+        }
+      } else {
+        offset = slabSize;
+        slabSize += alignedSize;
+      }
+
+      entries.set(m.tableIdx, { offset, paddedSize: m.paddedSize });
+      if (m.initialData) {
+        initialDataWrites.push({ offset, data: m.initialData });
+      }
+    } else if (op.type === "free") {
+      const entry = entries.get(op.tableIdx);
+      if (entry) {
+        const alignedSize = Math.ceil(entry.paddedSize / ALIGNMENT) * ALIGNMENT;
+        freeList.push({ offset: entry.offset, size: alignedSize });
+      }
+    } else if (op.type === "recycle") {
+      const fromEntry = entries.get(op.fromIdx);
+      if (fromEntry) {
+        entries.set(op.toIdx, fromEntry);
+      }
+    }
+  }
+
+  return slabSize > 0 ? { slabSize, entries, initialDataWrites } : null;
+}
+
 /** A pre-compiled dispatch sequence for a kernel-only JitProgram. */
 export interface WebGPUCommandTape {
   /** Operations in original step order (malloc/free/recycle/dispatch). */
@@ -69,6 +164,8 @@ export interface WebGPUCommandTape {
   allocatedIdxs: number[];
   /** Uniform buffers owned by this tape (kept alive for bind group references). */
   uniformBuffers: GPUBuffer[];
+  /** Slab sub-allocation layout, or null when no intermediates exist. */
+  arena: ArenaLayout | null;
 }
 
 // ---------------------------------------------------------------------------
