@@ -251,18 +251,19 @@ work around 256-byte alignment.
 | **Ping-pong buffers**       | `lax.scan` carry alternates between two buffers                                                 |
 | **Uniform buffers**         | Per-iteration offsets for `lax.scan`                                                            |
 | **Subgroups**               | `subgroupAdd`/`Mul`/`Min`/`Max` in JIT & block-map reductions, `subgroupShuffleUp` in assocScan |
+| **Atomic CAS + Store**      | Decoupled Fallback scan: inter-workgroup prefix propagation via bounded-spin + CAS fallback     |
 
 ### Features NOT exploited (opportunities)
 
-| Feature                       | What it enables                     | Why not used / status                               |
-| ----------------------------- | ----------------------------------- | --------------------------------------------------- |
-| **Indirect dispatch**         | GPU-driven workgroup counts         | No dynamic control flow needs it yet                |
-| **Texture sampling**          | Hardware-accelerated interpolation  | All ops use storage buffers                         |
-| **Atomic operations**         | Lock-free reductions, histograms    | Planned for Decoupled Fallback scan (P10)           |
-| **timestamp-query**           | GPU-side profiling                  | Not wired up yet; planned (P9)                      |
-| **subgroupInclusiveAdd/Mul**  | Hardware prefix sum within subgroup | Planned for assocScan (P8); Chrome 134+             |
-| **subgroupShuffleUp**         | Register-to-register scan neighbors | Planned for assocScan (P8); Chrome 134+             |
-| **Cooperative matrix (WMMA)** | Hardware tensor core matmul         | WGSL spec not stable; Dawn experimental; ~2026 (P7) |
+| Feature                       | What it enables                     | Why not used / status                                 |
+| ----------------------------- | ----------------------------------- | ----------------------------------------------------- |
+| **Indirect dispatch**         | GPU-driven workgroup counts         | No dynamic control flow needs it yet                  |
+| **Texture sampling**          | Hardware-accelerated interpolation  | All ops use storage buffers                           |
+| **Atomic operations**         | Lock-free reductions, histograms    | Used by Decoupled Fallback scan (P10) and scatter-add |
+| **timestamp-query**           | GPU-side profiling                  | Not wired up yet; planned (P9)                        |
+| **subgroupInclusiveAdd/Mul**  | Hardware prefix sum within subgroup | Planned for assocScan (P8); Chrome 134+               |
+| **subgroupShuffleUp**         | Register-to-register scan neighbors | Planned for assocScan (P8); Chrome 134+               |
+| **Cooperative matrix (WMMA)** | Hardware tensor core matmul         | WGSL spec not stable; Dawn experimental; ~2026 (P7)   |
 
 ### WASM feature opportunities
 
@@ -590,9 +591,11 @@ const result = lax.associativeScan(fn, elems, { axis?, reverse? });
 
 Uses Kogge-Stone doubling: O(N log N) work, O(log N) depth. ceil(log₂ N) parallel rounds.
 
-**Future:** Decoupled Fallback (P10) will replace Kogge-Stone on WebGPU for scalar associative ops
-(add/mul/min/max), achieving O(N) work in a single dispatch via atomic inter-workgroup communication
-with bounded spin + work-stealing fallback (FPG-safe). See PLAN.md P7 Tier 0.
+**Decoupled Fallback (P10, Phase 1 done):** For scalar associative ops (add/mul/min/max) on f32/u32,
+replaces Kogge-Stone with O(N) single-dispatch scan via atomic inter-workgroup communication with
+bounded spin + work-stealing fallback (FPG-safe). Descriptor: 2-bit flag + 30-bit value packed in
+single `atomic<u32>`. Detected automatically in `buildNativeAssocScanPlan`. Phase 2 (general bodies)
+deferred. See PLAN.md P7 Tier 0.
 
 **Backend behavior:**
 
@@ -769,7 +772,7 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 | P7  | Cooperative matrix (WMMA) | Blocked     | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable; ~2026 earliest    |
 | P8  | Subgroup scan builtins    | Medium      | `subgroupInclusiveAdd`/`subgroupShuffleUp` in assocScan. Available now (Chrome 134+)     |
 | P9  | Timestamp query profiling | Medium      | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)            |
-| P10 | Decoupled Fallback scan   | **High**    | Single-dispatch O(N) prefix scan. Replaces Kogge-Stone for scalar ops. See PLAN.md P7 T0 |
+| P10 | Decoupled Fallback scan   | **Done** ✅ | Single-dispatch O(N) prefix scan (Phase 1: f32/u32 scalar ops). See PLAN.md P7 T0        |
 | P11 | Analytical small linalg   | **Done** ✅ | Cholesky (n≤4), TriSolve (n≤8), QR (n≤8) as traced ops. Enables sqrt DLM fusion          |
 | P12 | WebGPU command tape       | **Done** ✅ | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs       |
 | P13 | WebGPU bind group cache   | **Done** ✅ | Bind group caching via GPUBuffer identity (pool LIFO). Arena reverted (spec violation)   |
@@ -803,39 +806,39 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 
 ## Key architecture decisions
 
-| Decision                                           | Rationale                                                                                                     |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| Non-consuming ownership model                      | Eliminates `UseAfterFreeError`; trades for silent leaks + linting                                             |
-| Concrete compilation + symbolic cache              | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                            |
-| `effectDrivenAllocate` over two-pass               | Single-pass liveness; DUS zero-copy from `Mutate` effect                                                      |
-| Direct LU→triSolve gradient path                   | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                        |
-| `transposeJaxprCache` is cache-owned               | Prevents repeated transposition; callers must NOT dispose                                                     |
-| WASM `(start, end, ...ptrs)` kernel signature      | Enables `WasmWorkerPool` work-splitting                                                                       |
-| Mega-module extracted-functions design             | V8 inlines direct `call` → perf-neutral serial, enables parallel                                              |
-| Module Workers (`type: "module"`)                  | Required for Vitest browser mode and worker pool                                                              |
-| SAB constructability over `crossOriginIsolated`    | Works in browsers with COOP/COEP headers                                                                      |
-| `jit()` identity dedup via WeakMap                 | Prevents cache bloat from inline `jit(fn)(args)` patterns                                                     |
-| DUS vmap → shrink+concat decomposition             | JIT `dus` step is axis=0 only; vmap shifts axis, so decompose instead                                         |
-| Phase 1 carry snapshot fusion                      | Same-gidx deps in single fused shader; avoids N×S dispatch overhead                                           |
-| Phase 2 preencoded-multi-step                      | Cross-element deps as N×S dispatches in 1 submit                                                              |
-| Phase 3 preencoded routine support                 | Non-Sort routines in preencoded-multi-step                                                                    |
-| GPU config factory (`gpu-config.ts`)               | DRY NVIDIA/Intel configs; thin wrappers over shared launch args                                               |
-| Self-similar plan recursion                        | `runFusedPlan` uses same primitives for assocScan and block_map                                               |
-| Kogge-Stone over Decoupled Lookback (current)      | No FPG in WebGPU; Decoupled Fallback (bounded spin + CAS) planned as P10                                      |
-| `Primitive.Reverse` over flip/view                 | Materialized reverse is polymorphic-safe; views need concrete strides                                         |
-| Shared blocked-data-movement primitives            | `gatherAxisPoints`/`copyAxisRange`/`mapOverBlocks` replace bespoke types (-1761 LOC)                          |
-| Register tiling (`threadTile`) over scalar         | 4×4–8×8 outputs/thread in `var<private>` → 4× fewer shmem reads                                               |
-| Two-lane IR for block-map codegen                  | Correctness-by-construction: shmem writes vs private reads cleanly separate                                   |
-| Reduction kernels in `workgroup_assoc_scan`        | Allows DLM matmul compose in fused shmem path (25 Hz → 6 kHz, 245× speedup)                                   |
-| Per-element reduction codegen in Phase 4 block_map | gidx loop + ridx accumulation per thread; 1 dispatch vs O(M-1) for matmul bodies                              |
-| Inline typed copy for small WASM assocScan leaves  | v128/i32 load/store instead of `memory.copy` for ≤32-byte leaves (~9% faster)                                 |
-| Axis-aware DUS fiber loop                          | `outerFibers` separate `copyBufferToBuffer` calls for axis > 0; axis=0 fast path                              |
-| Axis-aware blocked-data-movement helpers           | `gatherAxisPoints`/`copyAxisRange`/`mapOverBlocks` accept `axis` param; generic stride math                   |
-| WASM assocScan boundary transpose for axis > 0     | Strided gather/scatter around contiguous WASM core; avoids modifying codegen                                  |
-| WebGPU assocScan axis-aware via inAxes/outAxes     | Block-map body always sees B at block dim; `inAxes`/`outAxes` map to source axis                              |
-| `tree.data()`/`tree.consumeData()` parallel read   | Overlap `mapAsync` calls via `Promise.all`; 13.2× faster for 15 outputs on eGPU                               |
-| Scalar promotion (`pushLit` → `initialData`)       | Lit scalars encoded to bytes at compile time; `writeBuffer`/`memcpy` instead of kernel dispatch               |
-| Analytical inv for n ≤ 4 (Cramer's rule)           | Jaxpr-traceable: fuses in block-map. Routines break fusion. Pattern extends to cholesky/QR/trisolve           |
-| WebGPU command tape over step-by-step              | Pre-resolved pipelines + flat buffer table eliminates ~76% of JS-side JIT loop overhead                       |
-| Bind group cache over arena sub-allocation         | Arena reverted: WebGPU spec forbids mixed read/write bindings to same buffer. Pool LIFO gives stable identity |
-| Targeted jaxprification over general               | Cholesky (n≤4), TriSolve/QR (n≤8) traced to fusable ops. Sort/Argsort/LU are non-jaxprifiable                 |
+| Decision                                                    | Rationale                                                                                                     |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Non-consuming ownership model                               | Eliminates `UseAfterFreeError`; trades for silent leaks + linting                                             |
+| Concrete compilation + symbolic cache                       | Simpler than full symbolic IR; ShapeTracker needs concrete strides                                            |
+| `effectDrivenAllocate` over two-pass                        | Single-pass liveness; DUS zero-copy from `Mutate` effect                                                      |
+| Direct LU→triSolve gradient path                            | Fixing TriSolve JVP `triu(dA)` mask made Newton refinement unnecessary                                        |
+| `transposeJaxprCache` is cache-owned                        | Prevents repeated transposition; callers must NOT dispose                                                     |
+| WASM `(start, end, ...ptrs)` kernel signature               | Enables `WasmWorkerPool` work-splitting                                                                       |
+| Mega-module extracted-functions design                      | V8 inlines direct `call` → perf-neutral serial, enables parallel                                              |
+| Module Workers (`type: "module"`)                           | Required for Vitest browser mode and worker pool                                                              |
+| SAB constructability over `crossOriginIsolated`             | Works in browsers with COOP/COEP headers                                                                      |
+| `jit()` identity dedup via WeakMap                          | Prevents cache bloat from inline `jit(fn)(args)` patterns                                                     |
+| DUS vmap → shrink+concat decomposition                      | JIT `dus` step is axis=0 only; vmap shifts axis, so decompose instead                                         |
+| Phase 1 carry snapshot fusion                               | Same-gidx deps in single fused shader; avoids N×S dispatch overhead                                           |
+| Phase 2 preencoded-multi-step                               | Cross-element deps as N×S dispatches in 1 submit                                                              |
+| Phase 3 preencoded routine support                          | Non-Sort routines in preencoded-multi-step                                                                    |
+| GPU config factory (`gpu-config.ts`)                        | DRY NVIDIA/Intel configs; thin wrappers over shared launch args                                               |
+| Self-similar plan recursion                                 | `runFusedPlan` uses same primitives for assocScan and block_map                                               |
+| Decoupled Fallback for scalar ops + Kogge-Stone for general | DF: O(N) single dispatch for f32/u32 add/mul/min/max. Kogge-Stone: general bodies, pytree, axis > 0           |
+| `Primitive.Reverse` over flip/view                          | Materialized reverse is polymorphic-safe; views need concrete strides                                         |
+| Shared blocked-data-movement primitives                     | `gatherAxisPoints`/`copyAxisRange`/`mapOverBlocks` replace bespoke types (-1761 LOC)                          |
+| Register tiling (`threadTile`) over scalar                  | 4×4–8×8 outputs/thread in `var<private>` → 4× fewer shmem reads                                               |
+| Two-lane IR for block-map codegen                           | Correctness-by-construction: shmem writes vs private reads cleanly separate                                   |
+| Reduction kernels in `workgroup_assoc_scan`                 | Allows DLM matmul compose in fused shmem path (25 Hz → 6 kHz, 245× speedup)                                   |
+| Per-element reduction codegen in Phase 4 block_map          | gidx loop + ridx accumulation per thread; 1 dispatch vs O(M-1) for matmul bodies                              |
+| Inline typed copy for small WASM assocScan leaves           | v128/i32 load/store instead of `memory.copy` for ≤32-byte leaves (~9% faster)                                 |
+| Axis-aware DUS fiber loop                                   | `outerFibers` separate `copyBufferToBuffer` calls for axis > 0; axis=0 fast path                              |
+| Axis-aware blocked-data-movement helpers                    | `gatherAxisPoints`/`copyAxisRange`/`mapOverBlocks` accept `axis` param; generic stride math                   |
+| WASM assocScan boundary transpose for axis > 0              | Strided gather/scatter around contiguous WASM core; avoids modifying codegen                                  |
+| WebGPU assocScan axis-aware via inAxes/outAxes              | Block-map body always sees B at block dim; `inAxes`/`outAxes` map to source axis                              |
+| `tree.data()`/`tree.consumeData()` parallel read            | Overlap `mapAsync` calls via `Promise.all`; 13.2× faster for 15 outputs on eGPU                               |
+| Scalar promotion (`pushLit` → `initialData`)                | Lit scalars encoded to bytes at compile time; `writeBuffer`/`memcpy` instead of kernel dispatch               |
+| Analytical inv for n ≤ 4 (Cramer's rule)                    | Jaxpr-traceable: fuses in block-map. Routines break fusion. Pattern extends to cholesky/QR/trisolve           |
+| WebGPU command tape over step-by-step                       | Pre-resolved pipelines + flat buffer table eliminates ~76% of JS-side JIT loop overhead                       |
+| Bind group cache over arena sub-allocation                  | Arena reverted: WebGPU spec forbids mixed read/write bindings to same buffer. Pool LIFO gives stable identity |
+| Targeted jaxprification over general                        | Cholesky (n≤4), TriSolve/QR (n≤8) traced to fusable ops. Sort/Argsort/LU are non-jaxprifiable                 |

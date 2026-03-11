@@ -44,6 +44,11 @@ import {
   ShaderInfo,
 } from "./webgpu/codegen";
 import { type TapeOp, type WebGPUCommandTape } from "./webgpu/command-tape";
+import {
+  type DFScanDtype,
+  type DFScanOp,
+  generateDecoupledFallbackScanShader,
+} from "./webgpu/decoupled-fallback-scan";
 import { SyncReader } from "./webgpu/reader";
 import { createRoutineShader } from "./webgpu/routines";
 import {
@@ -2388,6 +2393,108 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     _dispatchCount++;
     pass.end();
     this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Decoupled Fallback prefix scan (T0: single-dispatch O(N) scan)
+  // ---------------------------------------------------------------------------
+  #dfScanPipelineCache = new Map<string, GPUComputePipeline>();
+
+  dispatchDecoupledFallbackScan(
+    input: Slot,
+    output: Slot,
+    N: number,
+    op: AluOp,
+    dtype: DType,
+    blockSize: number,
+  ): void {
+    const M = Math.ceil(N / blockSize);
+
+    // Get or create pipeline
+    const cacheKey = `df_scan_${op}_${dtype}_${blockSize}`;
+    let pipeline = this.#dfScanPipelineCache.get(cacheKey);
+    if (!pipeline) {
+      const code = generateDecoupledFallbackScanShader(
+        op as DFScanOp,
+        dtype as DFScanDtype,
+        blockSize,
+      );
+      const shaderModule = this.device.createShaderModule({ code });
+      const layout = this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.device.createBindGroupLayout({
+            entries: [
+              {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "read-only-storage" },
+              },
+              {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "storage" },
+              },
+              {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "storage" },
+              },
+              {
+                binding: 3,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "uniform" },
+              },
+            ],
+          }),
+        ],
+      });
+      pipeline = this.device.createComputePipeline({
+        layout,
+        compute: { module: shaderModule, entryPoint: "main" },
+      });
+      this.#dfScanPipelineCache.set(cacheKey, pipeline);
+    }
+
+    // Allocate descriptor buffer (M u32s, will be zeroed via clearBuffer)
+    const descBytes = Math.max(M * 4, 4); // at least 4 bytes
+    const descSlot = this.malloc(descBytes);
+
+    // Allocate uniform buffer for params (N)
+    // Minimum allocation: 256 bytes (minUniformBufferOffsetAlignment)
+    const uniformSlot = this.malloc(256);
+    const uniformBuf = this.#getBuffer(uniformSlot).buffer;
+    this.device.queue.writeBuffer(uniformBuf, 0, new Uint32Array([N]).buffer);
+
+    // Build command buffer: clearBuffer(descriptors) → computePass
+    const commandEncoder = this.device.createCommandEncoder();
+    commandEncoder.clearBuffer(this.#getBuffer(descSlot).buffer, 0, descBytes);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.#getBuffer(input).buffer } },
+        { binding: 1, resource: { buffer: this.#getBuffer(output).buffer } },
+        {
+          binding: 2,
+          resource: {
+            buffer: this.#getBuffer(descSlot).buffer,
+            size: descBytes,
+          },
+        },
+        { binding: 3, resource: { buffer: uniformBuf, size: 256 } },
+      ],
+    });
+    const pass = commandEncoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(M);
+    _dispatchCount++;
+    pass.end();
+    this.device.queue.submit([commandEncoder.finish()]);
+
+    // Free temporary buffers
+    this.decRef(descSlot);
+    this.decRef(uniformSlot);
   }
 
   #createBuffer(

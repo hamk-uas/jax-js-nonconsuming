@@ -2,7 +2,7 @@
  * @file Scan plan construction — determines the execution strategy for a scan.
  */
 
-import { byteWidth, DType, Kernel, Reduction } from "../alu";
+import { AluOp, byteWidth, DType, Kernel, Reduction } from "../alu";
 import type { Backend, Executable } from "../backend";
 import {
   getScanRoutineInfo,
@@ -103,6 +103,18 @@ export type AssocScanPlan =
       applyVmapProgram: JitProgram;
       /** Vmapped apply body Jaxpr (for fused block_map in Phase 4). */
       applyVmapJaxpr: Jaxpr;
+    }
+  | {
+      /**
+       * Decoupled Fallback single-dispatch prefix scan (WebGPU only).
+       * O(N) work in one dispatch via inter-workgroup atomics with bounded
+       * spin + work-stealing fallback (no FPG required).
+       * Phase 1: scalar binary ops (add/mul/min/max) on f32/u32/i32.
+       */
+      path: "decoupled-fallback";
+      op: AluOp;
+      dtype: DType;
+      blockSize: number;
     }
   | { path: "fallback" };
 
@@ -311,6 +323,75 @@ export function classifyBodySteps(
     hasInternalDeps: internalDeps.length > 0,
     hasCrossGidxDeps,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Decoupled Fallback detection
+// ---------------------------------------------------------------------------
+
+/** Supported scalar binary ops for the Decoupled Fallback scan. */
+const DF_SUPPORTED_OPS = new Set<AluOp>([
+  AluOp.Add,
+  AluOp.Mul,
+  AluOp.Min,
+  AluOp.Max,
+]);
+const DF_SUPPORTED_DTYPES = new Set<DType>([
+  DType.Float32,
+  DType.Uint32,
+  // DType.Int32 deferred: i32 workgroup shared memory scan produces incorrect
+  // results on some drivers (only 1 Hillis-Steele round executes). Needs
+  // investigation — the same code works for f32/u32.
+]);
+
+/**
+ * Detect if an assocScan body is a simple scalar binary op eligible for
+ * the Decoupled Fallback single-dispatch path.
+ *
+ * Requirements:
+ * - numLeaves == 1 (single leaf, not pytree)
+ * - numConsts == 0 (no captured constants)
+ * - Body has exactly 1 execute step producing a single-output scalar kernel
+ * - Kernel expression is a supported binary op (Add/Mul/Min/Max) of the two inputs
+ * - Dtype is f32/u32/i32
+ */
+function detectDecoupledFallbackOp(
+  bodyProgram: JitProgram,
+  numLeaves: number,
+  numConsts: number,
+): { op: AluOp; dtype: DType } | null {
+  if (numLeaves !== 1 || numConsts !== 0) return null;
+
+  // Find the single execute step
+  const executeSteps = bodyProgram.steps.filter(
+    (s) => s.type === "execute",
+  ) as ExecuteStep[];
+  if (executeSteps.length !== 1) return null;
+
+  const step = executeSteps[0];
+  if (!(step.source instanceof Kernel)) return null;
+
+  const kernel = step.source;
+  if (kernel.numOutputs !== 1) return null;
+  if (kernel.size !== 1) return null; // must be scalar
+  if (kernel.outputs[0].reduction) return null;
+
+  const exp = kernel.outputs[0].exp;
+  if (!DF_SUPPORTED_OPS.has(exp.op)) return null;
+  if (exp.src.length !== 2) return null;
+  if (!DF_SUPPORTED_DTYPES.has(exp.dtype)) return null;
+
+  // Both sources must be GlobalIndex referring to the two input leaves
+  if (
+    exp.src[0].op !== AluOp.GlobalIndex ||
+    exp.src[1].op !== AluOp.GlobalIndex
+  )
+    return null;
+
+  const gids = new Set<number>([exp.src[0].arg[0], exp.src[1].arg[0]]);
+  if (!gids.has(0) || !gids.has(1)) return null;
+
+  return { op: exp.op, dtype: exp.dtype };
 }
 
 // ---------------------------------------------------------------------------
@@ -1649,6 +1730,25 @@ export function planAssociativeScan(
   // Constants that fit in uniform buffers (≤64KB) are moved to @group(1),
   // freeing storage bindings.
   if (backend.type === "webgpu") {
+    // --- Decoupled Fallback: single-dispatch O(N) scan for scalar binary ops ---
+    if (axis === 0) {
+      const dfOp = detectDecoupledFallbackOp(bodyProgram, numLeaves, numConsts);
+      if (dfOp) {
+        const BLOCK_SIZE = 256;
+        if (DEBUG >= 1) {
+          console.log(
+            `[assoc-scan] SUCCESS! Using Decoupled Fallback path (${dfOp.op} ${dfOp.dtype} B=${BLOCK_SIZE})`,
+          );
+        }
+        return {
+          path: "decoupled-fallback",
+          op: dfOp.op,
+          dtype: dfOp.dtype,
+          blockSize: BLOCK_SIZE,
+        };
+      }
+    }
+
     const maxBindings = backend.maxArgs + 1; // maxStorageBuffersPerShaderStage
     const uniformConsts = constInfos.every((c) => c.bytes <= 65536)
       ? numConsts

@@ -306,6 +306,20 @@ export interface Backend {
     innerBytes: number,
     dtype: DType,
   ): void;
+
+  /**
+   * Optional: Decoupled Fallback prefix scan — single-dispatch O(N) scan.
+   * Uses inter-workgroup atomics with bounded spin + work-stealing fallback.
+   * WebGPU only. Phase 1: scalar binary ops (add/mul/min/max) on f32/u32/i32.
+   */
+  dispatchDecoupledFallbackScan?(
+    input: Slot,
+    output: Slot,
+    N: number,
+    op: AluOp,
+    dtype: DType,
+    blockSize: number,
+  ): void;
 }
 
 export class Executable<T = any> {

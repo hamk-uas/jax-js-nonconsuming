@@ -967,14 +967,23 @@ This achieves **single-dispatch, memory-bandwidth-saturating performance** on al
 
 1. **Reference:** Start from Thomas Smith's `GPUPrefixSums` WGSL implementation (MIT license). Adapt
    the Decoupled Fallback shader structure to our codegen pipeline.
-2. **Phase 1 — scalar ops:** Implement for `add`, `mul`, `min`, `max` on f32/i32/u32.
-   Single-dispatch kernel with workgroup-local raking scan → atomic publish → bounded lookback →
-   apply prefix. Detect eligible ops in `prepareAssocScanPlan`.
+2. **Phase 1 — scalar ops: ✅ DONE.** Implemented for `add`, `mul`, `min`, `max` on f32/u32.
+   Single-dispatch kernel with workgroup-local Hillis-Steele scan → atomic publish → bounded
+   lookback with work-stealing fallback → apply prefix. Detected in `buildNativeAssocScanPlan` via
+   `detectDecoupledFallbackOp`. Descriptor packing: 2-bit flag + 30-bit value in single
+   `atomic<u32>`. i32 deferred (pre-existing WebGPU i32 workgroup-memory scan bug).
 3. **Phase 2 — general bodies:** Extend to arbitrary associative functions using a per-block
    descriptor buffer. The lookback subgroup fetches raw input tiles and re-evaluates the body
    function when fallback triggers.
-4. **Integration:** Add `"decoupled-fallback"` as a new `AssocScanPath`. Keep Kogge-Stone as
-   fallback for bodies that can't be adapted or for backends without atomics.
+4. **Integration:** `"decoupled-fallback"` added to `AssocScanPlan`. Kogge-Stone block-map path
+   remains for bodies that can't use DF (pytree, non-scalar, axis > 0) or for backends without
+   atomics.
+
+**Phase 1 remaining opportunities:**
+
+- Subgroup-parallel lookback (first subgroup instead of thread 0 only)
+- Raking pattern: multiple elements per thread for better bandwidth utilization
+- i32 support (blocked by pre-existing WebGPU i32 shmem scan bug)
 
 #### References
 
