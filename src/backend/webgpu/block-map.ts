@@ -3179,14 +3179,241 @@ export function blockMapFusedShaderSource(
       }
       emit("workgroupBarrier();");
 
+      // --- Shared helper: emit body kernels for a Kogge-Stone round ---
+      // Both subgroup-register and shmem paths use identical input
+      // classification, reduction codegen, and epilogue logic. Only the
+      // input resolution and output write differ.
+      type WasResolveAB = (elemIdx: number, indexExpr: string) => string;
+      type WasWriteLeaf = (
+        elemIdx: number,
+        ec: number,
+        value: string,
+        isGidx: boolean,
+      ) => void;
+      type WasMultiElemResolveAB = (elemIdx: number, eiVar: string) => string;
+
+      const emitWasRoundBody = (
+        prefix: string,
+        resolveA: WasResolveAB,
+        resolveB: WasResolveAB,
+        writeLeaf: WasWriteLeaf,
+        multiElemResolveA: WasMultiElemResolveAB,
+        multiElemResolveB: WasMultiElemResolveAB,
+      ) => {
+        for (let bsi = 0; bsi < was.bodyKernels.length; bsi++) {
+          const { step: bStep, kernel: bKernel } = was.bodyKernels[bsi];
+
+          // Classify each input as const / a / b / shmem
+          const bStepInputKind: ("const" | "a" | "b" | "shmem")[] = [];
+          const bStepInputElemIdx: number[] = [];
+          for (let j = 0; j < bStep.inputs.length; j++) {
+            const jitId = bStep.inputs[j];
+            const biIdx = was.bodyInputIds.indexOf(jitId);
+            if (biIdx >= 0 && biIdx < numBodyConsts) {
+              bStepInputKind.push("const");
+              bStepInputElemIdx.push(-1);
+            } else if (
+              biIdx >= numBodyConsts &&
+              biIdx < numBodyConsts + was.numElems
+            ) {
+              bStepInputKind.push("a");
+              bStepInputElemIdx.push(biIdx - numBodyConsts);
+            } else if (biIdx >= numBodyConsts + was.numElems) {
+              bStepInputKind.push("b");
+              bStepInputElemIdx.push(biIdx - numBodyConsts - was.numElems);
+            } else {
+              bStepInputKind.push("shmem");
+              bStepInputElemIdx.push(-1);
+            }
+          }
+
+          // Resolve const inputs (shared between both paths)
+          const resolveConst = (
+            bufIdx: number,
+            indexExpr: string,
+            dtype: DType,
+          ): string => {
+            const biIdx2 = was.bodyInputIds.indexOf(bStep.inputs[bufIdx]);
+            const inf = bodyInputInfo[biIdx2];
+            if (inf.name === BLOCK_IDX_SENTINEL) return `i32(block_idx)`;
+            if (inf.isGlobal) {
+              if (inf.parentInputIdx >= 0) {
+                const remapped = inRemap(inf.parentInputIdx, indexExpr);
+                const readExpr = `${inf.name}[i32(in_base_${inf.parentInputIdx}) + ${remapped}]`;
+                return hasBoundary
+                  ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
+                  : readExpr;
+              }
+              return `${inf.name}[${indexExpr}]`;
+            }
+            return `${inf.name}[${indexExpr}]`;
+          };
+
+          // Build scalar resolve
+          const resolve: ResolveGlobalIndex = (bufIdx, indexExpr, dtype) => {
+            const kind = bStepInputKind[bufIdx];
+            if (kind === "const") return resolveConst(bufIdx, indexExpr, dtype);
+            if (kind === "a")
+              return resolveA(bStepInputElemIdx[bufIdx], indexExpr);
+            if (kind === "b")
+              return resolveB(bStepInputElemIdx[bufIdx], indexExpr);
+            const sname = bodyIdToName.get(bStep.inputs[bufIdx]);
+            return `${sname ?? "__unknown"}[${indexExpr}]`;
+          };
+
+          const gen = createGen(bKernel, `${prefix}_s${bsi}`, resolve);
+
+          for (let oi = 0; oi < bKernel.numOutputs; oi++) {
+            const outId = bStep.outputs[oi];
+
+            // --- Reduction kernel: gidx loop + ridx accumulation ---
+            const bRe = bKernel.outputs[oi]?.reduction ?? null;
+            if (bRe) {
+              const reDtype = bRe.dtype;
+              const reTy = dtypeToWgsl(reDtype, false);
+              const bodyDtype = bKernel.outputs[oi].dtype;
+              const reSize = bRe.size as number;
+              const bodyExp = bKernel.outputs[oi].exp;
+              const kernelSize = bKernel.size as number;
+              const rePrefix = `${prefix}_s${bsi}`;
+              const isIdentityEpilogue =
+                bRe.epilogue.op === AluOp.Variable &&
+                bRe.epilogue.arg === "acc";
+
+              emit(
+                `for (var gidx: i32 = 0; gidx < ${kernelSize}; gidx++) {`,
+                pushIndent,
+              );
+              const accName = `${rePrefix}_acc`;
+              emit(
+                `var ${accName}: ${reTy} = ${constToWgsl(reDtype, bRe.identity)};`,
+              );
+              const UNROLL_THRESHOLD = 8;
+              const emitAccum = (rhs: string) => {
+                const castRhs = wgslCastReductionRhs(rhs, bodyDtype, reDtype);
+                emit(wgslReductionAccumStmt(bRe.op, accName, castRhs));
+              };
+              if (reSize <= UNROLL_THRESHOLD) {
+                for (let ri = 0; ri < reSize; ri++) {
+                  const riGen = createGen(
+                    bKernel,
+                    `${rePrefix}_r${ri}`,
+                    resolve,
+                    undefined,
+                    undefined,
+                    AluExp.i32(ri),
+                  );
+                  emitAccum(strip1(riGen(bodyExp)));
+                }
+              } else {
+                emit(
+                  `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
+                  pushIndent,
+                );
+                emitAccum(strip1(gen(bodyExp)));
+                emit(popIndent, "}");
+              }
+              let finalValue: string;
+              if (isIdentityEpilogue) {
+                finalValue = accName;
+              } else {
+                const epGen = createGen(
+                  bKernel,
+                  `${rePrefix}_ep`,
+                  resolve,
+                  new Map([["acc", accName]]),
+                );
+                finalValue = strip1(epGen(bRe.epilogue));
+              }
+
+              // Write result to leaf output or intermediate
+              const bodyOutIdx = was.bodyOutputIds.indexOf(outId);
+              if (bodyOutIdx >= 0) {
+                writeLeaf(
+                  bodyOutIdx,
+                  was.elemCounts[bodyOutIdx],
+                  finalValue,
+                  true,
+                );
+              } else {
+                const sname = bodyIdToName.get(outId);
+                if (sname) emit(`${sname}[gidx] = ${finalValue};`);
+              }
+              emit(popIndent, "}"); // end gidx loop
+              continue;
+            }
+
+            // --- Elementwise kernel ---
+            const bodyOutIdx = was.bodyOutputIds.indexOf(outId);
+            if (bodyOutIdx >= 0) {
+              const e = bodyOutIdx;
+              const ec = was.elemCounts[e];
+              if (ec > 1) {
+                emit(
+                  `for (var _was_oi: u32 = 0u; _was_oi < ${ec}u; _was_oi++) {`,
+                  pushIndent,
+                );
+                // Multi-element resolve: uses _was_oi as element index
+                const eiResolve: ResolveGlobalIndex = (
+                  bufIdx2,
+                  _indexExpr,
+                  dtype2,
+                ) => {
+                  const kind2 = bStepInputKind[bufIdx2];
+                  if (kind2 === "const")
+                    return resolveConst(bufIdx2, "i32(_was_oi)", dtype2);
+                  if (kind2 === "a")
+                    return multiElemResolveA(
+                      bStepInputElemIdx[bufIdx2],
+                      "_was_oi",
+                    );
+                  if (kind2 === "b")
+                    return multiElemResolveB(
+                      bStepInputElemIdx[bufIdx2],
+                      "_was_oi",
+                    );
+                  const sname = bodyIdToName.get(bStep.inputs[bufIdx2]);
+                  return `${sname ?? "__unknown"}[i32(_was_oi)]`;
+                };
+                const genEi = createGen(
+                  bKernel,
+                  `${prefix}_s${bsi}_ei`,
+                  eiResolve,
+                );
+                const rhsEi = strip1(genEi(bKernel.outputs[oi].exp));
+                writeLeaf(e, ec, rhsEi, false);
+                emit(popIndent, "}");
+              } else {
+                const rhs = strip1(gen(bKernel.outputs[oi].exp));
+                writeLeaf(e, ec, rhs, false);
+              }
+            } else {
+              // Body intermediate → write to body shmem
+              const rhs = strip1(gen(bKernel.outputs[oi].exp));
+              const sname = bodyIdToName.get(outId);
+              if (sname) {
+                emit(
+                  `${sname}[${bKernel.numOutputs > 1 ? `i32(tidx) * ${bKernel.numOutputs} + ${oi}` : "tidx"}] = ${rhs};`,
+                );
+              }
+            }
+          }
+        }
+      };
+
       // --- Subgroup-local Kogge-Stone rounds via subgroupShuffleUp ---
-      // Conservative: 3 rounds (stride ≤ 4) guaranteed within any subgroup
-      // (all known hardware has sg_size ≥ 8). For rounds where stride ≥ sg_size,
-      // the sg_inv_id guard prevents undefined shuffled values from being used,
-      // making those rounds harmless no-ops.
+      // Up to 3 rounds (stride ≤ 4) are unrolled at codegen time.
+      // An all-or-nothing runtime guard (`sg_size >= minRequired`)
+      // ensures either all subgroup rounds execute or none do,
+      // keeping ping/pong buffer parity deterministic in both paths.
       const sgRounds = useSubgroupShuffle ? Math.min(3, was.numRounds) : 0;
 
       if (sgRounds > 0) {
+        // Runtime guard: require subgroup size large enough for all
+        // unrolled rounds (stride = 1 << (sgRounds-1) must be < sg_size).
+        const minSgSize = 1 << sgRounds; // e.g. 8 for 3 rounds
+        emit(`if (sg_size >= ${minSgSize}u) {`, pushIndent);
+
         // Register variables to hold per-thread leaf values during subgroup
         // rounds. Avoids shared-memory writes + workgroupBarrier().
         for (let e = 0; e < was.numElems; e++) {
@@ -3231,536 +3458,153 @@ export function blockMapFusedShaderSource(
           // Invocations below stride keep their register value unchanged.
           emit(`if (sg_inv_id >= ${stride}u) {`, pushIndent);
 
-          // Emit body kernels with register-based resolution
-          for (let bsi = 0; bsi < was.bodyKernels.length; bsi++) {
-            const { step: bStep, kernel: bKernel } = was.bodyKernels[bsi];
-
-            // Build per-step input resolution (same as shmem path)
-            const bStepInputKind: ("const" | "a" | "b" | "shmem")[] = [];
-            const bStepInputElemIdx: number[] = [];
-            for (let j = 0; j < bStep.inputs.length; j++) {
-              const jitId = bStep.inputs[j];
-              const biIdx = was.bodyInputIds.indexOf(jitId);
-              if (biIdx >= 0 && biIdx < numBodyConsts) {
-                bStepInputKind.push("const");
-                bStepInputElemIdx.push(-1);
-              } else if (
-                biIdx >= numBodyConsts &&
-                biIdx < numBodyConsts + was.numElems
-              ) {
-                bStepInputKind.push("a");
-                bStepInputElemIdx.push(biIdx - numBodyConsts);
-              } else if (biIdx >= numBodyConsts + was.numElems) {
-                bStepInputKind.push("b");
-                bStepInputElemIdx.push(biIdx - numBodyConsts - was.numElems);
-              } else {
-                bStepInputKind.push("shmem");
-                bStepInputElemIdx.push(-1);
-              }
-            }
-
-            // Resolve reads from shuffled registers (a) and current registers (b)
-            const sgResolve: ResolveGlobalIndex = (
-              bufIdx,
-              indexExpr,
-              dtype,
-            ) => {
-              const kind = bStepInputKind[bufIdx];
-              if (kind === "const") {
-                const biIdx2 = was.bodyInputIds.indexOf(bStep.inputs[bufIdx]);
-                const inf = bodyInputInfo[biIdx2];
-                if (inf.name === BLOCK_IDX_SENTINEL) return `i32(block_idx)`;
-                if (inf.isGlobal) {
-                  if (inf.parentInputIdx >= 0) {
-                    const remapped = inRemap(inf.parentInputIdx, indexExpr);
-                    const readExpr = `${inf.name}[i32(in_base_${inf.parentInputIdx}) + ${remapped}]`;
-                    return hasBoundary
-                      ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
-                      : readExpr;
-                  }
-                  return `${inf.name}[${indexExpr}]`;
-                }
-                return `${inf.name}[${indexExpr}]`;
-              } else if (kind === "a") {
-                const e = bStepInputElemIdx[bufIdx];
-                const shName = `was_sg_a_${entry.wasIdx}_r${r}_${e}`;
-                const ec = was.elemCounts[e];
-                return ec > 1 ? `${shName}[u32(${indexExpr})]` : shName;
-              } else if (kind === "b") {
-                const e = bStepInputElemIdx[bufIdx];
-                const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
-                const ec = was.elemCounts[e];
-                return ec > 1 ? `${regName}[u32(${indexExpr})]` : regName;
-              }
-              // shmem intermediate (var<private>)
-              const sname = bodyIdToName.get(bStep.inputs[bufIdx]);
-              return `${sname ?? "__unknown"}[${indexExpr}]`;
-            };
-
-            const gen = createGen(
-              bKernel,
-              `was${entry.wasIdx}_sg${r}_s${bsi}`,
-              sgResolve,
-            );
-
-            for (let oi = 0; oi < bKernel.numOutputs; oi++) {
-              const outId = bStep.outputs[oi];
-
-              // --- Reduction kernel: gidx loop + ridx accumulation ---
-              const bRe = bKernel.outputs[oi]?.reduction ?? null;
-              if (bRe) {
-                const reDtype = bRe.dtype;
-                const reTy = dtypeToWgsl(reDtype, false);
-                const bodyDtype = bKernel.outputs[oi].dtype;
-                const reSize = bRe.size as number;
-                const bodyExp = bKernel.outputs[oi].exp;
-                const kernelSize = bKernel.size as number;
-                const prefix = `was${entry.wasIdx}_sg${r}_s${bsi}`;
-                const isIdentityEpilogue =
-                  bRe.epilogue.op === AluOp.Variable &&
-                  bRe.epilogue.arg === "acc";
-
+          emitWasRoundBody(
+            `was${entry.wasIdx}_sg${r}`,
+            // resolveA: read from shuffled registers
+            (elemIdx, indexExpr) => {
+              const shName = `was_sg_a_${entry.wasIdx}_r${r}_${elemIdx}`;
+              const ec = was.elemCounts[elemIdx];
+              return ec > 1 ? `${shName}[u32(${indexExpr})]` : shName;
+            },
+            // resolveB: read from current registers
+            (elemIdx, indexExpr) => {
+              const regName = `was_sg_reg_${entry.wasIdx}_${elemIdx}`;
+              const ec = was.elemCounts[elemIdx];
+              return ec > 1 ? `${regName}[u32(${indexExpr})]` : regName;
+            },
+            // writeLeaf: write to register
+            (elemIdx, ec, value, isGidx) => {
+              const regName = `was_sg_reg_${entry.wasIdx}_${elemIdx}`;
+              const cast = dtypeToWgsl(was.elemDtypes[elemIdx]);
+              if (ec > 1) {
                 emit(
-                  `for (var gidx: i32 = 0; gidx < ${kernelSize}; gidx++) {`,
-                  pushIndent,
+                  `${regName}[${isGidx ? "u32(gidx)" : "_was_oi"}] = ${cast}(${value});`,
                 );
-                const accName = `${prefix}_acc`;
-                emit(
-                  `var ${accName}: ${reTy} = ${constToWgsl(reDtype, bRe.identity)};`,
-                );
-                const UNROLL_THRESHOLD = 8;
-                const emitAccum = (rhs: string) => {
-                  const castRhs = wgslCastReductionRhs(rhs, bodyDtype, reDtype);
-                  emit(wgslReductionAccumStmt(bRe.op, accName, castRhs));
-                };
-                if (reSize <= UNROLL_THRESHOLD) {
-                  for (let ri = 0; ri < reSize; ri++) {
-                    const riGen = createGen(
-                      bKernel,
-                      `${prefix}_r${ri}`,
-                      sgResolve,
-                      undefined,
-                      undefined,
-                      AluExp.i32(ri),
-                    );
-                    emitAccum(strip1(riGen(bodyExp)));
-                  }
-                } else {
-                  emit(
-                    `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
-                    pushIndent,
-                  );
-                  emitAccum(strip1(gen(bodyExp)));
-                  emit(popIndent, "}");
-                }
-                let finalValue: string;
-                if (isIdentityEpilogue) {
-                  finalValue = accName;
-                } else {
-                  const epGen = createGen(
-                    bKernel,
-                    `${prefix}_ep`,
-                    sgResolve,
-                    new Map([["acc", accName]]),
-                  );
-                  finalValue = strip1(epGen(bRe.epilogue));
-                }
-                // Write to register
-                const bodyOutIdx = was.bodyOutputIds.indexOf(outId);
-                if (bodyOutIdx >= 0) {
-                  const e = bodyOutIdx;
-                  const ec = was.elemCounts[e];
-                  const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
-                  if (ec > 1) {
-                    emit(
-                      `${regName}[u32(gidx)] = ${dtypeToWgsl(was.elemDtypes[e])}(${finalValue});`,
-                    );
-                  } else {
-                    emit(
-                      `${regName} = ${dtypeToWgsl(was.elemDtypes[e])}(${finalValue});`,
-                    );
-                  }
-                } else {
-                  const sname = bodyIdToName.get(outId);
-                  if (sname) emit(`${sname}[gidx] = ${finalValue};`);
-                }
-                emit(popIndent, "}"); // end gidx loop
-                continue;
-              }
-
-              // --- Elementwise kernel ---
-              const bodyOutIdx = was.bodyOutputIds.indexOf(outId);
-              if (bodyOutIdx >= 0) {
-                const e = bodyOutIdx;
-                const ec = was.elemCounts[e];
-                const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
-                if (ec > 1) {
-                  emit(
-                    `for (var _was_oi: u32 = 0u; _was_oi < ${ec}u; _was_oi++) {`,
-                    pushIndent,
-                  );
-                  const genEi = createGen(
-                    bKernel,
-                    `was${entry.wasIdx}_sg${r}_s${bsi}_ei`,
-                    (bufIdx2, _indexExpr, dtype2) => {
-                      const kind2 = bStepInputKind[bufIdx2];
-                      if (kind2 === "const") {
-                        const biIdx2 = was.bodyInputIds.indexOf(
-                          bStep.inputs[bufIdx2],
-                        );
-                        const inf2 = bodyInputInfo[biIdx2];
-                        if (inf2.name === BLOCK_IDX_SENTINEL)
-                          return `i32(block_idx)`;
-                        if (inf2.isGlobal && inf2.parentInputIdx >= 0) {
-                          const remapped2 = inRemap(
-                            inf2.parentInputIdx,
-                            "i32(_was_oi)",
-                          );
-                          const readExpr2 = `${inf2.name}[i32(in_base_${inf2.parentInputIdx}) + ${remapped2}]`;
-                          return hasBoundary
-                            ? `select(${dtypeToWgsl(dtype2)}(0), ${readExpr2}, valid)`
-                            : readExpr2;
-                        }
-                        return `${inf2.name}[i32(_was_oi)]`;
-                      } else if (kind2 === "a") {
-                        const e2 = bStepInputElemIdx[bufIdx2];
-                        return `was_sg_a_${entry.wasIdx}_r${r}_${e2}[_was_oi]`;
-                      } else if (kind2 === "b") {
-                        const e2 = bStepInputElemIdx[bufIdx2];
-                        return `was_sg_reg_${entry.wasIdx}_${e2}[_was_oi]`;
-                      }
-                      const sname = bodyIdToName.get(bStep.inputs[bufIdx2]);
-                      return `${sname ?? "__unknown"}[i32(_was_oi)]`;
-                    },
-                  );
-                  const rhsEi = strip1(genEi(bKernel.outputs[oi].exp));
-                  emit(`${regName}[_was_oi] = ${rhsEi};`);
-                  emit(popIndent, "}");
-                } else {
-                  const rhs = strip1(gen(bKernel.outputs[oi].exp));
-                  emit(`${regName} = ${rhs};`);
-                }
               } else {
-                // Body intermediate → write to var<private>
-                const rhs = strip1(gen(bKernel.outputs[oi].exp));
-                const sname = bodyIdToName.get(outId);
-                if (sname) {
-                  emit(
-                    `${sname}[${bKernel.numOutputs > 1 ? `i32(tidx) * ${bKernel.numOutputs} + ${oi}` : "tidx"}] = ${rhs};`,
-                  );
-                }
+                emit(`${regName} = ${cast}(${value});`);
               }
-            }
-          }
+            },
+            // multiElemResolveA: shuffled register by element index
+            (elemIdx, eiVar) =>
+              `was_sg_a_${entry.wasIdx}_r${r}_${elemIdx}[${eiVar}]`,
+            // multiElemResolveB: current register by element index
+            (elemIdx, eiVar) =>
+              `was_sg_reg_${entry.wasIdx}_${elemIdx}[${eiVar}]`,
+          );
 
           emit(popIndent, "}"); // end if (sg_inv_id >= stride)
         }
 
-        // Flush registers to the shmem buffer that the first shmem round will
-        // read from: readBuf[sgRounds] = sgRounds % 2 === 0 ? ping : pong.
-        const flushNames = was.pingPongNames.map(([ping, pong]) =>
-          sgRounds % 2 === 0 ? ping : pong,
-        );
+        // Flush registers to shmem. After sgRounds rounds, the target
+        // buffer is deterministic: sgRounds even → ping, odd → pong.
         for (let e = 0; e < was.numElems; e++) {
           const ec = was.elemCounts[e];
           const regName = `was_sg_reg_${entry.wasIdx}_${e}`;
+          const flushTarget =
+            sgRounds % 2 === 0
+              ? was.pingPongNames[e][0]
+              : was.pingPongNames[e][1];
           if (ec > 1) {
             for (let ei = 0; ei < ec; ei++) {
               emit(
-                `${flushNames[e]}[tidx * ${ec}u + ${ei}u] = ${regName}[${ei}u];`,
+                `${flushTarget}[tidx * ${ec}u + ${ei}u] = ${regName}[${ei}u];`,
               );
             }
           } else {
-            emit(`${flushNames[e]}[tidx] = ${regName};`);
+            emit(`${flushTarget}[tidx] = ${regName};`);
           }
         }
         emit("workgroupBarrier();");
       }
 
-      // Unrolled Kogge-Stone shmem rounds (inter-subgroup communication)
-      // Even rounds: read from ping, write to pong
-      // Odd rounds: read from pong, write to ping
-      for (let r = sgRounds; r < was.numRounds; r++) {
-        const stride = 1 << r;
-        const readNames = was.pingPongNames.map(([ping, pong]) =>
-          r % 2 === 0 ? ping : pong,
-        );
-        const writeNames = was.pingPongNames.map(([ping, pong]) =>
-          r % 2 === 0 ? pong : ping,
-        );
+      // --- Emit shmem rounds for a given range ---
+      // Factored out so both the subgroup-path tail and the fallback can
+      // call it with different starting round numbers.
+      const emitShmemRounds = (fromRound: number) => {
+        for (let r = fromRound; r < was.numRounds; r++) {
+          const stride = 1 << r;
+          const readBuf = (e: number) =>
+            r % 2 === 0 ? was.pingPongNames[e][0] : was.pingPongNames[e][1];
+          const writeBuf = (e: number) =>
+            r % 2 === 0 ? was.pingPongNames[e][1] : was.pingPongNames[e][0];
 
-        emit(`if (tidx >= ${stride}u) {`, pushIndent);
+          emit(`if (tidx >= ${stride}u) {`, pushIndent);
 
-        // Evaluate body kernels: fn(a, b) where
-        //   a = readBuf[(tidx - stride) * elemCount + ei]
-        //   b = readBuf[tidx * elemCount + ei]
-        // Map body output JitIds to writeBuf[tidx * elemCount + ei]
-        for (let bsi = 0; bsi < was.bodyKernels.length; bsi++) {
-          const { step: bStep, kernel: bKernel } = was.bodyKernels[bsi];
-
-          // Build per-step input resolution
-          const bStepInputNames: string[] = [];
-          const bStepInputKind: ("const" | "a" | "b" | "shmem")[] = [];
-          const bStepInputElemIdx: number[] = []; // which elem in the pytree
-          for (let j = 0; j < bStep.inputs.length; j++) {
-            const jitId = bStep.inputs[j];
-            const biIdx = was.bodyInputIds.indexOf(jitId);
-            if (biIdx >= 0 && biIdx < numBodyConsts) {
-              // Const
-              bStepInputNames.push(bodyInputInfo[biIdx].name);
-              bStepInputKind.push("const");
-              bStepInputElemIdx.push(-1);
-            } else if (
-              biIdx >= numBodyConsts &&
-              biIdx < numBodyConsts + was.numElems
-            ) {
-              // a_elem
-              const e = biIdx - numBodyConsts;
-              bStepInputNames.push(readNames[e]);
-              bStepInputKind.push("a");
-              bStepInputElemIdx.push(e);
-            } else if (biIdx >= numBodyConsts + was.numElems) {
-              // b_elem
-              const e = biIdx - numBodyConsts - was.numElems;
-              bStepInputNames.push(readNames[e]);
-              bStepInputKind.push("b");
-              bStepInputElemIdx.push(e);
-            } else {
-              // Body shmem intermediate
-              const sname = bodyIdToName.get(jitId);
-              bStepInputNames.push(sname ?? `__was_unknown_${jitId}`);
-              bStepInputKind.push("shmem");
-              bStepInputElemIdx.push(-1);
-            }
-          }
-
-          const wasResolve: ResolveGlobalIndex = (bufIdx, indexExpr, dtype) => {
-            const kind = bStepInputKind[bufIdx];
-            const name = bStepInputNames[bufIdx];
-            if (kind === "const") {
-              if (name === BLOCK_IDX_SENTINEL) return `i32(block_idx)`;
-              const inf =
-                bodyInputInfo[was.bodyInputIds.indexOf(bStep.inputs[bufIdx])];
-              if (inf.isGlobal) {
-                if (inf.parentInputIdx >= 0) {
-                  const remapped = inRemap(inf.parentInputIdx, indexExpr);
-                  const readExpr = `${name}[i32(in_base_${inf.parentInputIdx}) + ${remapped}]`;
-                  return hasBoundary
-                    ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
-                    : readExpr;
-                }
-                return `${name}[${indexExpr}]`;
-              }
-              return `${name}[${indexExpr}]`;
-            } else if (kind === "a") {
-              const e = bStepInputElemIdx[bufIdx];
-              const ec = was.elemCounts[e];
+          emitWasRoundBody(
+            `was${entry.wasIdx}_r${r}`,
+            // resolveA: shmem read at (tidx - stride)
+            (elemIdx, indexExpr) => {
+              const ec = was.elemCounts[elemIdx];
+              if (ec > 1)
+                return `${readBuf(elemIdx)}[(tidx - ${stride}u) * ${ec}u + u32(${indexExpr})]`;
+              return `${readBuf(elemIdx)}[tidx - ${stride}u]`;
+            },
+            // resolveB: shmem read at tidx
+            (elemIdx, indexExpr) => {
+              const ec = was.elemCounts[elemIdx];
+              if (ec > 1)
+                return `${readBuf(elemIdx)}[tidx * ${ec}u + u32(${indexExpr})]`;
+              return `${readBuf(elemIdx)}[tidx]`;
+            },
+            // writeLeaf: write to shmem write buffer
+            (elemIdx, ec, value, isGidx) => {
+              const cast = dtypeToWgsl(was.elemDtypes[elemIdx]);
               if (ec > 1) {
-                return `${name}[(tidx - ${stride}u) * ${ec}u + u32(${indexExpr})]`;
+                emit(
+                  `${writeBuf(elemIdx)}[tidx * ${ec}u + ${isGidx ? "u32(gidx)" : "_was_oi"}] = ${cast}(${value});`,
+                );
+              } else {
+                emit(`${writeBuf(elemIdx)}[tidx] = ${value};`);
               }
-              return `${name}[tidx - ${stride}u]`;
-            } else if (kind === "b") {
-              const e = bStepInputElemIdx[bufIdx];
-              const ec = was.elemCounts[e];
-              if (ec > 1) {
-                return `${name}[tidx * ${ec}u + u32(${indexExpr})]`;
-              }
-              return `${name}[tidx]`;
-            }
-            // shmem intermediate
-            return `${name}[${indexExpr}]`;
-          };
-
-          const gen = createGen(
-            bKernel,
-            `was${entry.wasIdx}_r${r}_s${bsi}`,
-            wasResolve,
+            },
+            // multiElemResolveA
+            (elemIdx, eiVar) => {
+              return `${readBuf(elemIdx)}[(tidx - ${stride}u) * ${was.elemCounts[elemIdx]}u + ${eiVar}]`;
+            },
+            // multiElemResolveB
+            (elemIdx, eiVar) => {
+              return `${readBuf(elemIdx)}[tidx * ${was.elemCounts[elemIdx]}u + ${eiVar}]`;
+            },
           );
 
-          for (let oi = 0; oi < bKernel.numOutputs; oi++) {
-            const outId = bStep.outputs[oi];
+          emit(popIndent, "} else {", pushIndent);
 
-            // --- Reduction kernel: gidx loop + ridx accumulation ---
-            const bRe = bKernel.outputs[oi]?.reduction ?? null;
-            if (bRe) {
-              const reDtype = bRe.dtype;
-              const reTy = dtypeToWgsl(reDtype, false);
-              const bodyDtype = bKernel.outputs[oi].dtype;
-              const reSize = bRe.size as number;
-              const bodyExp = bKernel.outputs[oi].exp;
-              const kernelSize = bKernel.size as number;
-              const prefix = `was${entry.wasIdx}_r${r}_s${bsi}`;
-              const isIdentityEpilogue =
-                bRe.epilogue.op === AluOp.Variable &&
-                bRe.epilogue.arg === "acc";
-
-              // Emit a gidx loop over output elements
+          // Copy: writeBuf[tidx] = readBuf[tidx]
+          for (let e = 0; e < was.numElems; e++) {
+            const ec = was.elemCounts[e];
+            if (ec > 1) {
               emit(
-                `for (var gidx: i32 = 0; gidx < ${kernelSize}; gidx++) {`,
+                `for (var _was_ci: u32 = 0u; _was_ci < ${ec}u; _was_ci++) {`,
                 pushIndent,
               );
-
-              // Accumulator
-              const accName = `${prefix}_acc`;
               emit(
-                `var ${accName}: ${reTy} = ${constToWgsl(reDtype, bRe.identity)};`,
+                `${writeBuf(e)}[tidx * ${ec}u + _was_ci] = ${readBuf(e)}[tidx * ${ec}u + _was_ci];`,
               );
-
-              // Reduction loop — unroll for small sizes (DLM typical: 2)
-              const UNROLL_THRESHOLD = 8;
-              const emitAccum = (rhs: string) => {
-                const castRhs = wgslCastReductionRhs(rhs, bodyDtype, reDtype);
-                emit(wgslReductionAccumStmt(bRe.op, accName, castRhs));
-              };
-
-              if (reSize <= UNROLL_THRESHOLD) {
-                for (let ri = 0; ri < reSize; ri++) {
-                  const riGen = createGen(
-                    bKernel,
-                    `${prefix}_r${ri}`,
-                    wasResolve,
-                    undefined,
-                    undefined,
-                    AluExp.i32(ri),
-                  );
-                  emitAccum(strip1(riGen(bodyExp)));
-                }
-              } else {
-                emit(
-                  `for (var ridx: i32 = 0; ridx < ${reSize}; ridx++) {`,
-                  pushIndent,
-                );
-                emitAccum(strip1(gen(bodyExp)));
-                emit(popIndent, "}");
-              }
-
-              // Apply epilogue
-              let finalValue: string;
-              if (isIdentityEpilogue) {
-                finalValue = accName;
-              } else {
-                const epGen = createGen(
-                  bKernel,
-                  `${prefix}_ep`,
-                  wasResolve,
-                  new Map([["acc", accName]]),
-                );
-                finalValue = strip1(epGen(bRe.epilogue));
-              }
-
-              // Write result
-              const bodyOutIdx = was.bodyOutputIds.indexOf(outId);
-              if (bodyOutIdx >= 0) {
-                const e = bodyOutIdx;
-                const ec = was.elemCounts[e];
-                if (ec > 1) {
-                  emit(
-                    `${writeNames[e]}[tidx * ${ec}u + u32(gidx)] = ${dtypeToWgsl(was.elemDtypes[e])}(${finalValue});`,
-                  );
-                } else {
-                  emit(
-                    `${writeNames[e]}[tidx] = ${dtypeToWgsl(was.elemDtypes[e])}(${finalValue});`,
-                  );
-                }
-              } else {
-                const sname = bodyIdToName.get(outId);
-                if (sname) {
-                  emit(`${sname}[gidx] = ${finalValue};`);
-                }
-              }
-
-              emit(popIndent, "}"); // end gidx loop
-              continue; // skip the elementwise path below
-            }
-
-            // --- Elementwise kernel: existing codegen ---
-            const rhs = strip1(gen(bKernel.outputs[oi].exp));
-            // Map body output to the correct write buffer
-            const bodyOutIdx = was.bodyOutputIds.indexOf(outId);
-            if (bodyOutIdx >= 0) {
-              const e = bodyOutIdx;
-              const ec = was.elemCounts[e];
-              if (ec > 1) {
-                // Need to emit for each sub-element — but gen already uses gidx
-                // which maps to a single element. For multi-element outputs the
-                // kernel iterates gidx over elemCount, so we wrap in a loop.
-                emit(
-                  `for (var _was_oi: u32 = 0u; _was_oi < ${ec}u; _was_oi++) {`,
-                  pushIndent,
-                );
-                // Re-generate with explicit eidx
-                const genEi = createGen(
-                  bKernel,
-                  `was${entry.wasIdx}_r${r}_s${bsi}_ei`,
-                  (bufIdx2, _indexExpr, dtype2) => {
-                    const kind2 = bStepInputKind[bufIdx2];
-                    const name2 = bStepInputNames[bufIdx2];
-                    if (kind2 === "const") {
-                      if (name2 === BLOCK_IDX_SENTINEL) return `i32(block_idx)`;
-                      const inf2 =
-                        bodyInputInfo[
-                          was.bodyInputIds.indexOf(bStep.inputs[bufIdx2])
-                        ];
-                      if (inf2.isGlobal && inf2.parentInputIdx >= 0) {
-                        const remapped2 = inRemap(
-                          inf2.parentInputIdx,
-                          "i32(_was_oi)",
-                        );
-                        const readExpr2 = `${name2}[i32(in_base_${inf2.parentInputIdx}) + ${remapped2}]`;
-                        return hasBoundary
-                          ? `select(${dtypeToWgsl(dtype2)}(0), ${readExpr2}, valid)`
-                          : readExpr2;
-                      }
-                      return `${name2}[i32(_was_oi)]`;
-                    } else if (kind2 === "a") {
-                      const e2 = bStepInputElemIdx[bufIdx2];
-                      return `${name2}[(tidx - ${stride}u) * ${was.elemCounts[e2]}u + _was_oi]`;
-                    } else if (kind2 === "b") {
-                      const e2 = bStepInputElemIdx[bufIdx2];
-                      return `${name2}[tidx * ${was.elemCounts[e2]}u + _was_oi]`;
-                    }
-                    return `${name2}[i32(_was_oi)]`;
-                  },
-                );
-                const rhsEi = strip1(genEi(bKernel.outputs[oi].exp));
-                emit(`${writeNames[e]}[tidx * ${ec}u + _was_oi] = ${rhsEi};`);
-                emit(popIndent, "}");
-              } else {
-                emit(`${writeNames[e]}[tidx] = ${rhs};`);
-              }
+              emit(popIndent, "}");
             } else {
-              // Body intermediate → write to body shmem
-              const sname = bodyIdToName.get(outId);
-              if (sname) {
-                emit(
-                  `${sname}[${bKernel.numOutputs > 1 ? `i32(tidx) * ${bKernel.numOutputs} + ${oi}` : "tidx"}] = ${rhs};`,
-                );
-              }
+              emit(`${writeBuf(e)}[tidx] = ${readBuf(e)}[tidx];`);
             }
           }
+
+          emit(popIndent, "}");
+          emit("workgroupBarrier();");
         }
+      };
 
-        emit(popIndent, "} else {", pushIndent);
-
-        // Copy: writeBuf[tidx] = readBuf[tidx]
-        for (let e = 0; e < was.numElems; e++) {
-          const ec = was.elemCounts[e];
-          if (ec > 1) {
-            emit(
-              `for (var _was_ci: u32 = 0u; _was_ci < ${ec}u; _was_ci++) {`,
-              pushIndent,
-            );
-            emit(
-              `${writeNames[e]}[tidx * ${ec}u + _was_ci] = ${readNames[e]}[tidx * ${ec}u + _was_ci];`,
-            );
-            emit(popIndent, "}");
-          } else {
-            emit(`${writeNames[e]}[tidx] = ${readNames[e]}[tidx];`);
-          }
-        }
-
-        emit(popIndent, "}");
-        emit("workgroupBarrier();");
+      // When sgRounds > 0, the subgroup path is guarded by a runtime check
+      // on the actual subgroup size. If sg_size is large enough for all
+      // sgRounds, use registers; otherwise fall back to pure shmem rounds.
+      // This "all-or-nothing" approach keeps ping/pong parity deterministic
+      // in both branches, avoiding unsound dynamic buffer selection.
+      if (sgRounds > 0) {
+        // Remaining shmem rounds after the subgroup path
+        emitShmemRounds(sgRounds);
+        emit(popIndent, "} else {", pushIndent); // else: sg_size too small
+        // Pure shmem fallback: all rounds via shared memory
+        emitShmemRounds(0);
+        emit(popIndent, "}"); // end if (sg_size >= ...)
+      } else {
+        emitShmemRounds(0);
       }
 
       // Write output from final buffer to parent output shmem / result buffers

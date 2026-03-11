@@ -1028,18 +1028,21 @@ Kogge-Stone round with register-to-register shuffles. Each thread gets its neigh
 
 **Where:** Same as 1a, but applicable to ALL associative scan bodies including DLM compose.
 
-**Impact:** Eliminates shmem traffic for the first log₂(subgroup_size) rounds. For DLM 2-tuple N=100
-(1 dispatch, 1 block), this removes 5 of 8 shmem barrier pairs. The shmem barrier cost is small
-relative to the actual compute, but for small bodies this could yield **10–20% improvement**.
+**Impact:** Eliminates shmem traffic for the first 3 Kogge-Stone rounds when sg_size ≥ 8. For DLM
+2-tuple N=100 (1 dispatch, 1 block, 8 rounds), this removes 3 of 8 shmem barrier pairs. The shmem
+barrier cost is small relative to the actual compute, but for small bodies this could yield **10–20%
+improvement**.
 
 **Implementation (completed):**
 
-1. Conservative approach: 3 unconditional subgroup rounds (stride 1, 2, 4 — safe for minimum
-   subgroup size of 8 across all WebGPU hardware)
-2. Register variables (`var<private>`) hold leaf values during subgroup phase
-3. `subgroupShuffleUp(val, stride)` per leaf sub-element per round, guarded by `sg_inv_id >= stride`
-4. Compose body called with register-based resolution (`sgResolve`) — "a" reads shuffled registers,
-   "b" reads current registers
+1. All-or-nothing runtime guard: `if (sg_size >= 8u)` wraps the entire subgroup path. Either all 3
+   register rounds execute (and the remaining rounds use shmem starting from round 3), or the pure
+   shmem path handles all rounds. This keeps ping/pong buffer parity deterministic in both branches.
+2. Shared emitter (`emitWasRoundBody`): both subgroup and shmem paths call the same helper with
+   different resolve/write callbacks, eliminating ~200 lines of codegen duplication.
+3. Register variables (`var<private>`) hold leaf values during subgroup phase
+4. Compose body called via `emitWasRoundBody` with register-based callbacks — "a" reads shuffled
+   registers, "b" reads current registers
 5. After subgroup rounds: flush registers to shmem + single `workgroupBarrier()`
 6. Remaining rounds use existing shmem Kogge-Stone path (starting from round `sgRounds`)
 7. Both reduction kernel (gidx loop + ridx accumulation) and elementwise kernel paths supported
