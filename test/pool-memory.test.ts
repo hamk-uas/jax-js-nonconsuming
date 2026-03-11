@@ -194,7 +194,11 @@ describe("WebGPU buffer pool memory", () => {
     // JIT should not use significantly MORE peak slots than eager.
     // The command tape (O8) manages intermediates as raw GPUBuffers outside
     // the slot system, so jitPeak.delta can be lower than eagerPeak.delta —
-    // that's strictly better, not a regression.
+    // that's strictly better, not a regression.  Leak detection still works:
+    // tape intermediates are transient (allocated and freed within a single
+    // executeCommandTape call), and all final outputs become proper slots.
+    // The error path drains pooledDuringTape before destroying allocations,
+    // so no destroyed-buffer references leak into the pool on failure.
     expect(jitPeak.delta).toBeLessThanOrEqual(eagerPeak.delta + 1);
   });
 
@@ -258,4 +262,34 @@ describe("WebGPU buffer pool memory", () => {
     expect(afterBytes).toBeLessThanOrEqual(withArrayBytes);
     expect(afterBytes).toBeGreaterThanOrEqual(0);
   });
+
+  it(
+    "command tape pool integrity after repeated frees",
+    { timeout: 30_000 },
+    async ({ skip }) => {
+      if (!hasWebGPU) skip();
+
+      // Multi-step JIT with intermediates: tape will free mid-tape buffers and
+      // pool them.  Repeated execution exercises the pooledDuringTape tracking.
+      // If the pool were poisoned (destroyed refs surviving in pool), subsequent
+      // allocations from pool would use a destroyed GPUBuffer → device error.
+      using f = jit((x: any) => x.add(1).mul(2).sub(3).add(4).mul(5));
+      using x = np.ones([2048]);
+
+      // Warmup to compile + fill pool
+      (await f(x)).dispose();
+      const baselineBytes = getGpuBytes();
+
+      // Many iterations: each reuses pooled buffers from prior tape execution.
+      for (let i = 0; i < 50; i++) {
+        (await f(x)).dispose();
+      }
+
+      // gpuAllocatedBytes must stay stable — no unbounded growth and no
+      // negative drift (which would indicate double-accounting).
+      const finalBytes = getGpuBytes();
+      expect(finalBytes).toBeGreaterThanOrEqual(0);
+      expect(finalBytes).toBeLessThanOrEqual(baselineBytes);
+    },
+  );
 });

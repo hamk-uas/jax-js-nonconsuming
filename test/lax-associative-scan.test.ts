@@ -1917,6 +1917,27 @@ describe("lax.associativeScan — Decoupled Fallback (T0)", () => {
     expect(result).toBeAllclose([1, 3, 6, 10, 15]);
   });
 
+  // u32 excluded from DF: 30-bit descriptor packing truncates values > 2^30-1.
+  // This test verifies u32 falls back to Kogge-Stone and produces correct results.
+  test("u32 cumsum N=600 uses Kogge-Stone (not DF)", ({ skip }) => {
+    if (!available) skip();
+    const N = 600;
+    // Use values that individually fit in 30 bits but whose cumsum exceeds 2^30.
+    const values = Array.from({ length: N }, () =>
+      Math.floor(Math.random() * 10_000_000),
+    );
+    const expected = values.reduce<number[]>((acc, v, i) => {
+      acc.push(((acc[i - 1] ?? 0) + v) >>> 0);
+      return acc;
+    }, []);
+    using xs = np.array(values, { dtype: DType.Uint32 });
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    expect(result).toBeAllclose(expected);
+  });
+
   test("f32 cumsum N=1 (edge case)", ({ skip }) => {
     if (!available) skip();
     using xs = np.array([42], { dtype: DType.Float32 });

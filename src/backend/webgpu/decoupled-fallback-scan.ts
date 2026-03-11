@@ -6,11 +6,13 @@
  * Forward Progress Guarantee (FPG), making it portable across all WebGPU
  * backends (NVIDIA, AMD, Intel, Apple Silicon).
  *
- * Phase 1 targets scalar binary ops: add, mul, min, max on f32/u32/i32.
+ * Phase 1 targets scalar binary ops: add, mul, min, max on f32.
  *
  * Descriptor packing: status (2 bits) + value (30 bits) in a single
- * atomic<u32>. For f32, the 2 LSBs of the mantissa are truncated.
- * For u32/i32, values are truncated to 30 bits.
+ * atomic<u32>. For f32, the 2 LSBs of the mantissa are truncated (~4 ULPs
+ * precision loss per lookback step — acceptable for f32 prefix sums).
+ * u32/i32 excluded: 30-bit packing silently truncates values that exceed
+ * the representable range, producing incorrect results.
  *
  * References:
  * - Smith, Levien, & Owens: "Decoupled Fallback" (2024)
@@ -20,7 +22,7 @@
 import { AluOp, DType } from "../../alu";
 
 export type DFScanOp = AluOp.Add | AluOp.Mul | AluOp.Min | AluOp.Max;
-export type DFScanDtype = DType.Float32 | DType.Uint32 | DType.Int32;
+export type DFScanDtype = DType.Float32;
 
 interface OpConfig {
   wgslOp: string; // e.g. "a + b"
@@ -31,10 +33,7 @@ interface OpConfig {
   unpackValue: string; // expression using `bits` (the 30-bit u32)
 }
 
-function getOpConfig(op: DFScanOp, dtype: DFScanDtype): OpConfig {
-  const wgslType =
-    dtype === DType.Float32 ? "f32" : dtype === DType.Int32 ? "i32" : "u32";
-
+function getOpConfig(op: DFScanOp, _dtype: DFScanDtype): OpConfig {
   // Operation expression
   let wgslOp: string;
   switch (op) {
@@ -52,51 +51,26 @@ function getOpConfig(op: DFScanOp, dtype: DFScanDtype): OpConfig {
       break;
   }
 
-  // Identity value
+  // Identity value (f32 only)
   let identity: string;
   switch (op) {
     case AluOp.Add:
-      identity = dtype === DType.Float32 ? "0.0" : "0u";
-      if (dtype === DType.Int32) identity = "0i";
+      identity = "0.0";
       break;
     case AluOp.Mul:
-      identity = dtype === DType.Float32 ? "1.0" : "1u";
-      if (dtype === DType.Int32) identity = "1i";
+      identity = "1.0";
       break;
     case AluOp.Min:
-      identity =
-        dtype === DType.Float32
-          ? "bitcast<f32>(0x7F7FFFFFu)" // MAX_FLOAT
-          : dtype === DType.Int32
-            ? "0x7FFFFFFFi" // MAX_INT32
-            : "0xFFFFFFFFu"; // MAX_UINT32
+      identity = "bitcast<f32>(0x7F7FFFFFu)"; // MAX_FLOAT
       break;
     case AluOp.Max:
-      identity =
-        dtype === DType.Float32
-          ? "bitcast<f32>(0xFF7FFFFFu)" // -MAX_FLOAT
-          : dtype === DType.Int32
-            ? "i32(0x80000000u)" // MIN_INT32
-            : "0u"; // MIN_UINT32
+      identity = "bitcast<f32>(0xFF7FFFFFu)"; // -MAX_FLOAT
       break;
   }
 
-  // Packing/unpacking: 30-bit value fits in lower bits of descriptor u32
-  let packValue: string;
-  let unpackValue: string;
-  if (dtype === DType.Float32) {
-    // Truncate 2 LSBs of mantissa: shift right by 2
-    packValue = "(bitcast<u32>(v) >> 2u)";
-    unpackValue = "bitcast<f32>(bits << 2u)";
-  } else if (dtype === DType.Int32) {
-    // Bias to unsigned: add 2^29 then mask to 30 bits
-    packValue = "(u32(v + 0x20000000i) & 0x3FFFFFFFu)";
-    unpackValue = `${wgslType}(i32(bits) - 0x20000000i)`;
-  } else {
-    // u32: direct 30-bit truncation
-    packValue = "(v & 0x3FFFFFFFu)";
-    unpackValue = "bits";
-  }
+  // Packing/unpacking: truncate 2 LSBs of f32 mantissa (~4 ULPs precision)
+  const packValue = "(bitcast<u32>(v) >> 2u)";
+  const unpackValue = "bitcast<f32>(bits << 2u)";
 
   return { wgslOp, identity, packValue, unpackValue };
 }
@@ -115,8 +89,7 @@ export function generateDecoupledFallbackScanShader(
   dtype: DFScanDtype,
   blockSize: number,
 ): string {
-  const wgslType =
-    dtype === DType.Float32 ? "f32" : dtype === DType.Int32 ? "i32" : "u32";
+  const wgslType = "f32"; // DFScanDtype is f32-only (Phase 1)
   const storageType = wgslType; // atomic type is always u32 for descriptors
   const config = getOpConfig(op, dtype);
   const SPIN_LIMIT = 128;

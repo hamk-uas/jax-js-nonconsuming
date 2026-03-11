@@ -967,11 +967,12 @@ This achieves **single-dispatch, memory-bandwidth-saturating performance** on al
 
 1. **Reference:** Start from Thomas Smith's `GPUPrefixSums` WGSL implementation (MIT license). Adapt
    the Decoupled Fallback shader structure to our codegen pipeline.
-2. **Phase 1 — scalar ops: ✅ DONE.** Implemented for `add`, `mul`, `min`, `max` on f32/u32.
+2. **Phase 1 — scalar ops: ✅ DONE.** Implemented for `add`, `mul`, `min`, `max` on f32.
    Single-dispatch kernel with workgroup-local Hillis-Steele scan → atomic publish → bounded
    lookback with work-stealing fallback → apply prefix. Detected in `buildNativeAssocScanPlan` via
    `detectDecoupledFallbackOp`. Descriptor packing: 2-bit flag + 30-bit value in single
-   `atomic<u32>`. i32 deferred (pre-existing WebGPU i32 workgroup-memory scan bug).
+   `atomic<u32>`. u32 excluded (30-bit packing silently truncates values > 2^30-1). i32 deferred
+   (pre-existing WebGPU i32 workgroup-memory scan bug).
 3. **Phase 2 — general bodies:** Extend to arbitrary associative functions using a per-block
    descriptor buffer. The lookback subgroup fetches raw input tiles and re-evaluates the body
    function when fallback triggers.

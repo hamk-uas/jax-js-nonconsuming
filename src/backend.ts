@@ -310,7 +310,7 @@ export interface Backend {
   /**
    * Optional: Decoupled Fallback prefix scan — single-dispatch O(N) scan.
    * Uses inter-workgroup atomics with bounded spin + work-stealing fallback.
-   * WebGPU only. Phase 1: scalar binary ops (add/mul/min/max) on f32/u32/i32.
+   * WebGPU only. Phase 1: scalar binary ops (add/mul/min/max) on f32.
    */
   dispatchDecoupledFallbackScan?(
     input: Slot,

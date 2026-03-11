@@ -1709,6 +1709,16 @@ export class WebGPUBackend implements Backend {
     return true;
   }
 
+  /** Remove a specific buffer from the pool (error cleanup). */
+  #poolRemove(buffer: GPUBuffer): void {
+    const list = this.#bufferPool.get(buffer.size);
+    if (!list) return;
+    const idx = list.indexOf(buffer);
+    if (idx === -1) return;
+    list.splice(idx, 1);
+    this.#poolCurrentBytes -= buffer.size;
+  }
+
   /**
    * Prepare the pool for the next JitProgram execution:
    * 1. Evict entries whose sizes aren't needed (stale cross-program buffers).
@@ -2074,6 +2084,9 @@ export class WebGPUBackend implements Backend {
     // because earlier dispatches in the same GPUCommandEncoder still reference
     // them.  Defer destruction to post-submit.
     const deferredDestroys: GPUBuffer[] = [];
+    // Track buffers pushed to pool during this tape execution so we can
+    // remove them on error (prevents pool poisoning with destroyed refs).
+    const pooledDuringTape: GPUBuffer[] = [];
     let submitted = false;
 
     try {
@@ -2116,6 +2129,8 @@ export class WebGPUBackend implements Backend {
             if (buf && buf !== this.#reusableZsb) {
               if (!this.#poolPush(buf)) {
                 deferredDestroys.push(buf);
+              } else {
+                pooledDuringTape.push(buf);
               }
             }
             break;
@@ -2209,6 +2224,11 @@ export class WebGPUBackend implements Backend {
       submitted = true;
     } finally {
       if (!submitted) {
+        // Remove buffers pushed to pool during this (failed) tape execution
+        // to prevent pool poisoning (destroyed GPUBuffer refs in pool).
+        for (const buf of pooledDuringTape) {
+          this.#poolRemove(buf);
+        }
         for (const buf of allocs) {
           if (buf !== this.#reusableZsb) {
             this.#gpuAllocatedBytes -= buf.size;

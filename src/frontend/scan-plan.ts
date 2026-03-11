@@ -109,7 +109,7 @@ export type AssocScanPlan =
        * Decoupled Fallback single-dispatch prefix scan (WebGPU only).
        * O(N) work in one dispatch via inter-workgroup atomics with bounded
        * spin + work-stealing fallback (no FPG required).
-       * Phase 1: scalar binary ops (add/mul/min/max) on f32/u32/i32.
+       * Phase 1: scalar binary ops (add/mul/min/max) on f32.
        */
       path: "decoupled-fallback";
       op: AluOp;
@@ -338,10 +338,14 @@ const DF_SUPPORTED_OPS = new Set<AluOp>([
 ]);
 const DF_SUPPORTED_DTYPES = new Set<DType>([
   DType.Float32,
-  DType.Uint32,
+  // DType.Uint32 excluded: 30-bit descriptor packing silently truncates
+  // values > 2^30-1.  Cumulative sums/products can exceed that range with no
+  // compile-time guard, producing incorrect results.  Kogge-Stone handles u32
+  // correctly at O(N log N).
+  //
   // DType.Int32 deferred: i32 workgroup shared memory scan produces incorrect
   // results on some drivers (only 1 Hillis-Steele round executes). Needs
-  // investigation — the same code works for f32/u32.
+  // investigation — the same code works for f32.
 ]);
 
 /**
@@ -353,7 +357,7 @@ const DF_SUPPORTED_DTYPES = new Set<DType>([
  * - numConsts == 0 (no captured constants)
  * - Body has exactly 1 execute step producing a single-output scalar kernel
  * - Kernel expression is a supported binary op (Add/Mul/Min/Max) of the two inputs
- * - Dtype is f32/u32/i32
+ * - Dtype is f32
  */
 function detectDecoupledFallbackOp(
   bodyProgram: JitProgram,

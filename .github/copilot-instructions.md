@@ -591,11 +591,12 @@ const result = lax.associativeScan(fn, elems, { axis?, reverse? });
 
 Uses Kogge-Stone doubling: O(N log N) work, O(log N) depth. ceil(log₂ N) parallel rounds.
 
-**Decoupled Fallback (P10, Phase 1 done):** For scalar associative ops (add/mul/min/max) on f32/u32,
+**Decoupled Fallback (P10, Phase 1 done):** For scalar associative ops (add/mul/min/max) on f32,
 replaces Kogge-Stone with O(N) single-dispatch scan via atomic inter-workgroup communication with
 bounded spin + work-stealing fallback (FPG-safe). Descriptor: 2-bit flag + 30-bit value packed in
-single `atomic<u32>`. Detected automatically in `buildNativeAssocScanPlan`. Phase 2 (general bodies)
-deferred. See PLAN.md P7 Tier 0.
+single `atomic<u32>` (~4 ULPs f32 precision loss per lookback step). u32 excluded (30-bit packing
+silently truncates values > 2^30-1). Detected automatically in `buildNativeAssocScanPlan`. Phase 2
+(general bodies) deferred. See PLAN.md P7 Tier 0.
 
 **Backend behavior:**
 
@@ -772,7 +773,7 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 | P7  | Cooperative matrix (WMMA) | Blocked     | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable; ~2026 earliest    |
 | P8  | Subgroup scan builtins    | Medium      | `subgroupInclusiveAdd`/`subgroupShuffleUp` in assocScan. Available now (Chrome 134+)     |
 | P9  | Timestamp query profiling | Medium      | GPU-side per-kernel timing via `timestamp-query`. Available now (Chrome 121+)            |
-| P10 | Decoupled Fallback scan   | **Done** ✅ | Single-dispatch O(N) prefix scan (Phase 1: f32/u32 scalar ops). See PLAN.md P7 T0        |
+| P10 | Decoupled Fallback scan   | **Done** ✅ | Single-dispatch O(N) prefix scan (Phase 1: f32 scalar ops). See PLAN.md P7 T0            |
 | P11 | Analytical small linalg   | **Done** ✅ | Cholesky (n≤4), TriSolve (n≤8), QR (n≤8) as traced ops. Enables sqrt DLM fusion          |
 | P12 | WebGPU command tape       | **Done** ✅ | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs       |
 | P13 | WebGPU bind group cache   | **Done** ✅ | Bind group caching via GPUBuffer identity (pool LIFO). Arena reverted (spec violation)   |
@@ -824,7 +825,7 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Phase 3 preencoded routine support                          | Non-Sort routines in preencoded-multi-step                                                                    |
 | GPU config factory (`gpu-config.ts`)                        | DRY NVIDIA/Intel configs; thin wrappers over shared launch args                                               |
 | Self-similar plan recursion                                 | `runFusedPlan` uses same primitives for assocScan and block_map                                               |
-| Decoupled Fallback for scalar ops + Kogge-Stone for general | DF: O(N) single dispatch for f32/u32 add/mul/min/max. Kogge-Stone: general bodies, pytree, axis > 0           |
+| Decoupled Fallback for scalar ops + Kogge-Stone for general | DF: O(N) single dispatch for f32 add/mul/min/max. Kogge-Stone: general bodies, pytree, u32/i32, axis > 0      |
 | `Primitive.Reverse` over flip/view                          | Materialized reverse is polymorphic-safe; views need concrete strides                                         |
 | Shared blocked-data-movement primitives                     | `gatherAxisPoints`/`copyAxisRange`/`mapOverBlocks` replace bespoke types (-1761 LOC)                          |
 | Register tiling (`threadTile`) over scalar                  | 4×4–8×8 outputs/thread in `var<private>` → 4× fewer shmem reads                                               |
