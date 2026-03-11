@@ -1065,15 +1065,19 @@ benefit on larger state dimensions (m ≥ 5) where the compose body is heavier.
 7. Both reduction kernel (gidx loop + ridx accumulation) and elementwise kernel paths supported
 8. `@builtin(subgroup_invocation_id) sg_inv_id: u32` added to entry point when active
 
-#### 1c. `subgroupBroadcast` for scan carry / block-map constants
+#### 1c. `subgroupBroadcast` for scan carry / block-map constants — Assessed, deferred
 
 **What:** Broadcast a value from one invocation to all others in the subgroup without shmem.
 
 **Where:** Block-map Phase 4 (apply-prefix) where the scanned carry is broadcast to all threads in a
 workgroup. Also useful for broadcasting uniform values like block indices.
 
-**Impact:** Minor — the broadcast step is a small fraction of total compute. Clean architectural
-improvement.
+**Assessment:** No measurable benefit. All our broadcast patterns are workgroup-wide (workgroupSize
+64–256 > subgroupSize 16–64), and `subgroupBroadcast` only works within a single subgroup. The main
+candidates: (1) block-map point inputs — redundant global loads are coalesced by GPU L1 cache, (2)
+routine pivot/diagonal broadcasts (`x_j`, `L_jj`, `pivot_val`) — workgroup-wide via
+`var<workgroup>`, can't replace with subgroup-only broadcast, (3) decoupled fallback `shared_prefix`
+— same. Adding subgroupBroadcast would increase codegen complexity for zero gain.
 
 ### Tier 2: Cooperative Matrix / WMMA (not yet available in Chrome)
 
@@ -1148,19 +1152,21 @@ wall-clock `totalMs`. Zero overhead when not profiling (`_profilingTimestampWrit
 
 ### Priority ordering
 
-| ID  | Feature                           | Availability | Impact        | Effort      |
-| --- | --------------------------------- | ------------ | ------------- | ----------- |
-| T0  | Decoupled Fallback prefix scan    | Now          | **Very High** | **Done** ✅ |
-| T3  | Timestamp queries                 | Now          | Diagnostic    | **Done** ✅ |
-| 1b  | `subgroupShuffleUp` in assocScan  | Now          | Medium        | **Done** ✅ |
-| 1a  | `subgroupInclusive*` in assocScan | Now          | Medium        | **Done** ✅ |
-| 1c  | `subgroupBroadcast` cleanup       | Now          | Low           | Low         |
-| 2   | Cooperative matrix tiled matmul   | ~2026        | **Very High** | High        |
+| ID  | Feature                           | Availability | Impact        | Effort               |
+| --- | --------------------------------- | ------------ | ------------- | -------------------- |
+| T0  | Decoupled Fallback prefix scan    | Now          | **Very High** | **Done** ✅          |
+| T3  | Timestamp queries                 | Now          | Diagnostic    | **Done** ✅          |
+| 1b  | `subgroupShuffleUp` in assocScan  | Now          | Medium        | **Done** ✅          |
+| 1a  | `subgroupInclusive*` in assocScan | Now          | Medium        | **Done** ✅          |
+| 1c  | `subgroupBroadcast` cleanup       | Now          | Low           | Assessed: no benefit |
+| 2   | Cooperative matrix tiled matmul   | ~2026        | **Very High** | High                 |
 
-**Priority rationale:** Decoupled Fallback (T0), subgroup scan builtins (1a, 1b), and timestamp
-queries (T3) are complete. T3 provides `profileGpu()` for per-pass GPU timing validation.
+**Priority rationale:** T0, 1a, 1b, T3 are complete. 1c assessed — all broadcast patterns are
+workgroup-wide; `subgroupBroadcast` (subgroup-only) provides no measurable improvement over L1
+cached reads. Cooperative matrix (2) is blocked on WGSL spec.
 
-**Next action:** 1c (`subgroupBroadcast`) is the remaining low priority/low impact cleanup item.
+**Next action:** All P7 subgroup items are complete or assessed. Cooperative matrix (2) is blocked
+on Chrome WGSL spec stability (~2026).
 
 ---
 
