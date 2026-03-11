@@ -16,6 +16,7 @@ import {
   SlotError,
   UnsupportedOpError,
 } from "../backend";
+import type { JitId, JitStep } from "../frontend/jit";
 import { Routine } from "../routine";
 import { isSymbolicSize } from "../shape";
 import { tuneNullopt, tuneWebgpu, type WebGPUTuneResult } from "../tuner";
@@ -42,6 +43,11 @@ import {
   headerWgsl,
   ShaderInfo,
 } from "./webgpu/codegen";
+import {
+  type TapeDispatch,
+  type TapeMalloc,
+  type WebGPUCommandTape,
+} from "./webgpu/command-tape";
 import { SyncReader } from "./webgpu/reader";
 import { createRoutineShader } from "./webgpu/routines";
 import {
@@ -1876,6 +1882,276 @@ export class WebGPUBackend implements Backend {
       }
       this.#batchDeferredFreeBuffers = [];
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Command tape: pre-compiled dispatch sequence (O8)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compile a JitProgram's steps into a WebGPU command tape.
+   *
+   * Pre-resolves pipelines, bind group layouts, grid dimensions, and uniform
+   * bind groups. The resulting tape can be executed repeatedly with different
+   * input slots via `executeCommandTape()`.
+   *
+   * Caller must verify eligibility via `canCompileToCommandTape()` first.
+   */
+  compileCommandTape(
+    steps: JitStep[],
+    inputIds: JitId[],
+    outputIds: JitId[],
+  ): WebGPUCommandTape {
+    // 1. Build JitId → table index mapping
+    const idToIdx = new Map<JitId, number>();
+    let nextIdx = 0;
+
+    // Assign indices to inputs (deduplicate — same JitId may appear twice)
+    const inputTableIdxs: number[] = [];
+    for (const id of inputIds) {
+      if (!idToIdx.has(id)) idToIdx.set(id, nextIdx++);
+      inputTableIdxs.push(idToIdx.get(id)!);
+    }
+
+    // 2. Walk steps and build tape
+    const dispatches: TapeDispatch[] = [];
+    const mallocs: TapeMalloc[] = [];
+    const recycles: [number, number][] = [];
+    const frees: number[] = [];
+    const uniformBuffers: GPUBuffer[] = [];
+    // Track known byte sizes for table entries (from mallocs/recycles)
+    const knownSizes = new Map<number, number>();
+
+    const inputIdxSet = new Set(inputTableIdxs);
+
+    for (const step of steps) {
+      switch (step.type) {
+        case "execute": {
+          const inputIdxs = step.inputs.map((id) => idToIdx.get(id)!);
+          const outputIdxs = step.outputs.map((id) => idToIdx.get(id)!);
+
+          // Resolve pipeline
+          const exe =
+            step.source instanceof Kernel
+              ? this.prepareKernelSync(step.source)
+              : this.prepareRoutineSync(step.source);
+
+          // Create tape dispatches for each shader dispatch in the executable
+          for (const { pipeline, ...shader } of exe.data) {
+            const filteredPasses = shader.passes.filter(
+              (p) => prod(p.grid) > 0,
+            );
+            if (filteredPasses.length === 0) continue;
+
+            const bindGroupLayout = pipeline.getBindGroupLayout(0);
+
+            // Pre-build uniform bind group for static uniforms
+            let uniformBindGroup: GPUBindGroup | null = null;
+            let uniformAlignment = 0;
+
+            if (shader.hasUniform) {
+              const uniforms = filteredPasses.map((p) => p.uniform!);
+              const [uniformBuffer, alignment] = combineUniforms(
+                this.device,
+                uniforms,
+              );
+              uniformBuffers.push(uniformBuffer);
+              uniformAlignment = alignment;
+              uniformBindGroup = this.device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(1),
+                entries: [
+                  {
+                    binding: 0,
+                    resource: { buffer: uniformBuffer, size: alignment },
+                  },
+                ],
+              });
+            }
+
+            dispatches.push({
+              pipeline,
+              bindGroupLayout,
+              inputIdxs,
+              outputIdxs,
+              passes: filteredPasses.map((p) => ({ grid: p.grid })),
+              uniformBindGroup,
+              uniformAlignment,
+            });
+          }
+          break;
+        }
+        case "malloc": {
+          const idx = nextIdx++;
+          idToIdx.set(step.output, idx);
+          const size = step.size as number;
+          const paddedSize = Math.ceil(size / 4) * 4;
+          knownSizes.set(idx, size);
+          mallocs.push({
+            tableIdx: idx,
+            paddedSize,
+            originalSize: size,
+            initialData: (step.initialData as Uint8Array<ArrayBuffer>) ?? null,
+          });
+          break;
+        }
+        case "free": {
+          const idx = idToIdx.get(step.input)!;
+          frees.push(idx);
+          break;
+        }
+        case "recycle": {
+          const fromIdx = idToIdx.get(step.input)!;
+          const toIdx = nextIdx++;
+          idToIdx.set(step.output, toIdx);
+          const fromSize = knownSizes.get(fromIdx);
+          if (fromSize !== undefined) knownSizes.set(toIdx, fromSize);
+          recycles.push([fromIdx, toIdx]);
+          break;
+        }
+      }
+    }
+
+    // 3. Build output mapping
+    const outputTableIdxs = outputIds.map((id) => idToIdx.get(id)!);
+
+    // 4. Safety: filter out frees that target inputs or outputs
+    const outputIdxSet = new Set(outputTableIdxs);
+    const safeFrees = frees.filter(
+      (idx) => !inputIdxSet.has(idx) && !outputIdxSet.has(idx),
+    );
+
+    return {
+      dispatches,
+      mallocs,
+      recycles,
+      frees: safeFrees,
+      tableSize: nextIdx,
+      inputTableIdxs,
+      outputTableIdxs,
+      uniformBuffers,
+    };
+  }
+
+  /**
+   * Execute a pre-compiled command tape with the given input slots.
+   *
+   * Builds a flat GPUBuffer[] table, bulk-allocates intermediates, encodes
+   * all dispatches into a single command encoder, and returns output Slots.
+   */
+  executeCommandTape(tape: WebGPUCommandTape, inputSlots: Slot[]): Slot[] {
+    const table: GPUBuffer[] = new globalThis.Array(tape.tableSize);
+    const sizes: number[] = new globalThis.Array(tape.tableSize);
+
+    // 1. Map external inputs
+    for (let i = 0; i < inputSlots.length; i++) {
+      const { buffer, size } = this.#getBuffer(inputSlots[i]);
+      table[tape.inputTableIdxs[i]] = buffer;
+      sizes[tape.inputTableIdxs[i]] = size;
+    }
+
+    // 2. Bulk malloc all intermediates
+    for (const m of tape.mallocs) {
+      let buf: GPUBuffer;
+      if (m.paddedSize === 0) {
+        buf = this.#reusableZsb;
+      } else if (m.initialData) {
+        // Try pool first; otherwise create mapped buffer for small data
+        const pooled = this.#poolPop(m.paddedSize);
+        if (pooled) {
+          buf = pooled;
+          if (m.initialData.byteLength % 4 === 0) {
+            this.device.queue.writeBuffer(buf, 0, m.initialData);
+          } else {
+            const aligned =
+              m.initialData.byteLength - (m.initialData.byteLength % 4);
+            this.device.queue.writeBuffer(buf, 0, m.initialData, 0, aligned);
+            const remainder = new Uint8Array(4);
+            remainder.set(m.initialData.subarray(aligned));
+            this.device.queue.writeBuffer(buf, aligned, remainder);
+          }
+        } else {
+          buf = this.#createBuffer(m.paddedSize, { mapped: true });
+          new Uint8Array(buf.getMappedRange(), 0, m.initialData.byteLength).set(
+            m.initialData,
+          );
+          buf.unmap();
+        }
+      } else {
+        buf = this.#poolPop(m.paddedSize) ?? this.#createBuffer(m.paddedSize);
+      }
+      table[m.tableIdx] = buf;
+      sizes[m.tableIdx] = m.originalSize;
+    }
+
+    // 3. Apply recycling (pointer copy)
+    for (const [from, to] of tape.recycles) {
+      table[to] = table[from];
+      sizes[to] = sizes[from];
+    }
+
+    // 4. Encode all dispatches in a single command encoder
+    const encoder = this.device.createCommandEncoder();
+    for (const d of tape.dispatches) {
+      // Build storage bind group from flat table
+      const numIn = d.inputIdxs.length;
+      const numOut = d.outputIdxs.length;
+      const entries: GPUBindGroupEntry[] = new globalThis.Array(numIn + numOut);
+      for (let i = 0; i < numIn; i++) {
+        entries[i] = {
+          binding: i,
+          resource: { buffer: table[d.inputIdxs[i]] },
+        };
+      }
+      for (let i = 0; i < numOut; i++) {
+        entries[numIn + i] = {
+          binding: numIn + i,
+          resource: { buffer: table[d.outputIdxs[i]] },
+        };
+      }
+      const bindGroup = this.device.createBindGroup({
+        layout: d.bindGroupLayout,
+        entries,
+      });
+
+      for (let i = 0; i < d.passes.length; i++) {
+        const pass = d.passes[i];
+        const pe = encoder.beginComputePass();
+        pe.setPipeline(d.pipeline);
+        pe.setBindGroup(0, bindGroup);
+        if (d.uniformBindGroup) {
+          pe.setBindGroup(1, d.uniformBindGroup, [i * d.uniformAlignment]);
+        }
+        pe.dispatchWorkgroups(pass.grid[0], pass.grid[1]);
+        _dispatchCount++;
+        pe.end();
+      }
+    }
+    this.device.queue.submit([encoder.finish()]);
+
+    // 5. Free intermediates (return to pool or destroy)
+    for (const idx of tape.frees) {
+      const buf = table[idx];
+      if (buf !== this.#reusableZsb) {
+        if (!this.#poolPush(buf)) {
+          this.#gpuAllocatedBytes -= buf.size;
+          buf.destroy();
+        }
+      }
+    }
+
+    // 6. Create output slots
+    const outputs: Slot[] = new globalThis.Array(tape.outputTableIdxs.length);
+    for (let i = 0; i < tape.outputTableIdxs.length; i++) {
+      const idx = tape.outputTableIdxs[i];
+      const slot = this.nextSlot++;
+      this.buffers.set(slot, {
+        buffer: table[idx],
+        size: sizes[idx],
+        ref: 1,
+      });
+      outputs[i] = slot;
+    }
+    return outputs;
   }
 
   // ---------------------------------------------------------------------------
