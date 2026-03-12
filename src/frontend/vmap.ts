@@ -344,15 +344,19 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     return [[reduce(x, op, newAxis)], [outBdim]];
   },
   [Primitive.Dot](axisSize, [x, y], [xBdim, yBdim]) {
-    // Move both the batch axes to the second-to-last position.
+    // Move batch axes to the front so block_map's per-thread validity check
+    // works correctly: with batch outermost, each thread handles exactly one
+    // batch element's worth of data.  The old strategy (batch at ndim-2)
+    // scattered batch-0 elements across multiple threads, causing boundary
+    // blocks to zero out valid data assigned to "invalid" threads.
     const origX = x,
       origY = y;
-    x = moveBatchAxis(axisSize, xBdim, x.ndim - (xBdim === null ? 1 : 2), x);
-    y = moveBatchAxis(axisSize, yBdim, y.ndim - (yBdim === null ? 1 : 2), y);
+    x = moveBatchAxis(axisSize, xBdim, 0, x);
+    y = moveBatchAxis(axisSize, yBdim, 0, y);
     const z = dot(x, y);
     if (x !== origX) x[Symbol.dispose]();
     if (y !== origY) y[Symbol.dispose]();
-    return [[z], [z.ndim - 1]]; // The batch axis is now at the end.
+    return [[z], [0]];
   },
   [Primitive.Conv](axisSize, [x, y], [xBdim, yBdim], params) {
     // Move batch axes to the front, then increment params.vmapDims.

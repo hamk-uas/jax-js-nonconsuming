@@ -13,6 +13,7 @@
  */
 
 import {
+  clearCaches,
   defaultDevice,
   DType,
   grad,
@@ -1735,6 +1736,102 @@ describe("lax.associativeScan — WebGPU fused shader regression", () => {
     }
     expect(maxDiff).toBeLessThan(1.0);
   });
+
+  // ------------------------------------------------------------------
+  // N=65 forces a stub block with only 1 valid thread out of 64.
+  // Before the Dot vmap batch-position fix, the Mul+Reduce kernel placed
+  // the batch axis at an inner position, scattering valid-batch elements
+  // across multiple threads.  Invalid threads produced zeros for valid
+  // elements, corrupting the last block.
+  for (const rev of [false, true]) {
+    it(`3-field DLM m=5 stub=1 ${rev ? "reverse" : "forward"} (Dot vmap batch regression)`, async ({
+      skip,
+    }) => {
+      if (!available) skip();
+      const N = 65;
+      const m = 5;
+
+      let seed = 42;
+      const rng = () => {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed / 0x7fffffff;
+      };
+      const A_data: number[][][] = [];
+      const b_data: number[][][] = [];
+      const S_data: number[][][] = [];
+      for (let i = 0; i < N; i++) {
+        const aRow: number[][] = [],
+          sRow: number[][] = [];
+        for (let j = 0; j < m; j++) {
+          const ar: number[] = [],
+            sr: number[] = [];
+          for (let k = 0; k < m; k++) {
+            ar.push(j === k ? 0.8 + 0.1 * rng() : 0.02 * (rng() - 0.5));
+            sr.push(j === k ? 0.5 + 0.5 * rng() : 0.01 * rng());
+          }
+          aRow.push(ar);
+          sRow.push(sr);
+        }
+        A_data.push(aRow);
+        b_data.push(Array.from({ length: m }, () => [rng() * 10]));
+        S_data.push(sRow);
+      }
+
+      const compose = (
+        p: { A: np.Array; b: np.Array; S: np.Array },
+        q: { A: np.Array; b: np.Array; S: np.Array },
+      ) => {
+        const newA = np.einsum("ij,jk->ik", q.A, p.A) as np.Array;
+        using Ab = np.einsum("ij,jk->ik", q.A, p.b) as np.Array;
+        const newB = Ab.add(q.b) as np.Array;
+        using AS = np.einsum("ij,jk->ik", q.A, p.S) as np.Array;
+        using qAT = np.transpose(q.A, [-2, -1]) as np.Array;
+        using ASAT = np.einsum("ij,jk->ik", AS, qAT) as np.Array;
+        const newS = ASAT.add(q.S) as np.Array;
+        return { A: newA, b: newB, S: newS };
+      };
+
+      const prevDev = defaultDevice("wasm");
+      using aWasm = np.array(A_data, { dtype: DType.Float32 });
+      using bWasm = np.array(b_data, { dtype: DType.Float32 });
+      using sWasm = np.array(S_data, { dtype: DType.Float32 });
+      using wasmFn = jit((A: np.Array, b: np.Array, S: np.Array) =>
+        lax.associativeScan(compose, { A, b, S }, { reverse: rev }),
+      );
+      const wasmResult = wasmFn(aWasm, bWasm, sWasm) as {
+        A: np.Array;
+        b: np.Array;
+        S: np.Array;
+      };
+      const wasmB = await wasmResult.b.data();
+      tree.dispose(wasmResult);
+
+      defaultDevice("webgpu");
+      clearCaches();
+      using aGpu = np.array(A_data, { dtype: DType.Float32 });
+      using bGpu = np.array(b_data, { dtype: DType.Float32 });
+      using sGpu = np.array(S_data, { dtype: DType.Float32 });
+      using gpuFn = jit((A: np.Array, b: np.Array, S: np.Array) =>
+        lax.associativeScan(compose, { A, b, S }, { reverse: rev }),
+      );
+      const gpuResult = gpuFn(aGpu, bGpu, sGpu) as {
+        A: np.Array;
+        b: np.Array;
+        S: np.Array;
+      };
+      const gpuB = await gpuResult.b.data();
+      tree.dispose(gpuResult);
+
+      defaultDevice(prevDev);
+
+      let maxDiff = 0;
+      for (let i = 0; i < N * m; i++) {
+        const diff = Math.abs(wasmB[i] - gpuB[i]);
+        if (diff > maxDiff) maxDiff = diff;
+      }
+      expect(maxDiff).toBeLessThan(1.0);
+    });
+  }
 });
 
 // ============================================================================

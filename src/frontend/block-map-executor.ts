@@ -495,7 +495,9 @@ function executeBlockMapFallback(
     inputSlots,
     outputSlots,
     hasBlockIndex,
+    gridOffset: _gridOffset,
   } = params;
+  const gridOffset = _gridOffset ?? 0;
 
   const gridRank = blockShape.length;
   const numBlocks = gridShape.reduce((a, b) => a * b, 1);
@@ -549,7 +551,7 @@ function executeBlockMapFallback(
         for (let g = 0; g < gridRank; g++) {
           if (axes[g] !== null) {
             const ax = axes[g]!;
-            sliceStarts[ax] = blockIdx[g] * blockShape[g];
+            sliceStarts[ax] = (blockIdx[g] + gridOffset) * blockShape[g];
             // Clamp to available input data
             const available = inputShapes[i][ax] - sliceStarts[ax];
             if (available < blockShape[g]) {
@@ -670,7 +672,7 @@ function executeBlockMapFallback(
         for (let g = 0; g < gridRank; g++) {
           if (axes[g] !== null) {
             const ax = axes[g]!;
-            dstStarts[ax] = blockIdx[g] * blockShape[g];
+            dstStarts[ax] = (blockIdx[g] + gridOffset) * blockShape[g];
             // Clamp copy size to output extent
             const remaining = outputShapes[o][ax] - dstStarts[ax];
             if (remaining < blockShape[g]) {

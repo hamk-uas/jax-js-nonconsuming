@@ -3646,21 +3646,25 @@ export function blockMapFusedShaderSource(
       // Emit the appropriate branch structure. All branches keep ping/pong
       // parity deterministic by pairing shmem rounds with a fixed starting
       // round number.
+      // subgroupShuffleUp and subgroupInclusiveAdd/Mul operate WITHIN a
+      // subgroup only. When blockSize > sg_size, threads at subgroup
+      // boundaries (e.g., tidx=32 with sg_size=32) never receive data from
+      // the previous subgroup. The shmem rounds that follow build on these
+      // incomplete partial prefixes, producing wrong results for all
+      // subsequent threads. Safe only when sg_size >= blockSize (all threads
+      // in one subgroup). See dlm-js issue: reverse 3-field DLM compose.
+      const sgGuard = `${blockSize}u`;
       if (sgInclusiveRounds > 0) {
         if (DEBUG >= 1)
           console.info(
             `block_map fused: workgroup_assoc_scan using subgroupInclusive${was.scalarOp === AluOp.Add ? "Add" : "Mul"} (${sgInclusiveRounds} rounds replaced, ${was.numRounds - sgInclusiveRounds} shmem rounds remaining)`,
           );
         // 3-way branch: inclusive scan → shuffle fallback → pure shmem
-        emit(`if (sg_size >= 32u) {`, pushIndent);
+        emit(`if (sg_size >= ${sgGuard}) {`, pushIndent);
         emitInclusiveScanSection();
         emitShmemRounds(sgInclusiveRounds);
         if (sgShuffleRounds > 0) {
-          emit(
-            popIndent,
-            `} else if (sg_size >= ${1 << sgShuffleRounds}u) {`,
-            pushIndent,
-          );
+          emit(popIndent, `} else if (sg_size >= ${sgGuard}) {`, pushIndent);
           emitSubgroupShuffleSection();
           emitShmemRounds(sgShuffleRounds);
         }
@@ -3669,7 +3673,7 @@ export function blockMapFusedShaderSource(
         emit(popIndent, "}");
       } else if (sgShuffleRounds > 0) {
         // 2-way branch: shuffle → pure shmem
-        emit(`if (sg_size >= ${1 << sgShuffleRounds}u) {`, pushIndent);
+        emit(`if (sg_size >= ${sgGuard}) {`, pushIndent);
         emitSubgroupShuffleSection();
         emitShmemRounds(sgShuffleRounds);
         emit(popIndent, "} else {", pushIndent);
