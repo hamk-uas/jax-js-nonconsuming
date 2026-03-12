@@ -595,9 +595,9 @@ Uses Kogge-Stone doubling: O(N log N) work, O(log N) depth. ceil(log₂ N) paral
 **Decoupled Fallback (P10, Phase 1 done):** For scalar associative ops (add/mul/min/max) on f32,
 replaces Kogge-Stone with O(N) single-dispatch scan via atomic inter-workgroup communication with
 bounded spin + work-stealing fallback (FPG-safe). Descriptor: 2-bit flag + 30-bit value packed in
-single `atomic<u32>` (~4 ULPs f32 precision loss per lookback step). u32 excluded (30-bit packing
-silently truncates values > 2^30-1). Detected automatically in `buildNativeAssocScanPlan`. Phase 2
-(general bodies) deferred. See PLAN.md P7 Tier 0.
+single `atomic<u32>` (~4 ULPs f32 precision loss per lookback step). u32 and i32 excluded (30-bit
+packing truncates values exceeding ±2^29). Detected automatically in `buildNativeAssocScanPlan`.
+Phase 2 (general bodies) deferred. See PLAN.md P7 Tier 0.
 
 **Backend behavior:**
 

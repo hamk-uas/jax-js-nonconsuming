@@ -343,9 +343,9 @@ const DF_SUPPORTED_DTYPES = new Set<DType>([
   // compile-time guard, producing incorrect results.  Kogge-Stone handles u32
   // correctly at O(N log N).
   //
-  // DType.Int32 deferred: i32 workgroup shared memory scan produces incorrect
-  // results on some drivers (only 1 Hillis-Steele round executes). Needs
-  // investigation — the same code works for f32.
+  // DType.Int32 excluded: same 30-bit descriptor truncation issue — signed
+  // range ±2^29 (~537M) is insufficient for large cumulative sums.
+  // Kogge-Stone block-map path handles i32 correctly (fixed in v0.8.4).
 ]);
 
 /**

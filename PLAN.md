@@ -971,8 +971,9 @@ This achieves **single-dispatch, memory-bandwidth-saturating performance** on al
    Single-dispatch kernel with workgroup-local Hillis-Steele scan → atomic publish → bounded
    lookback with work-stealing fallback → apply prefix. Detected in `buildNativeAssocScanPlan` via
    `detectDecoupledFallbackOp`. Descriptor packing: 2-bit flag + 30-bit value in single
-   `atomic<u32>`. u32 excluded (30-bit packing silently truncates values > 2^30-1). i32 deferred
-   (pre-existing WebGPU i32 workgroup-memory scan bug).
+   `atomic<u32>`. u32 excluded (30-bit packing silently truncates values > 2^30-1). i32 excluded
+   (same 30-bit truncation issue as u32 — signed range ±2^29 insufficient for large cumulative
+   sums). Both u32 and i32 fall back to Kogge-Stone block-map path (fixed in v0.8.4).
 3. **Phase 2 — general bodies:** Extend to arbitrary associative functions using a per-block
    descriptor buffer. The lookback subgroup fetches raw input tiles and re-evaluates the body
    function when fallback triggers.
@@ -984,7 +985,6 @@ This achieves **single-dispatch, memory-bandwidth-saturating performance** on al
 
 - Subgroup-parallel lookback (first subgroup instead of thread 0 only)
 - Raking pattern: multiple elements per thread for better bandwidth utilization
-- i32 support (blocked by pre-existing WebGPU i32 shmem scan bug)
 
 #### References
 
@@ -1703,8 +1703,8 @@ high per-dispatch JS overhead**. The following optimizations form a coherent acc
 | **O9a**  | Arena allocator         | createBindGroup + cache stability | 6ms → ~1ms (reliable)   | **Reverted** ⚠️ |
 | **O9b**  | Bind group caching      | createBindGroup (6ms)             | 6ms → ~3ms (pool LIFO)  | **Done** ✅     |
 | **O6**   | Multi-reduction kernels | Dispatch count (~764)             | ~5-15% fewer dispatches | Deprioritized   |
-| **A-L**  | Analytical linalg (n≤4) | Routine fusion barriers           | Enables sqrt DLM fusion | Medium priority |
-| **T0**   | Decoupled Fallback scan | Scan dispatch count (log N → 1)   | ~0.05ms (3→1 dispatch)  | High priority   |
+| **A-L**  | Analytical linalg (n≤4) | Routine fusion barriers           | Enables sqrt DLM fusion | **Done** ✅     |
+| **T0**   | Decoupled Fallback scan | Scan dispatch count (log N → 1)   | ~0.05ms (3→1 dispatch)  | **Done** ✅     |
 | **P7-2** | WMMA cooperative matrix | Per-dispatch throughput           | 2-4× matmul GFLOP/s     | Blocked (~2026) |
 
 ### Projected wall-clock improvement
