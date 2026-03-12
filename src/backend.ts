@@ -343,6 +343,8 @@ export interface GpuTimingResult {
   passes: { durationMs: number }[];
   /** Wall-clock GPU time from first pass start to last pass end. */
   totalMs: number;
+  /** True if more compute passes were dispatched than the profiling buffer could record. */
+  truncated: boolean;
 }
 
 export class Executable<T = any> {

@@ -264,28 +264,37 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // --- GPU dispatch counter (module-level for pipelineSubmit access) ---
 let _dispatchCount = 0;
 
-// --- GPU timestamp profiling state (module-level for pipelineSubmit access) ---
-let _profilingQuerySet: GPUQuerySet | null = null;
-let _profilingPassIdx = 0;
+// --- GPU timestamp profiling state (passed explicitly from backend instance) ---
+interface _ProfilingState {
+  querySet: GPUQuerySet;
+  passIdx: number;
+  overflow: boolean;
+}
 const _MAX_PROFILING_PASSES = 4096;
 
 /** Return timestampWrites descriptor for the current pass, or undefined. */
-function _profilingTimestampWrites():
-  | GPUComputePassTimestampWrites
-  | undefined {
-  if (!_profilingQuerySet || _profilingPassIdx >= _MAX_PROFILING_PASSES)
+function _profilingTimestampWrites(
+  profiling: _ProfilingState | null,
+): GPUComputePassTimestampWrites | undefined {
+  if (!profiling) return undefined;
+  if (profiling.passIdx >= _MAX_PROFILING_PASSES) {
+    profiling.overflow = true;
     return undefined;
-  const idx = _profilingPassIdx++;
+  }
+  const idx = profiling.passIdx++;
   return {
-    querySet: _profilingQuerySet,
+    querySet: profiling.querySet,
     beginningOfPassWriteIndex: idx * 2,
     endOfPassWriteIndex: idx * 2 + 1,
   };
 }
 
 /** Begin a compute pass with optional profiling timestamps. */
-function _beginComputePass(encoder: GPUCommandEncoder): GPUComputePassEncoder {
-  const tsw = _profilingTimestampWrites();
+function _beginComputePass(
+  encoder: GPUCommandEncoder,
+  profiling: _ProfilingState | null = null,
+): GPUComputePassEncoder {
+  const tsw = _profilingTimestampWrites(profiling);
   return encoder.beginComputePass(tsw ? { timestampWrites: tsw } : undefined);
 }
 
@@ -354,6 +363,9 @@ export class WebGPUBackend implements Backend {
   #batchDepth = 0;
   #batchUniformsToDestroy: GPUBuffer[] = [];
   #batchDeferredFreeBuffers: GPUBuffer[] = [];
+
+  // --- GPU timestamp profiling state (T3/P9) ---
+  #profiling: _ProfilingState | null = null;
 
   constructor(readonly device: GPUDevice) {
     if (DEBUG >= 3 && device.adapterInfo) {
@@ -440,29 +452,30 @@ export class WebGPUBackend implements Backend {
     if (!this.device.features.has("timestamp-query")) {
       throw new Error("timestamp-query feature not available on this device");
     }
-    if (_profilingQuerySet) {
+    if (this.#profiling) {
       throw new Error("Profiling already active — call stopProfiling() first");
     }
-    _profilingQuerySet = this.device.createQuerySet({
-      type: "timestamp",
-      count: _MAX_PROFILING_PASSES * 2,
-    });
-    _profilingPassIdx = 0;
+    this.#profiling = {
+      querySet: this.device.createQuerySet({
+        type: "timestamp",
+        count: _MAX_PROFILING_PASSES * 2,
+      }),
+      passIdx: 0,
+      overflow: false,
+    };
   }
 
   /** Stop profiling and return per-pass GPU timing results. */
   async stopProfiling(): Promise<GpuTimingResult> {
-    const querySet = _profilingQuerySet;
-    const passCount = _profilingPassIdx;
-    _profilingQuerySet = null;
-    _profilingPassIdx = 0;
+    const state = this.#profiling;
+    this.#profiling = null;
 
-    if (!querySet || passCount === 0) {
-      querySet?.destroy();
-      return { passes: [], totalMs: 0 };
+    if (!state || state.passIdx === 0) {
+      state?.querySet.destroy();
+      return { passes: [], totalMs: 0, truncated: state?.overflow ?? false };
     }
 
-    const entryCount = passCount * 2;
+    const entryCount = state.passIdx * 2;
     const resolveSize = entryCount * 8; // BigUint64 = 8 bytes each
 
     const resolveBuffer = this.device.createBuffer({
@@ -475,7 +488,7 @@ export class WebGPUBackend implements Backend {
     });
 
     const encoder = this.device.createCommandEncoder();
-    encoder.resolveQuerySet(querySet, 0, entryCount, resolveBuffer, 0);
+    encoder.resolveQuerySet(state.querySet, 0, entryCount, resolveBuffer, 0);
     encoder.copyBufferToBuffer(resolveBuffer, 0, readBuffer, 0, resolveSize);
     this.device.queue.submit([encoder.finish()]);
 
@@ -483,7 +496,7 @@ export class WebGPUBackend implements Backend {
     const timestamps = new BigUint64Array(readBuffer.getMappedRange());
 
     const passes: { durationMs: number }[] = [];
-    for (let i = 0; i < passCount; i++) {
+    for (let i = 0; i < state.passIdx; i++) {
       const startNs = timestamps[i * 2];
       const endNs = timestamps[i * 2 + 1];
       passes.push({ durationMs: Number(endNs - startNs) / 1_000_000 });
@@ -494,9 +507,9 @@ export class WebGPUBackend implements Backend {
     readBuffer.unmap();
     readBuffer.destroy();
     resolveBuffer.destroy();
-    querySet.destroy();
+    state.querySet.destroy();
 
-    return { passes, totalMs };
+    return { passes, totalMs, truncated: state.overflow };
   }
 
   /** Buffer pool diagnostic: pooled buffer count, pooled bytes, and byte budget. */
@@ -737,6 +750,7 @@ export class WebGPUBackend implements Backend {
       dynamicParams,
       this.#batchEncoder ?? undefined,
       this.#batchEncoder ? this.#batchUniformsToDestroy : undefined,
+      this.#profiling,
     );
   }
 
@@ -818,7 +832,7 @@ export class WebGPUBackend implements Backend {
 
       for (const { grid } of shader.passes) {
         if (prod(grid) === 0) continue;
-        const passEncoder = _beginComputePass(commandEncoder);
+        const passEncoder = _beginComputePass(commandEncoder, this.#profiling);
         passEncoder.setPipeline(pipeline);
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.dispatchWorkgroups(grid[0], grid[1]);
@@ -889,7 +903,7 @@ export class WebGPUBackend implements Backend {
       entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
     });
 
-    const passEncoder = _beginComputePass(commandEncoder);
+    const passEncoder = _beginComputePass(commandEncoder, this.#profiling);
     passEncoder.setPipeline(pipeline);
     passEncoder.setBindGroup(0, storageBindGroup);
     passEncoder.setBindGroup(1, uniformBindGroup);
@@ -1194,7 +1208,10 @@ export class WebGPUBackend implements Backend {
         const storageBindGroup = iter % 2 === 0 ? pingBindGroup : pongBindGroup;
 
         for (const { grid } of filteredPasses) {
-          const passEncoder = _beginComputePass(commandEncoder);
+          const passEncoder = _beginComputePass(
+            commandEncoder,
+            this.#profiling,
+          );
           passEncoder.setPipeline(pipeline);
           passEncoder.setBindGroup(0, storageBindGroup);
           passEncoder.setBindGroup(1, uniformBindGroup, [
@@ -1655,7 +1672,7 @@ export class WebGPUBackend implements Backend {
         for (const dispatch of entry.dispatches) {
           for (const { grid } of dispatch.passes) {
             if (grid[0] === 0 || grid[1] === 0) continue;
-            const pass = _beginComputePass(commandEncoder);
+            const pass = _beginComputePass(commandEncoder, this.#profiling);
             pass.setPipeline(dispatch.pipeline);
             pass.setBindGroup(0, storageBG);
             if (ubg) {
@@ -1932,7 +1949,7 @@ export class WebGPUBackend implements Backend {
         })),
       });
       const grid = shader.passes[0].grid;
-      const passEncoder = _beginComputePass(commandEncoder);
+      const passEncoder = _beginComputePass(commandEncoder, this.#profiling);
       passEncoder.setPipeline(shader.pipeline);
       passEncoder.setBindGroup(0, bindGroup0);
       passEncoder.setBindGroup(1, bindGroup1);
@@ -1953,6 +1970,7 @@ export class WebGPUBackend implements Backend {
         undefined,
         this.#batchEncoder ?? undefined,
         this.#batchEncoder ? this.#batchUniformsToDestroy : undefined,
+        this.#profiling,
       );
     }
   }
@@ -2298,7 +2316,7 @@ export class WebGPUBackend implements Backend {
             }
 
             for (let i = 0; i < d.passes.length; i++) {
-              const pe = _beginComputePass(encoder);
+              const pe = _beginComputePass(encoder, this.#profiling);
               pe.setPipeline(d.pipeline);
               pe.setBindGroup(0, bindGroup);
               if (d.uniformBindGroup) {
@@ -2510,7 +2528,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         { binding: 2, resource: { buffer: updBuf } },
       ],
     });
-    const pass = _beginComputePass(commandEncoder);
+    const pass = _beginComputePass(commandEncoder, this.#profiling);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(gridX, gridY);
@@ -2608,7 +2626,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         { binding: 3, resource: { buffer: uniformBuf, size: 256 } },
       ],
     });
-    const pass = _beginComputePass(commandEncoder);
+    const pass = _beginComputePass(commandEncoder, this.#profiling);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(M);
@@ -3874,6 +3892,7 @@ function pipelineSubmit(
   dynamicParams?: number[],
   batchEncoder?: GPUCommandEncoder,
   batchUniformCollector?: GPUBuffer[],
+  profiling?: _ProfilingState | null,
 ) {
   const commandEncoder = batchEncoder ?? device.createCommandEncoder();
   const uniformBuffersToDestroy: GPUBuffer[] = [];
@@ -3975,7 +3994,7 @@ function pipelineSubmit(
 
     for (let i = 0; i < filteredPasses.length; i++) {
       const grid = symbolicGrid ?? filteredPasses[i].grid;
-      const passEncoder = _beginComputePass(commandEncoder);
+      const passEncoder = _beginComputePass(commandEncoder, profiling);
       passEncoder.setPipeline(pipeline);
       passEncoder.setBindGroup(0, bindGroup);
       if (uniformBindGroup)
