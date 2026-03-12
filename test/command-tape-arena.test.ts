@@ -85,14 +85,131 @@ describe("O9c constants slab", () => {
 });
 
 describe("conflict-graph coloring", async () => {
-  // We test the coloring indirectly through the command tape by verifying
-  // that programs with various dispatch patterns produce correct results.
-  // The buildConflictGraphAndColor function is tested directly below.
+  const { buildConflictGraphAndColor } = await import(
+    "../src/backend/webgpu/command-tape"
+  );
 
-  it("imports and can be called", async () => {
-    const { buildConflictGraphAndColor, canCompileToCommandTape } =
-      await import("../src/backend/webgpu/command-tape");
-    expect(typeof buildConflictGraphAndColor).toBe("function");
-    expect(typeof canCompileToCommandTape).toBe("function");
+  it("colors independent indices with same color", () => {
+    // Two dispatches that don't share any indices → no conflicts → 1 color
+    const tape = {
+      ops: [
+        {
+          type: "malloc" as const,
+          malloc: {
+            tableIdx: 2,
+            paddedSize: 16,
+            originalSize: 12,
+            slabAllocated: false,
+            arenaAllocated: false,
+          },
+        },
+        {
+          type: "dispatch" as const,
+          dispatch: { inputIdxs: [0], outputIdxs: [2], pipeline: null! },
+        },
+        { type: "free" as const, tableIdx: 2 },
+        {
+          type: "malloc" as const,
+          malloc: {
+            tableIdx: 3,
+            paddedSize: 16,
+            originalSize: 12,
+            slabAllocated: false,
+            arenaAllocated: false,
+          },
+        },
+        {
+          type: "dispatch" as const,
+          dispatch: { inputIdxs: [0], outputIdxs: [3], pipeline: null! },
+        },
+        { type: "free" as const, tableIdx: 3 },
+      ],
+      tableSize: 4,
+      inputTableIdxs: [0],
+      outputTableIdxs: [1],
+      allocatedIdxs: [2, 3],
+      uniformBuffers: [],
+      constSlab: null,
+      arenaSlabs: null,
+    };
+    const result = buildConflictGraphAndColor(tape as any);
+    // Indices 2 and 3 have no conflict → should share color 0
+    expect(result.numColors).toBe(1);
+    expect(result.colorGroups[0]).toEqual(expect.arrayContaining([2, 3]));
+  });
+
+  it("assigns different colors to conflicting indices", () => {
+    // One dispatch reads idx=2 and writes idx=3 → they conflict
+    const tape = {
+      ops: [
+        {
+          type: "malloc" as const,
+          malloc: {
+            tableIdx: 2,
+            paddedSize: 16,
+            originalSize: 12,
+            slabAllocated: false,
+            arenaAllocated: false,
+          },
+        },
+        {
+          type: "malloc" as const,
+          malloc: {
+            tableIdx: 3,
+            paddedSize: 16,
+            originalSize: 12,
+            slabAllocated: false,
+            arenaAllocated: false,
+          },
+        },
+        {
+          type: "dispatch" as const,
+          dispatch: { inputIdxs: [2], outputIdxs: [3], pipeline: null! },
+        },
+      ],
+      tableSize: 4,
+      inputTableIdxs: [0],
+      outputTableIdxs: [1],
+      allocatedIdxs: [2, 3],
+      uniformBuffers: [],
+      constSlab: null,
+      arenaSlabs: null,
+    };
+    const result = buildConflictGraphAndColor(tape as any);
+    expect(result.numColors).toBe(2);
+    expect(result.colors[2]).not.toBe(result.colors[3]);
+  });
+
+  it("excludes recycle participants from coloring", () => {
+    const tape = {
+      ops: [
+        {
+          type: "malloc" as const,
+          malloc: {
+            tableIdx: 2,
+            paddedSize: 16,
+            originalSize: 12,
+            slabAllocated: false,
+            arenaAllocated: false,
+          },
+        },
+        {
+          type: "dispatch" as const,
+          dispatch: { inputIdxs: [0], outputIdxs: [2], pipeline: null! },
+        },
+        { type: "recycle" as const, fromIdx: 2, toIdx: 3 },
+      ],
+      tableSize: 4,
+      inputTableIdxs: [0],
+      outputTableIdxs: [1],
+      allocatedIdxs: [2, 3],
+      uniformBuffers: [],
+      constSlab: null,
+      arenaSlabs: null,
+    };
+    const result = buildConflictGraphAndColor(tape as any);
+    // Both 2 and 3 are recycle participants → excluded → 0 colors
+    expect(result.colors[2]).toBe(-1);
+    expect(result.colors[3]).toBe(-1);
   });
 });

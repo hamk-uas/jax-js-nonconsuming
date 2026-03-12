@@ -18,15 +18,9 @@ import { describe, expect, it } from "vitest";
 describe("stub-block reverse assocScan repro", () => {
   for (const N of [65, 128, 200]) {
     for (const rev of [false, true]) {
-      it(`N=${N} m=5 ${rev ? "reverse" : "forward"} 3-field compose`, async ({
-        skip,
-      }) => {
+      it(`N=${N} m=5 ${rev ? "reverse" : "forward"} 3-field compose`, async () => {
         await init("wasm");
-        const devs = await init("webgpu");
-        if (!devs.includes("webgpu")) {
-          skip();
-          return;
-        }
+        await init("webgpu");
 
         const m = 5;
         // Deterministic PRNG

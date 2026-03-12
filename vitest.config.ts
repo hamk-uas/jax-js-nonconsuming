@@ -90,6 +90,10 @@ export default defineConfig({
       // GPU-specific benchmarks (run with scripts/gpu-test.sh):
       "test/gpu-bench.test.ts",
       "test/debug-wgsl.test.ts",
+      // WebGPU-only tests — must run under GPU configs, not the default suite:
+      "test/o9a-arena.test.ts",
+      "test/o9c-slab.test.ts",
+      "test/repro-stub.test.ts",
       "test/vitest.nvidia.config.ts",
       "test/vitest.intel.config.ts",
     ],

@@ -2294,6 +2294,35 @@ export class WebGPUBackend implements Backend {
   }
 
   /**
+   * Destroy all GPU resources owned by a command tape.
+   *
+   * Called during cache eviction (`clearCaches()`) to prevent GPU memory leaks.
+   * Destroys uniform buffers, constants slab, and arena slabs. After this call
+   * the tape must not be executed again.
+   */
+  destroyCommandTapeResources(tape: WebGPUCommandTape): void {
+    for (const buf of tape.uniformBuffers) {
+      this.#gpuAllocatedBytes -= buf.size;
+      buf.destroy();
+    }
+    tape.uniformBuffers.length = 0;
+
+    if (tape.constSlab) {
+      this.#gpuAllocatedBytes -= tape.constSlab.buffer.size;
+      tape.constSlab.buffer.destroy();
+      tape.constSlab = null;
+    }
+
+    if (tape.arenaSlabs) {
+      for (const slab of tape.arenaSlabs) {
+        this.#gpuAllocatedBytes -= slab.buffer.size;
+        slab.buffer.destroy();
+      }
+      tape.arenaSlabs = null;
+    }
+  }
+
+  /**
    * Execute a pre-compiled command tape with the given input slots.
    *
    * Each intermediate gets its own pooled GPUBuffer. Dispatches use bind group

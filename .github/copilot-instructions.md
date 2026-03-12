@@ -212,7 +212,7 @@ creations. Used in `test/setup.ts` to wrap every test.
 | Cache                    | Freed by `.dispose()`? | Freed by `clearCaches()`? |
 | ------------------------ | ---------------------- | ------------------------- |
 | Per-function jaxpr cache | **Yes**                | **Yes**                   |
-| `jitCompileCache`        | No                     | **Yes**                   |
+| `jitCompileCache`        | No                     | **Yes** (+ GPU teardown)  |
 | `transposeJaxprCache`    | No                     | **Yes**                   |
 | `ShaderPipelineCache`    | No                     | No (GPUDevice lifetime)   |
 | WASM routine LRU cache   | No                     | No (Backend lifetime)     |
@@ -854,3 +854,5 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Constants slab (O9c) for initialData                        | All constants read-only → single slab safe. Eliminates per-invocation mapped buffer creation + writeBuffer              |
 | Colored multi-slab arena (O9a-v2)                           | Conflict graph from command tape → greedy coloring → 1 GPUBuffer/color. 256-byte alignment. MAX_COLORS=4                |
 | Targeted jaxprification over general                        | Cholesky (n≤4), TriSolve/QR (n≤8) traced to fusable ops. Sort/Argsort/LU are non-jaxprifiable                           |
+| Command tape GPU teardown on `clearCaches()`                | `_clearJitCompileCache` iterates programs, destroys uniform/constSlab/arena GPUBuffers before dropping refs             |
+| WebGPU-only tests in GPU-enforced suite                     | Tests requiring WebGPU excluded from default vitest config; run under gpu-test.sh where adapter is guaranteed           |

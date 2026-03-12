@@ -284,6 +284,27 @@ export interface JitStepCounts {
 }
 
 /**
+ * Structural stats about a command tape's optimization state.
+ * @internal — test-only, not part of the public API contract.
+ */
+export interface CommandTapeStats {
+  /** Whether O9c constants slab is active. */
+  hasConstSlab: boolean;
+  /** Number of entries in the constants slab. */
+  constSlabEntries: number;
+  /** Number of O9a-v2 colored arena slab GPUBuffers. */
+  arenaSlabCount: number;
+  /** Total number of table entries allocated in arena slabs. */
+  arenaEntryCount: number;
+  /** Number of recycle ops in the tape. */
+  recycleCount: number;
+  /** Number of dispatch ops in the tape. */
+  dispatchCount: number;
+  /** Total table size (number of buffer slots). */
+  tableSize: number;
+}
+
+/**
  * Pool hints computed at JIT compile time. Tells the backend which buffer
  * sizes the program will allocate and how many bytes are live at peak, so the
  * pool can evict stale entries and cap retained memory.
@@ -373,6 +394,20 @@ export class JitProgram {
   private _megaModulePoolReady?: boolean;
   /** Cached command tape: undefined = not attempted, null = unsupported. */
   private _commandTape?: WebGPUCommandTape | null;
+
+  /**
+   * Destroy GPU resources owned by the cached command tape (if any).
+   * Called during cache eviction to prevent GPU memory leaks from persistent
+   * uniform buffers, constants slab, and arena slabs.
+   */
+  _disposeCommandTape(): void {
+    if (this._commandTape) {
+      (this.backend as WebGPUBackend).destroyCommandTapeResources(
+        this._commandTape,
+      );
+      this._commandTape = null;
+    }
+  }
 
   constructor(
     readonly backend: Backend,
@@ -465,6 +500,33 @@ export class JitProgram {
 
   toString(): string {
     return this.pprint().toString();
+  }
+
+  /**
+   * Return structural stats about the cached command tape (if any).
+   * Useful for verifying that O9c constants slab and O9a-v2 colored arena
+   * are active, not silently bypassed.
+   * @internal — test-only, not part of the public API contract.
+   */
+  commandTapeStats(): CommandTapeStats | null {
+    if (!this._commandTape) return null;
+    const tape = this._commandTape;
+    let recycleCount = 0;
+    let dispatchCount = 0;
+    for (const op of tape.ops) {
+      if (op.type === "recycle") recycleCount++;
+      if (op.type === "dispatch") dispatchCount++;
+    }
+    return {
+      hasConstSlab: tape.constSlab !== null,
+      constSlabEntries: tape.constSlab?.entries.length ?? 0,
+      arenaSlabCount: tape.arenaSlabs?.length ?? 0,
+      arenaEntryCount:
+        tape.arenaSlabs?.reduce((n, s) => n + s.entries.length, 0) ?? 0,
+      recycleCount,
+      dispatchCount,
+      tableSize: tape.tableSize,
+    };
   }
 
   /**
@@ -1435,15 +1497,36 @@ const jitCompileCache = new Map<string, JitProgram>();
 /**
  * Clear the internal JIT compilation cache. Called by `_disposeAllJitCaches()`
  * in jaxpr.ts during leak checking.
+ *
+ * Destroys GPU resources owned by cached command tapes (uniform buffers,
+ * constants slabs, arena slabs) before dropping JitProgram references.
  * @internal
  */
 export function _clearJitCompileCache(): void {
+  for (const prog of jitCompileCache.values()) {
+    prog._disposeCommandTape();
+  }
   jitCompileCache.clear();
 }
 
 // Register with jaxpr.ts so checkLeaks.stop() can flush this cache.
 _registerJitCacheDisposer(_clearJitCompileCache);
 _registerCacheSizeGetter("jitCompile", () => jitCompileCache.size);
+
+/**
+ * Return command tape stats for all cached WebGPU JitPrograms that have a
+ * compiled command tape. Useful for verifying that O9c/O9a-v2 optimizations
+ * are active in test scenarios.
+ * @internal — test-only.
+ */
+export function _getCommandTapeStats(): CommandTapeStats[] {
+  const results: CommandTapeStats[] = [];
+  for (const prog of jitCompileCache.values()) {
+    const stats = prog.commandTapeStats();
+    if (stats) results.push(stats);
+  }
+  return results;
+}
 
 /**
  * Module-level dim bindings for jitRules to use when resolving symbolic shapes
