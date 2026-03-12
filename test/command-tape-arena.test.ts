@@ -1,9 +1,16 @@
 /**
- * Tests for O9c constants slab and O9a-v2 conflict-graph coloring.
+ * Tests for O9c constants slab, O9a-v2 conflict-graph coloring,
+ * and O8c DUS/scatter_add/reverse tape eligibility.
  */
 import { describe, expect, it } from "vitest";
 
-import { grad, jit, nn, numpy as np } from "../src";
+import { DType, grad, jit, nn, numpy as np } from "../src";
+import {
+  buildConflictGraphAndColor,
+  canCompileToCommandTape,
+} from "../src/backend/webgpu/command-tape";
+import { SymbolicSize, SymDim } from "../src/dim";
+import type { JitStep } from "../src/frontend/jit";
 
 describe("O9c constants slab", () => {
   it("jit with scalar constants produces correct results", () => {
@@ -211,5 +218,232 @@ describe("conflict-graph coloring", async () => {
     // Both 2 and 3 are recycle participants → excluded → 0 colors
     expect(result.colors[2]).toBe(-1);
     expect(result.colors[3]).toBe(-1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// O8c: DUS / scatter_add / reverse tape eligibility
+// ---------------------------------------------------------------------------
+
+describe("O8c canCompileToCommandTape", () => {
+  it("accepts DUS with concrete 4-byte-aligned sizes", () => {
+    const steps: JitStep[] = [
+      {
+        type: "malloc",
+        size: 16,
+        output: 2,
+      },
+      {
+        type: "dus",
+        dst: 0,
+        src: 1,
+        output: 2,
+        dstSizeBytes: 16,
+        offsetBytes: 4,
+        sliceBytes: 4,
+        outerFibers: 1,
+        srcFiberBytes: 4,
+        dstFiberBytes: 16,
+      },
+    ];
+    expect(canCompileToCommandTape(steps)).toBe(true);
+  });
+
+  it("rejects DUS with symbolic sliceBytes", () => {
+    const steps: JitStep[] = [
+      {
+        type: "dus",
+        dst: 0,
+        src: 1,
+        output: 2,
+        dstSizeBytes: 16,
+        offsetBytes: 0,
+        sliceBytes: new SymbolicSize(4, ["T"]),
+        outerFibers: 1,
+        srcFiberBytes: 4,
+        dstFiberBytes: 16,
+      },
+    ];
+    expect(canCompileToCommandTape(steps)).toBe(false);
+  });
+
+  it("rejects DUS with non-4-byte-aligned offsetBytes", () => {
+    const steps: JitStep[] = [
+      {
+        type: "dus",
+        dst: 0,
+        src: 1,
+        output: 2,
+        dstSizeBytes: 16,
+        offsetBytes: 2, // f16: 2-byte aligned
+        sliceBytes: 2,
+        outerFibers: 1,
+        srcFiberBytes: 2,
+        dstFiberBytes: 16,
+      },
+    ];
+    expect(canCompileToCommandTape(steps)).toBe(false);
+  });
+
+  it("accepts scatter_add with f32 dtype", () => {
+    const steps: JitStep[] = [
+      {
+        type: "malloc",
+        size: 20,
+        output: 3,
+      },
+      {
+        type: "scatter_add",
+        target: 0,
+        indices: 1,
+        updates: 2,
+        output: 3,
+        axis: 0,
+        targetShape: [5],
+        updatesLen: 2,
+        dtype: DType.Float32,
+      },
+    ];
+    expect(canCompileToCommandTape(steps)).toBe(true);
+  });
+
+  it("rejects scatter_add with f64 dtype", () => {
+    const steps: JitStep[] = [
+      {
+        type: "scatter_add",
+        target: 0,
+        indices: 1,
+        updates: 2,
+        output: 3,
+        axis: 0,
+        targetShape: [5],
+        updatesLen: 2,
+        dtype: DType.Float64,
+      },
+    ];
+    expect(canCompileToCommandTape(steps)).toBe(false);
+  });
+
+  it("accepts reverse with concrete axis size and 4-byte aligned inner", () => {
+    const steps: JitStep[] = [
+      {
+        type: "malloc",
+        size: 16,
+        output: 1,
+      },
+      {
+        type: "reverse",
+        input: 0,
+        output: 1,
+        axis: 0,
+        axisSize: 4,
+        innerBytes: 4,
+        totalBytes: 16,
+        dtype: DType.Float32,
+      },
+    ];
+    expect(canCompileToCommandTape(steps)).toBe(true);
+  });
+
+  it("rejects reverse with symbolic axisSize", () => {
+    const steps: JitStep[] = [
+      {
+        type: "reverse",
+        input: 0,
+        output: 1,
+        axis: 0,
+        axisSize: new SymDim("T"),
+        innerBytes: 4,
+        totalBytes: new SymbolicSize(4, ["T"]),
+        dtype: DType.Float32,
+      },
+    ];
+    expect(canCompileToCommandTape(steps)).toBe(false);
+  });
+
+  it("rejects reverse with non-4-byte-aligned innerBytes", () => {
+    const steps: JitStep[] = [
+      {
+        type: "reverse",
+        input: 0,
+        output: 1,
+        axis: 0,
+        axisSize: 8,
+        innerBytes: 2, // f16 elements
+        totalBytes: 16,
+        dtype: DType.Float16,
+      },
+    ];
+    expect(canCompileToCommandTape(steps)).toBe(false);
+  });
+});
+
+describe("O8c conflict graph with scatter_add", () => {
+  it("scatter_add output conflicts with indices and updates", () => {
+    const tape = {
+      ops: [
+        {
+          type: "malloc" as const,
+          malloc: {
+            tableIdx: 2,
+            paddedSize: 20,
+            originalSize: 20,
+            slabAllocated: false,
+            arenaAllocated: false,
+          },
+        },
+        {
+          type: "malloc" as const,
+          malloc: {
+            tableIdx: 3,
+            paddedSize: 8,
+            originalSize: 8,
+            slabAllocated: false,
+            arenaAllocated: false,
+          },
+        },
+        {
+          type: "malloc" as const,
+          malloc: {
+            tableIdx: 4,
+            paddedSize: 8,
+            originalSize: 8,
+            slabAllocated: false,
+            arenaAllocated: false,
+          },
+        },
+        {
+          type: "scatter_add" as const,
+          scatterAdd: {
+            targetIdx: 0,
+            indicesIdx: 3,
+            updatesIdx: 4,
+            outIdx: 2,
+            targetBytes: 20,
+            pipeline: null!,
+            bindGroupLayout: null!,
+            grid: [1, 1] as [number, number],
+          },
+        },
+      ],
+      tableSize: 5,
+      inputTableIdxs: [0],
+      outputTableIdxs: [1],
+      allocatedIdxs: [2, 3, 4],
+      uniformBuffers: [],
+      constSlab: null,
+      arenaSlabs: null,
+    };
+    const result = buildConflictGraphAndColor(tape as any);
+    // outIdx=2 conflicts with indicesIdx=3 and updatesIdx=4
+    // → 2, 3, 4 should NOT all share the same color
+    expect(result.colors[2]).not.toBe(-1);
+    expect(result.colors[3]).not.toBe(-1);
+    expect(result.colors[4]).not.toBe(-1);
+    // 2 should differ from 3 and 4 (it conflicts with both)
+    expect(result.colors[2]).not.toBe(result.colors[3]);
+    expect(result.colors[2]).not.toBe(result.colors[4]);
+    // 3 and 4 can share (they don't conflict with each other — both read-only)
+    expect(result.colors[3]).toBe(result.colors[4]);
   });
 });

@@ -1447,22 +1447,22 @@ invalidated when the pool is reconfigured.
 
 ### Supported step types
 
-| Step type              | Supported? | Notes                                                    |
-| ---------------------- | ---------- | -------------------------------------------------------- |
-| `execute` (Kernel)     | ✅         | Pre-resolved pipeline, pre-computed grid                 |
-| `execute` (Routine)    | ✅         | Same as Kernel — routines are also GPU dispatches        |
-| `malloc`               | ✅         | Bulk alloc into flat table                               |
-| `free`                 | ✅         | Deferred to post-submit                                  |
-| `recycle`              | ✅         | Table index copy (zero-cost)                             |
-| `fori_loop` (concrete) | ✅         | Unroll iterations into dispatch sequence                 |
-| `incref`               | ❌         | Requires refcount tracking during encode                 |
-| `scan`                 | ❌         | Requires nested execution with complex coordination      |
-| `dus`                  | ⚠️         | Could support via pre-encoded `copyBufferToBuffer` calls |
-| `scatter_add`          | ⚠️         | Could support via pre-resolved scatter dispatch          |
-| `assoc_scan`           | ❌         | Multi-phase dispatch with dynamic buffer management      |
-| `block_map`            | ❌         | Complex shader generation and buffer management          |
-| `workgroup_assoc_scan` | ❌         | Nested inside block_map                                  |
-| `reverse`              | ⚠️         | Could support via pre-encoded copy shader                |
+| Step type              | Supported? | Notes                                                  |
+| ---------------------- | ---------- | ------------------------------------------------------ |
+| `execute` (Kernel)     | ✅         | Pre-resolved pipeline, pre-computed grid               |
+| `execute` (Routine)    | ✅         | Same as Kernel — routines are also GPU dispatches      |
+| `malloc`               | ✅         | Bulk alloc into flat table                             |
+| `free`                 | ✅         | Deferred to post-submit                                |
+| `recycle`              | ✅         | Table index copy (zero-cost)                           |
+| `fori_loop` (concrete) | ✅         | Unroll iterations into dispatch sequence               |
+| `dus`                  | ✅         | Pre-encoded `copyBufferToBuffer` (4-byte-aligned only) |
+| `scatter_add`          | ✅         | Copy + pre-resolved scatter dispatch (non-f64)         |
+| `reverse`              | ✅         | Pre-encoded reverse-order copies (4-byte-aligned only) |
+| `incref`               | ❌         | Requires refcount tracking during encode               |
+| `scan`                 | ❌         | Requires nested execution with complex coordination    |
+| `assoc_scan`           | ❌         | Multi-phase dispatch with dynamic buffer management    |
+| `block_map`            | ❌         | Complex shader generation and buffer management        |
+| `workgroup_assoc_scan` | ❌         | Nested inside block_map                                |
 
 **Programs with unsupported steps fall back to current step-by-step execution.** This is the same
 strategy as the WASM mega-module.
@@ -1510,7 +1510,7 @@ The tape is compiled on first invocation and cached on the `JitProgram` instance
 | ----- | ----------------------------------------------- | ------ | --------------------------------------- |
 | O8a   | Basic command tape (kernel+malloc+free+recycle) | Medium | ~4× for kernel-only programs            |
 | O8b   | Bind group caching                              | Small  | Additional ~20% on repeated invocations |
-| O8c   | DUS + scatter_add + reverse support             | Small  | Expands tape eligibility                |
+| O8c   | DUS + scatter_add + reverse support ✅          | Small  | Expands tape eligibility                |
 | O8d   | fori_loop unrolling into tape                   | Medium | Handles loop-containing programs        |
 
 ### Comparison with alternatives

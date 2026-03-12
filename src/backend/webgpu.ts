@@ -49,7 +49,10 @@ import {
   type ArenaSlabEntry,
   buildConflictGraphAndColor,
   type ConstSlabEntry,
+  type TapeDUS,
   type TapeOp,
+  type TapeReverse,
+  type TapeScatterAdd,
   type WebGPUCommandTape,
 } from "./webgpu/command-tape";
 import {
@@ -2155,6 +2158,61 @@ export class WebGPUBackend implements Backend {
           ops.push({ type: "recycle", fromIdx, toIdx });
           break;
         }
+        case "dus": {
+          const dstIdx = idToIdx.get(step.dst)!;
+          const srcIdx = idToIdx.get(step.src)!;
+          const outIdx = idToIdx.get(step.output)!;
+          const dus: TapeDUS = {
+            dstIdx,
+            srcIdx,
+            outIdx,
+            dstSizeBytes: step.dstSizeBytes as number,
+            offsetBytes: step.offsetBytes,
+            sliceBytes: step.sliceBytes as number,
+            outerFibers: step.outerFibers,
+            srcFiberBytes: step.srcFiberBytes,
+            dstFiberBytes: step.dstFiberBytes,
+          };
+          ops.push({ type: "dus", dus });
+          break;
+        }
+        case "scatter_add": {
+          const targetIdx = idToIdx.get(step.target)!;
+          const indicesIdx = idToIdx.get(step.indices)!;
+          const updatesIdx = idToIdx.get(step.updates)!;
+          const outIdx = idToIdx.get(step.output)!;
+          const targetBytes = prod(step.targetShape) * byteWidth(step.dtype);
+          const { pipeline, grid } = this.#resolveScatterAddPipeline(
+            step.axis,
+            step.targetShape,
+            step.updatesLen,
+            step.dtype,
+          );
+          const scatterAdd: TapeScatterAdd = {
+            targetIdx,
+            indicesIdx,
+            updatesIdx,
+            outIdx,
+            targetBytes,
+            pipeline,
+            bindGroupLayout: pipeline.getBindGroupLayout(0),
+            grid,
+          };
+          ops.push({ type: "scatter_add", scatterAdd });
+          break;
+        }
+        case "reverse": {
+          const inputIdx = idToIdx.get(step.input)!;
+          const outIdx = idToIdx.get(step.output)!;
+          const reverse: TapeReverse = {
+            inputIdx,
+            outIdx,
+            axisSize: step.axisSize as number,
+            innerBytes: step.innerBytes,
+          };
+          ops.push({ type: "reverse", reverse });
+          break;
+        }
       }
     }
 
@@ -2551,6 +2609,129 @@ export class WebGPUBackend implements Backend {
             }
             break;
           }
+          case "dus": {
+            const d = op.dus;
+            const dstBuf = buffers[d.dstIdx];
+            const dstOff = offsets[d.dstIdx];
+            const srcBuf = buffers[d.srcIdx];
+            const srcOff = offsets[d.srcIdx];
+            const outBuf = buffers[d.outIdx];
+            const outOff = offsets[d.outIdx];
+
+            // Copy dst → output (skip if recycled: same buffer + offset)
+            if (dstBuf !== outBuf || dstOff !== outOff) {
+              encoder.copyBufferToBuffer(
+                dstBuf,
+                dstOff,
+                outBuf,
+                outOff,
+                d.dstSizeBytes,
+              );
+            }
+            // Copy src slice into output at offsetBytes
+            if (d.outerFibers === 1) {
+              // Contiguous fast path (axis=0)
+              encoder.copyBufferToBuffer(
+                srcBuf,
+                srcOff,
+                outBuf,
+                outOff + d.offsetBytes,
+                d.sliceBytes,
+              );
+            } else {
+              // Fiber-by-fiber copy for non-contiguous axis > 0
+              for (let i = 0; i < d.outerFibers; i++) {
+                encoder.copyBufferToBuffer(
+                  srcBuf,
+                  srcOff + i * d.srcFiberBytes,
+                  outBuf,
+                  outOff + i * d.dstFiberBytes + d.offsetBytes,
+                  d.srcFiberBytes,
+                );
+              }
+            }
+            break;
+          }
+          case "scatter_add": {
+            const sa = op.scatterAdd;
+            const targetBuf = buffers[sa.targetIdx];
+            const targetOff = offsets[sa.targetIdx];
+            const outBuf = buffers[sa.outIdx];
+            const outOff = offsets[sa.outIdx];
+
+            // Copy target → output (skip if recycled)
+            if (targetBuf !== outBuf || targetOff !== outOff) {
+              encoder.copyBufferToBuffer(
+                targetBuf,
+                targetOff,
+                outBuf,
+                outOff,
+                sa.targetBytes,
+              );
+            }
+
+            // Dispatch scatter_add kernel
+            const idxBuf = buffers[sa.indicesIdx];
+            const idxOff = offsets[sa.indicesIdx];
+            const idxBsz = bindSizes[sa.indicesIdx];
+            const updBuf = buffers[sa.updatesIdx];
+            const updOff = offsets[sa.updatesIdx];
+            const updBsz = bindSizes[sa.updatesIdx];
+            const outBsz = bindSizes[sa.outIdx];
+
+            const bindGroup = this.device.createBindGroup({
+              layout: sa.bindGroupLayout,
+              entries: [
+                {
+                  binding: 0,
+                  resource:
+                    outBsz > 0
+                      ? { buffer: outBuf, offset: outOff, size: outBsz }
+                      : { buffer: outBuf },
+                },
+                {
+                  binding: 1,
+                  resource:
+                    idxBsz > 0
+                      ? { buffer: idxBuf, offset: idxOff, size: idxBsz }
+                      : { buffer: idxBuf },
+                },
+                {
+                  binding: 2,
+                  resource:
+                    updBsz > 0
+                      ? { buffer: updBuf, offset: updOff, size: updBsz }
+                      : { buffer: updBuf },
+                },
+              ],
+            });
+            const pe = _beginComputePass(encoder, this.#profiling);
+            pe.setPipeline(sa.pipeline);
+            pe.setBindGroup(0, bindGroup);
+            pe.dispatchWorkgroups(sa.grid[0], sa.grid[1]);
+            _dispatchCount++;
+            pe.end();
+            break;
+          }
+          case "reverse": {
+            const r = op.reverse;
+            const inBuf = buffers[r.inputIdx];
+            const inOff = offsets[r.inputIdx];
+            const outBuf = buffers[r.outIdx];
+            const outOff = offsets[r.outIdx];
+
+            // Copy slices in reverse order
+            for (let i = 0; i < r.axisSize; i++) {
+              encoder.copyBufferToBuffer(
+                inBuf,
+                inOff + i * r.innerBytes,
+                outBuf,
+                outOff + (r.axisSize - 1 - i) * r.innerBytes,
+                r.innerBytes,
+              );
+            }
+            break;
+          }
         }
       }
 
@@ -2599,20 +2780,16 @@ export class WebGPUBackend implements Backend {
   // ---------------------------------------------------------------------------
   #scatterAddPipelineCache = new Map<string, GPUComputePipeline>();
 
-  dispatchScatterAdd(
-    output: Slot,
-    indices: Slot,
-    updates: Slot,
+  /**
+   * Resolve (get or create) a scatter_add pipeline for the given parameters.
+   * Returns the pipeline and pre-computed grid dimensions.
+   */
+  #resolveScatterAddPipeline(
     axis: number,
     targetShape: number[],
     updatesLen: number,
     dtype: DType,
-  ): void {
-    if (dtype === DType.Float64) {
-      throw new Error("ScatterAdd: Float64 not supported on WebGPU");
-    }
-
-    // Compute strides for the scatter axis
+  ): { pipeline: GPUComputePipeline; grid: [number, number] } {
     const ndim = targetShape.length;
     const innerSize =
       ndim > 0 ? targetShape.slice(axis + 1).reduce((a, b) => a * b, 1) : 1;
@@ -2620,11 +2797,9 @@ export class WebGPUBackend implements Backend {
       ndim > 0 ? targetShape.slice(0, axis).reduce((a, b) => a * b, 1) : 1;
     const axisSize = ndim > 0 ? targetShape[axis] : 1;
 
-    // Total number of update elements
     const totalUpdates = updatesLen * outerSize * innerSize;
     const [gridX, gridY] = calculateGrid(Math.ceil(totalUpdates / 64));
 
-    // Use native atomicAdd for f32 when the device supports shader-f32-atomic-add
     const useNativeF32Atomic =
       dtype === DType.Float32 && this.capabilities.atomicF32Add;
 
@@ -2642,7 +2817,6 @@ export class WebGPUBackend implements Backend {
             ? "i32"
             : "u32";
 
-      // Build shader
       let code = useNativeF32Atomic ? "enable shader_f32_atomic_add;\n" : "";
       code += `
 @group(0) @binding(0) var<storage, read_write> output: array<atomic<${atomicType}>>;
@@ -2661,31 +2835,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let flat = gid.x + gid.y * ${gridX}u;
   if (flat >= TOTAL) { return; }
 
-  // Decompose flat index into (outer, updateIdx, inner)
   let inner = flat % INNER;
   let tmp = flat / INNER;
   let updateIdx = tmp % UPDATES_LEN;
   let outer = tmp / UPDATES_LEN;
 
-  // Look up target axis index
   let targetAxisIdx = u32(indices[updateIdx]);
   if (targetAxisIdx >= AXIS_SIZE) { return; }
 
-  // Compute flat output index
   let outFlat = outer * TARGET_INNER_STRIDE + targetAxisIdx * INNER + inner;
 
   let val = updates[flat];
 `;
 
       if (useNativeF32Atomic) {
-        // Native f32 atomicAdd via shader-f32-atomic-add extension
         code += `
   atomicAdd(&output[outFlat], val);
 `;
       } else if (isFloat) {
-        // CAS loop for f32/f16 atomics (bitcast through u32)
         code += `
-  // CAS loop: atomically add via bitcast<u32>
   var old_bits = atomicLoad(&output[outFlat]);
   loop {
     let old_val = bitcast<${wgslType}>(old_bits);
@@ -2697,7 +2865,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 `;
       } else {
-        // Native atomicAdd for integer types
         code += `
   atomicAdd(&output[outFlat], ${atomicType === "u32" ? "bitcast<u32>(val)" : "val"});
 `;
@@ -2736,6 +2903,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       this.#scatterAddPipelineCache.set(cacheKey, pipeline);
     }
 
+    return { pipeline, grid: [gridX, gridY] };
+  }
+
+  dispatchScatterAdd(
+    output: Slot,
+    indices: Slot,
+    updates: Slot,
+    axis: number,
+    targetShape: number[],
+    updatesLen: number,
+    dtype: DType,
+  ): void {
+    if (dtype === DType.Float64) {
+      throw new Error("ScatterAdd: Float64 not supported on WebGPU");
+    }
+
+    const { pipeline, grid } = this.#resolveScatterAddPipeline(
+      axis,
+      targetShape,
+      updatesLen,
+      dtype,
+    );
+
     const outBuf = this.#getBuffer(output).buffer;
     const idxBuf = this.#getBuffer(indices).buffer;
     const updBuf = this.#getBuffer(updates).buffer;
@@ -2752,7 +2942,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     const pass = _beginComputePass(commandEncoder, this.#profiling);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(gridX, gridY);
+    pass.dispatchWorkgroups(grid[0], grid[1]);
     _dispatchCount++;
     pass.end();
     this.device.queue.submit([commandEncoder.finish()]);

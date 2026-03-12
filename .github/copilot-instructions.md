@@ -323,8 +323,9 @@ spin-wait (`Atomics.wait` blocked) — detected at construction, falls back to d
 sequence with pre-resolved pipelines, pre-computed buffer indices, and pre-built uniform bind
 groups. Eliminates per-step JS overhead (scope lookups, array allocation, refcounting, pipeline
 cache lookups) by replacing the generic step loop with a tight command-encoding loop over a flat
-`GPUBuffer[]` table. ~4× reduction in JS-side overhead for kernel-only programs. Same eligibility as
-WASM mega-module (rejects scan, DUS, scatter_add, assoc_scan, block_map). See PLAN.md O8.
+`GPUBuffer[]` table. ~4× reduction in JS-side overhead for kernel-only programs. Supports kernels,
+routines, malloc/free/recycle, DUS (4-byte-aligned), scatter_add (non-f64), and reverse
+(4-byte-aligned). Rejects scan, assoc_scan, block_map, incref. See PLAN.md O8.
 
 **Effect system:** `MemoryEffect` enum (`Alloc`, `Borrow`, `Consume`, `Mutate`) on Jaxpr equations.
 `effectDrivenAllocate` uses annotations for sound buffer recycling including DUS/ScatterAdd
@@ -855,4 +856,5 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Colored multi-slab arena (O9a-v2)                           | Conflict graph from command tape → greedy coloring → 1 GPUBuffer/color. 256-byte alignment. MAX_COLORS=4                |
 | Targeted jaxprification over general                        | Cholesky (n≤4), TriSolve/QR (n≤8) traced to fusable ops. Sort/Argsort/LU are non-jaxprifiable                           |
 | Command tape GPU teardown on `clearCaches()`                | `_clearJitCompileCache` iterates programs, destroys uniform/constSlab/arena GPUBuffers before dropping refs             |
+| O8c DUS/scatter_add/reverse in tape                         | Pre-encoded copies + pre-resolved scatter pipeline. 4-byte alignment gate for copies; f64 gate for scatter_add          |
 | WebGPU-only tests in GPU-enforced suite                     | Tests requiring WebGPU excluded from default vitest config; run under gpu-test.sh where adapter is guaranteed           |

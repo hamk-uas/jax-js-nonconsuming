@@ -10,7 +10,7 @@
 // pool *before* subsequent mallocs, reducing peak VRAM compared to the
 // bulk-malloc-then-bulk-free approach.
 
-import { Kernel } from "../../alu";
+import { DType, Kernel } from "../../alu";
 import type { JitStep } from "../../frontend/jit";
 import { isSymbolicSize } from "../../shape";
 
@@ -96,12 +96,60 @@ export interface ArenaSlab {
   entries: ArenaSlabEntry[];
 }
 
+/** Pre-resolved DUS (dynamic update slice) buffer copy. */
+export interface TapeDUS {
+  dstIdx: number;
+  srcIdx: number;
+  outIdx: number;
+  /** Total byte size of the destination (= output size). */
+  dstSizeBytes: number;
+  /** Per-fiber byte offset into dst where src is written. */
+  offsetBytes: number;
+  /** Byte size of the src slice (axis=0 contiguous fast path). */
+  sliceBytes: number;
+  /** Number of outer fibers (1 for axis=0). */
+  outerFibers: number;
+  /** Bytes per fiber in src (stride between fibers). */
+  srcFiberBytes: number;
+  /** Bytes per fiber in dst (stride between fibers). */
+  dstFiberBytes: number;
+}
+
+/** Pre-resolved scatter_add: copy target → output, then dispatch atomic kernel. */
+export interface TapeScatterAdd {
+  targetIdx: number;
+  indicesIdx: number;
+  updatesIdx: number;
+  outIdx: number;
+  /** Pre-computed target byte size for the initial copy. */
+  targetBytes: number;
+  /** Pre-compiled scatter pipeline. */
+  pipeline: GPUComputePipeline;
+  /** Bind group layout for the 3-binding scatter shader. */
+  bindGroupLayout: GPUBindGroupLayout;
+  /** Grid dimensions for the scatter dispatch. */
+  grid: [number, number];
+}
+
+/** Pre-resolved reverse: copy slices in reverse order. */
+export interface TapeReverse {
+  inputIdx: number;
+  outIdx: number;
+  /** Number of elements along the reversed axis (concrete). */
+  axisSize: number;
+  /** Byte size of each axis slice (innerBytes = prod(shape[axis+1:]) * elemBytes). */
+  innerBytes: number;
+}
+
 /** A single tape operation in execution order. */
 export type TapeOp =
   | { type: "malloc"; malloc: TapeMalloc }
   | { type: "free"; tableIdx: number }
   | { type: "recycle"; fromIdx: number; toIdx: number }
-  | { type: "dispatch"; dispatch: TapeDispatch };
+  | { type: "dispatch"; dispatch: TapeDispatch }
+  | { type: "dus"; dus: TapeDUS }
+  | { type: "scatter_add"; scatterAdd: TapeScatterAdd }
+  | { type: "reverse"; reverse: TapeReverse };
 
 /** A pre-compiled dispatch sequence for a kernel-only JitProgram. */
 export interface WebGPUCommandTape {
@@ -201,27 +249,40 @@ export function buildConflictGraphAndColor(
   for (let i = 0; i < n; i++) adj[i] = new Set();
 
   for (const op of tape.ops) {
-    if (op.type !== "dispatch") continue;
-    const d = op.dispatch;
-    const outIdxs = d.outputIdxs;
-    const inIdxs = d.inputIdxs;
+    if (op.type === "dispatch") {
+      const d = op.dispatch;
+      const outIdxs = d.outputIdxs;
+      const inIdxs = d.inputIdxs;
 
-    // Each output conflicts with every input in the same dispatch.
-    for (const oi of outIdxs) {
-      if (externalSet.has(oi)) continue;
-      for (const ii of inIdxs) {
-        if (ii === oi || externalSet.has(ii)) continue;
-        adj[oi].add(ii);
-        adj[ii].add(oi);
+      // Each output conflicts with every input in the same dispatch.
+      for (const oi of outIdxs) {
+        if (externalSet.has(oi)) continue;
+        for (const ii of inIdxs) {
+          if (ii === oi || externalSet.has(ii)) continue;
+          adj[oi].add(ii);
+          adj[ii].add(oi);
+        }
       }
-    }
-    // Each output conflicts with every other output in the same dispatch.
-    for (let a = 0; a < outIdxs.length; a++) {
-      if (externalSet.has(outIdxs[a])) continue;
-      for (let b = a + 1; b < outIdxs.length; b++) {
-        if (externalSet.has(outIdxs[b])) continue;
-        adj[outIdxs[a]].add(outIdxs[b]);
-        adj[outIdxs[b]].add(outIdxs[a]);
+      // Each output conflicts with every other output in the same dispatch.
+      for (let a = 0; a < outIdxs.length; a++) {
+        if (externalSet.has(outIdxs[a])) continue;
+        for (let b = a + 1; b < outIdxs.length; b++) {
+          if (externalSet.has(outIdxs[b])) continue;
+          adj[outIdxs[a]].add(outIdxs[b]);
+          adj[outIdxs[b]].add(outIdxs[a]);
+        }
+      }
+    } else if (op.type === "scatter_add") {
+      // scatter_add dispatch: output (storage rw) conflicts with inputs (ro).
+      const sa = op.scatterAdd;
+      const outIdx = sa.outIdx;
+      const inIdxs = [sa.indicesIdx, sa.updatesIdx];
+      if (!externalSet.has(outIdx)) {
+        for (const ii of inIdxs) {
+          if (ii === outIdx || externalSet.has(ii)) continue;
+          adj[outIdx].add(ii);
+          adj[ii].add(outIdx);
+        }
       }
     }
   }
@@ -265,8 +326,10 @@ export function buildConflictGraphAndColor(
  * Check whether a JitProgram's steps can be compiled to a WebGPU command tape.
  *
  * Returns true if all steps are supported: execute (Kernel or Routine),
- * malloc (concrete size), free, and recycle. Programs with scan, DUS,
- * scatter_add, block_map, or other complex steps fall back to step-by-step.
+ * malloc (concrete size), free, recycle, DUS (concrete sizes, 4-byte-aligned
+ * offsets), scatter_add (non-f64), and reverse (concrete axis size, 4-byte-
+ * aligned innerBytes). Programs with scan, block_map, or other complex steps
+ * fall back to step-by-step.
  */
 export function canCompileToCommandTape(steps: JitStep[]): boolean {
   for (const step of steps) {
@@ -282,11 +345,39 @@ export function canCompileToCommandTape(steps: JitStep[]): boolean {
         if (step.source instanceof Kernel && step.source.needsDynamicParams)
           return false;
         break;
+      case "dus":
+        // Reject symbolic sizes
+        if (
+          isSymbolicSize(step.sliceBytes) ||
+          isSymbolicSize(step.dstSizeBytes)
+        )
+          return false;
+        // copyBufferToBuffer requires 4-byte alignment on all offsets/sizes
+        if (
+          (step.dstSizeBytes as number) % 4 !== 0 ||
+          step.offsetBytes % 4 !== 0 ||
+          (step.sliceBytes as number) % 4 !== 0 ||
+          step.srcFiberBytes % 4 !== 0 ||
+          step.dstFiberBytes % 4 !== 0
+        )
+          return false;
+        break;
+      case "scatter_add":
+        // Float64 not supported on WebGPU
+        if (step.dtype === DType.Float64) return false;
+        break;
+      case "reverse":
+        // Reject symbolic axis size or total bytes
+        if (
+          typeof step.axisSize !== "number" ||
+          isSymbolicSize(step.totalBytes)
+        )
+          return false;
+        // copyBufferToBuffer requires 4-byte aligned innerBytes
+        if (step.innerBytes % 4 !== 0) return false;
+        break;
       case "incref":
       case "scan":
-      case "dus":
-      case "scatter_add":
-      case "reverse":
       case "assoc_scan":
       case "block_map":
       case "fori_loop":
