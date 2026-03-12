@@ -48,6 +48,9 @@ When an upstream dependency evolves, follow this loop:
 
 - **Architecture Decision Records (ADRs):** Document the "Why" behind large restructurings in a way
   that future sessions benefit from it. Don't keep stale information.
+- **Code Comments:** If you misunderstood something in the code, add a code comment that prevents
+  you from doing the same mistake again. Likewise, proactively comment non-obvious code with the
+  rationale behind it.
 
 ## 5. Methodology
 
