@@ -938,6 +938,20 @@ export function blockMapFusedShaderSource(
     }
   }
 
+  // Refine shmem dtypes from workgroup_assoc_scan outputs.
+  // WAS outputs are malloc'd parent shmem buffers written by WAS codegen,
+  // not by any top-level kernel step, so the above loop misses them.
+  for (const was of workgroupAssocScans) {
+    for (let e = 0; e < was.numElems; e++) {
+      const parentOutId = was.wasStep.outputs[e];
+      const entry = shmemMap.get(parentOutId);
+      if (entry) {
+        entry.dtype = was.elemDtypes[e];
+        entry.elemCount = entry.sizeBytes / byteWidth(entry.dtype);
+      }
+    }
+  }
+
   // --- Build JitId → buffer name mapping ---
   // Body inputs (consts + block inputs) → global storage buffer names
   // Intermediates (malloc outputs) → shmem array names
@@ -1152,6 +1166,19 @@ export function blockMapFusedShaderSource(
         }
         return -1;
       });
+    }
+  }
+
+  // Populate inputDtypes for WAS elem inputs: the scan body reads elem
+  // data from ping-pong shared memory, not via GlobalIndex, so the above
+  // tracing loop misses them. Use the known elemDtypes.
+  for (const was of workgroupAssocScans) {
+    for (let e = 0; e < was.numElems; e++) {
+      const elemId = was.wasStep.elems[e];
+      const bodyIdx = bodyInputIds.indexOf(elemId);
+      if (bodyIdx >= 0 && inputDtypes[bodyIdx] === null) {
+        inputDtypes[bodyIdx] = was.elemDtypes[e];
+      }
     }
   }
 

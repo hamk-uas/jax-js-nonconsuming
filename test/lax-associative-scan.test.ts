@@ -2000,10 +2000,7 @@ describe("lax.associativeScan — Decoupled Fallback (T0)", () => {
     expect(result).toBeAllclose(expected, { rtol: 1e-5 });
   });
 
-  // i32 assocScan on WebGPU produces incorrect results (pre-existing:
-  // only 1 Hillis-Steele round executes in the block-map shader).
-  // Eager path works; JIT path fails regardless of DF vs block-map.
-  test.skip("i32 cumsum N=5 (single block)", ({ skip }) => {
+  test("i32 cumsum N=5 (single block)", ({ skip }) => {
     if (!available) skip();
     const values = [1, 2, 3, 4, 5];
     using xs = np.array(values, { dtype: DType.Int32 });
