@@ -32,8 +32,8 @@ import {
   OwnedFunction,
   verifyJaxprEffects,
 } from "./frontend/jaxpr";
-import type { CommandTapeStats, JitStepCounts } from "./frontend/jit";
-import { _getCommandTapeStats, jitCompile, JitProgram } from "./frontend/jit";
+import type { JitStepCounts } from "./frontend/jit";
+import { jitCompile, JitProgram } from "./frontend/jit";
 import * as jvpModule from "./frontend/jvp";
 import * as linearizeModule from "./frontend/linearize";
 import * as vmapModule from "./frontend/vmap";
@@ -79,8 +79,6 @@ export {
   type JsTree,
   type JsTreeDef,
   type JitStepCounts,
-  type CommandTapeStats,
-  _getCommandTapeStats,
   lax,
   type LeakReport,
   MemoryEffect,

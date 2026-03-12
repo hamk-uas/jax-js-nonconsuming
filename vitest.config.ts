@@ -94,6 +94,8 @@ export default defineConfig({
       "test/o9a-arena.test.ts",
       "test/o9c-slab.test.ts",
       "test/repro-stub.test.ts",
+      "test/pool-memory.test.ts",
+      "test/blocked-data-movement.test.ts",
       "test/vitest.nvidia.config.ts",
       "test/vitest.intel.config.ts",
     ],

@@ -22,7 +22,6 @@ import {
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 describe("WebGPU buffer pool memory", () => {
-  let hasWebGPU = false;
   let prevDevice: ReturnType<typeof defaultDevice>;
 
   function getGpuBytes(): number {
@@ -75,23 +74,18 @@ describe("WebGPU buffer pool memory", () => {
   beforeEach(() => clearCaches());
 
   beforeAll(async () => {
-    const devices = await init();
-    hasWebGPU = devices.includes("webgpu");
-    if (hasWebGPU) {
-      prevDevice = defaultDevice("webgpu");
-    }
+    await init("webgpu");
+    prevDevice = defaultDevice("webgpu");
   });
 
   afterAll(() => {
-    if (hasWebGPU) defaultDevice(prevDevice as any);
+    defaultDevice(prevDevice as any);
   });
 
   it(
     "repeated JIT calls stay within peak memory",
     { timeout: 30_000 },
-    async ({ skip }) => {
-      if (!hasWebGPU) skip();
-
+    async () => {
       using f = jit((x: any) => x.add(1).mul(2).sub(3));
       using x = np.ones([1024]);
 
@@ -115,9 +109,7 @@ describe("WebGPU buffer pool memory", () => {
   it(
     "multi-output JIT stays within peak memory",
     { timeout: 30_000 },
-    async ({ skip }) => {
-      if (!hasWebGPU) skip();
-
+    async () => {
       using f = jit((x: any) => [x.add(1), x.mul(2)]);
       using x = np.ones([2048]);
 
@@ -142,11 +134,7 @@ describe("WebGPU buffer pool memory", () => {
     },
   );
 
-  it("shape-varying JIT calls don't accumulate stale buffers", async ({
-    skip,
-  }) => {
-    if (!hasWebGPU) skip();
-
+  it("shape-varying JIT calls don't accumulate stale buffers", async () => {
     using fSmall = jit((x: any) => x.add(1).mul(2));
     using fLarge = jit((x: any) => x.add(1).mul(2));
     using xSmall = np.ones([256]);
@@ -166,9 +154,7 @@ describe("WebGPU buffer pool memory", () => {
     expect(getGpuBytes()).toBeLessThanOrEqual(baselineBytes);
   });
 
-  it("eager vs jit peak-memory parity", async ({ skip }) => {
-    if (!hasWebGPU) skip();
-
+  it("eager vs jit peak-memory parity", async () => {
     using x = np.ones([4096]);
     using addV = np.ones([4096]);
     using mulV = np.full([4096], 2);
@@ -202,53 +188,45 @@ describe("WebGPU buffer pool memory", () => {
     expect(jitPeak.delta).toBeLessThanOrEqual(eagerPeak.delta + 1);
   });
 
-  it(
-    "scan cumsum stays within peak memory",
-    { timeout: 30_000 },
-    async ({ skip }) => {
-      if (!hasWebGPU) skip();
+  it("scan cumsum stays within peak memory", { timeout: 30_000 }, async () => {
+    const initCarry = np.zeros([64]);
+    using scanF = jit((xs: any) =>
+      lax.scan(
+        (carry: any, x: any) => {
+          const s = carry.add(x);
+          return [s, s];
+        },
+        initCarry,
+        xs,
+      ),
+    );
+    using xs = np.ones([100, 64]);
 
-      const initCarry = np.zeros([64]);
-      using scanF = jit((xs: any) =>
-        lax.scan(
-          (carry: any, x: any) => {
-            const s = carry.add(x);
-            return [s, s];
-          },
-          initCarry,
-          xs,
-        ),
-      );
-      using xs = np.ones([100, 64]);
+    // Warmup
+    const [c, ys] = scanF(xs) as any[];
+    await c.data();
+    await ys.data();
+    c.dispose();
+    ys.dispose();
 
-      // Warmup
-      const [c, ys] = scanF(xs) as any[];
-      await c.data();
-      await ys.data();
-      c.dispose();
-      ys.dispose();
+    const baselineBytes = getGpuBytes();
 
-      const baselineBytes = getGpuBytes();
+    for (let i = 0; i < 5; i++) {
+      const [c2, ys2] = scanF(xs) as any[];
+      await c2.data();
+      await ys2.data();
+      c2.dispose();
+      ys2.dispose();
+    }
 
-      for (let i = 0; i < 5; i++) {
-        const [c2, ys2] = scanF(xs) as any[];
-        await c2.data();
-        await ys2.data();
-        c2.dispose();
-        ys2.dispose();
-      }
+    // Allow small tolerance: concurrent tests may add pool entries between
+    // baseline measurement and final check (fileParallelism shares one GPUDevice).
+    const tolerance = 4096;
+    expect(getGpuBytes()).toBeLessThanOrEqual(baselineBytes + tolerance);
+    initCarry.dispose();
+  });
 
-      // Allow small tolerance: concurrent tests may add pool entries between
-      // baseline measurement and final check (fileParallelism shares one GPUDevice).
-      const tolerance = 4096;
-      expect(getGpuBytes()).toBeLessThanOrEqual(baselineBytes + tolerance);
-      initCarry.dispose();
-    },
-  );
-
-  it("gpuAllocatedBytes tracks creates and pool returns", async ({ skip }) => {
-    if (!hasWebGPU) skip();
-
+  it("gpuAllocatedBytes tracks creates and pool returns", async () => {
     // Use a unique size unlikely to be in the pool from previous tests
     const arr = np.ones([7919]);
     await blockUntilReady(arr);
@@ -266,9 +244,7 @@ describe("WebGPU buffer pool memory", () => {
   it(
     "command tape pool integrity after repeated frees",
     { timeout: 30_000 },
-    async ({ skip }) => {
-      if (!hasWebGPU) skip();
-
+    async () => {
       // Multi-step JIT with intermediates: tape will free mid-tape buffers and
       // pool them.  Repeated execution exercises the pooledDuringTape tracking.
       // If the pool were poisoned (destroyed refs surviving in pool), subsequent

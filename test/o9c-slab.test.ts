@@ -7,7 +7,6 @@
  * Run with: GPU=nvidia scripts/gpu-test.sh run test/o9c-slab.test.ts
  */
 import {
-  _getCommandTapeStats,
   clearCaches,
   defaultDevice,
   grad,
@@ -17,6 +16,8 @@ import {
   numpy as np,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { beforeAll, describe, expect, it } from "vitest";
+
+import { _getCommandTapeStats } from "../src/frontend/jit";
 
 await init("webgpu");
 

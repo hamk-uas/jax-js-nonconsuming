@@ -27,18 +27,8 @@ import { describe, expect, test } from "vitest";
 
 const B = 256; // WebGPU block size
 
-// Attempt top-level WebGPU init. If WebGPU is unavailable the entire file
-// is effectively a no-op (all describes use `describe.skipIf`).
-let hasWebGPU = false;
-try {
-  const devs = await init("webgpu");
-  if (devs.includes("webgpu")) {
-    defaultDevice("webgpu");
-    hasWebGPU = true;
-  }
-} catch {
-  await init();
-}
+await init("webgpu");
+defaultDevice("webgpu");
 
 // Reference cumsum for verification
 function referenceCumsum(values: number[]): number[] {
@@ -61,7 +51,7 @@ function referenceCumprod(values: number[]): number[] {
 // ============================================================================
 
 describe("copyAxisRange (via single-block assocScan)", () => {
-  test.skipIf(!hasWebGPU)("N < B: single block, entire range", () => {
+  test("N < B: single block, entire range", () => {
     const values = Array.from({ length: 100 }, (_, i) => i + 1);
     using xs = np.array(values);
     using result = lax.associativeScan(
@@ -71,7 +61,7 @@ describe("copyAxisRange (via single-block assocScan)", () => {
     expect(result).toBeAllclose(referenceCumsum(values));
   });
 
-  test.skipIf(!hasWebGPU)("N = 1: scalar edge case", () => {
+  test("N = 1: scalar edge case", () => {
     using xs = np.array([42.0]);
     using result = lax.associativeScan(
       (a: np.Array, b: np.Array) => np.add(a, b),
@@ -80,7 +70,7 @@ describe("copyAxisRange (via single-block assocScan)", () => {
     expect(result).toBeAllclose([42]);
   });
 
-  test.skipIf(!hasWebGPU)("N = B: exactly one full block", () => {
+  test("N = B: exactly one full block", () => {
     const values = Array.from({ length: B }, () => 1);
     using xs = np.array(values);
     using result = lax.associativeScan(
@@ -96,7 +86,7 @@ describe("copyAxisRange (via single-block assocScan)", () => {
 // ============================================================================
 
 describe("gatherAxisPoints (via multi-block assocScan)", () => {
-  test.skipIf(!hasWebGPU)("N = B+1: two blocks, partial trailing block", () => {
+  test("N = B+1: two blocks, partial trailing block", () => {
     const N = B + 1;
     const values = Array.from({ length: N }, (_, i) => i + 1);
     using xs = np.array(values);
@@ -107,7 +97,7 @@ describe("gatherAxisPoints (via multi-block assocScan)", () => {
     expect(result).toBeAllclose(referenceCumsum(values));
   });
 
-  test.skipIf(!hasWebGPU)("N = 2*B: exactly two full blocks", () => {
+  test("N = 2*B: exactly two full blocks", () => {
     const N = 2 * B;
     const values = Array.from({ length: N }, () => 1);
     using xs = np.array(values);
@@ -118,21 +108,18 @@ describe("gatherAxisPoints (via multi-block assocScan)", () => {
     expect(result).toBeAllclose(referenceCumsum(values));
   });
 
-  test.skipIf(!hasWebGPU)(
-    "N = 2*B-1: partial last block (one element short)",
-    () => {
-      const N = 2 * B - 1;
-      const values = Array.from({ length: N }, (_, i) => (i % 7) + 1);
-      using xs = np.array(values);
-      using result = lax.associativeScan(
-        (a: np.Array, b: np.Array) => np.add(a, b),
-        xs,
-      );
-      expect(result).toBeAllclose(referenceCumsum(values));
-    },
-  );
+  test("N = 2*B-1: partial last block (one element short)", () => {
+    const N = 2 * B - 1;
+    const values = Array.from({ length: N }, (_, i) => (i % 7) + 1);
+    using xs = np.array(values);
+    using result = lax.associativeScan(
+      (a: np.Array, b: np.Array) => np.add(a, b),
+      xs,
+    );
+    expect(result).toBeAllclose(referenceCumsum(values));
+  });
 
-  test.skipIf(!hasWebGPU)("N = 3*B+17: three full blocks + partial", () => {
+  test("N = 3*B+17: three full blocks + partial", () => {
     const N = 3 * B + 17;
     const values = Array.from({ length: N }, (_, i) => (i % 5) + 1);
     using xs = np.array(values);
@@ -149,27 +136,21 @@ describe("gatherAxisPoints (via multi-block assocScan)", () => {
 // ============================================================================
 
 describe("mapOverBlocks (via multi-block apply phase)", () => {
-  test.skipIf(!hasWebGPU)(
-    "cumulative product — non-linear associative op",
-    () => {
-      // cumprod exercises that mapOverBlocks correctly applies the prefix
-      // via multiplication, not just addition
-      const N = B + 50;
-      // Use small values to avoid float overflow
-      const values = Array.from(
-        { length: N },
-        () => 1.0 + Math.random() * 0.01,
-      );
-      using xs = np.array(values);
-      using result = lax.associativeScan(
-        (a: np.Array, b: np.Array) => np.multiply(a, b),
-        xs,
-      );
-      expect(result).toBeAllclose(referenceCumprod(values), { rtol: 1e-4 });
-    },
-  );
+  test("cumulative product — non-linear associative op", () => {
+    // cumprod exercises that mapOverBlocks correctly applies the prefix
+    // via multiplication, not just addition
+    const N = B + 50;
+    // Use small values to avoid float overflow
+    const values = Array.from({ length: N }, () => 1.0 + Math.random() * 0.01);
+    using xs = np.array(values);
+    using result = lax.associativeScan(
+      (a: np.Array, b: np.Array) => np.multiply(a, b),
+      xs,
+    );
+    expect(result).toBeAllclose(referenceCumprod(values), { rtol: 1e-4 });
+  });
 
-  test.skipIf(!hasWebGPU)("running max — non-additive associative op", () => {
+  test("running max — non-additive associative op", () => {
     const N = B + 100;
     const values = Array.from({ length: N }, (_, i) => Math.sin(i * 0.1) * 100);
     const expected = new Array(N);
@@ -185,7 +166,7 @@ describe("mapOverBlocks (via multi-block apply phase)", () => {
     expect(result).toBeAllclose(expected);
   });
 
-  test.skipIf(!hasWebGPU)("partial trailing block correctness", () => {
+  test("partial trailing block correctness", () => {
     // N = B + 3: block 1 has only 3 elements. Verifies that mapOverBlocks
     // correctly writes only valid elements and doesn't corrupt output.
     const N = B + 3;
@@ -203,7 +184,7 @@ describe("mapOverBlocks (via multi-block apply phase)", () => {
     }
   });
 
-  test.skipIf(!hasWebGPU)("jit(assocScan) with multi-block N", () => {
+  test("jit(assocScan) with multi-block N", () => {
     // Ensures that the primitives work under JIT compilation too
     const N = 2 * B + 10;
     const values = Array.from({ length: N }, (_, i) => i + 1);
@@ -221,30 +202,27 @@ describe("mapOverBlocks (via multi-block apply phase)", () => {
 // ============================================================================
 
 describe("multi-level recursion (N > B²)", () => {
-  test.skipIf(!hasWebGPU)(
-    "N = B² + B: three-level blocked decomposition",
-    () => {
-      // B=256, B²=65536, M=257 > B → triggers a second recursion level.
-      // Level 0: N=65792 → M=257 blocks
-      // Level 1: N=257 → M=2 blocks
-      // Level 2: N=2 → M=1 block (terminates)
-      const N = B * B + B;
-      const values = Array.from({ length: N }, () => 1);
-      using xs = np.array(values);
-      using result = lax.associativeScan(
-        (a: np.Array, b: np.Array) => np.add(a, b),
-        xs,
-      );
-      // cumsum of all-ones = [1, 2, 3, ..., N]
-      const data = result.js() as number[];
-      expect(data[0]).toBe(1);
-      expect(data[N - 1]).toBe(N);
-      // Spot-check block boundaries
-      expect(data[B - 1]).toBe(B);
-      expect(data[B]).toBe(B + 1);
-      expect(data[2 * B - 1]).toBe(2 * B);
-    },
-  );
+  test("N = B² + B: three-level blocked decomposition", () => {
+    // B=256, B²=65536, M=257 > B → triggers a second recursion level.
+    // Level 0: N=65792 → M=257 blocks
+    // Level 1: N=257 → M=2 blocks
+    // Level 2: N=2 → M=1 block (terminates)
+    const N = B * B + B;
+    const values = Array.from({ length: N }, () => 1);
+    using xs = np.array(values);
+    using result = lax.associativeScan(
+      (a: np.Array, b: np.Array) => np.add(a, b),
+      xs,
+    );
+    // cumsum of all-ones = [1, 2, 3, ..., N]
+    const data = result.js() as number[];
+    expect(data[0]).toBe(1);
+    expect(data[N - 1]).toBe(N);
+    // Spot-check block boundaries
+    expect(data[B - 1]).toBe(B);
+    expect(data[B]).toBe(B + 1);
+    expect(data[2 * B - 1]).toBe(2 * B);
+  });
 });
 
 // ============================================================================
@@ -253,7 +231,7 @@ describe("multi-level recursion (N > B²)", () => {
 // ============================================================================
 
 describe("blocked assocScan with multi-dimensional elements", () => {
-  test.skipIf(!hasWebGPU)("cumsum over [N, 4] with N > B", () => {
+  test("cumsum over [N, 4] with N > B", () => {
     const N = B + 32;
     const data = new Float32Array(N * 4);
     for (let i = 0; i < N * 4; i++) data[i] = (i % 7) + 1;

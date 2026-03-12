@@ -63,8 +63,7 @@ export type GpuProfile = keyof typeof GPU_PROFILES;
 /**
  * Build a complete vitest config for the given GPU.
  *
- * The config disables leak-checking (`setupFiles: []`) and uses a 300 s
- * timeout — GPU benchmarks are long-running and allocate freely.
+ * The config uses a 300 s timeout — GPU tests/benchmarks are long-running.
  */
 export function gpuConfig(gpu: GpuProfile) {
   const profile = GPU_PROFILES[gpu];
@@ -110,7 +109,7 @@ export function gpuConfig(gpu: GpuProfile) {
       },
       testTimeout: 300000,
       passWithNoTests: true,
-      setupFiles: [],
+      setupFiles: ["test/setup.ts"],
     },
   });
 }
