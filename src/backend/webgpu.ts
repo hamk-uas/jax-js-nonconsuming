@@ -389,6 +389,8 @@ export class WebGPUBackend implements Backend {
         device.limits.maxComputeInvocationsPerWorkgroup,
       maxComputeWorkgroupStorageSize:
         device.limits.maxComputeWorkgroupStorageSize,
+      adapterArchitecture: device.adapterInfo?.architecture,
+      adapterVendor: device.adapterInfo?.vendor,
       timestampQuery: device.features.has("timestamp-query"),
     };
     this.pipelines = new ShaderPipelineCache(device);

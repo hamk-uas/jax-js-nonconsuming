@@ -36,6 +36,8 @@ export interface BackendCapabilities {
   readonly maxComputeWorkgroupStorageSize?: number;
   /** WebGPU: adapter architecture string (e.g. "gen-9", "xe-lpg"). */
   readonly adapterArchitecture?: string;
+  /** WebGPU: adapter vendor string (e.g. "intel", "nvidia", "apple"). */
+  readonly adapterVendor?: string;
   /** WebGPU: true if timestamp-query feature is available. */
   readonly timestampQuery?: boolean;
 }
