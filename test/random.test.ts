@@ -1,22 +1,9 @@
-import {
-  defaultDevice,
-  devices,
-  init,
-  numpy as np,
-  random,
-  vmap,
-} from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { numpy as np, random, vmap } from "@hamk-uas/jax-js-nonconsuming";
+import { expect, suite, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
 
-suite.each(devices)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite((device) => {
   suite("PRNG correctness", () => {
     test("random bits", () => {
       // jax.random.bits(jax.random.key(0))

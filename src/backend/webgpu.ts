@@ -12,10 +12,12 @@ import {
   type BackendCapabilities,
   Device,
   Executable,
+  type GpuTimingResult,
   Slot,
   SlotError,
   UnsupportedOpError,
 } from "../backend";
+import type { JitId, JitStep } from "../frontend/jit";
 import { Routine } from "../routine";
 import { isSymbolicSize } from "../shape";
 import { tuneNullopt, tuneWebgpu, type WebGPUTuneResult } from "../tuner";
@@ -42,6 +44,12 @@ import {
   headerWgsl,
   ShaderInfo,
 } from "./webgpu/codegen";
+import { type TapeOp, type WebGPUCommandTape } from "./webgpu/command-tape";
+import {
+  type DFScanDtype,
+  type DFScanOp,
+  generateDecoupledFallbackScanShader,
+} from "./webgpu/decoupled-fallback-scan";
 import { SyncReader } from "./webgpu/reader";
 import { createRoutineShader } from "./webgpu/routines";
 import {
@@ -256,6 +264,40 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // --- GPU dispatch counter (module-level for pipelineSubmit access) ---
 let _dispatchCount = 0;
 
+// --- GPU timestamp profiling state (passed explicitly from backend instance) ---
+interface _ProfilingState {
+  querySet: GPUQuerySet;
+  passIdx: number;
+  overflow: boolean;
+}
+const _MAX_PROFILING_PASSES = 4096;
+
+/** Return timestampWrites descriptor for the current pass, or undefined. */
+function _profilingTimestampWrites(
+  profiling: _ProfilingState | null,
+): GPUComputePassTimestampWrites | undefined {
+  if (!profiling) return undefined;
+  if (profiling.passIdx >= _MAX_PROFILING_PASSES) {
+    profiling.overflow = true;
+    return undefined;
+  }
+  const idx = profiling.passIdx++;
+  return {
+    querySet: profiling.querySet,
+    beginningOfPassWriteIndex: idx * 2,
+    endOfPassWriteIndex: idx * 2 + 1,
+  };
+}
+
+/** Begin a compute pass with optional profiling timestamps. */
+function _beginComputePass(
+  encoder: GPUCommandEncoder,
+  profiling: _ProfilingState | null = null,
+): GPUComputePassEncoder {
+  const tsw = _profilingTimestampWrites(profiling);
+  return encoder.beginComputePass(tsw ? { timestampWrites: tsw } : undefined);
+}
+
 /** Implementation of `Backend` that uses WebGPU in browsers. */
 export class WebGPUBackend implements Backend {
   readonly type: Device = "webgpu";
@@ -322,6 +364,9 @@ export class WebGPUBackend implements Backend {
   #batchUniformsToDestroy: GPUBuffer[] = [];
   #batchDeferredFreeBuffers: GPUBuffer[] = [];
 
+  // --- GPU timestamp profiling state (T3/P9) ---
+  #profiling: _ProfilingState | null = null;
+
   constructor(readonly device: GPUDevice) {
     if (DEBUG >= 3 && device.adapterInfo) {
       console.info(
@@ -344,6 +389,9 @@ export class WebGPUBackend implements Backend {
         device.limits.maxComputeInvocationsPerWorkgroup,
       maxComputeWorkgroupStorageSize:
         device.limits.maxComputeWorkgroupStorageSize,
+      adapterArchitecture: device.adapterInfo?.architecture,
+      adapterVendor: device.adapterInfo?.vendor,
+      timestampQuery: device.features.has("timestamp-query"),
     };
     this.pipelines = new ShaderPipelineCache(device);
     this.syncReader = new SyncReader(device);
@@ -397,6 +445,75 @@ export class WebGPUBackend implements Backend {
     _dispatchCount = 0;
   }
 
+  // ---------------------------------------------------------------------------
+  // GPU timestamp profiling (T3/P9)
+  // ---------------------------------------------------------------------------
+
+  /** Begin GPU timestamp profiling. Requires `timestamp-query` feature. */
+  startProfiling(): void {
+    if (!this.device.features.has("timestamp-query")) {
+      throw new Error("timestamp-query feature not available on this device");
+    }
+    if (this.#profiling) {
+      throw new Error("Profiling already active — call stopProfiling() first");
+    }
+    this.#profiling = {
+      querySet: this.device.createQuerySet({
+        type: "timestamp",
+        count: _MAX_PROFILING_PASSES * 2,
+      }),
+      passIdx: 0,
+      overflow: false,
+    };
+  }
+
+  /** Stop profiling and return per-pass GPU timing results. */
+  async stopProfiling(): Promise<GpuTimingResult> {
+    const state = this.#profiling;
+    this.#profiling = null;
+
+    if (!state || state.passIdx === 0) {
+      state?.querySet.destroy();
+      return { passes: [], totalMs: 0, truncated: state?.overflow ?? false };
+    }
+
+    const entryCount = state.passIdx * 2;
+    const resolveSize = entryCount * 8; // BigUint64 = 8 bytes each
+
+    const resolveBuffer = this.device.createBuffer({
+      size: resolveSize,
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    });
+    const readBuffer = this.device.createBuffer({
+      size: resolveSize,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+
+    const encoder = this.device.createCommandEncoder();
+    encoder.resolveQuerySet(state.querySet, 0, entryCount, resolveBuffer, 0);
+    encoder.copyBufferToBuffer(resolveBuffer, 0, readBuffer, 0, resolveSize);
+    this.device.queue.submit([encoder.finish()]);
+
+    await readBuffer.mapAsync(GPUMapMode.READ);
+    const timestamps = new BigUint64Array(readBuffer.getMappedRange());
+
+    const passes: { durationMs: number }[] = [];
+    for (let i = 0; i < state.passIdx; i++) {
+      const startNs = timestamps[i * 2];
+      const endNs = timestamps[i * 2 + 1];
+      passes.push({ durationMs: Number(endNs - startNs) / 1_000_000 });
+    }
+    const wallNs = timestamps[entryCount - 1] - timestamps[0];
+    const totalMs = Number(wallNs) / 1_000_000;
+
+    readBuffer.unmap();
+    readBuffer.destroy();
+    resolveBuffer.destroy();
+    state.querySet.destroy();
+
+    return { passes, totalMs, truncated: state.overflow };
+  }
+
   /** Buffer pool diagnostic: pooled buffer count, pooled bytes, and byte budget. */
   poolStats(): {
     pooledBuffers: number;
@@ -427,15 +544,7 @@ export class WebGPUBackend implements Backend {
       const pooled = this.#poolPop(paddedSize);
       if (pooled) {
         buffer = pooled;
-        if (initialData.byteLength % 4 === 0) {
-          this.device.queue.writeBuffer(buffer, 0, initialData);
-        } else {
-          const aligned = initialData.byteLength - (initialData.byteLength % 4);
-          this.device.queue.writeBuffer(buffer, 0, initialData, 0, aligned);
-          const remainder = new Uint8Array(4);
-          remainder.set(initialData.subarray(aligned));
-          this.device.queue.writeBuffer(buffer, aligned, remainder);
-        }
+        this.#writeBufferUnaligned(buffer, initialData);
       } else if (initialData.byteLength < 4096) {
         buffer = this.#createBuffer(paddedSize, { mapped: true });
         new Uint8Array(buffer.getMappedRange(), 0, size).set(initialData);
@@ -443,16 +552,7 @@ export class WebGPUBackend implements Backend {
       } else {
         // getMappedRange() seems slower for large buffers, use writeBuffer() instead.
         buffer = this.#createBuffer(paddedSize);
-        if (initialData.byteLength % 4 === 0) {
-          this.device.queue.writeBuffer(buffer, 0, initialData);
-        } else {
-          // Copy all but the last few bytes, then copy 4 bytes as remainder.
-          const aligned = initialData.byteLength - (initialData.byteLength % 4);
-          this.device.queue.writeBuffer(buffer, 0, initialData, 0, aligned);
-          const remainder = new Uint8Array(4);
-          remainder.set(initialData.subarray(aligned));
-          this.device.queue.writeBuffer(buffer, aligned, remainder);
-        }
+        this.#writeBufferUnaligned(buffer, initialData);
       }
     } else {
       // No initial data — try the pool first.
@@ -572,6 +672,26 @@ export class WebGPUBackend implements Backend {
     }
   }
 
+  /**
+   * Write data to a GPU buffer, handling non-4-byte-aligned sizes.
+   * WebGPU's writeBuffer requires 4-byte-aligned size; this pads the
+   * trailing bytes when necessary.
+   */
+  #writeBufferUnaligned(
+    buffer: GPUBuffer,
+    data: Uint8Array<ArrayBuffer>,
+  ): void {
+    if (data.byteLength % 4 === 0) {
+      this.device.queue.writeBuffer(buffer, 0, data);
+    } else {
+      const aligned = data.byteLength - (data.byteLength % 4);
+      this.device.queue.writeBuffer(buffer, 0, data, 0, aligned);
+      const remainder = new Uint8Array(4);
+      remainder.set(data.subarray(aligned));
+      this.device.queue.writeBuffer(buffer, aligned, remainder);
+    }
+  }
+
   #cachedShader(kernel: Kernel): ShaderInfo {
     const cacheKey = FpHash.hash(kernel);
     let result = this.#cachedShaderMap.get(cacheKey);
@@ -632,6 +752,7 @@ export class WebGPUBackend implements Backend {
       dynamicParams,
       this.#batchEncoder ?? undefined,
       this.#batchEncoder ? this.#batchUniformsToDestroy : undefined,
+      this.#profiling,
     );
   }
 
@@ -713,7 +834,7 @@ export class WebGPUBackend implements Backend {
 
       for (const { grid } of shader.passes) {
         if (prod(grid) === 0) continue;
-        const passEncoder = commandEncoder.beginComputePass();
+        const passEncoder = _beginComputePass(commandEncoder, this.#profiling);
         passEncoder.setPipeline(pipeline);
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.dispatchWorkgroups(grid[0], grid[1]);
@@ -784,7 +905,7 @@ export class WebGPUBackend implements Backend {
       entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
     });
 
-    const passEncoder = commandEncoder.beginComputePass();
+    const passEncoder = _beginComputePass(commandEncoder, this.#profiling);
     passEncoder.setPipeline(pipeline);
     passEncoder.setBindGroup(0, storageBindGroup);
     passEncoder.setBindGroup(1, uniformBindGroup);
@@ -1089,7 +1210,10 @@ export class WebGPUBackend implements Backend {
         const storageBindGroup = iter % 2 === 0 ? pingBindGroup : pongBindGroup;
 
         for (const { grid } of filteredPasses) {
-          const passEncoder = commandEncoder.beginComputePass();
+          const passEncoder = _beginComputePass(
+            commandEncoder,
+            this.#profiling,
+          );
           passEncoder.setPipeline(pipeline);
           passEncoder.setBindGroup(0, storageBindGroup);
           passEncoder.setBindGroup(1, uniformBindGroup, [
@@ -1550,7 +1674,7 @@ export class WebGPUBackend implements Backend {
         for (const dispatch of entry.dispatches) {
           for (const { grid } of dispatch.passes) {
             if (grid[0] === 0 || grid[1] === 0) continue;
-            const pass = commandEncoder.beginComputePass();
+            const pass = _beginComputePass(commandEncoder, this.#profiling);
             pass.setPipeline(dispatch.pipeline);
             pass.setBindGroup(0, storageBG);
             if (ubg) {
@@ -1699,6 +1823,16 @@ export class WebGPUBackend implements Backend {
     return true;
   }
 
+  /** Remove a specific buffer from the pool (error cleanup). */
+  #poolRemove(buffer: GPUBuffer): void {
+    const list = this.#bufferPool.get(buffer.size);
+    if (!list) return;
+    const idx = list.indexOf(buffer);
+    if (idx === -1) return;
+    list.splice(idx, 1);
+    this.#poolCurrentBytes -= buffer.size;
+  }
+
   /**
    * Prepare the pool for the next JitProgram execution:
    * 1. Evict entries whose sizes aren't needed (stale cross-program buffers).
@@ -1817,7 +1951,7 @@ export class WebGPUBackend implements Backend {
         })),
       });
       const grid = shader.passes[0].grid;
-      const passEncoder = commandEncoder.beginComputePass();
+      const passEncoder = _beginComputePass(commandEncoder, this.#profiling);
       passEncoder.setPipeline(shader.pipeline);
       passEncoder.setBindGroup(0, bindGroup0);
       passEncoder.setBindGroup(1, bindGroup1);
@@ -1838,6 +1972,7 @@ export class WebGPUBackend implements Backend {
         undefined,
         this.#batchEncoder ?? undefined,
         this.#batchEncoder ? this.#batchUniformsToDestroy : undefined,
+        this.#profiling,
       );
     }
   }
@@ -1876,6 +2011,368 @@ export class WebGPUBackend implements Backend {
       }
       this.#batchDeferredFreeBuffers = [];
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Command tape: pre-compiled dispatch sequence (O8)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compile a JitProgram's steps into a WebGPU command tape.
+   *
+   * Pre-resolves pipelines, bind group layouts, grid dimensions, and uniform
+   * bind groups. The resulting tape can be executed repeatedly with different
+   * input slots via `executeCommandTape()`.
+   *
+   * Caller must verify eligibility via `canCompileToCommandTape()` first.
+   */
+  compileCommandTape(
+    steps: JitStep[],
+    inputIds: JitId[],
+    outputIds: JitId[],
+  ): WebGPUCommandTape {
+    // 1. Build JitId → table index mapping
+    const idToIdx = new Map<JitId, number>();
+    let nextIdx = 0;
+
+    // Assign indices to inputs (deduplicate — same JitId may appear twice)
+    const inputTableIdxs: number[] = [];
+    for (const id of inputIds) {
+      if (!idToIdx.has(id)) idToIdx.set(id, nextIdx++);
+      inputTableIdxs.push(idToIdx.get(id)!);
+    }
+
+    // 2. Walk steps in order, emitting TapeOps that preserve the original
+    //    malloc/free/recycle/dispatch interleaving.  This lets freed buffers
+    //    return to the pool *before* subsequent mallocs, reducing peak VRAM.
+    const ops: TapeOp[] = [];
+    const allocatedIdxs: number[] = [];
+    const uniformBuffers: GPUBuffer[] = [];
+    const knownSizes = new Map<number, number>();
+
+    // Indices that must not be freed (external inputs + final outputs)
+    const inputIdxSet = new Set(inputTableIdxs);
+
+    for (const step of steps) {
+      switch (step.type) {
+        case "execute": {
+          const inputIdxs = step.inputs.map((id) => idToIdx.get(id)!);
+          const outputIdxs = step.outputs.map((id) => idToIdx.get(id)!);
+
+          // Resolve pipeline
+          const exe =
+            step.source instanceof Kernel
+              ? this.prepareKernelSync(step.source)
+              : this.prepareRoutineSync(step.source);
+
+          // Create tape dispatches for each shader dispatch in the executable
+          for (const { pipeline, ...shader } of exe.data) {
+            const filteredPasses = shader.passes.filter(
+              (p) => prod(p.grid) > 0,
+            );
+            if (filteredPasses.length === 0) continue;
+
+            const bindGroupLayout = pipeline.getBindGroupLayout(0);
+
+            // Pre-build uniform bind group for static uniforms
+            let uniformBindGroup: GPUBindGroup | null = null;
+            let uniformAlignment = 0;
+
+            if (shader.hasUniform) {
+              const uniforms = filteredPasses.map((p) => p.uniform!);
+              const [uniformBuffer, alignment] = combineUniforms(
+                this.device,
+                uniforms,
+              );
+              uniformBuffers.push(uniformBuffer);
+              uniformAlignment = alignment;
+              uniformBindGroup = this.device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(1),
+                entries: [
+                  {
+                    binding: 0,
+                    resource: { buffer: uniformBuffer, size: alignment },
+                  },
+                ],
+              });
+            }
+
+            ops.push({
+              type: "dispatch",
+              dispatch: {
+                pipeline,
+                bindGroupLayout,
+                inputIdxs,
+                outputIdxs,
+                passes: filteredPasses.map((p) => ({ grid: p.grid })),
+                uniformBindGroup,
+                uniformAlignment,
+              },
+            });
+          }
+          break;
+        }
+        case "malloc": {
+          const idx = nextIdx++;
+          idToIdx.set(step.output, idx);
+          const size = step.size as number;
+          const paddedSize = Math.ceil(size / 4) * 4;
+          knownSizes.set(idx, size);
+          allocatedIdxs.push(idx);
+          ops.push({
+            type: "malloc",
+            malloc: {
+              tableIdx: idx,
+              paddedSize,
+              originalSize: size,
+              initialData:
+                (step.initialData as Uint8Array<ArrayBuffer>) ?? null,
+            },
+          });
+          break;
+        }
+        case "free": {
+          const idx = idToIdx.get(step.input)!;
+          // Don't free external inputs or outputs
+          if (!inputIdxSet.has(idx)) {
+            ops.push({ type: "free", tableIdx: idx });
+          }
+          break;
+        }
+        case "recycle": {
+          const fromIdx = idToIdx.get(step.input)!;
+          const toIdx = nextIdx++;
+          idToIdx.set(step.output, toIdx);
+          const fromSize = knownSizes.get(fromIdx);
+          if (fromSize !== undefined) knownSizes.set(toIdx, fromSize);
+          ops.push({ type: "recycle", fromIdx, toIdx });
+          break;
+        }
+      }
+    }
+
+    // 3. Build output mapping and filter out output frees from ops
+    const outputTableIdxs = outputIds.map((id) => idToIdx.get(id)!);
+    const outputIdxSet = new Set(outputTableIdxs);
+    const safeOps = ops.filter(
+      (op) => op.type !== "free" || !outputIdxSet.has(op.tableIdx),
+    );
+
+    return {
+      ops: safeOps,
+      tableSize: nextIdx,
+      inputTableIdxs,
+      outputTableIdxs,
+      allocatedIdxs,
+      uniformBuffers,
+    };
+  }
+
+  /**
+   * Execute a pre-compiled command tape with the given input slots.
+   *
+   * Each intermediate gets its own pooled GPUBuffer. Dispatches use bind group
+   * caching (O9b) — when the pool returns the same GPUBuffer objects as the
+   * previous invocation (common with LIFO pool ordering), the cached bind
+   * group is reused, skipping `device.createBindGroup()`.
+   *
+   * Error-safe: if any step throws, all allocated GPU buffers are cleaned up.
+   */
+  executeCommandTape(tape: WebGPUCommandTape, inputSlots: Slot[]): Slot[] {
+    // Parallel arrays indexed by table position:
+    //   buffers[i] — GPUBuffer for this table entry
+    //   sizes[i]   — original (unpadded) byte size for output slot creation
+    const buffers: GPUBuffer[] = new globalThis.Array(tape.tableSize);
+    const sizes: number[] = new globalThis.Array(tape.tableSize);
+
+    // Map external inputs
+    for (let i = 0; i < inputSlots.length; i++) {
+      const { buffer, size } = this.#getBuffer(inputSlots[i]);
+      const idx = tape.inputTableIdxs[i];
+      buffers[idx] = buffer;
+      sizes[idx] = size;
+    }
+
+    // Track allocated buffers for error cleanup.
+    const allocs: GPUBuffer[] = [];
+    // Buffers freed mid-tape must NOT be destroyed until after queue.submit()
+    // because earlier dispatches in the same GPUCommandEncoder still reference
+    // them.  Defer destruction to post-submit.
+    const deferredDestroys: GPUBuffer[] = [];
+    // Track buffers pushed to pool during this tape execution so we can
+    // remove them on error (prevents pool poisoning with destroyed refs).
+    const pooledDuringTape: GPUBuffer[] = [];
+    let submitted = false;
+
+    try {
+      const encoder = this.device.createCommandEncoder();
+
+      for (const op of tape.ops) {
+        switch (op.type) {
+          case "malloc": {
+            const m = op.malloc;
+            if (m.paddedSize === 0) {
+              buffers[m.tableIdx] = this.#reusableZsb;
+            } else {
+              let buf: GPUBuffer;
+              if (m.initialData) {
+                // Always create fresh mapped buffers for initialData: a pooled
+                // buffer may have been written by an earlier dispatch in this
+                // same encoder, and queue.writeBuffer() executes BEFORE the
+                // encoder's dispatches — so the dispatch would overwrite the
+                // constant data.
+                buf = this.#createBuffer(m.paddedSize, { mapped: true });
+                new Uint8Array(
+                  buf.getMappedRange(),
+                  0,
+                  m.initialData.byteLength,
+                ).set(m.initialData);
+                buf.unmap();
+              } else {
+                buf =
+                  this.#poolPop(m.paddedSize) ??
+                  this.#createBuffer(m.paddedSize);
+              }
+              buffers[m.tableIdx] = buf;
+              allocs.push(buf);
+            }
+            sizes[m.tableIdx] = m.originalSize;
+            break;
+          }
+          case "free": {
+            const buf = buffers[op.tableIdx];
+            if (buf && buf !== this.#reusableZsb) {
+              if (!this.#poolPush(buf)) {
+                deferredDestroys.push(buf);
+              } else {
+                pooledDuringTape.push(buf);
+              }
+            }
+            break;
+          }
+          case "recycle":
+            buffers[op.toIdx] = buffers[op.fromIdx];
+            sizes[op.toIdx] = sizes[op.fromIdx];
+            break;
+          case "dispatch": {
+            const d = op.dispatch;
+            const numIn = d.inputIdxs.length;
+            const numOut = d.outputIdxs.length;
+            const totalBindings = numIn + numOut;
+
+            // O9b: bind group cache — reuse when all referenced GPUBuffers
+            // are the same objects as the previous invocation (common with
+            // pool LIFO ordering returning the same buffers).
+            let bindGroup: GPUBindGroup;
+            let cacheHit = false;
+            const cached = d._bgCache;
+            if (cached && cached.key.length === totalBindings) {
+              cacheHit = true;
+              for (let j = 0; j < numIn; j++) {
+                if (cached.key[j] !== buffers[d.inputIdxs[j]]) {
+                  cacheHit = false;
+                  break;
+                }
+              }
+              if (cacheHit) {
+                for (let j = 0; j < numOut; j++) {
+                  if (cached.key[numIn + j] !== buffers[d.outputIdxs[j]]) {
+                    cacheHit = false;
+                    break;
+                  }
+                }
+              }
+            }
+
+            if (cacheHit) {
+              bindGroup = cached!.value;
+            } else {
+              const entries: GPUBindGroupEntry[] = new globalThis.Array(
+                totalBindings,
+              );
+              for (let i = 0; i < numIn; i++) {
+                const idx = d.inputIdxs[i];
+                entries[i] = {
+                  binding: i,
+                  resource: { buffer: buffers[idx] },
+                };
+              }
+              for (let i = 0; i < numOut; i++) {
+                const idx = d.outputIdxs[i];
+                entries[numIn + i] = {
+                  binding: numIn + i,
+                  resource: { buffer: buffers[idx] },
+                };
+              }
+              bindGroup = this.device.createBindGroup({
+                layout: d.bindGroupLayout,
+                entries,
+              });
+
+              // Cache the bind group keyed by GPUBuffer identity
+              const key: GPUBuffer[] = new globalThis.Array(totalBindings);
+              for (let i = 0; i < numIn; i++) key[i] = buffers[d.inputIdxs[i]];
+              for (let i = 0; i < numOut; i++)
+                key[numIn + i] = buffers[d.outputIdxs[i]];
+              d._bgCache = { key, value: bindGroup };
+            }
+
+            for (let i = 0; i < d.passes.length; i++) {
+              const pe = _beginComputePass(encoder, this.#profiling);
+              pe.setPipeline(d.pipeline);
+              pe.setBindGroup(0, bindGroup);
+              if (d.uniformBindGroup) {
+                pe.setBindGroup(1, d.uniformBindGroup, [
+                  i * d.uniformAlignment,
+                ]);
+              }
+              pe.dispatchWorkgroups(d.passes[i].grid[0], d.passes[i].grid[1]);
+              _dispatchCount++;
+              pe.end();
+            }
+            break;
+          }
+        }
+      }
+
+      this.device.queue.submit([encoder.finish()]);
+      submitted = true;
+    } finally {
+      if (!submitted) {
+        // Remove buffers pushed to pool during this (failed) tape execution
+        // to prevent pool poisoning (destroyed GPUBuffer refs in pool).
+        for (const buf of pooledDuringTape) {
+          this.#poolRemove(buf);
+        }
+        for (const buf of allocs) {
+          if (buf !== this.#reusableZsb) {
+            this.#gpuAllocatedBytes -= buf.size;
+            buf.destroy();
+          }
+        }
+      }
+    }
+
+    // Now safe to destroy buffers that couldn't fit in the pool — the command
+    // buffer has been submitted, so references are no longer live.
+    for (const buf of deferredDestroys) {
+      this.#gpuAllocatedBytes -= buf.size;
+      buf.destroy();
+    }
+
+    // Create output slots
+    const outputs: Slot[] = new globalThis.Array(tape.outputTableIdxs.length);
+    for (let i = 0; i < tape.outputTableIdxs.length; i++) {
+      const idx = tape.outputTableIdxs[i];
+      const slot = this.nextSlot++;
+      this.buffers.set(slot, {
+        buffer: buffers[idx],
+        size: sizes[idx],
+        ref: 1,
+      });
+      outputs[i] = slot;
+    }
+    return outputs;
   }
 
   // ---------------------------------------------------------------------------
@@ -2033,13 +2530,115 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         { binding: 2, resource: { buffer: updBuf } },
       ],
     });
-    const pass = commandEncoder.beginComputePass();
+    const pass = _beginComputePass(commandEncoder, this.#profiling);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(gridX, gridY);
     _dispatchCount++;
     pass.end();
     this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Decoupled Fallback prefix scan (T0: single-dispatch O(N) scan)
+  // ---------------------------------------------------------------------------
+  #dfScanPipelineCache = new Map<string, GPUComputePipeline>();
+
+  dispatchDecoupledFallbackScan(
+    input: Slot,
+    output: Slot,
+    N: number,
+    op: AluOp,
+    dtype: DType,
+    blockSize: number,
+  ): void {
+    const M = Math.ceil(N / blockSize);
+
+    // Get or create pipeline
+    const cacheKey = `df_scan_${op}_${dtype}_${blockSize}`;
+    let pipeline = this.#dfScanPipelineCache.get(cacheKey);
+    if (!pipeline) {
+      const code = generateDecoupledFallbackScanShader(
+        op as DFScanOp,
+        dtype as DFScanDtype,
+        blockSize,
+      );
+      const shaderModule = this.device.createShaderModule({ code });
+      const layout = this.device.createPipelineLayout({
+        bindGroupLayouts: [
+          this.device.createBindGroupLayout({
+            entries: [
+              {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "read-only-storage" },
+              },
+              {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "storage" },
+              },
+              {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "storage" },
+              },
+              {
+                binding: 3,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "uniform" },
+              },
+            ],
+          }),
+        ],
+      });
+      pipeline = this.device.createComputePipeline({
+        layout,
+        compute: { module: shaderModule, entryPoint: "main" },
+      });
+      this.#dfScanPipelineCache.set(cacheKey, pipeline);
+    }
+
+    // Allocate descriptor buffer (M u32s, will be zeroed via clearBuffer)
+    const descBytes = Math.max(M * 4, 4); // at least 4 bytes
+    const descSlot = this.malloc(descBytes);
+
+    // Allocate uniform buffer for params (N)
+    // Minimum allocation: 256 bytes (minUniformBufferOffsetAlignment)
+    const uniformSlot = this.malloc(256);
+    const uniformBuf = this.#getBuffer(uniformSlot).buffer;
+    this.device.queue.writeBuffer(uniformBuf, 0, new Uint32Array([N]).buffer);
+
+    // Build command buffer: clearBuffer(descriptors) → computePass
+    const commandEncoder = this.device.createCommandEncoder();
+    commandEncoder.clearBuffer(this.#getBuffer(descSlot).buffer, 0, descBytes);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.#getBuffer(input).buffer } },
+        { binding: 1, resource: { buffer: this.#getBuffer(output).buffer } },
+        {
+          binding: 2,
+          resource: {
+            buffer: this.#getBuffer(descSlot).buffer,
+            size: descBytes,
+          },
+        },
+        { binding: 3, resource: { buffer: uniformBuf, size: 256 } },
+      ],
+    });
+    const pass = _beginComputePass(commandEncoder, this.#profiling);
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(M);
+    _dispatchCount++;
+    pass.end();
+    this.device.queue.submit([commandEncoder.finish()]);
+
+    // Free temporary buffers
+    this.decRef(descSlot);
+    this.decRef(uniformSlot);
   }
 
   #createBuffer(
@@ -3295,6 +3894,7 @@ function pipelineSubmit(
   dynamicParams?: number[],
   batchEncoder?: GPUCommandEncoder,
   batchUniformCollector?: GPUBuffer[],
+  profiling?: _ProfilingState | null,
 ) {
   const commandEncoder = batchEncoder ?? device.createCommandEncoder();
   const uniformBuffersToDestroy: GPUBuffer[] = [];
@@ -3396,7 +3996,7 @@ function pipelineSubmit(
 
     for (let i = 0; i < filteredPasses.length; i++) {
       const grid = symbolicGrid ?? filteredPasses[i].grid;
-      const passEncoder = commandEncoder.beginComputePass();
+      const passEncoder = _beginComputePass(commandEncoder, profiling);
       passEncoder.setPipeline(pipeline);
       passEncoder.setBindGroup(0, bindGroup);
       if (uniformBindGroup)

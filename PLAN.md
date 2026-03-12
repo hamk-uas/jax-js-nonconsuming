@@ -757,10 +757,10 @@ expressed as jaxpr-traceable ops for small matrices, enabling fusion?
 | Routine              | Algorithm for small n                  | Ops used                                | Complexity (n=4) | Feasible?                                                         |
 | -------------------- | -------------------------------------- | --------------------------------------- | ---------------- | ----------------------------------------------------------------- |
 | **inv** (n ≤ 4)      | Cramer's rule (adjugate/det)           | mul, sub, neg, reciprocal, stack        | ~120 mul+add     | **Done** ✅                                                       |
-| **cholesky** (n ≤ 4) | Cholesky-Banachiewicz, unrolled        | mul, sub, div, sqrt                     | ~30 ops          | **Yes**                                                           |
-| **trisolve** (n ≤ 4) | Back/forward substitution, unrolled    | mul, sub, div                           | ~20 ops          | **Yes**                                                           |
+| **cholesky** (n ≤ 4) | Cholesky-Banachiewicz, unrolled        | mul, sub, div, sqrt                     | ~30 ops          | **Done** ✅                                                       |
+| **trisolve** (n ≤ 4) | Back/forward substitution, unrolled    | mul, sub, div                           | ~20 ops          | **Done** ✅ (limit=8)                                             |
 | **LU** (n ≤ 4)       | Gaussian elimination with pivoting     | mul, sub, div, argmax, swap             | ~40 ops          | **Tricky** — pivoting requires data-dependent control flow        |
-| **QR** (n ≤ 4)       | Householder reflections, unrolled      | mul, sub, div, sqrt, dot, outer product | ~60 ops          | **Yes** (no data-dependent branching for thin QR)                 |
+| **QR** (n ≤ 4)       | Householder reflections, unrolled      | mul, sub, div, sqrt, dot, outer product | ~60 ops          | **Done** ✅ (limit=8)                                             |
 | **inv** (n = 5)      | Cramer's rule (5×5 cofactor expansion) | mul, sub, neg, reciprocal, stack        | ~720 terms       | **Marginal** — large trace graph, may exceed JIT cache efficiency |
 
 **LU is the hardest** because partial pivoting (`argmax` + row swap) introduces data-dependent
@@ -770,11 +770,11 @@ variant uses QR + TriangularSolve, not LU.
 
 ### Impact on DLM variants
 
-| DLM variant            | Linalg ops in compose body | Current state                      | With analytical paths |
-| ---------------------- | -------------------------- | ---------------------------------- | --------------------- |
-| Standard (5-tuple)     | `np.linalg.inv`            | **Fuses for m ≤ 4** (already done) | No change needed      |
-| Sqrt forward (3-tuple) | QR + trisolve              | **Never fuses** (Routines)         | **Fuses for m ≤ 4**   |
-| Sqrt backward          | QR                         | **Never fuses** (Routine)          | **Fuses for m ≤ 4**   |
+| DLM variant            | Linalg ops in compose body | Current state                      | With analytical paths     |
+| ---------------------- | -------------------------- | ---------------------------------- | ------------------------- |
+| Standard (5-tuple)     | `np.linalg.inv`            | **Fuses for m ≤ 4** (already done) | No change needed          |
+| Sqrt forward (3-tuple) | QR + trisolve              | **Fuses for m ≤ 8** (done)         | All paths fusable for m≤4 |
+| Sqrt backward          | QR                         | **Fuses for m ≤ 8** (done)         | All paths fusable for m≤4 |
 
 The sqrt DLM variant (`composeSqrtForward`, `composeSqrtBackward`) is numerically more stable than
 the standard variant for poorly conditioned systems. Enabling it to fuse on WebGPU for small m
@@ -967,14 +967,24 @@ This achieves **single-dispatch, memory-bandwidth-saturating performance** on al
 
 1. **Reference:** Start from Thomas Smith's `GPUPrefixSums` WGSL implementation (MIT license). Adapt
    the Decoupled Fallback shader structure to our codegen pipeline.
-2. **Phase 1 — scalar ops:** Implement for `add`, `mul`, `min`, `max` on f32/i32/u32.
-   Single-dispatch kernel with workgroup-local raking scan → atomic publish → bounded lookback →
-   apply prefix. Detect eligible ops in `prepareAssocScanPlan`.
+2. **Phase 1 — scalar ops: ✅ DONE.** Implemented for `add`, `mul`, `min`, `max` on f32.
+   Single-dispatch kernel with workgroup-local Hillis-Steele scan → atomic publish → bounded
+   lookback with work-stealing fallback → apply prefix. Detected in `buildNativeAssocScanPlan` via
+   `detectDecoupledFallbackOp`. Descriptor packing: 2-bit flag + 30-bit value in single
+   `atomic<u32>`. u32 excluded (30-bit packing silently truncates values > 2^30-1). i32 deferred
+   (pre-existing WebGPU i32 workgroup-memory scan bug).
 3. **Phase 2 — general bodies:** Extend to arbitrary associative functions using a per-block
    descriptor buffer. The lookback subgroup fetches raw input tiles and re-evaluates the body
    function when fallback triggers.
-4. **Integration:** Add `"decoupled-fallback"` as a new `AssocScanPath`. Keep Kogge-Stone as
-   fallback for bodies that can't be adapted or for backends without atomics.
+4. **Integration:** `"decoupled-fallback"` added to `AssocScanPlan`. Kogge-Stone block-map path
+   remains for bodies that can't use DF (pytree, non-scalar, axis > 0) or for backends without
+   atomics.
+
+**Phase 1 remaining opportunities:**
+
+- Subgroup-parallel lookback (first subgroup instead of thread 0 only)
+- Raking pattern: multiple elements per thread for better bandwidth utilization
+- i32 support (blocked by pre-existing WebGPU i32 shmem scan bug)
 
 #### References
 
@@ -985,32 +995,36 @@ This achieves **single-dispatch, memory-bandwidth-saturating performance** on al
 
 ### Tier 1: Remaining subgroup builtins (available now, Chrome 134+)
 
-#### 1a. `subgroupInclusiveAdd` / `subgroupInclusiveMul` for associative scan
+#### 1a. `subgroupInclusiveAdd` / `subgroupInclusiveMul` for associative scan — **Done** ✅
 
 **What:** Replace the innermost Kogge-Stone rounds within a subgroup with a single hardware
 instruction. For `subgroup_size = 32`, the first 5 rounds of Kogge-Stone (doubling 1→2→4→8→16→32)
 are replaced by one `subgroupInclusiveAdd()` call.
 
-**Where:** `associativeScan` WebGPU fused shader — the per-round Kogge-Stone loop in
-`nativeScanMultiShaderSource` / block-map fused path.
+**Where:** `associativeScan` WebGPU fused shader — the per-round Kogge-Stone loop in the block-map
+fused path.
 
 **Impact:** For cumulative sum/product with N=1024, blockSize=256: each block has 8 subgroups of 32.
-Currently 8 Kogge-Stone rounds per block (log₂ 256). With subgroup inclusive scan, rounds 0–4 are
-free, leaving only 3 inter-subgroup rounds. **~40% fewer barrier-separated shader rounds.**
+With subgroup inclusive scan, rounds 0–4 are free, leaving only 3 inter-subgroup shmem rounds.
+**~40% fewer barrier-separated shader rounds.**
 
 **Prerequisites:** Body function must be a simple associative op (`add` or `mul`) that maps directly
 to the hardware builtin. For pytree bodies (DLM compose), the body is a general function — the
 inclusive scan builtin doesn't help unless we can decompose the body into scalar associative ops.
 
-**Implementation sketch:**
+**Implementation (completed):**
 
-1. In `runFusedPlan` Phase 1, detect if the body is pure `add` or `mul`
-2. If so, emit `subgroupInclusiveAdd(val)` for the first log₂(subgroup_size) rounds
-3. After the intra-subgroup prefix, the last invocation in each subgroup writes its result to shmem
-4. Continue normal inter-subgroup Kogge-Stone for the remaining rounds
-5. Requires `enable subgroups;` already present
+1. `WorkgroupAssocScanInfo.scalarOp` detects scalar `Add` or `Mul` bodies at analysis time (single
+   kernel, single elem, elemCount=1, no reduction, no constants)
+2. `emitInclusiveScanSection()` emits `subgroupInclusiveAdd(val)` / `subgroupInclusiveMul(val)` for
+   the first 5 rounds (assuming sg_size ≥ 32)
+3. 3-way runtime branch: `sg_size >= 32` → inclusive scan, `sg_size >= 8` → shuffle fallback, else
+   pure shmem. All branches keep ping/pong parity deterministic.
+4. After the intra-subgroup prefix, the result is written to the correct shmem buffer and normal
+   inter-subgroup Kogge-Stone continues for the remaining rounds
+5. Applies to all numeric dtypes (f32, f16, i32, u32) — broader than DF which is f32 only
 
-#### 1b. `subgroupShuffle` / `subgroupShuffleUp` for associative scan (general bodies)
+#### 1b. `subgroupShuffle` / `subgroupShuffleUp` for associative scan (general bodies) — **Done** ✅
 
 **What:** For general associative bodies (not just add/mul), replace `var<workgroup>` reads within a
 Kogge-Stone round with register-to-register shuffles. Each thread gets its neighbor's value via
@@ -1018,28 +1032,52 @@ Kogge-Stone round with register-to-register shuffles. Each thread gets its neigh
 
 **Where:** Same as 1a, but applicable to ALL associative scan bodies including DLM compose.
 
-**Impact:** Eliminates shmem traffic for the first log₂(subgroup_size) rounds. For DLM 2-tuple N=100
-(1 dispatch, 1 block), this removes 5 of 8 shmem barrier pairs. The shmem barrier cost is small
-relative to the actual compute, but for small bodies this could yield **10–20% improvement**.
+**Impact:** Eliminates shmem traffic for the first 3 Kogge-Stone rounds when sg_size ≥ 8. For DLM
+2-tuple N=100 (1 dispatch, 1 block, 8 rounds), this removes 3 of 8 shmem barrier pairs. The shmem
+barrier cost is small relative to the actual compute, but for small bodies this could yield **10–20%
+improvement**.
 
-**Implementation sketch:**
+**Measured impact (dlm-js Nile m=2 model, RTX 4070 Ti SUPER):**
 
-1. For rounds where `offset < subgroup_size`, emit `subgroupShuffleUp` instead of shmem write+read
-2. The body function operates on register-resident values — no shmem allocation needed for these
-   rounds
-3. After subgroup-local rounds complete, fall back to shmem path for inter-subgroup communication
-4. `subgroupShuffleUp(val, offset)` requires `offset` to be dynamically uniform or compile-time
-   constant — in Kogge-Stone, the offset per round is a constant power of 2, so this works
+| N         | v0.8.2 baseline (ms) | 59f03a6 + subgroups (ms) | Δ     |
+| --------- | -------------------- | ------------------------ | ----- |
+| 100       | 1,275                | 1,286                    | +0.9% |
+| 102,400   | 2,462                | 2,464                    | +0.1% |
+| 819,200   | 6,087                | 5,997                    | −1.5% |
+| 1,638,400 | 9,886                | 9,918                    | +0.3% |
 
-#### 1c. `subgroupBroadcast` for scan carry / block-map constants
+No measurable speedup. For the Nile m=2 model the compose body is so small that shmem barriers
+aren't the bottleneck — dispatch overhead and compilation time dominate. Subgroups may show more
+benefit on larger state dimensions (m ≥ 5) where the compose body is heavier.
+
+**Implementation (completed):**
+
+1. All-or-nothing runtime guard: `if (sg_size >= 8u)` wraps the entire subgroup path. Either all 3
+   register rounds execute (and the remaining rounds use shmem starting from round 3), or the pure
+   shmem path handles all rounds. This keeps ping/pong buffer parity deterministic in both branches.
+2. Shared emitter (`emitWasRoundBody`): both subgroup and shmem paths call the same helper with
+   different resolve/write callbacks, eliminating ~200 lines of codegen duplication.
+3. Register variables (`var<private>`) hold leaf values during subgroup phase
+4. Compose body called via `emitWasRoundBody` with register-based callbacks — "a" reads shuffled
+   registers, "b" reads current registers
+5. After subgroup rounds: flush registers to shmem + single `workgroupBarrier()`
+6. Remaining rounds use existing shmem Kogge-Stone path (starting from round `sgRounds`)
+7. Both reduction kernel (gidx loop + ridx accumulation) and elementwise kernel paths supported
+8. `@builtin(subgroup_invocation_id) sg_inv_id: u32` added to entry point when active
+
+#### 1c. `subgroupBroadcast` for scan carry / block-map constants — Assessed, deferred
 
 **What:** Broadcast a value from one invocation to all others in the subgroup without shmem.
 
 **Where:** Block-map Phase 4 (apply-prefix) where the scanned carry is broadcast to all threads in a
 workgroup. Also useful for broadcasting uniform values like block indices.
 
-**Impact:** Minor — the broadcast step is a small fraction of total compute. Clean architectural
-improvement.
+**Assessment:** No measurable benefit. All our broadcast patterns are workgroup-wide (workgroupSize
+64–256 > subgroupSize 16–64), and `subgroupBroadcast` only works within a single subgroup. The main
+candidates: (1) block-map point inputs — redundant global loads are coalesced by GPU L1 cache, (2)
+routine pivot/diagonal broadcasts (`x_j`, `L_jj`, `pivot_val`) — workgroup-wide via
+`var<workgroup>`, can't replace with subgroup-only broadcast, (3) decoupled fallback `shared_prefix`
+— same. Adding subgroupBroadcast would increase codegen complexity for zero gain.
 
 ### Tier 2: Cooperative Matrix / WMMA (not yet available in Chrome)
 
@@ -1100,47 +1138,41 @@ throughput increase.**
 5. **Fallback:** Keep current scalar tiled matmul as fallback when cooperative matrix is
    unavailable.
 
-### Tier 3: Timestamp queries for profiling
+### Tier 3: Timestamp queries for profiling ✅
 
 **What:** `timestamp-query` feature allows GPU-side timing of compute passes. Already in WebGPU spec
-(Chrome 121+), not yet wired up in jax-js.
+(Chrome 121+).
 
-**Where:** `pipelineSubmit` / `commandEncoder.beginComputePass` — record timestamps before/after
-each dispatch.
-
-**Impact:** Enables accurate per-kernel GPU timing without CPU round-trip overhead. Critical for
-validating that subgroup/WMMA optimizations actually improve wall-clock GPU time (vs just reducing
-dispatch count). Would replace the indirect "dispatch count" proxy we currently use for WebGPU
-performance analysis.
-
-**Implementation:** Add `profiling: boolean` option to `JitProgram.execute()`. When enabled, insert
-timestamp queries around each dispatch, readback the query buffer after execution, and return
-per-step timing data.
+**Implementation:** Module-level profiling state (`_profilingQuerySet`, `_profilingPassIdx`) with
+`_beginComputePass()` wrapper injects `timestampWrites` into all 9 compute pass creation sites.
+`WebGPUBackend.startProfiling()` / `stopProfiling()` manage the query set lifecycle. Public API:
+`profileGpu(fn)` returns `{ result, timing: GpuTimingResult }` with per-pass `durationMs` and
+wall-clock `totalMs`. Zero overhead when not profiling (`_profilingTimestampWrites()` returns
+`undefined`).
 
 ### Priority ordering
 
-| ID  | Feature                           | Availability | Impact        | Effort |
-| --- | --------------------------------- | ------------ | ------------- | ------ |
-| T0  | Decoupled Fallback prefix scan    | Now          | **Very High** | High   |
-| T3  | Timestamp queries                 | Now          | Diagnostic    | Low    |
-| 1b  | `subgroupShuffleUp` in assocScan  | Now          | Medium        | Medium |
-| 1a  | `subgroupInclusive*` in assocScan | Now          | Medium        | Medium |
-| 1c  | `subgroupBroadcast` cleanup       | Now          | Low           | Low    |
-| 2   | Cooperative matrix tiled matmul   | ~2026        | **Very High** | High   |
+| ID  | Feature                           | Availability | Impact        | Effort               |
+| --- | --------------------------------- | ------------ | ------------- | -------------------- |
+| T0  | Decoupled Fallback prefix scan    | Now          | **Very High** | **Done** ✅          |
+| T3  | Timestamp queries                 | Now          | Diagnostic    | **Done** ✅          |
+| 1b  | `subgroupShuffleUp` in assocScan  | Now          | Medium        | **Done** ✅          |
+| 1a  | `subgroupInclusive*` in assocScan | Now          | Medium        | **Done** ✅          |
+| 1c  | `subgroupBroadcast` cleanup       | Now          | Low           | Assessed: no benefit |
+| 2   | Cooperative matrix tiled matmul   | ~2026        | **Very High** | High                 |
 
-**Priority rationale:** Decoupled Fallback (T0) is the highest-impact item because it reduces
-associative scan from O(N log N) to O(N) work and from O(log N) to O(1) dispatches. For large N this
-is transformative. Timestamp queries (T3) are low-effort and provide the diagnostic infrastructure
-to validate T0's impact. The subgroup shuffle optimizations (1a, 1b) become less critical once
-Decoupled Fallback replaces the Kogge-Stone inner loop — but remain valuable for the
-within-workgroup raking scan phase of the Decoupled Fallback itself.
+**Priority rationale:** T0, 1a, 1b, T3 are complete. 1c assessed — all broadcast patterns are
+workgroup-wide; `subgroupBroadcast` (subgroup-only) provides no measurable improvement over L1
+cached reads. Cooperative matrix (2) is blocked on WGSL spec.
 
-**Next action:** Implement T3 (timestamp queries) for accurate GPU profiling, then T0 (Decoupled
-Fallback for scalar ops). Reference: `GPUPrefixSums` by Thomas Smith.
+**Next action:** All P7 subgroup items are complete or assessed. Cooperative matrix (2) is blocked
+on Chrome WGSL spec stability (~2026).
 
 ---
 
-## O8: WebGPU Command Tape (Mega-Module Equivalent)
+## O8: WebGPU Command Tape (Mega-Module Equivalent) ✅
+
+**Status:** Implemented in commits `3ce29ae` (O8a core) and `caa3974` (tech debt fixes).
 
 ### Problem statement
 
@@ -1520,7 +1552,12 @@ statically known.
 
 ---
 
-## O9: WebGPU Arena Allocator
+## O9: WebGPU Bind Group Caching
+
+**Status:** O9a (arena slab) reverted — WebGPU spec prohibits a GPUBuffer from appearing in both
+read-only-storage and storage bindings within a single compute pass (buffer-identity-level
+validation). O9b (bind group caching via pool LIFO identity) in commit `fc3ebfc`. O9c shelved
+(depends on O9a).
 
 ### Problem statement
 
@@ -1625,11 +1662,11 @@ Only JitProgram-internal intermediates (malloc→use→free within one execution
 
 ### Implementation phases
 
-| Phase | Scope                                          | Effort | Depends on |
-| ----- | ---------------------------------------------- | ------ | ---------- |
-| O9a   | Slab allocator for JitProgram locals           | Medium | O8a        |
-| O9b   | Pre-built bind groups for arena slots          | Small  | O9a        |
-| O9c   | Constants slab (persistent across invocations) | Small  | O9a        |
+| Phase | Scope                                          | Effort | Depends on | Status                                  |
+| ----- | ---------------------------------------------- | ------ | ---------- | --------------------------------------- |
+| O9a   | Slab allocator for JitProgram locals           | Medium | O8a        | **Reverted** (WebGPU spec violation)    |
+| O9b   | Bind group caching (GPUBuffer identity key)    | Small  | Pool LIFO  | **Done** ✅                             |
+| O9c   | Constants slab (persistent across invocations) | Small  | O9a        | Shelved (blocked on O9a or double-slab) |
 
 ### Risks
 
@@ -1662,9 +1699,9 @@ high per-dispatch JS overhead**. The following optimizations form a coherent acc
 
 | ID       | Optimization            | Target                            | Impact estimate         | Status          |
 | -------- | ----------------------- | --------------------------------- | ----------------------- | --------------- |
-| **O8a**  | Command tape            | JS loop overhead (95ms)           | 95ms → ~2ms (**47×**)   | Planned         |
-| **O8b**  | Bind group caching      | createBindGroup (6ms)             | 6ms → ~3ms (fragile)    | Planned         |
-| **O9**   | Arena allocator         | createBindGroup + cache stability | 6ms → ~1ms (reliable)   | Planned         |
+| **O8a**  | Command tape            | JS loop overhead (95ms)           | 95ms → ~2ms (**47×**)   | **Done** ✅     |
+| **O9a**  | Arena allocator         | createBindGroup + cache stability | 6ms → ~1ms (reliable)   | **Reverted** ⚠️ |
+| **O9b**  | Bind group caching      | createBindGroup (6ms)             | 6ms → ~3ms (pool LIFO)  | **Done** ✅     |
 | **O6**   | Multi-reduction kernels | Dispatch count (~764)             | ~5-15% fewer dispatches | Deprioritized   |
 | **A-L**  | Analytical linalg (n≤4) | Routine fusion barriers           | Enables sqrt DLM fusion | Medium priority |
 | **T0**   | Decoupled Fallback scan | Scan dispatch count (log N → 1)   | ~0.05ms (3→1 dispatch)  | High priority   |
@@ -1676,7 +1713,7 @@ high per-dispatch JS overhead**. The following optimizations form a coherent acc
 | ------------------------ | ------------- | -------------------- | --------------- |
 | Current                  | 124 ms        | ~15 ms               | ~50 ms          |
 | + O8a (command tape)     | ~30 ms        | ~5 ms                | ~15 ms          |
-| + O9 (arena)             | ~25 ms        | ~4 ms                | ~12 ms          |
+| + O9b (BG cache)         | ~27 ms        | ~4.5 ms              | ~13 ms          |
 | + Analytical linalg (≤4) | ~25 ms\*      | ~4 ms                | ~12 ms          |
 | + WMMA (future)          | ~15 ms        | ~2 ms                | ~6 ms           |
 

@@ -10,12 +10,34 @@ import {
   Reduction,
 } from "../alu";
 import { Backend, Slot } from "../backend";
+import { aluCompare, PendingExecute } from "./array";
+import { executeBlockMap } from "./block-map-executor";
+import {
+  _registerCacheSizeGetter,
+  _registerJitCacheDisposer,
+} from "./check-leaks";
+import { pool, poolTranspose, prepareConv } from "./convolution";
+import {
+  Primitive,
+  PrimitiveParams,
+  promoteAvals,
+  routinePrimitives,
+  ShapedArray,
+} from "./core";
+import { type Atom, Jaxpr, JaxprEqn, Lit, Var } from "./jaxpr";
+import { executeAssociativeScan, executeScan } from "./scan-executor";
+import { planAssociativeScan, planScan } from "./scan-plan";
 import type { WasmBackend } from "../backend/wasm";
 import {
   canCompileToMegaModule,
   compileToMegaModule,
   type WasmMegaModule,
 } from "../backend/wasm/mega-module";
+import type { WebGPUBackend } from "../backend/webgpu";
+import {
+  canCompileToCommandTape,
+  type WebGPUCommandTape,
+} from "../backend/webgpu/command-tape";
 import { PPrint } from "../pprint";
 import { Routine } from "../routine";
 import {
@@ -42,24 +64,7 @@ import {
   range,
   rep,
 } from "../utils";
-import { aluCompare, PendingExecute } from "./array";
-import { executeBlockMap } from "./block-map-executor";
-import {
-  _registerCacheSizeGetter,
-  _registerJitCacheDisposer,
-} from "./check-leaks";
-import { pool, poolTranspose, prepareConv } from "./convolution";
-import {
-  Primitive,
-  PrimitiveParams,
-  promoteAvals,
-  routinePrimitives,
-  ShapedArray,
-} from "./core";
-import { type Atom, Jaxpr, JaxprEqn, Lit, Var } from "./jaxpr";
-import { executeAssociativeScan, executeScan } from "./scan-executor";
 import type { AssocScanPlan, ScanPlan } from "./scan-plan";
-import { planAssociativeScan, planScan } from "./scan-plan";
 import type { ScanPath } from "../utils";
 
 /**
@@ -366,6 +371,8 @@ export class JitProgram {
   /** M6.2c: worker pool registration state for parallel mega-module dispatch.
    *  undefined = not attempted, false = registering, true = ready. */
   private _megaModulePoolReady?: boolean;
+  /** Cached command tape: undefined = not attempted, null = unsupported. */
+  private _commandTape?: WebGPUCommandTape | null;
 
   constructor(
     readonly backend: Backend,
@@ -551,6 +558,29 @@ export class JitProgram {
         // Monolithic path: orchestrator (M6.2b) or direct execution
         const outputSlots = wasmBackend.executeMegaModule(
           this._megaModule,
+          inputs,
+        );
+        return { outputs: outputSlots, pending: [] };
+      }
+    }
+
+    // Command tape fast path (WebGPU only, kernel/routine-only programs):
+    // Pre-compiles the dispatch sequence into a flat representation with
+    // pre-resolved pipelines and buffer table indices, eliminating per-step
+    // JS overhead (scope lookups, array alloc, refcounting, pipeline lookups).
+    if (this.backend.type === "webgpu") {
+      if (this._commandTape === undefined) {
+        this._commandTape = canCompileToCommandTape(this.steps)
+          ? (this.backend as WebGPUBackend).compileCommandTape(
+              this.steps,
+              this.inputs,
+              this.outputs,
+            )
+          : null;
+      }
+      if (this._commandTape) {
+        const outputSlots = (this.backend as WebGPUBackend).executeCommandTape(
+          this._commandTape,
           inputs,
         );
         return { outputs: outputSlots, pending: [] };

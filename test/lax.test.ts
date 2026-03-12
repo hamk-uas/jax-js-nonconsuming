@@ -1,23 +1,9 @@
-import {
-  defaultDevice,
-  devices,
-  grad,
-  init,
-  jit,
-  lax,
-  numpy as np,
-} from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { grad, jit, lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { expect, suite, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
 
-suite.each(devices)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite((device) => {
   const deviceHasSort = ["cpu", "wasm", "webgpu"].includes(device);
 
   if (deviceHasSort) {

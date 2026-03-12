@@ -36,6 +36,10 @@ export interface BackendCapabilities {
   readonly maxComputeWorkgroupStorageSize?: number;
   /** WebGPU: adapter architecture string (e.g. "gen-9", "xe-lpg"). */
   readonly adapterArchitecture?: string;
+  /** WebGPU: adapter vendor string (e.g. "intel", "nvidia", "apple"). */
+  readonly adapterVendor?: string;
+  /** WebGPU: true if timestamp-query feature is available. */
+  readonly timestampQuery?: boolean;
 }
 export const devices: Device[] = ["cpu", "wasm", "webgpu", "webgl"];
 
@@ -306,6 +310,43 @@ export interface Backend {
     innerBytes: number,
     dtype: DType,
   ): void;
+
+  /**
+   * Optional: Decoupled Fallback prefix scan — single-dispatch O(N) scan.
+   * Uses inter-workgroup atomics with bounded spin + work-stealing fallback.
+   * WebGPU only. Phase 1: scalar binary ops (add/mul/min/max) on f32.
+   */
+  dispatchDecoupledFallbackScan?(
+    input: Slot,
+    output: Slot,
+    N: number,
+    op: AluOp,
+    dtype: DType,
+    blockSize: number,
+  ): void;
+
+  /**
+   * Optional: begin GPU timestamp profiling.
+   * Subsequent compute passes will record per-pass timestamps.
+   * Call `stopProfiling()` to retrieve timing data.
+   */
+  startProfiling?(): void;
+
+  /**
+   * Optional: stop GPU timestamp profiling and return timing results.
+   * Resolves timestamps, reads them back, and returns per-pass GPU timing.
+   */
+  stopProfiling?(): Promise<GpuTimingResult>;
+}
+
+/** GPU timing data returned by `profileGpu`. */
+export interface GpuTimingResult {
+  /** Per-compute-pass GPU duration (nanosecond precision). */
+  passes: { durationMs: number }[];
+  /** Wall-clock GPU time from first pass start to last pass end. */
+  totalMs: number;
+  /** True if more compute passes were dispatched than the profiling buffer could record. */
+  truncated: boolean;
 }
 
 export class Executable<T = any> {

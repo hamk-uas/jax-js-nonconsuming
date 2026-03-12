@@ -844,6 +844,7 @@ function chooseTileConfig(
   const maxShmem = caps.maxComputeWorkgroupStorageSize ?? 16384;
   const bytesPerElem = dtype === DType.Float16 ? 2 : 4;
   const arch = caps.adapterArchitecture?.toLowerCase() ?? "";
+  const vendor = caps.adapterVendor?.toLowerCase() ?? "";
 
   // Gate: 64×64 tt44 (256 threads × 16 registers) causes catastrophic register
   // spill on older Intel iGPUs (gen-9, gen-11, gen-12lp — ≤32 EU), triggering
@@ -851,6 +852,16 @@ function chooseTileConfig(
   // carry-accumulation fusion eliminating the separate accumulator array.
   const isOldIntelIGPU =
     arch.startsWith("gen-") || arch === "gen_12lp" || arch === "gen_11";
+
+  // Only allow 64×64 tt44 (256 threads × 16 regs = 4096 total registers) on
+  // GPUs positively identified as having large register files. Unknown GPUs
+  // and mobile GPUs (Adreno, Mali) may suffer the same register spill as
+  // old Intel iGPUs. 32×32 tt44 (64 threads × 16 regs) is the safe default.
+  const isKnownPowerful =
+    vendor === "nvidia" ||
+    vendor === "apple" ||
+    arch.startsWith("xe-") || // Intel Arc / Meteor Lake
+    arch.startsWith("rdna"); // AMD RDNA
 
   // Candidates ordered by expected performance (best first).
   // numThreads = (Br/tt[0]) * (Bc/tt[1])
@@ -874,8 +885,10 @@ function chooseTileConfig(
 
     // Skip large tt44 (256 threads) on GPUs with insufficient register files.
     // Small tt44 (64 threads at 32×32) is safe and 1.5× faster than tt22.
-    if (isOldIntelIGPU && tt && tt[0] >= 4 && tt[1] >= 4 && numThreads >= 256)
-      continue;
+    // On unknown GPUs, also skip 64×64 to avoid catastrophic register spill.
+    if (tt && tt[0] >= 4 && tt[1] >= 4 && numThreads >= 256) {
+      if (isOldIntelIGPU || !isKnownPowerful) continue;
+    }
 
     // Estimate shmem: A tile + B tile + bank padding (~6% overhead)
     const tileA = c.Br * c.Bk * bytesPerElem;

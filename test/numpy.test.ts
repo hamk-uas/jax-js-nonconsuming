@@ -1,26 +1,17 @@
 import {
-  defaultDevice,
-  devices,
   DType,
   grad,
-  init,
   jit,
   jvp,
   lax,
   numpy as np,
   tree,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { expect, suite, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
 
-suite.each(devices)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite((device) => {
   suite("jax.numpy.sum()", () => {
     test("can take multiple axes", () => {
       using _x = np.arange(24);

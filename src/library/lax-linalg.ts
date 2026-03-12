@@ -37,11 +37,27 @@ export function cholesky(
   a: ArrayLike,
   { upper = false }: { upper?: boolean } = {},
 ): Array {
+  const arr = fudgeArray(a);
+  const n = arr.shape[arr.ndim - 1] as number;
+
+  // Pure-primitive polyfill: only inside makeJaxpr tracing (JIT/scan body)
+  // where arrays are fully abstract JaxprTracers. Produces unrolled
+  // Cholesky-Banachiewicz kernel equations instead of a Routine dispatch,
+  // enabling block-map fusion in scan/block-map bodies.
+  if (core.inMakeJaxprBody() && n <= CHOLESKY_UNROLL_LIMIT) {
+    const L = choleskyBatched(arr);
+    if (upper) {
+      using l = L;
+      return moveaxis(l, -2, -1);
+    }
+    return L;
+  }
+
   if (upper) {
-    using L = core.cholesky(a) as Array;
+    using L = core.cholesky(arr) as Array;
     return moveaxis(L, -2, -1);
   }
-  return core.cholesky(a) as Array;
+  return core.cholesky(arr) as Array;
 }
 
 /**
@@ -210,6 +226,102 @@ function triangularSolveRoutine(
     for (const v of d) v[Symbol.dispose]();
   }
 }
+
+// ── Analytical small-matrix Cholesky ─────────────────────────────────────
+
+/**
+ * Maximum matrix dimension for unrolled Cholesky-Banachiewicz.
+ * n=4 → ~30 traced ops. Matches inv analytical threshold.
+ * @internal
+ */
+const CHOLESKY_UNROLL_LIMIT = 4;
+
+/**
+ * Unrolled Cholesky-Banachiewicz for 2D matrices (no batch dims).
+ * Produces lower-triangular L such that A = L @ L^T.
+ *
+ * All operations are standard elementwise ops (mul, sub, div, sqrt, stack)
+ * that trace to fusable Kernel steps — no Routine dispatch.
+ * AD works natively through these ops without custom rules.
+ *
+ * @internal
+ */
+function cholesky2D(a: Array): Array {
+  const n = a.shape[0] as number;
+
+  // L[i][j] for j <= i — scalar traced arrays
+  const L: Array[][] = [];
+
+  for (let i = 0; i < n; i++) {
+    L[i] = [];
+    for (let j = 0; j <= i; j++) {
+      // Extract a[i, j]
+      const row_i = laxLib.dynamicIndexInDim(a, i, 0);
+      const a_ij = laxLib.dynamicIndexInDim(row_i, j, 0);
+      row_i.dispose();
+
+      if (i === j) {
+        // Diagonal: L[i,i] = sqrt(A[i,i] - sum_{k<i} L[i,k]^2)
+        let val = a_ij;
+        for (let k = 0; k < i; k++) {
+          const sq = numpy.multiply(L[i][k], L[i][k]);
+          const next = numpy.subtract(val, sq);
+          sq.dispose();
+          val.dispose();
+          val = next;
+        }
+        L[i][j] = numpy.sqrt(val);
+        val.dispose();
+      } else {
+        // Off-diagonal: L[i,j] = (A[i,j] - sum_{k<j} L[i,k]*L[j,k]) / L[j,j]
+        let val = a_ij;
+        for (let k = 0; k < j; k++) {
+          const prod = numpy.multiply(L[i][k], L[j][k]);
+          const next = numpy.subtract(val, prod);
+          prod.dispose();
+          val.dispose();
+          val = next;
+        }
+        L[i][j] = numpy.divide(val, L[j][j]);
+        val.dispose();
+      }
+    }
+  }
+
+  // Assemble L into [n, n] lower-triangular matrix
+  const zero = numpy.array(0, { dtype: a.dtype });
+  const rows: Array[] = [];
+  for (let i = 0; i < n; i++) {
+    const entries: Array[] = new globalThis.Array(n);
+    for (let j = 0; j < n; j++) {
+      entries[j] = j <= i ? L[i][j] : zero;
+    }
+    rows.push(numpy.stack(entries, 0));
+  }
+
+  const result = numpy.stack(rows, 0);
+
+  // Cleanup
+  for (const r of rows) r.dispose();
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) L[i][j].dispose();
+  }
+  zero.dispose();
+
+  return result;
+}
+
+/**
+ * Batched unrolled Cholesky.
+ * Uses vmap to map over batch dimensions.
+ * @internal
+ */
+function choleskyBatched(a: Array): Array {
+  if (a.ndim === 2) return cholesky2D(a);
+  return vmap((a2: Array) => choleskyBatched(a2))(a) as Array;
+}
+
+// ── Analytical small-matrix triangular solve ─────────────────────────────
 
 /**
  * Pure-primitive upper-triangular back-substitution for 2D matrices.

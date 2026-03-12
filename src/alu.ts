@@ -1908,3 +1908,29 @@ export function erfc(x: number): number {
     return 2 - _erfapprox(-x);
   }
 }
+
+/**
+ * Detect if a kernel is a simple scalar binary Add or Mul of its two inputs.
+ * Used by both the Decoupled Fallback scan path (scan-plan.ts) and the
+ * subgroupInclusiveAdd/Mul block-map path (block-map.ts).
+ *
+ * Returns the op if detected, null otherwise.
+ */
+export function detectScalarAssocOp(
+  kernel: Kernel,
+): AluOp.Add | AluOp.Mul | null {
+  if (kernel.numOutputs !== 1 || kernel.size !== 1) return null;
+  if (kernel.outputs[0].reduction) return null;
+  const exp = kernel.outputs[0].exp;
+  if (exp.op !== AluOp.Add && exp.op !== AluOp.Mul) return null;
+  if (exp.src.length !== 2) return null;
+  if (
+    exp.src[0].op !== AluOp.GlobalIndex ||
+    exp.src[1].op !== AluOp.GlobalIndex
+  )
+    return null;
+  const g0 = exp.src[0].arg[0] as number;
+  const g1 = exp.src[1].arg[0] as number;
+  if ((g0 === 0 && g1 === 1) || (g0 === 1 && g1 === 0)) return exp.op;
+  return null;
+}

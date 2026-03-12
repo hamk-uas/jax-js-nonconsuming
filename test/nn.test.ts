@@ -1,22 +1,9 @@
-import {
-  defaultDevice,
-  devices,
-  grad,
-  init,
-  nn,
-  numpy as np,
-} from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { grad, nn, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { expect, suite, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
 
-suite.each(devices)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite(() => {
   suite("jax.nn.relu()", () => {
     test("should compute ReLU", () => {
       using x = np.array([-1, 0, 1, 2]);

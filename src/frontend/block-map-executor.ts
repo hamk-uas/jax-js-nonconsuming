@@ -635,6 +635,16 @@ function executeBlockMapFallback(
         bodyInputs.push(blockIndexSlot);
       }
 
+      // Flush the batch encoder before body execution: the input slice copies
+      // above are encoded in the batch encoder but not yet submitted. If the
+      // body program uses the command tape fast path (WebGPU O8), it creates
+      // its own GPUCommandEncoder and submits independently — so the copies
+      // must be submitted first or the body reads uninitialized buffers.
+      if (useBatching) {
+        backend.endBatch!();
+        backend.beginBatch!();
+      }
+
       // Execute body program
       const bodyResult = bodyProgram.execute(bodyInputs);
       pending.push(...bodyResult.pending);

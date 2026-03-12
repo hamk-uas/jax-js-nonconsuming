@@ -498,6 +498,19 @@ export function executeAssociativeScan(
     return executeAssocScanBlockMap(params);
   }
 
+  if (plan.path === "decoupled-fallback") {
+    const N = resolveAxisN(elemAvals[0].shape, axis, dimBindings);
+    (backend as WebGPUBackend).dispatchDecoupledFallbackScan(
+      elemSlots[0],
+      outputSlots[0],
+      N,
+      plan.op,
+      plan.dtype,
+      plan.blockSize,
+    );
+    return { outputs: outputSlots, pending: [] };
+  }
+
   // Fallback: JS Kogge-Stone loop
   const resolveAvalShape = (shape: Dim[]): number[] =>
     hasSymbolicDims(shape)

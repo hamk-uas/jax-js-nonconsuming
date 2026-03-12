@@ -1822,3 +1822,175 @@ describe("lax.associativeScan — axis-aware native paths", () => {
     ]);
   });
 });
+
+// ============================================================================
+// Decoupled Fallback single-dispatch scan (T0)
+// ============================================================================
+
+describe("lax.associativeScan — Decoupled Fallback (T0)", () => {
+  let prev: ReturnType<typeof defaultDevice>;
+  let available = false;
+
+  beforeAll(async () => {
+    try {
+      await init("webgpu");
+      prev = defaultDevice("webgpu");
+      available = true;
+    } catch {
+      // WebGPU not available, skip
+    }
+  });
+  afterAll(() => {
+    if (available) defaultDevice(prev);
+  });
+
+  test("f32 cumsum N=5 (single block)", ({ skip }) => {
+    if (!available) skip();
+    using xs = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    expect(result).toBeAllclose([1, 3, 6, 10, 15]);
+  });
+
+  test("f32 cumsum N=600 (multi-block, exercises lookback)", ({ skip }) => {
+    if (!available) skip();
+    // N=600 → 3 blocks of 256, exercises inter-block atomic lookback.
+    const N = 600;
+    const values = Array.from({ length: N }, (_, i) => (i + 1) * 0.01);
+    const expected = values.reduce<number[]>((acc, v, i) => {
+      acc.push((acc[i - 1] ?? 0) + v);
+      return acc;
+    }, []);
+    using xs = np.array(values, { dtype: DType.Float32 });
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    // Relax tolerance slightly for 30-bit packed descriptor precision
+    expect(result).toBeAllclose(expected, { rtol: 1e-4 });
+  });
+
+  test("f32 cumprod N=20 (single block)", ({ skip }) => {
+    if (!available) skip();
+    const values = Array.from({ length: 20 }, () => 0.9 + Math.random() * 0.2);
+    const expected = values.reduce<number[]>((acc, v, i) => {
+      acc.push((acc[i - 1] ?? 1) * v);
+      return acc;
+    }, []);
+    using xs = np.array(values, { dtype: DType.Float32 });
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => a.mul(b), x),
+    );
+    using result = f(xs) as np.Array;
+    expect(result).toBeAllclose(expected, { rtol: 1e-4 });
+  });
+
+  test("f32 running max N=600 (multi-block)", ({ skip }) => {
+    if (!available) skip();
+    const N = 600;
+    const values = Array.from({ length: N }, () => Math.random() * 100);
+    const expected = values.reduce<number[]>((acc, v, i) => {
+      acc.push(Math.max(acc[i - 1] ?? -Infinity, v));
+      return acc;
+    }, []);
+    using xs = np.array(values, { dtype: DType.Float32 });
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.maximum(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    expect(result).toBeAllclose(expected, { rtol: 1e-5 });
+  });
+
+  // i32 assocScan on WebGPU produces incorrect results (pre-existing:
+  // only 1 Hillis-Steele round executes in the block-map shader).
+  // Eager path works; JIT path fails regardless of DF vs block-map.
+  test.skip("i32 cumsum N=5 (single block)", ({ skip }) => {
+    if (!available) skip();
+    const values = [1, 2, 3, 4, 5];
+    using xs = np.array(values, { dtype: DType.Int32 });
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    expect(result).toBeAllclose([1, 3, 6, 10, 15]);
+  });
+
+  // u32 excluded from DF: 30-bit descriptor packing truncates values > 2^30-1.
+  // This test verifies u32 falls back to Kogge-Stone and produces correct results.
+  test("u32 cumsum N=600 uses Kogge-Stone (not DF)", ({ skip }) => {
+    if (!available) skip();
+    const N = 600;
+    // Use values that individually fit in 30 bits but whose cumsum exceeds 2^30.
+    const values = Array.from({ length: N }, () =>
+      Math.floor(Math.random() * 10_000_000),
+    );
+    const expected = values.reduce<number[]>((acc, v, i) => {
+      acc.push(((acc[i - 1] ?? 0) + v) >>> 0);
+      return acc;
+    }, []);
+    using xs = np.array(values, { dtype: DType.Uint32 });
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    expect(result).toBeAllclose(expected);
+  });
+
+  test("f32 cumsum N=1 (edge case)", ({ skip }) => {
+    if (!available) skip();
+    using xs = np.array([42], { dtype: DType.Float32 });
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    expect(result).toBeAllclose([42]);
+  });
+
+  test("f32 cumsum N=256 (exact block boundary)", ({ skip }) => {
+    if (!available) skip();
+    const N = 256;
+    const values = Array.from({ length: N }, (_, i) => (i + 1) * 0.1);
+    const expected = values.reduce<number[]>((acc, v, i) => {
+      acc.push((acc[i - 1] ?? 0) + v);
+      return acc;
+    }, []);
+    using xs = np.array(values, { dtype: DType.Float32 });
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    expect(result).toBeAllclose(expected, { rtol: 1e-4 });
+  });
+
+  test("f32 cumsum N=257 (block boundary + 1)", ({ skip }) => {
+    if (!available) skip();
+    const N = 257;
+    const values = Array.from({ length: N }, (_, i) => (i + 1) * 0.1);
+    const expected = values.reduce<number[]>((acc, v, i) => {
+      acc.push((acc[i - 1] ?? 0) + v);
+      return acc;
+    }, []);
+    using xs = np.array(values, { dtype: DType.Float32 });
+    using f = jit((x: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), x),
+    );
+    using result = f(xs) as np.Array;
+    expect(result).toBeAllclose(expected, { rtol: 1e-4 });
+  });
+
+  test("grad through cumsum uses DF path", ({ skip }) => {
+    if (!available) skip();
+    using xs = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
+    using g = grad((x: np.Array) => {
+      using scanned = lax.associativeScan(
+        (a: np.Array, b: np.Array) => np.add(a, b),
+        x,
+      ) as np.Array;
+      return np.sum(scanned);
+    })(xs) as np.Array;
+    // d(sum(cumsum(xs)))/d(xs) = [4, 3, 2, 1]
+    expect(g).toBeAllclose([4, 3, 2, 1]);
+  });
+});

@@ -1,21 +1,10 @@
-import {
-  defaultDevice,
-  devices,
-  init,
-  numpy as np,
-} from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+import { expect, suite, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
 
 // Tests run on all available backends: CPU, WASM, and WebGPU
-suite.each(devices)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite(() => {
   suite("argmax correctness", () => {
     test("argmax returns first index on ties", () => {
       using x = np.array([3, 5, 5, 2, 5, 1]);

@@ -1,25 +1,18 @@
 import {
-  defaultDevice,
-  Device,
+  type Device,
   grad,
-  init,
   jvp,
   numpy as np,
   random,
   valueAndGrad,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { beforeEach, expect, suite, test } from "vitest";
+import { expect, suite, test } from "vitest";
 
-const devicesAvailable = await init();
+import { deviceSuite } from "./device-suite.js";
+
 const devicesWithLinalg: Device[] = ["cpu", "wasm", "webgpu"];
 
-suite.each(devicesWithLinalg)("device:%s", (device) => {
-  const skipped = !devicesAvailable.includes(device);
-  beforeEach(({ skip }) => {
-    if (skipped) skip();
-    defaultDevice(device);
-  });
-
+await deviceSuite((device) => {
   suite("numpy.linalg.cholesky()", () => {
     test("symmetrizes input by default", () => {
       using x = np.array([
@@ -423,4 +416,4 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       }
     });
   });
-});
+}, devicesWithLinalg);
