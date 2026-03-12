@@ -45,6 +45,9 @@ import {
   ShaderInfo,
 } from "./webgpu/codegen";
 import {
+  type ArenaSlab,
+  type ArenaSlabEntry,
+  buildConflictGraphAndColor,
   type ConstSlabEntry,
   type TapeOp,
   type WebGPUCommandTape,
@@ -2203,6 +2206,81 @@ export class WebGPUBackend implements Backend {
       }
     }
 
+    // 5. Build colored arena slabs (O9a-v2): partition internal intermediates
+    //    by conflict-graph color so that no single GPUBuffer appears in both
+    //    read-only-storage and storage bindings within a dispatch. Each color
+    //    gets one persistent GPUBuffer slab; entries are 256-byte aligned.
+    //    This makes buffer identities stable across invocations, enabling
+    //    100% bind group cache hits for internal-only dispatches.
+    let arenaSlabs: ArenaSlab[] | null = null;
+    {
+      // Build a temporary tape object for the coloring function.
+      const tempTape: WebGPUCommandTape = {
+        ops: safeOps,
+        tableSize: nextIdx,
+        inputTableIdxs,
+        outputTableIdxs,
+        allocatedIdxs,
+        uniformBuffers,
+        constSlab,
+        arenaSlabs: null,
+      };
+      const coloring = buildConflictGraphAndColor(tempTape);
+
+      if (coloring.numColors > 0) {
+        const SLAB_ALIGN = 256; // minStorageBufferOffsetAlignment
+        const MAX_COLORS = 4; // spill to discrete pool above this
+
+        // Collect padded sizes for each table index from malloc ops.
+        const idxPaddedSize = new Map<number, number>();
+        const idxOriginalSize = new Map<number, number>();
+        const idxToMalloc = new Map<number, TapeOp & { type: "malloc" }>();
+        for (const op of safeOps) {
+          if (op.type === "malloc" && !op.malloc.slabAllocated) {
+            idxPaddedSize.set(op.malloc.tableIdx, op.malloc.paddedSize);
+            idxOriginalSize.set(op.malloc.tableIdx, op.malloc.originalSize);
+            idxToMalloc.set(
+              op.malloc.tableIdx,
+              op as TapeOp & { type: "malloc" },
+            );
+          }
+        }
+
+        const slabs: ArenaSlab[] = [];
+        for (let c = 0; c < coloring.numColors && c < MAX_COLORS; c++) {
+          const group = coloring.colorGroups[c];
+          const entries: ArenaSlabEntry[] = [];
+          let slabSize = 0;
+
+          for (const idx of group) {
+            const paddedSize = idxPaddedSize.get(idx);
+            if (paddedSize === undefined || paddedSize === 0) continue;
+            entries.push({
+              tableIdx: idx,
+              offset: slabSize,
+              bindSize: paddedSize,
+              originalSize: idxOriginalSize.get(idx)!,
+            });
+            // Advance by 256-byte-aligned stride
+            slabSize += Math.ceil(paddedSize / SLAB_ALIGN) * SLAB_ALIGN;
+          }
+
+          if (entries.length === 0) continue;
+          slabSize = Math.max(slabSize, 4); // WebGPU minimum buffer size
+          const slabBuffer = this.#createBuffer(slabSize);
+          slabs.push({ buffer: slabBuffer, entries });
+
+          // Mark mallocs as arena-allocated
+          for (const entry of entries) {
+            const mallocOp = idxToMalloc.get(entry.tableIdx);
+            if (mallocOp) mallocOp.malloc.arenaAllocated = true;
+          }
+        }
+
+        arenaSlabs = slabs.length > 0 ? slabs : null;
+      }
+    }
+
     return {
       ops: safeOps,
       tableSize: nextIdx,
@@ -2211,6 +2289,7 @@ export class WebGPUBackend implements Backend {
       allocatedIdxs,
       uniformBuffers,
       constSlab,
+      arenaSlabs,
     };
   }
 
@@ -2248,6 +2327,22 @@ export class WebGPUBackend implements Backend {
       }
     }
 
+    // Pre-populate colored arena slab entries (O9a-v2): persistent GPUBuffers
+    // at fixed offsets make all internal dispatches hit the O9b bind group
+    // cache after the first invocation.
+    const arenaBufferSet = new Set<GPUBuffer>();
+    if (tape.arenaSlabs) {
+      for (const slab of tape.arenaSlabs) {
+        arenaBufferSet.add(slab.buffer);
+        for (const e of slab.entries) {
+          buffers[e.tableIdx] = slab.buffer;
+          sizes[e.tableIdx] = e.originalSize;
+          offsets[e.tableIdx] = e.offset;
+          bindSizes[e.tableIdx] = e.bindSize;
+        }
+      }
+    }
+
     // Map external inputs
     for (let i = 0; i < inputSlots.length; i++) {
       const { buffer, size } = this.#getBuffer(inputSlots[i]);
@@ -2277,6 +2372,8 @@ export class WebGPUBackend implements Backend {
             const m = op.malloc;
             // O9c: slab-allocated constants are pre-populated above.
             if (m.slabAllocated) break;
+            // O9a-v2: arena-allocated intermediates are pre-populated above.
+            if (m.arenaAllocated) break;
             if (m.paddedSize === 0) {
               buffers[m.tableIdx] = this.#reusableZsb;
             } else {
@@ -2306,6 +2403,8 @@ export class WebGPUBackend implements Backend {
             const buf = buffers[op.tableIdx];
             // Skip slab buffer — owned by tape, not per-invocation.
             if (buf === slabBuf) break;
+            // Skip arena buffers — owned by tape, not per-invocation.
+            if (arenaBufferSet.has(buf)) break;
             if (buf && buf !== this.#reusableZsb) {
               if (!this.#poolPush(buf)) {
                 deferredDestroys.push(buf);
@@ -2315,12 +2414,19 @@ export class WebGPUBackend implements Backend {
             }
             break;
           }
-          case "recycle":
+          case "recycle": {
+            // O9a-v2: if toIdx is arena-allocated, it already has a
+            // pre-assigned buffer — skip the recycle. fromIdx is also arena
+            // (recycle chains bridging arena/external are excluded from
+            // coloring), so its "free" was already a no-op.
+            const toBuf = buffers[op.toIdx];
+            if (toBuf && arenaBufferSet.has(toBuf)) break;
             buffers[op.toIdx] = buffers[op.fromIdx];
             sizes[op.toIdx] = sizes[op.fromIdx];
             offsets[op.toIdx] = offsets[op.fromIdx];
             bindSizes[op.toIdx] = bindSizes[op.fromIdx];
             break;
+          }
           case "dispatch": {
             const d = op.dispatch;
             const numIn = d.inputIdxs.length;
@@ -2375,9 +2481,17 @@ export class WebGPUBackend implements Backend {
               }
               for (let i = 0; i < numOut; i++) {
                 const idx = d.outputIdxs[i];
+                const bsz = bindSizes[idx];
                 entries[numIn + i] = {
                   binding: numIn + i,
-                  resource: { buffer: buffers[idx] },
+                  resource:
+                    bsz > 0
+                      ? {
+                          buffer: buffers[idx],
+                          offset: offsets[idx],
+                          size: bsz,
+                        }
+                      : { buffer: buffers[idx] },
                 };
               }
               bindGroup = this.device.createBindGroup({

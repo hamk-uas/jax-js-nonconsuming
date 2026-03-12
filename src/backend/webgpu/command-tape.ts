@@ -57,6 +57,11 @@ export interface TapeMalloc {
    * The buffer/offset/bindSize are set up before the main execution loop.
    */
   slabAllocated?: boolean;
+  /**
+   * If true, this malloc is pre-allocated from a colored arena slab (O9a-v2).
+   * The buffer/offset/bindSize are set up before the main execution loop.
+   */
+  arenaAllocated?: boolean;
 }
 
 /** Entry in the constants slab (O9c). */
@@ -69,6 +74,26 @@ export interface ConstSlabEntry {
   bindSize: number;
   /** Original (unpadded) byte size for output slot creation. */
   originalSize: number;
+}
+
+/** Entry in a colored arena slab (O9a-v2). */
+export interface ArenaSlabEntry {
+  /** Index in the flat buffer table. */
+  tableIdx: number;
+  /** Byte offset within the slab buffer (256-byte aligned). */
+  offset: number;
+  /** Bind size for this entry (4-byte aligned, the actual padded data size). */
+  bindSize: number;
+  /** Original (unpadded) byte size for output slot creation. */
+  originalSize: number;
+}
+
+/** A single colored arena slab (one per color). */
+export interface ArenaSlab {
+  /** The GPU buffer for this color group. */
+  buffer: GPUBuffer;
+  /** Per-entry layout within this slab. */
+  entries: ArenaSlabEntry[];
 }
 
 /** A single tape operation in execution order. */
@@ -98,6 +123,13 @@ export interface WebGPUCommandTape {
    * Persists across invocations — constants are written once at compile time.
    */
   constSlab: { buffer: GPUBuffer; entries: ConstSlabEntry[] } | null;
+  /**
+   * Colored arena slabs (O9a-v2): one GPUBuffer per conflict-graph color.
+   * Internal intermediates are pre-assigned to slab regions with 256-byte
+   * alignment. Persists across invocations for stable bind group caching.
+   * Null if no internal intermediates are eligible (e.g., all external).
+   */
+  arenaSlabs: ArenaSlab[] | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +182,17 @@ export function buildConflictGraphAndColor(
   for (const idx of tape.outputTableIdxs) externalSet.add(idx);
   if (tape.constSlab) {
     for (const e of tape.constSlab.entries) externalSet.add(e.tableIdx);
+  }
+
+  // Exclude recycle participants from arena allocation entirely.
+  // A recycle replaces free(a) → malloc(b) with buffer sharing. If fromIdx
+  // is arena-allocated, toIdx would inherit its slab buffer but won't have
+  // its own arena entry — leading to buffer identity conflicts. Rather than
+  // tracking this inheritance, we exclude all recycle ends from coloring.
+  for (const op of tape.ops) {
+    if (op.type !== "recycle") continue;
+    externalSet.add(op.fromIdx);
+    externalSet.add(op.toIdx);
   }
 
   // Build adjacency lists (conflict graph).

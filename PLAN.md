@@ -1581,7 +1581,7 @@ This means a single slab buffer cannot hold both inputs and outputs of the same 
 original O9a attempted a single slab and was reverted because the same `GPUBuffer` appeared in both
 read-only-storage (input) and storage (output) bindings.
 
-### Design: role-colored multi-slab arena (O9a-v2)
+### Design: role-colored multi-slab arena (O9a-v2, implemented)
 
 The solution is to partition intermediates by **usage role** so that no buffer appears in
 conflicting binding types within a single dispatch.
@@ -1592,16 +1592,28 @@ conflicting binding types within a single dispatch.
    pass, and the output needs `storage` while inputs need `read-only-storage`).
 2. Inputs do NOT conflict with other inputs (multiple `read-only-storage` is OK).
 3. Build an undirected conflict graph where nodes = table indices, edges = conflicting pairs.
+4. **Recycle exclusion:** All recycle participants (both `fromIdx` and `toIdx`) are excluded from
+   coloring. Recycles share buffer identity between indices, and the inherited buffer would conflict
+   with arena-allocated indices in the same slab.
 
 **Graph coloring → slab assignment:**
 
-4. Greedy-color the conflict graph. Each color → one physical GPUBuffer slab.
-5. Interval-pack within each color: assign 256-byte-aligned offsets using a bump allocator over each
-   buffer's live range within its slab.
-6. Spill to discrete pool for edge cases with too many colors (>4).
+5. Greedy-color the conflict graph. Each color → one physical GPUBuffer slab.
+6. Bump-allocate within each color: assign 256-byte-aligned offsets sequentially.
+7. Spill to discrete pool for edge cases with too many colors (>4).
 
-**Expected color counts:** Most programs need 2–3 colors (inputs vs outputs, with some sharing). DLM
-programs with linear chains typically need 2 colors.
+**Execution:**
+
+8. Arena slabs persist across invocations (like constants slab). Buffer identities are stable.
+9. O9b bind group cache achieves 100% hit rate for internal-only dispatches after first invocation.
+10. Outputs bound with `{ buffer, offset, size }` (sub-range) — not whole-buffer — to prevent
+    within-slab aliasing conflicts.
+
+**Measured color counts:** Matmul+bias+relu programs use 2 colors. Elementwise-only chains need 1
+color. Chains with a single branching reduction: 1–3 colors.
+
+**Limitation:** Recycle-participating indices fall back to discrete pool allocation. This is a
+conservative exclusion to avoid buffer-identity inheritance conflicts.
 
 ### O9c: Constants slab (implemented)
 
@@ -1639,7 +1651,7 @@ O9b cache hits are guaranteed for the constant portion of every dispatch.
 | Phase  | Scope                                          | Effort | Depends on | Status          |
 | ------ | ---------------------------------------------- | ------ | ---------- | --------------- |
 | O9a    | Single-slab arena (original)                   | Medium | O8a        | **Reverted** ⚠️ |
-| O9a-v2 | Colored multi-slab arena                       | Medium | O9c        | Not started     |
+| O9a-v2 | Colored multi-slab arena                       | Medium | O9c        | **Done** ✅     |
 | O9b    | Bind group cache (GPUBuffer identity key)      | Small  | Pool LIFO  | **Done** ✅     |
 | O9c    | Constants slab (persistent across invocations) | Small  | O8a        | **Done** ✅     |
 
@@ -1677,7 +1689,7 @@ high per-dispatch JS overhead**. The following optimizations form a coherent acc
 | ---------- | ------------------------ | --------------------------------- | ------------------------ | --------------- |
 | **O8a**    | Command tape             | JS loop overhead (95ms)           | 95ms → ~2ms (**47×**)    | **Done** ✅     |
 | **O9a**    | Arena allocator          | createBindGroup + cache stability | 6ms → ~1ms (reliable)    | **Reverted** ⚠️ |
-| **O9a-v2** | Colored multi-slab arena | createBindGroup (full)            | 6ms → ~0.5ms             | Not started     |
+| **O9a-v2** | Colored multi-slab arena | createBindGroup (full)            | 6ms → ~0.5ms             | **Done** ✅     |
 | **O9b**    | Bind group caching       | createBindGroup (6ms)             | 6ms → ~3ms (pool LIFO)   | **Done** ✅     |
 | **O9c**    | Constants slab           | initialData buffer creation       | Eliminates const mallocs | **Done** ✅     |
 | **O6**     | Multi-reduction kernels  | Dispatch count (~764)             | ~5-15% fewer dispatches  | Deprioritized   |
