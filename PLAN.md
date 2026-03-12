@@ -1552,127 +1552,103 @@ statically known.
 
 ---
 
-## O9: WebGPU Bind Group Caching
+## O9: WebGPU Bind Group Caching & Arena Allocation
 
-**Status:** O9a (arena slab) reverted — WebGPU spec prohibits a GPUBuffer from appearing in both
-read-only-storage and storage bindings within a single compute pass (buffer-identity-level
-validation). O9b (bind group caching via pool LIFO identity) in commit `fc3ebfc`. O9c shelved
-(depends on O9a).
+**Status:** O9a (single-slab arena) reverted — WebGPU spec prohibits a GPUBuffer from appearing in
+both `read-only-storage` and `storage` bindings within a single compute pass (buffer-identity-level
+validation). O9b (bind group caching via pool LIFO identity) done. O9c (constants slab) done.
 
 ### Problem statement
 
 The command tape (O8) eliminates most JS-side overhead, but `device.createBindGroup()` remains at
 ~6ms for 764 dispatches (~8µs per call). This cost is irreducible under the current discrete buffer
 pool because every JIT invocation allocates different `GPUBuffer` objects, forcing fresh bind group
-creation every time. O8b bind group caching is fragile because pool LIFO order isn't guaranteed
+creation every time. O9b bind group caching is fragile because pool LIFO order isn't guaranteed
 across invocations.
 
 The root cause: **discrete per-allocation buffers** mean bind groups (which reference buffer
 identities) can never be stable.
 
-### Design: slab sub-allocation
+### WebGPU aliasing constraint
 
-Instead of `device.createBuffer()` per malloc, allocate from a small number of large **slab
-buffers**. Each intermediate gets a (slab, offset, size) triple instead of its own `GPUBuffer`.
+The WebGPU spec validates at **buffer identity** level, not byte-range:
 
-WebGPU storage buffer bindings support sub-range binding:
+- `read-only-storage` + `read-only-storage` (same buffer) → **OK**
+- `read-only-storage` + `storage` (same buffer) → **REJECTED** (validation error)
+- `storage` + `storage` (same buffer, same or different offsets) → **REJECTED**
 
-```typescript
-{
-  binding: 0,
-  resource: { buffer: slab, offset: 1024, size: 256 },
-}
-```
+This means a single slab buffer cannot hold both inputs and outputs of the same dispatch. The
+original O9a attempted a single slab and was reverted because the same `GPUBuffer` appeared in both
+read-only-storage (input) and storage (output) bindings.
 
-This is valid WebGPU — the spec allows explicit `offset` and `size` on storage buffer resource
-entries. The constraint: **offsets must be aligned to `minStorageBufferOffsetAlignment`** (256 bytes
-on all current hardware).
+### Design: role-colored multi-slab arena (O9a-v2)
 
-### Allocation scheme
+The solution is to partition intermediates by **usage role** so that no buffer appears in
+conflicting binding types within a single dispatch.
 
-For a JitProgram with known intermediate sizes (all concrete at tape compile time):
+**Conflict graph construction** (from command tape):
 
-1. **Layout phase:** Walk all malloc/free/recycle steps. Compute peak live set. Assign each
-   intermediate a (slabIndex, offset) pair using a linear bump allocator within each slab, with
-   256-byte alignment on all offsets.
-2. **Slab sizing:** Sum all peak-live intermediate sizes (with 256-byte alignment padding). Round up
-   to the next power-of-2 slab size. Typical DLM program: ~50KB of intermediates → 1 slab of 64KB.
-3. **Bind group pre-build:** Because slab identity and offsets are fixed at compile time, bind
-   groups can be pre-built once and reused indefinitely (O8b becomes trivial).
-4. **Input/output handling:** External inputs and outputs cannot be arena-allocated (they have
-   independent lifetimes). The bind group entries for external buffers change per invocation — only
-   dispatches using exclusively internal buffers get fully cached bind groups.
+1. For each dispatch, outputs conflict with all inputs and all other outputs (they share a compute
+   pass, and the output needs `storage` while inputs need `read-only-storage`).
+2. Inputs do NOT conflict with other inputs (multiple `read-only-storage` is OK).
+3. Build an undirected conflict graph where nodes = table indices, edges = conflicting pairs.
+
+**Graph coloring → slab assignment:**
+
+4. Greedy-color the conflict graph. Each color → one physical GPUBuffer slab.
+5. Interval-pack within each color: assign 256-byte-aligned offsets using a bump allocator over each
+   buffer's live range within its slab.
+6. Spill to discrete pool for edge cases with too many colors (>4).
+
+**Expected color counts:** Most programs need 2–3 colors (inputs vs outputs, with some sharing). DLM
+programs with linear chains typically need 2 colors.
+
+### O9c: Constants slab (implemented)
+
+All `initialData` mallocs (O2 scalar-promoted literals) are packed into a single persistent
+GPUBuffer with 256-byte-aligned offsets at tape compile time. This is safe because:
+
+- Constants are always inputs (bound as `read-only-storage`), never outputs.
+- Multiple `read-only-storage` bindings to the same buffer are spec-compliant.
+- The slab persists across invocations — no per-invocation `createBuffer` or `writeBuffer`.
+
+**Bind group cache benefit:** Constants always reference the same GPUBuffer at the same offsets, so
+O9b cache hits are guaranteed for the constant portion of every dispatch.
 
 ### 256-byte alignment overhead
 
-| Buffer logical size | Padded (256-byte aligned) | Waste   | Typical count in DLM |
-| ------------------- | ------------------------- | ------- | -------------------- |
-| 4 bytes (scalar)    | 256 bytes                 | 252B    | ~100                 |
-| 16 bytes (2×2 f32)  | 256 bytes                 | 240B    | ~200                 |
-| 64 bytes (4×4 f32)  | 256 bytes                 | 192B    | ~50                  |
-| 256+ bytes          | size rounded to 256       | ≤255B   | ~10                  |
-| **Total DLM slab**  |                           | ~100 KB | (fits in L1 cache)   |
-
-For DLM (m=2, 764 dispatches): ~360 intermediates × 256 bytes = ~90 KB slab. This is negligible —
-GPU VRAM has GBs of headroom. The L1/L2 cache benefit of spatial locality may actually improve
-performance.
-
-For large-matrix ML (1024×1024 intermediates at 4 MB each): alignment waste is <0.01%. Arena is
-overwhelmingly beneficial.
-
-### Mixed strategy: arena + discrete pool
-
-Small constant buffers with `initialData` (O2 scalar promotion, typically 4–8 bytes) are write-once.
-These can be arena-allocated in a separate **constants slab** that persists across invocations
-(never freed, never reallocated). This eliminates `writeBuffer` calls on warm invocations for
-constants that don't change.
-
-Large external inputs/outputs that outlive the JitProgram execution remain in the discrete pool.
-Only JitProgram-internal intermediates (malloc→use→free within one execution) go in the arena.
+| Buffer logical size | Padded (256-byte aligned stride) | Waste  | Typical count in DLM |
+| ------------------- | -------------------------------- | ------ | -------------------- |
+| 4 bytes (scalar)    | 256 bytes                        | 252B   | ~100                 |
+| 16 bytes (2×2 f32)  | 256 bytes                        | 240B   | ~200                 |
+| 64 bytes (4×4 f32)  | 256 bytes                        | 192B   | ~50                  |
+| 256+ bytes          | size rounded up to 256           | ≤255B  | ~10                  |
+| **Total DLM slab**  |                                  | ~100KB | (fits in L1 cache)   |
 
 ### Impact on bind group caching
 
-| Scenario                     | Without arena (O8b) | With arena (O9)                |
-| ---------------------------- | ------------------- | ------------------------------ |
-| Internal-only dispatches     | ~60% cache hit      | **100% cache hit** (permanent) |
-| Dispatches reading inputs    | ~0% cache hit       | ~0% (input buffers vary)       |
-| Repeated invocations (DLM)   | **Fragile** (LIFO)  | **Guaranteed stable**          |
-| createBindGroup cost (764 d) | ~6ms → ~3ms (50%)   | ~6ms → ~1ms (85%)              |
-
-### Impact on overall DLM execution
-
-| Component              | Current | O8 tape | O8 + O9 arena |
-| ---------------------- | ------- | ------- | ------------- |
-| JS loop overhead       | 95 ms   | ~2 ms   | ~2 ms         |
-| createBindGroup        | 6 ms    | 6 ms    | **~1 ms**     |
-| queue.submit           | 22 ms   | 22 ms   | 22 ms         |
-| prepareKernelSync      | 1 ms    | 0       | 0             |
-| **Total**              | 124 ms  | ~30 ms  | **~25 ms**    |
-| **Speedup vs current** | 1×      | ~4×     | **~5×**       |
-
-### WebGPU spec constraints
-
-| Constraint                          | Value     | Impact                                         |
-| ----------------------------------- | --------- | ---------------------------------------------- |
-| `minStorageBufferOffsetAlignment`   | 256 bytes | All sub-allocations must be 256-byte aligned   |
-| `maxStorageBufferBindingSize`       | 128 MB+   | Single slab can be very large                  |
-| `maxBufferSize`                     | 256 MB+   | Ample headroom for any program                 |
-| Buffer usage flags must be superset | Spec req  | Slab must have STORAGE \| COPY_SRC \| COPY_DST |
-| `copyBufferToBuffer` 4-byte aligned | Spec req  | DUS/scatter within slab needs 4-byte offsets   |
+| Scenario                     | Without arena (O9b only) | With O9c slab    | With full arena (O9a-v2) |
+| ---------------------------- | ------------------------ | ---------------- | ------------------------ |
+| Internal-only dispatches     | ~60% cache hit           | ~80% cache hit   | **100% cache hit**       |
+| Dispatches reading inputs    | ~0% cache hit            | ~0% (ext vary)   | ~0% (ext vary)           |
+| Repeated invocations (DLM)   | **Fragile** (LIFO)       | Partially stable | **Guaranteed stable**    |
+| createBindGroup cost (764 d) | ~6ms → ~3ms (50%)        | ~6ms → ~2ms      | ~6ms → ~0.5ms            |
 
 ### Implementation phases
 
-| Phase | Scope                                          | Effort | Depends on | Status                                  |
-| ----- | ---------------------------------------------- | ------ | ---------- | --------------------------------------- |
-| O9a   | Slab allocator for JitProgram locals           | Medium | O8a        | **Reverted** (WebGPU spec violation)    |
-| O9b   | Bind group caching (GPUBuffer identity key)    | Small  | Pool LIFO  | **Done** ✅                             |
-| O9c   | Constants slab (persistent across invocations) | Small  | O9a        | Shelved (blocked on O9a or double-slab) |
+| Phase  | Scope                                          | Effort | Depends on | Status          |
+| ------ | ---------------------------------------------- | ------ | ---------- | --------------- |
+| O9a    | Single-slab arena (original)                   | Medium | O8a        | **Reverted** ⚠️ |
+| O9a-v2 | Colored multi-slab arena                       | Medium | O9c        | Not started     |
+| O9b    | Bind group cache (GPUBuffer identity key)      | Small  | Pool LIFO  | **Done** ✅     |
+| O9c    | Constants slab (persistent across invocations) | Small  | O8a        | **Done** ✅     |
 
 ### Risks
 
 | Risk                                    | Likelihood | Mitigation                                                |
 | --------------------------------------- | ---------- | --------------------------------------------------------- |
-| 256-byte alignment wastes memory        | Certain    | ~90 KB for DLM — negligible vs GPU VRAM                   |
+| 256-byte alignment wastes memory        | Certain    | ~100KB for DLM — negligible vs GPU VRAM                   |
+| Graph coloring needs too many colors    | Low        | Spill overflow to discrete pool                           |
 | Slab fragmentation on varying programs  | Medium     | Per-JitProgram slab; freed as unit                        |
 | Slab too small for unexpected program   | Low        | Fallback to discrete alloc for overflow                   |
 | `copyBufferToBuffer` within same buffer | N/A        | WebGPU spec permits same-buffer copies (non-overlapping)  |
@@ -1697,15 +1673,17 @@ high per-dispatch JS overhead**. The following optimizations form a coherent acc
 
 ### Optimization stack
 
-| ID       | Optimization            | Target                            | Impact estimate         | Status          |
-| -------- | ----------------------- | --------------------------------- | ----------------------- | --------------- |
-| **O8a**  | Command tape            | JS loop overhead (95ms)           | 95ms → ~2ms (**47×**)   | **Done** ✅     |
-| **O9a**  | Arena allocator         | createBindGroup + cache stability | 6ms → ~1ms (reliable)   | **Reverted** ⚠️ |
-| **O9b**  | Bind group caching      | createBindGroup (6ms)             | 6ms → ~3ms (pool LIFO)  | **Done** ✅     |
-| **O6**   | Multi-reduction kernels | Dispatch count (~764)             | ~5-15% fewer dispatches | Deprioritized   |
-| **A-L**  | Analytical linalg (n≤4) | Routine fusion barriers           | Enables sqrt DLM fusion | **Done** ✅     |
-| **T0**   | Decoupled Fallback scan | Scan dispatch count (log N → 1)   | ~0.05ms (3→1 dispatch)  | **Done** ✅     |
-| **P7-2** | WMMA cooperative matrix | Per-dispatch throughput           | 2-4× matmul GFLOP/s     | Blocked (~2026) |
+| ID         | Optimization             | Target                            | Impact estimate          | Status          |
+| ---------- | ------------------------ | --------------------------------- | ------------------------ | --------------- |
+| **O8a**    | Command tape             | JS loop overhead (95ms)           | 95ms → ~2ms (**47×**)    | **Done** ✅     |
+| **O9a**    | Arena allocator          | createBindGroup + cache stability | 6ms → ~1ms (reliable)    | **Reverted** ⚠️ |
+| **O9a-v2** | Colored multi-slab arena | createBindGroup (full)            | 6ms → ~0.5ms             | Not started     |
+| **O9b**    | Bind group caching       | createBindGroup (6ms)             | 6ms → ~3ms (pool LIFO)   | **Done** ✅     |
+| **O9c**    | Constants slab           | initialData buffer creation       | Eliminates const mallocs | **Done** ✅     |
+| **O6**     | Multi-reduction kernels  | Dispatch count (~764)             | ~5-15% fewer dispatches  | Deprioritized   |
+| **A-L**    | Analytical linalg (n≤4)  | Routine fusion barriers           | Enables sqrt DLM fusion  | **Done** ✅     |
+| **T0**     | Decoupled Fallback scan  | Scan dispatch count (log N → 1)   | ~0.05ms (3→1 dispatch)   | **Done** ✅     |
+| **P7-2**   | WMMA cooperative matrix  | Per-dispatch throughput           | 2-4× matmul GFLOP/s      | Blocked (~2026) |
 
 ### Projected wall-clock improvement
 

@@ -150,6 +150,11 @@ pnpm vitest run <file> -c test/vitest.intel.config.ts
 `VK_DRIVER_FILES` to bypass NVIDIA's default Vulkan adapter priority. Intel OOMs on 4096×4096 —
 bench files must handle this gracefully.
 
+**DISPLAY for GPU tests:** Headless Chromium still needs a running X server to initialize the GPU
+adapter. The GPU config auto-detects `DISPLAY` by scanning `/tmp/.X11-unix/` for X server sockets
+(falls back to `:0`). If GPU tests silently skip all WebGPU cases, check `ls /tmp/.X11-unix/` and
+verify the detected socket matches a running X server.
+
 **Pre-commit CI checks**: Husky runs `lint-staged`, then full Vitest. Before commit:
 
 ```bash
@@ -778,6 +783,7 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 | P11 | Analytical small linalg   | **Done** ✅ | Cholesky (n≤4), TriSolve (n≤8), QR (n≤8) as traced ops. Enables sqrt DLM fusion             |
 | P12 | WebGPU command tape       | **Done** ✅ | Pre-compiled dispatch sequence. ~4× JS overhead reduction for kernel-only programs          |
 | P13 | WebGPU bind group cache   | **Done** ✅ | Bind group caching via GPUBuffer identity (pool LIFO). Arena reverted (spec violation)      |
+| P14 | Constants slab (O9c)      | **Done** ✅ | initialData constants packed into single persistent slab buffer with 256-byte alignment     |
 
 ---
 
@@ -843,4 +849,5 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Analytical inv for n ≤ 4 (Cramer's rule)                    | Jaxpr-traceable: fuses in block-map. Routines break fusion. Pattern extends to cholesky/QR/trisolve           |
 | WebGPU command tape over step-by-step                       | Pre-resolved pipelines + flat buffer table eliminates ~76% of JS-side JIT loop overhead                       |
 | Bind group cache over arena sub-allocation                  | Arena reverted: WebGPU spec forbids mixed read/write bindings to same buffer. Pool LIFO gives stable identity |
+| Constants slab (O9c) for initialData                        | All constants read-only → single slab safe. Eliminates per-invocation mapped buffer creation + writeBuffer    |
 | Targeted jaxprification over general                        | Cholesky (n≤4), TriSolve/QR (n≤8) traced to fusable ops. Sort/Argsort/LU are non-jaxprifiable                 |

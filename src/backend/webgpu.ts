@@ -44,7 +44,11 @@ import {
   headerWgsl,
   ShaderInfo,
 } from "./webgpu/codegen";
-import { type TapeOp, type WebGPUCommandTape } from "./webgpu/command-tape";
+import {
+  type ConstSlabEntry,
+  type TapeOp,
+  type WebGPUCommandTape,
+} from "./webgpu/command-tape";
 import {
   type DFScanDtype,
   type DFScanOp,
@@ -2158,6 +2162,47 @@ export class WebGPUBackend implements Backend {
       (op) => op.type !== "free" || !outputIdxSet.has(op.tableIdx),
     );
 
+    // 4. Build constants slab (O9c): pack all initialData mallocs into a
+    //    single GPU buffer with 256-byte-aligned offsets. This eliminates
+    //    per-invocation mapped buffer creation for scalar-promoted constants.
+    let constSlab: { buffer: GPUBuffer; entries: ConstSlabEntry[] } | null =
+      null;
+    {
+      const SLAB_ALIGN = 256; // minStorageBufferOffsetAlignment
+      const entries: ConstSlabEntry[] = [];
+      const dataChunks: { data: Uint8Array<ArrayBuffer>; offset: number }[] =
+        [];
+      let slabSize = 0;
+
+      for (const op of safeOps) {
+        if (op.type !== "malloc" || !op.malloc.initialData) continue;
+        const m = op.malloc;
+        const data = m.initialData!;
+        entries.push({
+          tableIdx: m.tableIdx,
+          offset: slabSize,
+          bindSize: m.paddedSize,
+          originalSize: m.originalSize,
+        });
+        dataChunks.push({ data, offset: slabSize });
+        // Advance by 256-byte-aligned stride
+        slabSize += Math.ceil(m.paddedSize / SLAB_ALIGN) * SLAB_ALIGN;
+        // Mark as slab-allocated so executeTape skips per-invocation creation
+        m.slabAllocated = true;
+      }
+
+      if (entries.length > 0) {
+        slabSize = Math.max(slabSize, 4); // WebGPU minimum buffer size
+        const slabBuffer = this.#createBuffer(slabSize, { mapped: true });
+        const mapped = new Uint8Array(slabBuffer.getMappedRange());
+        for (const { data, offset } of dataChunks) {
+          mapped.set(data, offset);
+        }
+        slabBuffer.unmap();
+        constSlab = { buffer: slabBuffer, entries };
+      }
+    }
+
     return {
       ops: safeOps,
       tableSize: nextIdx,
@@ -2165,6 +2210,7 @@ export class WebGPUBackend implements Backend {
       outputTableIdxs,
       allocatedIdxs,
       uniformBuffers,
+      constSlab,
     };
   }
 
@@ -2180,10 +2226,27 @@ export class WebGPUBackend implements Backend {
    */
   executeCommandTape(tape: WebGPUCommandTape, inputSlots: Slot[]): Slot[] {
     // Parallel arrays indexed by table position:
-    //   buffers[i] — GPUBuffer for this table entry
-    //   sizes[i]   — original (unpadded) byte size for output slot creation
+    //   buffers[i]   — GPUBuffer for this table entry
+    //   sizes[i]     — original (unpadded) byte size for output slot creation
+    //   offsets[i]   — byte offset within buffer for bind group entry (O9c slab)
+    //   bindSizes[i] — bind size for bind group entry (0 = use whole buffer)
     const buffers: GPUBuffer[] = new globalThis.Array(tape.tableSize);
     const sizes: number[] = new globalThis.Array(tape.tableSize);
+    const offsets: number[] = new globalThis.Array(tape.tableSize).fill(0);
+    const bindSizes: number[] = new globalThis.Array(tape.tableSize).fill(0);
+
+    // Pre-populate constants slab entries (O9c): these are stable across
+    // invocations — same GPUBuffer at same offsets — so O9b cache hits are
+    // guaranteed for dispatches that only reference slab + stable pool buffers.
+    const slabBuf = tape.constSlab?.buffer;
+    if (tape.constSlab) {
+      for (const e of tape.constSlab.entries) {
+        buffers[e.tableIdx] = slabBuf!;
+        sizes[e.tableIdx] = e.originalSize;
+        offsets[e.tableIdx] = e.offset;
+        bindSizes[e.tableIdx] = e.bindSize;
+      }
+    }
 
     // Map external inputs
     for (let i = 0; i < inputSlots.length; i++) {
@@ -2191,6 +2254,7 @@ export class WebGPUBackend implements Backend {
       const idx = tape.inputTableIdxs[i];
       buffers[idx] = buffer;
       sizes[idx] = size;
+      // offsets[idx] stays 0, bindSizes[idx] stays 0 (whole buffer)
     }
 
     // Track allocated buffers for error cleanup.
@@ -2211,16 +2275,15 @@ export class WebGPUBackend implements Backend {
         switch (op.type) {
           case "malloc": {
             const m = op.malloc;
+            // O9c: slab-allocated constants are pre-populated above.
+            if (m.slabAllocated) break;
             if (m.paddedSize === 0) {
               buffers[m.tableIdx] = this.#reusableZsb;
             } else {
               let buf: GPUBuffer;
               if (m.initialData) {
-                // Always create fresh mapped buffers for initialData: a pooled
-                // buffer may have been written by an earlier dispatch in this
-                // same encoder, and queue.writeBuffer() executes BEFORE the
-                // encoder's dispatches — so the dispatch would overwrite the
-                // constant data.
+                // Fallback for non-slab initialData (shouldn't happen with
+                // O9c, but kept for safety).
                 buf = this.#createBuffer(m.paddedSize, { mapped: true });
                 new Uint8Array(
                   buf.getMappedRange(),
@@ -2241,6 +2304,8 @@ export class WebGPUBackend implements Backend {
           }
           case "free": {
             const buf = buffers[op.tableIdx];
+            // Skip slab buffer — owned by tape, not per-invocation.
+            if (buf === slabBuf) break;
             if (buf && buf !== this.#reusableZsb) {
               if (!this.#poolPush(buf)) {
                 deferredDestroys.push(buf);
@@ -2253,6 +2318,8 @@ export class WebGPUBackend implements Backend {
           case "recycle":
             buffers[op.toIdx] = buffers[op.fromIdx];
             sizes[op.toIdx] = sizes[op.fromIdx];
+            offsets[op.toIdx] = offsets[op.fromIdx];
+            bindSizes[op.toIdx] = bindSizes[op.fromIdx];
             break;
           case "dispatch": {
             const d = op.dispatch;
@@ -2261,8 +2328,9 @@ export class WebGPUBackend implements Backend {
             const totalBindings = numIn + numOut;
 
             // O9b: bind group cache — reuse when all referenced GPUBuffers
-            // are the same objects as the previous invocation (common with
-            // pool LIFO ordering returning the same buffers).
+            // are the same objects as the previous invocation. With O9c slab,
+            // constant inputs always match (same GPUBuffer), so cache hit rate
+            // increases significantly.
             let bindGroup: GPUBindGroup;
             let cacheHit = false;
             const cached = d._bgCache;
@@ -2292,9 +2360,17 @@ export class WebGPUBackend implements Backend {
               );
               for (let i = 0; i < numIn; i++) {
                 const idx = d.inputIdxs[i];
+                const bsz = bindSizes[idx];
                 entries[i] = {
                   binding: i,
-                  resource: { buffer: buffers[idx] },
+                  resource:
+                    bsz > 0
+                      ? {
+                          buffer: buffers[idx],
+                          offset: offsets[idx],
+                          size: bsz,
+                        }
+                      : { buffer: buffers[idx] },
                 };
               }
               for (let i = 0; i < numOut; i++) {

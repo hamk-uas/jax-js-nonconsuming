@@ -8,10 +8,30 @@
  *   import { gpuConfig } from "./gpu-config";
  *   export default gpuConfig("nvidia");
  */
+import fs from "node:fs";
 import path from "node:path";
 
 import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
+
+/**
+ * Auto-detect DISPLAY by scanning /tmp/.X11-unix/ for X server sockets.
+ * Falls back to ":0" if detection fails or no sockets are found.
+ */
+function detectDisplay(): string {
+  if (process.env.DISPLAY) return process.env.DISPLAY;
+  try {
+    const entries = fs.readdirSync("/tmp/.X11-unix");
+    // Entries look like "X0", "X1", etc. Pick the first one.
+    for (const e of entries) {
+      const m = e.match(/^X(\d+)$/);
+      if (m) return `:${m[1]}`;
+    }
+  } catch {
+    // /tmp/.X11-unix doesn't exist or isn't readable
+  }
+  return ":0";
+}
 
 /** Chromium args shared by all GPU configs. */
 const COMMON_ARGS = [
@@ -78,7 +98,7 @@ export function gpuConfig(gpu: GpuProfile) {
           launchOptions: {
             args: [...COMMON_ARGS, ...profile.args],
             env: {
-              DISPLAY: process.env.DISPLAY ?? ":0",
+              DISPLAY: detectDisplay(),
               XAUTHORITY:
                 process.env.XAUTHORITY ??
                 `/run/user/${process.getuid?.() ?? 1000}/gdm/Xauthority`,
