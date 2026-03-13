@@ -16,10 +16,27 @@ import { defineConfig } from "vitest/config";
 
 /**
  * Auto-detect DISPLAY by scanning /tmp/.X11-unix/ for X server sockets.
+ * If process.env.DISPLAY is set, validate that its socket exists before
+ * trusting it — stale DISPLAY values (e.g. `:0` when X server is at `:1`)
+ * cause silent WebGPU adapter failures.
  * Falls back to ":0" if detection fails or no sockets are found.
  */
 function detectDisplay(): string {
-  if (process.env.DISPLAY) return process.env.DISPLAY;
+  if (process.env.DISPLAY) {
+    // Validate that the socket for this DISPLAY actually exists.
+    const m = process.env.DISPLAY.match(/^:(\d+)/);
+    if (m) {
+      try {
+        fs.accessSync(`/tmp/.X11-unix/X${m[1]}`);
+        return process.env.DISPLAY;
+      } catch {
+        // Socket doesn't exist — fall through to auto-detect.
+      }
+    } else {
+      // Non-local DISPLAY (e.g. host:0) — trust it.
+      return process.env.DISPLAY;
+    }
+  }
   try {
     const entries = fs.readdirSync("/tmp/.X11-unix");
     // Entries look like "X0", "X1", etc. Pick the first one.

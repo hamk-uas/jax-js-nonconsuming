@@ -1512,6 +1512,18 @@ The tape is compiled on first invocation and cached on the `JitProgram` instance
 | O8b   | Bind group caching                              | Small  | Additional ~20% on repeated invocations |
 | O8c   | DUS + scatter_add + reverse support ✅          | Small  | Expands tape eligibility                |
 | O8d   | fori_loop unrolling into tape                   | Medium | Handles loop-containing programs        |
+| O8e   | Unify tape copy encoding with unaligned helper  | Small  | Deferred — see below                    |
+
+**O8e (deferred):** The tape execution path for DUS, scatter_add, and reverse uses raw
+`encoder.copyBufferToBuffer()`, which requires 4-byte alignment. The backend's
+`copyBufferToBuffer(Slot, ...)` method has a WGSL copy-shader fallback for unaligned sizes, but the
+tape does not share that code path. Instead, `canCompileToCommandTape` rejects unaligned cases
+(e.g., Float16 with odd element counts), falling back to step-by-step execution. This is correct but
+means the tape path and the standalone path duplicate alignment-aware copy semantics. The fix is to
+factor the unaligned-copy logic into a helper that operates on raw `GPUCommandEncoder` + `GPUBuffer`
+(rather than requiring `Slot` objects), then call it from both `copyBufferToBuffer` and the tape
+execution loop. Not urgent — Float16 scatter_add/DUS/reverse on odd shapes is rare in practice, and
+the fallback is correct.
 
 ### Comparison with alternatives
 

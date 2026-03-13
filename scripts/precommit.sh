@@ -85,3 +85,21 @@ fi
 if [[ "$profile" == "full" ]]; then
   pnpm run test:website:smoke
 fi
+
+# --- WebGPU-only tests ---
+# These correctness tests are excluded from the default vitest config because
+# they require a real GPU adapter.  Run them here so WebGPU regressions are
+# caught during regular development, not just during manual gpu-test.sh runs.
+gpu_only_tests=(
+  test/o9a-arena.test.ts
+  test/o9c-slab.test.ts
+  test/command-tape-gpu.test.ts
+  test/pool-memory.test.ts
+  test/blocked-data-movement.test.ts
+  test/repro-stub.test.ts
+)
+if [[ "$profile" == "full" ]]; then
+  scripts/gpu-test.sh run "${gpu_only_tests[@]}"
+else
+  GPU=nvidia scripts/gpu-test.sh run "${gpu_only_tests[@]}"
+fi

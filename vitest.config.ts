@@ -93,6 +93,7 @@ export default defineConfig({
       // WebGPU-only tests — must run under GPU configs, not the default suite:
       "test/o9a-arena.test.ts",
       "test/o9c-slab.test.ts",
+      "test/command-tape-gpu.test.ts",
       "test/repro-stub.test.ts",
       "test/pool-memory.test.ts",
       "test/blocked-data-movement.test.ts",

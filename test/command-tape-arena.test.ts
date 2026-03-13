@@ -324,6 +324,25 @@ describe("O8c canCompileToCommandTape", () => {
     expect(canCompileToCommandTape(steps)).toBe(false);
   });
 
+  it("rejects scatter_add with unaligned targetBytes (f16 odd count)", () => {
+    // Float16 targetShape [3] → 3*2 = 6 bytes, not 4-byte aligned.
+    // copyBufferToBuffer requires 4-byte alignment; falls back to step-by-step.
+    const steps: JitStep[] = [
+      {
+        type: "scatter_add",
+        target: 0,
+        indices: 1,
+        updates: 2,
+        output: 3,
+        axis: 0,
+        targetShape: [3],
+        updatesLen: 1,
+        dtype: DType.Float16,
+      },
+    ];
+    expect(canCompileToCommandTape(steps)).toBe(false);
+  });
+
   it("accepts reverse with concrete axis size and 4-byte aligned inner", () => {
     const steps: JitStep[] = [
       {
