@@ -10,10 +10,9 @@
 // pool *before* subsequent mallocs, reducing peak VRAM compared to the
 // bulk-malloc-then-bulk-free approach.
 
-import { byteWidth, DType, Kernel } from "../../alu";
+import { DType, Kernel } from "../../alu";
 import type { JitStep } from "../../frontend/jit";
 import { isSymbolicSize } from "../../shape";
-import { prod } from "../../utils";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -327,10 +326,10 @@ export function buildConflictGraphAndColor(
  * Check whether a JitProgram's steps can be compiled to a WebGPU command tape.
  *
  * Returns true if all steps are supported: execute (Kernel or Routine),
- * malloc (concrete size), free, recycle, DUS (concrete sizes, 4-byte-aligned
- * offsets), scatter_add (non-f64), and reverse (concrete axis size, 4-byte-
- * aligned innerBytes). Programs with scan, block_map, or other complex steps
- * fall back to step-by-step.
+ * malloc (concrete size), free, recycle, DUS (concrete sizes), scatter_add
+ * (non-f64), and reverse (concrete axis size). Unaligned copies use the WGSL
+ * copy shader via `#encodeCopyAuto`. Programs with scan, block_map, or other
+ * complex steps fall back to step-by-step.
  */
 export function canCompileToCommandTape(steps: JitStep[]): boolean {
   for (const step of steps) {
@@ -353,25 +352,10 @@ export function canCompileToCommandTape(steps: JitStep[]): boolean {
           isSymbolicSize(step.dstSizeBytes)
         )
           return false;
-        // copyBufferToBuffer requires 4-byte alignment on all offsets/sizes
-        if (
-          (step.dstSizeBytes as number) % 4 !== 0 ||
-          step.offsetBytes % 4 !== 0 ||
-          (step.sliceBytes as number) % 4 !== 0 ||
-          step.srcFiberBytes % 4 !== 0 ||
-          step.dstFiberBytes % 4 !== 0
-        )
-          return false;
         break;
       case "scatter_add":
         // Float64 not supported on WebGPU
         if (step.dtype === DType.Float64) return false;
-        // The tape copies target → output via copyBufferToBuffer which
-        // requires 4-byte-aligned size. Reject unaligned cases (e.g. Float16
-        // with odd element count) so they fall back to step-by-step which
-        // routes through the unaligned WGSL copy shader.
-        if ((prod(step.targetShape) * byteWidth(step.dtype)) % 4 !== 0)
-          return false;
         break;
       case "reverse":
         // Reject symbolic axis size or total bytes
@@ -380,8 +364,6 @@ export function canCompileToCommandTape(steps: JitStep[]): boolean {
           isSymbolicSize(step.totalBytes)
         )
           return false;
-        // copyBufferToBuffer requires 4-byte aligned innerBytes
-        if (step.innerBytes % 4 !== 0) return false;
         break;
       case "incref":
       case "scan":

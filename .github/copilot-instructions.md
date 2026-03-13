@@ -675,6 +675,15 @@ first; `decRef` returns to pool instead of destroying.
 **Peak-memory guarantee:** Before each JIT execution, `configurePool()` evicts stale entries and
 caps retained bytes at the program's peak live bytes.
 
+**16-byte malloc floor:** All `GPUBuffer` allocations are padded to ≥16 bytes (4-byte aligned).
+Uniform bindings require ≥16 bytes (vec4), but the floor applies to all allocations because
+threading an `isUniform` flag through `malloc` would add complexity for negligible gain — only
+scalar-promotion mallocs (2–8 bytes) are affected. Removing the floor requires either (a) a surgical
+approach adding `isUniform` params to `malloc`/pool/arena/recycle/tape paths (~60–120 lines, spreads
+complexity) or (b) a proper allocator refactor splitting `mallocStorage` vs `mallocUniform`
+(~half-day, cleaner but larger scope). Keep the floor unless measured fragmentation harm justifies
+the change.
+
 **WASM comparison:** `WasmAllocator` uses free-list + reset-on-empty + top-of-heap compaction.
 Zeroes on free-list reuse. WebGPU pool does NOT zero pooled buffers.
 
@@ -859,4 +868,6 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Targeted jaxprification over general                        | Cholesky (n≤4), TriSolve/QR (n≤8) traced to fusable ops. Sort/Argsort/LU are non-jaxprifiable                                                                                                                                  |
 | Command tape GPU teardown on `clearCaches()`                | `_clearJitCompileCache` iterates programs, destroys uniform/constSlab/arena GPUBuffers before dropping refs                                                                                                                    |
 | O8c DUS/scatter_add/reverse in tape                         | Pre-encoded copies + pre-resolved scatter pipeline. 4-byte alignment gate for all copies (DUS, scatter_add, reverse); f64 gate for scatter_add. Unaligned cases fall back to step-by-step; O8e deferred to unify copy encoding |
+| O8e Unified copy encoding                                   | `#encodeCopyAuto` handles aligned (native) and unaligned (WGSL copy shader) transparently. Tape alignment gates removed — all DUS/scatter_add/reverse now handled                                                              |
+| Leaf packing for 6+ tuple assocScan                         | `needsLeafPacking` flag → shader emits `in_packed`/`out_packed` with compile-time offsets. Executor pack/unpack around dispatch. Binding count reduced from 2×numLeaves to 2                                                   |
 | WebGPU-only tests in GPU-enforced suite                     | Tests requiring WebGPU excluded from default vitest config; run under gpu-test.sh where adapter is guaranteed. Pre-commit runs them automatically (NVIDIA on feature, both GPUs on main)                                       |

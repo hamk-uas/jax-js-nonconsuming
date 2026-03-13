@@ -1147,6 +1147,12 @@ export class JitProgram {
             // IncRef consts for body
             for (const s of constSlots) this.backend.incRef(s);
 
+            // Flush the batch encoder before body execution: the copy commands
+            // above are still in the batch encoder. If the inner body uses the
+            // command tape fast path, it creates its own GPUCommandEncoder — so
+            // the copies must be submitted first or the body reads stale data.
+            this.backend.flushBatch?.();
+
             // Body inputs: [consts, a (carry), b (current)]
             const bodyInputs = [...constSlots, ...carrySlots, ...bSlots];
             const bodyResult = step.bodyProgram.execute(bodyInputs);

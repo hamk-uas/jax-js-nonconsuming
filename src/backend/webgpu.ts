@@ -542,8 +542,12 @@ export class WebGPUBackend implements Backend {
   malloc(size: number, initialData?: Uint8Array<ArrayBuffer>): Slot {
     let buffer: GPUBuffer;
     // All GPUBuffer must be a multiple of 4 bytes in length, to support copy
-    // operations. Pad it to a multiple of 4.
-    const paddedSize = Math.ceil(size / 4) * 4;
+    // operations. Pad it to a multiple of 4. Minimum 16 bytes ensures uniform
+    // bindings work (vec4 in shaders requires ≥16-byte buffers). This floor
+    // applies to all allocations, not just uniforms, because threading an
+    // `isUniform` flag through malloc would add complexity for negligible
+    // gain — only scalar-promotion mallocs (2–8 bytes) are affected.
+    const paddedSize = Math.max(Math.ceil(size / 4) * 4, 16);
     if (size === 0) {
       buffer = this.#reusableZsb;
     } else if (initialData) {
@@ -651,34 +655,20 @@ export class WebGPUBackend implements Backend {
     // otherwise create a standalone command encoder.
     const encoder = this.#batchEncoder ?? this.device.createCommandEncoder();
     const ownEncoder = !this.#batchEncoder;
-    // WebGPU copyBufferToBuffer requires 4-byte alignment on offsets and size.
-    if (srcOffset % 4 === 0 && dstOffset % 4 === 0 && size % 4 === 0) {
-      // Fast GPU copy path — all alignments satisfied.
-      encoder.copyBufferToBuffer(
-        srcBuf.buffer,
-        srcOffset,
-        dstBuf.buffer,
-        dstOffset,
-        size,
-      );
-      if (ownEncoder) this.device.queue.submit([encoder.finish()]);
-    } else {
-      // Unaligned fallback: use WGSL copy shader (stays on GPU).
-      const uniformBuf = this.#encodeCopyWithShader(
-        encoder,
-        srcBuf.buffer,
-        srcOffset,
-        dstBuf.buffer,
-        dstOffset,
-        size,
-      );
-      if (ownEncoder) {
-        this.device.queue.submit([encoder.finish()]);
-        if (uniformBuf) uniformBuf.destroy();
-      } else if (uniformBuf) {
-        // Defer uniform buffer destruction until batch ends
-        this.#batchUniformsToDestroy.push(uniformBuf);
-      }
+    const uniformBuf = this.#encodeCopyAuto(
+      encoder,
+      srcBuf.buffer,
+      srcOffset,
+      dstBuf.buffer,
+      dstOffset,
+      size,
+    );
+    if (ownEncoder) {
+      this.device.queue.submit([encoder.finish()]);
+      if (uniformBuf) uniformBuf.destroy();
+    } else if (uniformBuf) {
+      // Defer uniform buffer destruction until batch ends
+      this.#batchUniformsToDestroy.push(uniformBuf);
     }
   }
 
@@ -924,6 +914,39 @@ export class WebGPUBackend implements Backend {
     passEncoder.end();
 
     return uniformBuffer;
+  }
+
+  /**
+   * Encode a buffer copy that works for both aligned and unaligned sizes.
+   * Operates on raw GPUBuffer/GPUCommandEncoder — no Slot dependency.
+   *
+   * - Aligned (offsets and size divisible by 4): native copyBufferToBuffer.
+   * - Unaligned: WGSL copy shader dispatch (stays on GPU).
+   *
+   * Returns the temporary uniform buffer to destroy after queue.submit(),
+   * or null if no temporary was needed (aligned path or zero size).
+   */
+  #encodeCopyAuto(
+    encoder: GPUCommandEncoder,
+    srcBuf: GPUBuffer,
+    srcOffset: number,
+    dstBuf: GPUBuffer,
+    dstOffset: number,
+    size: number,
+  ): GPUBuffer | null {
+    if (size === 0) return null;
+    if (srcOffset % 4 === 0 && dstOffset % 4 === 0 && size % 4 === 0) {
+      encoder.copyBufferToBuffer(srcBuf, srcOffset, dstBuf, dstOffset, size);
+      return null;
+    }
+    return this.#encodeCopyWithShader(
+      encoder,
+      srcBuf,
+      srcOffset,
+      dstBuf,
+      dstOffset,
+      size,
+    );
   }
 
   /**
@@ -2023,6 +2046,26 @@ export class WebGPUBackend implements Backend {
     }
   }
 
+  /**
+   * Submit the current batch encoder mid-batch and replace it with a fresh one.
+   * Does NOT change #batchDepth — the batch nesting structure is preserved.
+   * This is needed when inner code (e.g., body program execution) must read
+   * buffers that were written by commands still in the batch encoder.
+   * No-op when no batch is active.
+   */
+  flushBatch(): void {
+    const encoder = this.#batchEncoder;
+    if (!encoder) return;
+    this.device.queue.submit([encoder.finish()]);
+    // Destroy any uniform buffers from the flushed encoder
+    for (const buf of this.#batchUniformsToDestroy) buf.destroy();
+    this.#batchUniformsToDestroy = [];
+    // Note: deferred frees are NOT processed here — they are still referenced
+    // by the outer batch scope and will be freed when depth reaches 0.
+    // Create a fresh encoder for subsequent commands.
+    this.#batchEncoder = this.device.createCommandEncoder();
+  }
+
   // ---------------------------------------------------------------------------
   // Command tape: pre-compiled dispatch sequence (O8)
   // ---------------------------------------------------------------------------
@@ -2445,6 +2488,9 @@ export class WebGPUBackend implements Backend {
     // because earlier dispatches in the same GPUCommandEncoder still reference
     // them.  Defer destruction to post-submit.
     const deferredDestroys: GPUBuffer[] = [];
+    // Temporary uniform buffers created by #encodeCopyAuto for unaligned
+    // copies (O8e).  Must survive until after queue.submit().
+    const copyUniforms: GPUBuffer[] = [];
     // Track buffers pushed to pool during this tape execution so we can
     // remove them on error (prevents pool poisoning with destroyed refs).
     const pooledDuringTape: GPUBuffer[] = [];
@@ -2620,34 +2666,40 @@ export class WebGPUBackend implements Backend {
 
             // Copy dst → output (skip if recycled: same buffer + offset)
             if (dstBuf !== outBuf || dstOff !== outOff) {
-              encoder.copyBufferToBuffer(
+              const u = this.#encodeCopyAuto(
+                encoder,
                 dstBuf,
                 dstOff,
                 outBuf,
                 outOff,
                 d.dstSizeBytes,
               );
+              if (u) copyUniforms.push(u);
             }
             // Copy src slice into output at offsetBytes
             if (d.outerFibers === 1) {
               // Contiguous fast path (axis=0)
-              encoder.copyBufferToBuffer(
+              const u = this.#encodeCopyAuto(
+                encoder,
                 srcBuf,
                 srcOff,
                 outBuf,
                 outOff + d.offsetBytes,
                 d.sliceBytes,
               );
+              if (u) copyUniforms.push(u);
             } else {
               // Fiber-by-fiber copy for non-contiguous axis > 0
               for (let i = 0; i < d.outerFibers; i++) {
-                encoder.copyBufferToBuffer(
+                const u = this.#encodeCopyAuto(
+                  encoder,
                   srcBuf,
                   srcOff + i * d.srcFiberBytes,
                   outBuf,
                   outOff + i * d.dstFiberBytes + d.offsetBytes,
                   d.srcFiberBytes,
                 );
+                if (u) copyUniforms.push(u);
               }
             }
             break;
@@ -2661,13 +2713,15 @@ export class WebGPUBackend implements Backend {
 
             // Copy target → output (skip if recycled)
             if (targetBuf !== outBuf || targetOff !== outOff) {
-              encoder.copyBufferToBuffer(
+              const u = this.#encodeCopyAuto(
+                encoder,
                 targetBuf,
                 targetOff,
                 outBuf,
                 outOff,
                 sa.targetBytes,
               );
+              if (u) copyUniforms.push(u);
             }
 
             // Dispatch scatter_add kernel
@@ -2722,13 +2776,15 @@ export class WebGPUBackend implements Backend {
 
             // Copy slices in reverse order
             for (let i = 0; i < r.axisSize; i++) {
-              encoder.copyBufferToBuffer(
+              const u = this.#encodeCopyAuto(
+                encoder,
                 inBuf,
                 inOff + i * r.innerBytes,
                 outBuf,
                 outOff + (r.axisSize - 1 - i) * r.innerBytes,
                 r.innerBytes,
               );
+              if (u) copyUniforms.push(u);
             }
             break;
           }
@@ -2750,6 +2806,8 @@ export class WebGPUBackend implements Backend {
             buf.destroy();
           }
         }
+        // Destroy any copy-shader uniforms created before the failure.
+        for (const buf of copyUniforms) buf.destroy();
       }
     }
 
@@ -2759,6 +2817,8 @@ export class WebGPUBackend implements Backend {
       this.#gpuAllocatedBytes -= buf.size;
       buf.destroy();
     }
+    // Destroy temporary uniform buffers from unaligned copy shader (O8e).
+    for (const buf of copyUniforms) buf.destroy();
 
     // Create output slots
     const outputs: Slot[] = new globalThis.Array(tape.outputTableIdxs.length);

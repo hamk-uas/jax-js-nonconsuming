@@ -267,7 +267,7 @@ describe("O8c canCompileToCommandTape", () => {
     expect(canCompileToCommandTape(steps)).toBe(false);
   });
 
-  it("rejects DUS with non-4-byte-aligned offsetBytes", () => {
+  it("accepts DUS with non-4-byte-aligned offsetBytes (O8e copy shader)", () => {
     const steps: JitStep[] = [
       {
         type: "dus",
@@ -275,14 +275,14 @@ describe("O8c canCompileToCommandTape", () => {
         src: 1,
         output: 2,
         dstSizeBytes: 16,
-        offsetBytes: 2, // f16: 2-byte aligned
+        offsetBytes: 2, // f16: 2-byte aligned — routed through WGSL copy shader
         sliceBytes: 2,
         outerFibers: 1,
         srcFiberBytes: 2,
         dstFiberBytes: 16,
       },
     ];
-    expect(canCompileToCommandTape(steps)).toBe(false);
+    expect(canCompileToCommandTape(steps)).toBe(true);
   });
 
   it("accepts scatter_add with f32 dtype", () => {
@@ -324,9 +324,9 @@ describe("O8c canCompileToCommandTape", () => {
     expect(canCompileToCommandTape(steps)).toBe(false);
   });
 
-  it("rejects scatter_add with unaligned targetBytes (f16 odd count)", () => {
+  it("accepts scatter_add with unaligned targetBytes (f16 odd count, O8e copy shader)", () => {
     // Float16 targetShape [3] → 3*2 = 6 bytes, not 4-byte aligned.
-    // copyBufferToBuffer requires 4-byte alignment; falls back to step-by-step.
+    // O8e routes through the WGSL copy shader for byte-exact copies.
     const steps: JitStep[] = [
       {
         type: "scatter_add",
@@ -340,7 +340,7 @@ describe("O8c canCompileToCommandTape", () => {
         dtype: DType.Float16,
       },
     ];
-    expect(canCompileToCommandTape(steps)).toBe(false);
+    expect(canCompileToCommandTape(steps)).toBe(true);
   });
 
   it("accepts reverse with concrete axis size and 4-byte aligned inner", () => {
@@ -380,7 +380,7 @@ describe("O8c canCompileToCommandTape", () => {
     expect(canCompileToCommandTape(steps)).toBe(false);
   });
 
-  it("rejects reverse with non-4-byte-aligned innerBytes", () => {
+  it("accepts reverse with non-4-byte-aligned innerBytes (O8e copy shader)", () => {
     const steps: JitStep[] = [
       {
         type: "reverse",
@@ -388,12 +388,12 @@ describe("O8c canCompileToCommandTape", () => {
         output: 1,
         axis: 0,
         axisSize: 8,
-        innerBytes: 2, // f16 elements
+        innerBytes: 2, // f16 elements — routed through WGSL copy shader
         totalBytes: 16,
         dtype: DType.Float16,
       },
     ];
-    expect(canCompileToCommandTape(steps)).toBe(false);
+    expect(canCompileToCommandTape(steps)).toBe(true);
   });
 });
 

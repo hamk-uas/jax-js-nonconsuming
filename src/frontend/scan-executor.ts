@@ -675,6 +675,7 @@ function executeAssocScanBlockMapInner(
     inputSlots: elemSlots,
     outputSlots: localScanSlots,
     constInfos: localScan.constInfos,
+    needsLeafPacking: plan.needsLeafPacking,
   };
 
   const bmResult = executeBlockMap(blockMapParams);
@@ -784,27 +785,24 @@ function executeAssocScanBlockMapInner(
       return shape;
     });
 
-    // inAxes: consts=null, prefix leaves=null (point mode handles offset),
+    // inAxes: prefix leaves=null (point mode handles offset),
     //         block leaves=mapped on axis
+    // Note: inAxes covers only non-const inputs (numInputs entries).
+    // Constants are handled separately via constSlots/numConsts.
     const inAxes: (number | null)[][] = [
-      ...constSlots.map(() => [null as number | null]),
       ...prefixElemShapes.map(() => [null as number | null]),
       ...resolvedElemShapes.map(() => [axis as number | null]),
     ];
     const outAxes: (number | null)[][] = resolvedElemShapes.map(() => [axis]);
 
-    // pointInputs: false for consts, true for prefix leaves, false for block leaves
+    // pointInputs: true for prefix leaves, false for block leaves
+    // (covers only non-const inputs, same length as inAxes)
     const pointInputs = [
-      ...constSlots.map(() => false),
       ...prefixElemShapes.map(() => true),
       ...resolvedElemShapes.map(() => false),
     ];
 
-    const inputShapes = [
-      ...constAvals.map((a) => a.shape as number[]),
-      ...prefixElemShapes,
-      ...resolvedElemShapes,
-    ];
+    const inputShapes = [...prefixElemShapes, ...resolvedElemShapes];
 
     const phase4Params: ExecuteBlockMapParams = {
       backend,
@@ -827,6 +825,7 @@ function executeAssocScanBlockMapInner(
       constInfos: plan.localScan.constInfos,
       pointInputs,
       gridOffset: 1,
+      needsLeafPacking: plan.needsLeafPacking,
     };
 
     const phase4Result = executeBlockMap(phase4Params);

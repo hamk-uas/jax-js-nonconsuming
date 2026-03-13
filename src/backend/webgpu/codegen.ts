@@ -2,6 +2,25 @@
 
 import { DType } from "../../alu";
 
+/**
+ * Packed leaf buffer layout — used when the number of per-leaf storage
+ * bindings would exceed maxStorageBuffersPerShaderStage.  All non-const
+ * inputs are packed into a single `array<T>` storage buffer (and similarly
+ * for outputs), with compile-time element offsets baked into the WGSL shader.
+ */
+export interface PackedLeafLayout {
+  /** Per-non-const-input element offset in the packed input buffer. */
+  inputOffsets: number[];
+  /** Total element count of the packed input buffer. */
+  totalInputElems: number;
+  /** Per-output element offset in the packed output buffer. */
+  outputOffsets: number[];
+  /** Total element count of the packed output buffer. */
+  totalOutputElems: number;
+  /** Common dtype for all packed arrays. */
+  dtype: DType;
+}
+
 export interface ShaderInfo {
   code: string; // WGSL shader source code.
   numInputs: number;
@@ -30,6 +49,8 @@ export interface ShaderInfo {
   sharedMemoryBytes?: number;
   /** Number of constant inputs moved to @group(1) var<uniform> bindings. */
   numUniformConsts?: number;
+  /** Packed leaf layout for 6+ tuple assocScan (Phase 2 leaf packing). */
+  packedLeafLayout?: PackedLeafLayout;
 }
 
 export const headerWgsl = String.raw`

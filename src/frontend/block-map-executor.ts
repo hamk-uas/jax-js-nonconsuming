@@ -10,7 +10,8 @@
 import { byteWidth, type DType, Kernel, Reduction } from "../alu";
 import { type Backend, Executable, type Slot } from "../backend";
 import type { BlockMapWasmParams, GeneralScanStep } from "../backend/wasm";
-import { DEBUG } from "../utils";
+import type { PackedLeafLayout } from "../backend/webgpu/codegen";
+import { DEBUG, prod } from "../utils";
 import type { PendingExecute } from "./array";
 import { _registerJitCacheDisposer } from "./check-leaks";
 import type { Jaxpr } from "./jaxpr";
@@ -48,6 +49,12 @@ export interface ExecuteBlockMapParams {
   pointInputs?: boolean[];
   /** Grid offset for mapped input/output base offsets (see BlockMapShaderParams). */
   gridOffset?: number;
+  /**
+   * Enable leaf packing — all non-const inputs packed into a single storage buffer
+   * (and similarly for outputs) to stay within maxStorageBuffersPerShaderStage.
+   * The shader codegen computes concrete element offsets from shapes.
+   */
+  needsLeafPacking?: boolean;
 }
 
 export interface ExecuteBlockMapResult {
@@ -131,6 +138,7 @@ function blockMapSpecKey(params: ExecuteBlockMapParams): string {
     params.hasBlockIndex ? "bi" : "-",
     params.pointInputs?.map((p) => (p ? "P" : "-")).join("") ?? "-",
     params.gridOffset ?? 0,
+    params.needsLeafPacking ? "LP" : "-",
   ];
   return parts.join("|");
 }
@@ -168,6 +176,7 @@ function tryExecuteBlockMapFused(
         constInfos: params.constInfos,
         pointInputs: params.pointInputs,
         gridOffset: params.gridOffset,
+        needsLeafPacking: params.needsLeafPacking,
       }) ?? null;
     inner.set(specKey, exe);
   }
@@ -176,6 +185,58 @@ function tryExecuteBlockMapFused(
 
   if (DEBUG >= 1) {
     console.info("block_map: using fused WebGPU shader path");
+  }
+
+  // --- Leaf packing: pack/unpack buffers around dispatch ---
+  const layout: PackedLeafLayout | undefined = exe.data[0].packedLeafLayout;
+  if (layout) {
+    const bw = byteWidth(layout.dtype);
+    const backend = params.backend;
+
+    // Allocate packed input buffer and copy leaf inputs into it
+    const packedInBytes = layout.totalInputElems * bw;
+    const packedInSlot = backend.malloc(packedInBytes);
+    for (let i = 0; i < params.inputSlots.length; i++) {
+      const offsetBytes = layout.inputOffsets[i] * bw;
+      const sizeBytes = prod(params.inputShapes[i]) * bw;
+      backend.copyBufferToBuffer(
+        params.inputSlots[i],
+        0,
+        packedInSlot,
+        offsetBytes,
+        sizeBytes,
+      );
+    }
+
+    // Allocate packed output buffer
+    const packedOutBytes = layout.totalOutputElems * bw;
+    const packedOutSlot = backend.malloc(packedOutBytes);
+
+    // Dispatch with packed buffers
+    webgpuBackend.dispatchBlockMapFused(
+      exe,
+      [...params.constSlots, packedInSlot],
+      [packedOutSlot],
+    );
+
+    // Unpack output buffer into individual output slots
+    for (let o = 0; o < params.outputSlots.length; o++) {
+      const offsetBytes = layout.outputOffsets[o] * bw;
+      const sizeBytes = prod(params.outputShapes[o]) * bw;
+      backend.copyBufferToBuffer(
+        packedOutSlot,
+        offsetBytes,
+        params.outputSlots[o],
+        0,
+        sizeBytes,
+      );
+    }
+
+    // Free packed temporaries
+    backend.decRef(packedInSlot);
+    backend.decRef(packedOutSlot);
+
+    return { outputs: params.outputSlots, pending: [] };
   }
 
   // Dispatch: inputs = [consts, blockInputs], outputs = [outputSlots]
@@ -642,7 +703,13 @@ function executeBlockMapFallback(
       // body program uses the command tape fast path (WebGPU O8), it creates
       // its own GPUCommandEncoder and submits independently — so the copies
       // must be submitted first or the body reads uninitialized buffers.
-      if (useBatching) {
+      // Use flushBatch() to submit mid-batch without changing the depth —
+      // this works correctly even when a parent scope (e.g.,
+      // executeAssocScanBlockMap) has started a batch around us.
+      // For backends without flushBatch, fall back to endBatch/beginBatch.
+      if (backend.flushBatch) {
+        backend.flushBatch();
+      } else if (useBatching) {
         backend.endBatch!();
         backend.beginBatch!();
       }

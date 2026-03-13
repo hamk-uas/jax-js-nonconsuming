@@ -25,6 +25,7 @@ import {
   constToWgsl,
   dtypeToWgsl,
   headerWgsl,
+  type PackedLeafLayout,
   type ShaderInfo,
 } from "./codegen";
 import {
@@ -51,6 +52,8 @@ import { DEBUG, mapSetUnion, prod, strip1 } from "../../utils";
 // ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
+
+export type { PackedLeafLayout } from "./codegen";
 
 export interface BlockMapShaderParams {
   /** The compiled body program (its steps are analyzed). */
@@ -90,6 +93,12 @@ export interface BlockMapShaderParams {
    * assocScan Phase 4 starts from block 1, not block 0).
    */
   gridOffset?: number;
+  /**
+   * Request leaf packing — when set, the shader codegen computes a
+   * PackedLeafLayout from inputShapes/outputShapes and emits packed storage
+   * bindings.  The computed layout is returned in ShaderInfo.packedLeafLayout.
+   */
+  needsLeafPacking?: boolean;
 }
 
 /**
@@ -108,6 +117,7 @@ export function blockMapFusedShaderSource(
     numConsts,
     numInputs,
     threadTile,
+    needsLeafPacking,
   } = params;
   const steps = bodyProgram.steps;
 
@@ -184,6 +194,8 @@ export function blockMapFusedShaderSource(
     JitId,
     { sizeBytes: number; dtype: DType; elemCount: number }
   >();
+  /** Recycle aliases: recycled output → original malloc input. */
+  const recycleAliases = new Map<JitId, JitId>();
   /** Steps that produce outputs (execute with Kernel source). */
   const kernelSteps: {
     step: Extract<JitStep, { type: "execute" }>;
@@ -327,9 +339,15 @@ export function blockMapFusedShaderSource(
         break;
       }
       case "free":
-      case "recycle":
       case "incref":
         break;
+      case "recycle": {
+        // Alias the recycled output to the same shmem as the input.
+        // Don't add to shmemMap (which drives var<workgroup> declarations) —
+        // just record the alias so idToReadName maps both IDs to the same name.
+        recycleAliases.set(step.output, step.input);
+        break;
+      }
       case "fori_loop": {
         // Analyze fori_loop body: must be kernel-only, elementwise-only
         const flIdx = foriLoops.length;
@@ -406,9 +424,16 @@ export function blockMapFusedShaderSource(
               break;
             }
             case "free":
-            case "recycle":
             case "incref":
               break;
+            case "recycle": {
+              const bExisting = bodyShmemMap.get(bs.input);
+              if (bExisting) {
+                bodyShmemMap.set(bs.output, bExisting);
+                bodyShmemIds.add(bs.output);
+              }
+              break;
+            }
             default:
               if (DEBUG >= 1)
                 console.info(
@@ -673,6 +698,58 @@ export function blockMapFusedShaderSource(
         >();
         const bodyShmemIds = new Set<JitId>();
 
+        // Pre-scan: collect byte sizes of every JitId in the body so we can
+        // handle recycle steps whose input is a body input (not in bodyShmemMap).
+        // Recycle replaces free+malloc; when the freed input is a body program
+        // input (const/elem), bodyShmemMap won't have it, but we still need
+        // a shmem entry for the recycled output.
+        const bodyIdBytes = new Map<JitId, number>();
+        // Body inputs: consts get sizes from parent shmemMap; elems from elemAvals
+        for (let bi = 0; bi < bodyProg.inputs.length; bi++) {
+          const bInId = bodyProg.inputs[bi];
+          if (bi < step.numConsts) {
+            const parentId = step.consts[bi];
+            const parentInfo = shmemMap.get(parentId);
+            if (parentInfo) {
+              bodyIdBytes.set(bInId, parentInfo.sizeBytes);
+            }
+          } else {
+            // a-elem or b-elem: index wraps around numElems
+            const elemIdx = (bi - step.numConsts) % step.numElems;
+            const aval = step.elemAvals[elemIdx];
+            bodyIdBytes.set(
+              bInId,
+              prod(aval.shape as number[]) * byteWidth(aval.dtype),
+            );
+          }
+        }
+        // Pass 1: collect known sizes from mallocs and kernel outputs
+        for (const bs2 of bodySteps) {
+          if (bs2.type === "malloc" && typeof bs2.size === "number") {
+            bodyIdBytes.set(bs2.output, bs2.size);
+          } else if (
+            bs2.type === "execute" &&
+            !(bs2.source instanceof Routine)
+          ) {
+            const bk = bs2.source as Kernel;
+            for (let oi = 0; oi < bk.numOutputs; oi++) {
+              const b = bk.outputs[oi].bytes;
+              if (typeof b === "number") bodyIdBytes.set(bs2.outputs[oi], b);
+            }
+          }
+        }
+        // Pass 2: propagate sizes through recycle aliases
+        for (const bs2 of bodySteps) {
+          if (bs2.type === "recycle") {
+            const sz =
+              bodyIdBytes.get(bs2.input) ?? bodyIdBytes.get(bs2.output);
+            if (sz != null) {
+              bodyIdBytes.set(bs2.input, sz);
+              bodyIdBytes.set(bs2.output, sz);
+            }
+          }
+        }
+
         let valid = true;
         for (const bs of bodySteps) {
           switch (bs.type) {
@@ -724,9 +801,26 @@ export function blockMapFusedShaderSource(
               break;
             }
             case "free":
-            case "recycle":
             case "incref":
               break;
+            case "recycle": {
+              const bExisting = bodyShmemMap.get(bs.input);
+              if (bExisting) {
+                // Output reuses input's storage. Keep both mapped to same entry;
+                // declaration site deduplicates by name.
+                bodyShmemMap.set(bs.output, bExisting);
+                bodyShmemIds.add(bs.output);
+              } else {
+                // Input is a body input (const/elem), not a prior shmem malloc.
+                // The fused shader can't represent this — fall back.
+                if (DEBUG >= 1)
+                  console.info(
+                    "block_map fused: recycle of body input in workgroup_assoc_scan body, fallback",
+                  );
+                valid = false;
+              }
+              break;
+            }
             default:
               valid = false;
               break;
@@ -889,11 +983,15 @@ export function blockMapFusedShaderSource(
   // to keep the binding renumbering simple.
   const effectiveUniformConsts = numUniformConsts === numConsts ? numConsts : 0;
 
-  // Total global storage bindings needed:
-  //   (numConsts - effectiveUniformConsts) + numInputs (read) + numOutputs (read_write)
+  // Packed leaf layout is computed later (after inputDtypes is populated).
+  // For now, derive binding counts assuming packing is viable when requested.
   const numOutputs = bodyOutputIds.length;
-  const storageInputs = numBodyInputs - effectiveUniformConsts;
-  const totalBindings = storageInputs + numOutputs;
+  const assumePacked = needsLeafPacking === true;
+  const storageInputs = assumePacked
+    ? 1
+    : numBodyInputs - effectiveUniformConsts;
+  const numOutputBindings = assumePacked ? 1 : numOutputs;
+  const totalBindings = storageInputs + numOutputBindings;
   const maxBindings = device.limits.maxStorageBuffersPerShaderStage;
   if (totalBindings > maxBindings) {
     if (DEBUG >= 1)
@@ -972,9 +1070,12 @@ export function blockMapFusedShaderSource(
   >(); // resultIdx → input info
 
   // Global inputs: in0..in{numBodyInputs-1}
+  // With leaf packing: uniform consts keep in{ci}, non-consts map to "in_packed".
   for (let i = 0; i < numBodyInputs; i++) {
-    inputIdToName.set(bodyInputIds[i], `in${i}`);
-    idToReadName.set(bodyInputIds[i], `in${i}`);
+    const name =
+      assumePacked && i >= effectiveUniformConsts ? "in_packed" : `in${i}`;
+    inputIdToName.set(bodyInputIds[i], name);
+    idToReadName.set(bodyInputIds[i], name);
   }
   // BlockIndex input: not a storage buffer — resolved to `block_idx` inline.
   // Add sentinel to idToReadName so fori_loop const mapping can find it.
@@ -986,18 +1087,39 @@ export function blockMapFusedShaderSource(
     const outId = bodyOutputIds[o];
     const bodyInputIdx = bodyInputIds.indexOf(outId);
     if (bodyInputIdx >= 0) {
+      const ptInputName =
+        assumePacked && bodyInputIdx >= effectiveUniformConsts
+          ? "in_packed"
+          : `in${bodyInputIdx}`;
       passThroughOutputs.set(o, {
-        inputName: `in${bodyInputIdx}`,
+        inputName: ptInputName,
         inputIdx: bodyInputIdx >= numConsts ? bodyInputIdx - numConsts : -1,
       });
     }
   }
+
+  // Output variable name helper (packed: out_packed; normal: result{o})
+  const resultVar = assumePacked
+    ? (_o: number) => "out_packed"
+    : (o: number) => `result${o}`;
 
   // Shared memory intermediates: shmem_{id}
   for (const [id] of shmemMap) {
     const name = `shmem_${id}`;
     idToReadName.set(id, name);
     idIsShmem.add(id);
+  }
+
+  // Recycle aliases: recycled output → same shmem array as original input.
+  // Resolve through chains (recycle of a recycle) to find the root shmem name.
+  for (const [recycledId, originalId] of recycleAliases) {
+    let rootId = originalId;
+    while (recycleAliases.has(rootId)) rootId = recycleAliases.get(rootId)!;
+    const name = idToReadName.get(rootId);
+    if (name) {
+      idToReadName.set(recycledId, name);
+      if (idIsShmem.has(rootId)) idIsShmem.add(recycledId);
+    }
   }
 
   // Determine which kernel outputs write directly to global result buffers
@@ -1200,10 +1322,65 @@ export function blockMapFusedShaderSource(
     }
   }
 
+  // --- Compute packedLeafLayout now that inputDtypes is populated ---
+  let packedLeafLayout: PackedLeafLayout | undefined;
+  if (assumePacked) {
+    const ncInputs = numBodyInputs - effectiveUniformConsts;
+    let commonDtype: DType | null = null;
+    for (let i = effectiveUniformConsts; i < numBodyInputs; i++) {
+      const dt = inputDtypes[i] ?? DType.Float32;
+      if (commonDtype === null) commonDtype = dt;
+      else if (dt !== commonDtype) {
+        commonDtype = null;
+        break;
+      }
+    }
+    if (commonDtype !== null && ncInputs > 0) {
+      const inputOffsets: number[] = [];
+      let totalIn = 0;
+      for (let i = 0; i < ncInputs; i++) {
+        inputOffsets.push(totalIn);
+        totalIn += prod(params.inputShapes[i]);
+      }
+      const outputOffsets: number[] = [];
+      let totalOut = 0;
+      for (let o = 0; o < numOutputs; o++) {
+        outputOffsets.push(totalOut);
+        totalOut += prod(params.outputShapes[o]);
+      }
+      packedLeafLayout = {
+        inputOffsets,
+        totalInputElems: totalIn,
+        outputOffsets,
+        totalOutputElems: totalOut,
+        dtype: commonDtype,
+      };
+    }
+    if (!packedLeafLayout) {
+      // Mixed dtypes — can't pack. Fall back.
+      if (DEBUG >= 1)
+        console.info(
+          "block_map fused: leaf packing requested but dtypes differ, fallback",
+        );
+      return null;
+    }
+  }
+
   // --- Emit input bindings ---
   // Uniform constants go to @group(1); non-const inputs go to @group(0).
   // Variable names stay as in0, in1, ... regardless of binding group.
-  if (effectiveUniformConsts > 0) {
+  // With packedLeafLayout: all non-const inputs share `in_packed : array<T>`.
+  if (packedLeafLayout) {
+    // Emit uniform constant bindings on @group(1) (same as non-packed path)
+    for (let ci = 0; ci < effectiveUniformConsts; ci++) {
+      const info = constInfos![ci];
+      const ty = dtypeToWgsl(inputDtypes[ci] ?? info.dtype, true);
+      emit(`@group(1) @binding(${ci}) var<uniform> in${ci} : vec4<${ty}>;`);
+    }
+    // Emit single packed input storage binding on @group(0) @binding(0)
+    const pty = dtypeToWgsl(packedLeafLayout.dtype, true);
+    emit(`@group(0) @binding(0) var<storage, read> in_packed : array<${pty}>;`);
+  } else if (effectiveUniformConsts > 0) {
     // Emit uniform constant bindings on @group(1) as vec4<T>.
     // All uniform constants have ≤4 elements, so a single vec4 suffices.
     // Component access via in{ci}[idx] returns the scalar type.
@@ -1257,9 +1434,28 @@ export function blockMapFusedShaderSource(
       }
     }
     outputDtypes.push(dtype);
-    const ty = dtypeToWgsl(dtype, true);
+    if (!packedLeafLayout) {
+      const ty = dtypeToWgsl(dtype, true);
+      emit(
+        `@group(0) @binding(${storageInputs + o}) var<storage, read_write> result${o} : array<${ty}>;`,
+      );
+    }
+  }
+  // With packedLeafLayout: validate output dtypes match the packed dtype,
+  // then emit a single packed output binding.
+  if (packedLeafLayout) {
+    for (let o = 0; o < numOutputs; o++) {
+      if (outputDtypes[o] !== packedLeafLayout.dtype) {
+        if (DEBUG >= 1)
+          console.info(
+            `block_map fused: output ${o} dtype ${outputDtypes[o]} != packed dtype ${packedLeafLayout.dtype}, fallback`,
+          );
+        return null;
+      }
+    }
+    const pty = dtypeToWgsl(packedLeafLayout.dtype, true);
     emit(
-      `@group(0) @binding(${storageInputs + o}) var<storage, read_write> result${o} : array<${ty}>;`,
+      `@group(0) @binding(${storageInputs}) var<storage, read_write> out_packed : array<${pty}>;`,
     );
   }
 
@@ -1294,8 +1490,11 @@ export function blockMapFusedShaderSource(
 
   // Fori_loop body intermediate shmem arrays (skip private buffers)
   for (const fl of foriLoops) {
+    const flDeclaredNames = new Set<string>();
     for (const [id, info] of fl.bodyShmemMap) {
       if (fl.privateShmemIds.has(id)) continue; // O4: private → declared in fn body
+      if (flDeclaredNames.has(info.name)) continue; // recycle aliases
+      flDeclaredNames.add(info.name);
       const ty = dtypeToWgsl(info.dtype, false);
       // O11: bank-padded shmem — add 1 extra element per row
       const pad = fl.shmemBankPad.get(id);
@@ -1313,7 +1512,10 @@ export function blockMapFusedShaderSource(
       emit(`var<workgroup> ${pingName}: array<${ty}, ${count}>;`);
       emit(`var<workgroup> ${pongName}: array<${ty}, ${count}>;`);
     }
+    const wasDeclaredNames = new Set<string>();
     for (const [, info] of was.bodyShmemMap) {
+      if (wasDeclaredNames.has(info.name)) continue; // recycle aliases
+      wasDeclaredNames.add(info.name);
       const ty = dtypeToWgsl(info.dtype, false);
       // Body intermediates are per-thread (each thread computes its own
       // compose result), so use var<private> — NOT var<workgroup>.
@@ -1490,11 +1692,19 @@ export function blockMapFusedShaderSource(
     inNeedsRemap.push(needsRemap);
 
     // Compute base offset
+    // With packedLeafLayout: add per-leaf element offset within packed buffer.
+    const packInputOff =
+      packedLeafLayout && !isPoint
+        ? packedLeafLayout.inputOffsets[i]
+        : packedLeafLayout && isPoint
+          ? packedLeafLayout.inputOffsets[i]
+          : 0;
+    const packPrefix = packInputOff > 0 ? `${packInputOff}u + ` : "";
     if (isPoint) {
       // Point-mode: 1 element per grid point, indexed by block_i0.
       // inputShapes[i] is the per-element shape (no grid dimension).
       const elemFlatSize = inShape.reduce((a, b) => a * b, 1);
-      emit(`let in_base_${i}: u32 = block_i0 * ${elemFlatSize}u;`);
+      emit(`let in_base_${i}: u32 = ${packPrefix}block_i0 * ${elemFlatSize}u;`);
     } else {
       // Normal mapped: blockShape elements per grid point.
       const terms: string[] = [];
@@ -1510,7 +1720,7 @@ export function blockMapFusedShaderSource(
         }
       }
       const baseExpr = terms.length > 0 ? terms.join(" + ") : "0u";
-      emit(`let in_base_${i}: u32 = ${baseExpr};`);
+      emit(`let in_base_${i}: u32 = ${packPrefix}${baseExpr};`);
     }
   }
 
@@ -1579,7 +1789,10 @@ export function blockMapFusedShaderSource(
       }
     }
     const baseExpr = terms.length > 0 ? terms.join(" + ") : "0u";
-    emit(`let out_base_${o}: u32 = ${baseExpr};`);
+    // With packedLeafLayout: add per-output element offset in packed output.
+    const packOutOff = packedLeafLayout ? packedLeafLayout.outputOffsets[o] : 0;
+    const packOutPrefix = packOutOff > 0 ? `${packOutOff}u + ` : "";
+    emit(`let out_base_${o}: u32 = ${packOutPrefix}${baseExpr};`);
 
     // Check if flat block-local index matches strided output offset.
     // They differ when the output buffer stride for any mapped axis
@@ -1691,9 +1904,21 @@ export function blockMapFusedShaderSource(
 
   // Phony assignments for unused inputs
   if (numBodyInputs > 0) {
-    emit(
-      Array.from({ length: numBodyInputs }, (_, i) => `_ = &in${i};`).join(" "),
-    );
+    if (packedLeafLayout) {
+      // With leaf packing: only keep-alive uniform consts + packed buffers
+      const parts: string[] = [];
+      for (let i = 0; i < effectiveUniformConsts; i++)
+        parts.push(`_ = &in${i};`);
+      parts.push("_ = &in_packed;");
+      parts.push("_ = &out_packed;");
+      emit(parts.join(" "));
+    } else {
+      emit(
+        Array.from({ length: numBodyInputs }, (_, i) => `_ = &in${i};`).join(
+          " ",
+        ),
+      );
+    }
   }
 
   // --- Helper: create gen() function for a kernel step ---
@@ -1914,7 +2139,7 @@ export function blockMapFusedShaderSource(
           const castFinal =
             resultTy !== reTy ? `${resultTy}(${finalValue})` : finalValue;
           emit(
-            `result${resultIdx}[i32(out_base_${resultIdx})] = ${castFinal};`,
+            `${resultVar(resultIdx)}[i32(out_base_${resultIdx})] = ${castFinal};`,
           );
         } else if (idIsShmem.has(outId)) {
           const shmemName = idToReadName.get(outId)!;
@@ -2000,12 +2225,12 @@ export function blockMapFusedShaderSource(
           if (hasBoundary) {
             emit(`if (valid) {`, pushIndent);
             emit(
-              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${reOutOff})] = ${castFinal};`,
+              `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${reOutOff})] = ${castFinal};`,
             );
             emit(popIndent, "}");
           } else {
             emit(
-              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${reOutOff})] = ${castFinal};`,
+              `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${reOutOff})] = ${castFinal};`,
             );
           }
         } else if (idIsShmem.has(outId)) {
@@ -2046,12 +2271,12 @@ export function blockMapFusedShaderSource(
             if (hasBoundary) {
               emit(`if (valid) {`, pushIndent);
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${offsetExpr})] = ${castRhs};`,
+                `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${offsetExpr})] = ${castRhs};`,
               );
               emit(popIndent, "}");
             } else {
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${offsetExpr})] = ${castRhs};`,
+                `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${offsetExpr})] = ${castRhs};`,
               );
             }
           } else if (idIsShmem.has(outId)) {
@@ -2942,7 +3167,7 @@ export function blockMapFusedShaderSource(
             }
             const oExpr = oTerms.length > 0 ? oTerms.join(" + ") : `_rt_idx`;
             emit(
-              `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${oExpr})] = ${resultTy}(${varName}[_rt_idx]);`,
+              `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${oExpr})] = ${resultTy}(${varName}[_rt_idx]);`,
             );
             emitTileLoopClose();
           } else {
@@ -2952,12 +3177,12 @@ export function blockMapFusedShaderSource(
             if (hasBoundary) {
               emit(`if (valid) {`, pushIndent);
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${carryName}[tidx]);`,
+                `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${carryName}[tidx]);`,
               );
               emit(popIndent, "}");
             } else {
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${carryName}[tidx]);`,
+                `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${carryName}[tidx]);`,
               );
             }
           }
@@ -3131,12 +3356,12 @@ export function blockMapFusedShaderSource(
             if (hasBoundary) {
               emit(`if (valid) {`, pushIndent);
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${carryName}[tidx]);`,
+                `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${carryName}[tidx]);`,
               );
               emit(popIndent, "}");
             } else {
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${carryName}[tidx]);`,
+                `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${carryName}[tidx]);`,
               );
             }
           }
@@ -3444,13 +3669,56 @@ export function blockMapFusedShaderSource(
                 writeLeaf(e, ec, rhs, false);
               }
             } else {
-              // Body intermediate → write to body shmem
+              // Body intermediate → write to var<private> array.
+              // The array has `elemCount` entries (1 for scalar ops, M² for
+              // matrix ops). Write at the element-local index, NOT tidx.
               const rhs = strip1(gen(bKernel.outputs[oi].exp));
               const sname = bodyIdToName.get(outId);
               if (sname) {
-                emit(
-                  `${sname}[${bKernel.numOutputs > 1 ? `i32(tidx) * ${bKernel.numOutputs} + ${oi}` : "tidx"}] = ${rhs};`,
-                );
+                const elemCount = was.bodyShmemMap.get(outId)?.elemCount ?? 1;
+                if (elemCount === 1) {
+                  // Scalar intermediate: always index 0
+                  emit(`${sname}[0] = ${rhs};`);
+                } else if (bKernel.numOutputs > 1) {
+                  // Multi-output kernel: output index within the element
+                  emit(`${sname}[${oi}] = ${rhs};`);
+                } else {
+                  // Single-output, multi-element: need gidx loop
+                  emit(
+                    `for (var _was_ii: u32 = 0u; _was_ii < ${elemCount}u; _was_ii++) {`,
+                    pushIndent,
+                  );
+
+                  const iiResolve: ResolveGlobalIndex = (
+                    bufIdx2,
+                    _indexExpr,
+                    dtype2,
+                  ) => {
+                    const kind2 = bStepInputKind[bufIdx2];
+                    if (kind2 === "const")
+                      return resolveConst(bufIdx2, "i32(_was_ii)", dtype2);
+                    if (kind2 === "a")
+                      return multiElemResolveA(
+                        bStepInputElemIdx[bufIdx2],
+                        "_was_ii",
+                      );
+                    if (kind2 === "b")
+                      return multiElemResolveB(
+                        bStepInputElemIdx[bufIdx2],
+                        "_was_ii",
+                      );
+                    const sn2 = bodyIdToName.get(bStep.inputs[bufIdx2]);
+                    return `${sn2 ?? "__unknown"}[i32(_was_ii)]`;
+                  };
+                  const genIi = createGen(
+                    bKernel,
+                    `${prefix}_s${bsi}_ii`,
+                    iiResolve,
+                  );
+                  const rhsIi = strip1(genIi(bKernel.outputs[oi].exp));
+                  emit(`${sname}[_was_ii] = ${rhsIi};`);
+                  emit(popIndent, "}");
+                }
               }
             }
           }
@@ -3604,10 +3872,16 @@ export function blockMapFusedShaderSource(
                 emit(`${regName} = ${cast}(${value});`);
               }
             },
-            (elemIdx, eiVar) =>
-              `was_sg_a_${entry.wasIdx}_r${r}_${elemIdx}[${eiVar}]`,
-            (elemIdx, eiVar) =>
-              `was_sg_reg_${entry.wasIdx}_${elemIdx}[${eiVar}]`,
+            (elemIdx, eiVar) => {
+              const ec = was.elemCounts[elemIdx];
+              const n = `was_sg_a_${entry.wasIdx}_r${r}_${elemIdx}`;
+              return ec > 1 ? `${n}[${eiVar}]` : n;
+            },
+            (elemIdx, eiVar) => {
+              const ec = was.elemCounts[elemIdx];
+              const n = `was_sg_reg_${entry.wasIdx}_${elemIdx}`;
+              return ec > 1 ? `${n}[${eiVar}]` : n;
+            },
           );
 
           emit(popIndent, "}"); // end if (sg_inv_id >= stride)
@@ -3739,12 +4013,12 @@ export function blockMapFusedShaderSource(
             if (hasBoundary) {
               emit(`if (valid) {`, pushIndent);
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + ${outOff}] = ${resultTy}(${finalNames[e]}[${shmemIdx}]);`,
+                `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + ${outOff}] = ${resultTy}(${finalNames[e]}[${shmemIdx}]);`,
               );
               emit(popIndent, "}");
             } else {
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + ${outOff}] = ${resultTy}(${finalNames[e]}[${shmemIdx}]);`,
+                `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + ${outOff}] = ${resultTy}(${finalNames[e]}[${shmemIdx}]);`,
               );
             }
             emit(popIndent, "}");
@@ -3752,12 +4026,12 @@ export function blockMapFusedShaderSource(
             if (hasBoundary) {
               emit(`if (valid) {`, pushIndent);
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${finalNames[e]}[tidx]);`,
+                `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${finalNames[e]}[tidx]);`,
               );
               emit(popIndent, "}");
             } else {
               emit(
-                `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${finalNames[e]}[tidx]);`,
+                `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${resultTy}(${finalNames[e]}[tidx]);`,
               );
             }
           }
@@ -3792,12 +4066,12 @@ export function blockMapFusedShaderSource(
       // Non-const input: apply block offset with stride remap
       const remapped = inRemap(info.inputIdx, "i32(tidx)");
       emit(
-        `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${info.inputName}[i32(in_base_${info.inputIdx}) + ${remapped}];`,
+        `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${info.inputName}[i32(in_base_${info.inputIdx}) + ${remapped}];`,
       );
     } else {
       // Const input: no block offset
       emit(
-        `result${resultIdx}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${info.inputName}[i32(tidx)];`,
+        `${resultVar(resultIdx)}[i32(out_base_${resultIdx}) + i32(${outOffset(resultIdx)})] = ${info.inputName}[i32(tidx)];`,
       );
     }
   }
@@ -3807,14 +4081,17 @@ export function blockMapFusedShaderSource(
 
   emit(popIndent, "}");
 
+  const code = shader.join("\n");
+
   return {
-    code: shader.join("\n"),
+    code,
     numInputs: storageInputs,
-    numOutputs,
+    numOutputs: numOutputBindings,
     hasUniform: effectiveUniformConsts > 0,
     passes: [{ grid: [gridX, gridY] }],
     sharedMemoryBytes: totalShmemBytes > 0 ? totalShmemBytes : undefined,
     numUniformConsts:
       effectiveUniformConsts > 0 ? effectiveUniformConsts : undefined,
+    packedLeafLayout: packedLeafLayout ?? undefined,
   };
 }

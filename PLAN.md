@@ -100,11 +100,31 @@ The `lax.scan` wrapper (`src/backend/webgpu/scan-wrapper.ts`) already uses
 
 ---
 
-## Phase 2: Leaf Packing (future, for 6+ tuples)
+## Phase 2: Leaf Packing ✅
 
-**Goal:** Pack multiple same-dtype pytree leaves into a single contiguous GPUBuffer, reducing
-binding count from `2 * numLeaves` to as low as 2 (1 input + 1 output). Only needed when
-`2 * numLeaves` exceeds the device limit minus uniform-migrated constants.
+**Status:** Implemented. Pack all same-dtype non-const pytree leaves into a single contiguous
+GPUBuffer, reducing binding count from `2 * numLeaves` to 2 (1 packed input + 1 packed output).
+Activated automatically when binding count exceeds `maxStorageBuffersPerShaderStage`.
+
+### Architecture
+
+- **scan-plan.ts**: Binding guard detects when `neededBindings > maxBindings`. If all leaves share
+  the same dtype and packed count (`uniformConsts + 2`) fits, sets `needsLeafPacking: true` on the
+  plan.
+- **block-map.ts**: When `needsLeafPacking` is set, shader codegen computes a `PackedLeafLayout`
+  from concrete `inputShapes`/`outputShapes`, emitting `in_packed : array<T>` and
+  `out_packed : array<T>` with compile-time element offsets baked into `in_base_i`/`out_base_o`.
+- **block-map-executor.ts**: Reads `packedLeafLayout` from the compiled shader metadata. Allocates
+  packed temporary buffers, copies leaf inputs → packed, dispatches, copies packed → leaf outputs,
+  frees temporaries. All within the batch encoder for GPU efficiency.
+- **scan-executor.ts**: Passes `needsLeafPacking` through to both Phase 1 (local scan) and Phase 4
+  (apply) `ExecuteBlockMapParams`.
+
+| Tuple size | Bindings (unpacked) | Packed bindings | Fits 10? |
+| ---------- | ------------------- | --------------- | -------- |
+| 5-tuple    | 10                  | 2               | Yes      |
+| 6-tuple    | 12                  | 2               | Yes      |
+| 8-tuple    | 16                  | 2               | Yes      |
 
 ### When this is needed
 
@@ -186,11 +206,11 @@ output → 2 storage bindings + 1 uniform = 3 total.
 
 ## Prioritization
 
-| Phase                       | Effort                                 | Impact                         | Recommendation |
-| --------------------------- | -------------------------------------- | ------------------------------ | -------------- |
-| ~~einsum cleanup~~          | ~~Small~~                              | ~~Correctness of docs~~        | **Done** ✅    |
-| ~~Phase 1: Uniform consts~~ | ~~Medium~~                             | ~~Unblocks 5-tuple on WebGPU~~ | **Done** ✅    |
-| Phase 2: Leaf packing       | Large (new allocator + shader rewrite) | Unblocks 6+ tuples             | Do when needed |
+| Phase                       | Effort     | Impact                         | Recommendation |
+| --------------------------- | ---------- | ------------------------------ | -------------- |
+| ~~einsum cleanup~~          | ~~Small~~  | ~~Correctness of docs~~        | **Done** ✅    |
+| ~~Phase 1: Uniform consts~~ | ~~Medium~~ | ~~Unblocks 5-tuple on WebGPU~~ | **Done** ✅    |
+| ~~Phase 2: Leaf packing~~   | ~~Large~~  | ~~Unblocks 6+ tuples~~         | **Done** ✅    |
 
 Phase 1 alone is sufficient to enable the 5-tuple DLM compose on WebGPU's fused block-map path.
 Phase 2 is insurance for the future and can be deferred until a real 6+ tuple use case materializes.
@@ -1506,24 +1526,19 @@ The tape is compiled on first invocation and cached on the `JitProgram` instance
 
 ### Implementation phases
 
-| Phase | Scope                                           | Effort | Impact                                  |
-| ----- | ----------------------------------------------- | ------ | --------------------------------------- |
-| O8a   | Basic command tape (kernel+malloc+free+recycle) | Medium | ~4× for kernel-only programs            |
-| O8b   | Bind group caching                              | Small  | Additional ~20% on repeated invocations |
-| O8c   | DUS + scatter_add + reverse support ✅          | Small  | Expands tape eligibility                |
-| O8d   | fori_loop unrolling into tape                   | Medium | Handles loop-containing programs        |
-| O8e   | Unify tape copy encoding with unaligned helper  | Small  | Deferred — see below                    |
+| Phase | Scope                                             | Effort | Impact                                  |
+| ----- | ------------------------------------------------- | ------ | --------------------------------------- |
+| O8a   | Basic command tape (kernel+malloc+free+recycle)   | Medium | ~4× for kernel-only programs            |
+| O8b   | Bind group caching                                | Small  | Additional ~20% on repeated invocations |
+| O8c   | DUS + scatter_add + reverse support ✅            | Small  | Expands tape eligibility                |
+| O8d   | fori_loop unrolling into tape                     | Medium | Handles loop-containing programs        |
+| O8e   | Unify tape copy encoding with unaligned helper ✅ | Small  | Tape handles all alignment              |
 
-**O8e (deferred):** The tape execution path for DUS, scatter_add, and reverse uses raw
-`encoder.copyBufferToBuffer()`, which requires 4-byte alignment. The backend's
-`copyBufferToBuffer(Slot, ...)` method has a WGSL copy-shader fallback for unaligned sizes, but the
-tape does not share that code path. Instead, `canCompileToCommandTape` rejects unaligned cases
-(e.g., Float16 with odd element counts), falling back to step-by-step execution. This is correct but
-means the tape path and the standalone path duplicate alignment-aware copy semantics. The fix is to
-factor the unaligned-copy logic into a helper that operates on raw `GPUCommandEncoder` + `GPUBuffer`
-(rather than requiring `Slot` objects), then call it from both `copyBufferToBuffer` and the tape
-execution loop. Not urgent — Float16 scatter_add/DUS/reverse on odd shapes is rare in practice, and
-the fallback is correct.
+**O8e:** `#encodeCopyAuto(encoder, srcBuf, srcOff, dstBuf, dstOff, size)` transparently selects
+native `copyBufferToBuffer` (4-byte aligned) or WGSL copy shader (unaligned). Called from both the
+slot-level `copyBufferToBuffer()` and the command tape execution path for DUS, scatter_add, and
+reverse. The alignment gates in `canCompileToCommandTape` have been removed — all cases are now
+handled by the tape.
 
 ### Comparison with alternatives
 
@@ -1798,6 +1813,74 @@ above. The concrete next steps:
 
 Priority: **Medium-High** (upgraded from Medium). The sqrt DLM variant is numerically superior for
 poorly conditioned systems. Enabling it to fuse for m ≤ 4 on WebGPU is a concrete, achievable goal.
+
+---
+
+## Leaf Packing Phase 2 Cleanup
+
+Leaf packing (6+ tuple `associativeScan`) landed with three cleanup items. All are addressed in the
+same commit.
+
+### LP-1: Validate output dtypes against packed dtype ✅
+
+**Problem:** `packedLeafLayout.dtype` is derived from input dtypes only. Output dtypes are resolved
+later (from kernel metadata / shmem / pass-through) and were not checked against the common dtype.
+If an output had a different dtype, the packed `out_packed : array<T>` binding would misinterpret
+the data.
+
+**Fix:** After the `outputDtypes` loop in `block-map.ts`, validate all output dtypes match
+`packedLeafLayout.dtype`. Mismatch → bail to `return null` (same as mixed-input dtypes). Same guard
+added in `scan-plan.ts`: check `bodyJaxpr.outBinders` dtypes alongside `inBinders`.
+
+**Risk:** Near zero — tightening assertion. AssocScan combine functions structurally produce
+same-dtype outputs, so this can't fire in practice today. Prevents silent corruption if future
+callers use leaf packing with heterogeneous output dtypes.
+
+### LP-2: Eliminate redundant batch restart after flushBatch ✅
+
+**Problem:** In `block-map-executor.ts` fallback path, `flushBatch?.()` submits and creates a fresh
+encoder, then `endBatch()/beginBatch()` runs unconditionally when `useBatching` is true. The
+end/begin is redundant queue churn after a flush.
+
+**Fix:** Make the two paths mutually exclusive: `flushBatch` (WebGPU-only) handles mid-batch submit;
+`endBatch/beginBatch` is the generic fallback for backends without `flushBatch`.
+
+### LP-3: Document 16-byte malloc floor scope ✅
+
+**Problem:** `malloc()` in `webgpu.ts` pads all allocations to ≥16 bytes. Only uniform bindings
+(vec4) actually require this. Narrowing it to uniform-only paths would thread an `isUniform` flag
+through `malloc`, adding complexity for negligible gain.
+
+**Fix:** Add a code comment explaining why the floor is broad and why narrowing is deferred. No code
+change.
+
+**Removal analysis (deferred):** Two approaches evaluated:
+
+1. **Surgical** (~60–120 lines): Add `isUniform?: boolean` to `malloc`, skip the 16-byte floor for
+   storage-only allocations. Must propagate through: buffer pool keying (pool map uses `paddedSize`;
+   uniform buffers would need separate pool or tag), colored arena (arena slabs are storage buffers
+   — exempt), recycle steps (recycle matches by byte size — uniform→storage recycle would need a
+   size-mismatch guard), command tape (tape pre-encodes malloc — would need the flag in `TapeOp`),
+   constants slab (already 256-byte aligned — exempt). Spreads `isUniform` awareness across 5+
+   subsystems.
+
+2. **Proper refactor** (~half-day): Split `malloc` into `mallocStorage(size)` and
+   `mallocUniform(size)` with distinct pools and padding rules. Cleaner long-term but touches every
+   allocation site (~25 call sites).
+
+**Decision:** Keep the floor. Only scalar-promotion mallocs (2–8 bytes) are affected — the 8–14 byte
+waste per scalar is negligible vs. the 256-byte arena alignment padding. Revisit if: (a) measured
+pool fragmentation from mixed sizes justifies it, (b) an allocator refactor is underway for other
+reasons, or (c) a new subsystem needs explicit storage/uniform distinction.
+
+### LP-4: Phase 4 leaf-packed GPU test ✅
+
+**Problem:** No in-repo GPU test exercises Phase 4 apply
+(`pointInputs + gridOffset + needsLeafPacking`). The 6-tuple test at N=64 fits in one block (B=256),
+so only Phase 1 runs. Phase 4 was only tested via DLM integration.
+
+**Fix:** Add a large-N variant (N=300 > B=256) of the 6-tuple test, forcing M=2 blocks and
+triggering Phase 4 apply with leaf packing active.
 
 ---
 

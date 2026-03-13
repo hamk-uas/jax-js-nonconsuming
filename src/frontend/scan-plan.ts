@@ -110,6 +110,13 @@ export type AssocScanPlan =
       applyVmapProgram: JitProgram;
       /** Vmapped apply body Jaxpr (for fused block_map in Phase 4). */
       applyVmapJaxpr: Jaxpr;
+      /**
+       * Enable leaf packing — pack all non-const inputs into a single storage
+       * buffer (and similarly for outputs) to stay within
+       * maxStorageBuffersPerShaderStage.  When true, the block-map shader
+       * codegen computes concrete offsets from shapes at compile time.
+       */
+      needsLeafPacking?: boolean;
     }
   | {
       /**
@@ -1763,13 +1770,39 @@ export function planAssociativeScan(
       ? numConsts
       : 0;
     const neededBindings = numConsts - uniformConsts + 2 * numLeaves;
+
+    // Leaf packing: when binding count exceeds the limit but all leaves share
+    // the same dtype, pack all non-const inputs into one storage buffer and
+    // all outputs into another.  Reduces binding count to uniformConsts + 2.
+    let needsLeafPacking = false;
     if (neededBindings > maxBindings) {
-      if (DEBUG >= 1) {
-        console.log(
-          `[assoc-scan] block-map rejected: ${neededBindings} bindings > device max ${maxBindings}`,
-        );
+      const packedBindings = numConsts - uniformConsts + 2;
+      const leafDtypes = new Set<DType>();
+      for (let i = 0; i < numLeaves; i++) {
+        leafDtypes.add(bodyJaxpr.inBinders[numConsts + i].aval.dtype);
       }
-      return { path: "fallback" };
+      // Output dtypes must also match — packed output buffer has a single dtype.
+      for (const out of bodyJaxpr.outs) {
+        if (out instanceof Var) leafDtypes.add(out.aval.dtype);
+      }
+      if (leafDtypes.size === 1 && packedBindings <= maxBindings) {
+        needsLeafPacking = true;
+        if (DEBUG >= 1) {
+          console.log(
+            `[assoc-scan] leaf packing: ${neededBindings} bindings > ${maxBindings}, packed to ${packedBindings}`,
+          );
+        }
+      } else {
+        if (DEBUG >= 1) {
+          console.log(
+            `[assoc-scan] block-map rejected: ${neededBindings} bindings > device max ${maxBindings}` +
+              (leafDtypes.size > 1
+                ? " (mixed dtypes, packing not viable)"
+                : ""),
+          );
+        }
+        return { path: "fallback" };
+      }
     }
 
     // Try progressively smaller block sizes until the fused shader fits in
@@ -1788,11 +1821,12 @@ export function planAssociativeScan(
           reverse,
           BLOCK_SIZE,
           dimBindings,
+          needsLeafPacking,
         );
         if (blockMapPlan) {
           if (DEBUG >= 1) {
             console.log(
-              `[assoc-scan] SUCCESS! Using WebGPU block-map path (B=${BLOCK_SIZE})`,
+              `[assoc-scan] SUCCESS! Using WebGPU block-map path (B=${BLOCK_SIZE}${needsLeafPacking ? ", leaf-packed" : ""})`,
             );
           }
           return blockMapPlan;
@@ -1873,6 +1907,7 @@ function tryBuildBlockMapAssocScanPlan(
   reverse: boolean,
   blockSize: number,
   dimBindings?: ReadonlyMap<string, number>,
+  needsLeafPacking?: boolean,
 ): AssocScanPlan | null {
   if (backend.type !== "webgpu") return null;
 
@@ -2023,11 +2058,11 @@ function tryBuildBlockMapAssocScanPlan(
     return null;
   }
 
-  // inAxes: constants broadcast (null), elements sliced along scan axis
-  const inAxes: (number | null)[][] = [
-    ...constAvals.map(() => [null as number | null]),
-    ...elemAvals.map(() => [axis as number | null]),
-  ];
+  // inAxes: per non-const input. Constants are broadcast (handled by
+  // numConsts), so inAxes only covers the numLeaves element inputs.
+  const inAxes: (number | null)[][] = elemAvals.map(() => [
+    axis as number | null,
+  ]);
   const outAxes: (number | null)[][] = elemAvals.map(() => [axis]);
 
   // Build constInfos for uniform buffer migration
@@ -2061,5 +2096,6 @@ function tryBuildBlockMapAssocScanPlan(
     numConsts,
     applyVmapProgram,
     applyVmapJaxpr: applyVmapClosed.jaxpr,
+    needsLeafPacking: needsLeafPacking || undefined,
   };
 }

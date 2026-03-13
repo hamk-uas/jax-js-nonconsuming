@@ -281,6 +281,14 @@ export interface Backend {
   endBatch?(): void;
 
   /**
+   * Optional: submit the current batch encoder mid-batch without changing depth.
+   * Materializes all pending GPU commands so that subsequent non-batch operations
+   * (e.g., body program execution) can read the results.
+   * No-op when no batch is active.
+   */
+  flushBatch?(): void;
+
+  /**
    * Optional: dispatch a scatter-add operation.
    * Accumulates `updates` into `target` (already copied to output) at
    * positions given by `indices` along `axis`.
