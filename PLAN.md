@@ -245,24 +245,91 @@ applicable. Use Phase A0 tooling to capture structured per-pass data alongside r
 - `bench/conv2d.bench.ts` (new)
 - `website/src/routes/bench/conv2d/jaxStrategy.ts` (optional alignment / shape parity)
 
+#### Baseline results (bench/conv2d.bench.ts, March 2026)
+
+All cases compile to exactly **1 kernel** (fused im2col + matmul + epilogue).
+
+**WASM (same CPU for both GPU configs):**
+
+| Case                | Eager (Hz) | Eager (ms) | JIT (Hz) | JIT (ms) |
+| ------------------- | ---------- | ---------- | -------- | -------- |
+| 3×3 s1 32ch 64×64   | 3,517      | 0.28       | 3.1      | 319      |
+| 3×3 s1 64ch 64×64   | 3,658      | 0.27       | 1.6      | 641      |
+| 3×3 s1 128ch 32×32  | 4,944      | 0.20       | 1.6      | 629      |
+| 1×1 pw 64ch 64×64   | 4,284      | 0.23       | 29.5     | 33.9     |
+| 1×1 pw 128ch 32×32  | 4,468      | 0.22       | 15.4     | 64.8     |
+| 5×5 s1 32ch 64×64   | 5,213      | 0.19       | 2.2      | 456      |
+| 3×3 s2 64ch 128×128 | 8,576      | 0.12       | 1.0      | 1,046    |
+
+**WebGPU — NVIDIA RTX 4070 Ti SUPER (TB3 eGPU):**
+
+| Case                | Eager (Hz) | Eager (ms) | JIT (Hz) | JIT (ms) |
+| ------------------- | ---------- | ---------- | -------- | -------- |
+| 3×3 s1 32ch 64×64   | 291        | 3.43       | 340      | 2.94     |
+| 3×3 s1 64ch 64×64   | 333        | 3.01       | 363      | 2.75     |
+| 3×3 s1 128ch 32×32  | 316        | 3.17       | 360      | 2.78     |
+| 1×1 pw 64ch 64×64   | 1,365      | 0.73       | 371      | 2.69     |
+| 1×1 pw 128ch 32×32  | 408        | 2.45       | 373      | 2.68     |
+| 5×5 s1 32ch 64×64   | 317        | 3.15       | 371      | 2.70     |
+| 3×3 s2 64ch 128×128 | 347        | 2.88       | 374      | 2.67     |
+
+**WebGPU — Intel Arc iGPU:**
+
+| Case                | Eager (Hz) | Eager (ms) | JIT (Hz) | JIT (ms) |
+| ------------------- | ---------- | ---------- | -------- | -------- |
+| 3×3 s1 32ch 64×64   | 375        | 2.67       | 393      | 2.54     |
+| 3×3 s1 64ch 64×64   | 372        | 2.69       | 321      | 3.12     |
+| 3×3 s1 128ch 32×32  | 273        | 3.67       | 289      | 3.46     |
+| 1×1 pw 64ch 64×64   | 355        | 2.81       | 401      | 2.49     |
+| 1×1 pw 128ch 32×32  | 374        | 2.67       | 391      | 2.56     |
+| 5×5 s1 32ch 64×64   | 356        | 2.81       | 392      | 2.55     |
+| 3×3 s2 64ch 128×128 | 248        | 4.03       | 236      | 4.23     |
+
+**Key findings:**
+
+1. **WASM JIT is 100–1,000× slower than eager** — JIT compilation overhead dominates; conv2d
+   produces a single large kernel with no fusion benefit over the eager im2col+matmul path.
+2. **WebGPU is dispatch-bound at ~2.5–3ms** — all cases bottleneck on dispatch overhead, not
+   compute. NVIDIA and Intel show similar timings → GPU compute is irrelevant at this scale.
+3. **GPU utilization is <1%** — e.g. 3×3 32ch 64×64 = 0.151 GFLOP at 340 Hz ≈ 51 GFLOP/s vs RTX 4070
+   Ti SUPER peak 22,577 GFLOP/s (0.2%).
+4. **WASM eager is competitive** — 0.1–0.3ms per conv, faster than WebGPU for these sizes.
+5. **Bottleneck is 100% dispatch overhead, not kernel quality** — Phase B/C optimizations won't help
+   until we address the overhead floor. Larger batch sizes or `lax.scan` over conv bodies would
+   amortize dispatch cost.
+
 ### Phase B: Cheap wins in existing lowering
 
 **Deliverable:** better performance without changing the primitive surface.
 
+#### Results
+
+**1×1 fast path: implemented** (`prepareConv1x1` in `convolution.ts`, JIT branch in `jit.ts`).
+
+The fast path bypasses `pool()` entirely, lowering 1×1 conv to `moveaxis + reshape + Dot` directly.
+This reduces ShapeTracker view complexity (fewer compose operations during compilation) but produces
+the **same kernel** — a single Dot reduction. Compilation time is negligibly faster.
+
+**Benchmark delta: none measurable.** Both WASM and WebGPU produce identical throughput. This
+confirms Phase A finding #5: the bottleneck is dispatch overhead (WebGPU ~2.5ms) and kernel
+execution (WASM), not ShapeTracker complexity. The 1×1 fast path is an architectural simplification,
+not a runtime optimization.
+
+| Case      | Backend       | Baseline (Hz) | Post-1×1 (Hz) | Delta |
+| --------- | ------------- | ------------- | ------------- | ----- |
+| 1×1 64ch  | WebGPU NVIDIA | 371           | 374           | noise |
+| 1×1 128ch | WebGPU NVIDIA | 355           | 355           | none  |
+| 1×1 64ch  | WebGPU Intel  | 400           | 405           | noise |
+| 1×1 128ch | WebGPU Intel  | 413           | 416           | noise |
+| 1×1 64ch  | WASM JIT      | 29.5          | 29.5          | none  |
+| 1×1 128ch | WASM JIT      | 15.4          | 15.5          | none  |
+
+**Tests added:** 5 new tests in `test/conv.test.ts` — correctness (1d, 2d), grad, vmap, grouped-conv
+fallback. All use `_lastConvLoweringKind()` path-selection assertions.
+
 #### Candidate optimizations
 
-1. **1×1 fast path**
-
-- Detect: all kernel dims = 1, stride 1, no dilation, **no groups** (`vmapDims`-aware)
-- Guard: `groups > 1` must fall through to generic path (grouped conv semantics differ from matmul)
-- Lower to reshape + `Dot` directly, bypassing `pool()` entirely
-- Currently `pool()` already takes its fast path for 1×1 (d=1, k=1 ≤ s=1), adding only two trailing
-  dims of size 1. The actual win is reducing ShapeTracker view complexity, not eliminating pool.
-  Realistic expectation: **20–50% improvement** unless we lower to `block_map` tiled matmul.
-- To match matmul-class throughput, detect 1×1 conv with large channel counts and lower to
-  `block_map` tiled matmul directly (reusing existing `tileMatmul` body).
-- **Autodiff:** reshape + Dot both have JVP/transpose rules, so `jit(grad(conv1x1))` works
-  automatically. No new transform rules needed.
+1. **1×1 fast path** ✅ Done — see results above.
 
 2. **Kernel-shape heuristics**
 

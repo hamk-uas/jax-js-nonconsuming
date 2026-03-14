@@ -402,6 +402,51 @@ function applyDilation(st: ShapeTracker, dilation: number[]): ShapeTracker {
 }
 
 /**
+ * Fast path for 1×1 convolution with stride=1, no dilation, no groups.
+ *
+ * Bypasses pool() entirely. For 1×1 conv, pool() just adds trivial size-1
+ * trailing dimensions via reshape — the expensive ShapeTracker view chain
+ * (repeat, shrink, reshape, permute) adds overhead without benefit.
+ *
+ * Instead, we directly reshape to the Dot-compatible broadcast layout:
+ *   LHS [*vmap, N, C_in, *spatial] → [*vmap, N, 1, *spatial, C_in]
+ *   RHS [*vmap, C_out, C_in, *1s]  → [*vmap, 1, C_out, *1s, C_in]
+ */
+export function prepareConv1x1(
+  stX: ShapeTracker,
+  stY: ShapeTracker,
+  params: ConvParams,
+): [ShapeTracker, ShapeTracker] {
+  const v = params.vmapDims;
+  const n = stX.shape.length - 2 - v; // spatial dimensions count
+  const vmapShape = stX.shape.slice(0, v);
+  const batch = stX.shape[v];
+  const cIn = stX.shape[v + 1];
+  const spatial = stX.shape.slice(v + 2, v + 2 + n);
+  const cOut = stY.shape[v];
+
+  // LHS: move C_in to reduction position at end, add broadcast dim for C_out
+  stX = stX.moveaxis(v + 1, v + n + 1).reshape([
+    ...vmapShape,
+    batch,
+    1, // broadcasts with C_out
+    ...spatial,
+    cIn, // reduction dim
+  ]);
+
+  // RHS: reshape kernel [C_out, C_in, 1, ..., 1] → [1, C_out, 1, ..., 1, C_in]
+  stY = stY.reshape([
+    ...vmapShape,
+    1, // broadcasts with batch
+    cOut,
+    ...rep(n, 1), // spatial dims (all 1, broadcast)
+    cIn, // reduction dim
+  ]);
+
+  return [stX, stY];
+}
+
+/**
  * Prepare for a convolution between two arrays.
  *
  * This does not check the validity of the shapes, which should be checked

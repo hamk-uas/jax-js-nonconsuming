@@ -16,7 +16,12 @@ import {
   _registerCacheSizeGetter,
   _registerJitCacheDisposer,
 } from "./check-leaks";
-import { pool, poolTranspose, prepareConv } from "./convolution";
+import {
+  pool,
+  poolTranspose,
+  prepareConv,
+  prepareConv1x1,
+} from "./convolution";
 import type { ConvParams } from "./convolution";
 import {
   Primitive,
@@ -2718,7 +2723,9 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
       params as ConvParams,
       kernelShape,
     );
-    const [stX, stY] = prepareConv(
+    const prepare =
+      lastConvLoweringKind === "fast-1x1-dot" ? prepareConv1x1 : prepareConv;
+    const [stX, stY] = prepare(
       ShapeTracker.fromShape(as.shape as number[]),
       ShapeTracker.fromShape(bs.shape as number[]),
       params,

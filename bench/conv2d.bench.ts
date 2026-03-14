@@ -1,0 +1,145 @@
+// Conv2d benchmark: measures convolution throughput for common CNN inference shapes.
+// Target cases from P4 Conv2d Tuning Plan, Phase A.
+//
+// Input layout: NCHW, kernel layout: OIHW (matching lax.convGeneralDilated defaults).
+//
+// Run: pnpm build && pnpm vitest bench bench/conv2d.bench.ts
+// GPU: pnpm build && scripts/gpu-test.sh bench bench/conv2d.bench.ts
+
+import {
+  blockUntilReady,
+  type CodeCaptureEntry,
+  defaultDevice,
+  init,
+  jit,
+  lax,
+  numpy as np,
+  random,
+  setCodeCapture,
+} from "@hamk-uas/jax-js-nonconsuming";
+import { afterAll, bench, suite } from "vitest";
+
+// ── Shape definitions ──────────────────────────────────────────────────────────
+// Each case: [label, batchSize, inChannels, H, W, outChannels, kH, kW, stride, padding]
+const CASES = [
+  ["3x3 s1 SAME 32ch  64x64", 1, 32, 64, 64, 64, 3, 3, 1, "SAME"],
+  ["3x3 s1 SAME 64ch  64x64", 1, 64, 64, 64, 64, 3, 3, 1, "SAME"],
+  ["3x3 s1 SAME 128ch 32x32", 1, 128, 32, 32, 128, 3, 3, 1, "SAME"],
+  ["1x1 pointwise 64ch 64x64", 1, 64, 64, 64, 64, 1, 1, 1, "VALID"],
+  ["1x1 pointwise 128ch 32x32", 1, 128, 32, 32, 256, 1, 1, 1, "VALID"],
+  ["5x5 s1 SAME 32ch  64x64", 1, 32, 64, 64, 32, 5, 5, 1, "SAME"],
+  ["3x3 s2 down 64ch 128x128", 1, 64, 128, 128, 128, 3, 3, 2, "SAME"],
+] as const;
+
+type Case = (typeof CASES)[number];
+
+// WASM is always available. WebGPU only runs under GPU configs
+// (scripts/gpu-test.sh bench bench/conv2d.bench.ts).
+const devices = await init("wasm", "webgpu");
+const hasWebGPU = devices.includes("webgpu");
+
+// ── Helper: create inputs for a case ───────────────────────────────────────────
+function makeInputs(c: Case) {
+  const [, N, Cin, H, W, Cout, kH, kW] = c;
+  const x = random.uniform(random.key(0), [N, Cin, H, W]);
+  const w = random.uniform(random.key(1), [Cout, Cin, kH, kW]);
+  return { x, w };
+}
+
+// ── Helper: compute GFLOP for a conv ───────────────────────────────────────────
+function convGflops(c: Case): number {
+  const [, N, Cin, H, W, Cout, kH, kW, stride] = c;
+  const outH = Math.ceil(H / stride);
+  const outW = Math.ceil(W / stride);
+  // 2 * N * Cout * outH * outW * Cin * kH * kW (multiply-accumulate = 2 FLOPs)
+  return (2 * N * Cout * outH * outW * Cin * kH * kW) / 1e9;
+}
+
+// ── Capture code on first compilation ──────────────────────────────────────────
+function captureOnce(): CodeCaptureEntry[] {
+  const entries: CodeCaptureEntry[] = [];
+  setCodeCapture((e) => entries.push(e));
+  return entries;
+}
+
+// ── WASM benchmarks ────────────────────────────────────────────────────────────
+suite.skipIf(!devices.includes("wasm"))("wasm conv2d", async () => {
+  defaultDevice("wasm");
+
+  for (const c of CASES) {
+    const [label, , , , , , , , stride, padding] = c;
+    const { x, w } = makeInputs(c);
+    await blockUntilReady([x, w]);
+    afterAll(() => {
+      x.dispose();
+      w.dispose();
+    });
+
+    // Eager (no JIT)
+    bench(`${label} eager`, () => {
+      const out = lax.convGeneralDilated(x, w, [stride, stride], padding);
+      out.dispose();
+    });
+
+    // JIT
+    const f = jit((a: np.Array, b: np.Array) =>
+      lax.convGeneralDilated(a, b, [stride, stride], padding),
+    );
+    // Warmup
+    const warmup = f(x, w);
+    warmup.dispose();
+    afterAll(() => f.dispose());
+
+    bench(`${label} jit`, () => {
+      const out = f(x, w);
+      out.dispose();
+    });
+  }
+});
+
+// ── WebGPU benchmarks (run via: scripts/gpu-test.sh bench bench/conv2d.bench.ts)
+suite.skipIf(!hasWebGPU)("webgpu conv2d", async () => {
+  defaultDevice("webgpu");
+
+  for (const c of CASES) {
+    const [label, , , , , , , , stride, padding] = c;
+    const gflops = convGflops(c);
+    const { x, w } = makeInputs(c);
+    await blockUntilReady([x, w]);
+    afterAll(() => {
+      x.dispose();
+      w.dispose();
+    });
+
+    // Eager
+    bench(`${label} eager`, async () => {
+      const out = lax.convGeneralDilated(x, w, [stride, stride], padding);
+      await out.blockUntilReady();
+      out.dispose();
+    });
+
+    // JIT — capture compiled code on warmup
+    const entries = captureOnce();
+    const f = jit((a: np.Array, b: np.Array) =>
+      lax.convGeneralDilated(a, b, [stride, stride], padding),
+    );
+    const warmup = f(x, w);
+    await warmup.blockUntilReady();
+    warmup.dispose();
+    setCodeCapture(null);
+    afterAll(() => f.dispose());
+
+    // Log dispatch info (code capture fires in ShaderPipelineCache,
+    // only on first compilation — not repeatable after clearCaches).
+    const kernelCount = entries.filter((e) => e.kind === "kernel").length;
+    console.log(
+      `[${label}] ${entries.length} dispatches (${kernelCount} kernels), GFLOP=${gflops.toFixed(3)}`,
+    );
+
+    bench(`${label} jit`, async () => {
+      const out = f(x, w);
+      await out.blockUntilReady();
+      out.dispose();
+    });
+  }
+});

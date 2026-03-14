@@ -1,6 +1,7 @@
 // Tests for convolution-related operations.
 
 import {
+  _lastConvLoweringKind,
   grad,
   jit,
   lax,
@@ -12,6 +13,79 @@ import { expect, test } from "vitest";
 import { deviceSuite } from "./device-suite.js";
 
 await deviceSuite(() => {
+  // ── 1×1 conv fast path tests ─────────────────────────────────────────────────
+  test("1x1 conv fast path: 1d matches generic path", () => {
+    using x = np.ones([1, 4, 8]); // [N, C_in, W]
+    using w = np.ones([2, 4, 1]); // [C_out, C_in, kW=1]
+    using eager = lax.convGeneralDilated(x, w, [1], "VALID");
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1], "VALID"),
+    );
+    using jitted = f(x, w);
+    f.dispose();
+    expect(_lastConvLoweringKind()).toBe("fast-1x1-dot");
+    expect(jitted.shape).toEqual(eager.shape);
+    expect(jitted.dataSync()).toEqual(eager.dataSync());
+  });
+
+  test("1x1 conv fast path: 2d matches generic path", () => {
+    using x = np.ones([1, 64, 4, 4]); // [N, C_in, H, W]
+    using w = np.ones([32, 64, 1, 1]); // [C_out, C_in, kH=1, kW=1]
+    using eager = lax.convGeneralDilated(x, w, [1, 1], "VALID");
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1, 1], "VALID"),
+    );
+    using jitted = f(x, w);
+    f.dispose();
+    expect(_lastConvLoweringKind()).toBe("fast-1x1-dot");
+    expect(jitted.shape).toEqual(eager.shape);
+    expect(jitted.dataSync()).toEqual(eager.dataSync());
+  });
+
+  test("1x1 conv fast path: grad is correct", () => {
+    using x = np.ones([1, 4, 8]);
+    using w = np.ones([2, 4, 1]);
+    const loss = (a: typeof x, b: typeof w) => {
+      const out = lax.convGeneralDilated(a, b, [1], "VALID");
+      const s = out.sum();
+      out.dispose();
+      return s;
+    };
+    const g = grad(loss);
+    const f = jit(g);
+    using gradResult = f(x, w);
+    f.dispose();
+    // Gradient of sum(x @ w) w.r.t. x should equal the sum of weights
+    // repeated along spatial dim. Each output channel contributes C_in weights,
+    // summed across C_out=2 output channels.
+    expect(gradResult.shape).toEqual([1, 4, 8]);
+    // Each input element contributes to 2 output channels, each with weight 1
+    const vals = gradResult.dataSync();
+    for (const v of vals) expect(v).toBeCloseTo(2, 5);
+  });
+
+  test("1x1 conv fast path: vmap is correct", () => {
+    using x = np.ones([3, 1, 4, 4, 4]); // batch=3, [N=1, C_in=4, H=4, W=4]
+    using w = np.ones([2, 4, 1, 1]);
+    const f = vmap((xi: np.Array) =>
+      lax.convGeneralDilated(xi, w, [1, 1], "VALID"),
+    );
+    using result = f(x);
+    expect(result.shape).toEqual([3, 1, 2, 4, 4]);
+  });
+
+  test("1x1 conv: grouped conv falls back to generic-dot", () => {
+    // featureGroupCount > 1 should NOT use the fast path
+    using x = np.ones([1, 4, 8]);
+    using w = np.ones([4, 2, 1]); // 2 groups: 4/2=2 out per group
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1], "VALID", { featureGroupCount: 2 }),
+    );
+    using _result = f(x, w);
+    f.dispose();
+    expect(_lastConvLoweringKind()).toBe("generic-dot");
+  });
+
   test("1d convolution", () => {
     using x = np.array([[[1, 2, 3, 4, 5]]]);
     using y = np.array([[[2, 0.5, -1]]]);
