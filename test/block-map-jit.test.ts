@@ -359,7 +359,7 @@ describe("lax.blockMap — fused shader guards", () => {
     using xs = np.arange(256).astype(DType.Float32);
     using expected = lax.blockMap(body, xs, { blockShape: [256] });
     using result = f_jit(xs);
-    expect(result).toBeAllclose(expected, { atol: 1e-3 });
+    expect(result).toBeAllclose(expected, { atol: 1e-3, equalNaN: true });
     f_jit.dispose();
   });
 

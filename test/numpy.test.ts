@@ -1694,7 +1694,9 @@ await deviceSuite((device) => {
       using _y = y;
       using _dy = dy;
       expect(y).toBeAllclose([-2, -1, 0, 1, 2]);
-      expect(dy).toBeAllclose([1 / 12, 1 / 3, NaN, 1 / 3, 1 / 12]);
+      expect(dy).toBeAllclose([1 / 12, 1 / 3, NaN, 1 / 3, 1 / 12], {
+        equalNaN: true,
+      });
     });
   });
 

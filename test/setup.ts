@@ -35,7 +35,7 @@ expect.extend({
   toBeAllclose(
     actual: np.ArrayLike,
     expected: np.ArrayLike,
-    options: { rtol?: number; atol?: number } = {},
+    options: { rtol?: number; atol?: number; equalNaN?: boolean } = {},
   ) {
     const { isNot } = this;
     // Don't allocate arrays here — np.allclose handles conversion and disposal

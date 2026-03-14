@@ -159,6 +159,39 @@ await deviceSuite((device) => {
       using expected = leftRight.mul(-1);
       expect(da).toBeAllclose(expected, { rtol: 1e-3, atol: 1e-3 });
     });
+
+    test("inv preserves input dtype", () => {
+      const dtype = device === "webgpu" ? np.float16 : np.float64;
+      using a = np.array(
+        [
+          [2, 1],
+          [1, 3],
+        ],
+        { dtype },
+      );
+      using aInv = np.linalg.inv(a);
+      expect(aInv.dtype).toBe(dtype);
+      using identity = np.matmul(a, aInv);
+      using expected = np.eye(2);
+      expect(identity).toBeAllclose(expected, { rtol: 0, atol: 1e-3 });
+    });
+  });
+
+  suite("numpy.linalg.matrixPower()", () => {
+    test("matrixPower(A, 0) preserves input dtype", () => {
+      const dtype = device === "webgpu" ? np.float16 : np.float64;
+      using a = np.array(
+        [
+          [2, 1],
+          [1, 3],
+        ],
+        { dtype },
+      );
+      using result = np.linalg.matrixPower(a, 0);
+      expect(result.dtype).toBe(dtype);
+      using expected = np.eye(2);
+      expect(result).toBeAllclose(expected, { rtol: 0, atol: 1e-3 });
+    });
   });
 
   suite("numpy.linalg.lstsq()", () => {
