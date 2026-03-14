@@ -33,6 +33,7 @@
     { title: "Tracing Jaxprs", id: "02-tracing" },
     { title: "Logistic regression", id: "03-logistic-regression" },
     { title: "Mandelbrot set", id: "04-mandelbrot" },
+    { title: "Code capture", id: "05-code-capture" },
   ];
 
   interface URLSelection {

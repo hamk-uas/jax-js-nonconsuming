@@ -8,6 +8,8 @@ import {
   Kernel,
 } from "../alu";
 import {
+  _emitCodeCapture,
+  _isCodeCaptureEnabled,
   Backend,
   type BackendCapabilities,
   Device,
@@ -4604,6 +4606,23 @@ class ShaderPipelineCache {
       console.info("=========== WebGPU shader ===========\n" + shader.code);
     }
 
+    if (_isCodeCaptureEnabled()) {
+      _emitCodeCapture({
+        backend: "webgpu",
+        kind: "kernel",
+        code: shader.code,
+        workgroupSize: Array.isArray(shader.workgroupSize)
+          ? (shader.workgroupSize as [number, number, number])
+          : shader.workgroupSize
+            ? [shader.workgroupSize, 1, 1]
+            : undefined,
+        metadata: {
+          numInputs: shader.numInputs,
+          numOutputs: shader.numOutputs,
+        },
+      });
+    }
+
     const shaderModule = this.device.createShaderModule({ code: shader.code });
     const promise = (async () => {
       this.device.pushErrorScope("validation");
@@ -4640,6 +4659,23 @@ class ShaderPipelineCache {
 
     if (DEBUG >= 2) {
       console.info("=========== WebGPU shader ===========\n" + shader.code);
+    }
+
+    if (_isCodeCaptureEnabled()) {
+      _emitCodeCapture({
+        backend: "webgpu",
+        kind: "kernel",
+        code: shader.code,
+        workgroupSize: Array.isArray(shader.workgroupSize)
+          ? (shader.workgroupSize as [number, number, number])
+          : shader.workgroupSize
+            ? [shader.workgroupSize, 1, 1]
+            : undefined,
+        metadata: {
+          numInputs: shader.numInputs,
+          numOutputs: shader.numOutputs,
+        },
+      });
     }
 
     const shaderModule = this.device.createShaderModule({ code: shader.code });

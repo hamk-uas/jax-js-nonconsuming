@@ -1,6 +1,17 @@
 import { DType } from "./alu";
-import { defaultDevice, Device, devices, getBackend, init } from "./backend";
-import type { BackendCapabilities, GpuTimingResult } from "./backend";
+import {
+  defaultDevice,
+  Device,
+  devices,
+  getBackend,
+  init,
+  setCodeCapture,
+} from "./backend";
+import type {
+  BackendCapabilities,
+  CodeCaptureEntry,
+  GpuTimingResult,
+} from "./backend";
 import { type Dim, hasSymbolicDims, isSymbolicDim, SymDim } from "./dim";
 import { Array, ArrayLike } from "./frontend/array";
 import { aotLinearize } from "./frontend/artifacts";
@@ -32,8 +43,8 @@ import {
   OwnedFunction,
   verifyJaxprEffects,
 } from "./frontend/jaxpr";
-import type { JitStepCounts } from "./frontend/jit";
-import { jitCompile, JitProgram } from "./frontend/jit";
+import type { ConvLoweringKind, JitStepCounts } from "./frontend/jit";
+import { _lastConvLoweringKind, jitCompile, JitProgram } from "./frontend/jit";
 import * as jvpModule from "./frontend/jvp";
 import * as linearizeModule from "./frontend/linearize";
 import * as vmapModule from "./frontend/vmap";
@@ -56,6 +67,8 @@ export {
   type AotLinearizeResult,
   type BackendCapabilities,
   type CacheSizes,
+  type CodeCaptureEntry,
+  type ConvLoweringKind,
   type Dim,
   type GpuTimingResult,
   init,
@@ -79,6 +92,7 @@ export {
   type JsTree,
   type JsTreeDef,
   type JitStepCounts,
+  _lastConvLoweringKind,
   lax,
   type LeakReport,
   MemoryEffect,
@@ -91,6 +105,7 @@ export {
   type ResidualPack,
   reverse,
   scatterAdd,
+  setCodeCapture,
   _setVerifyEffects,
   _setDebugAnonymousConsts,
   setDebug,

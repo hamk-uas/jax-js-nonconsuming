@@ -133,11 +133,13 @@ class Memory {
   }
 
   size() {
+    this.cg._trace("memory.size");
     this.cg._emit(0x3f);
     this.cg._emit(0x00);
   }
 
   grow() {
+    this.cg._trace("memory.grow");
     this.cg._emit(0x40);
     this.cg._emit(0x00);
   }
@@ -155,6 +157,7 @@ class Memory {
     assert(n.typeId === cg.i32.typeId, "memory.copy: expected i32 length");
     assert(src.typeId === cg.i32.typeId, "memory.copy: expected i32 src");
     assert(dst.typeId === cg.i32.typeId, "memory.copy: expected i32 dst");
+    cg._trace("memory.copy");
     cg._emit(0xfc); // prefix byte
     cg._emit(encodeUnsigned(0x0a)); // memory.copy opcode
     cg._emit(0x00); // dst memory index
@@ -174,6 +177,7 @@ class Memory {
     assert(n.typeId === cg.i32.typeId, "memory.fill: expected i32 length");
     assert(val.typeId === cg.i32.typeId, "memory.fill: expected i32 value");
     assert(dst.typeId === cg.i32.typeId, "memory.fill: expected i32 dst");
+    cg._trace("memory.fill");
     cg._emit(0xfc); // prefix byte
     cg._emit(encodeUnsigned(0x0b)); // memory.fill opcode
     cg._emit(0x00); // memory index
@@ -210,6 +214,11 @@ export class CodeGenerator {
   memory: Memory;
   void: Type = { typeId: 0x40, name: "void" };
 
+  /** Enable WAT trace mode. When true, instruction methods record WAT mnemonics. */
+  trace = false;
+  #traceLines: string[] = [];
+  #traceIndent = 0;
+
   #functions: Function_[] = [];
   #importedFunctions: ImportedFunction[] = [];
   #exportedFunctions = new Map<number, string>();
@@ -232,23 +241,40 @@ export class CodeGenerator {
 
   // Control and branching instructions
   unreachable() {
+    this._trace("unreachable");
     this._emit(0x00);
   }
   nop() {
+    this._trace("nop");
     this._emit(0x01);
   }
   block(...type: Type[]) {
+    const sig = type.length
+      ? ` (result ${type.map((t) => t.name).join(" ")})`
+      : "";
+    this._trace(`block${sig}`);
+    this.#traceIndent++;
     this.#blockFrames.push({ idx: this.#typeStack.length, ty: type });
     this._emit(0x02);
     this._emit(encodeBlocktype(type));
   }
   loop(...type: Type[]) {
+    const sig = type.length
+      ? ` (result ${type.map((t) => t.name).join(" ")})`
+      : "";
+    this._trace(`loop${sig}`);
+    this.#traceIndent++;
     this.#blockFrames.push({ idx: this.#typeStack.length, ty: type });
     this._emit(0x03);
     this._emit(encodeBlocktype(type));
   }
   if(...type: Type[]) {
     assert(this._pop().typeId === this.i32.typeId, "if_: expected i32");
+    const sig = type.length
+      ? ` (result ${type.map((t) => t.name).join(" ")})`
+      : "";
+    this._trace(`if${sig}`);
+    this.#traceIndent++;
     this.#blockFrames.push({ idx: this.#typeStack.length, ty: type });
     this._emit(0x04);
     this._emit(encodeBlocktype(type));
@@ -257,6 +283,9 @@ export class CodeGenerator {
     assert(this.#blockFrames.length > 0, "else: no block to else");
     const frame = this.#blockFrames[this.#blockFrames.length - 1];
     this.#typeStack = this.#typeStack.slice(0, frame.idx);
+    this.#traceIndent--;
+    this._trace("else");
+    this.#traceIndent++;
     this._emit(0x05);
   }
   /** End a block (`block`, `if`/`else`, `loop`, or function). */
@@ -267,16 +296,20 @@ export class CodeGenerator {
     for (const ty of frame.ty) {
       if (ty.typeId !== this.void.typeId) this._push(ty);
     }
+    this.#traceIndent = Math.max(0, this.#traceIndent - 1);
+    this._trace("end");
     this._emit(0x0b);
   }
   /** Branch to a block a certain depth outward on the stack. */
   br(depth: number) {
+    this._trace(`br ${depth}`);
     this._emit(0x0c);
     this._emit(encodeUnsigned(depth));
   }
   /** Conditional branch to a block a certain depth outward on the stack. */
   br_if(depth: number) {
     assert(this._pop().typeId === this.i32.typeId, "br_if: expected i32");
+    this._trace(`br_if ${depth}`);
     this._emit(0x0d);
     this._emit(encodeUnsigned(depth));
   }
@@ -284,12 +317,14 @@ export class CodeGenerator {
   br_table(...depths: number[]) {
     assert(this._pop().typeId === this.i32.typeId, "br_table: expected i32");
     assert(depths.length > 0, "br_table: expected at least one default depth");
+    this._trace(`br_table ${depths.join(" ")}`);
     this._emit(0x0e);
     this._emit(encodeUnsigned(depths.length - 1));
     for (const d of depths) this._emit(encodeUnsigned(d));
   }
   /** Return from a function, branching out of the outermost block. */
   return() {
+    this._trace("return");
     this._emit(0x0f);
   }
   /** Call a function with the given ID. */
@@ -314,12 +349,14 @@ export class CodeGenerator {
       this._push(outputType);
     }
 
+    this._trace(`call ${fn}`);
     this._emit(0x10);
     this._emit(encodeUnsigned(fn));
   }
   /** Throw away an operand on the stack. */
   drop() {
     this._pop();
+    this._trace("drop");
     this._emit(0x1a);
   }
   /** Select one of the first two operands (T, F) based on the third operand (i32)'s value. */
@@ -335,6 +372,7 @@ export class CodeGenerator {
       "select: expected same type for both operands",
     );
     this._push(a);
+    this._trace("select");
     this._emit(0x1b);
   }
 
@@ -360,6 +398,10 @@ export class CodeGenerator {
   /** Declare a new function; returns its index. */
   function(inputTypes: Type[], outputTypes: Type[], body: () => void): number {
     const idx = this.#importedFunctions.length + this.#functions.length;
+    const inSig = inputTypes.map((t) => t.name).join(" ");
+    const outSig = outputTypes.map((t) => t.name).join(" ");
+    this._trace(`(func $f${idx} (param ${inSig}) (result ${outSig})`);
+    this.#traceIndent++;
     this.#functions.push(new Function_(inputTypes, outputTypes, body));
     return idx;
   }
@@ -396,6 +438,17 @@ export class CodeGenerator {
   _emit(bytes: number | number[]) {
     if (typeof bytes === "number") this.#curBytes.push(bytes);
     else this.#curBytes.push(...bytes);
+  }
+
+  /** Append a WAT line when trace mode is enabled. */
+  _trace(line: string) {
+    if (!this.trace) return;
+    this.#traceLines.push("  ".repeat(this.#traceIndent) + line);
+  }
+
+  /** Return accumulated WAT source. Only meaningful when `trace = true`. */
+  toWat(): string {
+    return this.#traceLines.join("\n");
   }
 
   // Emit the complete module as an array of bytes.
@@ -574,6 +627,7 @@ class Local {
     } else {
       this.cg._push(this.cg._locals()[idx - inputTypes.length]);
     }
+    this.cg._trace(`local.get ${idx}`);
     this.cg._emit(0x20);
     this.cg._emit(encodeUnsigned(idx));
   }
@@ -588,6 +642,7 @@ class Local {
       expectedType.typeId === t.typeId,
       "can't set local to this value (wrong type)",
     );
+    this.cg._trace(`local.set ${idx}`);
     this.cg._emit(0x21);
     this.cg._emit(encodeUnsigned(idx));
   }
@@ -602,6 +657,7 @@ class Local {
       expectedType.typeId === t.typeId,
       "can't tee local to this value (wrong type)",
     );
+    this.cg._trace(`local.tee ${idx}`);
     this.cg._emit(0x22);
     this.cg._emit(encodeUnsigned(idx));
     this.cg._push(expectedType);
@@ -622,6 +678,7 @@ function UNARY_OP(
       t.typeId === this.cg[inType].typeId,
       `invalid type for ${op} (${inType} -> ${outType})`,
     );
+    this.cg._trace(`${inType}.${op}`);
     this.cg._emit(encodeOpcode(opcode));
     this.cg._push(this.cg[outType]);
   };
@@ -641,6 +698,7 @@ function BINARY_OP(
       a.typeId === this.cg[typeA].typeId && b.typeId === this.cg[typeB].typeId,
       `invalid type for ${op} (${typeA}, ${typeB} -> ${outType})`,
     );
+    this.cg._trace(`${typeA}.${op}`);
     this.cg._emit(encodeOpcode(opcode));
     this.cg._push(this.cg[outType]);
   };
@@ -658,6 +716,12 @@ function LOAD_OP(
   ) {
     const idxType = this.cg._pop();
     assert(idxType.typeId === this.cg.i32.typeId, `invalid type for ${op}`);
+    const args = offset
+      ? ` offset=${offset} align=${align}`
+      : align
+        ? ` align=${align}`
+        : "";
+    this.cg._trace(`${outType}.${op}${args}`);
     this.cg._emit(encodeOpcode(opcode));
     this.cg._emit(encodeUnsigned(align));
     this.cg._emit(encodeUnsigned(offset));
@@ -682,6 +746,12 @@ function STORE_OP(
       `invalid value type for ${op} (${inType})`,
     );
     assert(idxType.typeId === this.cg.i32.typeId, `invalid type for ${op}`);
+    const args = offset
+      ? ` offset=${offset} align=${align}`
+      : align
+        ? ` align=${align}`
+        : "";
+    this.cg._trace(`${inType}.${op}${args}`);
     this.cg._emit(encodeOpcode(opcode));
     this.cg._emit(encodeUnsigned(align));
     this.cg._emit(encodeUnsigned(offset));
@@ -708,6 +778,7 @@ class I32 implements Type {
         `If this is a SymbolicSize, the caller must resolve it to a concrete number first ` +
         `(or canCompileToMegaModule should have rejected this program).`,
     );
+    this.cg._trace(`i32.const ${i}`);
     this.cg._emit(0x41);
     this.cg._emit(encodeSigned(i));
     this.cg._push(this);
@@ -779,6 +850,7 @@ class F32 implements Type {
       typeof f === "number",
       `f32.const: expected a number, got ${typeof f}`,
     );
+    this.cg._trace(`f32.const ${f}`);
     this.cg._emit(0x43);
     const buffer = new ArrayBuffer(4);
     new DataView(buffer).setFloat32(0, f, true);
@@ -835,6 +907,7 @@ class F64 implements Type {
       typeof f === "number",
       `f64.const: expected a number, got ${typeof f}`,
     );
+    this.cg._trace(`f64.const ${f}`);
     this.cg._emit(0x44);
     const buffer = new ArrayBuffer(8);
     new DataView(buffer).setFloat64(0, f, true);
@@ -892,6 +965,7 @@ function VECTOR_OP(
         `invalid type for ${op} (${inTypes.join(", ")} -> ${outType})`,
       );
     }
+    this.cg._trace(`v128.${op}`);
     this.cg._emit(encodeOpcode([0xfd, vopcode]));
     this.cg._push(this.cg[outType]);
   };
@@ -912,6 +986,7 @@ function VECTOR_OPL(
         `invalid type for ${op} (${inTypes} -> ${outType})`,
       );
     }
+    this.cg._trace(`v128.${op} ${lane}`);
     this.cg._emit(encodeOpcode([0xfd, vopcode]));
     this.cg._emit(lane); // 1 byte
     this.cg._push(this.cg[outType]);
@@ -926,6 +1001,12 @@ function VECTOR_LOAD_OP(op: string, vopcode: number) {
   ) {
     const idxType = this.cg._pop();
     assert(idxType.typeId === this.cg.i32.typeId, `invalid type for ${op}`);
+    const args = offset
+      ? ` offset=${offset} align=${align}`
+      : align
+        ? ` align=${align}`
+        : "";
+    this.cg._trace(`v128.${op}${args}`);
     this.cg._emit(encodeOpcode([0xfd, vopcode]));
     this.cg._emit(encodeUnsigned(align));
     this.cg._emit(encodeUnsigned(offset));
@@ -953,6 +1034,12 @@ class V128 implements Type {
     assert(valType.typeId === this.cg.v128.typeId, `invalid type for store`);
     const idxType = this.cg._pop();
     assert(idxType.typeId === this.cg.i32.typeId, `invalid type for store`);
+    const args = offset
+      ? ` offset=${offset} align=${align}`
+      : align
+        ? ` align=${align}`
+        : "";
+    this.cg._trace(`v128.store${args}`);
     this.cg._emit(0xfd);
     this.cg._emit(encodeUnsigned(0x0b));
     this.cg._emit(encodeUnsigned(align));

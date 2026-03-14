@@ -17,6 +17,7 @@ import {
   _registerJitCacheDisposer,
 } from "./check-leaks";
 import { pool, poolTranspose, prepareConv } from "./convolution";
+import type { ConvParams } from "./convolution";
 import {
   Primitive,
   PrimitiveParams,
@@ -66,6 +67,44 @@ import {
 } from "../utils";
 import type { AssocScanPlan, ScanPlan } from "./scan-plan";
 import type { ScanPath } from "../utils";
+
+// ── Conv lowering kind signal (Phase A0) ──────────────────────────────────
+// Tracks which lowering path the last Primitive.Conv JIT rule took.
+// Testable via _lastConvLoweringKind() without parsing console output.
+
+/** The lowering path chosen for the most recent Conv JIT compilation. */
+export type ConvLoweringKind =
+  | "generic-dot"
+  | "fast-1x1-dot"
+  | "fast-1x1-block-map"
+  | "block-map-3x3"
+  | "block-map-5x5";
+
+let lastConvLoweringKind: ConvLoweringKind | null = null;
+
+/** Return the lowering path the last Primitive.Conv JIT rule took. */
+export function _lastConvLoweringKind(): ConvLoweringKind | null {
+  return lastConvLoweringKind;
+}
+
+function classifyConvLowering(
+  params: ConvParams,
+  kernelShape: number[],
+): ConvLoweringKind {
+  // kernelShape is the spatial kernel dimensions (after stripping vmapDims and channel dims)
+  const allOnes = kernelShape.every((k) => k === 1);
+  const allStride1 = params.strides.every((s) => s === 1);
+  const noDilation =
+    params.lhsDilation.every((d) => d === 1) &&
+    params.rhsDilation.every((d) => d === 1);
+  const noGroups = params.vmapDims === 0;
+
+  if (allOnes && allStride1 && noDilation && noGroups) {
+    return "fast-1x1-dot"; // eligible for 1×1 fast path (currently lowered as generic dot)
+  }
+  // Future: block-map-3x3, block-map-5x5, fast-1x1-block-map
+  return "generic-dot";
+}
 
 /**
  * Rewrite a body jaxpr: replace all `Primitive.BlockIndex` equations with a
@@ -2673,6 +2712,12 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     });
   },
   [Primitive.Conv]([a, b], [as, bs], params) {
+    const v = (params as ConvParams).vmapDims;
+    const kernelShape = (bs.shape as number[]).slice(v + 2);
+    lastConvLoweringKind = classifyConvLowering(
+      params as ConvParams,
+      kernelShape,
+    );
     const [stX, stY] = prepareConv(
       ShapeTracker.fromShape(as.shape as number[]),
       ShapeTracker.fromShape(bs.shape as number[]),

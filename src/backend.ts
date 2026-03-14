@@ -43,6 +43,62 @@ export interface BackendCapabilities {
 }
 export const devices: Device[] = ["cpu", "wasm", "webgpu", "webgl"];
 
+// ── Code capture API (Phase A0) ──────────────────────────────────────────
+// Registers a callback invoked on every compiled code unit (WGSL/WASM).
+// Disabled by default (null). Zero overhead when not installed.
+
+/** A compiled code unit captured by `setCodeCapture`. */
+export type CodeCaptureEntry = {
+  backend: "webgpu" | "wasm";
+  kind:
+    | "kernel"
+    | "mega-module"
+    | "scan"
+    | "assoc-scan"
+    | "block-map"
+    | "routine";
+  label?: string;
+  /** WGSL source (WebGPU) or WAT source (WASM). */
+  code?: string;
+  /** WebGPU only: workgroup size of the compute shader. */
+  workgroupSize?: [number, number, number];
+  /** Structured metadata (both backends). */
+  metadata?: {
+    size?: number;
+    simd?: boolean;
+    numInputs?: number;
+    numOutputs?: number;
+    dtype?: number | string;
+    reduction?: boolean;
+    numSteps?: number;
+    numKernels?: number;
+    byteLength?: number;
+    [key: string]: unknown;
+  };
+};
+
+let codeCaptureCallback: ((entry: CodeCaptureEntry) => void) | null = null;
+
+/**
+ * Register a callback invoked on every compiled code unit (WGSL shader or WASM
+ * module). Pass `null` to disable. Disabled by default (zero overhead).
+ */
+export function setCodeCapture(
+  cb: ((entry: CodeCaptureEntry) => void) | null,
+): void {
+  codeCaptureCallback = cb;
+}
+
+/** Internal: invoke the code capture callback if installed. */
+export function _emitCodeCapture(entry: CodeCaptureEntry): void {
+  if (codeCaptureCallback) codeCaptureCallback(entry);
+}
+
+/** Internal: check if code capture is currently enabled. */
+export function _isCodeCaptureEnabled(): boolean {
+  return codeCaptureCallback !== null;
+}
+
 const initializedBackends = new Map<Device, Backend>();
 
 // Default backends, initialized at startup.

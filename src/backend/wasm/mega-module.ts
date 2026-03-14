@@ -19,6 +19,7 @@
  */
 
 import { AluExp, AluOp, byteWidth, DType, Kernel } from "../../alu";
+import { _emitCodeCapture, _isCodeCaptureEnabled } from "../../backend";
 import type { JitId, JitStep } from "../../frontend/jit";
 import { Routine } from "../../routine";
 import { isSymbolicSize, type SizeExpr } from "../../shape";
@@ -287,7 +288,9 @@ export function compileToMegaModule(
   collectKernelOps(steps);
 
   // --- Generate WASM module ---
+  const traceEnabled = _isCodeCaptureEnabled();
   const cg = new CodeGenerator();
+  cg.trace = traceEnabled;
 
   // Configure memory import (shared/non-shared)
   configureMemoryImport(cg);
@@ -536,6 +539,20 @@ export function compileToMegaModule(
       " ",
     );
     console.info(`mega-module WASM bytes (${bytes.length}):\n${hex}`);
+  }
+
+  // --- Code capture ---
+  if (traceEnabled) {
+    _emitCodeCapture({
+      backend: "wasm",
+      kind: "mega-module",
+      code: cg.toWat(),
+      metadata: {
+        numSteps: steps.length,
+        numKernels: kernelExports.length,
+        byteLength: bytes.length,
+      },
+    });
   }
 
   // --- M6.2c: Build step metadata for JS-driven parallel execution ---

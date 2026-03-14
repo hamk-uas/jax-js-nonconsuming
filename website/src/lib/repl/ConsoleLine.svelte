@@ -1,5 +1,6 @@
 <script lang="ts">
   import {
+    ChevronDownIcon,
     ChevronRightIcon,
     ImageIcon,
     InfoIcon,
@@ -11,6 +12,10 @@
 
   let { line, showTime = false }: { line: ConsoleLine; showTime?: boolean } =
     $props();
+
+  let expanded = $state(true);
+  let text = $derived(line.data.join(" "));
+  let multiline = $derived(text.includes("\n"));
 </script>
 
 <div
@@ -24,7 +29,21 @@
   ]}
 >
   {#if line.level === "log"}
-    <ChevronRightIcon size={18} class="shrink-0 text-gray-300" />
+    {#if multiline}
+      <button
+        class="shrink-0 text-gray-400 hover:text-gray-600 cursor-pointer"
+        onclick={() => (expanded = !expanded)}
+        aria-label={expanded ? "Collapse" : "Expand"}
+      >
+        {#if expanded}
+          <ChevronDownIcon size={18} />
+        {:else}
+          <ChevronRightIcon size={18} />
+        {/if}
+      </button>
+    {:else}
+      <ChevronRightIcon size={18} class="shrink-0 text-gray-300" />
+    {/if}
   {:else if line.level === "info"}
     <InfoIcon size={18} class="shrink-0 text-blue-500" />
   {:else if line.level === "warn"}
@@ -34,15 +53,18 @@
   {:else if line.level === "image"}
     <ImageIcon size={18} class="shrink-0 text-gray-400" />
   {/if}
-  <p class="font-mono whitespace-pre-wrap">
+  <p class="font-mono whitespace-pre-wrap min-w-0 overflow-x-auto">
     {#if line.level === "image"}
       <img
         src={line.data[0]}
         alt="Output from displayImage()"
         class="max-w-full my-0.5"
       />
+    {:else if !expanded}
+      {text.split("\n")[0]}
+      <span class="text-gray-400">({text.split("\n").length} lines)</span>
     {:else}
-      {line.data.join(" ")}
+      {text}
     {/if}
   </p>
   {#if showTime}

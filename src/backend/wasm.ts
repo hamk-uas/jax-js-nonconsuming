@@ -8,6 +8,8 @@ import {
   Kernel,
 } from "../alu";
 import {
+  _emitCodeCapture,
+  _isCodeCaptureEnabled,
   Backend,
   type BackendCapabilities,
   Device,
@@ -432,8 +434,24 @@ export class WasmBackend implements Backend {
 
   prepareKernelSync(kernel: Kernel): Executable<WasmProgram> {
     const kernelHash = FpHash.hash(kernel);
+    const captureEnabled = _isCodeCaptureEnabled();
     const module = runWithCache(moduleCache, kernelHash.toString(), () => {
-      const bytes = codegenWasm(kernel);
+      const { bytes, wat } = codegenWasm(kernel, captureEnabled);
+      if (captureEnabled) {
+        const re = kernel.outputs[0]?.reduction;
+        _emitCodeCapture({
+          backend: "wasm",
+          kind: "kernel",
+          code: wat,
+          metadata: {
+            numInputs: kernel.nargs,
+            numOutputs: kernel.numOutputs,
+            dtype: kernel.outputs[0]?.dtype,
+            reduction: re != null,
+            simd: false, // set below if applicable
+          },
+        });
+      }
       return new WebAssembly.Module(bytes);
     });
     return new Executable(kernel, { module });
@@ -1501,9 +1519,12 @@ export function translateExpCoreSimd(
   gen(exp);
 }
 
-function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
+function codegenWasm(
+  kernel: Kernel,
+  traceEnabled: boolean,
+): { bytes: Uint8Array<ArrayBuffer>; wat?: string } {
   if (kernel.isMultiOutput) {
-    return codegenWasmMulti(kernel);
+    return codegenWasmMulti(kernel, traceEnabled);
   }
 
   const tune = tuneNullopt(kernel);
@@ -1521,6 +1542,7 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   }
 
   const cg = new CodeGenerator();
+  cg.trace = traceEnabled;
   configureMemoryImport(cg);
 
   const distinctOps = mapSetUnion(
@@ -1645,7 +1667,8 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   });
   cg.export(kernelFunc, "kernel");
 
-  return cg.finish();
+  const bytes = cg.finish();
+  return { bytes, wat: traceEnabled ? cg.toWat() : undefined };
 }
 
 /**
@@ -1653,7 +1676,10 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
  * evaluates and stores each output expression sequentially per element.
  * Function signature: (input0, ..., inputN-1, output0, ..., outputM-1).
  */
-function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
+function codegenWasmMulti(
+  kernel: Kernel,
+  traceEnabled: boolean,
+): { bytes: Uint8Array<ArrayBuffer>; wat?: string } {
   const numOutputs = kernel.numOutputs;
   const tunes = kernel.outputs.map((o) => {
     // Build a temporary single-output kernel for tuning
@@ -1667,6 +1693,7 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
   });
 
   const cg = new CodeGenerator();
+  cg.trace = traceEnabled;
   configureMemoryImport(cg);
 
   // Collect all distinct ops across all output expressions
@@ -1788,7 +1815,7 @@ function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
   });
   cg.export(kernelFunc, "kernel");
 
-  return cg.finish();
+  return { bytes: cg.finish(), wat: traceEnabled ? cg.toWat() : undefined };
 }
 
 // ---------------------------------------------------------------------------
