@@ -1,10 +1,10 @@
-// Tests for setCodeCapture API and conv lowering kind signal.
+// Tests for setCodeCapture API and conv classification signal.
 
 import {
-  _lastConvLoweringKind,
+  _lastConvClass,
   clearCaches,
   type CodeCaptureEntry,
-  type ConvLoweringKind,
+  type ConvClass,
   jit,
   lax,
   numpy as np,
@@ -80,7 +80,7 @@ await deviceSuite(
       expect(entries.length).toBe(countAfterFirst);
     });
 
-    test("conv lowering kind: 1x1 kernel classified as fast-1x1-dot", () => {
+    test("conv classification: 1x1 kernel classified as fast-1x1-dot", () => {
       using x = np.ones([1, 1, 4]); // NCW format
       using w = np.ones([1, 1, 1]); // OIW format, 1x1 kernel
       const f = jit((a: typeof x, b: typeof w) =>
@@ -89,11 +89,11 @@ await deviceSuite(
       using _result = f(x, w);
       f.dispose();
 
-      const kind: ConvLoweringKind | null = _lastConvLoweringKind();
+      const kind: ConvClass | null = _lastConvClass();
       expect(kind).toBe("fast-1x1-dot");
     });
 
-    test("conv lowering kind: 3x3 kernel classified as generic-dot", () => {
+    test("conv classification: 3x3 kernel classified as generic-dot", () => {
       using x = np.ones([1, 1, 8]); // NCW format
       using w = np.ones([1, 1, 3]); // OIW format, 3-wide kernel
       const f = jit((a: typeof x, b: typeof w) =>
@@ -102,7 +102,7 @@ await deviceSuite(
       using _result = f(x, w);
       f.dispose();
 
-      const kind: ConvLoweringKind | null = _lastConvLoweringKind();
+      const kind: ConvClass | null = _lastConvClass();
       expect(kind).toBe("generic-dot");
     });
   },

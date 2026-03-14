@@ -70,8 +70,8 @@ Phase A needs to answer "is the bottleneck dispatch count, reduction codegen, or
 
 1. **Conv lowering kind signal** — add an internal enum
    (`generic-dot | fast-1x1-dot | fast-1x1-block-map | block-map-3x3 | block-map-5x5`) set during
-   `Primitive.Conv` JIT lowering. Expose via a `_lastConvLoweringKind()` internal API (underscore =
-   not public). Tests can assert which path activated without parsing console output.
+   `Primitive.Conv` JIT lowering. Expose via a `_lastConvClass()` internal API (underscore = not
+   public). Tests can assert which path activated without parsing console output.
 
 2. **`profileGpuDetailed(fn)`** — extend `profileGpu()` with a detailed variant that returns:
    - pass count
@@ -180,7 +180,7 @@ Phase A needs to answer "is the bottleneck dispatch count, reduction codegen, or
 #### Files
 
 - `src/frontend/jit.ts` — conv lowering kind signal
-- `src/index.ts` — export `profileGpuDetailed`, `_lastConvLoweringKind`, `setCodeCapture`,
+- `src/index.ts` — export `profileGpuDetailed`, `_lastConvClass`, `setCodeCapture`,
   `CodeCaptureEntry`
 - `src/backend.ts` — extend `GpuTimingResult` with per-pass metadata; `CodeCaptureEntry` type;
   `setCodeCapture` callback storage + global variable
@@ -304,7 +304,7 @@ All cases compile to exactly **1 kernel** (fused im2col + matmul + epilogue).
 6. **WASM conv is CPU-bound on reduction** — 3×3 64ch 64×64 takes 636ms (1.6 Hz). The reduction
    kernel uses scalar (non-SIMD) codegen. This is the main WASM optimization opportunity.
 
-#### GPU timing data (NVIDIA RTX 4070 Ti SUPER, `tmp/conv2d-gpu-bench.test.ts`)
+#### GPU timing data (NVIDIA RTX 4070 Ti SUPER)
 
 Larger shapes measured with `blockUntilReady()` timing, bypassing the `vitest bench` API (which
 hangs on WebGPU async). This data motivated the Phase C decision gate.
@@ -352,15 +352,15 @@ not a runtime optimization.
 | 1×1 128ch | WASM JIT      | 15.4          | 15.5          | none  |
 
 **Tests added:** 5 new tests in `test/conv.test.ts` — correctness (1d, 2d), grad, vmap, grouped-conv
-fallback. All use `_lastConvLoweringKind()` path-selection assertions.
+fallback. All use `_lastConvClass()` path-selection assertions.
 
 #### Candidate optimizations
 
 1. **1×1 fast path** ✅ Done — see results above.
 
-2. **Kernel-shape heuristics** ✅ Done — `classifyConvLowering` in `jit.ts` detects 3×3/5×5 and
-   returns `block-map-3x3`/`block-map-5x5`. These still fall through to generic Dot lowering.
-   Path-selection tests in `test/conv.test.ts` assert the classification.
+2. **Kernel-shape heuristics** ✅ Done — `classifyConv` in `jit.ts` detects 3×3/5×5 and returns
+   `block-map-3x3`/`block-map-5x5`. These still fall through to generic Dot lowering. Path-selection
+   tests in `test/conv.test.ts` assert the classification.
 
 ### Phase C: Tiled conv2d via `block_map`
 
@@ -416,10 +416,10 @@ paths:
 3. 5×5 SAME optimized path matches generic path
 4. Grouped conv continues to use correct fallback path
 5. `jit`, `grad`, and `vmap` behavior remain correct for optimized cases
-6. **Path-selection tests** using `_lastConvLoweringKind()` (Phase A0): assert that eligible shapes
-   take the intended fast path and ineligible shapes (groups, dilation, exotic padding) fall through
-   to `generic-dot`. This replaces the fragile approach of inferring activation from performance
-   deltas or console output.
+6. **Path-selection tests** using `_lastConvClass()` (Phase A0): assert that eligible shapes take
+   the intended fast path and ineligible shapes (groups, dilation, exotic padding) fall through to
+   `generic-dot`. This replaces the fragile approach of inferring activation from performance deltas
+   or console output.
 7. WebGPU-only code capture tests confirm that `block_map` conv emits the expected fused shader
    (single dispatch, correct grid) rather than falling back to per-block dispatch
 8. REPL compiled-code panel displays captured WGSL and WAT source when "Capture compiled code" is
@@ -429,7 +429,7 @@ paths:
 
 1. Add benchmark coverage in `bench/conv2d.bench.ts` ✅
 2. No regressions in `test/conv.test.ts` ✅
-3. Path classification (block-map-3x3/5x5) in `classifyConvLowering` ✅
+3. Path classification (block-map-3x3/5x5) in `classifyConv` ✅
 4. 1×1 conv fast path ✅ (Phase B: `fast-1x1-dot` and `fast-1x1-block-map`)
 5. Clear WebGPU speedup for 3×3/5×5: **deferred** pending halo-aware `block_map`
 6. Intel path remains correct ✅

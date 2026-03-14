@@ -32,7 +32,7 @@ const CASES = [
   ["3x3 s2 down 64ch 128x128", 1, 64, 128, 128, 128, 3, 3, 2, "SAME"],
 
   // Phase C decision-gate cases — larger tensors pushing toward compute-bound
-  // 3×3 64ch 64×64 batch=8:  8 × 2×64×64×64×64×9 = 1.21 GFLOP
+  // 3×3 64ch 64×64 batch=8:  8 × 2×64×64×64×64×9 = 2.42 GFLOP
   ["3x3 B8 64ch  64x64", 8, 64, 64, 64, 64, 3, 3, 1, "SAME"],
   // 3×3 128ch 64×64 batch=8: 8 × 2×128×64×64×128×9 = 9.66 GFLOP
   ["3x3 B8 128ch 64x64", 8, 128, 64, 64, 128, 3, 3, 1, "SAME"],

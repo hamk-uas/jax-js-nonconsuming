@@ -1,7 +1,7 @@
 // Tests for convolution-related operations.
 
 import {
-  _lastConvLoweringKind,
+  _lastConvClass,
   grad,
   jit,
   lax,
@@ -23,7 +23,7 @@ await deviceSuite(() => {
     );
     using jitted = f(x, w);
     f.dispose();
-    expect(_lastConvLoweringKind()).toBe("fast-1x1-dot");
+    expect(_lastConvClass()).toBe("fast-1x1-dot");
     expect(jitted.shape).toEqual(eager.shape);
     expect(jitted.dataSync()).toEqual(eager.dataSync());
   });
@@ -37,7 +37,7 @@ await deviceSuite(() => {
     );
     using jitted = f(x, w);
     f.dispose();
-    expect(_lastConvLoweringKind()).toBe("fast-1x1-dot");
+    expect(_lastConvClass()).toBe("fast-1x1-dot");
     expect(jitted.shape).toEqual(eager.shape);
     expect(jitted.dataSync()).toEqual(eager.dataSync());
   });
@@ -83,7 +83,7 @@ await deviceSuite(() => {
     );
     using _result = f(x, w);
     f.dispose();
-    expect(_lastConvLoweringKind()).toBe("generic-dot");
+    expect(_lastConvClass()).toBe("generic-dot");
   });
 
   test("3x3 conv classified as block-map-3x3", () => {
@@ -94,7 +94,7 @@ await deviceSuite(() => {
     );
     using result = f(x, w);
     f.dispose();
-    expect(_lastConvLoweringKind()).toBe("block-map-3x3");
+    expect(_lastConvClass()).toBe("block-map-3x3");
     // Still produces correct output (uses generic-dot lowering internally)
     expect(result.shape).toEqual([1, 2, 8, 8]);
   });
@@ -107,7 +107,7 @@ await deviceSuite(() => {
     );
     using result = f(x, w);
     f.dispose();
-    expect(_lastConvLoweringKind()).toBe("block-map-5x5");
+    expect(_lastConvClass()).toBe("block-map-5x5");
     expect(result.shape).toEqual([1, 2, 8, 8]);
   });
 
@@ -119,7 +119,7 @@ await deviceSuite(() => {
     );
     using result = f(x, w);
     f.dispose();
-    expect(_lastConvLoweringKind()).toBe("generic-dot");
+    expect(_lastConvClass()).toBe("generic-dot");
     expect(result.shape).toEqual([1, 2, 8, 8]);
   });
 
@@ -135,7 +135,7 @@ await deviceSuite(() => {
     );
     using jitted = f(x, w);
     f.dispose();
-    expect(_lastConvLoweringKind()).toBe("fast-1x1-dot");
+    expect(_lastConvClass()).toBe("fast-1x1-dot");
     expect(jitted.shape).toEqual(eager.shape);
     expect(jitted.dataSync()).toEqual(eager.dataSync());
   });

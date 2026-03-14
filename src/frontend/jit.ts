@@ -73,29 +73,30 @@ import {
 import type { AssocScanPlan, ScanPlan } from "./scan-plan";
 import type { ScanPath } from "../utils";
 
-// ── Conv lowering kind signal (Phase A0) ──────────────────────────────────
-// Tracks which lowering path the last Primitive.Conv JIT rule took.
-// Testable via _lastConvLoweringKind() without parsing console output.
+// ── Conv classification signal (Phase A0) ─────────────────────────────────
+// Tracks which classification the last Primitive.Conv JIT rule produced.
+// Testable via _lastConvClass() without parsing console output.
 
-/** The lowering path chosen for the most recent Conv JIT compilation. */
-export type ConvLoweringKind =
+/**
+ * Conv classification for the most recent Conv JIT compilation.
+ * Values like `block-map-3x3` indicate the shape was *detected* as eligible
+ * for a future specialized path — actual lowering may still use generic-dot.
+ */
+export type ConvClass =
   | "generic-dot"
   | "fast-1x1-dot"
   | "fast-1x1-block-map"
   | "block-map-3x3"
   | "block-map-5x5";
 
-let lastConvLoweringKind: ConvLoweringKind | null = null;
+let lastConvClass: ConvClass | null = null;
 
-/** Return the lowering path the last Primitive.Conv JIT rule took. */
-export function _lastConvLoweringKind(): ConvLoweringKind | null {
-  return lastConvLoweringKind;
+/** Return the conv classification from the last Primitive.Conv JIT rule. */
+export function _lastConvClass(): ConvClass | null {
+  return lastConvClass;
 }
 
-function classifyConvLowering(
-  params: ConvParams,
-  kernelShape: number[],
-): ConvLoweringKind {
+function classifyConv(params: ConvParams, kernelShape: number[]): ConvClass {
   // kernelShape is the spatial kernel dimensions (after stripping vmapDims and channel dims)
   const allOnes = kernelShape.every((k) => k === 1);
   const allStride1 = params.strides.every((s) => s === 1);
@@ -2730,15 +2731,12 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   [Primitive.Conv]([a, b], [as, bs], params) {
     const v = (params as ConvParams).vmapDims;
     const kernelShape = (bs.shape as number[]).slice(v + 2);
-    lastConvLoweringKind = classifyConvLowering(
-      params as ConvParams,
-      kernelShape,
-    );
+    lastConvClass = classifyConv(params as ConvParams, kernelShape);
     // block-map-3x3 and block-map-5x5 are detected but not yet specialized —
     // they still fall through to the generic Dot lowering. A fused tiled conv
     // with implicit im2col (no materialization) is planned.
     const prepare =
-      lastConvLoweringKind === "fast-1x1-dot" ? prepareConv1x1 : prepareConv;
+      lastConvClass === "fast-1x1-dot" ? prepareConv1x1 : prepareConv;
     const [stX, stY] = prepare(
       ShapeTracker.fromShape(as.shape as number[]),
       ShapeTracker.fromShape(bs.shape as number[]),
