@@ -64,6 +64,7 @@ function captureOnce(): CodeCaptureEntry[] {
 
 // ── WASM benchmarks ────────────────────────────────────────────────────────────
 suite.skipIf(!devices.includes("wasm"))("wasm conv2d", async () => {
+  if (!devices.includes("wasm")) return; // vitest bench runs setup even when skipped
   defaultDevice("wasm");
 
   for (const c of CASES) {
@@ -101,6 +102,7 @@ suite.skipIf(!devices.includes("wasm"))("wasm conv2d", async () => {
 
 // ── WebGPU benchmarks (run via: scripts/gpu-test.sh bench bench/conv2d.bench.ts)
 suite.skipIf(!hasWebGPU)("webgpu conv2d", async () => {
+  if (!hasWebGPU) return; // vitest bench runs setup even when skipped
   defaultDevice("webgpu");
 
   for (const c of CASES) {
@@ -125,10 +127,13 @@ suite.skipIf(!hasWebGPU)("webgpu conv2d", async () => {
     const f = jit((a: np.Array, b: np.Array) =>
       lax.convGeneralDilated(a, b, [stride, stride], padding),
     );
-    const warmup = f(x, w);
-    await warmup.blockUntilReady();
-    warmup.dispose();
-    setCodeCapture(null);
+    try {
+      const warmup = f(x, w);
+      await warmup.blockUntilReady();
+      warmup.dispose();
+    } finally {
+      setCodeCapture(null);
+    }
     afterAll(() => f.dispose());
 
     // Log dispatch info (code capture fires in ShaderPipelineCache,

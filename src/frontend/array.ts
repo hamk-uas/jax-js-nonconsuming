@@ -289,6 +289,9 @@ export class Array extends Tracer {
       // Leak tracking: remove from map (no-op when map is empty / tracking off).
       if (_leakTrackingMap.size > 0) _leakTrackingMap.delete(this);
       // Free any pending executables that haven't been submitted yet.
+      // WARNING: This cancels lazy PendingExecute without running the kernel.
+      // In benchmarks/profiling, call .dataSync() or .blockUntilReady() first
+      // to force materialization, otherwise the operation never executes.
       for (const exe of this.#pending) exe.updateRc(-1);
       // If this has an array source, free it from the backend.
       if (typeof this.#source === "number") {

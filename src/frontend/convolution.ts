@@ -402,15 +402,58 @@ function applyDilation(st: ShapeTracker, dilation: number[]): ShapeTracker {
 }
 
 /**
+ * Shared final step of prepareConv1x1 and prepareConv.
+ *
+ * Both conv paths converge to the same Dot-compatible broadcast layout:
+ *   LHS: [*vmap, batch, 1, *spatial, reduction]
+ *   RHS: [*vmap, 1, C_out, *1s, reduction]
+ *
+ * where reduction = C_in × prod(kernelSpatial). For 1×1 kernels,
+ * prod(kernelSpatial) = 1, so reduction = C_in.
+ *
+ * This function is the SINGLE SOURCE OF TRUTH for the layout contract.
+ * If you change the broadcast layout, both conv paths update automatically.
+ */
+function applyDotLayout(
+  stX: ShapeTracker,
+  stY: ShapeTracker,
+  v: number,
+  n: number,
+): [ShapeTracker, ShapeTracker] {
+  const vmapShape = stX.shape.slice(0, v);
+  const cOut = stY.shape[v];
+  const ks = stY.shape.slice(v + 2);
+
+  // Move C_in from (v+1) to reduction position at end, then reshape
+  // to insert broadcast dim for C_out.
+  stX = stX.moveaxis(v + 1, v + n + 1).reshape([
+    ...vmapShape,
+    stX.shape[v], // batch
+    1, // broadcasts with C_out
+    ...stX.shape.slice(v + 2, v + 2 + n), // spatial dimensions
+    stX.shape[v + 1] * prod(ks), // reduction (C_in × prod(ks))
+  ]);
+
+  stY = stY.reshape([
+    ...vmapShape,
+    1, // broadcasts with batch
+    cOut,
+    ...rep(n, 1), // spatial dimensions (broadcast)
+    stY.shape[v + 1] * prod(ks), // reduction
+  ]);
+
+  return [stX, stY];
+}
+
+/**
  * Fast path for 1×1 convolution with stride=1, no dilation, no groups.
  *
  * Bypasses pool() entirely. For 1×1 conv, pool() just adds trivial size-1
  * trailing dimensions via reshape — the expensive ShapeTracker view chain
  * (repeat, shrink, reshape, permute) adds overhead without benefit.
  *
- * Instead, we directly reshape to the Dot-compatible broadcast layout:
- *   LHS [*vmap, N, C_in, *spatial] → [*vmap, N, 1, *spatial, C_in]
- *   RHS [*vmap, C_out, C_in, *1s]  → [*vmap, 1, C_out, *1s, C_in]
+ * Uses applyDotLayout() for the final reshape — same layout contract as
+ * the generic prepareConv path.
  */
 export function prepareConv1x1(
   stX: ShapeTracker,
@@ -418,32 +461,8 @@ export function prepareConv1x1(
   params: ConvParams,
 ): [ShapeTracker, ShapeTracker] {
   const v = params.vmapDims;
-  const n = stX.shape.length - 2 - v; // spatial dimensions count
-  const vmapShape = stX.shape.slice(0, v);
-  const batch = stX.shape[v];
-  const cIn = stX.shape[v + 1];
-  const spatial = stX.shape.slice(v + 2, v + 2 + n);
-  const cOut = stY.shape[v];
-
-  // LHS: move C_in to reduction position at end, add broadcast dim for C_out
-  stX = stX.moveaxis(v + 1, v + n + 1).reshape([
-    ...vmapShape,
-    batch,
-    1, // broadcasts with C_out
-    ...spatial,
-    cIn, // reduction dim
-  ]);
-
-  // RHS: reshape kernel [C_out, C_in, 1, ..., 1] → [1, C_out, 1, ..., 1, C_in]
-  stY = stY.reshape([
-    ...vmapShape,
-    1, // broadcasts with batch
-    cOut,
-    ...rep(n, 1), // spatial dims (all 1, broadcast)
-    cIn, // reduction dim
-  ]);
-
-  return [stX, stY];
+  const n = stX.shape.length - 2 - v;
+  return applyDotLayout(stX, stY, v, n);
 }
 
 /**
@@ -451,6 +470,9 @@ export function prepareConv1x1(
  *
  * This does not check the validity of the shapes, which should be checked
  * beforehand using `checkConvShape()`.
+ *
+ * Uses applyDotLayout() for the final reshape — same layout contract as
+ * the 1×1 fast path.
  */
 export function prepareConv(
   stX: ShapeTracker,
@@ -458,30 +480,13 @@ export function prepareConv(
   params: ConvParams,
 ): [ShapeTracker, ShapeTracker] {
   const v = params.vmapDims;
-  const n = stX.shape.length - 2 - v; // spatial dimensions count
-  const vmapShape = stX.shape.slice(0, v);
+  const n = stX.shape.length - 2 - v;
 
   stX = applyDilation(stX, params.lhsDilation);
 
-  const ks = stY.shape.slice(v + 2); // kernel shape, ks.length == n
+  const ks = stY.shape.slice(v + 2);
   stX = stX.padOrShrink([...rep<Pair>(v + 2, [0, 0]), ...params.padding]);
   stX = pool(stX, ks, params.strides, params.rhsDilation);
 
-  // Permute in channels to the end along with ks, to be reduced.
-  stX = stX.moveaxis(v + 1, v + n + 1).reshape([
-    ...vmapShape, // vmap dimensions
-    stX.shape[v], // batch size
-    1, // output channels
-    ...stX.shape.slice(v + 2, v + n + 2), // spatial dimensions
-    stX.shape[v + 1] * prod(ks), // reduction
-  ]);
-  stY = stY.reshape([
-    ...vmapShape, // vmap dimensions
-    1, // batch size (broadcasts with stX's batch size)
-    stY.shape[v], // output channels
-    ...rep(n, 1), // spatial dimensions
-    stY.shape[v + 1] * prod(ks), // reduction
-  ]);
-
-  return [stX, stY];
+  return applyDotLayout(stX, stY, v, n);
 }

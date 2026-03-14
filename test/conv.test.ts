@@ -86,6 +86,23 @@ await deviceSuite(() => {
     expect(_lastConvLoweringKind()).toBe("generic-dot");
   });
 
+  test("1x1 fast path: non-trivial values match generic path", () => {
+    // Uses distinct values (not all-ones) to catch layout mismatches in
+    // applyDotLayout — the shared reshape used by both prepareConv1x1 and
+    // prepareConv. If the Dot broadcast layout were wrong, values would differ.
+    using x = np.arange(6).reshape([1, 3, 2]); // [N=1, C=3, W=2]
+    using w = np.arange(1, 7).reshape([2, 3, 1]); // [Cout=2, Cin=3, kW=1]
+    using eager = lax.convGeneralDilated(x, w, [1], "VALID");
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1], "VALID"),
+    );
+    using jitted = f(x, w);
+    f.dispose();
+    expect(_lastConvLoweringKind()).toBe("fast-1x1-dot");
+    expect(jitted.shape).toEqual(eager.shape);
+    expect(jitted.dataSync()).toEqual(eager.dataSync());
+  });
+
   test("1d convolution", () => {
     using x = np.array([[[1, 2, 3, 4, 5]]]);
     using y = np.array([[[2, 0.5, -1]]]);
