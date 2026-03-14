@@ -75,9 +75,11 @@ suite.skipIf(!devices.includes("wasm"))("wasm conv2d", async () => {
       w.dispose();
     });
 
-    // Eager (no JIT)
+    // Eager (no JIT) — dataSync() forces materialization; without it,
+    // dispose() cancels the lazy PendingExecute without running the kernel.
     bench(`${label} eager`, () => {
       const out = lax.convGeneralDilated(x, w, [stride, stride], padding);
+      out.dataSync();
       out.dispose();
     });
 

@@ -253,50 +253,56 @@ All cases compile to exactly **1 kernel** (fused im2col + matmul + epilogue).
 
 | Case                | Eager (Hz) | Eager (ms) | JIT (Hz) | JIT (ms) |
 | ------------------- | ---------- | ---------- | -------- | -------- |
-| 3×3 s1 32ch 64×64   | 3,517      | 0.28       | 3.1      | 319      |
-| 3×3 s1 64ch 64×64   | 3,658      | 0.27       | 1.6      | 641      |
-| 3×3 s1 128ch 32×32  | 4,944      | 0.20       | 1.6      | 629      |
-| 1×1 pw 64ch 64×64   | 4,284      | 0.23       | 29.5     | 33.9     |
-| 1×1 pw 128ch 32×32  | 4,468      | 0.22       | 15.4     | 64.8     |
-| 5×5 s1 32ch 64×64   | 5,213      | 0.19       | 2.2      | 456      |
-| 3×3 s2 64ch 128×128 | 8,576      | 0.12       | 1.0      | 1,046    |
+| 3×3 s1 32ch 64×64   | 3.1        | 323        | 3.1      | 320      |
+| 3×3 s1 64ch 64×64   | 1.6        | 642        | 1.6      | 636      |
+| 3×3 s1 128ch 32×32  | 1.6        | 637        | 1.6      | 629      |
+| 1×1 pw 64ch 64×64   | 29.2       | 34.2       | 29.6     | 33.7     |
+| 1×1 pw 128ch 32×32  | 15.4       | 65.0       | 15.5     | 64.9     |
+| 5×5 s1 32ch 64×64   | 2.2        | 453        | 2.2      | 452      |
+| 3×3 s2 64ch 128×128 | 1.0        | 1,050      | 1.0      | 1,046    |
 
 **WebGPU — NVIDIA RTX 4070 Ti SUPER (TB3 eGPU):**
 
 | Case                | Eager (Hz) | Eager (ms) | JIT (Hz) | JIT (ms) |
 | ------------------- | ---------- | ---------- | -------- | -------- |
-| 3×3 s1 32ch 64×64   | 291        | 3.43       | 340      | 2.94     |
-| 3×3 s1 64ch 64×64   | 333        | 3.01       | 363      | 2.75     |
-| 3×3 s1 128ch 32×32  | 316        | 3.17       | 360      | 2.78     |
-| 1×1 pw 64ch 64×64   | 1,365      | 0.73       | 371      | 2.69     |
-| 1×1 pw 128ch 32×32  | 408        | 2.45       | 373      | 2.68     |
-| 5×5 s1 32ch 64×64   | 317        | 3.15       | 371      | 2.70     |
-| 3×3 s2 64ch 128×128 | 347        | 2.88       | 374      | 2.67     |
+| 3×3 s1 32ch 64×64   | 284        | 3.52       | 351      | 2.85     |
+| 3×3 s1 64ch 64×64   | 331        | 3.02       | 365      | 2.74     |
+| 3×3 s1 128ch 32×32  | 333        | 3.01       | 367      | 2.72     |
+| 1×1 pw 64ch 64×64   | 1,453      | 0.69       | 377      | 2.65     |
+| 1×1 pw 128ch 32×32  | 812        | 1.23       | 368      | 2.72     |
+| 5×5 s1 32ch 64×64   | 302        | 3.32       | 366      | 2.74     |
+| 3×3 s2 64ch 128×128 | 336        | 2.97       | —        | —        |
 
 **WebGPU — Intel Arc iGPU:**
 
 | Case                | Eager (Hz) | Eager (ms) | JIT (Hz) | JIT (ms) |
 | ------------------- | ---------- | ---------- | -------- | -------- |
-| 3×3 s1 32ch 64×64   | 375        | 2.67       | 393      | 2.54     |
-| 3×3 s1 64ch 64×64   | 372        | 2.69       | 321      | 3.12     |
-| 3×3 s1 128ch 32×32  | 273        | 3.67       | 289      | 3.46     |
-| 1×1 pw 64ch 64×64   | 355        | 2.81       | 401      | 2.49     |
-| 1×1 pw 128ch 32×32  | 374        | 2.67       | 391      | 2.56     |
-| 5×5 s1 32ch 64×64   | 356        | 2.81       | 392      | 2.55     |
-| 3×3 s2 64ch 128×128 | 248        | 4.03       | 236      | 4.23     |
+| 3×3 s1 32ch 64×64   | 363        | 2.76       | 402      | 2.49     |
+| 3×3 s1 64ch 64×64   | 376        | 2.66       | 310      | 3.23     |
+| 3×3 s1 128ch 32×32  | 260        | 3.85       | 278      | 3.60     |
+| 1×1 pw 64ch 64×64   | 367        | 2.73       | 398      | 2.51     |
+| 1×1 pw 128ch 32×32  | 380        | 2.63       | 385      | 2.60     |
+| 5×5 s1 32ch 64×64   | 386        | 2.59       | 339      | 2.95     |
+| 3×3 s2 64ch 128×128 | 262        | 3.82       | 234      | 4.27     |
 
 **Key findings:**
 
-1. **WASM JIT is 100–1,000× slower than eager** — JIT compilation overhead dominates; conv2d
-   produces a single large kernel with no fusion benefit over the eager im2col+matmul path.
+1. **WASM eager ≈ JIT** — conv2d compiles to a single reduction kernel with no fusion benefit. JIT
+   overhead is negligible; both paths execute the same scalar reduction. Original 1000× gap was a
+   **benchmark bug** — eager bench was not materializing results (`.dispose()` cancelled pending
+   execution without running the kernel). Fixed by adding `.dataSync()`.
 2. **WebGPU is dispatch-bound at ~2.5–3ms** — all cases bottleneck on dispatch overhead, not
    compute. NVIDIA and Intel show similar timings → GPU compute is irrelevant at this scale.
-3. **GPU utilization is <1%** — e.g. 3×3 32ch 64×64 = 0.151 GFLOP at 340 Hz ≈ 51 GFLOP/s vs RTX 4070
+3. **GPU utilization is <1%** — e.g. 3×3 32ch 64×64 = 0.151 GFLOP at 351 Hz ≈ 53 GFLOP/s vs RTX 4070
    Ti SUPER peak 22,577 GFLOP/s (0.2%).
-4. **WASM eager is competitive** — 0.1–0.3ms per conv, faster than WebGPU for these sizes.
-5. **Bottleneck is 100% dispatch overhead, not kernel quality** — Phase B/C optimizations won't help
-   until we address the overhead floor. Larger batch sizes or `lax.scan` over conv bodies would
-   amortize dispatch cost.
+4. **WebGPU eager faster for 1×1** — 1×1 conv eager bypasses command tape overhead, reaching 1,453
+   Hz (0.69ms) vs JIT 377 Hz (2.65ms). For small ops, eager dispatch directly to GPU queue is faster
+   than the command tape's pre-resolved pipeline machinery.
+5. **Bottleneck is 100% dispatch overhead, not kernel quality** — Phase B/C kernel optimizations
+   won't help until tensor sizes are large enough to dominate dispatch cost. Larger batch sizes or
+   `lax.scan` over conv bodies would amortize dispatch cost.
+6. **WASM conv is CPU-bound on reduction** — 3×3 64ch 64×64 takes 636ms (1.6 Hz). The reduction
+   kernel uses scalar (non-SIMD) codegen. This is the main WASM optimization opportunity.
 
 ### Phase B: Cheap wins in existing lowering
 
@@ -374,9 +380,17 @@ existing `BlockMap` JVP/transpose rules. No new transform rules needed.
 
 #### Decision gate
 
-Before implementing, compare Phase A numbers against the improved Phase B generic path. If Phase B
-already achieves acceptable throughput on the target shapes, defer Phase C. Implement Phase C only
-for cases where the generic Dot reduction is clearly memory-bandwidth-limited due to poor locality.
+Phase A results (corrected) show all cases are **dispatch-bound on WebGPU** (~2.5ms) and
+**compute-bound on WASM** (scalar reduction, no SIMD). Phase C tiled conv via `block_map` would help
+only if:
+
+1. **WebGPU tensor sizes are large enough** to dominate dispatch overhead (batch > 1, or channels >
+   256). Current single-batch sizes saturate at dispatch cost.
+2. **WASM SIMD for reductions** is implemented first — the generic scalar reduction is the WASM
+   bottleneck, not conv-specific lowering.
+
+Implement Phase C only for cases where GFLOP/s is clearly below memory bandwidth limits at
+sufficient tensor sizes.
 
 #### Files
 
