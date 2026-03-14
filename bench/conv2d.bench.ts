@@ -22,6 +22,7 @@ import { afterAll, bench, suite } from "vitest";
 // ── Shape definitions ──────────────────────────────────────────────────────────
 // Each case: [label, batchSize, inChannels, H, W, outChannels, kH, kW, stride, padding]
 const CASES = [
+  // Original Phase A cases (dispatch-bound at batch=1)
   ["3x3 s1 SAME 32ch  64x64", 1, 32, 64, 64, 64, 3, 3, 1, "SAME"],
   ["3x3 s1 SAME 64ch  64x64", 1, 64, 64, 64, 64, 3, 3, 1, "SAME"],
   ["3x3 s1 SAME 128ch 32x32", 1, 128, 32, 32, 128, 3, 3, 1, "SAME"],
@@ -29,6 +30,14 @@ const CASES = [
   ["1x1 pointwise 128ch 32x32", 1, 128, 32, 32, 256, 1, 1, 1, "VALID"],
   ["5x5 s1 SAME 32ch  64x64", 1, 32, 64, 64, 32, 5, 5, 1, "SAME"],
   ["3x3 s2 down 64ch 128x128", 1, 64, 128, 128, 128, 3, 3, 2, "SAME"],
+
+  // Phase C decision-gate cases — larger tensors pushing toward compute-bound
+  // 3×3 64ch 64×64 batch=8:  8 × 2×64×64×64×64×9 = 1.21 GFLOP
+  ["3x3 B8 64ch  64x64", 8, 64, 64, 64, 64, 3, 3, 1, "SAME"],
+  // 3×3 128ch 64×64 batch=8: 8 × 2×128×64×64×128×9 = 9.66 GFLOP
+  ["3x3 B8 128ch 64x64", 8, 128, 64, 64, 128, 3, 3, 1, "SAME"],
+  // 1×1 256ch 64×64:  1 × 2×256×64×64×256 = 0.54 GFLOP
+  ["1x1 pw 256ch 64x64", 1, 256, 64, 64, 256, 1, 1, 1, "VALID"],
 ] as const;
 
 type Case = (typeof CASES)[number];

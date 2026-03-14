@@ -304,6 +304,27 @@ All cases compile to exactly **1 kernel** (fused im2col + matmul + epilogue).
 6. **WASM conv is CPU-bound on reduction** — 3×3 64ch 64×64 takes 636ms (1.6 Hz). The reduction
    kernel uses scalar (non-SIMD) codegen. This is the main WASM optimization opportunity.
 
+#### GPU timing data (NVIDIA RTX 4070 Ti SUPER, `tmp/conv2d-gpu-bench.test.ts`)
+
+Larger shapes measured with `blockUntilReady()` timing, bypassing the `vitest bench` API (which
+hangs on WebGPU async). This data motivated the Phase C decision gate.
+
+| Case              | GFLOP | Eager ms | JIT ms | GFLOP/s | % Peak |
+| ----------------- | ----- | -------- | ------ | ------- | ------ |
+| 3×3 1×32ch 64×64  | 0.151 | 2.82     | 2.64   | 57.3    | 0.3%   |
+| 3×3 1×64ch 64×64  | 0.302 | 3.03     | 2.22   | 136.1   | 0.6%   |
+| 3×3 1×128ch 32×32 | 0.302 | 3.04     | 2.53   | 119.4   | 0.5%   |
+| 3×3 8×64ch 64×64  | 2.416 | 3.70     | 2.77   | 872.6   | 3.9%   |
+| 3×3 8×128ch 64×64 | 9.664 | 9.40     | 7.20   | 1342.0  | 5.9%   |
+| 5×5 1×32ch 64×64  | 0.210 | 3.22     | 2.62   | 80.1    | 0.4%   |
+| 1×1 1×64ch 64×64  | 0.034 | 0.84     | 2.72   | 12.3    | 0.1%   |
+| 1×1 1×256ch 64×64 | 0.537 | 3.33     | 2.61   | 206.0   | 0.9%   |
+| 3×3 s2 128ch 128² | 0.604 | 2.92     | 2.60   | 232.7   | 1.0%   |
+
+Note: peak (22,577 GFLOP/s) is theoretical FP32 throughput. Even the largest case (9.664 GFLOP)
+achieves only 5.9% utilization, confirming conv2d remains dispatch-bound and memory-latency-bound
+for single-batch shapes.
+
 ### Phase B: Cheap wins in existing lowering
 
 **Deliverable:** better performance without changing the primitive surface.
@@ -337,66 +358,53 @@ fallback. All use `_lastConvLoweringKind()` path-selection assertions.
 
 1. **1×1 fast path** ✅ Done — see results above.
 
-2. **Kernel-shape heuristics**
-
-- Detect 3×3 and 5×5 cases early in jit lowering so Phase C codegen can branch cleanly
-- Tag the detection result on the JIT context, don't emit specialized code yet
-
-#### Files
-
-- `src/frontend/convolution.ts`
-- `src/frontend/jit.ts`
-- Possibly `src/alu.ts` if expression simplification around conv lowering proves limiting
+2. **Kernel-shape heuristics** ✅ Done — `classifyConvLowering` in `jit.ts` detects 3×3/5×5 and
+   returns `block-map-3x3`/`block-map-5x5`. These still fall through to generic Dot lowering.
+   Path-selection tests in `test/conv.test.ts` assert the classification.
 
 ### Phase C: Tiled conv2d via `block_map`
 
-**Deliverable:** materially higher WebGPU throughput for 3×3 / 5×5 conv2d.
+**Status:** Im2col materialization approach **rejected** (41% regression on NVIDIA). Fused approach
+planned.
 
-#### Mechanism: `block_map` (not hand-written WGSL)
+#### Im2col materialization: attempted and rejected
 
-The project's design philosophy is "generative compiler over static kernel libraries." The right
-vehicle for tiled conv2d is `block_map`, which already provides shared-memory tiling, barrier
-scheduling, register tiling (`threadTile`), and fused codegen. A new Routine with hand-written WGSL
-would contradict the philosophy and duplicate infrastructure.
+The im2col + tiledMatmul approach was fully implemented and benchmarked:
 
-**Approach:**
+- Extract kH×kW patches via `uncheckedDynamicSlice` (compiles to index math in JIT)
+- Concatenate into [M, K] matrix → tiledMatmul via `block_map`
 
-1. Express conv2d as a `block_map` body: load input tile + halo into shared memory, apply kernel
-   weights, accumulate output tile. Use `ForiLoop` to iterate over input-channel tiles (K-dim),
-   mirroring the existing tiled matmul pattern.
-2. Detect eligible conv shapes in `Primitive.Conv` JIT lowering (3×3/5×5, stride 1 or 2, no
-   dilation, no groups) and emit `BlockMap` IR instead of generic `Dot`.
-3. Generic conv lowering remains the fallback for all other shapes.
+**Result:** 41% slower than generic Dot lowering on NVIDIA RTX 4070 Ti SUPER for the target case
+(3×3, batch=8, 128ch, 64×64):
 
-**Key differences from tiled matmul:**
+| Case              | Generic Dot  | Im2col + tiledMatmul | Delta |
+| ----------------- | ------------ | -------------------- | ----- |
+| 3×3 8×64ch 64×64  | 797 GFLOP/s  | 374 GFLOP/s          | −53%  |
+| 3×3 8×128ch 64×64 | 1336 GFLOP/s | 787 GFLOP/s          | −41%  |
 
-- Input tile includes a halo region (kernel_size - 1 pixels on each spatial edge)
-- Halo means input tile is larger than output tile (e.g., 66×66 input for 64×64 output with 3×3)
-- Weight tile is small and fixed (e.g., 3×3×C_in per output channel group)
-- Stride-2 halves the output spatial dims relative to input tile
+**Root cause:** The im2col materialization writes ~150 MB to VRAM (9× input for 3×3) then reads it
+back in tiledMatmul. This extra bandwidth overwhelms the compute savings from shared-memory tiling.
+The generic Dot path reads input directly with computed indices — higher arithmetic intensity per
+byte fetched.
 
-**Autodiff:** `block_map` bodies are jaxpr-traceable, so `jit(grad(conv_blockmap))` works via
-existing `BlockMap` JVP/transpose rules. No new transform rules needed.
+#### Revised approach: implicit im2col inside block_map body
 
-#### Decision gate
+The correct approach avoids materialization entirely. Each workgroup computes im2col indices
+on-the-fly and loads input data directly into shared memory with halo regions.
 
-Phase A results (corrected) show all cases are **dispatch-bound on WebGPU** (~2.5ms) and
-**compute-bound on WASM** (scalar reduction, no SIMD). Phase C tiled conv via `block_map` would help
-only if:
+**Key challenge:** `block_map` tiles non-overlapping blocks along axes. Convolution has overlapping
+receptive fields (halo regions). Two options:
 
-1. **WebGPU tensor sizes are large enough** to dominate dispatch overhead (batch > 1, or channels >
-   256). Current single-batch sizes saturate at dispatch cost.
-2. **WASM SIMD for reductions** is implemented first — the generic scalar reduction is the WASM
-   bottleneck, not conv-specific lowering.
+1. **Halo-aware block_map** — extend `block_map` to support overlap/halo in `inAxes` specification.
+   Each input tile is larger than the output tile by `(kH-1, kW-1)` pixels.
+2. **Custom WGSL conv shader** via Routine — hand-written tiled conv with explicit halo loading.
+   Contradicts "generative compiler > static kernels" philosophy but guarantees optimal memory
+   access patterns.
 
-Implement Phase C only for cases where GFLOP/s is clearly below memory bandwidth limits at
-sufficient tensor sizes.
+Option 1 is preferred — it extends the general `block_map` infrastructure rather than adding a
+one-off Routine. The halo concept would also benefit other stencil computations.
 
-#### Files
-
-- `src/frontend/jit.ts` — fast-path detection in `Primitive.Conv` rule, emit `BlockMap` IR
-- `src/frontend/convolution.ts` — helper to compute halo sizes and tile parameters
-- `src/library/lax.ts` — possibly a `tiledConv2d` internal helper (not public API)
+**Deferred** until halo support is designed for `block_map`.
 
 ### Correctness and regression coverage
 
@@ -419,30 +427,25 @@ paths:
 
 ### Success criteria
 
-1. Add benchmark coverage in `bench/conv2d.bench.ts`
-2. No regressions in `test/conv.test.ts`
-3. Clear WebGPU speedup on at least one common case:
-
-- 1×1 conv: target **match raw matmul throughput** for equivalent matrix shapes (current generic
-  path adds ~20–50% overhead from ShapeTracker complexity; 2× only achievable via `block_map`)
-- 3×3/5×5 conv: target **2×+** on NVIDIA via `block_map` tiled path (shared-memory tiling is
-  required to beat the generic Dot reduction's poor spatial locality)
-
-4. Intel path remains correct; if a specialization regresses Intel badly, gate it by heuristic
+1. Add benchmark coverage in `bench/conv2d.bench.ts` ✅
+2. No regressions in `test/conv.test.ts` ✅
+3. Path classification (block-map-3x3/5x5) in `classifyConvLowering` ✅
+4. 1×1 conv fast path ✅ (Phase B: `fast-1x1-dot` and `fast-1x1-block-map`)
+5. Clear WebGPU speedup for 3×3/5×5: **deferred** pending halo-aware `block_map`
+6. Intel path remains correct ✅
 
 ### Recommended execution order
 
-1. Phase A0 conv lowering kind signal (~20 lines, unblocks testable path selection)
+1. ~~Phase A0 conv lowering kind signal~~ ✅ Done (commit f1663c7)
 2. Phase A0 `setCodeCapture` public API + wasmblr trace mode — WebGPU hook first, then WASM kernel +
    mega-module hooks (trace mode enables WAT source collection at all WASM sites)
-3. Phase A benchmark file + baseline numbers (use `profileGpuDetailed` if ready, `setDebug(1)` as
-   fallback)
+3. ~~Phase A benchmark file + baseline numbers~~ ✅ Done (commit 83722e9)
 4. Phase A0 items 2 + 4 (detailed profiling + REPL compiled-code panel) in parallel with Phase A
    analysis. WASM scan/assoc-scan/block-map/routine hooks land incrementally after initial panel
-5. 1×1 fast path (highest expected ROI / lowest complexity)
-6. Re-benchmark with structured profiling
-7. 3×3 stride-1 `block_map` specialization if still clearly bottlenecked
-8. 5×5 specialization only if benchmarks justify it
+5. ~~1×1 fast path~~ ✅ Done (commit 83722e9, Phase B)
+6. ~~3×3/5×5 classification~~ ✅ Done (commit 83722e9)
+7. ~~3×3 im2col + tiledMatmul~~ ❌ Rejected (41% regression from materialization overhead)
+8. Halo-aware block_map design for implicit im2col (future)
 
 ## Deferred Items
 

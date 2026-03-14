@@ -86,6 +86,43 @@ await deviceSuite(() => {
     expect(_lastConvLoweringKind()).toBe("generic-dot");
   });
 
+  test("3x3 conv classified as block-map-3x3", () => {
+    using x = np.ones([1, 4, 8, 8]);
+    using w = np.ones([2, 4, 3, 3]);
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1, 1], "SAME"),
+    );
+    using result = f(x, w);
+    f.dispose();
+    expect(_lastConvLoweringKind()).toBe("block-map-3x3");
+    // Still produces correct output (uses generic-dot lowering internally)
+    expect(result.shape).toEqual([1, 2, 8, 8]);
+  });
+
+  test("5x5 conv classified as block-map-5x5", () => {
+    using x = np.ones([1, 4, 8, 8]);
+    using w = np.ones([2, 4, 5, 5]);
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1, 1], "SAME"),
+    );
+    using result = f(x, w);
+    f.dispose();
+    expect(_lastConvLoweringKind()).toBe("block-map-5x5");
+    expect(result.shape).toEqual([1, 2, 8, 8]);
+  });
+
+  test("3x3 with dilation falls back to generic-dot", () => {
+    using x = np.ones([1, 4, 8, 8]);
+    using w = np.ones([2, 4, 3, 3]);
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1, 1], "SAME", { rhsDilation: [2, 2] }),
+    );
+    using result = f(x, w);
+    f.dispose();
+    expect(_lastConvLoweringKind()).toBe("generic-dot");
+    expect(result.shape).toEqual([1, 2, 8, 8]);
+  });
+
   test("1x1 fast path: non-trivial values match generic path", () => {
     // Uses distinct values (not all-ones) to catch layout mismatches in
     // applyDotLayout — the shared reshape used by both prepareConv1x1 and

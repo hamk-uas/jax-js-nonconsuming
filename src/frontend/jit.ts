@@ -105,9 +105,20 @@ function classifyConvLowering(
   const noGroups = params.vmapDims === 0;
 
   if (allOnes && allStride1 && noDilation && noGroups) {
-    return "fast-1x1-dot"; // eligible for 1×1 fast path (currently lowered as generic dot)
+    return "fast-1x1-dot";
   }
-  // Future: block-map-3x3, block-map-5x5, fast-1x1-block-map
+
+  // Detect common kernel sizes for future block_map specialization.
+  // Currently still lowered as generic-dot — the classification enables
+  // path-selection tests and benchmarks. Im2col materialization was tried
+  // and found too expensive (41% regression on NVIDIA); a fused tiled conv
+  // with implicit im2col inside block_map is the path forward.
+  if (noDilation && noGroups && kernelShape.length === 2) {
+    const [kH, kW] = kernelShape;
+    if (kH === 3 && kW === 3) return "block-map-3x3";
+    if (kH === 5 && kW === 5) return "block-map-5x5";
+  }
+
   return "generic-dot";
 }
 
@@ -2723,6 +2734,9 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
       params as ConvParams,
       kernelShape,
     );
+    // block-map-3x3 and block-map-5x5 are detected but not yet specialized —
+    // they still fall through to the generic Dot lowering. A fused tiled conv
+    // with implicit im2col (no materialization) is planned.
     const prepare =
       lastConvLoweringKind === "fast-1x1-dot" ? prepareConv1x1 : prepareConv;
     const [stX, stY] = prepare(
