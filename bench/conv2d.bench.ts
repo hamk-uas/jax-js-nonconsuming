@@ -8,7 +8,6 @@
 
 import {
   _lastConvRewritten,
-  _setConvRewriteEnabled,
   blockUntilReady,
   clearCaches,
   type CodeCaptureEntry,
@@ -21,6 +20,10 @@ import {
   setCodeCapture,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { afterAll, bench, suite } from "vitest";
+
+// Internal-only toggle: not part of public API, imported directly from source.
+// Vitest resolves this via the alias in vitest.config.ts.
+import { _setConvRewriteEnabled } from "../src/frontend/jit";
 
 // ── Shape definitions ──────────────────────────────────────────────────────────
 // Each case: [label, batchSize, inChannels, H, W, outChannels, kH, kW, stride, padding]

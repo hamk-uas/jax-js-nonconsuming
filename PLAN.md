@@ -730,7 +730,9 @@ Wire Steps 1 and 2 together in the BlockMap transpose rule:
 - `src/frontend/stencil-analysis.ts` — (new, Phase C.4 Step 2) linear stencil body synthesis for
   gather-based halo VJP
 - `src/frontend/vmap.ts` — forward `halo` in vmap rule _(C.1)_
-- `src/index.ts` — no new exports needed (halo is part of existing `BlockMapOptions`)
+- `src/index.ts` — `_lastConvRewritten` export _(C.3)_; `_setConvRewriteEnabled` is NOT exported
+  (internal-only, bench imports directly from source); no new exports for halo (part of existing
+  `BlockMapOptions`)
 - `test/block-map.test.ts` — halo-specific test cases T8.1–T8.8 _(C.1–C.2)_
 
 ### Correctness and regression coverage
@@ -747,8 +749,11 @@ paths:
    the intended fast path and ineligible shapes (groups, dilation, exotic padding) fall through to
    `generic-dot`. This replaces the fragile approach of inferring activation from performance deltas
    or console output.
-7. WebGPU-only code capture tests confirm that `block_map` conv emits the expected fused shader
-   (single dispatch, correct grid) rather than falling back to per-block dispatch
+7. ~~WebGPU-only code capture tests confirm that `block_map` conv emits the expected fused shader
+   (single dispatch, correct grid) rather than falling back to per-block dispatch~~ **Blocked:**
+   Conv→BlockMap rewrite is gated off on WebGPU (`backendType === "webgpu"` → early return in
+   `rewriteConvToBlockMap`). Unblock requires fused-shader support for conv bodies in
+   `block-map.ts`. Tests should verify `_lastConvRewritten() === false` on WebGPU instead
 8. REPL compiled-code panel displays captured WGSL and WAT source when "Capture compiled code" is
    enabled
 
@@ -759,7 +764,8 @@ paths:
 3. Path classification (block-map-3x3/5x5) in `classifyConv` ✅
 4. 1×1 conv fast path ✅ (Phase B: `fast-1x1-dot` and `fast-1x1-block-map`)
 5. Clear WebGPU speedup for 3×3/5×5: **partial** — C.3 WASM shows 1.02–1.36× speedup (grows with
-   spatial size); WebGPU fused shader pending
+   spatial size); WebGPU gated off (`rewriteConvToBlockMap` returns early for
+   `backendType === "webgpu"`). Unblock: fused-shader codegen for conv bodies in `block-map.ts`
 6. Intel path remains correct ✅
 
 ### Recommended execution order

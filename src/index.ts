@@ -47,7 +47,6 @@ import type { ConvClass, JitStepCounts } from "./frontend/jit";
 import {
   _lastConvClass,
   _lastConvRewritten,
-  _setConvRewriteEnabled,
   jitCompile,
   JitProgram,
 } from "./frontend/jit";
@@ -100,7 +99,6 @@ export {
   type JitStepCounts,
   _lastConvClass,
   _lastConvRewritten,
-  _setConvRewriteEnabled,
   lax,
   type LeakReport,
   MemoryEffect,
