@@ -1784,6 +1784,99 @@ type TransposeRule<P extends Primitive> = (
   params: PrimitiveParams<P>,
 ) => (Tracer | null)[];
 
+/**
+ * Slice a traced array along mapped axes for a given block index.
+ * No halo — just a clean [j*B, (j+1)*B] slice (clamped for partial last block).
+ */
+function sliceBlock(
+  arr: Tracer,
+  axes: (number | null)[],
+  blockIdx: number[],
+  blockShape: number[],
+  gridRank: number,
+): Tracer {
+  const shape = arr.aval.shape;
+  const slicePairs: [number, number][] = (shape as number[]).map((s) => [0, s]);
+  let anySlice = false;
+  for (let g = 0; g < gridRank; g++) {
+    if (axes[g] === null) continue;
+    const ax = axes[g]!;
+    const dim = shape[ax] as number;
+    const start = blockIdx[g] * blockShape[g];
+    const end = Math.min(start + blockShape[g], dim);
+    if (start !== 0 || end !== dim) anySlice = true;
+    slicePairs[ax] = [start, end];
+  }
+  if (!anySlice) return arr.ref;
+  const sliced = shrink(arr, slicePairs) as Tracer;
+  // Pad to full blockShape if the last block is partial.
+  const padWidth: [number, number][] = (shape as number[]).map(() => [0, 0]);
+  let anyPad = false;
+  for (let g = 0; g < gridRank; g++) {
+    if (axes[g] === null) continue;
+    const ax = axes[g]!;
+    const got = slicePairs[ax][1] - slicePairs[ax][0];
+    if (got < blockShape[g]) {
+      padWidth[ax] = [0, blockShape[g] - got];
+      anyPad = true;
+    }
+  }
+  if (!anyPad) return sliced;
+  const padded = pad(sliced, padWidth) as Tracer;
+  sliced.dispose();
+  return padded;
+}
+
+/**
+ * Slice a traced array along mapped axes with halo expansion.
+ * Replicates the eager block_map boundary clamping + zero-padding logic.
+ */
+function sliceBlockWithHalo(
+  arr: Tracer,
+  axes: (number | null)[],
+  haloTable: [number, number][],
+  blockIdx: number[],
+  blockShape: number[],
+  gridRank: number,
+): Tracer {
+  const shape = arr.aval.shape;
+  const slicePairs: [number, number][] = (shape as number[]).map((s) => [0, s]);
+  const padWidth: [number, number][] = (shape as number[]).map(() => [0, 0]);
+  let anySlice = false;
+  let anyPad = false;
+  for (let g = 0; g < gridRank; g++) {
+    if (axes[g] === null) continue;
+    const ax = axes[g]!;
+    const dim = shape[ax] as number;
+    const [lo, hi] = haloTable[g];
+    const start = blockIdx[g] * blockShape[g] - lo;
+    const end = blockIdx[g] * blockShape[g] + blockShape[g] + hi;
+    const clampedStart = Math.max(0, start);
+    const clampedEnd = Math.min(end, dim);
+    slicePairs[ax] = [clampedStart, clampedEnd];
+    anySlice = anySlice || clampedStart !== 0 || clampedEnd !== dim;
+
+    const leftPad = start < 0 ? -start : 0;
+    const tileSize = blockShape[g] + lo + hi;
+    const actual = clampedEnd - clampedStart;
+    const rightPad = tileSize - actual - leftPad;
+    if (leftPad > 0 || rightPad > 0) {
+      padWidth[ax] = [leftPad, rightPad];
+      anyPad = true;
+    }
+  }
+  let result: Tracer;
+  if (anySlice) {
+    result = shrink(arr, slicePairs) as Tracer;
+  } else {
+    result = arr.ref;
+  }
+  if (!anyPad) return result;
+  const padded = pad(result, padWidth) as Tracer;
+  result.dispose();
+  return padded;
+}
+
 // You need a transpose rule for a primitive p if:
 //  - p is used in jvpRules, while computing a tangent (not primal)
 //  - in this use, at least one argument to p is a tangent
@@ -1800,23 +1893,23 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       outAxes,
       numInputs: _numInputs,
     } = params;
+    const gridRank = blockShape.length;
     const undefMask = args.map((x) => x instanceof UndefPrimal);
 
-    // Guard: grad through halo-overlapping inputs requires scatter-add
-    // accumulation for overlapping gradient contributions. Not yet implemented
-    // (Phase C.4). Throw eagerly to avoid silently wrong gradients.
+    // Check if any differentiated input has non-zero halo. When true,
+    // overlapping gradient regions require the scatter-add fallback path.
+    let needsHaloVjp = false;
     if (params.halo) {
       for (let i = numConsts; i < args.length; i++) {
         if (!undefMask[i]) continue;
         const inputHalo = params.halo[i - numConsts];
         for (const [lo, hi] of inputHalo) {
           if (lo !== 0 || hi !== 0) {
-            throw new Error(
-              "grad(blockMap) with halo is not yet supported: overlapping " +
-                "input regions require scatter-add accumulation (Phase C.4)",
-            );
+            needsHaloVjp = true;
+            break;
           }
         }
+        if (needsHaloVjp) break;
       }
     }
 
@@ -1830,54 +1923,301 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       .slice(numConsts)
       .filter((_, i) => !undefMask[numConsts + i]) as Tracer[];
 
-    const residualAxes = inAxes.filter((_, i) => !undefMask[numConsts + i]);
-    const transposeInAxes = [...residualAxes, ...outAxes];
+    if (!needsHaloVjp) {
+      // ---- Standard path: no halo overlap → delegate to block_map ----
+      const residualAxes = inAxes.filter((_, i) => !undefMask[numConsts + i]);
+      const transposeInAxes = [...residualAxes, ...outAxes];
 
-    const nullOutAxis = Array(blockShape.length).fill(null);
-    const constOutAxes = args
-      .slice(0, numConsts)
-      .filter((_, i) => undefMask[i])
-      .map(() => nullOutAxis);
+      const nullOutAxis = Array(gridRank).fill(null);
+      const constOutAxes = args
+        .slice(0, numConsts)
+        .filter((_, i) => undefMask[i])
+        .map(() => nullOutAxis);
+      const argOutAxes = inAxes.filter((_, i) => undefMask[numConsts + i]);
+      const transposeOutAxes = [...constOutAxes, ...argOutAxes];
 
-    const argOutAxes = inAxes.filter((_, i) => undefMask[numConsts + i]);
-    const transposeOutAxes = [...constOutAxes, ...argOutAxes];
+      const jaxprConsts = transposedBody.consts;
+      const allConsts = [...jaxprConsts, ...constResiduals];
 
-    const jaxprConsts = transposedBody.consts;
-    const allConsts = [...jaxprConsts, ...constResiduals];
+      // Forward halo for residual inputs; cotangent inputs (from outAxes)
+      // have no halo — they match blockShape, not blockShape+halo.
+      let transposeHalo: [number, number][][] | undefined;
+      if (params.halo) {
+        const residualHalo = params.halo.filter(
+          (_, i) => !undefMask[numConsts + i],
+        );
+        const ctHalo = outAxes.map(() =>
+          blockShape.map(() => [0, 0] as [number, number]),
+        );
+        transposeHalo = [...residualHalo, ...ctHalo];
+      }
 
-    // Forward halo for residual inputs; cotangent inputs (from outAxes) have
-    // no halo — they match blockShape, not blockShape+halo.
-    let transposeHalo: [number, number][][] | undefined;
-    if (params.halo) {
-      const residualHalo = params.halo.filter(
-        (_, i) => !undefMask[numConsts + i],
+      const transposedOut = bind(
+        Primitive.BlockMap,
+        [...allConsts, ...argResiduals, ...(cts as Tracer[])],
+        {
+          jaxpr: transposedBody.jaxpr,
+          blockShape,
+          inAxes: transposeInAxes,
+          outAxes: transposeOutAxes,
+          numConsts: allConsts.length,
+          numInputs: argResiduals.length + cts.length,
+          threadTile: params.threadTile,
+          halo: transposeHalo,
+        },
       );
-      const ctHalo = outAxes.map(() =>
-        blockShape.map(() => [0, 0] as [number, number]),
-      );
-      transposeHalo = [...residualHalo, ...ctHalo];
+
+      transposedBody.dispose();
+
+      const numUndefConsts = constOutAxes.length;
+      const constCts = transposedOut.slice(0, numUndefConsts);
+      const argCts = transposedOut.slice(numUndefConsts);
+
+      const outVals = [];
+      let constIdx = 0,
+        argIdx = 0;
+      for (let i = 0; i < args.length; i++) {
+        if (!undefMask[i]) outVals.push(null);
+        else if (i < numConsts) outVals.push(constCts[constIdx++]);
+        else outVals.push(argCts[argIdx++]);
+      }
+      return outVals;
     }
 
-    const transposedOut = bind(
-      Primitive.BlockMap,
-      [...allConsts, ...argResiduals, ...(cts as Tracer[])],
-      {
-        jaxpr: transposedBody.jaxpr,
-        blockShape,
-        inAxes: transposeInAxes,
-        outAxes: transposeOutAxes,
-        numConsts: allConsts.length,
-        numInputs: argResiduals.length + cts.length,
-        threadTile: params.threadTile,
-        halo: transposeHalo,
-      },
+    // ---- Halo VJP: scatter-add fallback (Phase C.4 Step 1) ----
+    // Overlapping halo regions mean adjacent blocks' gradient patches share
+    // elements. Standard block_map concat/trim would lose overlap
+    // contributions. Strategy: unroll the block loop at trace time, pad each
+    // gradient patch to the padded-accumulator size, and add.
+    if (DEBUG >= 1) console.log("halo-VJP: using scatter-add accumulation");
+
+    const halo = params.halo!;
+
+    // Compute grid shape and original dims from ALL args (including UndefPrimal).
+    const gridShape: number[] = new Array(gridRank).fill(0);
+    const origDims: number[] = new Array(gridRank).fill(0);
+    for (let i = 0; i < args.length - numConsts; i++) {
+      const axes = inAxes[i];
+      const shape = args[numConsts + i].aval.shape;
+      for (let g = 0; g < gridRank; g++) {
+        if (axes[g] !== null && gridShape[g] === 0) {
+          const dim = shape[axes[g]!] as number;
+          gridShape[g] = Math.ceil(dim / blockShape[g]);
+          origDims[g] = dim;
+        }
+      }
+    }
+    const numBlocks = gridShape.reduce((a, b) => a * b, 1);
+
+    // Build input tables for slicing.
+    // residualAxes[i] / residualHaloTable[i]: per-residual-arg axes and halo.
+    const residualAxes = inAxes.filter((_, i) => !undefMask[numConsts + i]);
+    const residualHaloTable: [number, number][][] = [];
+    for (let i = 0; i < args.length - numConsts; i++) {
+      if (!undefMask[numConsts + i]) residualHaloTable.push(halo[i]);
+    }
+
+    // Transposed body outputs: [grad_consts..., grad_args...].
+    // constOutAxes: null for all grid axes (summed across blocks).
+    // argOutAxes: inAxes for each differentiated arg.
+    // argHaloTable[i]: halo for each differentiated arg (from original halo).
+    const nullOutAxis = Array(gridRank).fill(null) as (number | null)[];
+    const constOutAxes: (number | null)[][] = [];
+    for (let i = 0; i < numConsts; i++) {
+      if (undefMask[i]) constOutAxes.push(nullOutAxis);
+    }
+    const argOutAxes: (number | null)[][] = [];
+    const argHaloTable: [number, number][][] = [];
+    for (let i = 0; i < args.length - numConsts; i++) {
+      if (undefMask[numConsts + i]) {
+        argOutAxes.push(inAxes[i]);
+        argHaloTable.push(halo[i]);
+      }
+    }
+    const allOutAxes = [...constOutAxes, ...argOutAxes];
+    const allOutHalo = [
+      ...constOutAxes.map(() =>
+        blockShape.map(() => [0, 0] as [number, number]),
+      ),
+      ...argHaloTable,
+    ];
+
+    // Compute per-output accumulator shapes and body output shapes.
+    const { outTypes } = typecheckJaxpr(transposedBody.jaxpr);
+    const numOutputs = outTypes.length;
+    const accumShapes: number[][] = [];
+    const bodyOutShapes: number[][] = [];
+    for (let o = 0; o < numOutputs; o++) {
+      const bodyShape = [...outTypes[o].shape] as number[];
+      bodyOutShapes.push(bodyShape);
+      const accumShape = [...bodyShape];
+      const axes = allOutAxes[o];
+      const oHalo = allOutHalo[o];
+      for (let g = 0; g < gridRank; g++) {
+        if (axes[g] !== null) {
+          const [lo, hi] = oHalo[g];
+          accumShape[axes[g]!] = origDims[g] + lo + hi;
+        }
+      }
+      accumShapes.push(accumShape);
+    }
+
+    // Initialize accumulators to zero.
+    let accumulators: Tracer[] = accumShapes.map((shape, o) =>
+      zerosInternal(shape, outTypes[o].dtype),
     );
+
+    // ---- Unrolled block loop ----
+    for (let flatIdx = 0; flatIdx < numBlocks; flatIdx++) {
+      // Convert flat index to grid coordinates.
+      const blockIdx: number[] = new Array(gridRank);
+      let remaining = flatIdx;
+      for (let g = gridRank - 1; g >= 0; g--) {
+        blockIdx[g] = remaining % gridShape[g];
+        remaining = Math.floor(remaining / gridShape[g]);
+      }
+
+      // Slice each residual input with halo expansion + boundary padding.
+      const blockResiduals: Tracer[] = [];
+      for (let ri = 0; ri < argResiduals.length; ri++) {
+        blockResiduals.push(
+          sliceBlockWithHalo(
+            argResiduals[ri],
+            residualAxes[ri],
+            residualHaloTable[ri],
+            blockIdx,
+            blockShape,
+            gridRank,
+          ),
+        );
+      }
+
+      // Slice each cotangent (no halo, block-aligned).
+      const blockCts: Tracer[] = [];
+      for (let ci = 0; ci < cts.length; ci++) {
+        blockCts.push(
+          sliceBlock(
+            cts[ci] as Tracer,
+            outAxes[ci],
+            blockIdx,
+            blockShape,
+            gridRank,
+          ),
+        );
+      }
+
+      // Evaluate transposed body for this block.
+      const bodyOuts = evalJaxpr(transposedBody.jaxpr, [
+        ...transposedBody.consts,
+        ...constResiduals,
+        ...blockResiduals,
+        ...blockCts,
+      ]);
+
+      // Accumulate each output via pad + add.
+      const newAccumulators: Tracer[] = [];
+      for (let o = 0; o < numOutputs; o++) {
+        const axes = allOutAxes[o];
+        const oHalo = allOutHalo[o];
+        const bodyShape = bodyOutShapes[o];
+        const accumShape = accumShapes[o];
+
+        // Compute pad widths: place the gradient patch at the correct
+        // position in the padded accumulator.
+        let grad: Tracer = bodyOuts[o] as Tracer;
+        const padWidth: [number, number][] = bodyShape.map(() => [0, 0]);
+        let anyPad = false;
+        let needsTrim = false;
+
+        for (let g = 0; g < gridRank; g++) {
+          if (axes[g] === null) continue;
+          const ax = axes[g]!;
+          const bDim = bodyShape[ax]; // B+lo+hi for halo, B for non-halo
+          const [_lo, _hi] = oHalo[g];
+          // In padded space, block j writes at offset j*B:
+          // padded_accum[0] = original[-lo], padded_accum[lo] = original[0].
+          // Block j covers original [j*B-lo, j*B+B+hi), which in padded
+          // space is [j*B-lo+lo, j*B+B+hi+lo) = [j*B, j*B+bDim).
+          // But account for the lo offset already baked into accumShape.
+          const offset = blockIdx[g] * blockShape[g];
+          const available = accumShape[ax] - offset;
+          if (bDim > available) {
+            // Last block extends past accumulator — trim gradient.
+            needsTrim = true;
+          }
+          padWidth[ax] = [offset, Math.max(0, available - bDim)];
+          anyPad = anyPad || padWidth[ax][0] !== 0 || padWidth[ax][1] !== 0;
+        }
+
+        // Trim gradient if it overflows the accumulator (partial last block).
+        if (needsTrim) {
+          const trimSlice: [number, number][] = bodyShape.map((s) => [0, s]);
+          for (let g = 0; g < gridRank; g++) {
+            if (axes[g] === null) continue;
+            const ax = axes[g]!;
+            const offset = blockIdx[g] * blockShape[g];
+            const available = accumShape[ax] - offset;
+            if (bodyShape[ax] > available) {
+              trimSlice[ax] = [0, available];
+              // Update padWidth: after trimming, rightPad = 0.
+              padWidth[ax] = [offset, 0];
+            }
+          }
+          const trimmed = shrink(grad, trimSlice) as Tracer;
+          grad.dispose();
+          grad = trimmed;
+        }
+
+        // Pad gradient to accumulator shape and add.
+        if (anyPad || needsTrim) {
+          const padded = pad(grad, padWidth) as Tracer;
+          grad.dispose();
+          grad = padded;
+        }
+
+        const updated = add(accumulators[o], grad) as Tracer;
+        accumulators[o].dispose();
+        grad.dispose();
+        newAccumulators.push(updated);
+      }
+      accumulators = newAccumulators;
+
+      // Dispose block slices and body outputs.
+      for (const r of blockResiduals) r.dispose();
+      for (const c of blockCts) c.dispose();
+    }
+
+    // Slice padded accumulators to remove halo padding.
+    const finalOutputs: Tracer[] = [];
+    for (let o = 0; o < numOutputs; o++) {
+      const axes = allOutAxes[o];
+      const oHalo = allOutHalo[o];
+      let needsSlice = false;
+      const slicePairs: [number, number][] = accumShapes[o].map((s) => [0, s]);
+      for (let g = 0; g < gridRank; g++) {
+        if (axes[g] === null) continue;
+        const ax = axes[g]!;
+        const [lo, hi] = oHalo[g];
+        if (lo !== 0 || hi !== 0) {
+          slicePairs[ax] = [lo, lo + origDims[g]];
+          needsSlice = true;
+        }
+      }
+      if (needsSlice) {
+        const sliced = shrink(accumulators[o], slicePairs) as Tracer;
+        accumulators[o].dispose();
+        finalOutputs.push(sliced);
+      } else {
+        finalOutputs.push(accumulators[o]);
+      }
+    }
 
     transposedBody.dispose();
 
+    // Assemble outputs in the correct order.
     const numUndefConsts = constOutAxes.length;
-    const constCts = transposedOut.slice(0, numUndefConsts);
-    const argCts = transposedOut.slice(numUndefConsts);
+    const constCts = finalOutputs.slice(0, numUndefConsts);
+    const argCts = finalOutputs.slice(numUndefConsts);
 
     const outVals = [];
     let constIdx = 0,

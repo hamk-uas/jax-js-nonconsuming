@@ -15,8 +15,6 @@
  */
 
 import {
-  checkLeaks,
-  clearCaches,
   DType,
   grad,
   init,
@@ -832,8 +830,56 @@ describe("lax.blockMap — halo", () => {
     }
   });
 
-  // T8.8: grad(blockMap) with halo throws until Phase C.4 scatter-add.
-  test("T8.8: grad(blockMap) with halo throws", () => {
+  // ---- Phase C.4 Step 1: grad(blockMap) with halo ----
+
+  // T8.8: grad of 1D 3-point stencil with halo [1,1] matches finite differences.
+  test("T8.8: grad(blockMap) halo [1,1] — 1D stencil vs FD", () => {
+    // f(xs) = sum(stencil(xs)) where stencil[i] = xs[i-1] + xs[i] + xs[i+1]
+    // (boundary zero-padded). grad = each element contributes to its own
+    // position and to its neighbors' stencil outputs.
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(
+        (block: np.Array) => {
+          // block shape: [6] (B=4 + halo [1,1])
+          using a = lax.sliceInDim(block, 0, 4, 0);
+          using b = lax.sliceInDim(block, 1, 5, 0);
+          using c = lax.sliceInDim(block, 2, 6, 0);
+          using ab = np.add(a, b);
+          using abc = np.add(ab, c);
+          return abc.ref; // jax-js-lint: allow-ref
+        },
+        xs,
+        { blockShape: [4], halo: [[1, 1]] },
+      );
+      return np.sum(mapped);
+    };
+
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    using g = grad(f)(xs);
+    const gData = g.dataSync() as Float32Array;
+
+    // Finite differences
+    const eps = 1e-3;
+    const xsData = xs.dataSync() as Float32Array;
+    using fwdArr = f(xs);
+    const fwd = fwdArr.dataSync()[0] as number;
+    for (let i = 0; i < 8; i++) {
+      const perturbed = new Float32Array(xsData);
+      perturbed[i] += eps;
+      using xp = np.array(perturbed);
+      using fpArr = f(xp);
+      const fp = fpArr.dataSync()[0] as number;
+      const fdGrad = (fp - fwd) / eps;
+      expect(gData[i]).toBeCloseTo(fdGrad, 1);
+    }
+  });
+
+  // T8.9: grad of 1D identity-slice body with halo (no overlap in output,
+  // but gradient still flows through halo-expanded slicing).
+  test("T8.9: grad(blockMap) halo [1,1] — identity slice body", () => {
+    // Body: extract center 4 from 6-element halo tile → output = input.
+    // f(xs) = sum(blockMap(extract_center, xs)) = sum(xs)
+    // grad = all ones.
     const f = (xs: np.Array) => {
       using mapped = lax.blockMap(
         (block: np.Array) => {
@@ -841,20 +887,145 @@ describe("lax.blockMap — halo", () => {
           return sliced.ref; // jax-js-lint: allow-ref
         },
         xs,
-        {
-          blockShape: [4],
-          halo: [[1, 1]],
-        },
+        { blockShape: [4], halo: [[1, 1]] },
       );
       return np.sum(mapped);
     };
 
     using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
-    // Error during tracing leaks internal tracers — stop/restart the leak
-    // checker around the expected throw so those slots aren't counted.
-    checkLeaks.stop();
-    expect(() => grad(f)(xs)).toThrow(/scatter-add accumulation/);
-    clearCaches();
-    checkLeaks.start();
+    using g = grad(f)(xs);
+    // sum(xs) → grad = all ones
+    expect(g).toBeAllclose([1, 1, 1, 1, 1, 1, 1, 1]);
+  });
+
+  // T8.10: grad of 1D stencil with asymmetric halo [0, 2] (causal stencil).
+  test("T8.10: grad(blockMap) asymmetric halo [0,2] vs FD", () => {
+    // Causal stencil: out[i] = x[i] + x[i+1] + x[i+2]
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(
+        (block: np.Array) => {
+          // block shape: [6] (B=4 + halo [0,2])
+          using a = lax.sliceInDim(block, 0, 4, 0);
+          using b = lax.sliceInDim(block, 1, 5, 0);
+          using c = lax.sliceInDim(block, 2, 6, 0);
+          using ab = np.add(a, b);
+          using abc = np.add(ab, c);
+          return abc.ref; // jax-js-lint: allow-ref
+        },
+        xs,
+        { blockShape: [4], halo: [[0, 2]] },
+      );
+      return np.sum(mapped);
+    };
+
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    using g = grad(f)(xs);
+    const gData = g.dataSync() as Float32Array;
+
+    // Finite differences
+    const eps = 1e-3;
+    const xsData = xs.dataSync() as Float32Array;
+    using fwdArr = f(xs);
+    const fwd = fwdArr.dataSync()[0] as number;
+    for (let i = 0; i < 8; i++) {
+      const perturbed = new Float32Array(xsData);
+      perturbed[i] += eps;
+      using xp = np.array(perturbed);
+      using fpArr = f(xp);
+      const fp = fpArr.dataSync()[0] as number;
+      const fdGrad = (fp - fwd) / eps;
+      expect(gData[i]).toBeCloseTo(fdGrad, 1);
+    }
+  });
+
+  // T8.11: jit(grad(blockMap)) with halo — compiled backward path.
+  test("T8.11: jit(grad(blockMap)) halo [1,1]", () => {
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(
+        (block: np.Array) => {
+          using a = lax.sliceInDim(block, 0, 4, 0);
+          using b = lax.sliceInDim(block, 1, 5, 0);
+          using c = lax.sliceInDim(block, 2, 6, 0);
+          using ab = np.add(a, b);
+          using abc = np.add(ab, c);
+          return abc.ref; // jax-js-lint: allow-ref
+        },
+        xs,
+        { blockShape: [4], halo: [[1, 1]] },
+      );
+      return np.sum(mapped);
+    };
+
+    const gf = jit(grad(f));
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    using g = gf(xs) as np.Array;
+    const gData = g.dataSync() as Float32Array;
+
+    // Same FD check as T8.8
+    const eps = 1e-3;
+    const xsData = xs.dataSync() as Float32Array;
+    using fwdArr = f(xs);
+    const fwd = fwdArr.dataSync()[0] as number;
+    for (let i = 0; i < 8; i++) {
+      const perturbed = new Float32Array(xsData);
+      perturbed[i] += eps;
+      using xp = np.array(perturbed);
+      using fpArr = f(xp);
+      const fp = fpArr.dataSync()[0] as number;
+      const fdGrad = (fp - fwd) / eps;
+      expect(gData[i]).toBeCloseTo(fdGrad, 1);
+    }
+    gf.dispose();
+  });
+
+  // T8.12: grad of 2D 3×3 stencil with halo [[1,1],[1,1]].
+  // Each output[r,c] = sum of 3×3 neighborhood centered at (r,c), zero-padded.
+  // grad[r,c] = number of output positions whose 3×3 window contains (r,c):
+  //   corners=4, edges=6, interior=9.
+  test("T8.12: grad(blockMap) 2D halo [[1,1],[1,1]] — 3×3 stencil", () => {
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(
+        (block: np.Array) => {
+          // block shape: [4, 4] (B=[2,2] + halo [[1,1],[1,1]])
+          // Sum all 9 shifts of the block, then extract center [2,2].
+          using s00 = lax.sliceInDim(lax.sliceInDim(block, 0, 2, 0), 0, 2, 1);
+          let acc = s00.ref; // jax-js-lint: allow-ref
+          for (let dr = 0; dr < 3; dr++) {
+            for (let dc = 0; dc < 3; dc++) {
+              if (dr === 0 && dc === 0) continue;
+              using rowSlice = lax.sliceInDim(block, dr, dr + 2, 0);
+              using shifted = lax.sliceInDim(rowSlice, dc, dc + 2, 1);
+              // eslint-disable-next-line jax-js/require-using -- accumulator reassigned to acc
+              const next = np.add(acc, shifted);
+              acc.dispose();
+              acc = next;
+            }
+          }
+          return acc;
+        },
+        xs,
+        {
+          blockShape: [2, 2],
+          inAxes: [0, 1],
+          outAxes: [0, 1],
+          halo: [
+            [1, 1],
+            [1, 1],
+          ],
+        },
+      );
+      return np.sum(mapped);
+    };
+
+    using flat = np.arange(16).astype(DType.Float32);
+    using xs = flat.reshape([4, 4]);
+    using g = grad(f)(xs);
+    // prettier-ignore
+    expect(g).toBeAllclose([
+      [4, 6, 6, 4],
+      [6, 9, 9, 6],
+      [6, 9, 9, 6],
+      [4, 6, 6, 4],
+    ]);
   });
 });

@@ -675,20 +675,21 @@ Speedup grows with spatial size as tiled memory access patterns dominate over di
 
 _Prerequisite: C.1–C.2 landed (halo works in forward pass)._
 
-**Step 1: Scatter-add fallback (correct baseline)**
+**Step 1: Scatter-add fallback (correct baseline)** ✅
 
-The default path. Use `transposeJaxpr(forwardBody)` as-is — it produces a body with shape contract
-`B → (B+lo+hi)` via the existing UDS→scatterAdd transpose. Run the transposed block_map WITHOUT
-halo. Each backward block writes `(B+lo+hi)` elements that overlap neighbors. Post-pass scatter-add
-accumulates the overlapping regions.
+The default path. Uses `transposeJaxpr(forwardBody)` to produce a body with shape contract
+`B → (B+lo+hi)`. Unrolls the block loop at trace time: each block's gradient patch is padded to
+accumulator size and added. Final slice removes halo padding.
 
-1. In `transposeBlockMap` (`linearize.ts`): when `params.halo` is present, emit the transposed
-   block_map with NO halo and output shapes `(B+lo+hi)`. Follow with a `scatterAdd` to accumulate
-   overlapping tiles into the `B`-sized input gradient.
-2. Emit `setDebug(1)` diagnostic: "halo-VJP: using scatter-add accumulation".
-3. Test: `grad(blockMap({halo: [[1,1]]}))` on 1D 3-point stencil matches finite differences.
-4. Test: `grad(blockMap({halo: [[1,1],[1,1]]}))` on 2D 3×3 stencil matches finite differences.
-5. Test: `jit(grad(blockMap({halo})))` on WASM and WebGPU.
+_Implementation: unrolled pad+add accumulation in `transposeBlockMap` (`linearize.ts`), with
+`sliceBlock` and `sliceBlockWithHalo` helper functions for block-level array slicing._
+
+1. ✅ `transposeBlockMap` (`linearize.ts`): halo-VJP unrolled pad+add accumulation path.
+2. ✅ `setDebug(1)` diagnostic: "halo-VJP: using scatter-add accumulation".
+3. ✅ T8.8: `grad(blockMap({halo: [[1,1]]}))` 1D 3-point stencil matches finite differences.
+4. ✅ T8.12: `grad(blockMap({halo: [[1,1],[1,1]]}))` 2D 3×3 stencil — analytical gradient.
+5. ✅ T8.11: `jit(grad(blockMap({halo})))` on WASM. WebGPU: not tested (block_map Phase 4 needed).
+   Also: T8.9 (identity body), T8.10 (asymmetric halo [0,2]).
 
 **Step 2: Stencil body synthesis for linear stencils** (new `stencil-analysis.ts`)
 
