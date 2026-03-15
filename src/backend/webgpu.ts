@@ -69,6 +69,7 @@ import {
   type ScanBindingInfo,
   wrapRoutineForScan,
 } from "./webgpu/scan-wrapper";
+import { maybeAcquireTracingSlot, recordTrace } from "./webgpu/tracing";
 import { createWgslGen, type ResolveGlobalIndex } from "./webgpu/wgsl-gen";
 
 interface ShaderDispatch extends ShaderInfo {
@@ -316,8 +317,9 @@ function _beginComputePass(
   encoder: GPUCommandEncoder,
   profiling: _ProfilingState | null = null,
   meta?: _ProfilingPassMeta,
+  fallbackTsw?: GPUComputePassTimestampWrites,
 ): GPUComputePassEncoder {
-  const tsw = _profilingTimestampWrites(profiling, meta);
+  const tsw = _profilingTimestampWrites(profiling, meta) ?? fallbackTsw;
   return encoder.beginComputePass(tsw ? { timestampWrites: tsw } : undefined);
 }
 
@@ -775,6 +777,7 @@ export class WebGPUBackend implements Backend {
       this.#batchEncoder ?? undefined,
       this.#batchEncoder ? this.#batchUniformsToDestroy : undefined,
       this.#profiling,
+      exe.source,
     );
   }
 
@@ -4397,6 +4400,7 @@ function pipelineSubmit(
   batchEncoder?: GPUCommandEncoder,
   batchUniformCollector?: GPUBuffer[],
   profiling?: _ProfilingState | null,
+  source?: Kernel | Routine,
 ) {
   const commandEncoder = batchEncoder ?? device.createCommandEncoder();
   const uniformBuffersToDestroy: GPUBuffer[] = [];
@@ -4414,6 +4418,7 @@ function pipelineSubmit(
     const filteredPasses = shader.passes.filter(({ grid }) => prod(grid) > 0);
     if (filteredPasses.length === 0) continue; // No work to do.
 
+    const slot = maybeAcquireTracingSlot(device);
     const bindGroup = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: [
@@ -4498,7 +4503,21 @@ function pipelineSubmit(
 
     for (let i = 0; i < filteredPasses.length; i++) {
       const grid = symbolicGrid ?? filteredPasses[i].grid;
-      const passEncoder = _beginComputePass(commandEncoder, profiling);
+      const tracingTsw =
+        slot && !profiling
+          ? {
+              querySet: slot.batch.querySet,
+              beginningOfPassWriteIndex: i === 0 ? slot.beginIndex : undefined,
+              endOfPassWriteIndex:
+                i === filteredPasses.length - 1 ? slot.endIndex : undefined,
+            }
+          : undefined;
+      const passEncoder = _beginComputePass(
+        commandEncoder,
+        profiling,
+        undefined,
+        tracingTsw,
+      );
       passEncoder.setPipeline(pipeline);
       passEncoder.setBindGroup(0, bindGroup);
       if (uniformBindGroup)
@@ -4506,6 +4525,10 @@ function pipelineSubmit(
       passEncoder.dispatchWorkgroups(grid[0], grid[1]);
       _dispatchCount++;
       passEncoder.end();
+    }
+
+    if (slot && source) {
+      recordTrace(device, slot, source, filteredPasses.length, shader.code);
     }
   }
   if (batchEncoder) {

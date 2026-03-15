@@ -464,6 +464,8 @@ installed automatically if available for your platform.
 
 ### Performance
 
+To see per-kernel traces in browser development tools, call `jax.profiler.startTrace()`.
+
 The WebGPU runtime includes an ML compiler with tile-aware optimizations, tuned for individual
 browsers. Also, this library uniquely has the `jit()` feature that fuses operations together and
 records an execution graph. jax-js achieves **over 7000 GFLOP/s** for matrix multiplication on an

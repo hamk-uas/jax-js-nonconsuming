@@ -20,6 +20,7 @@ import {
 } from "../backend";
 import { isSymbolicSize, type SizeExpr } from "../dim";
 import { Routine, Routines, runCpuRoutine } from "../routine";
+import { emitTrace, isTracing, traceSourceInfo } from "../tracing";
 import { tuneNullopt } from "../tuner";
 import { DEBUG, FpHash, mapSetUnion, rep, runWithCache } from "../utils";
 import { WasmAllocator } from "./wasm/allocator";
@@ -479,6 +480,9 @@ export class WasmBackend implements Backend {
     outputs: Slot[],
     dynamicParams?: number[],
   ): void {
+    const tracing = isTracing();
+    const start = tracing ? performance.now() : 0;
+
     if (exe.source instanceof Routine) {
       const routine = exe.source;
       // Determine element size from dtype (f32=4, f64=8)
@@ -489,67 +493,84 @@ export class WasmBackend implements Backend {
         const elementSize: 4 | 8 = isF32 ? 4 : 8;
         switch (routine.name) {
           case Routines.Cholesky:
-            return this.#dispatchCholesky(
-              routine,
-              inputs,
-              outputs,
-              elementSize,
-            );
+            this.#dispatchCholesky(routine, inputs, outputs, elementSize);
+            break;
           case Routines.TriangularSolve:
-            return this.#dispatchTriangularSolve(
+            this.#dispatchTriangularSolve(
               routine,
               inputs,
               outputs,
               elementSize,
             );
+            break;
           case Routines.LU:
-            return this.#dispatchLU(routine, inputs, outputs, elementSize);
+            this.#dispatchLU(routine, inputs, outputs, elementSize);
+            break;
           case Routines.Sort:
-            return this.#dispatchSort(routine, inputs, outputs, elementSize);
+            this.#dispatchSort(routine, inputs, outputs, elementSize);
+            break;
           case Routines.Argsort:
-            return this.#dispatchArgsort(routine, inputs, outputs, elementSize);
+            this.#dispatchArgsort(routine, inputs, outputs, elementSize);
+            break;
           // QR: fall through to CPU fallback (WASM routine has correctness issues)
+          default:
+            // Fall back to CPU for unimplemented routines
+            runCpuRoutine(
+              routine,
+              inputs.map((slot) => this.#getBuffer(slot)),
+              outputs.map((slot) => this.#getBuffer(slot)),
+            );
+            break;
         }
+      } else {
+        // Fall back to CPU for non-float routines
+        runCpuRoutine(
+          routine,
+          inputs.map((slot) => this.#getBuffer(slot)),
+          outputs.map((slot) => this.#getBuffer(slot)),
+        );
       }
-      // Fall back to CPU for non-float or unimplemented routines
-      return runCpuRoutine(
-        routine,
-        inputs.map((slot) => this.#getBuffer(slot)),
-        outputs.map((slot) => this.#getBuffer(slot)),
-      );
-    }
-
-    // Reuse cached instance if available
-    let instance = this.#instanceCache.get(exe.data.module);
-    if (!instance) {
-      instance = new WebAssembly.Instance(exe.data.module, {
-        env: { memory: this.#memory },
-      });
-      this.#instanceCache.set(exe.data.module, instance);
-    }
-    const ptrs = [...inputs, ...outputs].map(
-      (slot) => this.#buffers.get(slot)!.ptr,
-    );
-    // Kernel signature: (start, end, ...ptrs, [reduceSize]).
-    // For symbolic kernels, dynamicParams[0] is the resolved total size.
-    // dynamicParams[1] is the resolved reduction size (when kernel has symbolic reduction).
-    const totalSize = dynamicParams?.[0] ?? (exe.source.size as number);
-    const extraArgs =
-      dynamicParams && dynamicParams.length > 1 ? dynamicParams.slice(1) : [];
-
-    // Parallel dispatch: use workers when pool is available, module is registered,
-    // and array is large enough for the overhead to pay off.
-    const pool = this.#workerPool ?? null; // use pool if already created (don't force-create here)
-    if (
-      pool &&
-      totalSize >= PARALLEL_THRESHOLD &&
-      pool.isModuleReady(exe.data.module)
-    ) {
-      const moduleId = pool.getModuleId(exe.data.module)!;
-      pool.dispatchSync(moduleId, instance, totalSize, [...ptrs, ...extraArgs]);
     } else {
-      const func = instance.exports.kernel as (...args: number[]) => void;
-      func(0, totalSize, ...ptrs, ...extraArgs);
+      // Reuse cached instance if available
+      let instance = this.#instanceCache.get(exe.data.module);
+      if (!instance) {
+        instance = new WebAssembly.Instance(exe.data.module, {
+          env: { memory: this.#memory },
+        });
+        this.#instanceCache.set(exe.data.module, instance);
+      }
+      const ptrs = [...inputs, ...outputs].map(
+        (slot) => this.#buffers.get(slot)!.ptr,
+      );
+      // Kernel signature: (start, end, ...ptrs, [reduceSize]).
+      // For symbolic kernels, dynamicParams[0] is the resolved total size.
+      // dynamicParams[1] is the resolved reduction size (when kernel has symbolic reduction).
+      const totalSize = dynamicParams?.[0] ?? (exe.source.size as number);
+      const extraArgs =
+        dynamicParams && dynamicParams.length > 1 ? dynamicParams.slice(1) : [];
+
+      // Parallel dispatch: use workers when pool is available, module is registered,
+      // and array is large enough for the overhead to pay off.
+      const pool = this.#workerPool ?? null; // use pool if already created (don't force-create here)
+      if (
+        pool &&
+        totalSize >= PARALLEL_THRESHOLD &&
+        pool.isModuleReady(exe.data.module)
+      ) {
+        const moduleId = pool.getModuleId(exe.data.module)!;
+        pool.dispatchSync(moduleId, instance, totalSize, [
+          ...ptrs,
+          ...extraArgs,
+        ]);
+      } else {
+        const func = instance.exports.kernel as (...args: number[]) => void;
+        func(0, totalSize, ...ptrs, ...extraArgs);
+      }
+    }
+
+    if (tracing) {
+      const info = traceSourceInfo(exe.source);
+      emitTrace("wasm", info, start, performance.now());
     }
   }
 

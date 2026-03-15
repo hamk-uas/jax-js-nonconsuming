@@ -709,6 +709,9 @@ Available `tree` utilities:
 - `tree.makeDisposable(obj)` — make any object `Disposable` (for `using`) by recursively disposing
   all array leaves when `[Symbol.dispose]()` is called
 
+The `jax.profiler` module has `startTrace()` and `stopTrace()`. When traces are started, `jax-js`
+emits per-kernel timings that appear in browser development tools.
+
 These modules are unimplemented:
 
 - `jax.scipy` (partial: `scipy.special` — erf, erfc, logit, logsumexp, softmax, logSoftmax;
@@ -722,7 +725,6 @@ These modules are unimplemented:
 - `jax.flatten_util`
 - `jax.image`
 - `jax.ops`
-- `jax.profiler`
 - `jax.ref`
 - `jax.stages`
 - `jax.test_util`
