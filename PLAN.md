@@ -701,6 +701,7 @@ bodies. NOT `transposeJaxpr` reuse — this constructs a new jaxpr via `makeJaxp
    walk equations for `{Shrink, Mul(Lit scalar), Add}`. If the body contains only these ops
    targeting a single halo-ed input (linear stencil), it is eligible. Note: forward bodies use
    `Shrink` (from `lax.sliceInDim`), not `UncheckedDynamicSlice`.
+   - ✅ `Add(stencilTerms, Lit)` allowed — additive bias drops out in adjoint.
 2. ✅ For each `Shrink(input, slice)` with weight `w`, emit reversed
    `Shrink(ct_tile, reversed_slice) * w` in the synthesized backward body. Reversal formula:
    `reversed_start = (lo + hi) - forward_start` per grid-mapped axis.
@@ -711,6 +712,7 @@ bodies. NOT `transposeJaxpr` reuse — this constructs a new jaxpr via `makeJaxp
 6. ✅ Pre-existing T8.10: asymmetric halo [0,2] grad — uses pad+add (analysis NYI for 0-width halo
    sides). Gather path for asymmetric halos verified via scratch test.
 7. ✅ T8.14: non-linear body (multiply(x,x)) falls back to pad+add.
+8. ✅ T8.15: gather path selection verified via `setDebug(1)` + console log capture.
 
 **Step 3: Detect and route** ✅ (`linearize.ts`)
 
@@ -720,6 +722,8 @@ Wire Steps 1 and 2 together in the BlockMap transpose rule:
 2. ✅ If `halo` present and `params.originalJaxpr` available → try stencil analysis (Step 2). If
    eligible → synthesized gather body (single block_map dispatch).
 3. ✅ If analysis fails → pad+add fallback (Step 1) + diagnostic (`setDebug(1)` logs path).
+4. ✅ Multi-input guard: if any non-haloed tangent input is differentiated, fall through to pad+add
+   (gather path only produces gradient for the single haloed input).
 
 JVP rule threads `originalJaxpr` and `originalNumConsts` through BlockMap params so the transpose
 rule can analyze the clean forward body (not the JVP-doubled body).
@@ -748,7 +752,7 @@ rule can analyze the clean forward body (not the JVP-doubled body).
   (internal-only, bench imports directly from source); no new exports for halo (part of existing
   `BlockMapOptions`)
 - `test/block-map.test.ts` — halo-specific test cases T8.1–T8.8 _(C.1–C.2)_; T8.9–T8.13 _(C.4
-  Step 1)_; T8.14 non-linear fallback _(C.4 Step 2)_
+  Step 1)_; T8.14 non-linear fallback _(C.4 Step 2)_; T8.15 gather path selection _(C.4 Step 3)_
 
 ### Correctness and regression coverage
 

@@ -90,8 +90,16 @@ export function analyzeLinearStencil(
         } else if (termsA === null && termsB === null) {
           varTerms.set(out, null);
         } else {
-          // Mixed stencil + non-stencil in Add → ineligible.
-          return null;
+          // Mixed stencil + non-stencil: allow if the non-stencil side is a
+          // Lit (additive bias). Bias drops out in the adjoint, so the
+          // stencil terms are the only linear contribution.
+          if (termsA !== null && eqn.inputs[1] instanceof Lit) {
+            varTerms.set(out, termsA);
+          } else if (termsB !== null && eqn.inputs[0] instanceof Lit) {
+            varTerms.set(out, termsB);
+          } else {
+            return null;
+          }
         }
         break;
       }

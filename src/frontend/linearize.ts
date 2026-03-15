@@ -2004,8 +2004,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       const origHalo = halo.slice(0, origNI);
       const origInAxes = inAxes.slice(0, origNI);
 
-      // Eligible: single halo-ed input in the original body, no consts.
-      if (origNC !== 0) return null;
+      // Eligible: single halo-ed input in the original body, single output.
       if (origJaxpr.outs.length !== 1) return null;
 
       let origHaloIdx = -1;
@@ -2017,6 +2016,14 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         }
       }
       if (origHaloCount !== 1) return null;
+
+      // Guard: gather path only produces gradient for the haloed input.
+      // If other tangent inputs are also differentiated, fall through to
+      // pad+add which handles all inputs.
+      for (let i = 0; i < origNI; i++) {
+        if (i === origHaloIdx) continue;
+        if (undefMask[numConsts + origNI + i]) return null;
+      }
 
       // Analyze original forward body for linear stencil.
       const bodyInputIdx = origNC + origHaloIdx;

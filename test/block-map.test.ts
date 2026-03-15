@@ -1102,4 +1102,52 @@ describe("lax.blockMap — halo", () => {
     }
     gf.dispose();
   });
+
+  // T8.15: verify gather path is selected for linear stencil (via debug log).
+  // Exercises the stencil synthesis route, not the pad+add fallback.
+  test("T8.15: gather path selection for linear stencil", () => {
+    const logs: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+
+    try {
+      setDebug(1);
+      const f = (xs: np.Array) => {
+        using mapped = lax.blockMap(
+          (block: np.Array) => {
+            using a = lax.sliceInDim(block, 0, 4, 0);
+            using b = lax.sliceInDim(block, 1, 5, 0);
+            using sum = np.add(a, b);
+            return sum.ref; // jax-js-lint: allow-ref
+          },
+          xs,
+          { blockShape: [4], halo: [[1, 1]] },
+        );
+        return np.sum(mapped);
+      };
+
+      const gf = jit(grad(f));
+      using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+      using g = gf(xs) as np.Array;
+
+      // Verify gather path was selected (not pad+add).
+      const gatherLog = logs.find((l) =>
+        l.includes("gather-based stencil synthesis"),
+      );
+      expect(
+        gatherLog,
+        "T8.15 should use gather-based stencil synthesis",
+      ).toBeDefined();
+
+      // Gradient correctness: 2-point stencil [2, 2, 2, 2, 2, 2, 2, 1].
+      expect(g).toBeAllclose([2, 2, 2, 2, 2, 2, 2, 1]);
+
+      gf.dispose();
+    } finally {
+      setDebug(0);
+      console.log = origLog;
+    }
+  });
 });
