@@ -202,7 +202,7 @@ Most operations behave the same way as they do in JAX.
 | `cosh`                | 🟢      |                                                          |
 | `count_nonzero`       | 🟠      |                                                          |
 | `cov`                 | 🟢      |                                                          |
-| `cross`               | 🟠      |                                                          |
+| `cross`               | �       |                                                          |
 | `cumprod`             | 🟠      |                                                          |
 | `cumsum`              | 🟡      | Quadratic-time                                           |
 | `cumulative_prod`     | 🟠      |                                                          |
@@ -516,7 +516,7 @@ Cholesky, LU (with partial pivoting), triangular solve, and QR decomposition. St
 | ------------------ | ------- | ---------------------------------------------------------------------------- |
 | `cholesky`         | 🟢      |                                                                              |
 | `cond`             | 🔴      |                                                                              |
-| `cross`            | 🟠      |                                                                              |
+| `cross`            | �       |                                                                              |
 | `det`              | 🟢      |                                                                              |
 | `diagonal`         | 🟢      |                                                                              |
 | `eig`              | 🔴      |                                                                              |

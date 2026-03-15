@@ -3,7 +3,7 @@ import { triangularSolve } from "./lax-linalg";
 import * as np from "./numpy";
 import { Array, ArrayLike, fudgeArray } from "../frontend/array";
 import * as core from "../frontend/core";
-import { generalBroadcast } from "../utils";
+import { checkAxis, generalBroadcast } from "../utils";
 
 /**
  * Apply a pre-computed LU factorization to solve A x = b.
@@ -60,6 +60,26 @@ export function cholesky(
     return lax.linalg.cholesky(sym, { upper });
   }
   return lax.linalg.cholesky(a, { upper });
+}
+
+/**
+ * Compute the cross-product of two 3D vectors.
+ *
+ * This is a simpler and less flexible version of `jax.numpy.cross()`.
+ * Both inputs must have size 3 along the specified axis.
+ */
+export function cross(x1: ArrayLike, x2: ArrayLike, axis: number = -1): Array {
+  const a1 = checkAxis(axis, np.ndim(x1));
+  const a2 = checkAxis(axis, np.ndim(x2));
+  if (np.shape(x1)[a1] !== 3)
+    throw new Error(
+      `linalg.cross: x1 must have size 3 along axis ${axis}, got ${np.shape(x1)[a1]}`,
+    );
+  if (np.shape(x2)[a2] !== 3)
+    throw new Error(
+      `linalg.cross: x2 must have size 3 along axis ${axis}, got ${np.shape(x2)[a2]}`,
+    );
+  return np.cross(x1, x2, { axis });
 }
 
 /** Compute the determinant of a square matrix (batched). */
