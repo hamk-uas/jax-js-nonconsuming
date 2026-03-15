@@ -988,7 +988,8 @@ describe("lax.blockMap — halo", () => {
         (block: np.Array) => {
           // block shape: [4, 4] (B=[2,2] + halo [[1,1],[1,1]])
           // Sum all 9 shifts of the block, then extract center [2,2].
-          using s00 = lax.sliceInDim(lax.sliceInDim(block, 0, 2, 0), 0, 2, 1);
+          using rowSlice0 = lax.sliceInDim(block, 0, 2, 0);
+          using s00 = lax.sliceInDim(rowSlice0, 0, 2, 1);
           let acc = s00.ref; // jax-js-lint: allow-ref
           for (let dr = 0; dr < 3; dr++) {
             for (let dc = 0; dc < 3; dc++) {
@@ -1026,6 +1027,38 @@ describe("lax.blockMap — halo", () => {
       [6, 9, 9, 6],
       [6, 9, 9, 6],
       [4, 6, 6, 4],
+    ]);
+  });
+
+  // T8.13: vmap(grad(blockMap)) with halo — batched gradients.
+  // Each batch element uses the same 1D 3-point stencil as T8.8.
+  test("T8.13: vmap(grad(blockMap)) halo [1,1] — batched grad", () => {
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(
+        (block: np.Array) => {
+          using a = lax.sliceInDim(block, 0, 4, 0);
+          using b = lax.sliceInDim(block, 1, 5, 0);
+          using c = lax.sliceInDim(block, 2, 6, 0);
+          using ab = np.add(a, b);
+          using abc = np.add(ab, c);
+          return abc.ref; // jax-js-lint: allow-ref
+        },
+        xs,
+        { blockShape: [4], inAxes: [0], outAxes: [0], halo: [[1, 1]] },
+      );
+      return np.sum(mapped);
+    };
+
+    using flat = np.arange(24).astype(DType.Float32);
+    using batch = flat.reshape([3, 8]);
+    using grads = vmap(grad(f))(batch) as np.Array;
+    // Each row's gradient follows the 1D stencil pattern:
+    // boundary elements participate in fewer windows.
+    // For size=8: [2, 3, 3, 3, 3, 3, 3, 2]
+    expect(grads).toBeAllclose([
+      [2, 3, 3, 3, 3, 3, 3, 2],
+      [2, 3, 3, 3, 3, 3, 3, 2],
+      [2, 3, 3, 3, 3, 3, 3, 2],
     ]);
   });
 });

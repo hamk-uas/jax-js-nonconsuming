@@ -1989,7 +1989,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     // elements. Standard block_map concat/trim would lose overlap
     // contributions. Strategy: unroll the block loop at trace time, pad each
     // gradient patch to the padded-accumulator size, and add.
-    if (DEBUG >= 1) console.log("halo-VJP: using scatter-add accumulation");
+    if (DEBUG >= 1) console.log("halo-VJP: using pad+add accumulation");
 
     const halo = params.halo!;
 
@@ -2043,7 +2043,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     ];
 
     // Compute per-output accumulator shapes and body output shapes.
-    const { outTypes } = typecheckJaxpr(transposedBody.jaxpr);
+    const outTypes = transposedBody.jaxpr.outs.map((a) => a.aval);
     const numOutputs = outTypes.length;
     const accumShapes: number[][] = [];
     const bodyOutShapes: number[][] = [];
@@ -2118,7 +2118,6 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       const newAccumulators: Tracer[] = [];
       for (let o = 0; o < numOutputs; o++) {
         const axes = allOutAxes[o];
-        const oHalo = allOutHalo[o];
         const bodyShape = bodyOutShapes[o];
         const accumShape = accumShapes[o];
 
@@ -2133,7 +2132,6 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
           if (axes[g] === null) continue;
           const ax = axes[g]!;
           const bDim = bodyShape[ax]; // B+lo+hi for halo, B for non-halo
-          const [_lo, _hi] = oHalo[g];
           // In padded space, block j writes at offset j*B:
           // padded_accum[0] = original[-lo], padded_accum[lo] = original[0].
           // Block j covers original [j*B-lo, j*B+B+hi), which in padded
