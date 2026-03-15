@@ -1153,6 +1153,47 @@ export function allclose(
   }
 }
 
+/**
+ * Check if two arrays are element-wise equal.
+ *
+ * Returns False if the arrays have different shapes. If `equalNaN` is True,
+ * NaNs in the same position are considered equal.
+ */
+export function arrayEqual(
+  a1: ArrayLike,
+  a2: ArrayLike,
+  opts?: { equalNaN?: boolean },
+): Array {
+  a1 = fudgeArray(a1);
+  a2 = fudgeArray(a2);
+  if (!deepEqual(a1.shape, a2.shape)) {
+    return array(false);
+  }
+  if (opts?.equalNaN) {
+    // Where both are NaN, treat as equal; otherwise use element-wise equal
+    const nanMask = isnan(a1).mul(isnan(a2));
+    return (where(nanMask, true, a1.equal(a2)) as Array).all();
+  }
+  return a1.equal(a2).all();
+}
+
+/**
+ * Check if two arrays are element-wise equal after broadcasting.
+ *
+ * Unlike `arrayEqual`, this allows inputs with different but
+ * broadcast-compatible shapes.
+ */
+export function arrayEquiv(a1: ArrayLike, a2: ArrayLike): Array {
+  a1 = fudgeArray(a1);
+  a2 = fudgeArray(a2);
+  try {
+    const [b1, b2] = broadcastArrays(a1, a2);
+    return b1.equal(b2).all();
+  } catch {
+    return array(false);
+  }
+}
+
 /** Matrix product of two arrays with NumPy-style broadcasting of batch dims. */
 export function matmul(x: ArrayLike, y: ArrayLike): Array {
   if (ndim(x) === 0 || ndim(y) === 0) {

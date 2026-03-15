@@ -150,8 +150,8 @@ Most operations behave the same way as they do in JAX.
 | `argwhere`            | 🟠      | sorting                                                  |
 | `around`              | ⚪️      | alias of `round`                                         |
 | `array`               | 🟢      |                                                          |
-| `array_equal`         | 🔴      |                                                          |
-| `array_equiv`         | 🔴      |                                                          |
+| `array_equal`         | �       |                                                          |
+| `array_equiv`         | �       |                                                          |
 | `array_repr`          | 🔴      |                                                          |
 | `array_split`         | 🟠      | `split` is supported                                     |
 | `array_str`           | 🔴      |                                                          |
