@@ -195,6 +195,8 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     gridShape?: number[];
     /** Register tiling: each thread handles threadTile[g] outputs per axis. */
     threadTile?: number[];
+    /** Per-input per-grid-axis overlap: halo[i][g] = [lo, hi]. Expands input tiles beyond output block range. */
+    halo?: [number, number][][];
     /** Set by JVP rule when this block_map was produced by differentiating an outer block_map. */
     isJvpTransformed?: boolean;
   };

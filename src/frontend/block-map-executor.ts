@@ -55,6 +55,13 @@ export interface ExecuteBlockMapParams {
    * The shader codegen computes concrete element offsets from shapes.
    */
   needsLeafPacking?: boolean;
+  /**
+   * Per-input per-grid-axis overlap [lo, hi].
+   * When present, the body receives expanded tiles (blockShape[g] + lo + hi)
+   * and global reads that fall outside the input bounds return zero.
+   * inputShapes must be the ORIGINAL (unpadded) shapes.
+   */
+  halo?: [number, number][][];
 }
 
 export interface ExecuteBlockMapResult {
@@ -139,6 +146,11 @@ function blockMapSpecKey(params: ExecuteBlockMapParams): string {
     params.pointInputs?.map((p) => (p ? "P" : "-")).join("") ?? "-",
     params.gridOffset ?? 0,
     params.needsLeafPacking ? "LP" : "-",
+    params.halo
+      ? params.halo
+          .map((h) => h.map(([l, r]) => `${l}_${r}`).join(","))
+          .join(";")
+      : "-",
   ];
   return parts.join("|");
 }
@@ -177,6 +189,7 @@ function tryExecuteBlockMapFused(
         pointInputs: params.pointInputs,
         gridOffset: params.gridOffset,
         needsLeafPacking: params.needsLeafPacking,
+        halo: params.halo,
       }) ?? null;
     inner.set(specKey, exe);
   }
@@ -530,6 +543,7 @@ function buildBlockMapWasmParams(
     outputSources,
     inputStrides: inputStridesArr,
     outputStrides: outputStridesArr,
+    halo: params.halo,
   };
 }
 
@@ -576,6 +590,10 @@ function executeBlockMapFallback(
   const useBatching = backend.beginBatch != null && numBlocks > 1;
   if (useBatching) backend.beginBatch!();
 
+  // Shared zero buffer for halo/boundary blocks that need zero-padded tiles.
+  // Hoisted outside the loop to avoid per-block Uint8Array GC pressure.
+  let sharedZeros: Uint8Array | undefined;
+
   try {
     for (let flatIdx = 0; flatIdx < numBlocks; flatIdx++) {
       // Convert flat index to grid coordinates (row-major)
@@ -591,7 +609,7 @@ function executeBlockMapFallback(
 
       // Determine if this is a boundary block (last block on any axis where
       // the input dimension is not evenly divisible by blockShape).
-      const isBoundary = blockIdx.some((bi, g) => bi === gridShape[g] - 1);
+      const _isBoundary = blockIdx.some((bi, g) => bi === gridShape[g] - 1);
 
       // Create block input slots by slicing from full inputs
       const blockInputSlots: Slot[] = [];
@@ -604,30 +622,45 @@ function executeBlockMapFallback(
         const elemBytes = byteWidth(blockAval.dtype);
         const blockBytes = blockAval.size * elemBytes;
 
-        // Compute the slice region in the original input
+        // Compute the slice region in the original input, accounting for halo.
+        // rawStart may be negative (halo before start of input), rawEnd may
+        // exceed inputDim (halo past end). We clamp and zero-pad.
         const sliceStarts: number[] = new Array(nd).fill(0);
         const sliceSizes: number[] = [...blockAval.shape] as number[];
+        const dstStarts: number[] = new Array(nd).fill(0);
         let needsPad = false;
 
         for (let g = 0; g < gridRank; g++) {
           if (axes[g] !== null) {
             const ax = axes[g]!;
-            sliceStarts[ax] = (blockIdx[g] + gridOffset) * blockShape[g];
-            // Clamp to available input data
-            const available = inputShapes[i][ax] - sliceStarts[ax];
-            if (available < blockShape[g]) {
-              sliceSizes[ax] = Math.max(0, available);
+            const [lo] = params.halo?.[i]?.[g] ?? [0, 0];
+            const bodyDim = blockAval.shape[ax] as number;
+            const rawStart = (blockIdx[g] + gridOffset) * blockShape[g] - lo;
+            const rawEnd = rawStart + bodyDim;
+            const srcStart = Math.max(0, rawStart);
+            const srcEnd = Math.min(rawEnd, inputShapes[i][ax]);
+            sliceStarts[ax] = srcStart;
+            sliceSizes[ax] = Math.max(0, srcEnd - srcStart);
+            dstStarts[ax] = srcStart - rawStart; // offset in dst for valid data
+            if (dstStarts[ax] > 0 || sliceSizes[ax] < bodyDim) {
               needsPad = true;
             }
           }
         }
 
-        if (needsPad && isBoundary) {
-          // For boundary blocks, allocate zero-filled and copy valid portion
-          const zeros = new Uint8Array(blockBytes);
-          const blockSlot = backend.malloc(blockBytes, zeros);
+        if (needsPad) {
+          // Allocate zero-filled and copy valid portion at correct offset.
+          // Reuse a single shared zero buffer across blocks to avoid GC churn.
+          if (!sharedZeros || sharedZeros.byteLength < blockBytes) {
+            sharedZeros = new Uint8Array(blockBytes);
+          }
+          const blockSlot = backend.malloc(
+            blockBytes,
+            sharedZeros.byteLength === blockBytes
+              ? sharedZeros
+              : sharedZeros.subarray(0, blockBytes),
+          );
 
-          // Copy valid portion of input into the block
           const validBytes = sliceSizes.reduce((a, b) => a * b, 1) * elemBytes;
           if (validBytes > 0) {
             copyBlock(
@@ -638,7 +671,7 @@ function executeBlockMapFallback(
               sliceSizes,
               blockSlot,
               blockAval.shape as number[],
-              new Array(nd).fill(0) as number[],
+              dstStarts,
               elemBytes,
             );
           }

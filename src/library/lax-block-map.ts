@@ -69,6 +69,35 @@ export interface BlockMapOptions {
    * `blockShape` dimension.
    */
   threadTile?: number[];
+
+  /**
+   * Per-input overlap along each mapped grid axis. Each input tile extends
+   * beyond the output block range by `[lo, hi]` elements along the mapped
+   * dimension. The body receives input shapes of `blockShape[g] + lo + hi`
+   * (instead of `blockShape[g]`) along each halo-expanded axis.
+   *
+   * Format: `halo[i][g] = [lo, hi]` — extra elements before/after the
+   * output block's range for input `i` along grid axis `g`.
+   * `null` or `[0, 0]` means no halo.
+   *
+   * A single `([number, number] | null)[]` is broadcast to all inputs.
+   * An array of `([number, number] | null)[][]` provides per-input specs.
+   *
+   * Elements outside the array boundary are zero-padded.
+   *
+   * @example 3×3 convolution halos
+   * ```ts
+   * lax.blockMap(stencilBody, { image, kernel }, {
+   *   blockShape: [16, 16],
+   *   inAxes: { image: [2, 3], kernel: [null, null] },
+   *   outAxes: [2, 3],
+   *   halo: { image: [[1, 1], [1, 1]], kernel: [null, null] },
+   * });
+   * // image body shape: [16+1+1, 16+1+1] = [18, 18] per tile
+   * // kernel body shape: unchanged (broadcast, no halo)
+   * ```
+   */
+  halo?: ([number, number] | null)[] | ([number, number] | null)[][];
 }
 
 /**
@@ -111,13 +140,21 @@ export function blockMap<I extends JsTree<Array>, O extends JsTree<Array>>(
     "inAxes",
   );
 
+  // Resolve halo: flatHalo[inputIdx][gridAxis] = [lo, hi], default [0,0]
+  const flatHalo = resolveHalo(options.halo, numInputs, gridRank);
+  // Only store halo in params if any entry is non-zero
+  const hasHalo = flatHalo.some((h) =>
+    h.some(([lo, hi]) => lo !== 0 || hi !== 0),
+  );
+
   // Compute block-shaped abstract values for tracing
   const blockAvals: ShapedArray[] = flatElems.map((elem, i) => {
     const aval = getAval(elem);
     const shape = [...(aval.shape as number[])];
     for (let g = 0; g < gridRank; g++) {
       if (flatInAxes[i][g] !== null) {
-        shape[flatInAxes[i][g]!] = blockShape[g];
+        const [lo, hi] = flatHalo[i][g];
+        shape[flatInAxes[i][g]!] = blockShape[g] + lo + hi;
       }
     }
     return new ShapedArray(shape, aval.dtype, aval.weakType);
@@ -157,6 +194,7 @@ export function blockMap<I extends JsTree<Array>, O extends JsTree<Array>>(
     numInputs,
     gridShape: options.gridShape,
     threadTile: options.threadTile,
+    halo: hasHalo ? flatHalo : undefined,
   }) as Array[];
 
   // Dispose the captured consts from tracing
@@ -189,4 +227,57 @@ function resolveAxes(
     );
   }
   return multi;
+}
+
+/**
+ * Resolve a user-provided halo spec into `flatHalo[inputIdx][gridAxis] = [lo, hi]`.
+ * Defaults to `[0, 0]` for all entries.
+ */
+function resolveHalo(
+  halo: ([number, number] | null)[] | ([number, number] | null)[][] | undefined,
+  numInputs: number,
+  gridRank: number,
+): [number, number][][] {
+  const zero: [number, number] = [0, 0];
+  if (halo === undefined) {
+    return JsArray.from({ length: numInputs }, () =>
+      JsArray.from({ length: gridRank }, () => [...zero] as [number, number]),
+    );
+  }
+  // Single halo spec (1D array of [lo,hi]|null) → broadcast to all inputs
+  if (halo.length > 0 && !JsArray.isArray(halo[0]?.[0])) {
+    const single = halo as ([number, number] | null)[];
+    if (single.length !== gridRank) {
+      throw new Error(
+        `blockMap: halo has ${single.length} entries but gridRank is ${gridRank}`,
+      );
+    }
+    const resolved = single.map((h) =>
+      h === null
+        ? ([...zero] as [number, number])
+        : ([...h] as [number, number]),
+    );
+    return JsArray.from({ length: numInputs }, () =>
+      resolved.map((h) => [...h] as [number, number]),
+    );
+  }
+  // Array of per-input specs
+  const multi = halo as ([number, number] | null)[][];
+  if (multi.length !== numInputs) {
+    throw new Error(
+      `blockMap: halo has ${multi.length} entries but expected ${numInputs}`,
+    );
+  }
+  return multi.map((perInput) => {
+    if (perInput.length !== gridRank) {
+      throw new Error(
+        `blockMap: halo entry has ${perInput.length} axes but gridRank is ${gridRank}`,
+      );
+    }
+    return perInput.map((h) =>
+      h === null
+        ? ([...zero] as [number, number])
+        : ([...h] as [number, number]),
+    );
+  });
 }

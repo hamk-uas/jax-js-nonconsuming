@@ -364,8 +364,8 @@ fallback. All use `_lastConvClass()` path-selection assertions.
 
 ### Phase C: Tiled conv2d via `block_map`
 
-**Status:** Im2col materialization approach **rejected** (41% regression on NVIDIA). Fused approach
-planned.
+**Status:** Im2col materialization approach **rejected** (41% regression on NVIDIA). Halo-aware
+`block_map` extension **designed** — implementation pending.
 
 #### Im2col materialization: attempted and rejected
 
@@ -387,24 +387,351 @@ back in tiledMatmul. This extra bandwidth overwhelms the compute savings from sh
 The generic Dot path reads input directly with computed indices — higher arithmetic intensity per
 byte fetched.
 
-#### Revised approach: implicit im2col inside block_map body
+#### Halo-aware `block_map` design
 
-The correct approach avoids materialization entirely. Each workgroup computes im2col indices
-on-the-fly and loads input data directly into shared memory with halo regions.
+**Status:** Design complete. Implementation pending.
 
-**Key challenge:** `block_map` tiles non-overlapping blocks along axes. Convolution has overlapping
-receptive fields (halo regions). Two options:
+##### Problem
 
-1. **Halo-aware block_map** — extend `block_map` to support overlap/halo in `inAxes` specification.
-   Each input tile is larger than the output tile by `(kH-1, kW-1)` pixels.
-2. **Custom WGSL conv shader** via Routine — hand-written tiled conv with explicit halo loading.
-   Contradicts "generative compiler > static kernels" philosophy but guarantees optimal memory
-   access patterns.
+`block_map` tiles inputs into **non-overlapping** blocks of `blockShape` elements per axis. Each
+input tile is the same size as the output tile along mapped axes. Convolution has **overlapping
+receptive fields**: a 3×3 conv needs 2 extra rows/cols of input beyond each output tile. Without
+overlap, materialization (im2col) is the only option — and that was rejected above.
 
-Option 1 is preferred — it extends the general `block_map` infrastructure rather than adding a
-one-off Routine. The halo concept would also benefit other stencil computations.
+##### Solution: `halo` option with pre-pad strategy
 
-**Deferred** until halo support is designed for `block_map`.
+Extend `BlockMapOptions` with a `halo` field specifying per-input, per-grid-axis overlap:
+
+````ts
+interface BlockMapOptions {
+  blockShape: number[];
+  inAxes?: (number | null)[] | (number | null)[][];
+  outAxes?: (number | null)[] | (number | null)[][];
+  gridShape?: number[];
+  threadTile?: number[];
+  /**
+   * Per-input overlap along each mapped grid axis. Each input tile extends
+   * beyond the output block range by `[lo, hi]` elements along the mapped
+   * dimension. The body receives input shapes of `blockShape[g] + lo + hi`
+   * (instead of `blockShape[g]`) along each halo-expanded axis.
+   *
+   * Format: `halo[i][g] = [lo, hi]` — extra elements before/after the
+   * output block's range for input `i` along grid axis `g`.
+   * `null` or `[0, 0]` means no halo.
+   *
+   * A single `([number, number] | null)[]` is broadcast to all inputs.
+   * An array of `([number, number] | null)[][]` provides per-input specs.
+   *
+   * Elements outside the array boundary are zero-padded.
+   *
+   * @example 3×3 convolution halos
+   * ```ts
+   * lax.blockMap(stencilBody, { image, kernel }, {
+   *   blockShape: [16, 16],
+   *   inAxes: { image: [2, 3], kernel: [null, null] },
+   *   outAxes: [2, 3],
+   *   halo: { image: [[1, 1], [1, 1]], kernel: [null, null] },
+   * });
+   * // image body shape: [16+1+1, 16+1+1] = [18, 18] per tile
+   * // kernel body shape: unchanged (broadcast, no halo)
+   * ```
+   */
+  halo?: ([number, number] | null)[] | ([number, number] | null)[][];
+}
+````
+
+After resolution: `flatHalo[inputIdx][gridAxis] = [lo, hi]`, defaulting to `[0, 0]`.
+
+##### Core invariant: pre-pad makes halo transparent to backends
+
+**Grid shape is computed from original (un-padded) input dimensions.** The grid covers the output
+space; `blockShape` determines output tile size. Halo only expands input tiles.
+
+The key insight is that **pre-padding** the input by `[lo, hi]` along each halo axis lets the
+existing base-offset formula work unchanged:
+
+```
+Per block b, in the ORIGINAL tensor:
+  output range:    [b·bs, (b+1)·bs)
+  halo input range: [b·bs - lo, (b+1)·bs + hi)
+
+Per block b, in the PADDED tensor (shifted by lo):
+  halo input range: [b·bs, b·bs + (bs + lo + hi))
+  base offset = b · bs · stride   ← SAME formula as without halo!
+```
+
+The padded input dimension is `ceil(originalDim / bs) · bs + lo + hi`, which ensures all halo reads
+are in-bounds. No per-element OOB checks needed in shaders. No signed-arithmetic issues.
+
+##### Changes by layer
+
+| Layer                   | File(s)                 | What changes                                                                                                                |
+| ----------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **API**                 | `lax-block-map.ts`      | Add `halo` option, resolve to `flatHalo`, expand block avals: `shape[axis] = blockShape[g] + lo + hi`                       |
+| **Params type**         | `core.ts`               | Add `halo?: [number, number][][]` to `Primitive.BlockMap` params                                                            |
+| **Eager execution**     | `array.ts`              | Expand slice range by `[lo, hi]` around output block, zero-pad edges. Grid from original dims                               |
+| **JIT compilation**     | `jit.ts`                | Store `halo` in block_map step                                                                                              |
+| **JIT execution**       | `jit.ts` (step loop)    | Pre-pad inputs with `lo`/`hi` zeros, pass padded `inputShapes`. Free padded buffers after dispatch                          |
+| **JVP**                 | `jvp.ts`                | Forward `halo` in doubled BlockMap params (tangents have same spatial structure)                                            |
+| **Transpose**           | `linearize.ts`          | Forward `halo` in transposed params. Overlapping grad accumulation **deferred** (see below)                                 |
+| **Vmap**                | `vmap.ts`               | Forward `halo` unchanged (vmap adds batch dim; halo on spatial dims unaffected)                                             |
+| **Partial eval**        | `linearize.ts`          | Forward `halo` unchanged                                                                                                    |
+| **WebGPU fused shader** | `webgpu/block-map.ts`   | **No changes.** Pre-padded inputs + halo-expanded body avals flow through existing `inRemap`, `in_base`, stride math        |
+| **WASM compiled loop**  | `wasm.ts`               | **No changes.** `blockInputSizes` from body avals already reflect halo; `memory.copy` from padded buffer works              |
+| **Executor**            | `block-map-executor.ts` | **No changes.** Receives pre-padded inputs with correct `inputShapes`                                                       |
+| **Spec key**            | `block-map-executor.ts` | Include `halo` in `blockMapSpecKey` (affects body program + shapes → implicitly covered since `inputShapes` already in key) |
+
+**Why backends need no changes:** The body JitProgram is compiled from a jaxpr traced with
+halo-expanded input avals. All kernel sizes, stride computations, and shared-memory allocations in
+the body already reflect the expanded tile shape. The backends just see "larger input tiles" — the
+`inRemap` decomposition, boundary guards, and cooperative loading all adapt automatically because
+they're driven by `inputShapes` (padded) and body kernel dimensions (expanded).
+
+##### Pre-pad mechanics (JIT execution)
+
+```
+For each input i with halo[i][g] = [lo, hi] on grid axis g → dim d = axes[g]:
+  paddedDim = ceil(originalDim / bs) * bs + lo + hi
+  Allocate padded buffer: same shape but dim d → paddedDim
+  Copy original data into padded buffer at offset lo along dim d
+  (remaining positions are zero — default GPUBuffer / WASM alloc behavior)
+```
+
+For the WebGPU path, this is a `copyBufferToBuffer` with appropriate offsets. For WASM, a
+`memory.copy` into the scratch region. If no halo is active (`lo = hi = 0` for all inputs), no
+padding occurs — zero overhead for existing code.
+
+##### Body kernel size analysis
+
+The body function receives halo-expanded inputs and produces `blockShape`-sized outputs. Inside the
+body, stencil patterns trace like this:
+
+```ts
+// 3×3 stencil: 9 shifted views + weighted sum
+// inputTile: [18, 18],  output: [16, 16]
+for (ki of [-1, 0, 1])
+  for (kj of [-1, 0, 1]) {
+    const shifted = uncheckedDynamicSlice(inputTile, [1 + ki, 1 + kj], [16, 16]);
+    // shifted: [16, 16] → kernel.size = 256 = prod(blockShape) ✓
+    acc = acc.add(shifted.mul(weight[ki][kj]));
+  }
+```
+
+All intermediate kernels are `prod(blockShape)`-sized (output tile). The only "large" entity is the
+halo input's shared-memory allocation (`(blockShape[g] + lo + hi)` elements per mapped axis), but
+that's a `malloc` step, not a kernel. The fused shader's `kernel.size % blockSize === 0` check
+passes for all body steps.
+
+##### Autodiff considerations
+
+- **JVP (forward-mode):** Tangent inputs have the same shape as primals. JVP of halo block_map is
+  another halo block_map with doubled inputs/outputs. Works automatically with forwarded `halo`.
+
+- **VJP/Grad (reverse-mode):** Requires careful design. Two strategies exist with different
+  trade-offs.
+
+  **The overlap problem:** In the forward pass, each block reads a halo-expanded input tile
+  (overlapping with neighbors) and writes a disjoint output tile. A naive transpose reverses this:
+  each backward block reads a disjoint cotangent tile and writes to an overlapping input-gradient
+  region. Adjacent backward blocks write to the same addresses — requiring scatter-add or atomics.
+
+  **Why `transposeJaxpr` cannot produce a gather-based backward body:** The existing transpose of
+  `UncheckedDynamicSlice(input[B+lo+hi], offset, [B])` is `scatterAdd(zeros[B+lo+hi], indices, ct)`
+  (confirmed in `linearize.ts` line 3344). So `transposeJaxpr(forwardBody)` produces a body with
+  shape contract `B → (B+lo+hi)` — the opposite of what gather-based VJP needs `(B+hi+lo) → B`. This
+  is fundamental: the existing transpose machinery converts reads-with-halo into
+  writes-with-overlap, not into reads-with-reversed-halo.
+
+  **Strategy 1: Scatter-add (general, correct, slower)**
+
+  Use `transposeJaxpr` as-is. Run the transposed block_map **without halo** — each backward block
+  produces a `(B+lo+hi)`-sized gradient tile that overlaps with neighbors. Accumulate via
+  `scatterAdd` post-pass. This works for ALL body types (linear, non-linear, data-dependent).
+
+  Cost: extra dispatch + bandwidth for the scatter-add accumulation. On WebGPU, `atomicAdd` has ~4
+  ULP precision loss per accumulation step. Breaks the "one workgroup owns one output tile"
+  execution model.
+
+  **Strategy 2: Stencil body synthesis (fast for linear stencils, requires compiler pass)**
+
+  For bodies composed of `{UncheckedDynamicSlice, scalar Mul, Add}` — the standard linear stencil
+  pattern — we can **synthesize** a new backward body that reads with halo and writes disjointly:
+
+  | Pass     | Reads (with halo)     | Writes (disjoint) |
+  | -------- | --------------------- | ----------------- |
+  | Forward  | Input tensor          | Output tensor     |
+  | Backward | Cotangent/output-grad | Input gradient    |
+
+  The insight: the adjoint of a linear stencil is also a linear stencil with spatially reversed
+  weights. For each `UDS(input, [k], [B])` with weight `w[k]` in the forward body, the synthesized
+  backward body emits `UDS(ct_tile, [K-1-k], [B]) * w[K-1-k]`. The new body has shape contract
+  `(B+hi+lo) → B` — halo-expanded input, disjoint output. No atomics, no scatter-add.
+
+  **This is NOT `transposeJaxpr` reuse.** It is a domain-specific compiler pass that:
+  1. Analyzes the forward body for `{UDS, Mul(scalar), Add}` patterns
+  2. For each UDS at offset `[k]`, emits a reversed UDS at offset `[K-1-k]`
+  3. Preserves the combining ops with spatially reversed weights
+  4. Produces a new jaxpr with `(B+hi+lo) → B` shape contract
+
+  **Halo derivation for backward body:**
+  - Symmetric case (`lo === hi`): backward halo = forward halo (covers 3×3, 5×5, all odd kernels)
+  - Asymmetric case: backward halo `[hi, lo]` (reversed), derivable from UDS offset analysis
+
+  **For conv2d specifically:** `Primitive.Conv` has its own JVP/transpose rules — the block_map halo
+  is an execution strategy invisible to autodiff. Training correctness does not depend on halo-VJP.
+  `grad(conv2d)` traces conv transpose first, then JIT lowers both forward and backward convs to
+  halo block_map independently. No block_map transpose rule involved.
+
+  Supporting `grad(blockMap({halo}))` matters for user-authored stencils (custom blur, edge
+  detection, PDE solvers) but is not needed for conv2d training.
+
+  **Scope of stencil synthesis:** Mechanical for purely linear stencils. Undefined for non-linear
+  operations (relu, max-pool, data-dependent indexing) — these always fall back to scatter-add.
+
+  | Use case               | Linear body?       | Strategy 2 feasible?                  |
+  | ---------------------- | ------------------ | ------------------------------------- |
+  | 1D moving average      | Yes                | Yes                                   |
+  | 3×3 / 5×5 conv stencil | Yes                | Yes                                   |
+  | PDE Laplacian          | Yes (self-adjoint) | Yes (backward = forward)              |
+  | Causal stencil [0,K-1] | Yes                | Yes (backward halo [K-1,0])           |
+  | Non-linear stencil     | No                 | No → scatter-add                      |
+  | Max-pool with halo     | No                 | No → scatter-add                      |
+  | Halo + foriLoop body   | Depends            | Scope unclear → scatter-add initially |
+
+##### Implementation phases
+
+**Phase C.1: API + Tracing + Eager**
+
+1. Add `halo` to `BlockMapOptions`, resolve to `flatHalo: [number, number][][]`
+2. Modify block aval computation: `shape[axis] = blockShape[g] + lo + hi`
+3. Add `halo` to `Primitive.BlockMap` params type in `core.ts`
+4. Modify eager execution: expand slice range, zero-pad halo edges
+5. Forward `halo` in JVP, vmap, PE rules
+6. Test: 1D moving average (blockShape=[8], halo=[[1,1]]), verify eager output matches sequential
+
+**Phase C.2: JIT Zero-Copy Halo** ✅ (WebGPU + JS fallback) / interim (WASM pre-pad)
+
+_WebGPU fused shader:_ signed bounds-checked reads in `gen_resolve()` —
+`clamp(rawExpr, packOff, packOff+total-1)` with `select(zero, read, valid)`. Leaf-packing-aware:
+bounds use packed coordinates `[packOff, packOff+total)`. No pre-padding, no extra allocation.
+
+_JS fallback:_ halo-aware per-block slicing with `rawStart = blockIdx * blockShape - lo`, clamped
+ranges, hoisted `sharedZeros` buffer (reused across blocks, no GC pressure).
+
+_WASM compiled loop (interim):_ `prePadForWasmHalo()` allocates zero-filled padded buffers in WASM
+linear memory, copies original data at halo offset, passes to `buildBlockMapWasmParams` with
+`halo: undefined`. Correct but wasteful — see Phase C.2b.
+
+1. ~~Store `halo` in block_map JitStep~~ ✅
+2. ~~WebGPU: zero-copy signed bounds checks in fused shader~~ ✅
+3. ~~WebGPU: leaf-packing + halo correctness (packed coordinates)~~ ✅
+4. ~~JS fallback: halo-aware slicing with shared zero buffer~~ ✅
+5. ~~WASM: pre-pad interim (not rejected, falls through to compiled loop)~~ ✅
+6. ~~Test: T8.1–T8.8 covering 1D/2D, symmetric/asymmetric, eager/jit~~ ✅
+
+**Phase C.2b: WASM Compiled Halo (zero-copy) + Interior Fast Path** ✅
+
+Replaced `prePadForWasmHalo()` with halo-aware codegen in `codegenBlockMapLoop()`. Interior blocks
+skip `memory.fill` entirely (copy-only fast path). Boundary blocks use signed clamped copy with
+`dstSkip` for halo offset. Non-halo inputs use unsigned boundary check. `prePadForWasmHalo()`
+deleted (-80 LOC), `tryExecuteBlockMapWasm()` simplified (no alloc/free overhead).
+
+1. ~~Add `halo?: [number, number][][]` to `BlockMapWasmParams`~~ ✅
+2. ~~Pass `params.halo` through in `buildBlockMapWasmParams()`~~ ✅
+3. ~~Rewrite `codegenBlockMapLoop()` Step 1: interior fast path + halo-aware boundary~~ ✅
+4. ~~Remove `prePadForWasmHalo()` call from `tryExecuteBlockMapWasm()`~~ ✅
+5. ~~Delete `prePadForWasmHalo()` function~~ ✅
+6. ~~T8.1–T8.8 pass; all 1885 tests pass~~ ✅
+
+**Phase C.3: Conv2d Body + Integration** ✅
+
+`rewriteConvToBlockMap()` in `jit.ts` rewrites eligible Conv equations to BlockMap before dataflow
+analysis. Guards: `block-map-3x3`/`block-map-5x5`, stride=1, SAME-equivalent padding
+(padTop+padBottom = kH-1), spatial ≥ 16, concrete shapes, vmapDims=0, backend≠webgpu. Body jaxpr
+uses VALID conv on halo-expanded tiles (recursion guard: VALID padding fails SAME-equivalence
+check). Batch (N) and channel dims are untiled — each block handles the full N × C_out per tile.
+
+Backend gate: WebGPU is excluded because `block_map` falls back to per-block dispatch for conv
+bodies (no fused shader yet), which is slower than generic-dot. CPU and WASM have efficient
+block_map execution paths. `_lastConvRewritten()` reports whether the rewrite actually fired
+(distinct from `_lastConvClass()` which reports kernel-shape classification).
+
+WASM A/B benchmark (Intel Core Ultra 5 125H, same workload, `_setConvRewriteEnabled` toggle):
+
+| Size          | block_map | generic-dot | Speedup   |
+| ------------- | --------- | ----------- | --------- |
+| 3×3 4ch 16×16 | 162 µs    | 166 µs      | 1.02×     |
+| 3×3 4ch 32×32 | 500 µs    | 643 µs      | **1.29×** |
+| 3×3 8ch 64×64 | 7,504 µs  | 10,192 µs   | **1.36×** |
+
+Speedup grows with spatial size as tiled memory access patterns dominate over dispatch overhead.
+
+1. ~~Write conv body via `rewriteConvToBlockMap` jaxpr pass~~ ✅
+2. ~~Wire into `classifyConv` dispatch for `block-map-3x3` / `block-map-5x5`~~ ✅
+3. ~~Benchmark against generic Dot path~~ ✅ (WASM: 1.02–1.36× faster)
+4. ~~Handle batch (N) and output channel (C_out) dimensions~~ ✅ (untiled, full per block)
+
+**Phase C.4: Halo VJP**
+
+_Prerequisite: C.1–C.2 landed (halo works in forward pass)._
+
+**Step 1: Scatter-add fallback (correct baseline)**
+
+The default path. Use `transposeJaxpr(forwardBody)` as-is — it produces a body with shape contract
+`B → (B+lo+hi)` via the existing UDS→scatterAdd transpose. Run the transposed block_map WITHOUT
+halo. Each backward block writes `(B+lo+hi)` elements that overlap neighbors. Post-pass scatter-add
+accumulates the overlapping regions.
+
+1. In `transposeBlockMap` (`linearize.ts`): when `params.halo` is present, emit the transposed
+   block_map with NO halo and output shapes `(B+lo+hi)`. Follow with a `scatterAdd` to accumulate
+   overlapping tiles into the `B`-sized input gradient.
+2. Emit `setDebug(1)` diagnostic: "halo-VJP: using scatter-add accumulation".
+3. Test: `grad(blockMap({halo: [[1,1]]}))` on 1D 3-point stencil matches finite differences.
+4. Test: `grad(blockMap({halo: [[1,1],[1,1]]}))` on 2D 3×3 stencil matches finite differences.
+5. Test: `jit(grad(blockMap({halo})))` on WASM and WebGPU.
+
+**Step 2: Stencil body synthesis for linear stencils** (new `stencil-analysis.ts`)
+
+A domain-specific compiler pass that synthesizes a gather-based backward body for linear stencil
+bodies. NOT `transposeJaxpr` reuse — this constructs a new jaxpr.
+
+1. Analyze the forward body jaxpr: walk equations for `{UncheckedDynamicSlice, Mul(scalar), Add}`.
+   If the body contains only these ops (linear stencil), it is eligible.
+2. For each `UDS(input, [offH, offW], [B, B])` with weight `w`, emit reversed
+   `UDS(ct_tile, [K-1-offH, K-1-offW], [B, B]) * w` in the synthesized backward body.
+3. Compute backward halo: symmetric → same as forward; asymmetric → `[hi, lo]` per axis.
+4. Emit the synthesized backward body as a halo block_map with `(B+bwdHalo) → B` contract.
+5. Test: symmetric halo `[[1,1]]` backward matches finite differences (no body analysis needed).
+6. Test: asymmetric halo `[[0,2]]` (causal stencil) backward matches finite differences.
+7. Test: non-linear body (relu in stencil) falls back to Step 1 scatter-add.
+
+**Step 3: Detect and route** (`linearize.ts`)
+
+Wire Steps 1 and 2 together in the BlockMap transpose rule:
+
+1. If no `halo` → existing path unchanged.
+2. If `halo` present → try stencil analysis (Step 2). If eligible → synthesized gather body.
+3. If analysis fails → scatter-add fallback (Step 1) + diagnostic.
+
+##### Affected files (complete list)
+
+- `src/library/lax-block-map.ts` — API, resolution, block aval expansion _(C.1)_
+- `src/frontend/core.ts` — `Primitive.BlockMap` params type _(C.1)_
+- `src/frontend/array.ts` — eager block*map execution (halo slicing + padding) *(C.1)\_
+- `src/frontend/jit.ts` — block*map step type, halo in JitStep *(C.2)\_
+- `src/frontend/block-map-executor.ts` — WebGPU zero-copy, JS fallback halo-aware slicing _(C.2)_;
+  delete `prePadForWasmHalo`, simplify `tryExecuteBlockMapWasm` _(C.2b)_
+- `src/backend/webgpu/block-map.ts` — signed bounds-checked reads in `gen_resolve()` _(C.2)_
+- `src/backend/wasm.ts` — `BlockMapWasmParams.halo` field, `codegenBlockMapLoop()` halo-aware input
+  copy _(C.2b)_
+- `src/frontend/jvp.ts` — forward `halo` in JVP rule _(C.1)_
+- `src/frontend/linearize.ts` — forward `halo` in PE + transpose rules; scatter-add fallback +
+  stencil synthesis routing _(C.4)_
+- `src/frontend/stencil-analysis.ts` — (new, Phase C.4 Step 2) linear stencil body synthesis for
+  gather-based halo VJP
+- `src/frontend/vmap.ts` — forward `halo` in vmap rule _(C.1)_
+- `src/index.ts` — no new exports needed (halo is part of existing `BlockMapOptions`)
+- `test/block-map.test.ts` — halo-specific test cases T8.1–T8.8 _(C.1–C.2)_
 
 ### Correctness and regression coverage
 
@@ -431,7 +758,8 @@ paths:
 2. No regressions in `test/conv.test.ts` ✅
 3. Path classification (block-map-3x3/5x5) in `classifyConv` ✅
 4. 1×1 conv fast path ✅ (Phase B: `fast-1x1-dot` and `fast-1x1-block-map`)
-5. Clear WebGPU speedup for 3×3/5×5: **deferred** pending halo-aware `block_map`
+5. Clear WebGPU speedup for 3×3/5×5: **partial** — C.3 WASM shows 1.02–1.36× speedup (grows with
+   spatial size); WebGPU fused shader pending
 6. Intel path remains correct ✅
 
 ### Recommended execution order
@@ -445,7 +773,13 @@ paths:
 5. ~~1×1 fast path~~ ✅ Done (commit 83722e9, Phase B)
 6. ~~3×3/5×5 classification~~ ✅ Done (commit 83722e9)
 7. ~~3×3 im2col + tiledMatmul~~ ❌ Rejected (41% regression from materialization overhead)
-8. Halo-aware block_map design for implicit im2col (future)
+8. ~~Halo-aware block_map design~~ ✅ Done (Phase C design: `halo` option + pre-pad strategy)
+9. ~~Phase C.1: API + tracing + eager halo support~~ ✅ Done
+10. ~~Phase C.2: JIT zero-copy halo (WebGPU + JS fallback + WASM pre-pad interim)~~ ✅ Done
+11. ~~Phase C.2b: WASM compiled halo (zero-copy) — replace `prePadForWasmHalo` with compiled address
+    generation~~ ✅ Done
+12. ~~Phase C.3: Conv2d body + integration + benchmarks~~ ✅ Done
+13. Phase C.4: Halo VJP (scatter-add fallback first → stencil body synthesis for linear bodies)
 
 ## Deferred Items
 

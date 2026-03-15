@@ -90,10 +90,22 @@ export type ConvClass =
   | "block-map-5x5";
 
 let lastConvClass: ConvClass | null = null;
+let lastConvRewritten = false;
+let convRewriteEnabled = true;
 
 /** Return the conv classification from the last Primitive.Conv JIT rule. */
 export function _lastConvClass(): ConvClass | null {
   return lastConvClass;
+}
+
+/** Whether the last JIT-compiled Conv was actually rewritten to BlockMap. */
+export function _lastConvRewritten(): boolean {
+  return lastConvRewritten;
+}
+
+/** Enable/disable the Conv→BlockMap rewrite. For benchmarking A/B comparisons. */
+export function _setConvRewriteEnabled(enabled: boolean): void {
+  convRewriteEnabled = enabled;
 }
 
 function classifyConv(params: ConvParams, kernelShape: number[]): ConvClass {
@@ -109,11 +121,10 @@ function classifyConv(params: ConvParams, kernelShape: number[]): ConvClass {
     return "fast-1x1-dot";
   }
 
-  // Detect common kernel sizes for future block_map specialization.
-  // Currently still lowered as generic-dot — the classification enables
-  // path-selection tests and benchmarks. Im2col materialization was tried
-  // and found too expensive (41% regression on NVIDIA); a fused tiled conv
-  // with implicit im2col inside block_map is the path forward.
+  // Detect common kernel sizes eligible for block_map lowering.
+  // For eligible shapes (stride=1, SAME padding, spatial >= 16),
+  // rewriteConvToBlockMap() rewrites Conv → BlockMap before dataflow analysis.
+  // Non-eligible shapes fall through to generic-dot via the normal Conv lowering.
   if (noDilation && noGroups && kernelShape.length === 2) {
     const [kH, kW] = kernelShape;
     if (kH === 3 && kW === 3) return "block-map-3x3";
@@ -121,6 +132,177 @@ function classifyConv(params: ConvParams, kernelShape: number[]): ConvClass {
   }
 
   return "generic-dot";
+}
+
+/**
+ * Rewrite eligible Conv equations to BlockMap equations before dataflow analysis.
+ *
+ * Eligible: block-map-3x3/5x5 classification, stride=1, SAME-equivalent padding
+ * (padTop+padBottom = kH-1), spatial dims >= 16, concrete shapes.
+ *
+ * The body jaxpr performs a VALID conv on the halo-expanded tile. The body Conv
+ * naturally falls through to generic-dot because VALID padding fails the
+ * SAME-equivalence guard (recursion guard).
+ *
+ * Only runs on CPU and WASM backends — WebGPU block_map falls back to per-block
+ * dispatch for conv bodies (no fused shader yet), which is slower than generic-dot.
+ */
+function rewriteConvToBlockMap(jaxpr: Jaxpr, backendType: string): Jaxpr {
+  // Skip on WebGPU: block_map executor falls back to per-block dispatch for
+  // conv bodies (no fused shader yet), which is slower than generic-dot.
+  // CPU and WASM both have efficient block_map execution paths.
+  if (backendType === "webgpu" || !convRewriteEnabled) return jaxpr;
+
+  let changed = false;
+  const newEqns: JaxprEqn[] = [];
+
+  for (const eqn of jaxpr.eqns) {
+    if (eqn.primitive !== Primitive.Conv) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    const params = eqn.params as ConvParams;
+    const v = params.vmapDims;
+    // Only handle v=0 (no vmap) for now
+    if (v !== 0) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    const lhsShape = eqn.inputs[0].aval.shape;
+    const rhsShape = eqn.inputs[1].aval.shape;
+    // Guard: no symbolic dims
+    if (hasSymbolicDims(lhsShape) || hasSymbolicDims(rhsShape)) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    const lhs = lhsShape as number[];
+    const rhs = rhsShape as number[];
+    const kernelShape = rhs.slice(2); // v=0, skip C_out and C_in
+    const cls = classifyConv(params, kernelShape);
+
+    if (cls !== "block-map-3x3" && cls !== "block-map-5x5") {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    // Guard: stride=1
+    if (!params.strides.every((s) => s === 1)) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    // Guard: SAME-equivalent padding (outH = H, outW = W)
+    const [kH, kW] = kernelShape;
+    const totalPadH = params.padding[0][0] + params.padding[0][1];
+    const totalPadW = params.padding[1][0] + params.padding[1][1];
+    if (totalPadH !== kH - 1 || totalPadW !== kW - 1) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    // Guard: minimum spatial size (avoids overhead for tiny inputs)
+    const H = lhs[2];
+    const W = lhs[3];
+    if (H < 16 || W < 16) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    changed = true;
+    lastConvClass = cls;
+    lastConvRewritten = true;
+
+    if (DEBUG >= 1) {
+      console.info(
+        `conv→block_map: ${cls}, x=[${lhs}], w=[${rhs}], ` +
+          `padding=[${params.padding.map((p) => `[${p}]`)}]`,
+      );
+    }
+
+    // Tile size for output spatial dims
+    const tH = Math.min(32, H);
+    const tW = Math.min(32, W);
+
+    // Halo: extend input tiles to cover kernel footprint
+    const [padTop] = params.padding[0];
+    const [padLeft] = params.padding[1];
+    const halo_h: [number, number] = [padTop, kH - 1 - padTop];
+    const halo_w: [number, number] = [padLeft, kW - 1 - padLeft];
+
+    // Body jaxpr: Conv(xTile, w, VALID) → outTile
+    const N = lhs[0];
+    const C_in = lhs[1];
+    const C_out = rhs[0];
+
+    const tileH_in = tH + kH - 1; // tH + halo_h_lo + halo_h_hi
+    const tileW_in = tW + kW - 1;
+    const xTileAval = new ShapedArray(
+      [N, C_in, tileH_in, tileW_in],
+      eqn.inputs[0].aval.dtype,
+      false,
+    );
+    const wAval = new ShapedArray(rhs, eqn.inputs[1].aval.dtype, false);
+    const outTileAval = new ShapedArray(
+      [N, C_out, tH, tW],
+      eqn.outBinders[0].aval.dtype,
+      false,
+    );
+
+    const xTileVar = new Var(xTileAval);
+    const wVar = new Var(wAval);
+    const outTileVar = new Var(outTileAval);
+
+    const bodyConvEqn = new JaxprEqn(
+      Primitive.Conv,
+      [xTileVar, wVar],
+      {
+        vmapDims: 0,
+        strides: [1, 1],
+        padding: [
+          [0, 0],
+          [0, 0],
+        ],
+        lhsDilation: [1, 1],
+        rhsDilation: [1, 1],
+      } satisfies ConvParams,
+      [outTileVar],
+    );
+    const bodyJaxpr = new Jaxpr([xTileVar, wVar], [bodyConvEqn], [outTileVar]);
+
+    // BlockMap params
+    const blockMapEqn = new JaxprEqn(
+      Primitive.BlockMap,
+      eqn.inputs,
+      {
+        jaxpr: bodyJaxpr,
+        blockShape: [tH, tW],
+        inAxes: [
+          [2, 3], // x: grid dims map to spatial axes 2,3
+          [null, null], // w: broadcast (same kernel for all tiles)
+        ] as (number | null)[][],
+        outAxes: [
+          [2, 3], // output: grid dims map to spatial axes 2,3
+        ] as (number | null)[][],
+        numConsts: 0,
+        numInputs: 2,
+        halo: [
+          [halo_h, halo_w], // x: halo per grid dim
+          [
+            [0, 0],
+            [0, 0],
+          ], // w: no halo (broadcast)
+        ] as [number, number][][],
+      },
+      eqn.outBinders,
+    );
+    newEqns.push(blockMapEqn);
+  }
+
+  if (!changed) return jaxpr;
+  return new Jaxpr(jaxpr.inBinders, newEqns, jaxpr.outs);
 }
 
 /**
@@ -294,6 +476,8 @@ export type JitStep =
       threadTile?: number[];
       /** Explicit grid shape from BlockMap params. */
       explicitGridShape?: number[];
+      /** Per-input per-grid-axis overlap. */
+      halo?: [number, number][][];
       /** Body uses BlockIndex: the compiled body program has one extra input (block index scalar). */
       hasBlockIndex?: boolean;
     }
@@ -1045,8 +1229,9 @@ export class JitProgram {
               const axes = step.inAxes[ii];
               for (let g = 0; g < gridRank; g++) {
                 if (axes[g] !== null) {
-                  const dim = inputShapes[ii][axes[g]!];
-                  gridShape[g] = Math.ceil(dim / step.blockShape[g]);
+                  gridShape[g] = Math.ceil(
+                    inputShapes[ii][axes[g]!] / step.blockShape[g],
+                  );
                 }
               }
             }
@@ -1069,12 +1254,14 @@ export class JitProgram {
             outputSlots,
             threadTile: step.threadTile,
             hasBlockIndex: step.hasBlockIndex,
+            halo: step.halo,
           });
 
           for (let i = 0; i < step.outputs.length; i++) {
             scope[step.outputs[i]] = bmResult.outputs[i];
           }
           flushSubPending(bmResult.pending);
+
           break;
         }
         case "fori_loop": {
@@ -1619,6 +1806,13 @@ export function jitCompile(
     }
 
     jaxpr = jaxpr.flatten().simplify();
+    // Rewrite eligible Conv equations to BlockMap before dataflow analysis.
+    // This ensures splitGraphDataflow treats them as special black primitives,
+    // materializing their inputs properly.
+    // Only activates on WASM — WebGPU block_map falls back to per-block
+    // dispatch for conv bodies, which is slower than generic-dot.
+    lastConvRewritten = false;
+    jaxpr = rewriteConvToBlockMap(jaxpr, backend.type);
     const nargs = jaxpr.inBinders.length;
     const builder = new JitProgramBuilder(backend, nargs);
 
@@ -2158,12 +2352,19 @@ export function jitCompile(
           ctx.set(outVar, { type: "imm", arg: outId });
         }
 
-        // Compile body jaxpr (rewritten if BlockIndex was present)
+        // Compile body jaxpr (rewritten if BlockIndex was present).
+        // Save/restore lastConvClass and lastConvRewritten so body compilation
+        // (which may contain a Conv equation e.g. from conv→block_map rewriting)
+        // doesn't overwrite the outer conv classification/rewrite flag.
+        const savedConvClass = lastConvClass;
+        const savedConvRewritten: boolean = lastConvRewritten;
         const bodyProgram = jitCompile(
           backend,
           compiledBodyJaxpr,
           _currentDimBindings,
         );
+        lastConvClass = savedConvClass;
+        lastConvRewritten = savedConvRewritten;
 
         const inputShapes: Dim[][] = inputAvals.map((a) => [...a.shape]);
         const outputShapes: Dim[][] = eqn.outBinders.map((v) => [
@@ -2186,6 +2387,7 @@ export function jitCompile(
           outputs: outputIds,
           threadTile,
           explicitGridShape,
+          halo: params.halo,
           hasBlockIndex,
         });
         continue;
@@ -2732,9 +2934,9 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     const v = (params as ConvParams).vmapDims;
     const kernelShape = (bs.shape as number[]).slice(v + 2);
     lastConvClass = classifyConv(params as ConvParams, kernelShape);
-    // block-map-3x3 and block-map-5x5 are detected but not yet specialized —
-    // they still fall through to the generic Dot lowering. A fused tiled conv
-    // with implicit im2col (no materialization) is planned.
+    // Eligible block-map-3x3/5x5 convs are rewritten to BlockMap equations
+    // by rewriteConvToBlockMap() before reaching this rule. Any Conv that
+    // reaches here uses the generic im2col→Dot lowering path.
     const prepare =
       lastConvClass === "fast-1x1-dot" ? prepareConv1x1 : prepareConv;
     const [stX, stY] = prepare(

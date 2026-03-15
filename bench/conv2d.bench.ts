@@ -7,7 +7,10 @@
 // GPU: pnpm build && scripts/gpu-test.sh bench bench/conv2d.bench.ts
 
 import {
+  _lastConvRewritten,
+  _setConvRewriteEnabled,
   blockUntilReady,
+  clearCaches,
   type CodeCaptureEntry,
   defaultDevice,
   init,
@@ -159,3 +162,65 @@ suite.skipIf(!hasWebGPU)("webgpu conv2d", async () => {
     });
   }
 });
+
+// ── C.3 block_map vs generic-dot A/B (WASM, same workload) ─────────────────────
+// Runs the exact same conv workload with rewrite enabled (block_map) and disabled
+// (generic-dot). This isolates the rewrite's impact from workload differences.
+suite.skipIf(!devices.includes("wasm"))(
+  "wasm C.3 block_map vs generic-dot (same workload)",
+  async () => {
+    if (!devices.includes("wasm")) return;
+    defaultDevice("wasm");
+
+    const AB_CASES = [
+      // [label, Cin, Cout, H, W]
+      ["3x3 4ch 16x16", 4, 4, 16, 16],
+      ["3x3 4ch 32x32", 4, 4, 32, 32],
+      ["3x3 8ch 64x64", 8, 8, 64, 64],
+    ] as const;
+
+    for (const [label, Cin, Cout, H, W] of AB_CASES) {
+      const x = random.uniform(random.key(0), [1, Cin, H, W]);
+      const w = random.uniform(random.key(1), [Cout, Cin, 3, 3]);
+      await blockUntilReady([x, w]);
+      afterAll(() => {
+        x.dispose();
+        w.dispose();
+      });
+
+      // A: block_map path (rewrite enabled)
+      _setConvRewriteEnabled(true);
+      const fA = jit((a: np.Array, b: np.Array) =>
+        lax.convGeneralDilated(a, b, [1, 1], "SAME"),
+      );
+      fA(x, w).dispose();
+      console.log(
+        `[C.3 A/B] ${label} block_map: rewritten=${_lastConvRewritten()}`,
+      );
+      afterAll(() => fA.dispose());
+
+      bench(`${label} block_map`, () => {
+        fA(x, w).dispose();
+      });
+
+      // B: generic-dot path (rewrite disabled, same workload)
+      _setConvRewriteEnabled(false);
+      clearCaches();
+      const fB = jit((a: np.Array, b: np.Array) =>
+        lax.convGeneralDilated(a, b, [1, 1], "SAME"),
+      );
+      fB(x, w).dispose();
+      console.log(
+        `[C.3 A/B] ${label} generic-dot: rewritten=${_lastConvRewritten()}`,
+      );
+      afterAll(() => {
+        fB.dispose();
+        _setConvRewriteEnabled(true);
+      });
+
+      bench(`${label} generic-dot`, () => {
+        fB(x, w).dispose();
+      });
+    }
+  },
+);

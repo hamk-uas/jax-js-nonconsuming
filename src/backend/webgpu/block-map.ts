@@ -99,6 +99,13 @@ export interface BlockMapShaderParams {
    * bindings.  The computed layout is returned in ShaderInfo.packedLeafLayout.
    */
   needsLeafPacking?: boolean;
+  /**
+   * Per-input per-grid-axis overlap [lo, hi].
+   * When present, bodies see expanded tiles (blockShape[g] + lo + hi) and
+   * global reads that fall before index 0 or past the input dimension return
+   * zero. inputShapes must contain ORIGINAL (unpadded) dimensions.
+   */
+  halo?: [number, number][][];
 }
 
 /**
@@ -1655,6 +1662,13 @@ export function blockMapFusedShaderSource(
   const inBodyStrides: number[][] = []; // body-local strides per input
   const inBodyShapes: number[][] = []; // body-local shapes per input
   const inNeedsRemap: boolean[] = []; // whether remapping is needed
+  // Per-input halo metadata: shift in elements and total input element count.
+  // haloShift[i] is the signed element offset to subtract from in_base so that
+  // body-local index 0 maps to the first halo element (before the block start).
+  const inHaloShift: number[] = []; // per-input: sum of lo * globalStride[ax]
+  const inTotalElems: number[] = []; // per-input: product of original inputShape
+  const inHasHalo: boolean[] = []; // per-input: any non-zero halo?
+  const inPackOffset: number[] = []; // per-input: packed-buffer element offset (0 when no leaf packing)
 
   for (let i = 0; i < numInputs; i++) {
     const axes = params.inAxes[i];
@@ -1668,10 +1682,14 @@ export function blockMapFusedShaderSource(
       gStrides[d] = gStrides[d + 1] * inShape[d + 1];
     }
     inBufStrides.push(gStrides);
-    // Body shape: replace mapped dims with blockShape (skip for point inputs)
+    // Body shape: replace mapped dims with blockShape (skip for point inputs).
+    // With halo, the body sees blockShape[g] + lo + hi along mapped axes.
     const bShape = [...inShape];
     for (let g = 0; g < gridRank; g++) {
-      if (axes[g] !== null && !isPoint) bShape[axes[g]!] = blockShape[g];
+      if (axes[g] !== null && !isPoint) {
+        const [lo, hi] = params.halo?.[i]?.[g] ?? [0, 0];
+        bShape[axes[g]!] = blockShape[g] + lo + hi;
+      }
     }
     inBodyShapes.push(bShape);
     // Body strides
@@ -1691,14 +1709,32 @@ export function blockMapFusedShaderSource(
     }
     inNeedsRemap.push(needsRemap);
 
+    // Halo: compute signed element shift and total element count for OOB checks.
+    let haloShift = 0;
+    let hasHalo = false;
+    for (let g = 0; g < gridRank; g++) {
+      if (axes[g] !== null && !isPoint) {
+        const [lo, hi] = params.halo?.[i]?.[g] ?? [0, 0];
+        if (lo !== 0 || hi !== 0) {
+          hasHalo = true;
+          haloShift += lo * gStrides[axes[g]!];
+        }
+      }
+    }
+    inHaloShift.push(haloShift);
+    inTotalElems.push(inShape.reduce((a, b) => a * b, 1));
+    inHasHalo.push(hasHalo);
+
     // Compute base offset
     // With packedLeafLayout: add per-leaf element offset within packed buffer.
+    // Track the offset for halo bounds checking in packed coordinates.
     const packInputOff =
       packedLeafLayout && !isPoint
         ? packedLeafLayout.inputOffsets[i]
         : packedLeafLayout && isPoint
           ? packedLeafLayout.inputOffsets[i]
           : 0;
+    inPackOffset.push(packInputOff);
     const packPrefix = packInputOff > 0 ? `${packInputOff}u + ` : "";
     if (isPoint) {
       // Point-mode: 1 element per grid point, indexed by block_i0.
@@ -1999,9 +2035,29 @@ export function blockMapFusedShaderSource(
           const inputIdx = stepInputBodyIdx[bufIdx];
           if (inputIdx >= 0) {
             const remapped = inRemap(inputIdx, indexExpr);
-            const readExpr = `${stepInputNames[bufIdx]}[i32(in_base_${inputIdx}) + ${remapped}]`;
+            const name = stepInputNames[bufIdx];
+            const zero = `${dtypeToWgsl(dtype)}(0)`;
+            if (inHasHalo[inputIdx]) {
+              // Zero-copy halo: signed index with bounds check.
+              // in_base includes the pack offset when leaf packing is active,
+              // so bounds must be in packed coordinates: [packOff, packOff+total).
+              const shift = inHaloShift[inputIdx];
+              const total = inTotalElems[inputIdx];
+              const packOff = inPackOffset[inputIdx];
+              const lo = packOff; // lower bound in packed coords
+              const hi = packOff + total; // exclusive upper bound
+              const rawExpr = `(i32(in_base_${inputIdx}) + ${remapped} - ${shift})`;
+              const safeExpr = `clamp(${rawExpr}, ${lo}, ${hi - 1})`;
+              const readExpr = `${name}[${safeExpr}]`;
+              const haloValid = `(${rawExpr} >= ${lo} && ${rawExpr} < ${hi})`;
+              const validExpr = hasBoundary
+                ? `(valid && ${haloValid})`
+                : haloValid;
+              return `select(${zero}, ${readExpr}, ${validExpr})`;
+            }
+            const readExpr = `${name}[i32(in_base_${inputIdx}) + ${remapped}]`;
             return hasBoundary
-              ? `select(${dtypeToWgsl(dtype)}(0), ${readExpr}, valid)`
+              ? `select(${zero}, ${readExpr}, valid)`
               : readExpr;
           } else {
             const ci = bodyInputIds.indexOf(step.inputs[bufIdx]);

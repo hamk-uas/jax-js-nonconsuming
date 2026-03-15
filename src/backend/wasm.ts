@@ -153,6 +153,12 @@ export interface BlockMapWasmParams {
   inputStrides: number[][];
   /** Strides (in bytes) per dimension for each output. */
   outputStrides: number[][];
+  /**
+   * Per-input per-grid-axis overlap [lo, hi]. When present, codegen emits
+   * halo-shifted reads with interior fast path (skip memory.fill).
+   * `halo[i][g] = [lo, hi]` — extra elements before/after tile on grid axis g.
+   */
+  halo?: [number, number][][];
 }
 
 const moduleCache = new Map<string, WebAssembly.Module>();
@@ -3081,6 +3087,7 @@ function codegenBlockMapLoop(
     outputSources,
     inputStrides,
     outputStrides,
+    halo,
   } = params;
   const numInternal = internalSizes.length;
   const numBlocks = gridShape.reduce((a, b) => a * b, 1);
@@ -3158,65 +3165,191 @@ function codegenBlockMapLoop(
       }
 
       // ---- Step 1: Copy input slices into scratch buffers ----
+      // Declare rawStart local only if any input has halo (compile-time check)
+      const _anyHalo =
+        halo != null &&
+        halo.some((h, idx) =>
+          inAxes[idx].some(
+            (ax, g) => ax !== null && (h[g][0] !== 0 || h[g][1] !== 0),
+          ),
+        );
+      const rawStart = _anyHalo ? cg.local.declare(cg.i32) : -1;
+
       for (let i = 0; i < numInputs; i++) {
         const axes = inAxes[i];
         const inputShape = inputShapes[i];
         const iStrides = inputStrides[i];
+        const elemBytes = iStrides[inputShape.length - 1];
+        const totalBytes = inputShape.reduce((a, b) => a * b, 1) * elemBytes;
 
-        // Zero the scratch buffer (handles boundary padding)
-        cg.local.get(scratchInputsBase + i);
-        cg.i32.const(0);
-        cg.i32.const(blockInputSizes[i]);
-        cg.memory.fill();
-
-        // Compute source byte offset: sum over grid dims
-        // offset = sum_g(blockCoord[g] * blockShape[g] * stride[axes[g]])
-        cg.i32.const(0);
-        cg.local.set(srcOffset);
+        // Find the single mapped grid axis (at most one due to contiguity
+        // check in buildBlockMapWasmParams). Determine per-input halo.
+        let mappedG = -1;
+        let lo = 0;
+        let hi = 0;
         for (let g = 0; g < gridRank; g++) {
           if (axes[g] !== null) {
-            const ax = axes[g]!;
-            cg.local.get(srcOffset);
-            cg.local.get(blockCoords[g]);
-            cg.i32.const(blockShape[g] * iStrides[ax]);
-            cg.i32.mul();
-            cg.i32.add();
-            cg.local.set(srcOffset);
+            mappedG = g;
+            if (halo) {
+              lo = halo[i][g][0];
+              hi = halo[i][g][1];
+            }
           }
         }
 
-        // Compute valid copy size. For interior blocks, it's blockInputSizes[i].
-        // For boundary blocks (last on any mapped axis), clamp to available data.
-        // We emit a conservative loop: copy min(blockDim, available) on each
-        // mapped axis. For 1D (gridRank=1): copySize = min(blockShape*bw, (inputDim - start)*bw).
-        // For multi-dim we need row-by-row copy unless contiguous.
-        //
-        // Simplification: we only handle the contiguous case (1D or leading-axis).
-        // The contiguity is checked at prepare time so we can just do a single memory.copy.
-        // The copy length is min(blockInputSizes[i], totalInputBytes - srcOffset).
-        cg.local.get(scratchInputsBase + i); // dst
-        cg.local.get(inputsBase + i); // src base
-        cg.local.get(srcOffset);
-        cg.i32.add(); // src = inputPtr + srcOffset
+        if (mappedG === -1) {
+          // Broadcast input (no mapped axis) — copy full input to scratch.
+          // blockInputSizes[i] === totalBytes for broadcast inputs.
+          cg.local.get(scratchInputsBase + i);
+          cg.local.get(inputsBase + i);
+          cg.i32.const(blockInputSizes[i]);
+          cg.memory.copy();
+          continue;
+        }
 
-        // copySize = min(blockInputSizes[i], inputTotalBytes - srcOffset)
-        const inputTotalBytes = inputShape.reduce((a, b) => a * b, 1);
-        const elemBytes = iStrides[inputShape.length - 1]; // innermost stride = elemBytes
-        const totalBytes = inputTotalBytes * elemBytes;
-        cg.i32.const(totalBytes);
-        cg.local.get(srcOffset);
-        cg.i32.sub(); // available = totalBytes - srcOffset
-        // clamp to blockInputSizes[i]
-        cg.local.tee(copySize);
-        cg.i32.const(blockInputSizes[i]);
-        cg.i32.gt_u();
-        cg.if(cg.void);
-        cg.i32.const(blockInputSizes[i]);
-        cg.local.set(copySize);
-        cg.end();
+        const ax = axes[mappedG]!;
+        const axStride = iStrides[ax];
 
-        cg.local.get(copySize);
-        cg.memory.copy(); // memory.copy(dst, src, len) — but WASM memory.copy is (dst, src, len)
+        if (lo === 0 && hi === 0) {
+          // ---- Non-halo input: interior fast path ----
+          // srcOffset = blockCoord * blockShape * axStride
+          cg.local.get(blockCoords[mappedG]);
+          cg.i32.const(blockShape[mappedG] * axStride);
+          cg.i32.mul();
+          cg.local.set(srcOffset);
+
+          // Interior test: available = totalBytes - srcOffset >= blockInputSizes?
+          cg.i32.const(totalBytes);
+          cg.local.get(srcOffset);
+          cg.i32.sub();
+          cg.i32.const(blockInputSizes[i]);
+          cg.i32.ge_u();
+          cg.if(cg.void);
+          {
+            // Fast path: copy only, no fill
+            cg.local.get(scratchInputsBase + i);
+            cg.local.get(inputsBase + i);
+            cg.local.get(srcOffset);
+            cg.i32.add();
+            cg.i32.const(blockInputSizes[i]);
+            cg.memory.copy();
+          }
+          cg.else();
+          {
+            // Boundary path: fill + clamped copy
+            cg.local.get(scratchInputsBase + i);
+            cg.i32.const(0);
+            cg.i32.const(blockInputSizes[i]);
+            cg.memory.fill();
+
+            // copySize = totalBytes - srcOffset (available bytes)
+            cg.i32.const(totalBytes);
+            cg.local.get(srcOffset);
+            cg.i32.sub();
+            cg.local.set(copySize);
+
+            cg.local.get(scratchInputsBase + i); // dst
+            cg.local.get(inputsBase + i);
+            cg.local.get(srcOffset);
+            cg.i32.add(); // src
+            cg.local.get(copySize);
+            cg.memory.copy();
+          }
+          cg.end();
+        } else {
+          // ---- Halo input: signed interior test ----
+          const inputDim = inputShape[ax];
+          const tileElems = blockShape[mappedG] + lo + hi;
+
+          // rawStart (elements) = blockCoord * blockShape - lo
+          cg.local.get(blockCoords[mappedG]);
+          cg.i32.const(blockShape[mappedG]);
+          cg.i32.mul();
+          cg.i32.const(lo);
+          cg.i32.sub();
+          cg.local.set(rawStart);
+
+          // Interior: rawStart >= 0 AND rawStart + tileElems <= inputDim
+          cg.local.get(rawStart);
+          cg.i32.const(0);
+          cg.i32.ge_s();
+          cg.local.get(rawStart);
+          cg.i32.const(inputDim - tileElems);
+          cg.i32.le_s();
+          cg.i32.and();
+          cg.if(cg.void);
+          {
+            // Fast path: copy full tile, no fill
+            cg.local.get(scratchInputsBase + i);
+            cg.local.get(inputsBase + i);
+            cg.local.get(rawStart);
+            cg.i32.const(axStride);
+            cg.i32.mul();
+            cg.i32.add(); // src = input + rawStart * axStride
+            cg.i32.const(blockInputSizes[i]);
+            cg.memory.copy();
+          }
+          cg.else();
+          {
+            // Boundary path: fill + clamped copy with dstSkip
+            cg.local.get(scratchInputsBase + i);
+            cg.i32.const(0);
+            cg.i32.const(blockInputSizes[i]);
+            cg.memory.fill();
+
+            // clampedStart = max(0, rawStart) via select
+            cg.local.get(rawStart); // val1 (kept if cond true)
+            cg.i32.const(0); // val2 (kept if cond false)
+            cg.local.get(rawStart);
+            cg.i32.const(0);
+            cg.i32.gt_s(); // cond: rawStart > 0
+            cg.select();
+            cg.local.set(srcOffset); // srcOffset = clampedStart
+
+            // clampedEnd = min(inputDim, rawStart + tileElems) via select
+            cg.local.get(rawStart);
+            cg.i32.const(tileElems);
+            cg.i32.add();
+            cg.local.set(dstOffset); // dstOffset = rawEnd (temp)
+
+            cg.i32.const(inputDim); // val1
+            cg.local.get(dstOffset); // val2 (rawEnd)
+            cg.i32.const(inputDim);
+            cg.local.get(dstOffset);
+            cg.i32.lt_s(); // cond: inputDim < rawEnd
+            cg.select();
+            cg.local.set(dstOffset); // dstOffset = clampedEnd
+
+            // copyLen = (clampedEnd - clampedStart) * axStride
+            cg.local.get(dstOffset);
+            cg.local.get(srcOffset);
+            cg.i32.sub();
+            cg.i32.const(axStride);
+            cg.i32.mul();
+            cg.local.set(copySize);
+
+            // dst = scratch + (clampedStart - rawStart) * axStride
+            cg.local.get(scratchInputsBase + i);
+            cg.local.get(srcOffset);
+            cg.local.get(rawStart);
+            cg.i32.sub();
+            cg.i32.const(axStride);
+            cg.i32.mul();
+            cg.i32.add();
+
+            // src = input + clampedStart * axStride
+            cg.local.get(inputsBase + i);
+            cg.local.get(srcOffset);
+            cg.i32.const(axStride);
+            cg.i32.mul();
+            cg.i32.add();
+
+            // memory.copy(dst, src, copyLen)
+            cg.local.get(copySize);
+            cg.memory.copy();
+          }
+          cg.end();
+        }
       }
 
       // ---- Step 2: Execute body kernel steps ----

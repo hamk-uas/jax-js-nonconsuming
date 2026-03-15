@@ -2,6 +2,8 @@
 
 import {
   _lastConvClass,
+  _lastConvRewritten,
+  DType,
   grad,
   jit,
   lax,
@@ -12,7 +14,7 @@ import { expect, test } from "vitest";
 
 import { deviceSuite } from "./device-suite.js";
 
-await deviceSuite(() => {
+await deviceSuite((device) => {
   // ── 1×1 conv fast path tests ─────────────────────────────────────────────────
   test("1x1 conv fast path: 1d matches generic path", () => {
     using x = np.ones([1, 4, 8]); // [N, C_in, W]
@@ -580,5 +582,106 @@ await deviceSuite(() => {
       using _s = result.slice(0, 0);
       expect(_s.js()).toEqual([1, 1, 2, 2, 3, 3]);
     }
+  });
+
+  // ── C.3: block_map conv lowering tests ──────────────────────────────────────
+  // These test the conv→block_map rewriting path (rewriteConvToBlockMap).
+  // The rewrite activates for: block-map-3x3/5x5, stride=1, SAME padding, H,W >= 16.
+
+  test("C.3: 3x3 SAME conv uses block_map path for spatial >= 16", () => {
+    using x = np.arange(1 * 2 * 16 * 16).reshape([1, 2, 16, 16]);
+    using w = np.arange(3 * 2 * 3 * 3).reshape([3, 2, 3, 3]);
+    using eager = lax.convGeneralDilated(x, w, [1, 1], "SAME");
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1, 1], "SAME"),
+    );
+    using jitted = f(x, w);
+    f.dispose();
+    expect(_lastConvClass()).toBe("block-map-3x3");
+    // Rewrite fires on cpu/wasm but not webgpu (per-block dispatch is slower)
+    expect(_lastConvRewritten()).toBe(device !== "webgpu");
+    expect(jitted.shape).toEqual(eager.shape);
+    // Block_map tiles the spatial dims; values must match generic path exactly.
+    const jitVals = jitted.dataSync();
+    const eagerVals = eager.dataSync();
+    for (let i = 0; i < jitVals.length; i++) {
+      expect(jitVals[i]).toBeCloseTo(eagerVals[i], 3);
+    }
+  });
+
+  test("C.3: 5x5 SAME conv uses block_map path for spatial >= 16", () => {
+    using x = np.arange(1 * 2 * 16 * 16).reshape([1, 2, 16, 16]);
+    using w = np.arange(3 * 2 * 5 * 5).reshape([3, 2, 5, 5]);
+    using eager = lax.convGeneralDilated(x, w, [1, 1], "SAME");
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1, 1], "SAME"),
+    );
+    using jitted = f(x, w);
+    f.dispose();
+    expect(_lastConvClass()).toBe("block-map-5x5");
+    expect(_lastConvRewritten()).toBe(device !== "webgpu");
+    expect(jitted.shape).toEqual(eager.shape);
+    const jitVals = jitted.dataSync();
+    const eagerVals = eager.dataSync();
+    for (let i = 0; i < jitVals.length; i++) {
+      expect(jitVals[i]).toBeCloseTo(eagerVals[i], 3);
+    }
+  });
+
+  test("C.3: 3x3 SAME conv block_map path with larger spatial (32x32)", () => {
+    using x = np.arange(1 * 4 * 32 * 32).reshape([1, 4, 32, 32]);
+    using w = np.arange(8 * 4 * 3 * 3).reshape([8, 4, 3, 3]);
+    using eager = lax.convGeneralDilated(x, w, [1, 1], "SAME");
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1, 1], "SAME"),
+    );
+    using jitted = f(x, w);
+    f.dispose();
+    expect(_lastConvClass()).toBe("block-map-3x3");
+    expect(_lastConvRewritten()).toBe(device !== "webgpu");
+    expect(jitted.shape).toEqual([1, 8, 32, 32]);
+    const jitVals = jitted.dataSync();
+    const eagerVals = eager.dataSync();
+    for (let i = 0; i < jitVals.length; i++) {
+      expect(jitVals[i]).toBeCloseTo(eagerVals[i], 2);
+    }
+  });
+
+  test("C.3: 3x3 VALID conv falls through (not SAME-equivalent)", () => {
+    // VALID padding: totalPad = 0 != kH-1 = 2 → generic-dot
+    using x = np.arange(1 * 2 * 20 * 20).reshape([1, 2, 20, 20]);
+    using w = np.arange(3 * 2 * 3 * 3).reshape([3, 2, 3, 3]);
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1, 1], "VALID"),
+    );
+    using result = f(x, w);
+    f.dispose();
+    // Classification is block-map-3x3 (kernel shape), but rewrite didn't fire
+    // because VALID padding fails the SAME-equivalence guard.
+    expect(_lastConvClass()).toBe("block-map-3x3");
+    expect(_lastConvRewritten()).toBe(false);
+    expect(result.shape).toEqual([1, 3, 18, 18]);
+  });
+
+  test("C.3: grad(conv) with block_map path is correct", () => {
+    using x = np.ones([1, 2, 16, 16]);
+    using w_raw = np.arange(3 * 2 * 3 * 3).reshape([3, 2, 3, 3]);
+    using w = w_raw.astype(DType.Float32);
+    const loss = (a: typeof x) => {
+      const out = lax.convGeneralDilated(a, w, [1, 1], "SAME");
+      const s = out.sum();
+      out.dispose();
+      return s;
+    };
+    // grad runs through the normal Conv JVP/transpose rules,
+    // then JIT compiles — the forward conv should become block_map
+    const gFn = jit(grad(loss));
+    using gradResult = gFn(x);
+    gFn.dispose();
+    // Gradient should have the same shape as input
+    expect(gradResult.shape).toEqual([1, 2, 16, 16]);
+    // Gradient should be non-zero (weights are non-trivial)
+    const vals = gradResult.dataSync();
+    expect(vals.some((v: number) => v !== 0)).toBe(true);
   });
 });

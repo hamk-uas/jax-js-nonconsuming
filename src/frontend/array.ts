@@ -1683,13 +1683,21 @@ export class Array extends Tracer {
       },
       [Primitive.BlockMap](
         args,
-        { jaxpr: bodyJaxpr, blockShape, inAxes, outAxes, numConsts, numInputs },
+        {
+          jaxpr: bodyJaxpr,
+          blockShape,
+          inAxes,
+          outAxes,
+          numConsts,
+          numInputs,
+          halo,
+        },
       ) {
         // Eager impl: slice/pad/concat loop over the grid of blocks.
         const consts = args.slice(0, numConsts);
         const inputs = args.slice(numConsts, numConsts + numInputs);
 
-        // Compute grid shape from inputs + inAxes
+        // Compute grid shape from inputs + inAxes (from ORIGINAL dims, not halo-expanded)
         const gridRank = blockShape.length;
         const gridShape: number[] = new JsArray(gridRank).fill(0);
         for (let i = 0; i < inputs.length; i++) {
@@ -1722,7 +1730,7 @@ export class Array extends Tracer {
             remaining = Math.floor(remaining / gridShape[g]);
           }
 
-          // Slice each input along its mapped axes, pad if non-divisible
+          // Slice each input along its mapped axes, pad if non-divisible or halo
           const blockInputs: Array[] = [];
           for (let i = 0; i < inputs.length; i++) {
             const inputArr = inputs[i];
@@ -1734,19 +1742,25 @@ export class Array extends Tracer {
               0,
               inputArr.shape[d] as number,
             ]);
+            // Desired tile size per axis (including halo)
+            const tileSize: Map<number, number> = new Map();
             for (let g = 0; g < gridRank; g++) {
               if (axes[g] !== null) {
                 const ax = axes[g]!;
-                const start = blockIdx[g] * blockShape[g];
+                const [lo, hi] = halo ? halo[i][g] : [0, 0];
+                const start = blockIdx[g] * blockShape[g] - lo;
                 const fullDim = inputArr.shape[ax] as number;
-                const end = Math.min(start + blockShape[g], fullDim);
-                slice[ax] = [start, end];
+                const end = (blockIdx[g] + 1) * blockShape[g] + hi;
+                // Clamp to valid range
+                slice[ax] = [Math.max(0, start), Math.min(end, fullDim)];
+                tileSize.set(ax, blockShape[g] + lo + hi);
               }
             }
 
             let current = coreShrink(inputArr, slice) as Array;
 
-            // Pad to blockShape if this is the last block and non-divisible
+            // Pad to target tile size (blockShape + halo) if needed
+            // Left-pad when start < 0 (halo extends before array), right-pad for edge blocks
             const padWidth: Pair[] = range(current.ndim).map(
               () => [0, 0] as Pair,
             );
@@ -1754,9 +1768,14 @@ export class Array extends Tracer {
             for (let g = 0; g < gridRank; g++) {
               if (axes[g] !== null) {
                 const ax = axes[g]!;
+                const [lo, _hi] = halo ? halo[i][g] : [0, 0];
+                const start = blockIdx[g] * blockShape[g] - lo;
+                const target = tileSize.get(ax)!;
                 const actual = current.shape[ax] as number;
-                if (actual < blockShape[g]) {
-                  padWidth[ax] = [0, blockShape[g] - actual];
+                const leftPad = start < 0 ? -start : 0;
+                const rightPad = target - actual - leftPad;
+                if (leftPad > 0 || rightPad > 0) {
+                  padWidth[ax] = [leftPad, rightPad];
                   anyPad = true;
                 }
               }

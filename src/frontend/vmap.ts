@@ -299,14 +299,17 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     const bdim = dims.find((d) => d !== null) ?? 0;
     for (let i = 0; i < outAxes.length; i++) outBdims.push(bdim);
 
+    const { jaxpr: batchedJaxpr } = vmapJaxpr(jaxpr, axisSize, dims);
+
     const res = bind(Primitive.BlockMap, args, {
-      jaxpr,
+      jaxpr: batchedJaxpr,
       numConsts,
       numInputs,
       blockShape,
       inAxes: newInAxes,
       outAxes: newOutAxes,
       threadTile: params.threadTile,
+      halo: params.halo,
     });
 
     return [res, outBdims];

@@ -939,6 +939,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
         inAxes: jvpInAxes,
         outAxes: jvpOutAxes,
         threadTile: params.threadTile,
+        halo: params.halo ? [...params.halo, ...params.halo] : undefined,
         isJvpTransformed: true,
       },
     );

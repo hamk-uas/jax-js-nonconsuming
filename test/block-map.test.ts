@@ -15,6 +15,8 @@
  */
 
 import {
+  checkLeaks,
+  clearCaches,
   DType,
   grad,
   init,
@@ -583,5 +585,276 @@ describe("Phase 5 — blocked associativeScan", () => {
     using expected = np.array([5, 4, 3, 2, 1], { dtype: DType.Float32 });
     expect(g).toBeAllclose(expected);
     gf.dispose();
+  });
+});
+
+describe("lax.blockMap — halo", () => {
+  // T8.1: 1D moving average with halo [1, 1].
+  // Each block[i] sees neighbors halo[i-1] and halo[i+1], zero-padded at edges.
+  test("T8.1: 1D halo [1,1] — moving average", () => {
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+
+    // Block of 4 + halo [1,1] → body receives tiles of size 6.
+    // Block 0 tile: [0, 1, 2, 3, 4, 5] (zero-padded left)
+    // Block 1 tile: [4, 5, 6, 7, 8, 0] (zero-padded right if needed)
+    // Apply: sum of the tile (for test simplicity) divided by 6.
+    // More usefully: extract the center 4 elements = x[1:-1] as output.
+    const result = lax.blockMap(
+      (block: np.Array) => {
+        // block has shape [6] (blockShape=4 + halo [1,1])
+        // Extract center 4 elements for output
+        using sliced = lax.sliceInDim(block, 1, 5, 0);
+        return sliced.ref; // jax-js-lint: allow-ref
+      },
+      xs,
+      {
+        blockShape: [4],
+        halo: [[1, 1]],
+      },
+    );
+    // Block 0 tile: [0, 1, 2, 3, 4, 5] → center [1, 2, 3, 4]
+    // Block 1 tile: [4, 5, 6, 7, 8, 0] → center [5, 6, 7, 8]
+    expect(result).toBeAllclose([1, 2, 3, 4, 5, 6, 7, 8]);
+    result.dispose();
+  });
+
+  // T8.2: 1D halo — verify actual halo data overlap.
+  test("T8.2: 1D halo overlap — stencil sum", () => {
+    using xs = np.array([10, 20, 30, 40, 50, 60, 70, 80], {
+      dtype: DType.Float32,
+    });
+
+    // blockShape=4, halo=[1,1] → tile size 6.
+    // Body sums the 6-element tile and divides by 6 → scalar per block.
+    // But block_map output must tile along the output axis, so let's do
+    // a per-element 3-point stencil: out[i] = tile[i] + tile[i+1] + tile[i+2]
+    // with tile of size 6, outputting 4 elements.
+    const result = lax.blockMap(
+      (block: np.Array) => {
+        // block shape: [6]
+        using a = lax.sliceInDim(block, 0, 4, 0);
+        using b = lax.sliceInDim(block, 1, 5, 0);
+        using c = lax.sliceInDim(block, 2, 6, 0);
+        using ab = np.add(a, b);
+        using abc = np.add(ab, c);
+        return abc.ref; // jax-js-lint: allow-ref
+      },
+      xs,
+      {
+        blockShape: [4],
+        halo: [[1, 1]],
+      },
+    );
+    // Block 0 tile: [0, 10, 20, 30, 40, 50]
+    //   out[0]=0+10+20=30, out[1]=10+20+30=60, out[2]=20+30+40=90, out[3]=30+40+50=120
+    // Block 1 tile: [40, 50, 60, 70, 80, 0]
+    //   out[0]=40+50+60=150, out[1]=50+60+70=180, out[2]=60+70+80=210, out[3]=70+80+0=150
+    expect(result).toBeAllclose([30, 60, 90, 120, 150, 180, 210, 150]);
+    result.dispose();
+  });
+
+  // T8.3: 1D halo with non-divisible input size.
+  test("T8.3: 1D halo [1,1] — non-divisible N", () => {
+    using xs = np.array([1, 2, 3, 4, 5], { dtype: DType.Float32 });
+
+    // blockShape=4, N=5 → 2 blocks. Block 1 has only 1 real element + pad.
+    // halo=[1,1] → tiles of size 6.
+    const result = lax.blockMap(
+      (block: np.Array) => {
+        // Extract center 4 from tile of 6
+        using sliced = lax.sliceInDim(block, 1, 5, 0);
+        return sliced.ref; // jax-js-lint: allow-ref
+      },
+      xs,
+      {
+        blockShape: [4],
+        halo: [[1, 1]],
+      },
+    );
+    // N=5, blockShape=4 → 2 blocks, result trimmed to 5 elements.
+    // Block 0 tile: [0, 1, 2, 3, 4, 5] → center [1, 2, 3, 4]
+    // Block 1 tile: [4, 5, 0, 0, 0, 0] → center [5, 0, 0, 0]
+    // Concat: [1,2,3,4,5,0,0,0], trim to 5: [1,2,3,4,5]
+    expect(result).toBeAllclose([1, 2, 3, 4, 5]);
+    result.dispose();
+  });
+
+  // T8.4: Per-input halo — one input has halo, another doesn't.
+  test("T8.4: per-input halo (one halos, one broadcast)", () => {
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    using weights = np.array([0.25, 0.5, 0.25], { dtype: DType.Float32 });
+
+    // xs: halo [1,1] along grid axis 0 → tiles of 6
+    // weights: broadcast (null axis) → same every block
+    using result = lax.blockMap(
+      ({ data, w }: { data: np.Array; w: np.Array }) => {
+        // data: [6], w: [3]
+        // Simple weighted sum of 3 overlapping positions
+        using a = lax.sliceInDim(data, 0, 4, 0);
+        using b = lax.sliceInDim(data, 1, 5, 0);
+        using c = lax.sliceInDim(data, 2, 6, 0);
+        using w0 = lax.sliceInDim(w, 0, 1, 0);
+        using w1 = lax.sliceInDim(w, 1, 2, 0);
+        using w2 = lax.sliceInDim(w, 2, 3, 0);
+        using wa = np.multiply(a, w0);
+        using wb = np.multiply(b, w1);
+        using wc = np.multiply(c, w2);
+        using wab = np.add(wa, wb);
+        using wabc = np.add(wab, wc);
+        return wabc.ref; // jax-js-lint: allow-ref
+      },
+      { data: xs, w: weights },
+      {
+        blockShape: [4],
+        inAxes: [[0], [null]],
+        outAxes: [0],
+        halo: [[[1, 1]], [[0, 0]]],
+      },
+    );
+    // Block 0 tile: data=[0, 1, 2, 3, 4, 5], w=[0.25, 0.5, 0.25]
+    //   out = 0*0.25 + 1*0.5 + 2*0.25 = 1.0
+    //         1*0.25 + 2*0.5 + 3*0.25 = 2.0
+    //         2*0.25 + 3*0.5 + 4*0.25 = 3.0
+    //         3*0.25 + 4*0.5 + 5*0.25 = 4.0
+    // Block 1 tile: data=[4, 5, 6, 7, 8, 0], w=[0.25, 0.5, 0.25]
+    //   out = 4*0.25 + 5*0.5 + 6*0.25 = 5.0
+    //         5*0.25 + 6*0.5 + 7*0.25 = 6.0
+    //         6*0.25 + 7*0.5 + 8*0.25 = 7.0
+    //         7*0.25 + 8*0.5 + 0*0.25 = 5.75
+    expect(result).toBeAllclose([1, 2, 3, 4, 5, 6, 7, 5.75]);
+  });
+
+  // T8.5: jit(blockMap) with halo — verifies compiled WASM halo codegen path.
+  test("T8.5: jit(blockMap) with halo [1,1]", () => {
+    const logs: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+
+    try {
+      setDebug(1);
+      const f = jit((xs: np.Array) =>
+        lax.blockMap(
+          (block: np.Array) => {
+            using sliced = lax.sliceInDim(block, 1, 5, 0);
+            return sliced.ref; // jax-js-lint: allow-ref
+          },
+          xs,
+          {
+            blockShape: [4],
+            halo: [[1, 1]],
+          },
+        ),
+      );
+
+      using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+      using result = f(xs);
+      expect(result).toBeAllclose([1, 2, 3, 4, 5, 6, 7, 8]);
+
+      const wasmLog = logs.find((l) => l.includes("compiled WASM loop path"));
+      expect(
+        wasmLog,
+        "T8.5 should use compiled WASM halo path, not fallback",
+      ).toBeDefined();
+
+      f.dispose();
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
+  });
+
+  // T8.6: 1D halo — asymmetric [0, 2] (causal stencil).
+  test("T8.6: asymmetric halo [0, 2]", () => {
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+
+    const result = lax.blockMap(
+      (block: np.Array) => {
+        // block shape: [6] = 4 + 0 + 2
+        // Output is first 4 elements (matching blockShape)
+        using sliced = lax.sliceInDim(block, 0, 4, 0);
+        return sliced.ref; // jax-js-lint: allow-ref
+      },
+      xs,
+      {
+        blockShape: [4],
+        halo: [[0, 2]],
+      },
+    );
+    // Block 0 tile: [1, 2, 3, 4, 5, 6] → out [1, 2, 3, 4]
+    // Block 1 tile: [5, 6, 7, 8, 0, 0] → out [5, 6, 7, 8]
+    expect(result).toBeAllclose([1, 2, 3, 4, 5, 6, 7, 8]);
+    result.dispose();
+  });
+
+  // T8.7: jit(blockMap) with asymmetric halo [0, 2] — verifies compiled WASM
+  // halo codegen for right-only halos where lo=0.
+  test("T8.7: jit(blockMap) with asymmetric halo [0, 2]", () => {
+    const logs: string[] = [];
+    const origInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+
+    try {
+      setDebug(1);
+      const f = jit((xs: np.Array) =>
+        lax.blockMap(
+          (block: np.Array) => {
+            using sliced = lax.sliceInDim(block, 0, 4, 0);
+            return sliced.ref; // jax-js-lint: allow-ref
+          },
+          xs,
+          {
+            blockShape: [4],
+            halo: [[0, 2]],
+          },
+        ),
+      );
+
+      using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+      using result = f(xs);
+      // Block 0 tile: [1, 2, 3, 4, 5, 6] → out [1, 2, 3, 4]
+      // Block 1 tile: [5, 6, 7, 8, 0, 0] → out [5, 6, 7, 8]
+      expect(result).toBeAllclose([1, 2, 3, 4, 5, 6, 7, 8]);
+
+      const wasmLog = logs.find((l) => l.includes("compiled WASM loop path"));
+      expect(
+        wasmLog,
+        "T8.7 should use compiled WASM halo path, not fallback",
+      ).toBeDefined();
+
+      f.dispose();
+    } finally {
+      setDebug(0);
+      console.info = origInfo;
+    }
+  });
+
+  // T8.8: grad(blockMap) with halo throws until Phase C.4 scatter-add.
+  test("T8.8: grad(blockMap) with halo throws", () => {
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(
+        (block: np.Array) => {
+          using sliced = lax.sliceInDim(block, 1, 5, 0);
+          return sliced.ref; // jax-js-lint: allow-ref
+        },
+        xs,
+        {
+          blockShape: [4],
+          halo: [[1, 1]],
+        },
+      );
+      return np.sum(mapped);
+    };
+
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    // Error during tracing leaks internal tracers — stop/restart the leak
+    // checker around the expected throw so those slots aren't counted.
+    checkLeaks.stop();
+    expect(() => grad(f)(xs)).toThrow(/scatter-add accumulation/);
+    clearCaches();
+    checkLeaks.start();
   });
 });

@@ -1801,6 +1801,25 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       numInputs: _numInputs,
     } = params;
     const undefMask = args.map((x) => x instanceof UndefPrimal);
+
+    // Guard: grad through halo-overlapping inputs requires scatter-add
+    // accumulation for overlapping gradient contributions. Not yet implemented
+    // (Phase C.4). Throw eagerly to avoid silently wrong gradients.
+    if (params.halo) {
+      for (let i = numConsts; i < args.length; i++) {
+        if (!undefMask[i]) continue;
+        const inputHalo = params.halo[i - numConsts];
+        for (const [lo, hi] of inputHalo) {
+          if (lo !== 0 || hi !== 0) {
+            throw new Error(
+              "grad(blockMap) with halo is not yet supported: overlapping " +
+                "input regions require scatter-add accumulation (Phase C.4)",
+            );
+          }
+        }
+      }
+    }
+
     const bodyUndefPrimals = jaxpr.inBinders.map((_, i) => undefMask[i]);
     const transposedBody = transposeJaxpr(jaxpr, bodyUndefPrimals);
 
@@ -1826,6 +1845,19 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     const jaxprConsts = transposedBody.consts;
     const allConsts = [...jaxprConsts, ...constResiduals];
 
+    // Forward halo for residual inputs; cotangent inputs (from outAxes) have
+    // no halo — they match blockShape, not blockShape+halo.
+    let transposeHalo: [number, number][][] | undefined;
+    if (params.halo) {
+      const residualHalo = params.halo.filter(
+        (_, i) => !undefMask[numConsts + i],
+      );
+      const ctHalo = outAxes.map(() =>
+        blockShape.map(() => [0, 0] as [number, number]),
+      );
+      transposeHalo = [...residualHalo, ...ctHalo];
+    }
+
     const transposedOut = bind(
       Primitive.BlockMap,
       [...allConsts, ...argResiduals, ...(cts as Tracer[])],
@@ -1837,6 +1869,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         numConsts: allConsts.length,
         numInputs: argResiduals.length + cts.length,
         threadTile: params.threadTile,
+        halo: transposeHalo,
       },
     );
 
