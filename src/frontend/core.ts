@@ -199,6 +199,10 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     halo?: [number, number][][];
     /** Set by JVP rule when this block_map was produced by differentiating an outer block_map. */
     isJvpTransformed?: boolean;
+    /** Original forward body jaxpr, set by JVP rule for stencil analysis in transpose. */
+    originalJaxpr?: Jaxpr;
+    /** Original body's numConsts, set alongside originalJaxpr. */
+    originalNumConsts?: number;
   };
   [Primitive.ForiLoop]: {
     jaxpr: Jaxpr;

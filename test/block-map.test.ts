@@ -1061,4 +1061,45 @@ describe("lax.blockMap — halo", () => {
       [2, 3, 3, 3, 3, 3, 3, 2],
     ]);
   });
+
+  // T8.14: grad(blockMap) with non-linear stencil body → falls back to
+  // pad+add accumulation (stencil analysis returns null for Mul(x,x)).
+  test("T8.14: grad(blockMap) non-linear halo body — pad+add fallback", () => {
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(
+        (block: np.Array) => {
+          using a = lax.sliceInDim(block, 0, 4, 0);
+          using b = lax.sliceInDim(block, 2, 6, 0);
+          using sum = np.add(a, b);
+          using sq = np.multiply(sum, sum); // non-linear → blocks gather path
+          return sq.ref; // jax-js-lint: allow-ref
+        },
+        xs,
+        { blockShape: [4], halo: [[1, 1]] },
+      );
+      return np.sum(mapped);
+    };
+
+    // Verify grad agrees with finite differences.
+    const gf = jit(grad(f));
+    using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8], { dtype: DType.Float32 });
+    using g = gf(xs) as np.Array;
+    const gData = g.dataSync() as Float32Array;
+
+    // FD reference
+    const eps = 1e-3;
+    const xsData = xs.dataSync() as Float32Array;
+    using fwdArr = f(xs);
+    const fwd = fwdArr.dataSync()[0] as number;
+    for (let i = 0; i < 8; i++) {
+      const perturbed = new Float32Array(xsData);
+      perturbed[i] += eps;
+      using xp = np.array(perturbed);
+      using fpArr = f(xp);
+      const fp = fpArr.dataSync()[0] as number;
+      const fdGrad = (fp - fwd) / eps;
+      expect(gData[i]).toBeCloseTo(fdGrad, 1);
+    }
+    gf.dispose();
+  });
 });

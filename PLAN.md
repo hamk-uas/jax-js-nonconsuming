@@ -692,33 +692,43 @@ _Implementation: unrolled pad+add accumulation in `transposeBlockMap` (`lineariz
    Also: T8.9 (identity body), T8.10 (asymmetric halo [0,2]).
 6. ✅ T8.13: `vmap(grad(blockMap({halo})))` — batched gradients over 1D stencil.
 
-**Step 2: Stencil body synthesis for linear stencils** (new `stencil-analysis.ts`)
+**Step 2: Stencil body synthesis for linear stencils** ✅ (new `stencil-analysis.ts`)
 
 A domain-specific compiler pass that synthesizes a gather-based backward body for linear stencil
-bodies. NOT `transposeJaxpr` reuse — this constructs a new jaxpr.
+bodies. NOT `transposeJaxpr` reuse — this constructs a new jaxpr via `makeJaxpr`.
 
-1. Analyze the forward body jaxpr: walk equations for `{UncheckedDynamicSlice, Mul(scalar), Add}`.
-   If the body contains only these ops (linear stencil), it is eligible.
-2. For each `UDS(input, [offH, offW], [B, B])` with weight `w`, emit reversed
-   `UDS(ct_tile, [K-1-offH, K-1-offW], [B, B]) * w` in the synthesized backward body.
-3. Compute backward halo: symmetric → same as forward; asymmetric → `[hi, lo]` per axis.
-4. Emit the synthesized backward body as a halo block_map with `(B+bwdHalo) → B` contract.
-5. Test: symmetric halo `[[1,1]]` backward matches finite differences (no body analysis needed).
-6. Test: asymmetric halo `[[0,2]]` (causal stencil) backward matches finite differences.
-7. Test: non-linear body (relu in stencil) falls back to Step 1 scatter-add.
+1. ✅ Analyze the **original** forward body jaxpr (threaded via `params.originalJaxpr` from JVP):
+   walk equations for `{Shrink, Mul(Lit scalar), Add}`. If the body contains only these ops
+   targeting a single halo-ed input (linear stencil), it is eligible. Note: forward bodies use
+   `Shrink` (from `lax.sliceInDim`), not `UncheckedDynamicSlice`.
+2. ✅ For each `Shrink(input, slice)` with weight `w`, emit reversed
+   `Shrink(ct_tile, reversed_slice) * w` in the synthesized backward body. Reversal formula:
+   `reversed_start = (lo + hi) - forward_start` per grid-mapped axis.
+3. ✅ Compute backward halo: `[hi, lo]` per axis (reversed from forward `[lo, hi]`).
+4. ✅ Emit the synthesized backward body as a halo block_map with `(B+bwdHalo) → B` contract.
+5. ✅ T8.11: jit(grad(blockMap)) halo [1,1] — uses gather path (3-point stencil, verified via debug
+   log "halo-VJP: using gather-based stencil synthesis").
+6. ✅ Pre-existing T8.10: asymmetric halo [0,2] grad — uses pad+add (analysis NYI for 0-width halo
+   sides). Gather path for asymmetric halos verified via scratch test.
+7. ✅ T8.14: non-linear body (multiply(x,x)) falls back to pad+add.
 
-**Step 3: Detect and route** (`linearize.ts`)
+**Step 3: Detect and route** ✅ (`linearize.ts`)
 
 Wire Steps 1 and 2 together in the BlockMap transpose rule:
 
-1. If no `halo` → existing path unchanged.
-2. If `halo` present → try stencil analysis (Step 2). If eligible → synthesized gather body.
-3. If analysis fails → scatter-add fallback (Step 1) + diagnostic.
+1. ✅ If no `halo` → existing path unchanged.
+2. ✅ If `halo` present and `params.originalJaxpr` available → try stencil analysis (Step 2). If
+   eligible → synthesized gather body (single block_map dispatch).
+3. ✅ If analysis fails → pad+add fallback (Step 1) + diagnostic (`setDebug(1)` logs path).
+
+JVP rule threads `originalJaxpr` and `originalNumConsts` through BlockMap params so the transpose
+rule can analyze the clean forward body (not the JVP-doubled body).
 
 ##### Affected files (complete list)
 
 - `src/library/lax-block-map.ts` — API, resolution, block aval expansion _(C.1)_
-- `src/frontend/core.ts` — `Primitive.BlockMap` params type _(C.1)_
+- `src/frontend/core.ts` — `Primitive.BlockMap` params type _(C.1)_; `originalJaxpr`,
+  `originalNumConsts` fields for halo VJP stencil synthesis _(C.4 Step 2)_
 - `src/frontend/array.ts` — eager block*map execution (halo slicing + padding) *(C.1)\_
 - `src/frontend/jit.ts` — block*map step type, halo in JitStep *(C.2)\_
 - `src/frontend/block-map-executor.ts` — WebGPU zero-copy, JS fallback halo-aware slicing _(C.2)_;
@@ -726,16 +736,19 @@ Wire Steps 1 and 2 together in the BlockMap transpose rule:
 - `src/backend/webgpu/block-map.ts` — signed bounds-checked reads in `gen_resolve()` _(C.2)_
 - `src/backend/wasm.ts` — `BlockMapWasmParams.halo` field, `codegenBlockMapLoop()` halo-aware input
   copy _(C.2b)_
-- `src/frontend/jvp.ts` — forward `halo` in JVP rule _(C.1)_
-- `src/frontend/linearize.ts` — forward `halo` in PE + transpose rules; scatter-add fallback +
-  stencil synthesis routing _(C.4)_
-- `src/frontend/stencil-analysis.ts` — (new, Phase C.4 Step 2) linear stencil body synthesis for
-  gather-based halo VJP
+- `src/frontend/jvp.ts` — forward `halo` in JVP rule _(C.1)_; thread `originalJaxpr`,
+  `originalNumConsts` to transpose rule _(C.4 Step 2)_
+- `src/frontend/linearize.ts` — forward `halo` in PE + transpose rules; pad+add fallback +
+  gather-based stencil synthesis routing _(C.4 Steps 1–3)_
+- `src/frontend/stencil-analysis.ts` — (new, Phase C.4 Step 2) linear stencil body analysis
+  (`analyzeLinearStencil`) and reversed-slice computation (`reverseStencilSlice`) for gather-based
+  halo VJP
 - `src/frontend/vmap.ts` — forward `halo` in vmap rule _(C.1)_
 - `src/index.ts` — `_lastConvRewritten` export _(C.3)_; `_setConvRewriteEnabled` is NOT exported
   (internal-only, bench imports directly from source); no new exports for halo (part of existing
   `BlockMapOptions`)
-- `test/block-map.test.ts` — halo-specific test cases T8.1–T8.8 _(C.1–C.2)_
+- `test/block-map.test.ts` — halo-specific test cases T8.1–T8.8 _(C.1–C.2)_; T8.9–T8.13 _(C.4
+  Step 1)_; T8.14 non-linear fallback _(C.4 Step 2)_
 
 ### Correctness and regression coverage
 

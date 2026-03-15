@@ -93,6 +93,7 @@ import {
   Var,
 } from "./jaxpr";
 import { jvp, lowerAux } from "./jvp";
+import { analyzeLinearStencil, reverseStencilSlice } from "./stencil-analysis";
 import { jacfwd, moveaxis, vmap } from "./vmap";
 
 /** Internal zeros allocation (marking handled by fullInternal).
@@ -1984,14 +1985,138 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       return outVals;
     }
 
-    // ---- Halo VJP: scatter-add fallback (Phase C.4 Step 1) ----
+    // ---- Halo VJP: try gather-based stencil synthesis (Step 2) ----
+    // If the forward body is a linear stencil (only Shrink/Add/Mul(Lit)),
+    // synthesize a reversed-stencil backward body and run it as a single
+    // block_map with reversed halo. O(1) dispatches instead of O(numBlocks).
+
+    const halo = params.halo!;
+    const gatherResult = (() => {
+      // Need the original forward body for analysis. Only available after JVP.
+      const origJaxpr = params.originalJaxpr;
+      if (!origJaxpr) return null;
+      const origNC = params.originalNumConsts ?? 0;
+
+      // Original number of inputs (doubled by JVP → halve).
+      const origNI = _numInputs / 2;
+
+      // Original halo and inAxes are the first half of the doubled arrays.
+      const origHalo = halo.slice(0, origNI);
+      const origInAxes = inAxes.slice(0, origNI);
+
+      // Eligible: single halo-ed input in the original body, no consts.
+      if (origNC !== 0) return null;
+      if (origJaxpr.outs.length !== 1) return null;
+
+      let origHaloIdx = -1;
+      let origHaloCount = 0;
+      for (let i = 0; i < origNI; i++) {
+        if (origHalo[i].some(([lo, hi]) => lo !== 0 || hi !== 0)) {
+          origHaloCount++;
+          origHaloIdx = i;
+        }
+      }
+      if (origHaloCount !== 1) return null;
+
+      // Analyze original forward body for linear stencil.
+      const bodyInputIdx = origNC + origHaloIdx;
+      const desc = analyzeLinearStencil(origJaxpr, bodyInputIdx);
+      if (desc === null) return null;
+
+      if (DEBUG >= 1)
+        console.log(
+          "halo-VJP: using gather-based stencil synthesis (" +
+            desc.terms.length +
+            " terms)",
+        );
+
+      // Compute backward halo: [hi, lo] per grid axis.
+      const fwdHalo = origHalo[origHaloIdx];
+      const bwdHalo: [number, number][] = fwdHalo.map(
+        ([lo, hi]) => [hi, lo] as [number, number],
+      );
+      const inputInAxes = origInAxes[origHaloIdx];
+
+      // Reverse each stencil term's Shrink slice.
+      const reversedTerms = desc.terms.map((term) => ({
+        slice: reverseStencilSlice(
+          term.slice,
+          inputInAxes,
+          fwdHalo,
+          blockShape,
+        ),
+        weight: term.weight,
+      }));
+
+      // Backward tile aval: same total size as forward tile (B+lo+hi = B+hi+lo).
+      const fwdTileAval = origJaxpr.inBinders[bodyInputIdx].aval;
+      const bwdTileAval = new ShapedArray(
+        fwdTileAval.shape as number[],
+        fwdTileAval.dtype,
+        false,
+      );
+
+      // Synthesize backward body via makeJaxpr.
+      const { jaxpr: bwdBodyJaxpr } = makeJaxpr(
+        (ctTile: Tracer): Tracer => {
+          let result: TracerValue | null = null;
+          for (const term of reversedTerms) {
+            let val: TracerValue = shrink(ctTile, term.slice);
+            if (term.weight !== 1.0) val = mul(val, term.weight);
+            result = result === null ? val : add(result, val);
+          }
+          return result as Tracer;
+        },
+        { validateRefs: false },
+      )(bwdTileAval);
+
+      // The ct for the tangent output: in the doubled BlockMap outputs
+      // [outP..., outT...], the tangent outputs are the second half.
+      const numOrigOutputs = origJaxpr.outs.length; // 1
+      const ctTangent = cts[numOrigOutputs];
+      if (ctTangent == null) return null; // no gradient signal → skip
+
+      // Build backward block_map. outAxes[0] == outAxes[numOrigOutputs]
+      // since JVP duplicates them.
+      const bwdConsts = bwdBodyJaxpr.consts;
+      const bwdOut = bind(
+        Primitive.BlockMap,
+        [...bwdConsts, ctTangent as Tracer],
+        {
+          jaxpr: bwdBodyJaxpr.jaxpr,
+          blockShape,
+          inAxes: [outAxes[0]], // ct follows forward output tiling
+          outAxes: [inputInAxes], // gradient follows forward input tiling
+          numConsts: bwdConsts.length,
+          numInputs: 1,
+          halo: [[...bwdHalo]],
+        },
+      );
+
+      bwdBodyJaxpr.dispose();
+      transposedBody.dispose();
+
+      // Assemble outVals. In the doubled args:
+      //   [doubledConsts..., primalInputs..., tangentInputs...]
+      // The tangent input with halo is at: numConsts + origNI + origHaloIdx.
+      const tangentArgIdx = numConsts + origNI + origHaloIdx;
+
+      const outVals: (Tracer | null)[] = [];
+      for (let i = 0; i < args.length; i++) {
+        if (i === tangentArgIdx) outVals.push(bwdOut[0] as Tracer);
+        else outVals.push(null);
+      }
+      return outVals;
+    })();
+
+    if (gatherResult !== null) return gatherResult;
+
+    // ---- Halo VJP: pad+add fallback (Phase C.4 Step 1) ----
     // Overlapping halo regions mean adjacent blocks' gradient patches share
     // elements. Standard block_map concat/trim would lose overlap
     // contributions. Strategy: unroll the block loop at trace time, pad each
     // gradient patch to the padded-accumulator size, and add.
     if (DEBUG >= 1) console.log("halo-VJP: using pad+add accumulation");
-
-    const halo = params.halo!;
 
     // Compute grid shape and original dims from ALL args (including UndefPrimal).
     const gridShape: number[] = new Array(gridRank).fill(0);

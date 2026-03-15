@@ -941,6 +941,8 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
         threadTile: params.threadTile,
         halo: params.halo ? [...params.halo, ...params.halo] : undefined,
         isJvpTransformed: true,
+        originalJaxpr: jaxpr,
+        originalNumConsts: numConsts,
       },
     );
 
