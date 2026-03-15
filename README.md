@@ -78,7 +78,40 @@ import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 }
 ```
 
-## Demos
+In vanilla JavaScript (without a bundler), just import from a module script tag. This is the easiest
+way to get started on a blank HTML page.
+
+```html
+<script type="module">
+  import { numpy as np } from "https://esm.sh/@jax-js/jax";
+</script>
+```
+
+### Platforms
+
+This table refers to latest versions of each browser. WebGPU has gained wide support in browsers as
+of late 2025.
+
+| Platform            | CPU (Wasm) | GPU (WebGPU)   | GPU (WebGL) |
+| ------------------- | ---------- | -------------- | ----------- |
+| Chrome / Edge       | ✅         | ✅             | ✅          |
+| Firefox             | ✅         | ✅ - macOS 26+ | ✅          |
+| Safari              | ✅         | ✅ - macOS 26+ | ✅          |
+| iOS                 | ✅         | ✅ - iOS 26+   | ✅          |
+| Chrome for Android  | ✅         | ✅             | ✅          |
+| Firefox for Android | ✅         | ❌             | ✅          |
+| Node.js             | ✅         | ❌             | ❌          |
+| Deno                | ✅         | ✅ - async     | ❌          |
+
+## Examples
+
+Community usage:
+
+- [**autoresearch-webgpu**: autoresesarch, in the browser](https://autoresearch.lucasgelfond.online/)
+- [**tanh.xyz**: Interactive ML visualizations](https://tanh.xyz/)
+- [**jax-js-bayes**: Declarative Bayesian modeling library](https://github.com/StefanSko/jax-js-bayes)
+
+Demos:
 
 - [Training neural networks on MNIST](https://hamk-uas.github.io/jax-js-nonconsuming/mnist)
 - [Voice cloning: Kyutai Pocket TTS](https://hamk-uas.github.io/jax-js-nonconsuming/tts)
