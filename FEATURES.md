@@ -326,7 +326,7 @@ Most operations behave the same way as they do in JAX.
 | `mask_indices`        | 🟠      |                                                          |
 | `matmul`              | 🟢      | batch broadcasting, 1D vector support                    |
 | `matrix_transpose`    | 🟢      |                                                          |
-| `matvec`              | 🟠      |                                                          |
+| `matvec`              | �       |                                                          |
 | `max`                 | 🟢      |                                                          |
 | `maximum`             | 🟢      |                                                          |
 | `mean`                | 🟢      |                                                          |
@@ -470,7 +470,7 @@ Most operations behave the same way as they do in JAX.
 | `var`                 | 🟢      |                                                          |
 | `vdot`                | 🟢      |                                                          |
 | `vecdot`              | 🟢      |                                                          |
-| `vecmat`              | 🟠      |                                                          |
+| `vecmat`              | �       |                                                          |
 | `vectorize`           | 🟠      |                                                          |
 | `vsplit`              | 🟠      | `split` is supported                                     |
 | `vstack`              | 🟢      |                                                          |

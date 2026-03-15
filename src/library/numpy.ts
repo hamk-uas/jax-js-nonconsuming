@@ -1262,6 +1262,20 @@ export function matmul(x: ArrayLike, y: ArrayLike): Array {
   }
 }
 
+/** Matrix-vector product. x1 is [..., M, N], x2 is [..., N] → [..., M]. */
+export function matvec(x1: ArrayLike, x2: ArrayLike): Array {
+  if (ndim(x1) < 2 || ndim(x2) < 1)
+    throw new Error("matvec: x1 must be at least 2D and x2 at least 1D");
+  return einsum("...mn,...n->...m", x1, x2);
+}
+
+/** Vector-matrix product. x1 is [..., N], x2 is [..., N, M] → [..., M]. */
+export function vecmat(x1: ArrayLike, x2: ArrayLike): Array {
+  if (ndim(x1) < 1 || ndim(x2) < 2)
+    throw new Error("vecmat: x1 must be at least 1D and x2 at least 2D");
+  return einsum("...n,...nm->...m", x1, x2);
+}
+
 /** Dot product of two arrays. */
 export function dot(x: ArrayLike, y: ArrayLike): Array {
   if (ndim(x) === 0 || ndim(y) === 0) {
