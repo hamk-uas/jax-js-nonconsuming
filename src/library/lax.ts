@@ -33,6 +33,11 @@ export type { AssociativeScanOptions } from "./lax-associative-scan";
 export { blockIndex, blockMap };
 export type { BlockMapOptions } from "./lax-block-map";
 
+/** Elementwise bitcast an array into a new dtype. */
+export function bitcastConvertType(x: ArrayLike, newDtype: DType): Array {
+  return fudgeArray(x).view(newDtype);
+}
+
 /**
  * Dimension numbers for general `dot()` primitive.
  *
