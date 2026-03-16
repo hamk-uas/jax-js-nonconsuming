@@ -77,16 +77,24 @@ const computeDivergence = jit(function computeDivergence(
   return e.sub(w).add(n.sub(s)).mul(coeff);
 });
 
-const jacobiStep = jit(function jacobiStep(
-  divergence: np.Array,
-  p: np.Array,
-): np.Array {
+function jacobiStepRaw(divergence: np.Array, p: np.Array): np.Array {
   const n = shift2D(p, 0, 1);
   const s = shift2D(p, 0, -1);
   const e = shift2D(p, 1, 1);
   const w = shift2D(p, 1, -1);
   const alpha = -(DX * DX);
   return n.add(s).add(e).add(w).add(divergence.mul(alpha)).mul(0.25);
+}
+
+// Fused: all JACOBI_ITERS iterations traced into one JIT program (1 tape vs 10)
+const jacobiSolve = jit(function jacobiSolve(
+  divergence: np.Array,
+  p: np.Array,
+): np.Array {
+  for (let i = 0; i < JACOBI_ITERS; i++) {
+    p = jacobiStepRaw(divergence, p);
+  }
+  return p;
 });
 
 const subtractGradient = jit(function subtractGradient(
@@ -440,10 +448,8 @@ async function simulate() {
       // 4) Pressure projection (warm-start from previous frame)
       {
         using div = computeDivergence(velocity);
-        for (let i = 0; i < JACOBI_ITERS; i++) {
-          using prev = pressure;
-          pressure = jacobiStep(div, prev);
-        }
+        using prev = pressure;
+        pressure = jacobiSolve(div, prev);
       }
 
       // 5) Subtract pressure gradient
