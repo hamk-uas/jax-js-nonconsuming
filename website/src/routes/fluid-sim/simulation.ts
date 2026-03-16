@@ -3,6 +3,7 @@ import {
   getWebGPUDevice,
   init,
   jit,
+  lax,
   numpy as np,
   withBatch,
 } from "@hamk-uas/jax-js-nonconsuming";
@@ -86,15 +87,21 @@ function jacobiStepRaw(divergence: np.Array, p: np.Array): np.Array {
   return n.add(s).add(e).add(w).add(divergence.mul(alpha)).mul(0.25);
 }
 
-// Fused: all JACOBI_ITERS iterations traced into one JIT program (1 tape vs 10)
+// Fused: JACOBI_ITERS iterations via lax.scan (1 compact scan dispatch vs 10× unrolled)
 const jacobiSolve = jit(function jacobiSolve(
   divergence: np.Array,
   p: np.Array,
 ): np.Array {
-  for (let i = 0; i < JACOBI_ITERS; i++) {
-    p = jacobiStepRaw(divergence, p);
-  }
-  return p;
+  const [result] = lax.scan(
+    (carry: np.Array, _x: null): [np.Array, null] => {
+      const next = jacobiStepRaw(divergence, carry);
+      return [next, null];
+    },
+    p,
+    null as unknown as np.Array,
+    { length: JACOBI_ITERS },
+  );
+  return result;
 });
 
 const subtractGradient = jit(function subtractGradient(

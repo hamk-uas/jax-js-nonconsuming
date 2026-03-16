@@ -141,6 +141,16 @@ export interface TapeReverse {
   innerBytes: number;
 }
 
+/** Pre-resolved scan operation. */
+export interface TapeScan {
+  step: Extract<JitStep, { type: "scan" }>;
+  constIdxs: number[];
+  initCarryIdxs: number[];
+  xsIdxs: number[];
+  carryOutIdxs: number[];
+  ysStackedIdxs: number[];
+}
+
 /** A single tape operation in execution order. */
 export type TapeOp =
   | { type: "malloc"; malloc: TapeMalloc }
@@ -149,7 +159,8 @@ export type TapeOp =
   | { type: "dispatch"; dispatch: TapeDispatch }
   | { type: "dus"; dus: TapeDUS }
   | { type: "scatter_add"; scatterAdd: TapeScatterAdd }
-  | { type: "reverse"; reverse: TapeReverse };
+  | { type: "reverse"; reverse: TapeReverse }
+  | { type: "scan"; scan: TapeScan };
 
 /** A pre-compiled dispatch sequence for a kernel-only JitProgram. */
 export interface WebGPUCommandTape {
@@ -238,9 +249,16 @@ export function buildConflictGraphAndColor(
   // its own arena entry — leading to buffer identity conflicts. Rather than
   // tracking this inheritance, we exclude all recycle ends from coloring.
   for (const op of tape.ops) {
-    if (op.type !== "recycle") continue;
-    externalSet.add(op.fromIdx);
-    externalSet.add(op.toIdx);
+    if (op.type === "recycle") {
+      externalSet.add(op.fromIdx);
+      externalSet.add(op.toIdx);
+    } else if (op.type === "scan") {
+      for (const idx of op.scan.constIdxs) externalSet.add(idx);
+      for (const idx of op.scan.initCarryIdxs) externalSet.add(idx);
+      for (const idx of op.scan.xsIdxs) externalSet.add(idx);
+      for (const idx of op.scan.carryOutIdxs) externalSet.add(idx);
+      for (const idx of op.scan.ysStackedIdxs) externalSet.add(idx);
+    }
   }
 
   // Build adjacency lists (conflict graph).
@@ -365,8 +383,11 @@ export function canCompileToCommandTape(steps: JitStep[]): boolean {
         )
           return false;
         break;
-      case "incref":
       case "scan":
+        if (step.plan.path === "fallback") return false;
+        // WebGPU paths are supported
+        break;
+      case "incref":
       case "assoc_scan":
       case "block_map":
       case "fori_loop":

@@ -54,6 +54,7 @@ import {
   type TapeDUS,
   type TapeOp,
   type TapeReverse,
+  type TapeScan,
   type TapeScatterAdd,
   type WebGPUCommandTape,
 } from "./webgpu/command-tape";
@@ -817,18 +818,26 @@ export class WebGPUBackend implements Backend {
   dispatchNativeScanGeneral(
     exe: Executable<ShaderDispatch[]>,
     params: NativeScanMultiParams,
-    consts: Slot[],
-    initCarry: Slot[],
-    xs: Slot[],
-    carryOut: Slot[],
-    ysStacked: Slot[],
+    consts: (Slot | GPUBuffer)[],
+    initCarry: (Slot | GPUBuffer)[],
+    xs: (Slot | GPUBuffer)[],
+    carryOut: (Slot | GPUBuffer)[],
+    ysStacked: (Slot | GPUBuffer)[],
+    tapeCtx?: {
+      encoder: GPUCommandEncoder;
+      deferredDestroys: GPUBuffer[];
+      copyUniforms: GPUBuffer[];
+      pooledDuringTape: Set<GPUBuffer>;
+    }
   ): void {
-    const commandEncoder = this.device.createCommandEncoder();
+    const getBuf = (s: Slot | GPUBuffer) => s instanceof GPUBuffer ? s : this.#getBuffer(s).buffer;
+    const commandEncoder = tapeCtx?.encoder ?? this.#batchEncoder ?? this.device.createCommandEncoder();
+    const ownEncoder = !tapeCtx && !this.#batchEncoder;
 
     // Pre-copy initCarry → carryOut (shader reads carry as pre-initialized)
     for (let i = 0; i < initCarry.length; i++) {
-      const initBuf = this.#getBuffer(initCarry[i]).buffer;
-      const carryBuf = this.#getBuffer(carryOut[i]).buffer;
+      const initBuf = getBuf(initCarry[i]);
+      const carryBuf = getBuf(carryOut[i]);
       if (initBuf !== carryBuf) {
         commandEncoder.copyBufferToBuffer(
           initBuf,
@@ -842,10 +851,10 @@ export class WebGPUBackend implements Backend {
 
     // Binding order: [consts(read), xs(read), carry(read_write), ys(read_write)]
     const allBuffers = [
-      ...consts.map((slot) => this.#getBuffer(slot).buffer),
-      ...xs.map((slot) => this.#getBuffer(slot).buffer),
-      ...carryOut.map((slot) => this.#getBuffer(slot).buffer),
-      ...ysStacked.map((slot) => this.#getBuffer(slot).buffer),
+      ...consts.map(getBuf),
+      ...xs.map(getBuf),
+      ...carryOut.map(getBuf),
+      ...ysStacked.map(getBuf),
     ];
 
     for (const { pipeline, ...shader } of exe.data) {
@@ -876,7 +885,10 @@ export class WebGPUBackend implements Backend {
         passEncoder.end();
       }
     }
-    this.device.queue.submit([commandEncoder.finish()]);
+    
+    if (ownEncoder) {
+      this.device.queue.submit([commandEncoder.finish()]);
+    }
   }
   // ---------------------------------------------------------------------------
   // Preencoded-routine scan methods (P4)
@@ -1145,11 +1157,17 @@ export class WebGPUBackend implements Backend {
    */
   dispatchPreencodedScan(
     prepared: PreparedPreencodedScan,
-    constSlots: Slot[],
-    initCarrySlots: Slot[],
-    xsSlots: Slot[],
-    carryOutSlots: Slot[],
-    ysStackedSlots: Slot[],
+    constSlots: (Slot | GPUBuffer)[],
+    initCarrySlots: (Slot | GPUBuffer)[],
+    xsSlots: (Slot | GPUBuffer)[],
+    carryOutSlots: (Slot | GPUBuffer)[],
+    ysStackedSlots: (Slot | GPUBuffer)[],
+    tapeCtx?: {
+      encoder: GPUCommandEncoder;
+      deferredDestroys: GPUBuffer[];
+      copyUniforms: GPUBuffer[];
+      pooledDuringTape: Set<GPUBuffer>;
+    }
   ): void {
     const {
       params,
@@ -1169,17 +1187,12 @@ export class WebGPUBackend implements Backend {
       routineOutputJitIds,
     } = params;
 
-    const constBuffers = constSlots.map((slot) => this.#getBuffer(slot).buffer);
-    const initCarryBuffers = initCarrySlots.map(
-      (slot) => this.#getBuffer(slot).buffer,
-    );
-    const xsBuffers = xsSlots.map((slot) => this.#getBuffer(slot).buffer);
-    const carryOutBuffers = carryOutSlots.map(
-      (slot) => this.#getBuffer(slot).buffer,
-    );
-    const ysStackedBuffers = ysStackedSlots.map(
-      (slot) => this.#getBuffer(slot).buffer,
-    );
+    const getBuf = (s: Slot | GPUBuffer) => (s instanceof GPUBuffer ? s : this.#getBuffer(s).buffer);
+    const constBuffers = constSlots.map(getBuf);
+    const initCarryBuffers = initCarrySlots.map(getBuf);
+    const xsBuffers = xsSlots.map(getBuf);
+    const carryOutBuffers = carryOutSlots.map(getBuf);
+    const ysStackedBuffers = ysStackedSlots.map(getBuf);
 
     // Create ping-pong buffers for carry state (prefer pool)
     const carryPing = carrySizes.map((size) => {
@@ -1191,7 +1204,8 @@ export class WebGPUBackend implements Backend {
       return this.#poolPop(padded) ?? this.#createBuffer(padded);
     });
 
-    const commandEncoder = this.device.createCommandEncoder();
+    const commandEncoder = tapeCtx?.encoder ?? this.#batchEncoder ?? this.device.createCommandEncoder();
+    const ownEncoder = !tapeCtx && !this.#batchEncoder;
     const copyUniformBuffers: GPUBuffer[] = [];
 
     // Copy initCarry to carryPing
@@ -1298,7 +1312,7 @@ export class WebGPUBackend implements Backend {
         // Use original xs index for stacking position (reverse flips order)
         const ysIdx = reverse ? length - 1 - iter : iter;
         const currentCarryBuffers = iter % 2 === 0 ? carryPong : carryPing;
-        for (let c = 0; c < numCarry; c++) {
+        for (let c = 0; c < ysStackedBuffers.length; c++) {
           const copySize = carrySizes[c];
           if (copySize <= 0) continue;
           const yOffset = ysIdx * copySize;
@@ -1351,14 +1365,27 @@ export class WebGPUBackend implements Backend {
       }
     }
 
-    this.device.queue.submit([commandEncoder.finish()]);
+    if (ownEncoder) {
+      this.device.queue.submit([commandEncoder.finish()]);
+    }
 
     // Clean up temporary buffers
-    for (const buf of copyUniformBuffers) buf.destroy();
-    for (const buf of [...carryPing, ...carryPong]) {
-      if (!this.#poolPush(buf)) {
-        this.#gpuAllocatedBytes -= buf.size;
-        buf.destroy();
+    if (tapeCtx) {
+      for (const buf of copyUniformBuffers) tapeCtx.copyUniforms.push(buf);
+      for (const buf of [...carryPing, ...carryPong]) {
+        if (!this.#poolPush(buf)) {
+          tapeCtx.deferredDestroys.push(buf);
+        } else {
+          tapeCtx.pooledDuringTape.add(buf);
+        }
+      }
+    } else {
+      for (const buf of copyUniformBuffers) buf.destroy();
+      for (const buf of [...carryPing, ...carryPong]) {
+        if (!this.#poolPush(buf)) {
+          this.#gpuAllocatedBytes -= buf.size;
+          buf.destroy();
+        }
       }
     }
     // offsetBuffer is NOT destroyed — owned by PreparedPreencodedScan for reuse
@@ -1584,12 +1611,19 @@ export class WebGPUBackend implements Backend {
    */
   dispatchPreencodedMultiStepScan(
     prepared: PreparedPreencodedMultiStep,
-    constSlots: Slot[],
-    initCarrySlots: Slot[],
-    xsSlots: Slot[],
-    carryOutSlots: Slot[],
-    ysStackedSlots: Slot[],
+    constSlots: (Slot | GPUBuffer)[],
+    initCarrySlots: (Slot | GPUBuffer)[],
+    xsSlots: (Slot | GPUBuffer)[],
+    carryOutSlots: (Slot | GPUBuffer)[],
+    ysStackedSlots: (Slot | GPUBuffer)[],
+    tapeCtx?: {
+      encoder: GPUCommandEncoder;
+      deferredDestroys: GPUBuffer[];
+      copyUniforms: GPUBuffer[];
+      pooledDuringTape: Set<GPUBuffer>;
+    }
   ): void {
+    const getBuf = (s: Slot | GPUBuffer) => s instanceof GPUBuffer ? s : this.#getBuffer(s).buffer;
     const {
       length,
       stepEntries,
@@ -1609,15 +1643,11 @@ export class WebGPUBackend implements Backend {
     } = prepared;
 
     // Resolve slots to GPU buffers
-    const constBuffers = constSlots.map((s) => this.#getBuffer(s).buffer);
-    const initCarryBuffers = initCarrySlots.map(
-      (s) => this.#getBuffer(s).buffer,
-    );
-    const xsBuffers = xsSlots.map((s) => this.#getBuffer(s).buffer);
-    const carryOutBuffers = carryOutSlots.map((s) => this.#getBuffer(s).buffer);
-    const ysStackedBuffers = ysStackedSlots.map(
-      (s) => this.#getBuffer(s).buffer,
-    );
+    const constBuffers = constSlots.map(getBuf);
+    const initCarryBuffers = initCarrySlots.map(getBuf);
+    const xsBuffers = xsSlots.map(getBuf);
+    const carryOutBuffers = carryOutSlots.map(getBuf);
+    const ysStackedBuffers = ysStackedSlots.map(getBuf);
 
     // Create transient ping-pong carry buffers (prefer pool)
     const carryPing = carrySizes.map((sz) => {
@@ -1635,7 +1665,8 @@ export class WebGPUBackend implements Backend {
       return this.#poolPop(padded) ?? this.#createBuffer(padded);
     });
 
-    const commandEncoder = this.device.createCommandEncoder();
+    const commandEncoder = tapeCtx?.encoder ?? this.#batchEncoder ?? this.device.createCommandEncoder();
+    const ownEncoder = !tapeCtx && !this.#batchEncoder;
     const copyUniformBuffers: GPUBuffer[] = [];
 
     // Copy initCarry → carryPing
@@ -1834,14 +1865,27 @@ export class WebGPUBackend implements Backend {
       }
     }
 
-    this.device.queue.submit([commandEncoder.finish()]);
+    if (ownEncoder) {
+      this.device.queue.submit([commandEncoder.finish()]);
+    }
 
     // Clean up transient buffers
-    for (const buf of copyUniformBuffers) buf.destroy();
-    for (const buf of [...carryPing, ...carryPong, ...internalBuffers]) {
-      if (!this.#poolPush(buf)) {
-        this.#gpuAllocatedBytes -= buf.size;
-        buf.destroy();
+    if (tapeCtx) {
+      for (const buf of copyUniformBuffers) tapeCtx.copyUniforms.push(buf);
+      for (const buf of [...carryPing, ...carryPong, ...internalBuffers]) {
+        if (!this.#poolPush(buf)) {
+          tapeCtx.deferredDestroys.push(buf);
+        } else {
+          tapeCtx.pooledDuringTape.add(buf);
+        }
+      }
+    } else {
+      for (const buf of copyUniformBuffers) buf.destroy();
+      for (const buf of [...carryPing, ...carryPong, ...internalBuffers]) {
+        if (!this.#poolPush(buf)) {
+          this.#gpuAllocatedBytes -= buf.size;
+          buf.destroy();
+        }
       }
     }
     // Per-step offset buffers are NOT destroyed — owned by prepared for reuse
@@ -2293,6 +2337,18 @@ export class WebGPUBackend implements Backend {
           ops.push({ type: "reverse", reverse });
           break;
         }
+        case "scan": {
+          const tapeScan: TapeScan = {
+            step,
+            constIdxs: step.consts.map((id) => idToIdx.get(id)!),
+            initCarryIdxs: step.initCarry.map((id) => idToIdx.get(id)!),
+            xsIdxs: step.xs.map((id) => idToIdx.get(id)!),
+            carryOutIdxs: step.outputs.slice(0, step.numCarry).map((id) => idToIdx.get(id)!),
+            ysStackedIdxs: step.outputs.slice(step.numCarry).map((id) => idToIdx.get(id)!),
+          };
+          ops.push({ type: "scan", scan: tapeScan });
+          break;
+        }
       }
     }
 
@@ -2530,7 +2586,7 @@ export class WebGPUBackend implements Backend {
     const copyUniforms: GPUBuffer[] = [];
     // Track buffers pushed to pool during this tape execution so we can
     // remove them on error (prevents pool poisoning with destroyed refs).
-    const pooledDuringTape: GPUBuffer[] = [];
+    const pooledDuringTape = new Set<GPUBuffer>();
     let submitted = false;
     const ownEncoder = !this.#batchEncoder;
 
@@ -2581,7 +2637,7 @@ export class WebGPUBackend implements Backend {
                 if (!this.#poolPush(buf)) {
                   deferredDestroys.push(buf);
                 } else {
-                  pooledDuringTape.push(buf);
+                  pooledDuringTape.add(buf);
                 }
               } else {
                 this.#batchDeferredFreeBuffers.push(buf);
@@ -2832,6 +2888,56 @@ export class WebGPUBackend implements Backend {
                 r.innerBytes,
               );
               if (u) copyUniforms.push(u);
+            }
+            break;
+          }
+          case "scan": {
+            const { scan } = op;
+            const consts = scan.constIdxs.map((i) => buffers[i]);
+            const initCarry = scan.initCarryIdxs.map((i) => buffers[i]);
+            const xs = scan.xsIdxs.map((i) => buffers[i]);
+            const carryOut = scan.carryOutIdxs.map((i) => buffers[i]);
+            const ysStacked = scan.ysStackedIdxs.map((i) => buffers[i]);
+
+            const tapeCtx = {
+              encoder,
+              deferredDestroys,
+              copyUniforms,
+              pooledDuringTape,
+            };
+
+            const plan = scan.step.plan;
+            if (plan.path === "compiled-loop") {
+              this.dispatchNativeScanGeneral(
+                plan.executable,
+                plan.params as NativeScanMultiParams,
+                consts,
+                initCarry,
+                xs,
+                carryOut,
+                ysStacked,
+                tapeCtx,
+              );
+            } else if (plan.path === "preencoded-multi-step") {
+              this.dispatchPreencodedMultiStepScan(
+                plan.prepared as PreparedPreencodedMultiStep,
+                consts,
+                initCarry,
+                xs,
+                carryOut,
+                ysStacked,
+                tapeCtx,
+              );
+            } else if (plan.path === "preencoded-routine") {
+              this.dispatchPreencodedScan(
+                plan.preencodedParams as PreparedPreencodedScan,
+                consts,
+                initCarry,
+                xs,
+                carryOut,
+                ysStacked,
+                tapeCtx,
+              );
             }
             break;
           }

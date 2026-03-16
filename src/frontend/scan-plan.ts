@@ -1149,12 +1149,19 @@ function tryPreparePreencodedScan(
     return null;
   }
 
-  if (numCarry !== numY) {
-    if (DEBUG >= 2)
-      console.log(
-        `Preencoded scan: skipped, numCarry=${numCarry} !== numY=${numY}`,
-      );
-    return null;
+  // We only support passthrough pattern for Y outputs in preencoded scan.
+  // We don't mandate `numCarry === numY` (could be carry-only with numY=0),
+  // but if numY > 0, the Y outputs must exactly match the first numY carry outputs.
+  const yOutIds =
+    numY > 0 ? bodyProgram.outputs.slice(numCarry, numCarry + numY) : [];
+  const carryOutIds = bodyProgram.outputs.slice(0, numCarry);
+  
+  for (let i = 0; i < numY; i++) {
+    if (yOutIds[i] !== carryOutIds[i]) {
+      if (DEBUG >= 2)
+        console.log(`Preencoded scan: skipped, Y output ${i} is not passthrough from carry ${i}`);
+      return null;
+    }
   }
 
   const carryAvals = bodyJaxpr.inBinders
