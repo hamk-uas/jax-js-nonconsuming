@@ -16,10 +16,10 @@ Other features just aren't implemented yet. But those can probably be added easi
 
 In the tables below, we use a color legend to refer to functions in JAX:
 
-- 🟢 = supported **(~45%)**
+- 🟢 = supported **(~52%)**
 - 🟡 = supported, with API limitations **(~2%)**
-- 🟠 = not supported, easy to add (<1 day) **(~35%)**
-- 🔴 = not supported **(~18%)**
+- 🟠 = not supported, easy to add (<1 day) **(~32%)**
+- 🔴 = not supported **(~14%)**
 - ⚪️ = not applicable, will not be supported (see notes)
 
 ## [`jax`](https://docs.jax.dev/en/latest/jax.html)
@@ -318,10 +318,10 @@ Most operations behave the same way as they do in JAX.
 | `log2`                | 🟢      |                                                          |
 | `logaddexp`           | 🟠      |                                                          |
 | `logaddexp2`          | 🟠      |                                                          |
-| `logical_and`         | 🟠      |                                                          |
-| `logical_not`         | 🟠      |                                                          |
-| `logical_or`          | 🟠      |                                                          |
-| `logical_xor`         | 🟠      |                                                          |
+| `logical_and`         | 🟢      |                                                          |
+| `logical_not`         | 🟢      |                                                          |
+| `logical_or`          | 🟢      |                                                          |
+| `logical_xor`         | 🟢      |                                                          |
 | `logspace`            | 🟢      |                                                          |
 | `mask_indices`        | 🟠      |                                                          |
 | `matmul`              | 🟢      | batch broadcasting, 1D vector support                    |
