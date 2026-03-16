@@ -406,7 +406,15 @@ export interface Backend {
 /** GPU timing data returned by `profileGpu`. */
 export interface GpuTimingResult {
   /** Per-compute-pass GPU duration (nanosecond precision). */
-  passes: { durationMs: number }[];
+  passes: {
+    durationMs: number;
+    /** Dispatch grid dimensions (if available). */
+    grid?: [number, number];
+    /** Workgroup size (if available). */
+    workgroupSize?: number | number[];
+    /** Shader label or hash (if available). */
+    label?: string;
+  }[];
   /** Wall-clock GPU time from first pass start to last pass end. */
   totalMs: number;
   /** True if more compute passes were dispatched than the profiling buffer could record. */

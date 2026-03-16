@@ -869,7 +869,22 @@ export class WasmBackend implements Backend {
   prepareNativeScanGeneral(
     params: NativeScanGeneralParams,
   ): Executable<WasmProgram> {
-    const bytes = codegenNativeScanGeneral(params);
+    const captureEnabled = _isCodeCaptureEnabled();
+    const { bytes, wat } = codegenNativeScanGeneral(params, captureEnabled);
+    if (captureEnabled) {
+      _emitCodeCapture({
+        backend: "wasm",
+        kind: "scan",
+        code: wat,
+        metadata: {
+          numCarry: params.numCarry,
+          numY: params.numY,
+          reverse: params.reverse,
+          numSteps: params.steps.length,
+          byteLength: bytes.byteLength,
+        },
+      });
+    }
     const module = new WebAssembly.Module(bytes);
     return new Executable(null as any, { module });
   }
@@ -974,7 +989,25 @@ export class WasmBackend implements Backend {
   prepareBlockedAssociativeScan(
     params: NativeAssocScanBlockedParams,
   ): Executable<WasmProgram> {
-    const bytes = codegenBlockedAssociativeScan(params);
+    const captureEnabled = _isCodeCaptureEnabled();
+    const { bytes, wat } = codegenBlockedAssociativeScan(
+      params,
+      captureEnabled,
+    );
+    if (captureEnabled) {
+      _emitCodeCapture({
+        backend: "wasm",
+        kind: "assoc-scan",
+        code: wat,
+        metadata: {
+          numLeaves: params.numLeaves,
+          blockSize: params.blockSize,
+          reverse: params.reverse,
+          numSteps: params.steps.length,
+          byteLength: bytes.byteLength,
+        },
+      });
+    }
     const module = new WebAssembly.Module(bytes);
     return new Executable(null as any, { module });
   }
@@ -1271,7 +1304,23 @@ export class WasmBackend implements Backend {
     params: BlockMapWasmParams,
   ): Executable<WasmProgram> | null {
     try {
-      const bytes = codegenBlockMapLoop(params);
+      const captureEnabled = _isCodeCaptureEnabled();
+      const { bytes, wat } = codegenBlockMapLoop(params, captureEnabled);
+      if (captureEnabled) {
+        _emitCodeCapture({
+          backend: "wasm",
+          kind: "block-map",
+          code: wat,
+          metadata: {
+            gridShape: params.gridShape,
+            blockShape: params.blockShape,
+            numInputs: params.numInputs,
+            numOutputs: params.numOutputs,
+            numSteps: params.steps.length,
+            byteLength: bytes.byteLength,
+          },
+        });
+      }
       const module = new WebAssembly.Module(bytes);
       return new Executable(null as any, { module });
     } catch (e) {
@@ -2504,7 +2553,8 @@ function translateExpWithGeneralScanContext(
  */
 function codegenNativeScanGeneral(
   params: NativeScanGeneralParams,
-): Uint8Array<ArrayBuffer> {
+  traceEnabled: boolean,
+): { bytes: Uint8Array<ArrayBuffer>; wat?: string } {
   const {
     numConsts,
     constSizes,
@@ -2641,6 +2691,7 @@ function codegenNativeScanGeneral(
 
   // ---- Code generation ----
   const cg = new CodeGenerator();
+  cg.trace = traceEnabled;
   configureMemoryImport(cg);
 
   // Import routine functions from the "routines" module
@@ -2980,7 +3031,8 @@ function codegenNativeScanGeneral(
   });
 
   cg.export(scanFunc, "scan");
-  return cg.finish();
+  const bytes = cg.finish();
+  return { bytes, wat: traceEnabled ? cg.toWat() : undefined };
 }
 
 // ---------------------------------------------------------------------------
@@ -3068,7 +3120,8 @@ function translateExpWithBlockMapContext(
  */
 function codegenBlockMapLoop(
   params: BlockMapWasmParams,
-): Uint8Array<ArrayBuffer> {
+  traceEnabled: boolean,
+): { bytes: Uint8Array<ArrayBuffer>; wat?: string } {
   const {
     numConsts,
     numInputs,
@@ -3094,6 +3147,7 @@ function codegenBlockMapLoop(
 
   // ---- Code generation ----
   const cg = new CodeGenerator();
+  cg.trace = traceEnabled;
   configureMemoryImport(cg);
 
   // Collect all helper functions needed by body kernels
@@ -3452,7 +3506,8 @@ function codegenBlockMapLoop(
   });
 
   cg.export(mainFunc, "block_map_loop");
-  return cg.finish();
+  const bytes = cg.finish();
+  return { bytes, wat: traceEnabled ? cg.toWat() : undefined };
 }
 
 // ---------------------------------------------------------------------------
@@ -3550,7 +3605,8 @@ export interface NativeAssocScanBlockedParams extends NativeAssocScanParams {
  */
 function codegenBlockedAssociativeScan(
   params: NativeAssocScanBlockedParams,
-): Uint8Array<ArrayBuffer> {
+  traceEnabled: boolean,
+): { bytes: Uint8Array<ArrayBuffer>; wat?: string } {
   const {
     numConsts,
     numLeaves,
@@ -3584,6 +3640,7 @@ function codegenBlockedAssociativeScan(
   }
 
   const cg = new CodeGenerator();
+  cg.trace = traceEnabled;
   configureMemoryImport(cg);
   const funcs = importWasmHelperFuncs(cg, allOps);
 
@@ -4330,7 +4387,8 @@ function codegenBlockedAssociativeScan(
   });
 
   cg.export(mainFunc, "blocked_assoc_scan");
-  return cg.finish();
+  const bytes = cg.finish();
+  return { bytes, wat: traceEnabled ? cg.toWat() : undefined };
 }
 
 export function getScanRoutineInfo(routine: Routine): ScanRoutineInfo | null {

@@ -11,7 +11,6 @@
  * The LRU cache ensures memory is bounded while keeping frequently-used
  * sizes (typical for repeated model inference) hot.
  */
-
 import {
   buildArgsortModuleSized,
   buildCholeskyModuleSized,
@@ -22,6 +21,7 @@ import {
   buildSortModuleSized,
   buildTriangularSolveModuleSized,
 } from "./routines/index";
+import { _emitCodeCapture, _isCodeCaptureEnabled } from "../../backend";
 
 // ============================================================================
 // LRU Cache for size-specialized modules
@@ -198,6 +198,19 @@ export function getCholeskyModule(params: CholeskyParams): WebAssembly.Module {
     const bytes = useSIMD
       ? buildCholeskySimdModule(params.n)
       : buildCholeskyModuleSized(params.n, params.dtype);
+    if (_isCodeCaptureEnabled()) {
+      _emitCodeCapture({
+        backend: "wasm",
+        kind: "routine",
+        label: "cholesky",
+        metadata: {
+          n: params.n,
+          dtype: params.dtype,
+          simd: useSIMD,
+          byteLength: bytes.byteLength,
+        },
+      });
+    }
     module = new WebAssembly.Module(bytes);
     moduleCache.set(key, module);
   }
@@ -221,6 +234,19 @@ export function getTriangularSolveModule(
       params.unitDiagonal,
       params.lower,
     );
+    if (_isCodeCaptureEnabled()) {
+      _emitCodeCapture({
+        backend: "wasm",
+        kind: "routine",
+        label: "triangular_solve",
+        metadata: {
+          n: params.n,
+          dtype: params.dtype,
+          lower: params.lower,
+          byteLength: bytes.byteLength,
+        },
+      });
+    }
     module = new WebAssembly.Module(bytes);
     moduleCache.set(key, module);
   }
@@ -236,6 +262,19 @@ export function getLUModule(params: LUParams): WebAssembly.Module {
   let module = moduleCache.get(key);
   if (!module) {
     const bytes = buildLUModuleSized(params.m, params.n, params.dtype);
+    if (_isCodeCaptureEnabled()) {
+      _emitCodeCapture({
+        backend: "wasm",
+        kind: "routine",
+        label: "lu",
+        metadata: {
+          m: params.m,
+          n: params.n,
+          dtype: params.dtype,
+          byteLength: bytes.byteLength,
+        },
+      });
+    }
     module = new WebAssembly.Module(bytes);
     moduleCache.set(key, module);
   }
@@ -251,6 +290,18 @@ export function getSortModule(params: SortParams): WebAssembly.Module {
   let module = moduleCache.get(key);
   if (!module) {
     const bytes = buildSortModuleSized(params.n, params.dtype);
+    if (_isCodeCaptureEnabled()) {
+      _emitCodeCapture({
+        backend: "wasm",
+        kind: "routine",
+        label: "sort",
+        metadata: {
+          n: params.n,
+          dtype: params.dtype,
+          byteLength: bytes.byteLength,
+        },
+      });
+    }
     module = new WebAssembly.Module(bytes);
     moduleCache.set(key, module);
   }
@@ -266,6 +317,18 @@ export function getArgsortModule(params: ArgsortParams): WebAssembly.Module {
   let module = moduleCache.get(key);
   if (!module) {
     const bytes = buildArgsortModuleSized(params.n, params.dtype);
+    if (_isCodeCaptureEnabled()) {
+      _emitCodeCapture({
+        backend: "wasm",
+        kind: "routine",
+        label: "argsort",
+        metadata: {
+          n: params.n,
+          dtype: params.dtype,
+          byteLength: bytes.byteLength,
+        },
+      });
+    }
     module = new WebAssembly.Module(bytes);
     moduleCache.set(key, module);
   }
@@ -281,6 +344,19 @@ export function getQRModule(params: QRParams): WebAssembly.Module {
   let module = moduleCache.get(key);
   if (!module) {
     const bytes = buildQRModuleSized(params.m, params.n, params.dtype);
+    if (_isCodeCaptureEnabled()) {
+      _emitCodeCapture({
+        backend: "wasm",
+        kind: "routine",
+        label: "qr",
+        metadata: {
+          m: params.m,
+          n: params.n,
+          dtype: params.dtype,
+          byteLength: bytes.byteLength,
+        },
+      });
+    }
     module = new WebAssembly.Module(bytes);
     moduleCache.set(key, module);
   }
@@ -304,6 +380,14 @@ export function getScatterAddModule(
       params.axisSize,
       params.dtype,
     );
+    if (_isCodeCaptureEnabled()) {
+      _emitCodeCapture({
+        backend: "wasm",
+        kind: "routine",
+        label: "scatter_add",
+        metadata: { dtype: params.dtype, byteLength: bytes.byteLength },
+      });
+    }
     module = new WebAssembly.Module(bytes);
     moduleCache.set(key, module);
   }

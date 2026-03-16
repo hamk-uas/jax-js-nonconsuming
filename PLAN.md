@@ -804,7 +804,8 @@ paths:
 11. ~~Phase C.2b: WASM compiled halo (zero-copy) — replace `prePadForWasmHalo` with compiled address
     generation~~ ✅ Done
 12. ~~Phase C.3: Conv2d body + integration + benchmarks~~ ✅ Done
-13. Phase C.4: Halo VJP (scatter-add fallback first → stencil body synthesis for linear bodies)
+13. ~~Phase C.4: Halo VJP (scatter-add fallback first → stencil body synthesis for linear bodies)~~
+    ✅ Done
 
 ## Deferred Items
 

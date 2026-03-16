@@ -105,6 +105,101 @@ await deviceSuite(
       const kind: ConvClass | null = _lastConvClass();
       expect(kind).toBe("generic-dot");
     });
+
+    test("scan code capture emits kind=scan with WAT code", () => {
+      const entries: CodeCaptureEntry[] = [];
+      setCodeCapture((e) => entries.push(e));
+
+      using init = np.zeros([4]);
+      using xs = np.ones([10, 4]);
+      const f = jit((c: typeof init, x: typeof xs) =>
+        lax.scan(
+          (carry, xi) => {
+            const nc = np.add(carry, xi);
+            return [nc, nc];
+          },
+          c,
+          x,
+          { acceptPath: "compiled-loop" },
+        ),
+      );
+      const [carry, ys] = f(init, xs) as [typeof init, typeof xs];
+      carry.dispose();
+      ys.dispose();
+      f.dispose();
+
+      const scanEntries = entries.filter((e) => e.kind === "scan");
+      expect(scanEntries.length).toBeGreaterThanOrEqual(1);
+      for (const e of scanEntries) {
+        expect(e.backend).toBe("wasm");
+        expect(typeof e.code).toBe("string");
+        expect(e.code!.length).toBeGreaterThan(0);
+        expect(e.metadata?.numSteps).toBeGreaterThanOrEqual(1);
+      }
+    });
+
+    test("assoc-scan code capture emits kind=assoc-scan", async () => {
+      const entries: CodeCaptureEntry[] = [];
+      setCodeCapture((e) => entries.push(e));
+
+      using xs = np.array([1, 2, 3, 4, 5, 6, 7, 8]);
+      const f = jit((x: typeof xs) =>
+        lax.associativeScan((a, b) => a.add(b), x),
+      );
+      using _result = f(xs);
+      f.dispose();
+
+      const assocEntries = entries.filter((e) => e.kind === "assoc-scan");
+      expect(assocEntries.length).toBeGreaterThanOrEqual(1);
+      for (const e of assocEntries) {
+        expect(e.backend).toBe("wasm");
+        expect(typeof e.code).toBe("string");
+        expect(e.code!.length).toBeGreaterThan(0);
+        expect(e.metadata?.numLeaves).toBeGreaterThanOrEqual(1);
+      }
+    });
+
+    test("block-map code capture emits kind=block-map", () => {
+      const entries: CodeCaptureEntry[] = [];
+      setCodeCapture((e) => entries.push(e));
+
+      using x = np.ones([8]);
+      const f = jit((a: typeof x) =>
+        lax.blockMap((block) => block.mul(np.array([2, 2, 2, 2])), a, {
+          blockShape: [4],
+          inAxes: [0],
+          outAxes: [0],
+        }),
+      );
+      using _result = f(x) as typeof x;
+      f.dispose();
+
+      const bmEntries = entries.filter((e) => e.kind === "block-map");
+      expect(bmEntries.length).toBeGreaterThanOrEqual(1);
+      for (const e of bmEntries) {
+        expect(e.backend).toBe("wasm");
+        expect(typeof e.code).toBe("string");
+        expect(e.code!.length).toBeGreaterThan(0);
+        expect(e.metadata?.numSteps).toBeGreaterThanOrEqual(1);
+      }
+    });
+
+    test("routine code capture emits kind=routine for sort", () => {
+      const entries: CodeCaptureEntry[] = [];
+      setCodeCapture((e) => entries.push(e));
+
+      using x = np.array([3, 1, 4, 1, 5]);
+      const f = jit((a: typeof x) => np.sort(a));
+      using _result = f(x);
+      f.dispose();
+
+      const routineEntries = entries.filter((e) => e.kind === "routine");
+      expect(routineEntries.length).toBeGreaterThanOrEqual(1);
+      const sortEntry = routineEntries.find((e) => e.label === "sort");
+      expect(sortEntry).toBeDefined();
+      expect(sortEntry!.backend).toBe("wasm");
+      expect(sortEntry!.metadata?.n).toBe(5);
+    });
   },
   ["wasm"],
 );

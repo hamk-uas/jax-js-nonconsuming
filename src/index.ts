@@ -464,6 +464,7 @@ export async function devicePut<T extends JsTree<any>>(
  *
  * Requires the WebGPU backend with `timestamp-query` support.
  * Returns the function's result alongside per-pass GPU timing data.
+ * Per-pass metadata (grid, workgroupSize, label) is included when available.
  */
 export async function profileGpu<T>(
   fn: () => T | Promise<T>,
@@ -485,3 +486,9 @@ export async function profileGpu<T>(
   const timing = await backend.stopProfiling();
   return { result, timing };
 }
+
+/**
+ * Alias for `profileGpu`. Per-pass metadata (grid dimensions, workgroup size,
+ * shader label) is always included in the result when available.
+ */
+export const profileGpuDetailed = profileGpu;
