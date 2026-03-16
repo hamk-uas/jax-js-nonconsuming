@@ -1882,6 +1882,14 @@ export function sign(x: ArrayLike): Array {
   return where(isnan, x, result);
 }
 
+/**
+ * @function
+ * Return the value with the magnitude of x and the sign of y, element-wise.
+ */
+export const copysign = jit(function copysign(x: Array, y: Array): Array {
+  return absolute(x).mul(sign(y));
+});
+
 /** @function Return element-wise positive values of the input (no-op). */
 export const positive = fudgeArray;
 
@@ -2106,6 +2114,38 @@ export function divmod(x: ArrayLike, y: ArrayLike): [Array, Array] {
 export function trunc(x: ArrayLike): Array {
   return core.idiv(x, 1) as Array; // Integer division truncates the decimal part.
 }
+
+/**
+ * @function
+ * Round to the given number of decimals.
+ *
+ * Uses banker's rounding (round half to even) to match NumPy/JAX behavior.
+ */
+export const round = jit(
+  function round(a: Array, decimals: number = 0): Array {
+    if (decimals === 0) {
+      return rint(a);
+    }
+    const factor = 10 ** decimals;
+    return rint(a.mul(factor)).mul(1 / factor);
+  },
+  { staticArgnums: [1] },
+);
+
+export { round as around };
+
+/**
+ * @function
+ * Round to the nearest integer, with ties going to the nearest even integer.
+ */
+export const rint = jit(function rint(x: Array): Array {
+  // Banker's rounding: round half to even.
+  const rounded = floor(x.add(0.5));
+  // When the fractional part is exactly 0.5, round to even.
+  const half = x.sub(floor(x)).equal(0.5);
+  const odd = remainder(rounded, 2).notEqual(0);
+  return where(half.mul(odd), rounded.sub(1), rounded);
+});
 
 /**
  * Compute `x1 * 2 ** x2` as a standard multiplication and exponentiation.

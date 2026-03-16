@@ -3064,4 +3064,44 @@ await deviceSuite((device) => {
       ]);
     });
   });
+
+  suite("jax.numpy.copysign()", () => {
+    test("basic copysign", () => {
+      using result = np.copysign(
+        np.array([1, -2, 3, -4]),
+        np.array([-1, 1, -1, 1]),
+      );
+      expect(result.js()).toEqual([-1, 2, -3, 4]);
+    });
+
+    test("copysign with zero", () => {
+      using result = np.copysign(np.array([5, -5]), np.array([0, 0]));
+      expect(result.js()).toEqual([0, 0]);
+    });
+  });
+
+  suite("jax.numpy.round()", () => {
+    test("round to integer", () => {
+      using result = np.round(np.array([1.4, 1.5, 2.5, 3.5, -0.5]), 0);
+      // Banker's rounding: 1.5 -> 2, 2.5 -> 2, 3.5 -> 4, -0.5 -> 0
+      expect(result.js()).toBeAllclose([1, 2, 2, 4, 0]);
+    });
+
+    test("round to decimals", () => {
+      using result = np.round(np.array([1.234, 2.567, 3.891]), 2);
+      expect(result.js()).toBeAllclose([1.23, 2.57, 3.89]);
+    });
+
+    test("round with negative decimals", () => {
+      using result = np.round(np.array([123, 456, 789]), -2);
+      expect(result.js()).toBeAllclose([100, 500, 800]);
+    });
+  });
+
+  suite("jax.numpy.rint()", () => {
+    test("basic rint", () => {
+      using result = np.rint(np.array([1.4, 1.5, 2.5, 3.6]));
+      expect(result.js()).toBeAllclose([1, 2, 2, 4]);
+    });
+  });
 });
