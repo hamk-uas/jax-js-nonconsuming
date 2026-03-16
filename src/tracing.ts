@@ -25,7 +25,8 @@ export function startTrace(): void {
  */
 export function stopTrace(): void {
   traceEnabled = false;
-  for (const cb of flushCallbacks) cb();
+  const cbs = flushCallbacks.splice(0);
+  for (const cb of cbs) cb();
 }
 
 /** Check if tracing is currently enabled. */

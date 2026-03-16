@@ -1922,10 +1922,7 @@ export function sign(x: ArrayLike): Array {
   return where(isnan, x, result);
 }
 
-/**
- * @function
- * Return the value with the magnitude of x and the sign of y, element-wise.
- */
+/** @function Return the value with the magnitude of x and the sign of y, element-wise. */
 export const copysign = jit(function copysign(x: Array, y: Array): Array {
   return absolute(x).mul(sign(y));
 });

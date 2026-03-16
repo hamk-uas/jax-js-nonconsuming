@@ -93,6 +93,8 @@ fi
 
 # ============================================================
 # 2. Remove .ref() — upstream uses ref-counting, we don't
+#    ONLY in src/library/ files.  Frontend internals (linearize,
+#    vmap, jvp) legitimately use .ref for tracer propagation.
 # ============================================================
 if [[ "$do_refs" == "true" ]]; then
   ref_count=0
@@ -108,11 +110,11 @@ if [[ "$do_refs" == "true" ]]; then
       sed -i 's/\.ref()//g' "$file"
       ref_count=$((ref_count + 1))
     fi
-  done < <(changed_src_files)
+  done < <(changed_files | grep -E '^src/library/.*\.ts$' || true)
   if [[ $ref_count -gt 0 ]]; then
-    echo "[upstream-adapt] Removed .ref() from $ref_count source file(s)"
+    echo "[upstream-adapt] Removed .ref() from $ref_count library file(s)"
   else
-    echo "[upstream-adapt] No .ref() calls found in changed source files"
+    echo "[upstream-adapt] No .ref() calls found in changed library files"
   fi
 fi
 

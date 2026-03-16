@@ -3139,6 +3139,7 @@ await deviceSuite((device) => {
       using a = np.array([5, -5]);
       using b = np.array([0, 0]);
       using result = np.copysign(a, b);
+      // sign(0) = 0, so abs(x)*sign(0) = 0 (differs from NumPy which returns ±x)
       expect(result.js()).toEqual([0, 0]);
     });
   });
