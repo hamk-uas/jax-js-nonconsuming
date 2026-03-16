@@ -19,7 +19,7 @@
         class="text-lg"
         target="_blank"
         href="https://github.com/hamk-uas/jax-js-nonconsuming/blob/main/website/src/routes{page
-          .route.id}/%2Bpage.svelte">(source)</a
+          .route.id}/simulation.ts">(source)</a
       >
     </h1>
     <p class="text-sm text-neutral-400">
@@ -27,7 +27,7 @@
       force and move the obstacle.
     </p>
     <p class="text-sm text-neutral-400">
-      Using <a href="/">jax-js</a> on WebGPU. Based on
+      Using <a href="/">jax-js-nonconsuming</a> on WebGPU. Based on
       <a target="_blank" href="https://github.com/amandaghassaei/VortexShedding"
         >VortexShedding</a
       > — all credit to Amanda Ghassaei.
