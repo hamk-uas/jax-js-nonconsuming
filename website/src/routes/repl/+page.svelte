@@ -14,7 +14,6 @@
   } from "@lucide/svelte";
   import { SplitPane } from "@rich_harris/svelte-split-pane";
 
-  import CodePanel from "$lib/repl/CodePanel.svelte";
   import ConsoleLine from "$lib/repl/ConsoleLine.svelte";
   import ReplEditor from "$lib/repl/ReplEditor.svelte";
   import { decodeContent, encodeContent } from "$lib/repl/encode";
@@ -34,7 +33,6 @@
     { title: "Tracing Jaxprs", id: "02-tracing" },
     { title: "Logistic regression", id: "03-logistic-regression" },
     { title: "Mandelbrot set", id: "04-mandelbrot" },
-    { title: "Code capture", id: "05-code-capture" },
   ];
 
   interface URLSelection {
@@ -74,7 +72,6 @@
   let consoleLines = $derived(replRunner.consoleLines);
   let mockConsole = replRunner.mockConsole;
   let runDurationMs = $derived(replRunner.runDurationMs);
-  let bottomTab: "console" | "code" = $state("console");
 
   afterNavigate(({ type }) => {
     if (type === "enter") return; // Already handled on load
@@ -270,59 +267,25 @@
             <div
               class="flex items-center gap-2 text-sm py-2 px-4 select-none shrink-0"
             >
-              <button
-                class="text-gray-500 hover:text-gray-800 transition-colors"
-                class:font-semibold={bottomTab === "console"}
-                class:text-gray-800={bottomTab === "console"}
-                onclick={() => (bottomTab = "console")}
-              >
-                Console
-              </button>
-              <button
-                class="text-gray-500 hover:text-gray-800 transition-colors"
-                class:font-semibold={bottomTab === "code"}
-                class:text-gray-800={bottomTab === "code"}
-                onclick={() => (bottomTab = "code")}
-              >
-                Compiled Code
-                {#if replRunner.capturedCode.length > 0}
-                  <span class="text-gray-400 font-normal"
-                    >({replRunner.capturedCode.length})</span
-                  >
-                {/if}
-              </button>
-              {#if bottomTab === "console"}
-                {#if replRunner.running}
-                  <LoaderIcon
-                    size={14}
-                    class="inline-block animate-spin ml-1"
-                  />
-                {:else if consoleLines.length === 0}
-                  <span class="text-gray-400 text-sm">(empty)</span>
-                {:else if runDurationMs !== null}
-                  <span class="ml-1 text-gray-400 text-sm"
-                    >({Math.round(runDurationMs).toLocaleString()} ms)</span
-                  >
-                {/if}
+              <span class="text-gray-800 font-semibold">Console</span>
+              {#if replRunner.running}
+                <LoaderIcon size={14} class="inline-block animate-spin ml-1" />
+              {:else if consoleLines.length === 0}
+                <span class="text-gray-400 text-sm">(empty)</span>
+              {:else if runDurationMs !== null}
+                <span class="ml-1 text-gray-400 text-sm"
+                  >({Math.round(runDurationMs).toLocaleString()} ms)</span
+                >
               {/if}
             </div>
-            {#if bottomTab === "console"}
-              <div
-                class="pb-2 px-4 flex flex-col grow overflow-y-auto text-[13px]"
-                style:scrollbar-width="thin"
-              >
-                {#each consoleLines as line, i (i)}
-                  <ConsoleLine {line} showTime />
-                {/each}
-              </div>
-            {:else}
-              <div
-                class="pb-2 flex flex-col grow overflow-y-auto"
-                style:scrollbar-width="thin"
-              >
-                <CodePanel entries={replRunner.capturedCode} />
-              </div>
-            {/if}
+            <div
+              class="pb-2 px-4 flex flex-col grow overflow-y-auto text-[13px]"
+              style:scrollbar-width="thin"
+            >
+              {#each consoleLines as line, i (i)}
+                <ConsoleLine {line} showTime />
+              {/each}
+            </div>
           </div>
         {/snippet}
       </SplitPane>

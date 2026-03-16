@@ -17,9 +17,10 @@ import {
 export type { LeakMarker };
 
 export type ConsoleLine = {
-  level: "log" | "info" | "warn" | "error" | "image";
+  level: "log" | "info" | "warn" | "error" | "image" | "code";
   data: string[];
   time: number;
+  codeEntry?: CodeCaptureEntry;
 };
 
 // Intercepted methods similar to console.log().
@@ -42,7 +43,6 @@ export class ReplRunner {
   runDurationMs = $state<number | null>(null);
   detailedLeakDiagnostics = $state(true);
   captureCode = $state(false);
-  capturedCode: CodeCaptureEntry[] = $state([]);
   leakMarkers: LeakMarker[] = $state([]);
   consoleTimers = new Map<string, number>();
   mockConsole: Console;
@@ -70,7 +70,6 @@ export class ReplRunner {
     this.finished = false;
     this.runDurationMs = null;
     this.leakMarkers = [];
-    if (this.captureCode) this.capturedCode = [];
     const startedRunAt = performance.now();
     try {
       const result = await _runProgram(
@@ -327,7 +326,14 @@ async function _runProgram(
     }
 
     if (runner.captureCode) {
-      jax.setCodeCapture((entry) => runner.capturedCode.push(entry));
+      jax.setCodeCapture((entry) => {
+        runner.consoleLines.push({
+          level: "code",
+          data: [],
+          time: Date.now(),
+          codeEntry: entry,
+        });
+      });
     }
 
     await new AsyncFunction("_MODULES", "_BUILTINS", bundledCode)(
@@ -385,7 +391,6 @@ async function _runProgram(
         );
       }
     }
-    if (runner.captureCode) jax.setCodeCapture(null);
     return {
       success: true,
       duration: performance.now() - startTime,
@@ -427,9 +432,10 @@ async function _runProgram(
         );
       }
     }
-    if (runner.captureCode) jax.setCodeCapture(null);
     mockConsole.error(e);
     return { success: false, duration: 0 };
+  } finally {
+    if (runner.captureCode) jax.setCodeCapture(null);
   }
 }
 
