@@ -712,6 +712,12 @@ Available `tree` utilities:
 The `jax.profiler` module has `startTrace()` and `stopTrace()`. When traces are started, `jax-js`
 emits per-kernel timings that appear in browser development tools.
 
+**WebGPU interop:**
+
+- `getWebGPUDevice()` — return the `GPUDevice` used by the WebGPU backend
+- `Array.gpuBuffer()` / `Array.gpuBufferSync()` — return the underlying `GPUBuffer` for zero-copy
+  sharing with custom rendering pipelines
+
 These modules are unimplemented:
 
 - `jax.scipy` (partial: `scipy.special` — erf, erfc, logit, logsumexp, softmax, logSoftmax;

@@ -117,6 +117,7 @@ Demos:
 - [Voice cloning: Kyutai Pocket TTS](https://hamk-uas.github.io/jax-js-nonconsuming/tts)
 - [CLIP embeddings for books in-browser](https://hamk-uas.github.io/jax-js-nonconsuming/mobileclip)
 - [Object detection: DETR ResNet-50 (ONNX)](https://hamk-uas.github.io/jax-js-nonconsuming/detr-resnet-50)
+- [Fluid simulation (Navier-Stokes)](https://hamk-uas.github.io/jax-js-nonconsuming/fluid-sim)
 - [In-browser REPL](https://hamk-uas.github.io/jax-js-nonconsuming/repl)
 - [Matmul benchmark](https://hamk-uas.github.io/jax-js-nonconsuming/bench/matmul)
 - [Conv2d benchmark](https://hamk-uas.github.io/jax-js-nonconsuming/bench/conv2d)

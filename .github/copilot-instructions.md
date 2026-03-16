@@ -428,7 +428,8 @@ runtime i32 param).
 All public symbols must be exported from `src/index.ts`. Key exports: `jit`, `grad`, `valueAndGrad`,
 `jvp`, `vjp`, `vmap`, `jacfwd`, `jacrev`, `hessian`, `linearize`, `makeJaxpr`, `init`,
 `defaultDevice`, `devicePut`, `blockUntilReady`, `scatterAdd`, `clearCaches`, `checkLeaks`, `numpy`,
-`lax`, `nn`, `random`, `scipySpecial`, `scipyLinalg`, `tree`, `ScanPath`, `profileGpu`.
+`lax`, `nn`, `random`, `scipySpecial`, `scipyLinalg`, `tree`, `ScanPath`, `profileGpu`,
+`getWebGPUDevice`.
 
 ## Commit checklist
 

@@ -59,6 +59,11 @@
       description: "GPU-accelerated fractal rendering with JIT-compiled scan.",
     },
     {
+      title: "Fluid Simulation",
+      href: resolve("/fluid-sim"),
+      description: "Real-time Navier-Stokes fluid simulation on WebGPU.",
+    },
+    {
       title: "Matmul Benchmark",
       href: resolve("/bench/matmul"),
       description: "Measure matrix multiplication GFLOP/s on your device.",

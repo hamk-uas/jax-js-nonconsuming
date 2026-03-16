@@ -4,6 +4,7 @@ import {
   Device,
   devices,
   getBackend,
+  getWebGPUDevice,
   init,
   setCodeCapture,
 } from "./backend";
@@ -108,6 +109,7 @@ export {
   type OwnedFunction,
   type PrimalArtifact,
   type PullbackArtifact,
+  getWebGPUDevice,
   random,
   type ResidualPack,
   reverse,
