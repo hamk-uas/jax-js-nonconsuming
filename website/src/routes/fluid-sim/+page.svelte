@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { resolve } from "$app/paths";
   import { page } from "$app/state";
   import { onMount } from "svelte";
   import { startSimulation } from "./simulation";
@@ -27,7 +28,7 @@
       force and move the obstacle.
     </p>
     <p class="text-sm text-neutral-400">
-      Using <a href="/">jax-js-nonconsuming</a> on WebGPU. Based on
+      Using <a href={resolve("/")}>jax-js-nonconsuming</a> on WebGPU. Based on
       <a target="_blank" href="https://github.com/amandaghassaei/VortexShedding"
         >VortexShedding</a
       > — all credit to Amanda Ghassaei.
