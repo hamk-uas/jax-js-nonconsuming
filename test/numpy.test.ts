@@ -40,13 +40,15 @@ await deviceSuite((device) => {
   suite("jax.numpy.average()", () => {
     test("no weights is same as mean", () => {
       using x = np.array([1, 2, 3, 4]);
-      expect(np.average(x).js()).toEqual(2.5);
+      using result = np.average(x);
+      expect(result.js()).toEqual(2.5);
     });
 
     test("with weights", () => {
       using x = np.array([1, 2, 3, 4]);
       using w = np.array([4, 3, 2, 1]);
-      expect(np.average(x, null, { weights: w }).js()).toEqual(2);
+      using result = np.average(x, null, { weights: w });
+      expect(result.js()).toEqual(2);
     });
 
     test("with weights along axis", () => {
@@ -55,7 +57,8 @@ await deviceSuite((device) => {
         [4, 5, 6],
       ]);
       using w = np.array([0.25, 0.5, 0.25]);
-      expect(np.average(x, 1, { weights: w }).js()).toEqual([2, 5]);
+      using result = np.average(x, 1, { weights: w });
+      expect(result.js()).toEqual([2, 5]);
     });
 
     test("with matching shape weights", () => {
@@ -67,7 +70,8 @@ await deviceSuite((device) => {
         [1, 2],
         [3, 4],
       ]);
-      expect(np.average(x, 1, { weights: w })).toBeAllclose([5 / 3, 25 / 7]);
+      using result = np.average(x, 1, { weights: w });
+      expect(result).toBeAllclose([5 / 3, 25 / 7]);
     });
 
     test("keepdims", () => {
@@ -104,13 +108,15 @@ await deviceSuite((device) => {
     test("2D cross product", () => {
       using a = np.array([1, 2]);
       using b = np.array([3, 4]);
-      expect(np.cross(a, b).js()).toEqual(-2);
+      using result = np.cross(a, b);
+      expect(result.js()).toEqual(-2);
     });
 
     test("3D cross product", () => {
       using a = np.array([1, 2, 3]);
       using b = np.array([4, 5, 6]);
-      expect(np.cross(a, b).js()).toEqual([-3, 6, -3]);
+      using result = np.cross(a, b);
+      expect(result.js()).toEqual([-3, 6, -3]);
     });
 
     test("batched 3D cross product", () => {
@@ -122,7 +128,8 @@ await deviceSuite((device) => {
         [2, 3, 2],
         [4, 5, 6],
       ]);
-      expect(np.cross(a, b).js()).toEqual([
+      using result = np.cross(a, b);
+      expect(result.js()).toEqual([
         [-5, 4, -1],
         [9, -6, -1],
       ]);
@@ -137,7 +144,8 @@ await deviceSuite((device) => {
         [2, 3, 2],
         [4, 5, 6],
       ]);
-      expect(np.cross(a, b, { axis: 0 }).js()).toEqual([-2, -2, 12]);
+      using result = np.cross(a, b, { axis: 0 });
+      expect(result.js()).toEqual([-2, -2, 12]);
     });
   });
 
@@ -581,31 +589,36 @@ await deviceSuite((device) => {
     test("equal arrays", () => {
       using a = np.array([1, 2, 3]);
       using b = np.array([1, 2, 3]);
-      expect(np.arrayEqual(a, b).js()).toBe(true);
+      using result = np.arrayEqual(a, b);
+      expect(result.js()).toBe(true);
     });
 
     test("unequal arrays", () => {
       using a = np.array([1, 2, 3]);
       using b = np.array([1, 2, 4]);
-      expect(np.arrayEqual(a, b).js()).toBe(false);
+      using result = np.arrayEqual(a, b);
+      expect(result.js()).toBe(false);
     });
 
     test("different shapes", () => {
       using a = np.array([1, 2, 3]);
       using b = np.array([1, 2]);
-      expect(np.arrayEqual(a, b).js()).toBe(false);
+      using result = np.arrayEqual(a, b);
+      expect(result.js()).toBe(false);
     });
 
     test("NaN not equal by default", () => {
       using a = np.array([1, NaN]);
       using b = np.array([1, NaN]);
-      expect(np.arrayEqual(a, b).js()).toBe(false);
+      using result = np.arrayEqual(a, b);
+      expect(result.js()).toBe(false);
     });
 
     test("NaN equal with equalNaN", () => {
       using a = np.array([1, NaN]);
       using b = np.array([1, NaN]);
-      expect(np.arrayEqual(a, b, { equalNaN: true }).js()).toBe(true);
+      using result = np.arrayEqual(a, b, { equalNaN: true });
+      expect(result.js()).toBe(true);
     });
   });
 
@@ -613,7 +626,8 @@ await deviceSuite((device) => {
     test("equal arrays", () => {
       using a = np.array([1, 2, 3]);
       using b = np.array([1, 2, 3]);
-      expect(np.arrayEquiv(a, b).js()).toBe(true);
+      using result = np.arrayEquiv(a, b);
+      expect(result.js()).toBe(true);
     });
 
     test("broadcast-compatible arrays", () => {
@@ -622,7 +636,8 @@ await deviceSuite((device) => {
         [1, 2],
       ]);
       using b = np.array([1, 2]);
-      expect(np.arrayEquiv(a, b).js()).toBe(true);
+      using result = np.arrayEquiv(a, b);
+      expect(result.js()).toBe(true);
     });
 
     test("broadcast-compatible but unequal", () => {
@@ -631,13 +646,15 @@ await deviceSuite((device) => {
         [3, 4],
       ]);
       using b = np.array([1, 2]);
-      expect(np.arrayEquiv(a, b).js()).toBe(false);
+      using result = np.arrayEquiv(a, b);
+      expect(result.js()).toBe(false);
     });
 
     test("incompatible shapes", () => {
       using a = np.array([1, 2, 3]);
       using b = np.array([1, 2]);
-      expect(np.arrayEquiv(a, b).js()).toBe(false);
+      using result = np.arrayEquiv(a, b);
+      expect(result.js()).toBe(false);
     });
   });
 
@@ -891,7 +908,8 @@ await deviceSuite((device) => {
         [3, 4],
       ]);
       using v = np.array([5, 6]);
-      expect(np.matvec(a, v).js()).toEqual([17, 39]);
+      using result = np.matvec(a, v);
+      expect(result.js()).toEqual([17, 39]);
     });
 
     test("batched matrix-vector product", () => {
@@ -942,7 +960,8 @@ await deviceSuite((device) => {
         [3, 4],
         [5, 6],
       ]);
-      expect(np.vecmat(v, a).js()).toEqual([13, 16]);
+      using result = np.vecmat(v, a);
+      expect(result.js()).toEqual([13, 16]);
     });
 
     test("projection example from docs", () => {
@@ -952,7 +971,8 @@ await deviceSuite((device) => {
         [0, 1, 0],
         [0, 0, 0],
       ]);
-      expect(np.vecmat(v, a).js()).toEqual([0, 4, 0]);
+      using result = np.vecmat(v, a);
+      expect(result.js()).toEqual([0, 4, 0]);
     });
   });
 
@@ -3067,85 +3087,87 @@ await deviceSuite((device) => {
 
   suite("jax.numpy.logicalAnd()", () => {
     test("basic logical and", () => {
-      using result = np.logicalAnd(
-        np.array([1, 0, 3, 0]),
-        np.array([false, false, true, false]),
-      );
+      using a = np.array([1, 0, 3, 0]);
+      using b = np.array([false, false, true, false]);
+      using result = np.logicalAnd(a, b);
       expect(result.js()).toEqual([false, false, true, false]);
     });
 
     test("float inputs", () => {
-      using result = np.logicalAnd(
-        np.array([1.5, 0.0, -2.0]),
-        np.array([0.5, 0.0, 1.0]),
-      );
+      using a = np.array([1.5, 0.0, -2.0]);
+      using b = np.array([0.5, 0.0, 1.0]);
+      using result = np.logicalAnd(a, b);
       expect(result.js()).toEqual([true, false, true]);
     });
   });
 
   suite("jax.numpy.logicalOr()", () => {
     test("basic logical or", () => {
-      using result = np.logicalOr(
-        np.array([1, 0, 3, 0]),
-        np.array([0, 0, 1, 0]),
-      );
+      using a = np.array([1, 0, 3, 0]);
+      using b = np.array([0, 0, 1, 0]);
+      using result = np.logicalOr(a, b);
       expect(result.js()).toEqual([true, false, true, false]);
     });
   });
 
   suite("jax.numpy.logicalXor()", () => {
     test("basic logical xor", () => {
-      using result = np.logicalXor(
-        np.array([1, 0, 3, 0]),
-        np.array([0, 0, 1, 0]),
-      );
+      using a = np.array([1, 0, 3, 0]);
+      using b = np.array([0, 0, 1, 0]);
+      using result = np.logicalXor(a, b);
       expect(result.js()).toEqual([true, false, false, false]);
     });
   });
 
   suite("jax.numpy.logicalNot()", () => {
     test("basic logical not", () => {
-      using result = np.logicalNot(np.array([1, 0, 3, 0]));
+      using a = np.array([1, 0, 3, 0]);
+      using result = np.logicalNot(a);
       expect(result.js()).toEqual([false, true, false, true]);
     });
   });
 
   suite("jax.numpy.copysign()", () => {
     test("basic copysign", () => {
-      using result = np.copysign(
-        np.array([1, -2, 3, -4]),
-        np.array([-1, 1, -1, 1]),
-      );
+      using a = np.array([1, -2, 3, -4]);
+      using b = np.array([-1, 1, -1, 1]);
+      using result = np.copysign(a, b);
       expect(result.js()).toEqual([-1, 2, -3, 4]);
     });
 
     test("copysign with zero", () => {
-      using result = np.copysign(np.array([5, -5]), np.array([0, 0]));
+      using a = np.array([5, -5]);
+      using b = np.array([0, 0]);
+      using result = np.copysign(a, b);
       expect(result.js()).toEqual([0, 0]);
     });
   });
 
   suite("jax.numpy.round()", () => {
     test("round to integer", () => {
-      using result = np.round(np.array([1.4, 1.5, 2.5, 3.5, -0.5]), 0);
+      using x = np.array([1.4, 1.5, 2.5, 3.5, -0.5]);
+      using result = np.round(x, 0);
       // Banker's rounding: 1.5 -> 2, 2.5 -> 2, 3.5 -> 4, -0.5 -> 0
       expect(result.js()).toBeAllclose([1, 2, 2, 4, 0]);
     });
 
     test("round to decimals", () => {
-      using result = np.round(np.array([1.234, 2.567, 3.891]), 2);
+      using x = np.array([1.234, 2.567, 3.891]);
+      using result = np.round(x, 2);
       expect(result.js()).toBeAllclose([1.23, 2.57, 3.89]);
     });
 
     test("round with negative decimals", () => {
-      using result = np.round(np.array([123, 456, 789]), -2);
+      using x = np.array([123, 456, 789]);
+      using result = np.round(x, -2);
       expect(result.js()).toBeAllclose([100, 500, 800]);
     });
   });
 
   suite("jax.numpy.rint()", () => {
     test("basic rint", () => {
-      using result = np.rint(np.array([1.4, 1.5, 2.5, 3.6]));
+      using x = np.array([1.4, 1.5, 2.5, 3.6]);
+      using result = np.rint(x);
       expect(result.js()).toBeAllclose([1, 2, 2, 4]);
     });
   });

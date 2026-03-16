@@ -154,22 +154,29 @@ export const lessEqual = core.lessEqual as (
 
 /** Compute element-wise logical AND. */
 export function logicalAnd(x: ArrayLike, y: ArrayLike): Array {
-  return astype(x, DType.Bool).mul(astype(y, DType.Bool));
+  using xBool = astype(x, DType.Bool);
+  using yBool = astype(y, DType.Bool);
+  return xBool.mul(yBool);
 }
 
 /** Compute element-wise logical OR. */
 export function logicalOr(x: ArrayLike, y: ArrayLike): Array {
-  return astype(x, DType.Bool).add(astype(y, DType.Bool));
+  using xBool = astype(x, DType.Bool);
+  using yBool = astype(y, DType.Bool);
+  return xBool.add(yBool);
 }
 
 /** Compute element-wise logical XOR. */
 export function logicalXor(x: ArrayLike, y: ArrayLike): Array {
-  return notEqual(astype(x, DType.Bool), astype(y, DType.Bool));
+  using xBool = astype(x, DType.Bool);
+  using yBool = astype(y, DType.Bool);
+  return notEqual(xBool, yBool);
 }
 
 /** Compute element-wise logical NOT. */
 export function logicalNot(x: ArrayLike): Array {
-  return notEqual(astype(x, DType.Bool), true);
+  using xBool = astype(x, DType.Bool);
+  return notEqual(xBool, true);
 }
 
 /** @function Element-wise ternary operator, evaluates to `x` if cond else `y`. */
@@ -375,8 +382,10 @@ export function average(
 
   if (deepEqual(wShape, aShape)) {
     // weights match shape of a exactly
-    const scl = sum(weights, axis, opts);
-    return sum(multiply(a, weights) as Array, axis, opts).div(scl);
+    using scl = sum(weights, axis, opts);
+    using prod = multiply(a, weights) as Array;
+    using num = sum(prod, axis, opts);
+    return num.div(scl);
   } else if (
     axis.length === 1 &&
     wShape.length === 1 &&
@@ -386,9 +395,11 @@ export function average(
     const broadcastShape = aShape.map((_, i) =>
       i === axis[0] ? wShape[0] : 1,
     );
-    const wReshaped = reshape(weights, broadcastShape);
-    const scl = sum(wReshaped, axis, opts);
-    return sum(multiply(a, wReshaped) as Array, axis, opts).div(scl);
+    using wReshaped = reshape(weights, broadcastShape);
+    using scl = sum(wReshaped, axis, opts);
+    using prod = multiply(a, wReshaped) as Array;
+    using num = sum(prod, axis, opts);
+    return num.div(scl);
   } else {
     throw new Error(
       `average: weights shape ${JSON.stringify(wShape)} is not compatible with array shape ${JSON.stringify(aShape)} and axis ${JSON.stringify(axis)}`,
@@ -1192,10 +1203,15 @@ export function arrayEqual(
   }
   if (opts?.equalNaN) {
     // Where both are NaN, treat as equal; otherwise use element-wise equal
-    const nanMask = isnan(a1).mul(isnan(a2));
-    return (where(nanMask, true, a1.equal(a2)) as Array).all();
+    using nanA1 = isnan(a1);
+    using nanA2 = isnan(a2);
+    using nanMask = nanA1.mul(nanA2);
+    using eq = a1.equal(a2);
+    using merged = where(nanMask, true, eq) as Array;
+    return merged.all();
   }
-  return a1.equal(a2).all();
+  using eq = a1.equal(a2);
+  return eq.all();
 }
 
 /**
@@ -1209,7 +1225,10 @@ export function arrayEquiv(a1: ArrayLike, a2: ArrayLike): Array {
   a2 = fudgeArray(a2);
   try {
     const [b1, b2] = broadcastArrays(a1, a2);
-    return b1.equal(b2).all();
+    using _b1 = b1;
+    using _b2 = b2;
+    using eq = b1.equal(b2);
+    return eq.all();
   } catch {
     return array(false);
   }
