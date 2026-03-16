@@ -334,9 +334,12 @@ spin-wait (`Atomics.wait` blocked) — detected at construction, falls back to d
 sequence with pre-resolved pipelines, pre-computed buffer indices, and pre-built uniform bind
 groups. Eliminates per-step JS overhead (scope lookups, array allocation, refcounting, pipeline
 cache lookups) by replacing the generic step loop with a tight command-encoding loop over a flat
-`GPUBuffer[]` table. ~4× reduction in JS-side overhead for kernel-only programs. Supports kernels,
+`GPUBuffer[]` table. ~4× reduction in JS-side overhead. Supports kernels,
 routines, malloc/free/recycle, DUS, scatter_add, and reverse (`#encodeCopyAuto` handles aligned and
-unaligned copies transparently). Rejects scan, assoc_scan, block_map, incref.
+unaligned copies transparently). Supports scan (non-fallback paths: compiled-loop,
+preencoded-routine, preencoded-multi-step — scan dispatchers create their own encoder within the
+tape's command buffer, with transient buffers pooled via `#poolPush`). Rejects assoc_scan,
+block_map, incref.
 
 **Effect system:** `MemoryEffect` enum (`Alloc`, `Borrow`, `Consume`, `Mutate`) on Jaxpr equations.
 `effectDrivenAllocate` uses annotations for sound buffer recycling including DUS/ScatterAdd
@@ -429,7 +432,29 @@ All public symbols must be exported from `src/index.ts`. Key exports: `jit`, `gr
 `jvp`, `vjp`, `vmap`, `jacfwd`, `jacrev`, `hessian`, `linearize`, `makeJaxpr`, `init`,
 `defaultDevice`, `devicePut`, `blockUntilReady`, `scatterAdd`, `clearCaches`, `checkLeaks`, `numpy`,
 `lax`, `nn`, `random`, `scipySpecial`, `scipyLinalg`, `tree`, `ScanPath`, `profileGpu`,
-`getWebGPUDevice`.
+`profileGpuDetailed`, `setCodeCapture`, `CodeCaptureEntry`, `getWebGPUDevice`.
+
+Internal-only exports (underscore prefix, not public API): `_lastConvClass`,
+`_lastConvRewritten`.
+
+## Observability & code capture
+
+**`setCodeCapture(cb)`** — public API that registers a callback invoked on every compiled code unit
+(WGSL shader or WASM module) with a discriminated `CodeCaptureEntry`. Fires on cache miss only.
+Disabled by default (zero overhead). `setCodeCapture(null)` disables.
+
+**wasmblr trace mode:** When capture is enabled, `CodeGenerator` records WAT mnemonics alongside
+binary emission. `cg.toWat()` produces human-readable WAT source text. Off by default (zero cost).
+
+**`profileGpuDetailed(fn)`** — expert profiling API returning per-pass GPU duration, dispatch grid
+dimensions, workgroup size, shader label/hash, and pipeline cache hit/miss flags.
+
+**Hook points:** WebGPU: `ShaderPipelineCache.prepare()` on cache miss. WASM: 14 sites across
+kernels, mega-module, scan, assoc-scan, block-map, and routines (all on cache miss).
+
+**REPL integration:** The website REPL has a "Compiled Code" panel showing captured WGSL/WAT grouped
+by backend, with kind/label badges and metadata summaries. Enabled via "Capture compiled code"
+checkbox.
 
 ## Commit checklist
 
@@ -541,6 +566,64 @@ reductions; single-output reductions with concrete sizes are allowed.
 for reSize ≤ 8), (3) elementwise gidx loop for multi-element kernels. This enables DLM (Kalman)
 patterns with pytree matmul compose to use 1 fused dispatch instead of O(M-1) dispatches.
 
+### Halo overlap for stencil computations
+
+`block_map` supports a `halo` option specifying per-input, per-grid-axis overlap. Each input tile
+extends beyond the output block range by `[lo, hi]` elements, enabling stencil patterns (conv,
+blur, PDE) without materializing overlapping patches.
+
+```ts
+lax.blockMap(body, { image, kernel }, {
+  blockShape: [16, 16],
+  inAxes: { image: [2, 3], kernel: [null, null] },
+  outAxes: [2, 3],
+  halo: { image: [[1, 1], [1, 1]] },
+});
+// image body tiles: [18, 18]; output tiles: [16, 16]
+```
+
+**Zero-copy backends:** WebGPU uses signed bounds checks in the fused shader (no extra allocation).
+WASM uses compiled clamped-copy with an interior fast path that skips `memory.fill`. JS fallback
+uses per-block clamped slicing. No pre-padding on any backend.
+
+**Halo VJP (reverse-mode differentiation):** Two paths:
+
+- **Stencil body synthesis** (fast): For linear stencil bodies composed of `{Shrink, Mul(Lit),
+  Add}`, `analyzeLinearStencil` in `stencil-analysis.ts` synthesizes a gather-based backward body
+  with reversed spatial offsets. Shape contract: `(B+bwdHalo) → B` (halo-expanded input, disjoint
+  output). No atomics or scatter-add needed.
+- **Pad+add fallback** (general): `transposeJaxpr` produces overlapping gradient patches that are
+  padded and accumulated. Works for all body types including non-linear.
+
+JVP threads `originalJaxpr` + `originalNumConsts` through `BlockMap` params so the transpose rule
+analyzes the clean forward body, not the JVP-doubled body.
+
+### Conv2d lowering pipeline
+
+Conv2d is lowered through multiple paths depending on kernel shape and backend:
+
+| Classification       | Trigger                         | Lowering                                       |
+| -------------------- | ------------------------------- | ---------------------------------------------- |
+| `generic-dot`        | Default                         | `prepareConv` → reshaped views + `Dot`         |
+| `fast-1x1-dot`       | 1×1 kernel                      | `prepareConv1x1` → moveaxis + reshape + `Dot`  |
+| `fast-1x1-block-map` | 1×1 kernel + block_map eligible | Block-map tiled 1×1                            |
+| `block-map-3x3`      | 3×3 stride-1 SAME, spatial ≥ 16 | Halo block_map with VALID body                 |
+| `block-map-5x5`      | 5×5 stride-1 SAME, spatial ≥ 16 | Halo block_map with VALID body                 |
+
+`_lastConvClass()` reports which path was selected. `_lastConvRewritten()` reports whether the
+Conv→BlockMap jaxpr rewrite fired.
+
+**Conv→BlockMap rewrite** (`rewriteConvToBlockMap()` in `jit.ts`): Rewrites eligible 3×3/5×5 Conv
+equations to `BlockMap` nodes BEFORE `splitGraphDataflow`. Guards: stride=1, SAME-equivalent
+padding, spatial ≥ 16, concrete shapes, `vmapDims=0`. The body uses VALID conv (SAME guard prevents
+recursion). Currently gated off on WebGPU (block_map falls back to per-block dispatch for conv
+bodies; generic-dot is faster). WASM: 1.02–1.36× speedup growing with spatial size.
+
+**Key finding from benchmarking:** For single-batch inference shapes (3×3, batch=1, 32–128ch,
+32²–128²), WebGPU is **dispatch-bound at ~2.5ms** with <1% GPU utilization. Kernel quality is
+irrelevant until tensor sizes are large enough to dominate dispatch cost. Im2col materialization was
+attempted and rejected (41% regression from 150MB VRAM bandwidth overhead for 3×3).
+
 ---
 
 # Part 3: Scan & Associative Scan
@@ -575,13 +658,15 @@ Use `acceptPath: ["compiled-loop", "preencoded-routine", "preencoded-multi-step"
 numCarry/numY combination, internal buffer deps, reverse, polymorphic length.
 
 **WebGPU compiled-loop** handles: kernel-only bodies with same-gidx deps (Phase 1 extended fusion),
-carry passthrough, constants, reverse. Requires `numCarry === numY`.
+carry passthrough, constants, reverse. Requires `numCarry === numY` (or carry-only with numY=0,
+or passthrough where Y outputs are identity of carry outputs).
 
 **WebGPU preencoded-multi-step** handles: cross-element deps, mixed kernel+routine bodies (non-Sort
 routines). Phase 3 added Cholesky/TriSolve/LU support.
 
-**Limitations:** numCarry ≠ numY on WebGPU → fallback. Sort in scan body on WebGPU → fallback
-(uniform conflict). Mixed-dtype carries on WebGPU → fallback.
+**Limitations:** numCarry ≠ numY on WebGPU → fallback, except carry-only (numY=0) and passthrough
+patterns (Y outputs identical to carry outputs). Sort in scan body on WebGPU → fallback (uniform
+conflict). Mixed-dtype carries on WebGPU → fallback.
 
 ### Autodiff
 
@@ -788,7 +873,11 @@ pnpm build && pnpm vitest bench bench/<file>.bench.ts
 | File                              | What it measures                                                        |
 | --------------------------------- | ----------------------------------------------------------------------- |
 | `bench/argreduce.bench.ts`        | Argmin/argmax reduction performance                                     |
+| `bench/assoc-scan-scaling.bench.ts` | Associative scan scaling with N                                       |
 | `bench/associative-scan.bench.ts` | `associativeScan` vs sequential `scan` for cumsum/cumprod               |
+| `bench/block-map-matmul.bench.ts` | Tiled matmul via `block_map` at various sizes                           |
+| `bench/command-tape.bench.ts`     | Command tape vs step-by-step dispatch overhead                          |
+| `bench/conv2d.bench.ts`           | Conv2d throughput across backends, kernel sizes, batch sizes             |
 | `bench/dlm-scan.bench.ts`         | DLM (Kalman) scan: assocScan/scan/grad with pytree matmul compose       |
 | `bench/matmul.bench.ts`           | Matrix multiplication throughput at various sizes                       |
 | `bench/mega-module.bench.ts`      | Mega-module vs step-by-step: chains, multi-output, reduce, grad, matmul |
@@ -796,6 +885,8 @@ pnpm build && pnpm vitest bench bench/<file>.bench.ts
 | `bench/scan.bench.ts`             | `lax.scan` throughput across backends and body types                    |
 | `bench/scatter-add.bench.ts`      | `scatterAdd` throughput at 1K/10K/100K elements                         |
 | `bench/sort.bench.ts`             | Sorting performance across backends                                     |
+| `bench/tiled-matmul.bench.ts`     | Tiled matmul parameter sweeps (block size, thread tile)                 |
+| `bench/tts.bench.ts`              | Text-to-speech inference pipeline                                       |
 | `bench/where-branching.bench.ts`  | WASM `AluOp.Where` branching vs branchless select                       |
 
 Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`), use
@@ -803,13 +894,13 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 
 ## Future performance work
 
-| ID  | Title                     | Priority        | Description                                                                 |
-| --- | ------------------------- | --------------- | --------------------------------------------------------------------------- |
-| P2  | Relaxed SIMD FMA          | Medium          | `f32x4.relaxed_madd` for 2× WASM dot-product throughput. Safari unsupported |
-| P3  | i64 in wasmblr            | Medium          | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins       |
-| P4  | Conv2d tuning             | Medium          | Specialized WGSL for common kernel sizes (3×3, 5×5)                         |
-| P6  | Benchmark validation      | Medium          | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions      |
-| P7  | Cooperative matrix (WMMA) | Blocked (~2026) | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable       |
+| ID  | Title                        | Priority        | Description                                                                     |
+| --- | ---------------------------- | --------------- | ------------------------------------------------------------------------------- |
+| P2  | Relaxed SIMD FMA             | Medium          | `f32x4.relaxed_madd` for 2× WASM dot-product throughput. Safari unsupported     |
+| P3  | i64 in wasmblr               | Medium          | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins           |
+| P4  | Conv2d WebGPU fused shader   | Medium          | Fused-shader codegen for conv bodies in `block-map.ts`. WASM path done (1.02–1.36×) |
+| P6  | Benchmark validation         | Medium          | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions          |
+| P7  | Cooperative matrix (WMMA)    | Blocked (~2026) | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable           |
 
 See `PLAN.md` for deferred items (O6 multi-reduction, O8d fori_loop tape, Decoupled Fallback
 Phase 2) and non-goals.
@@ -889,3 +980,4 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Stencil body synthesis for halo-VJP                         | Forward bodies use Shrink (from `sliceInDim`), not UDS. `analyzeLinearStencil` walks body for {Shrink, Add, Mul(Lit)} targeting single halo input; `Add(stencilTerms, Lit)` allowed (additive bias drops out in adjoint). Gather-based VJP synthesizes reversed-stencil backward body via `makeJaxpr`; non-linear/unrecognized bodies fall back to pad+add. Multi-input guard: if any non-haloed tangent input is differentiated, falls through to pad+add. JVP threads `originalJaxpr`+`originalNumConsts` through BlockMap params so transpose analyzes clean forward body, not JVP-doubled body |
 | Conv→BlockMap jaxpr rewrite (C.3)                           | `rewriteConvToBlockMap()` rewrites eligible 3×3/5×5 Conv to BlockMap BEFORE `splitGraphDataflow`. Guards: stride=1, SAME-equiv padding, spatial≥16, v=0, backend≠webgpu. Body uses VALID conv (SAME guard prevents recursion). `_lastConvRewritten()` tracks actual rewrite. 1.02–1.36× WASM speedup (grows with spatial size)                                                                                                                                                                                                                                                                     |
 | WebGPU-only tests in GPU-enforced suite                     | Tests requiring WebGPU excluded from default vitest config; run under gpu-test.sh where adapter is guaranteed. Pre-commit runs them automatically (NVIDIA on feature, both GPUs on main)                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Scan-in-command-tape (`TapeScan`)                           | Non-fallback scan paths (compiled-loop, preencoded-routine, preencoded-multi-step) execute within the tape's command buffer. Scan dispatchers receive a `tapeCtx` with shared encoder, deferred destroys, and `Set<GPUBuffer>` for pooled transient buffers. Scan buffer indices excluded from arena coloring via `buildConflictGraphAndColor`                                                                                                                                                                                                                                                       |
