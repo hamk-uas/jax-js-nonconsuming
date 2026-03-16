@@ -43,8 +43,8 @@ import {
   constToWgsl,
   dtypeToWgsl,
   gridOffsetY,
-  headerWgsl,
   ShaderInfo,
+  withNanInfHeader,
 } from "./webgpu/codegen";
 import {
   type ArenaSlab,
@@ -218,8 +218,6 @@ export interface PreparedPreencodedMultiStep {
 const COPY_WORKGROUP_SIZE = 64;
 
 const COPY_SHADER_CODE = String.raw`
-${headerWgsl}
-
 struct CopyParams {
   srcOffset: u32,
   dstOffset: u32,
@@ -3220,8 +3218,6 @@ function pipelineSourceMulti(
     emit("enable f16;");
   }
 
-  emit(headerWgsl);
-
   // Collect all distinct ops across all output expressions
   let allOps: Map<AluOp, Set<DType>> = new Map();
   for (const tune of tunes) {
@@ -3437,7 +3433,7 @@ function pipelineSourceMulti(
 
   emit(popIndent, "}");
   return {
-    code: shader.join("\n"),
+    code: withNanInfHeader(shader.join("\n")),
     numInputs: nargs,
     numOutputs: numOutputs,
     hasUniform: symbolic,
@@ -3506,8 +3502,6 @@ function pipelineSource(
   if (useSubgroups) {
     emit("enable subgroups;");
   }
-
-  emit(headerWgsl);
 
   // Global functions at the start of the shader.
   const distinctOps = mapSetUnion(
@@ -4012,7 +4006,7 @@ function pipelineSource(
       byteWidth(re!.dtype)
     : undefined;
   return {
-    code: shader.join("\n"),
+    code: withNanInfHeader(shader.join("\n")),
     numInputs: nargs,
     numOutputs: 1,
     hasUniform: symbolic || symbolicReduce,
@@ -4157,8 +4151,6 @@ function nativeScanMultiShaderSource(
     }
     emit("enable f16;");
   }
-
-  emit(headerWgsl);
 
   // Global function definitions needed by all kernels
   const allDistinctOps = new Set<AluOp>();
@@ -4388,7 +4380,7 @@ function nativeScanMultiShaderSource(
   const numReadWriteOutputs = numCarry + numY;
 
   return {
-    code: getCode(),
+    code: withNanInfHeader(getCode()),
     numInputs: numReadOnlyInputs,
     numOutputs: numReadWriteOutputs,
     hasUniform: false,

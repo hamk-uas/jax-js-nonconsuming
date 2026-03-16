@@ -4,9 +4,9 @@ import {
   calculateGrid,
   dtypeToWgsl,
   gridOffsetY,
-  headerWgsl,
   maxValueWgsl,
   ShaderInfo,
+  withNanInfHeader,
 } from "./codegen";
 import { DType, isFloatDtype } from "../../alu";
 import { UnsupportedRoutineError } from "../../backend";
@@ -72,7 +72,6 @@ function bitonicSortShader(
 
   const code = `
 ${needsF16 ? "enable f16;" : ""}
-${headerWgsl}
 
 struct Uniforms {
   kind: u32, // 0 = sort, 1 = merge
@@ -253,7 +252,7 @@ ${
 
   return [
     {
-      code,
+      code: withNanInfHeader(code),
       numInputs: 1,
       numOutputs: outputIndices ? 2 : 1,
       hasUniform: true,
@@ -312,7 +311,6 @@ function createTriangularSolve(
 
   const code = `
 ${needsF16 ? "enable f16;" : ""}
-${headerWgsl}
 
 @group(0) @binding(0) var<storage, read> a: array<${ty}>;
 @group(0) @binding(1) var<storage, read> b: array<${ty}>;
@@ -369,7 +367,7 @@ fn main(
   const grid = calculateGrid(totalWorkgroups);
   return [
     {
-      code,
+      code: withNanInfHeader(code),
       numInputs: 2,
       numOutputs: 1,
       hasUniform: false,
@@ -404,7 +402,6 @@ function createCholesky(device: GPUDevice, type: RoutineType): ShaderInfo[] {
 
   const code = `
 ${needsF16 ? "enable f16;" : ""}
-${headerWgsl}
 
 @group(0) @binding(0) var<storage, read> input: array<${ty}>;
 @group(0) @binding(1) var<storage, read_write> output: array<${ty}>;
@@ -465,7 +462,7 @@ fn main(
   const grid = calculateGrid(batches);
   return [
     {
-      code,
+      code: withNanInfHeader(code),
       numInputs: 1,
       numOutputs: 1,
       hasUniform: false,
@@ -504,7 +501,6 @@ function createLU(device: GPUDevice, type: RoutineType): ShaderInfo[] {
 
   const code = `
 ${needsF16 ? "enable f16;" : ""}
-${headerWgsl}
 
 @group(0) @binding(0) var<storage, read> input: array<${ty}>;
 @group(0) @binding(1) var<storage, read_write> lu: array<${ty}>;
@@ -591,7 +587,7 @@ fn main(
   const grid = calculateGrid(batches);
   return [
     {
-      code,
+      code: withNanInfHeader(code),
       numInputs: 1,
       numOutputs: 3,
       hasUniform: false,

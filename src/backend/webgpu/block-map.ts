@@ -24,9 +24,9 @@ import {
   calculateGrid,
   constToWgsl,
   dtypeToWgsl,
-  headerWgsl,
   type PackedLeafLayout,
   type ShaderInfo,
+  withNanInfHeader,
 } from "./codegen";
 import {
   createWgslGen,
@@ -1229,7 +1229,6 @@ export function blockMapFusedShaderSource(
     emit("enable subgroups;");
   }
 
-  emit(headerWgsl);
   if (allOps.has(AluOp.Threefry2x32)) emit(threefrySrc);
   if (allOps.has(AluOp.Erf) || allOps.has(AluOp.Erfc)) emit(erfSrc);
   emit("");
@@ -4137,7 +4136,7 @@ export function blockMapFusedShaderSource(
 
   emit(popIndent, "}");
 
-  const code = shader.join("\n");
+  const code = withNanInfHeader(shader.join("\n"));
 
   return {
     code,

@@ -53,10 +53,30 @@ export interface ShaderInfo {
   packedLeafLayout?: PackedLeafLayout;
 }
 
-export const headerWgsl = String.raw`
+const nanInfDefs = String.raw`
 fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn inf() -> f32 { let bits = 0x7f800000u; return bitcast<f32>(bits); }
 `.trim();
+
+/**
+ * Prepend nan()/inf() helper definitions only if the shader body uses them.
+ * Matches function-call syntax `nan(` / `inf(` to avoid false positives on
+ * variable names like `a_nan`.
+ */
+export function withNanInfHeader(code: string): string {
+  if (code.includes("nan(") || code.includes("inf(")) {
+    // Insert after any `enable` directives at the top.
+    const lines = code.split("\n");
+    let insertIdx = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith("enable ")) insertIdx = i + 1;
+      else if (lines[i].trim() !== "") break;
+    }
+    lines.splice(insertIdx, 0, nanInfDefs);
+    return lines.join("\n");
+  }
+  return code;
+}
 
 export function dtypeToWgsl(dtype: DType, storage: boolean = false): string {
   switch (dtype) {
