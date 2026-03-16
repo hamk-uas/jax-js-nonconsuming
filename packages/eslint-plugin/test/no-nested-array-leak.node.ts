@@ -32,6 +32,37 @@ async function lint(code: string) {
   );
 }
 
+async function lintWithFix(code: string) {
+  const eslint = new ESLint({
+    fix: true,
+    overrideConfigFile: true,
+    overrideConfig: [
+      {
+        languageOptions: {
+          ecmaVersion: "latest",
+          sourceType: "module",
+        },
+        plugins: {
+          "jax-js": plugin as any,
+        },
+        rules: {
+          "jax-js/no-nested-array-leak": "error",
+        },
+      },
+    ],
+  });
+
+  const [result] = await eslint.lintText(code, {
+    filePath: "nested-leak.js",
+  });
+  return {
+    output: result.output ?? code,
+    messages: result.messages.filter(
+      (m) => m.ruleId === "jax-js/no-nested-array-leak",
+    ),
+  };
+}
+
 // ── Should report: nested array-producing calls ──────────────────────────
 
 test("no-nested-array-leak: np.tile(np.reshape(...)) flags inner reshape", async () => {
@@ -203,4 +234,72 @@ function f(x) {
   const messages = await lint(code);
   assert.equal(messages.length, 1);
   assert.ok(messages[0].message.includes("lax.erf"));
+});
+
+// ── Autofix tests ────────────────────────────────────────────────────────
+
+test("no-nested-array-leak: autofix extracts single nested arg", async () => {
+  const code = `
+function f(G) {
+  const result = np.tile(np.reshape(G, [1, 2, 2]), [10, 1, 1]);
+  return result;
+}
+`;
+  const { output, messages } = await lintWithFix(code);
+  assert.equal(messages.length, 0);
+  assert.match(output, /using _jaxTmp1 = np\.reshape\(G, \[1, 2, 2\]\);/);
+  assert.match(output, /np\.tile\(_jaxTmp1, \[10, 1, 1\]\)/);
+});
+
+test("no-nested-array-leak: autofix extracts both nested args", async () => {
+  const code = `
+function f() {
+  const result = np.add(np.array([1, 2]), np.eye(2));
+  return result;
+}
+`;
+  const { output, messages } = await lintWithFix(code);
+  assert.equal(messages.length, 0);
+  assert.match(output, /using _jaxTmp1 = np\.array\(\[1, 2\]\);/);
+  assert.match(output, /using _jaxTmp2 = np\.eye\(2\);/);
+  assert.match(output, /np\.add\(_jaxTmp1, _jaxTmp2\)/);
+});
+
+test("no-nested-array-leak: autofix extracts method-call arg", async () => {
+  const code = `
+function f(x, y) {
+  const result = np.add(x.reshape([2, 3]), y);
+  return result;
+}
+`;
+  const { output, messages } = await lintWithFix(code);
+  assert.equal(messages.length, 0);
+  assert.match(output, /using _jaxTmp1 = x\.reshape\(\[2, 3\]\);/);
+  assert.match(output, /np\.add\(_jaxTmp1, y\)/);
+});
+
+test("no-nested-array-leak: autofix preserves indentation", async () => {
+  const code = `
+function f(x) {
+    const result = np.add(np.square(x), x);
+    return result;
+}
+`;
+  const { output, messages } = await lintWithFix(code);
+  assert.equal(messages.length, 0);
+  // Should use 4-space indent matching the const statement
+  assert.match(output, /\n {4}using _jaxTmp1 = np\.square\(x\);/);
+});
+
+test("no-nested-array-leak: no autofix inside return statement", async () => {
+  // Return statements with nested calls get fix too — extracted before return
+  const code = `
+function f(x) {
+  return np.tile(np.reshape(x, [1, 2, 2]), [10, 1, 1]);
+}
+`;
+  const { output, messages } = await lintWithFix(code);
+  assert.equal(messages.length, 0);
+  assert.match(output, /using _jaxTmp1 = np\.reshape\(x, \[1, 2, 2\]\);/);
+  assert.match(output, /return np\.tile\(_jaxTmp1, \[10, 1, 1\]\);/);
 });

@@ -111,6 +111,23 @@ export const ARRAY_FACTORIES = new Set([
   "radians",
   "sinc",
   "sinh",
+  // numpy comparison / logical
+  "arrayEqual",
+  "arrayEquiv",
+  "logicalAnd",
+  "logicalOr",
+  "logicalNot",
+  "logicalXor",
+  // numpy linalg-adjacent
+  "cross",
+  "matvec",
+  "vecmat",
+  // numpy rounding / sign
+  "copysign",
+  "rint",
+  "round",
+  // numpy statistical
+  "average",
 ]);
 
 /**
@@ -170,6 +187,7 @@ export const ARRAY_METHODS = new Set([
   "expandDims",
   "at",
   "slice",
+  "view",
 ]);
 
 export function isArrayProducingCall(node: any): boolean {
