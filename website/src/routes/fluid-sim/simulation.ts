@@ -4,6 +4,7 @@ import {
   init,
   jit,
   numpy as np,
+  withBatch,
 } from "@hamk-uas/jax-js-nonconsuming";
 
 // --- Simulation parameters ---
@@ -223,7 +224,7 @@ const applyBoundary = jit(function applyBoundary(
   return np.stack([vxFinal, vyCombined], 2);
 });
 
-const applyForce = jit(function (
+const applyForce = jit(function applyForce(
   vel: np.Array,
   mx: np.Array,
   my: np.Array,
@@ -401,71 +402,77 @@ function renderFrame(matBuffer: GPUBuffer) {
 }
 
 // --- Main loop ---
+// Optimizations vs upstream:
+// 1. withBatch: batches all JIT dispatches into a single queue.submit()
+// 2. gpuBufferSync: synchronous GPU buffer access (no async overhead per frame)
 async function simulate() {
   while (running) {
-    // 1) Advect velocity
-    {
-      using prev = velocity;
-      velocity = advectVel(prev, prev);
-    }
-
-    // 2) Boundary conditions
-    const obsXv = (obstacleX / AW) * W;
-    const obsYv = (obstacleY / AH) * H;
-    const obsRadV = (obstacleRad / AW) * W;
-    {
-      using prev = velocity;
-      velocity = applyBoundary(prev, obsXv, obsYv, obsRadV);
-    }
-
-    // 3) Mouse force
-    if (mouseDown && !movingObstacle) {
-      const mx = (mouseX / AW) * W;
-      const my = (mouseY / AH) * H;
-      const fdx = (2 * (mouseX - lastMouseX)) / 3.5;
-      const fdy = (2 * (mouseY - lastMouseY)) / 3.5;
-      const radiusParam = 0.001 * Math.max(AW, AH);
+    // All simulation dispatches batched into a single queue.submit()
+    withBatch(() => {
+      // 1) Advect velocity
       {
         using prev = velocity;
-        velocity = applyForce(prev, mx, my, fdx, fdy, radiusParam);
+        velocity = advectVel(prev, prev);
+      }
+
+      // 2) Boundary conditions
+      const obsXv = (obstacleX / AW) * W;
+      const obsYv = (obstacleY / AH) * H;
+      const obsRadV = (obstacleRad / AW) * W;
+      {
+        using prev = velocity;
+        velocity = applyBoundary(prev, obsXv, obsYv, obsRadV);
+      }
+
+      // 3) Mouse force
+      if (mouseDown && !movingObstacle) {
+        const mx = (mouseX / AW) * W;
+        const my = (mouseY / AH) * H;
+        const fdx = (2 * (mouseX - lastMouseX)) / 3.5;
+        const fdy = (2 * (mouseY - lastMouseY)) / 3.5;
+        const radiusParam = 0.001 * Math.max(AW, AH);
+        {
+          using prev = velocity;
+          velocity = applyForce(prev, mx, my, fdx, fdy, radiusParam);
+        }
+        {
+          using prev = velocity;
+          velocity = applyBoundary(prev, obsXv, obsYv, obsRadV);
+        }
+      }
+
+      // 4) Pressure projection (warm-start from previous frame)
+      {
+        using div = computeDivergence(velocity);
+        for (let i = 0; i < JACOBI_ITERS; i++) {
+          using prev = pressure;
+          pressure = jacobiStep(div, prev);
+        }
+      }
+
+      // 5) Subtract pressure gradient
+      {
+        using prev = velocity;
+        velocity = subtractGradient(prev, pressure);
       }
       {
         using prev = velocity;
         velocity = applyBoundary(prev, obsXv, obsYv, obsRadV);
       }
-    }
 
-    // 4) Pressure projection (warm-start from previous frame)
-    {
-      using div = computeDivergence(velocity);
-      for (let i = 0; i < JACOBI_ITERS; i++) {
-        using prev = pressure;
-        pressure = jacobiStep(div, prev);
+      // 6) Advect material
+      {
+        using prev = material;
+        material = advectMat(prev, velocity);
       }
-    }
+      {
+        using prev = material;
+        material = applyMatBoundary(prev);
+      }
+    });
 
-    // 5) Subtract pressure gradient
-    {
-      using prev = velocity;
-      velocity = subtractGradient(prev, pressure);
-    }
-    {
-      using prev = velocity;
-      velocity = applyBoundary(prev, obsXv, obsYv, obsRadV);
-    }
-
-    // 6) Advect material
-    {
-      using prev = material;
-      material = advectMat(prev, velocity);
-    }
-    {
-      using prev = material;
-      material = applyMatBoundary(prev);
-    }
-
-    // 7) Render
-    const matBuffer = await material.gpuBuffer();
+    // Synchronous GPU buffer access — no async overhead per frame
+    const matBuffer = material.gpuBufferSync();
     renderFrame(matBuffer);
 
     await new Promise((r) => requestAnimationFrame(r));
