@@ -2532,9 +2532,10 @@ export class WebGPUBackend implements Backend {
     // remove them on error (prevents pool poisoning with destroyed refs).
     const pooledDuringTape: GPUBuffer[] = [];
     let submitted = false;
+    const ownEncoder = !this.#batchEncoder;
 
     try {
-      const encoder = this.device.createCommandEncoder();
+      const encoder = this.#batchEncoder ?? this.device.createCommandEncoder();
 
       for (const op of tape.ops) {
         switch (op.type) {
@@ -2576,10 +2577,14 @@ export class WebGPUBackend implements Backend {
             // Skip arena buffers — owned by tape, not per-invocation.
             if (arenaBufferSet.has(buf)) break;
             if (buf && buf !== this.#reusableZsb) {
-              if (!this.#poolPush(buf)) {
-                deferredDestroys.push(buf);
+              if (ownEncoder) {
+                if (!this.#poolPush(buf)) {
+                  deferredDestroys.push(buf);
+                } else {
+                  pooledDuringTape.push(buf);
+                }
               } else {
-                pooledDuringTape.push(buf);
+                this.#batchDeferredFreeBuffers.push(buf);
               }
             }
             break;
@@ -2833,7 +2838,9 @@ export class WebGPUBackend implements Backend {
         }
       }
 
-      this.device.queue.submit([encoder.finish()]);
+      if (ownEncoder) {
+        this.device.queue.submit([encoder.finish()]);
+      }
       submitted = true;
     } finally {
       if (!submitted) {
@@ -2853,14 +2860,19 @@ export class WebGPUBackend implements Backend {
       }
     }
 
-    // Now safe to destroy buffers that couldn't fit in the pool — the command
-    // buffer has been submitted, so references are no longer live.
-    for (const buf of deferredDestroys) {
-      this.#gpuAllocatedBytes -= buf.size;
-      buf.destroy();
+    if (ownEncoder) {
+      // Now safe to destroy buffers that couldn't fit in the pool — the command
+      // buffer has been submitted, so references are no longer live.
+      for (const buf of deferredDestroys) {
+        this.#gpuAllocatedBytes -= buf.size;
+        buf.destroy();
+      }
+      // Destroy temporary uniform buffers from unaligned copy shader (O8e).
+      for (const buf of copyUniforms) buf.destroy();
+    } else {
+      // Pass copy-shader uniforms to batch cleanup.
+      this.#batchUniformsToDestroy.push(...copyUniforms);
     }
-    // Destroy temporary uniform buffers from unaligned copy shader (O8e).
-    for (const buf of copyUniforms) buf.destroy();
 
     // Create output slots
     const outputs: Slot[] = new globalThis.Array(tape.outputTableIdxs.length);

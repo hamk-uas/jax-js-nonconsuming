@@ -402,12 +402,8 @@ function renderFrame(matBuffer: GPUBuffer) {
 }
 
 // --- Main loop ---
-// Optimizations vs upstream:
-// 1. withBatch: batches all JIT dispatches into a single queue.submit()
-// 2. gpuBufferSync: synchronous GPU buffer access (no async overhead per frame)
 async function simulate() {
   while (running) {
-    // All simulation dispatches batched into a single queue.submit()
     withBatch(() => {
       // 1) Advect velocity
       {
@@ -469,9 +465,8 @@ async function simulate() {
         using prev = material;
         material = applyMatBoundary(prev);
       }
-    });
+    }); // end withBatch
 
-    // Synchronous GPU buffer access — no async overhead per frame
     const matBuffer = material.gpuBufferSync();
     renderFrame(matBuffer);
 
