@@ -14,6 +14,7 @@
   } from "@lucide/svelte";
   import { SplitPane } from "@rich_harris/svelte-split-pane";
 
+  import CodePanel from "$lib/repl/CodePanel.svelte";
   import ConsoleLine from "$lib/repl/ConsoleLine.svelte";
   import ReplEditor from "$lib/repl/ReplEditor.svelte";
   import { decodeContent, encodeContent } from "$lib/repl/encode";
@@ -73,6 +74,7 @@
   let consoleLines = $derived(replRunner.consoleLines);
   let mockConsole = replRunner.mockConsole;
   let runDurationMs = $derived(replRunner.runDurationMs);
+  let bottomTab: "console" | "code" = $state("console");
 
   afterNavigate(({ type }) => {
     if (type === "enter") return; // Already handled on load
@@ -233,6 +235,13 @@
                 Detailed leak diagnostics
               </label>
 
+              <label
+                class="ml-2 flex items-center gap-1.5 text-xs text-gray-600 select-none"
+              >
+                <input type="checkbox" bind:checked={replRunner.captureCode} />
+                Capture compiled code
+              </label>
+
               <!-- Device selector -->
               <select
                 bind:value={device}
@@ -258,29 +267,62 @@
         {/snippet}
         {#snippet b()}
           <div class="flex flex-col h-full">
-            <p class="text-gray-500 text-sm py-2 px-4 select-none shrink-0">
-              Console
-              {#if replRunner.running}
-                <LoaderIcon
-                  size={14}
-                  class="inline-block animate-spin ml-1 mb-[3px]"
-                />
-              {:else if consoleLines.length === 0}
-                <span>(empty)</span>
-              {:else if runDurationMs !== null}
-                <span class="ml-1 text-gray-400"
-                  >({Math.round(runDurationMs).toLocaleString()} ms)</span
-                >
-              {/if}
-            </p>
             <div
-              class="pb-2 px-4 flex flex-col grow overflow-y-auto text-[13px]"
-              style:scrollbar-width="thin"
+              class="flex items-center gap-2 text-sm py-2 px-4 select-none shrink-0"
             >
-              {#each consoleLines as line, i (i)}
-                <ConsoleLine {line} showTime />
-              {/each}
+              <button
+                class="text-gray-500 hover:text-gray-800 transition-colors"
+                class:font-semibold={bottomTab === "console"}
+                class:text-gray-800={bottomTab === "console"}
+                onclick={() => (bottomTab = "console")}
+              >
+                Console
+              </button>
+              <button
+                class="text-gray-500 hover:text-gray-800 transition-colors"
+                class:font-semibold={bottomTab === "code"}
+                class:text-gray-800={bottomTab === "code"}
+                onclick={() => (bottomTab = "code")}
+              >
+                Compiled Code
+                {#if replRunner.capturedCode.length > 0}
+                  <span class="text-gray-400 font-normal"
+                    >({replRunner.capturedCode.length})</span
+                  >
+                {/if}
+              </button>
+              {#if bottomTab === "console"}
+                {#if replRunner.running}
+                  <LoaderIcon
+                    size={14}
+                    class="inline-block animate-spin ml-1"
+                  />
+                {:else if consoleLines.length === 0}
+                  <span class="text-gray-400 text-sm">(empty)</span>
+                {:else if runDurationMs !== null}
+                  <span class="ml-1 text-gray-400 text-sm"
+                    >({Math.round(runDurationMs).toLocaleString()} ms)</span
+                  >
+                {/if}
+              {/if}
             </div>
+            {#if bottomTab === "console"}
+              <div
+                class="pb-2 px-4 flex flex-col grow overflow-y-auto text-[13px]"
+                style:scrollbar-width="thin"
+              >
+                {#each consoleLines as line, i (i)}
+                  <ConsoleLine {line} showTime />
+                {/each}
+              </div>
+            {:else}
+              <div
+                class="pb-2 flex flex-col grow overflow-y-auto"
+                style:scrollbar-width="thin"
+              >
+                <CodePanel entries={replRunner.capturedCode} />
+              </div>
+            {/if}
           </div>
         {/snippet}
       </SplitPane>

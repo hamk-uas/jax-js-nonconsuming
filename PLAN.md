@@ -68,12 +68,12 @@ Phase A needs to answer "is the bottleneck dispatch count, reduction codegen, or
 
 #### Work
 
-1. **Conv lowering kind signal** — add an internal enum
+1. ✅ **Conv lowering kind signal** — add an internal enum
    (`generic-dot | fast-1x1-dot | fast-1x1-block-map | block-map-3x3 | block-map-5x5`) set during
    `Primitive.Conv` JIT lowering. Expose via a `_lastConvClass()` internal API (underscore = not
    public). Tests can assert which path activated without parsing console output.
 
-2. **`profileGpuDetailed(fn)`** — extend `profileGpu()` with a detailed variant that returns:
+2. ✅ **`profileGpuDetailed(fn)`** — extend `profileGpu()` with a detailed variant that returns:
    - pass count
    - per-pass GPU duration (already available from timestamp-query)
    - per-pass dispatch grid dimensions and workgroup size
@@ -83,7 +83,7 @@ Phase A needs to answer "is the bottleneck dispatch count, reduction codegen, or
    Keep `profileGpu()` as the simple user-facing API. `profileGpuDetailed()` is the expert API for
    optimization work and bench scripts.
 
-3. **Code capture API (public, unified)** — `setCodeCapture(cb)` registers a callback invoked on
+3. ✅ **Code capture API (public, unified)** — `setCodeCapture(cb)` registers a callback invoked on
    every compiled code unit (WGSL shader or WASM module) with a discriminated `CodeCaptureEntry`.
    `setCodeCapture(null)` disables it. Disabled by default (zero overhead). This is a **public
    export** from `src/index.ts`.
@@ -159,11 +159,11 @@ Phase A needs to answer "is the bottleneck dispatch count, reduction codegen, or
    in `routine-provider.ts`. Like WebGPU, the callback fires on cache miss only — repeated
    compilations of identical code units are not re-captured.
 
-4. **REPL compiled-code panel** — add a "Compiled Code" tab/pane to the website REPL alongside the
-   existing Console. Before each run, the runner installs a `setCodeCapture` callback that collects
-   entries into a reactive `$state` array. After the run, the panel displays entries grouped by
-   backend, with source code shown as syntax-highlighted text for both WGSL and WAT. The "Capture
-   compiled code" checkbox sits next to the existing "Detailed leak diagnostics" toggle.
+4. ✅ **REPL compiled-code panel** — add a "Compiled Code" tab/pane to the website REPL alongside
+   the existing Console. Before each run, the runner installs a `setCodeCapture` callback that
+   collects entries into a reactive `$state` array. After the run, the panel displays entries
+   grouped by backend, with source code shown as syntax-highlighted text for both WGSL and WAT. The
+   "Capture compiled code" checkbox sits next to the existing "Detailed leak diagnostics" toggle.
 
    **Implementation sketch:**
    - `runner.svelte.ts`: add `captureCode = $state(false)` and
@@ -790,11 +790,12 @@ paths:
 ### Recommended execution order
 
 1. ~~Phase A0 conv lowering kind signal~~ ✅ Done (commit f1663c7)
-2. Phase A0 `setCodeCapture` public API + wasmblr trace mode — WebGPU hook first, then WASM kernel +
-   mega-module hooks (trace mode enables WAT source collection at all WASM sites)
+2. ~~Phase A0 `setCodeCapture` public API + wasmblr trace mode — WebGPU hook first, then WASM
+   kernel + mega-module hooks (trace mode enables WAT source collection at all WASM sites)~~ ✅ Done
 3. ~~Phase A benchmark file + baseline numbers~~ ✅ Done (commit 83722e9)
-4. Phase A0 items 2 + 4 (detailed profiling + REPL compiled-code panel) in parallel with Phase A
-   analysis. WASM scan/assoc-scan/block-map/routine hooks land incrementally after initial panel
+4. ~~Phase A0 items 2 + 4 (detailed profiling + REPL compiled-code panel) in parallel with Phase A
+   analysis. WASM scan/assoc-scan/block-map/routine hooks land incrementally after initial panel~~
+   ✅ Done (profiling + all WASM hooks). REPL panel (item 4) is next
 5. ~~1×1 fast path~~ ✅ Done (commit 83722e9, Phase B)
 6. ~~3×3/5×5 classification~~ ✅ Done (commit 83722e9)
 7. ~~3×3 im2col + tiledMatmul~~ ❌ Rejected (41% regression from materialization overhead)
