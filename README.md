@@ -99,7 +99,7 @@ workload- and hardware-dependent.
 | **Overview**                             |                     |               |                 |                    |
 | API style                                | JAX/NumPy           | JAX/NumPy     | TensorFlow-like | Static ONNX graphs |
 | Speed                                    | Very fast           | Very fast     | Fast            | Very fast          |
-| Bundle size (gzip)                       | 137 KB              | 80 KB         | 269 KB          | 90 KB + 24 MB Wasm |
+| Bundle size (gzip)                       | 179 KB              | 80 KB         | 269 KB          | 90 KB + 24 MB Wasm |
 | **Autodiff & JIT**                       |                     |               |                 |                    |
 | Gradients                                | ✅                  | ✅            | ✅              | ❌                 |
 | Jacobian and Hessian                     | ✅                  | ✅            | ❌              | ❌                 |
