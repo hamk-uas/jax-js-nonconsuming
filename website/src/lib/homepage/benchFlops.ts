@@ -45,30 +45,57 @@ async function benchFlopsInner(
     k2.dispose();
     await jax.blockUntilReady([A, B]);
 
-    // Warmup: triggers JIT compilation + pipeline creation (not timed)
-    {
+    // Warmup: triggers JIT compilation + pipeline creation + GPU clock boost
+    for (let w = 0; w < 3; w++) {
       using C = matmulFn(A, B);
       await jax.blockUntilReady(C);
-      const sample = (await C.data())[0];
-      if (!Number.isFinite(sample))
-        throw new Error("GPU produced non-finite result");
+      if (w === 0) {
+        const sample = (await C.data())[0];
+        if (!Number.isFinite(sample))
+          throw new Error("GPU produced non-finite result");
+      }
     }
 
-    // Timed runs
+    // Batch-submit timing: dispatch BATCH_SIZE matmuls back-to-back in a
+    // single queue.submit(), fence once, divide total time by BATCH_SIZE.
+    // This amortizes per-fence overhead and renderer main-thread stalls
+    // (module compilation, layout, compositor BeginFrame) across many GPU
+    // dispatches — far more stable than per-iteration fence timing.
+    const BATCH_SIZE = 8;
+    const NUM_BATCHES = 7;
+
+    // Extra warmup: run a full batch to ramp GPU clocks before timing.
+    // Single-iteration warmup above compiles shaders but doesn't generate
+    // enough sustained load to bring the GPU out of low-power state.
+    // Without this, the first 1–2 timed batches run at reduced clock speed
+    // (observed: 183ms vs ~30ms on Intel gen-9 iGPU), occasionally
+    // contaminating the median.
+    {
+      const wOutputs: any[] = [];
+      jax.withBatch(() => {
+        for (let i = 0; i < BATCH_SIZE; i++) wOutputs.push(matmulFn(A, B));
+      });
+      await jax.blockUntilReady(wOutputs[wOutputs.length - 1]);
+      for (const o of wOutputs) o.dispose();
+    }
     const measurements: number[] = [];
-    for (let i = 0; i < 3; i++) {
+    for (let b = 0; b < NUM_BATCHES; b++) {
+      const outputs: any[] = [];
       const start = performance.now();
-      using C = matmulFn(A, B);
-      await jax.blockUntilReady(C);
+      jax.withBatch(() => {
+        for (let i = 0; i < BATCH_SIZE; i++) outputs.push(matmulFn(A, B));
+      });
+      await jax.blockUntilReady(outputs[outputs.length - 1]);
       const end = performance.now();
-      measurements.push((end - start) / 1000);
+      for (const o of outputs) o.dispose();
+      measurements.push((end - start) / 1000 / BATCH_SIZE);
     }
 
     matmulFn.dispose();
 
     const gflops = (2 * n * n * n) / 1e9;
-    const seconds =
-      measurements.reduce((a, b) => a + b, 0) / measurements.length;
+    measurements.sort((a, b) => a - b);
+    const seconds = measurements[Math.floor(measurements.length / 2)];
     const result = gflops / seconds;
 
     return Number.isFinite(result) && result > 0 ? result : undefined;

@@ -346,6 +346,13 @@ export interface Backend {
   flushBatch?(): void;
 
   /**
+   * Optional: lightweight GPU fence — resolves when all previously submitted
+   * work completes. Uses `queue.onSubmittedWorkDone()` on WebGPU.
+   * Backends without async dispatch (CPU, WASM) resolve immediately.
+   */
+  fence?(): Promise<void>;
+
+  /**
    * Optional: dispatch a scatter-add operation.
    * Accumulates `updates` into `target` (already copied to output) at
    * positions given by `indices` along `axis`.

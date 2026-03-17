@@ -24,6 +24,8 @@ import type {
   NativeScanMultiStep,
   PreparedPreencodedMultiStep,
   PreparedPreencodedScan,
+  WebGPUCarryOutputSource,
+  WebGPUYOutputSource,
 } from "../backend/webgpu";
 import type { WebGPUBackend } from "../backend/webgpu";
 import { Routine, Routines } from "../routine";
@@ -757,6 +759,130 @@ function tryPrepareWasmNativeScan(
 // WebGPU multi-kernel native scan (P3)
 // ---------------------------------------------------------------------------
 
+function classifyWebGPUCarrySources(
+  bodyProgram: JitProgram,
+  numCarry: number,
+  numConsts: number,
+  numX: number,
+  jitIdToInternalIdx: ReadonlyMap<JitId, number>,
+): WebGPUCarryOutputSource[] | null {
+  const xsStart = numConsts + numCarry;
+  const carryInputIds = bodyProgram.inputs.slice(
+    numConsts,
+    numConsts + numCarry,
+  );
+  const xsInputIds = bodyProgram.inputs.slice(xsStart, xsStart + numX);
+  const carryOutIds = bodyProgram.outputs.slice(0, numCarry);
+  const sources: WebGPUCarryOutputSource[] = [];
+
+  for (let ci = 0; ci < numCarry; ci++) {
+    const outId = carryOutIds[ci];
+
+    // 1. carry-passthrough: output JitId matches a carry input
+    const passIdx = carryInputIds.indexOf(outId);
+    if (passIdx !== -1) {
+      sources.push({ type: "carry-passthrough", carryIdx: passIdx });
+      continue;
+    }
+
+    // 2. internal: produced by a body step
+    const intIdx = jitIdToInternalIdx.get(outId);
+    if (intIdx !== undefined) {
+      sources.push({ type: "internal", internalIdx: intIdx });
+      continue;
+    }
+
+    // 3. const: output is a constant
+    if (outId < numConsts) {
+      sources.push({ type: "const", constIdx: outId });
+      continue;
+    }
+
+    // 4. xs: output is an xs element
+    const xIdx = xsInputIds.indexOf(outId);
+    if (xIdx !== -1) {
+      // INVARIANT: If the carry output is precisely an `xs` element,
+      // Jaxpr identity semantics guarantee its shape, dtype, and byte
+      // size are identical to the `xs` slice's properties. Because of
+      // this, it's safe for the executor to use `iterIdx * carrySizes[ci]`
+      // as the source byte offset into `xsBuffers[xIdx]`.
+      sources.push({ type: "xs", xIdx });
+      continue;
+    }
+
+    // Unrecognized source type — fail gracefully so the planner falls back
+    return null;
+  }
+  return sources;
+}
+
+/**
+ * Classify every Y output into one of four source categories.
+ * Shared by all WebGPU scan paths (compiled-loop, preencoded-routine, preencoded-multi-step).
+ *
+ * Returns null if any Y output cannot be resolved (caller should reject/fall back).
+ */
+function classifyWebGPUYSources(
+  bodyProgram: JitProgram,
+  numCarry: number,
+  numConsts: number,
+  numX: number,
+  numY: number,
+  jitIdToCarryIdx: ReadonlyMap<JitId, number>,
+  jitIdToInternalIdx?: ReadonlyMap<JitId, number>,
+): WebGPUYOutputSource[] | null {
+  if (numY === 0) return [];
+
+  const yOutIds = bodyProgram.outputs.slice(numCarry, numCarry + numY);
+  const carryInputIds = bodyProgram.inputs.slice(
+    numConsts,
+    numConsts + numCarry,
+  );
+  const xsInputIds = bodyProgram.inputs.slice(
+    numConsts + numCarry,
+    numConsts + numCarry + numX,
+  );
+
+  const sources: WebGPUYOutputSource[] = [];
+  for (let yi = 0; yi < numY; yi++) {
+    const yId = yOutIds[yi];
+
+    // 1. carry-snapshot: Y reads the pre-update carry value (body input)
+    const snapIdx = carryInputIds.indexOf(yId);
+    if (snapIdx !== -1) {
+      sources.push({ yi, type: "carry-snapshot", carryIdx: snapIdx });
+      continue;
+    }
+
+    // 2. carry-live: Y reads the updated carry output (produced by a step)
+    const liveIdx = jitIdToCarryIdx.get(yId);
+    if (liveIdx !== undefined) {
+      sources.push({ yi, type: "carry-live", carryIdx: liveIdx });
+      continue;
+    }
+
+    // 3. xs: Y passes through an xs input unchanged
+    const xsIdx = xsInputIds.indexOf(yId);
+    if (xsIdx !== -1) {
+      sources.push({ yi, type: "xs", xsIdx });
+      continue;
+    }
+
+    // 4. internal: Y reads a step-produced intermediate that isn't a carry
+    if (jitIdToInternalIdx) {
+      const intIdx = jitIdToInternalIdx.get(yId);
+      if (intIdx !== undefined) {
+        sources.push({ yi, type: "internal", internalIdx: intIdx });
+        continue;
+      }
+    }
+
+    // Unresolvable
+    return null;
+  }
+  return sources;
+}
+
 /**
  * Try to prepare a WebGPU native scan.
  *
@@ -853,27 +979,6 @@ function tryPrepareWebGPUNativeScan(
     // Passthrough carries are fine — carry buffer retains its value
   }
 
-  // Map Y output JitIds — each Y must be either a carry passthrough (same
-  // JitId as a carry output) or produced by a body step.
-  const yOutIds =
-    numY > 0 ? bodyProgram.outputs.slice(numCarry, numCarry + numY) : [];
-  const yOutputJitIds = new Set<JitId>();
-  const jitIdToYIdx = new Map<JitId, number>();
-  for (let yi = 0; yi < numY; yi++) {
-    const yId = yOutIds[yi];
-    // Y = carry passthrough: same JitId already mapped via carry
-    // Y = separate step output: must be produced by a step
-    if (!carryOutputJitIds.has(yId) && !outputToStepInfo.has(yId)) {
-      // Y references a body input (carry snapshot) — not yet supported
-      // in compiled-loop. Fall back.
-      if (DEBUG >= 1)
-        console.log(`[webgpu-scan] skipped, y${yi} not produced by body step`);
-      return null;
-    }
-    yOutputJitIds.add(yId);
-    jitIdToYIdx.set(yId, yi);
-  }
-
   // Map carry output JitIds → carry index
   const jitIdToCarryIdx = new Map<JitId, number>();
   for (let ci = 0; ci < numCarry; ci++) {
@@ -884,7 +989,6 @@ function tryPrepareWebGPUNativeScan(
 
   // Assign internal indices to step outputs that aren't carry outputs.
   // Internal intermediates become var<private> arrays in WGSL (no storage bindings).
-  // Y-only outputs also get internal indices so subsequent steps can read them.
   let nextInternalIdx = 0;
   const jitIdToInternalIdx = new Map<JitId, number>();
   const internalElemCounts: number[] = [];
@@ -903,6 +1007,52 @@ function tryPrepareWebGPUNativeScan(
     }
   }
   const numInternal = nextInternalIdx;
+
+  // Classify Y outputs using the shared vocabulary.
+  const allYSources = classifyWebGPUYSources(
+    bodyProgram,
+    numCarry,
+    numConsts,
+    numX,
+    numY,
+    jitIdToCarryIdx,
+    jitIdToInternalIdx,
+  );
+  if (!allYSources) {
+    if (DEBUG >= 1)
+      console.log(`[webgpu-scan] skipped, Y source not resolvable`);
+    return null;
+  }
+
+  // Compiled-loop splits Y handling:
+  // - Passthroughs (carry-snapshot, xs) → writeback phase via descriptors
+  // - Computed (carry-live, internal) → inline step writes via outputYIdxs
+  const yOutputSources = allYSources.filter(
+    (s): s is WebGPUYOutputSource & { type: "carry-snapshot" | "xs" } =>
+      s.type === "carry-snapshot" || s.type === "xs",
+  );
+
+  // Explicitly calculate element counts from output avals (break layout coupling)
+  const yAvals = bodyJaxpr.outs.slice(numCarry).map((v) => v.aval);
+  const yElemCounts = yAvals.map((a) => {
+    const shape =
+      dimBindings && hasSymbolicDims(a.shape)
+        ? resolveShape(a.shape, dimBindings)
+        : (a.shape as number[]);
+    return shape.reduce((acc, d) => acc * d, 1);
+  });
+
+  // Map from output JitId to Y indices (for carry-live and internal inline writes)
+  const yOutIds =
+    numY > 0 ? bodyProgram.outputs.slice(numCarry, numCarry + numY) : [];
+  const jitIdToYIdx = new Map<JitId, number[]>();
+  for (const src of allYSources) {
+    if (src.type === "carry-live" || src.type === "internal") {
+      const yId = yOutIds[src.yi];
+      if (!jitIdToYIdx.has(yId)) jitIdToYIdx.set(yId, []);
+      jitIdToYIdx.get(yId)!.push(src.yi);
+    }
+  }
 
   // Budget check: reject if total private-memory internal arrays exceed 8KB.
   // var<private> has no spec limit but excessive register pressure hurts occupancy.
@@ -948,7 +1098,6 @@ function tryPrepareWebGPUNativeScan(
     for (let oi = 0; oi < step.outputs.length; oi++) {
       const outId = step.outputs[oi];
       const carryIdx = jitIdToCarryIdx.get(outId) ?? -1;
-      const yIdx = jitIdToYIdx.get(outId) ?? -1;
       const internalIdx = jitIdToInternalIdx.get(outId) ?? -1;
 
       // Build reindex map: local kernel arg → scan gid
@@ -974,12 +1123,14 @@ function tryPrepareWebGPUNativeScan(
         reindexedReduction,
       );
 
+      const yIdxs = jitIdToYIdx.get(outId);
+
       multiSteps.push({
         kernel: reindexedKernel,
         inputs: scanReindexMap.slice(),
         outputCarryIdx: carryIdx,
-        outputYIdx: yIdx,
         outputInternalIdx: internalIdx,
+        outputYIdxs: yIdxs,
         outputSize: source.size as number,
       });
     }
@@ -999,8 +1150,10 @@ function tryPrepareWebGPUNativeScan(
     numY,
     ysStrides,
     ysDtypes,
+    yElemCounts,
     steps: multiSteps,
     reverse,
+    yOutputSources,
     numInternal,
     internalElemCounts,
     internalDtypes,
@@ -1012,16 +1165,14 @@ function tryPrepareWebGPUNativeScan(
   if (!exe) return null;
 
   if (DEBUG >= 1) {
-    const yOnlySteps = multiSteps.filter(
-      (s) => s.outputYIdx >= 0 && s.outputCarryIdx < 0,
-    ).length;
+    const ySrcTypes = allYSources.map((s) => s.type).join(", ");
     console.log(
       `[webgpu-scan] SUCCESS! Using WebGPU native scan with ${multiSteps.length} steps` +
         (numInternal > 0 ? ` (${numInternal} internal locals)` : "") +
         (carryOutputJitIds.size < numCarry
           ? ` (${numCarry - carryOutputJitIds.size} passthrough carries)`
           : "") +
-        (yOnlySteps > 0 ? ` (${yOnlySteps} Y-only steps)` : ""),
+        (numY > 0 ? ` (Y sources: ${ySrcTypes})` : ""),
     );
   }
   return { executable: exe, params };
@@ -1149,17 +1300,41 @@ function tryPreparePreencodedScan(
     return null;
   }
 
-  // We only support passthrough pattern for Y outputs in preencoded scan.
-  // We don't mandate `numCarry === numY` (could be carry-only with numY=0),
-  // but if numY > 0, the Y outputs must exactly match the first numY carry outputs.
-  const yOutIds =
-    numY > 0 ? bodyProgram.outputs.slice(numCarry, numCarry + numY) : [];
+  // Classify Y outputs. Preencoded-routine only supports carry-live (the executor
+  // copies updated carry → ys after each step), with Y[i] mapping to carry[i].
   const carryOutIds = bodyProgram.outputs.slice(0, numCarry);
-  
-  for (let i = 0; i < numY; i++) {
-    if (yOutIds[i] !== carryOutIds[i]) {
+  const carryInputIds = bodyProgram.inputs.slice(
+    numConsts,
+    numConsts + numCarry,
+  );
+  const jitIdToCarryIdx = new Map<JitId, number>();
+  for (let ci = 0; ci < numCarry; ci++) {
+    const outId = carryOutIds[ci];
+    if (!carryInputIds.includes(outId)) {
+      jitIdToCarryIdx.set(outId, ci);
+    }
+  }
+
+  const ySources = classifyWebGPUYSources(
+    bodyProgram,
+    numCarry,
+    numConsts,
+    numX,
+    numY,
+    jitIdToCarryIdx,
+  );
+  if (!ySources) {
+    if (DEBUG >= 2)
+      console.log("Preencoded scan: skipped, Y source not resolvable");
+    return null;
+  }
+  for (let i = 0; i < ySources.length; i++) {
+    const src = ySources[i];
+    if (src.type !== "carry-live" || src.carryIdx !== i) {
       if (DEBUG >= 2)
-        console.log(`Preencoded scan: skipped, Y output ${i} is not passthrough from carry ${i}`);
+        console.log(
+          `Preencoded scan: skipped, Y[${i}] is ${src.type} (need carry-live[${i}])`,
+        );
       return null;
     }
   }
@@ -1214,6 +1389,7 @@ function tryPreparePreencodedScan(
     reverse,
     routineInputJitIds: execStep.inputs,
     routineOutputJitIds: execStep.outputs,
+    ySources,
   };
 
   try {
@@ -1371,6 +1547,56 @@ function tryPreparePreencodedMultiStep(
   const ysElemStrides = yAvals.map((a) => a.size);
   const ysSizes = yAvals.map((a) => a.size * byteWidth(a.dtype));
 
+  // Classify Y outputs using the shared vocabulary.
+  // Preencoded-multi-step supports all source types (carry-snapshot, carry-live, xs, internal).
+  const carryOutIds = bodyProgram.outputs.slice(0, numCarry);
+  const carryInputIds = bodyProgram.inputs.slice(
+    numConsts,
+    numConsts + numCarry,
+  );
+  const jitIdToCarryIdx = new Map<JitId, number>();
+  for (let ci = 0; ci < numCarry; ci++) {
+    const outId = carryOutIds[ci];
+    if (!carryInputIds.includes(outId)) {
+      jitIdToCarryIdx.set(outId, ci);
+    }
+  }
+  // Convert internalMap (JitId → buffer index) to JitId → internal index for classifier
+  const jitIdToInternalIdx = new Map<JitId, number>();
+  for (const [jitId, idx] of internalMap) {
+    jitIdToInternalIdx.set(jitId, idx);
+  }
+
+  const carrySources = classifyWebGPUCarrySources(
+    bodyProgram,
+    numCarry,
+    numConsts,
+    numX,
+    jitIdToInternalIdx,
+  );
+  if (!carrySources) {
+    if (DEBUG >= 2)
+      console.log(
+        "Preencoded multi-step: skipped, carry source not resolvable",
+      );
+    return null;
+  }
+
+  const ySources = classifyWebGPUYSources(
+    bodyProgram,
+    numCarry,
+    numConsts,
+    numX,
+    numY,
+    jitIdToCarryIdx,
+    jitIdToInternalIdx,
+  );
+  if (!ySources) {
+    if (DEBUG >= 2)
+      console.log("Preencoded multi-step: skipped, Y source not resolvable");
+    return null;
+  }
+
   if (!webgpuBackend.preparePreencodedMultiStepScan) {
     if (DEBUG >= 2)
       console.log("Preencoded multi-step: backend missing method");
@@ -1392,12 +1618,14 @@ function tryPreparePreencodedMultiStep(
       xsElemStrides,
       ysElemStrides,
       ysSizes,
-      carryOutJitIds: bodyProgram.outputs.slice(0, numCarry),
-      yOutJitIds: bodyProgram.outputs.slice(numCarry, numCarry + numY),
+      carrySources,
+      ySources,
     });
     if (prepared && DEBUG >= 1) {
+      const ySrcTypes = ySources.map((s) => s.type).join(", ");
       console.log(
-        `Preencoded multi-step: SUCCESS! ${executeSteps.length} steps, ${length} iterations`,
+        `Preencoded multi-step: SUCCESS! ${executeSteps.length} steps, ${length} iterations` +
+          (numY > 0 ? ` (Y sources: ${ySrcTypes})` : ""),
       );
     }
     return prepared;

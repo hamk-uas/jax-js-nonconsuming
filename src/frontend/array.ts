@@ -910,7 +910,13 @@ export class Array extends Tracer {
         this.#backend.endBatch?.();
       }
     }
-    await this.#backend.read(this.#source, 0, 0);
+    // Lightweight GPU fence — resolves when all submitted work completes.
+    // Falls back to zero-byte read on backends without fence() (CPU, WASM).
+    if (this.#backend.fence) {
+      await this.#backend.fence();
+    } else {
+      await this.#backend.read(this.#source, 0, 0);
+    }
     return this;
   }
 

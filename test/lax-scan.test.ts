@@ -1082,6 +1082,93 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       ys.dispose();
       f.dispose();
     });
+    it("jit(scan) with computed-zero carry output", async () => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const y = np.add(carry, x);
+        // Carry is always zero (self-subtraction). Tests aliasing when carry
+        // output is a fresh computation unrelated to the carry input value.
+        return [np.subtract(carry, carry), y];
+      };
+
+      using initCarry = np.array(2.0);
+      using xs = np.array([10.0, 20.0, 30.0]);
+
+      const f = jit(() => lax.scan(step, initCarry, xs));
+      const [finalCarry, ys] = f() as [np.Array, np.Array];
+
+      expect(await finalCarry.data()).toEqual(new Float32Array([0.0]));
+      expect(await ys.data()).toEqual(new Float32Array([12.0, 20.0, 30.0]));
+      finalCarry.dispose();
+      ys.dispose();
+      f.dispose();
+    });
+
+    it("jit(scan) with xs passthrough as carry output", async () => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const y = np.add(carry, x);
+        return [x, y];
+      };
+
+      using initCarry = np.array(2.0);
+      using xs = np.array([10.0, 20.0, 30.0]);
+
+      const f = jit(() => lax.scan(step, initCarry, xs));
+      const [finalCarry, ys] = f() as [np.Array, np.Array];
+
+      expect(await finalCarry.data()).toEqual(new Float32Array([30.0]));
+      expect(await ys.data()).toEqual(new Float32Array([12.0, 30.0, 50.0]));
+      finalCarry.dispose();
+      ys.dispose();
+      f.dispose();
+    });
+
+    it("jit(scan) with xs passthrough as carry output, reverse=true", async () => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const y = np.add(carry, x);
+        return [x, y];
+      };
+
+      using initCarry = np.array(2.0);
+      using xs = np.array([10.0, 20.0, 30.0]);
+
+      const f = jit(() => lax.scan(step, initCarry, xs, { reverse: true }));
+      const [finalCarry, ys] = f() as [np.Array, np.Array];
+
+      expect(await finalCarry.data()).toEqual(new Float32Array([10.0]));
+      expect(await ys.data()).toEqual(new Float32Array([30.0, 50.0, 32.0]));
+      finalCarry.dispose();
+      ys.dispose();
+      f.dispose();
+    });
+
+    it("jit(scan) with multi-element xs passthrough as carry output", async () => {
+      // Tests non-trivial byte stride: carrySizes[ci] = 8 bytes (2 x f32)
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const y = np.add(carry, x);
+        return [x, y];
+      };
+
+      using initCarry = np.array([0.0, 0.0]);
+      using xs = np.array([
+        [1.0, 2.0],
+        [3.0, 4.0],
+        [5.0, 6.0],
+      ]);
+
+      const f = jit(() => lax.scan(step, initCarry, xs));
+      const [finalCarry, ys] = f() as [np.Array, np.Array];
+
+      expect(await finalCarry.data()).toEqual(new Float32Array([5.0, 6.0]));
+      // iter 0: carry=[0,0]+x=[1,2] => y=[1,2], carry=[1,2]
+      // iter 1: carry=[1,2]+x=[3,4] => y=[4,6], carry=[3,4]
+      // iter 2: carry=[3,4]+x=[5,6] => y=[8,10], carry=[5,6]
+      expect(await ys.data()).toEqual(
+        new Float32Array([1.0, 2.0, 4.0, 6.0, 8.0, 10.0]),
+      );
+      finalCarry.dispose();
+      ys.dispose();
+      f.dispose();
+    });
   });
 });
 
@@ -2209,6 +2296,146 @@ describe("preencoded multi-step scan (WebGPU)", () => {
         1e-4,
       );
     }
+  });
+
+  test("const as carry output", () => {
+    // Validates WebGPUCarryOutputSource 'const' dispatch path on multi-step.
+    // Pytree carry: position 0 is const (zero), position 1 is internal (mul).
+    // Two independent kernels (different input sets: [a,x] vs [b,x]) → 2 execute steps.
+    using zero = np.array([0.0]);
+    const step = (
+      carry: [np.Array, np.Array],
+      x: np.Array,
+    ): [[np.Array, np.Array], np.Array] => {
+      const [a, b] = carry;
+      const newA = np.add(a, x);
+      const newB = np.multiply(b, x);
+      return [[zero, newB], newA];
+    };
+
+    using initA = np.array([2.0]);
+    using initB = np.array([1.0]);
+    using xs = np.array([[10.0], [20.0], [30.0]]);
+
+    const [[finalA, finalB], ys] = lax.scan(step, [initA, initB], xs, {
+      acceptPath: ["preencoded-multi-step"],
+    });
+
+    // iter 0: newA=[2]+[10]=[12], newB=[1]*[10]=[10]. carry→[[0],[10]], y=[12]
+    // iter 1: newA=[0]+[20]=[20], newB=[10]*[20]=[200]. carry→[[0],[200]], y=[20]
+    // iter 2: newA=[0]+[30]=[30], newB=[200]*[30]=[6000]. carry→[[0],[6000]], y=[30]
+    expect(finalA).toBeAllclose([0]);
+    expect(finalB).toBeAllclose([6000]);
+    expect(ys).toBeAllclose([[12], [20], [30]]);
+    finalA.dispose();
+    finalB.dispose();
+    ys.dispose();
+  });
+
+  test("xs passthrough as carry output", () => {
+    // Validates WebGPUCarryOutputSource 'xs' dispatch path on multi-step.
+    // Pytree carry: position 0 is xs passthrough, position 1 is internal (mul).
+    const step = (
+      carry: [np.Array, np.Array],
+      x: np.Array,
+    ): [[np.Array, np.Array], np.Array] => {
+      const [a, b] = carry;
+      const newA = np.add(a, x);
+      const newB = np.multiply(b, x);
+      return [[x, newB], newA];
+    };
+
+    using initA = np.array([2.0]);
+    using initB = np.array([1.0]);
+    using xs = np.array([[10.0], [20.0], [30.0]]);
+
+    const [[finalA, finalB], ys] = lax.scan(step, [initA, initB], xs, {
+      acceptPath: ["preencoded-multi-step"],
+    });
+
+    // iter 0: newA=[2]+[10]=[12], newB=[1]*[10]=[10]. carry→[[10],[10]], y=[12]
+    // iter 1: newA=[10]+[20]=[30], newB=[10]*[20]=[200]. carry→[[20],[200]], y=[30]
+    // iter 2: newA=[20]+[30]=[50], newB=[200]*[30]=[6000]. carry→[[30],[6000]], y=[50]
+    expect(finalA).toBeAllclose([30]);
+    expect(finalB).toBeAllclose([6000]);
+    expect(ys).toBeAllclose([[12], [30], [50]]);
+    finalA.dispose();
+    finalB.dispose();
+    ys.dispose();
+  });
+
+  test("xs passthrough as carry output, reverse=true", () => {
+    // Validates reverse iteration with WebGPUCarryOutputSource 'xs'.
+    const step = (
+      carry: [np.Array, np.Array],
+      x: np.Array,
+    ): [[np.Array, np.Array], np.Array] => {
+      const [a, b] = carry;
+      const newA = np.add(a, x);
+      const newB = np.multiply(b, x);
+      return [[x, newB], newA];
+    };
+
+    using initA = np.array([2.0]);
+    using initB = np.array([1.0]);
+    using xs = np.array([[10.0], [20.0], [30.0]]);
+
+    const [[finalA, finalB], ys] = lax.scan(step, [initA, initB], xs, {
+      reverse: true,
+      acceptPath: ["preencoded-multi-step"],
+    });
+
+    // Reverse iterates xs[2]=[30], xs[1]=[20], xs[0]=[10]:
+    // iter 0: a=[2],b=[1],x=[30]: newA=[32], newB=[30]. carry→[[30],[30]], y=[32]
+    // iter 1: a=[30],b=[30],x=[20]: newA=[50], newB=[600]. carry→[[20],[600]], y=[50]
+    // iter 2: a=[20],b=[600],x=[10]: newA=[30], newB=[6000]. carry→[[10],[6000]], y=[30]
+    // ys by original index: [[30], [50], [32]]
+    expect(finalA).toBeAllclose([10]);
+    expect(finalB).toBeAllclose([6000]);
+    expect(ys).toBeAllclose([[30], [50], [32]]);
+    finalA.dispose();
+    finalB.dispose();
+    ys.dispose();
+  });
+
+  test("multi-element xs passthrough as carry output", () => {
+    // Validates non-trivial byte stride: carrySizes[ci] = 8 bytes (2 x f32).
+    // Pytree carry with xs passthrough.
+    const step = (
+      carry: [np.Array, np.Array],
+      x: np.Array,
+    ): [[np.Array, np.Array], np.Array] => {
+      const [a, b] = carry;
+      const newA = np.add(a, x);
+      const newB = np.multiply(b, x);
+      return [[x, newB], newA];
+    };
+
+    using initA = np.array([0.0, 0.0]);
+    using initB = np.array([1.0, 1.0]);
+    using xs = np.array([
+      [1.0, 2.0],
+      [3.0, 4.0],
+      [5.0, 6.0],
+    ]);
+
+    const [[finalA, finalB], ys] = lax.scan(step, [initA, initB], xs, {
+      acceptPath: ["preencoded-multi-step"],
+    });
+
+    // iter 0: newA=[0,0]+[1,2]=[1,2], newB=[1,1]*[1,2]=[1,2]. carry→[[1,2],[1,2]], y=[1,2]
+    // iter 1: newA=[1,2]+[3,4]=[4,6], newB=[1,2]*[3,4]=[3,8]. carry→[[3,4],[3,8]], y=[4,6]
+    // iter 2: newA=[3,4]+[5,6]=[8,10], newB=[3,8]*[5,6]=[15,48]. carry→[[5,6],[15,48]], y=[8,10]
+    expect(finalA).toBeAllclose([5, 6]);
+    expect(finalB).toBeAllclose([15, 48]);
+    expect(ys).toBeAllclose([
+      [1, 2],
+      [4, 6],
+      [8, 10],
+    ]);
+    finalA.dispose();
+    finalB.dispose();
+    ys.dispose();
   });
 });
 

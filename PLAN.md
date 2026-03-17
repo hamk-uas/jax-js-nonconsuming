@@ -5,13 +5,13 @@ into `.github/copilot-instructions.md`.
 
 ## Open Performance Items
 
-| ID  | Title                        | Priority        | Description                                                                     |
-| --- | ---------------------------- | --------------- | ------------------------------------------------------------------------------- |
-| P2  | Relaxed SIMD FMA             | Medium          | `f32x4.relaxed_madd` for 2× WASM dot-product throughput. Safari unsupported     |
-| P3  | i64 in wasmblr               | Medium          | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins           |
-| P4  | Conv2d WebGPU fused shader   | Medium          | Fused-shader codegen for conv bodies in `block-map.ts`. WASM path done (1.02–1.36×) |
-| P6  | Benchmark validation         | Medium          | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions          |
-| P7  | Cooperative matrix (WMMA)    | Blocked (~2026) | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable           |
+| ID  | Title                      | Priority        | Description                                                                         |
+| --- | -------------------------- | --------------- | ----------------------------------------------------------------------------------- |
+| P2  | Relaxed SIMD FMA           | Medium          | `f32x4.relaxed_madd` for 2× WASM dot-product throughput. Safari unsupported         |
+| P3  | i64 in wasmblr             | Medium          | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins               |
+| P4  | Conv2d WebGPU fused shader | Medium          | Fused-shader codegen for conv bodies in `block-map.ts`. WASM path done (1.02–1.36×) |
+| P6  | Benchmark validation       | Medium          | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions              |
+| P7  | Cooperative matrix (WMMA)  | Blocked (~2026) | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable               |
 
 ## P4: Conv2d WebGPU Fused Shader
 
@@ -30,13 +30,13 @@ All cases compile to exactly **1 kernel** (fused im2col + matmul + epilogue).
 
 **WebGPU — NVIDIA RTX 4070 Ti SUPER (TB3 eGPU):**
 
-| Case                | GFLOP | Eager ms | JIT ms | GFLOP/s | % Peak |
-| ------------------- | ----- | -------- | ------ | ------- | ------ |
-| 3×3 1×32ch 64×64    | 0.151 | 2.82     | 2.64   | 57.3    | 0.3%   |
-| 3×3 1×64ch 64×64    | 0.302 | 3.03     | 2.22   | 136.1   | 0.6%   |
-| 3×3 1×128ch 32×32   | 0.302 | 3.04     | 2.53   | 119.4   | 0.5%   |
-| 3×3 8×64ch 64×64    | 2.416 | 3.70     | 2.77   | 872.6   | 3.9%   |
-| 3×3 8×128ch 64×64   | 9.664 | 9.40     | 7.20   | 1342.0  | 5.9%   |
+| Case              | GFLOP | Eager ms | JIT ms | GFLOP/s | % Peak |
+| ----------------- | ----- | -------- | ------ | ------- | ------ |
+| 3×3 1×32ch 64×64  | 0.151 | 2.82     | 2.64   | 57.3    | 0.3%   |
+| 3×3 1×64ch 64×64  | 0.302 | 3.03     | 2.22   | 136.1   | 0.6%   |
+| 3×3 1×128ch 32×32 | 0.302 | 3.04     | 2.53   | 119.4   | 0.5%   |
+| 3×3 8×64ch 64×64  | 2.416 | 3.70     | 2.77   | 872.6   | 3.9%   |
+| 3×3 8×128ch 64×64 | 9.664 | 9.40     | 7.20   | 1342.0  | 5.9%   |
 
 **Key finding:** WebGPU conv2d is dispatch-bound at ~2.5ms for single-batch shapes (<1% GPU
 utilization). Larger batches (8×128ch) reach 5.9% peak. Im2col materialization was attempted and
@@ -94,6 +94,6 @@ elements/thread).
   data-dependent pivoting). Cannot be expressed as fixed arithmetic traces.
 - **GPU/WASM ratio ≤ 2× for small-matrix DLM:** Irreducible GPU API costs (`queue.submit`) prevent
   matching WASM mega-module latency at small N.
-- **Binding limit optimization on high-limit hardware:** On Deno/NVIDIA with
-  `maxArgs = 1,048,575`, the P2 split pass has no effect. Browser `maxArgs ≈ 9` causes additional
-  fragmentation, but dominant overhead is P1 structural rules.
+- **Binding limit optimization on high-limit hardware:** On Deno/NVIDIA with `maxArgs = 1,048,575`,
+  the P2 split pass has no effect. Browser `maxArgs ≈ 9` causes additional fragmentation, but
+  dominant overhead is P1 structural rules.

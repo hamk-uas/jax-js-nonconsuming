@@ -81,6 +81,23 @@ interface ShaderDispatch extends ShaderInfo {
 // Types for WebGPU native scan (multi-kernel shader)
 // ---------------------------------------------------------------------------
 
+/**
+ * Where a WebGPU scan Y output comes from.
+ *
+ * All three scan paths classify Y outputs into these categories via
+ * `classifyWebGPUYSources()` and store the result in the prepared struct.
+ * Executors dispatch Y stacking from source type, not raw JitIds:
+ * - compiled-loop: carry-snapshot/xs → writeback phase; carry-live/internal → inline step writes
+ * - preencoded-routine: carry-live only (carry → ysStacked copy)
+ * - preencoded-multi-step: all types (source-based buffer resolution per iteration)
+ */
+export type WebGPUYOutputSource = { yi: number } & (
+  | { type: "carry-snapshot"; carryIdx: number }
+  | { type: "carry-live"; carryIdx: number }
+  | { type: "xs"; xsIdx: number }
+  | { type: "internal"; internalIdx: number }
+);
+
 export interface NativeScanMultiStep {
   /** The kernel to execute. */
   kernel: Kernel;
@@ -88,10 +105,10 @@ export interface NativeScanMultiStep {
   inputs: number[];
   /** Which carry slot this kernel writes to (0..numCarry-1), or -1. */
   outputCarryIdx: number;
-  /** Which Y output slot this step writes to (0..numY-1), or -1. */
-  outputYIdx: number;
   /** Which internal local this step defines (0..numInternal-1), or -1. */
   outputInternalIdx: number;
+  /** Which Y outputs this kernel writes to directly. */
+  outputYIdxs?: number[];
   /** Size of output in elements (not bytes). */
   outputSize: number;
 }
@@ -111,8 +128,12 @@ export interface NativeScanMultiParams {
   numY: number;
   ysStrides: number[];
   ysDtypes: DType[];
+  /** Elements per Y output (explicit, instead of relying on source structure). */
+  yElemCounts: number[];
   steps: NativeScanMultiStep[];
   reverse?: boolean;
+  /** Declarative passthrough Y-output source descriptors (not handled by steps). */
+  yOutputSources: WebGPUYOutputSource[];
   /** Number of internal intermediate locals (from steps with internal deps). */
   numInternal: number;
   /** Per-internal element count (typed, not bytes). */
@@ -151,6 +172,8 @@ export interface PreencodedScanParams {
   routineInputJitIds: number[];
   /** For each routine output binding i, the body output index. */
   routineOutputJitIds: number[];
+  /** Classified Y-output sources (all carry-live for preencoded-routine). */
+  ySources: WebGPUYOutputSource[];
 }
 
 /** Prepared preencoded scan with wrapped shaders and offset buffer. */
@@ -171,6 +194,12 @@ export interface PreparedPreencodedScan {
 // ---------------------------------------------------------------------------
 // Types for WebGPU preencoded multi-step scan (Phase 2)
 // ---------------------------------------------------------------------------
+
+export type WebGPUCarryOutputSource =
+  | { type: "internal"; internalIdx: number }
+  | { type: "carry-passthrough"; carryIdx: number }
+  | { type: "const"; constIdx: number }
+  | { type: "xs"; xIdx: number };
 
 /** A single prepared step in a multi-step preencoded scan body. */
 export interface PreencodedMultiStepEntry {
@@ -209,10 +238,10 @@ export interface PreparedPreencodedMultiStep {
   copyUsesShader: boolean[];
   /** Bind group layout for the uniform offset group (with dynamic offset). */
   uniformLayout: GPUBindGroupLayout;
-  /** Body program output JitIds for carry outputs [0..numCarry). */
-  carryOutJitIds: number[];
-  /** Body program output JitIds for ys outputs [numCarry..numCarry+numY). */
-  yOutJitIds: number[];
+  /** Classified carry-output sources for carry-copy loop. */
+  carrySources: WebGPUCarryOutputSource[];
+  /** Classified Y-output sources from the shared vocabulary. */
+  ySources: WebGPUYOutputSource[];
   /** Per-ys byte sizes for ys stacking. */
   ysSizes: number[];
 }
@@ -828,10 +857,14 @@ export class WebGPUBackend implements Backend {
       deferredDestroys: GPUBuffer[];
       copyUniforms: GPUBuffer[];
       pooledDuringTape: Set<GPUBuffer>;
-    }
+    },
   ): void {
-    const getBuf = (s: Slot | GPUBuffer) => s instanceof GPUBuffer ? s : this.#getBuffer(s).buffer;
-    const commandEncoder = tapeCtx?.encoder ?? this.#batchEncoder ?? this.device.createCommandEncoder();
+    const getBuf = (s: Slot | GPUBuffer) =>
+      s instanceof GPUBuffer ? s : this.#getBuffer(s).buffer;
+    const commandEncoder =
+      tapeCtx?.encoder ??
+      this.#batchEncoder ??
+      this.device.createCommandEncoder();
     const ownEncoder = !tapeCtx && !this.#batchEncoder;
 
     // Pre-copy initCarry → carryOut (shader reads carry as pre-initialized)
@@ -885,7 +918,7 @@ export class WebGPUBackend implements Backend {
         passEncoder.end();
       }
     }
-    
+
     if (ownEncoder) {
       this.device.queue.submit([commandEncoder.finish()]);
     }
@@ -1167,7 +1200,7 @@ export class WebGPUBackend implements Backend {
       deferredDestroys: GPUBuffer[];
       copyUniforms: GPUBuffer[];
       pooledDuringTape: Set<GPUBuffer>;
-    }
+    },
   ): void {
     const {
       params,
@@ -1185,9 +1218,11 @@ export class WebGPUBackend implements Backend {
       reverse,
       routineInputJitIds,
       routineOutputJitIds,
+      ySources,
     } = params;
 
-    const getBuf = (s: Slot | GPUBuffer) => (s instanceof GPUBuffer ? s : this.#getBuffer(s).buffer);
+    const getBuf = (s: Slot | GPUBuffer) =>
+      s instanceof GPUBuffer ? s : this.#getBuffer(s).buffer;
     const constBuffers = constSlots.map(getBuf);
     const initCarryBuffers = initCarrySlots.map(getBuf);
     const xsBuffers = xsSlots.map(getBuf);
@@ -1204,7 +1239,10 @@ export class WebGPUBackend implements Backend {
       return this.#poolPop(padded) ?? this.#createBuffer(padded);
     });
 
-    const commandEncoder = tapeCtx?.encoder ?? this.#batchEncoder ?? this.device.createCommandEncoder();
+    const commandEncoder =
+      tapeCtx?.encoder ??
+      this.#batchEncoder ??
+      this.device.createCommandEncoder();
     const ownEncoder = !tapeCtx && !this.#batchEncoder;
     const copyUniformBuffers: GPUBuffer[] = [];
 
@@ -1308,28 +1346,40 @@ export class WebGPUBackend implements Backend {
           passEncoder.end();
         }
 
-        // Copy carry → ys for this iteration (passthrough pattern)
-        // Use original xs index for stacking position (reverse flips order)
+        // Stack ys: dispatch by classified Y source type.
+        // Preencoded-routine only accepts carry-live (validated by planner).
         const ysIdx = reverse ? length - 1 - iter : iter;
         const currentCarryBuffers = iter % 2 === 0 ? carryPong : carryPing;
-        for (let c = 0; c < ysStackedBuffers.length; c++) {
-          const copySize = carrySizes[c];
+        for (const src of ySources) {
+          let srcBuf: GPUBuffer;
+          let copySize: number;
+          switch (src.type) {
+            case "carry-live":
+              srcBuf = currentCarryBuffers[src.carryIdx];
+              copySize = carrySizes[src.carryIdx];
+              break;
+            /* c8 ignore next 3 */
+            default:
+              throw new Error(
+                `Unexpected Y source type "${src.type}" in preencoded-routine`,
+              );
+          }
           if (copySize <= 0) continue;
           const yOffset = ysIdx * copySize;
-          if (!copyUsesShader[c]) {
+          if (!copyUsesShader[src.yi]) {
             commandEncoder.copyBufferToBuffer(
-              currentCarryBuffers[c],
+              srcBuf,
               0,
-              ysStackedBuffers[c],
+              ysStackedBuffers[src.yi],
               yOffset,
               copySize,
             );
           } else {
             const uniformBuf = this.#encodeCopyWithShader(
               commandEncoder,
-              currentCarryBuffers[c],
+              srcBuf,
               0,
-              ysStackedBuffers[c],
+              ysStackedBuffers[src.yi],
               yOffset,
               copySize,
             );
@@ -1417,8 +1467,8 @@ export class WebGPUBackend implements Backend {
     xsElemStrides: number[];
     ysElemStrides: number[];
     ysSizes: number[];
-    carryOutJitIds: number[];
-    yOutJitIds: number[];
+    carrySources: WebGPUCarryOutputSource[];
+    ySources: WebGPUYOutputSource[];
   }): PreparedPreencodedMultiStep | null {
     const {
       length,
@@ -1433,8 +1483,8 @@ export class WebGPUBackend implements Backend {
       reverse,
       xsElemStrides,
       ysSizes,
-      carryOutJitIds,
-      yOutJitIds,
+      carrySources,
+      ySources,
     } = params;
 
     if (length === 0) return null;
@@ -1597,8 +1647,8 @@ export class WebGPUBackend implements Backend {
       reverse,
       copyUsesShader,
       uniformLayout,
-      carryOutJitIds,
-      yOutJitIds,
+      carrySources,
+      ySources,
       ysSizes,
     };
   }
@@ -1621,9 +1671,10 @@ export class WebGPUBackend implements Backend {
       deferredDestroys: GPUBuffer[];
       copyUniforms: GPUBuffer[];
       pooledDuringTape: Set<GPUBuffer>;
-    }
+    },
   ): void {
-    const getBuf = (s: Slot | GPUBuffer) => s instanceof GPUBuffer ? s : this.#getBuffer(s).buffer;
+    const getBuf = (s: Slot | GPUBuffer) =>
+      s instanceof GPUBuffer ? s : this.#getBuffer(s).buffer;
     const {
       length,
       stepEntries,
@@ -1634,11 +1685,10 @@ export class WebGPUBackend implements Backend {
       numConsts,
       numX,
       reverse: _reverse,
-      numY,
       copyUsesShader,
       uniformLayout,
-      carryOutJitIds,
-      yOutJitIds,
+      carrySources,
+      ySources,
       ysSizes,
     } = prepared;
 
@@ -1665,7 +1715,10 @@ export class WebGPUBackend implements Backend {
       return this.#poolPop(padded) ?? this.#createBuffer(padded);
     });
 
-    const commandEncoder = tapeCtx?.encoder ?? this.#batchEncoder ?? this.device.createCommandEncoder();
+    const commandEncoder =
+      tapeCtx?.encoder ??
+      this.#batchEncoder ??
+      this.device.createCommandEncoder();
     const ownEncoder = !tapeCtx && !this.#batchEncoder;
     const copyUniformBuffers: GPUBuffer[] = [];
 
@@ -1685,6 +1738,8 @@ export class WebGPUBackend implements Backend {
     const xsStart = numConsts + numCarry;
 
     // Helper: resolve a body JitId to a GPU buffer.
+    // Used ONLY for bind-group construction. Carry and Y propagation use
+    // typed source arrays instead of resolving raw JitIds per iteration.
     // carryRead is the current iteration's carry read side (ping or pong).
     const resolveBuffer = (
       jitId: number,
@@ -1788,19 +1843,45 @@ export class WebGPUBackend implements Backend {
         }
       }
 
-      // Copy carry outputs: resolve body output JitIds → carry write buffers
+      const iterIdx = _reverse ? length - 1 - iter : iter;
+
+      // Copy carry outputs: dispatch by classified carry source type
       for (let ci = 0; ci < numCarry; ci++) {
-        const jitId = carryOutJitIds[ci];
-        const srcBuf = resolveBuffer(jitId, carryRead);
+        const src = carrySources[ci];
+        let srcBuf: GPUBuffer;
+        let srcOffset = 0;
+
+        switch (src.type) {
+          case "internal":
+            srcBuf = internalBuffers[src.internalIdx];
+            break;
+          case "carry-passthrough":
+            srcBuf = carryRead[src.carryIdx];
+            break;
+          case "const":
+            srcBuf = constBuffers[src.constIdx];
+            break;
+          case "xs":
+            srcBuf = xsBuffers[src.xIdx];
+            srcOffset = iterIdx * carrySizes[ci];
+            break;
+        }
+
         const sz = carrySizes[ci];
         if (sz <= 0) continue;
         if (sz % 4 === 0) {
-          commandEncoder.copyBufferToBuffer(srcBuf, 0, carryWrite[ci], 0, sz);
+          commandEncoder.copyBufferToBuffer(
+            srcBuf,
+            srcOffset,
+            carryWrite[ci],
+            0,
+            sz,
+          );
         } else {
           const ub = this.#encodeCopyWithShader(
             commandEncoder,
             srcBuf,
-            0,
+            srcOffset,
             carryWrite[ci],
             0,
             sz,
@@ -1809,19 +1890,39 @@ export class WebGPUBackend implements Backend {
         }
       }
 
-      // Stack ys: copy each ys source → ysStacked at original xs index
+      // Stack ys: dispatch by classified Y source type.
+      // Carry copy above has already written carryWrite, so carry-live reads
+      // from carryWrite (post-update). Carry-snapshot reads from carryRead
+      // (pre-update). xs reads from the stacked xs buffer at iteration offset.
+      // Internal reads from the scratch buffer.
       const ysIdx = _reverse ? length - 1 - iter : iter;
-      for (let yi = 0; yi < numY; yi++) {
-        const jitId = yOutJitIds[yi];
-        const srcBuf = resolveBuffer(jitId, carryRead);
-        const sz = ysSizes[yi];
+      for (const src of ySources) {
+        let srcBuf: GPUBuffer;
+        let srcOffset = 0;
+        switch (src.type) {
+          case "carry-snapshot":
+            srcBuf = carryRead[src.carryIdx];
+            break;
+          case "carry-live":
+            srcBuf = carryWrite[src.carryIdx];
+            break;
+          case "xs":
+            srcBuf = xsBuffers[src.xsIdx];
+            // xs buffer is the full stacked array; read the iteration's slice
+            srcOffset = ysIdx * ysSizes[src.yi];
+            break;
+          case "internal":
+            srcBuf = internalBuffers[src.internalIdx];
+            break;
+        }
+        const sz = ysSizes[src.yi];
         if (sz <= 0) continue;
         const yOffset = ysIdx * sz;
-        if (!copyUsesShader[yi]) {
+        if (!copyUsesShader[src.yi]) {
           commandEncoder.copyBufferToBuffer(
             srcBuf,
-            0,
-            ysStackedBuffers[yi],
+            srcOffset,
+            ysStackedBuffers[src.yi],
             yOffset,
             sz,
           );
@@ -1829,8 +1930,8 @@ export class WebGPUBackend implements Backend {
           const ub = this.#encodeCopyWithShader(
             commandEncoder,
             srcBuf,
-            0,
-            ysStackedBuffers[yi],
+            srcOffset,
+            ysStackedBuffers[src.yi],
             yOffset,
             sz,
           );
@@ -2147,6 +2248,10 @@ export class WebGPUBackend implements Backend {
     this.#batchEncoder = this.device.createCommandEncoder();
   }
 
+  async fence(): Promise<void> {
+    await this.device.queue.onSubmittedWorkDone();
+  }
+
   // ---------------------------------------------------------------------------
   // Command tape: pre-compiled dispatch sequence (O8)
   // ---------------------------------------------------------------------------
@@ -2343,8 +2448,12 @@ export class WebGPUBackend implements Backend {
             constIdxs: step.consts.map((id) => idToIdx.get(id)!),
             initCarryIdxs: step.initCarry.map((id) => idToIdx.get(id)!),
             xsIdxs: step.xs.map((id) => idToIdx.get(id)!),
-            carryOutIdxs: step.outputs.slice(0, step.numCarry).map((id) => idToIdx.get(id)!),
-            ysStackedIdxs: step.outputs.slice(step.numCarry).map((id) => idToIdx.get(id)!),
+            carryOutIdxs: step.outputs
+              .slice(0, step.numCarry)
+              .map((id) => idToIdx.get(id)!),
+            ysStackedIdxs: step.outputs
+              .slice(step.numCarry)
+              .map((id) => idToIdx.get(id)!),
           };
           ops.push({ type: "scan", scan: tapeScan });
           break;
@@ -4396,20 +4505,22 @@ function nativeScanMultiShaderSource(
   };
 
   // Helper: emit store(s) for a step's computed value.
-  // A step can write to any combination of carry, Y, and internal.
+  // Steps write to carry, internal, and/or direct Y outputs in a single pass.
+  // Passthrough Y outputs use a separate writeback phase driven by yOutputSources.
   const emitStepStore = (step: NativeScanMultiStep, valExpr: string) => {
     if (step.outputCarryIdx >= 0) {
       emit(`carry${step.outputCarryIdx}[eidx] = ${valExpr};`);
     }
-    if (step.outputYIdx >= 0) {
-      const yi = step.outputYIdx;
-      const ysStride = ysElemStrides[yi] ?? 0;
-      if (ysStride > 0) {
-        emit(`ys${yi}[i32(dataIdx) * ${ysStride} + eidx] = ${valExpr};`);
-      }
-    }
     if (step.outputInternalIdx >= 0) {
       emit(`internal_${step.outputInternalIdx}[eidx] = ${valExpr};`);
+    }
+    if (step.outputYIdxs) {
+      for (const yi of step.outputYIdxs) {
+        const ysStride = ysElemStrides[yi] ?? 0;
+        if (ysStride > 0) {
+          emit(`ys${yi}[i32(dataIdx) * ${ysStride} + eidx] = ${valExpr};`);
+        }
+      }
     }
   };
 
@@ -4421,7 +4532,6 @@ function nativeScanMultiShaderSource(
 
     const targets: string[] = [];
     if (step.outputCarryIdx >= 0) targets.push(`carry${step.outputCarryIdx}`);
-    if (step.outputYIdx >= 0) targets.push(`ys${step.outputYIdx}`);
     if (step.outputInternalIdx >= 0)
       targets.push(`internal_${step.outputInternalIdx}`);
 
@@ -4491,6 +4601,53 @@ function nativeScanMultiShaderSource(
       const val = wgslToStorage(strip1(gen(kernel.outputs[0].exp)), outDtype);
       emitStepStore(step, val);
       emit(popIndent, "}");
+    }
+  }
+
+  // Y output writeback phase — copy from source to stacked Y buffers.
+  // In compiled-loop, only passthrough sources (carry-snapshot, xs) appear here;
+  // carry-live and internal are written inline by steps via outputYIdxs.
+  const yOutputSources = params.yOutputSources;
+  if (yOutputSources.length > 0) {
+    emit("");
+    emit("// Y output writeback (passthroughs)");
+    for (let i = 0; i < yOutputSources.length; i++) {
+      const src = yOutputSources[i];
+      const yi = src.yi;
+      const ysStride = ysElemStrides[yi] ?? 0;
+      if (ysStride === 0) continue;
+
+      let srcExpr: string;
+      const elemCount = params.yElemCounts[yi];
+      switch (src.type) {
+        case "carry-snapshot": {
+          srcExpr = `c_${src.carryIdx}[eidx]`;
+          break;
+        }
+        case "xs": {
+          const xsStride = xsElemStrides[src.xsIdx];
+          srcExpr = `xs${src.xsIdx}[i32(dataIdx) * ${xsStride} + eidx]`;
+          break;
+        }
+        // carry-live and internal are handled by outputYIdxs in compiled-loop,
+        // but the type union is shared with preencoded paths that use all variants.
+        /* c8 ignore next 2 */
+        case "carry-live":
+        case "internal":
+          throw new Error(
+            `Unexpected Y source type "${src.type}" in compiled-loop writeback`,
+          );
+      }
+
+      if (elemCount > 1) {
+        emit(
+          `for (var eidx: i32 = 0; eidx < ${elemCount}; eidx++) { ys${yi}[i32(dataIdx) * ${ysStride} + eidx] = ${srcExpr}; }`,
+        );
+      } else {
+        emit(
+          `{ let eidx: i32 = 0; ys${yi}[i32(dataIdx) * ${ysStride} + eidx] = ${srcExpr}; }`,
+        );
+      }
     }
   }
 
