@@ -5,13 +5,14 @@
  */
 import { init } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, it } from "vitest";
+
 import {
   calculateMandelbrot,
   calculateMandelbrotForiLoop,
   calculateMandelbrotJitLoop,
   calculateMandelbrotScan,
-  width,
   height,
+  width,
 } from "../website/src/routes/mandelbrot/mandelbrot";
 
 await init();
