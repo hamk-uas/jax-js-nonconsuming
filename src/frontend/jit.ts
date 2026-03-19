@@ -305,6 +305,386 @@ function rewriteConvToBlockMap(jaxpr: Jaxpr, backendType: string): Jaxpr {
   return new Jaxpr(jaxpr.inBinders, newEqns, jaxpr.outs);
 }
 
+// ── ForiLoop → BlockMap rewrite (WebGPU) ──────────────────────────────────
+// On WebGPU, a standalone fori_loop dispatches body kernels per iteration
+// (~100µs per dispatch × N iterations). Wrapping in block_map fuses the
+// entire loop into a single WGSL shader with a native `for` — 1 dispatch.
+// WASM already compiles fori_loop to a native loop in mega-module, so this
+// rewrite is WebGPU-only.
+
+/**
+ * Primitives that are strictly point-wise and have no shape-modifying
+ * parameters (like axes, starts, limits). These are safe to unconditionally
+ * retile simply by overriding their input and output avals.
+ */
+const pointwisePrimitives = new Set<Primitive>([
+  Primitive.Add,
+  Primitive.Mul,
+  Primitive.Idiv,
+  Primitive.Mod,
+  Primitive.Min,
+  Primitive.Max,
+  Primitive.Neg,
+  Primitive.Reciprocal,
+  Primitive.Floor,
+  Primitive.Ceil,
+  Primitive.StopGradient,
+  Primitive.Cast,
+  Primitive.Bitcast,
+  Primitive.Sin,
+  Primitive.Cos,
+  Primitive.Asin,
+  Primitive.Atan,
+  Primitive.Exp,
+  Primitive.Log,
+  Primitive.Erf,
+  Primitive.Erfc,
+  Primitive.Sqrt,
+  Primitive.Compare,
+  Primitive.Where,
+]);
+
+/**
+ * Check whether a foriLoop body can be retiled to operate on block-sized data.
+ * The body must consist entirely of purely point-wise operations, and all
+ * intermediates must match the carry shape exactly or be scalars. This ensures
+ * that the body can be safely resized along all grid dimensions without breaking
+ * broadcasting semantics or primitive parameters.
+ */
+function isForiBodyRetilable(
+  bodyJaxpr: Jaxpr,
+  carryShape: readonly number[],
+): boolean {
+  for (const eqn of bodyJaxpr.eqns) {
+    if (!pointwisePrimitives.has(eqn.primitive)) return false;
+    for (const ob of eqn.outBinders) {
+      const s = ob.aval.shape;
+      if (
+        s.length > 0 &&
+        !(
+          s.length === carryShape.length &&
+          s.every((d, i) => d === carryShape[i])
+        )
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Clone a jaxpr, replacing every occurrence of `origShape` with `tileShape`.
+ * Scalars and differently-shaped vars are left unchanged. Only safe for
+ * elementwise-only bodies where all array intermediates share a single shape.
+ */
+function retileJaxpr(
+  jaxpr: Jaxpr,
+  origShape: readonly number[],
+  tileShape: readonly number[],
+): Jaxpr {
+  const varMap = new Map<Var, Var>();
+
+  const shapeMatches = (shape: readonly (number | Dim)[]): boolean =>
+    shape.length === origShape.length &&
+    shape.every((d, i) => d === origShape[i]);
+
+  const retileAval = (aval: ShapedArray): ShapedArray =>
+    shapeMatches(aval.shape)
+      ? new ShapedArray(tileShape as number[], aval.dtype, aval.weakType)
+      : aval;
+
+  const mapVar = (v: Var): Var => {
+    let nv = varMap.get(v);
+    if (!nv) {
+      nv = new Var(retileAval(v.aval));
+      varMap.set(v, nv);
+    }
+    return nv;
+  };
+
+  const mapAtom = (a: Atom): Atom => (a instanceof Var ? mapVar(a) : a);
+
+  const newInBinders = jaxpr.inBinders.map(mapVar);
+  const newEqns = jaxpr.eqns.map((eqn) => {
+    const newInputs = eqn.inputs.map(mapAtom);
+    const newOuts = eqn.outBinders.map((ob) => {
+      const nv = new Var(retileAval(ob.aval));
+      varMap.set(ob, nv);
+      return nv;
+    });
+    return new JaxprEqn(eqn.primitive, newInputs, eqn.params, newOuts);
+  });
+  const newOuts = jaxpr.outs.map(mapAtom);
+
+  return new Jaxpr(newInBinders, newEqns, newOuts);
+}
+
+let lastForiRewritten = false;
+
+/** Prevents foriLoop→blockMap rewrite in nested jitCompile calls (body compilations). */
+let _skipForiRewrite = false;
+
+/**
+ * Whether the last JIT-compiled ForiLoop was rewritten to BlockMap.
+ * For testing and benchmarking.
+ */
+export function _lastForiRewritten(): boolean {
+  return lastForiRewritten;
+}
+
+/**
+ * Rewrite eligible ForiLoop equations to BlockMap wrapping ForiLoop.
+ *
+ * Eligible: WebGPU backend, elementwise body, all non-scalar inputs share the
+ * same concrete shape, shape large enough to benefit from tiling (≥ 4 per dim).
+ *
+ * The BlockMap body contains the original ForiLoop operating on tile-sized
+ * data. On WebGPU, the fused shader emits a native WGSL `for` loop — 1
+ * dispatch regardless of iteration count.
+ */
+function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
+  // Only WebGPU benefits — WASM mega-module already compiles fori_loop natively.
+  if (backend.type !== "webgpu") return jaxpr;
+  // Skip in nested body compilations (blockMap/scan/foriLoop bodies).
+  if (_skipForiRewrite) return jaxpr;
+
+  let changed = false;
+  const newEqns: JaxprEqn[] = [];
+
+  for (const eqn of jaxpr.eqns) {
+    if (eqn.primitive !== Primitive.ForiLoop) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    const params = eqn.params as PrimitiveParams<typeof Primitive.ForiLoop>;
+    const { jaxpr: bodyJaxpr, numConsts, lower, upper } = params;
+
+    // Guard: concrete bounds
+    if (typeof lower !== "number" || typeof upper !== "number") {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    // Guard: at least 2 iterations (overhead of block_map setup)
+    if (upper - lower < 2) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    // Guard: all carries must have same concrete shape, rank >= 1
+    const carries = eqn.inputs.slice(numConsts); // init carries
+    if (carries.length === 0) {
+      newEqns.push(eqn);
+      continue;
+    }
+    const carryShape = carries[0].aval.shape;
+    if (hasSymbolicDims(carryShape) || carryShape.length === 0) {
+      newEqns.push(eqn);
+      continue;
+    }
+    const cShape = carryShape as number[];
+    if (
+      !carries.every((c) => {
+        const s = c.aval.shape as number[];
+        return s.length === cShape.length && s.every((d, i) => d === cShape[i]);
+      })
+    ) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    // Guard: body must be retilable (all outputs carry-shaped or scalar,
+    // no structural ops or routines)
+    if (!isForiBodyRetilable(bodyJaxpr, cShape)) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    // Guard: consts must be either same-shape-as-carry or scalar
+    const consts = eqn.inputs.slice(0, numConsts);
+    const constIsTiled: boolean[] = [];
+    let constGuardOk = true;
+    for (const c of consts) {
+      const s = c.aval.shape as number[];
+      if (s.length === 0 || hasSymbolicDims(c.aval.shape)) {
+        constIsTiled.push(false);
+        continue;
+      }
+      if (s.length === cShape.length && s.every((d, i) => d === cShape[i])) {
+        constIsTiled.push(true);
+        continue;
+      }
+      constGuardOk = false;
+      break;
+    }
+    if (!constGuardOk) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    // Guard: each carry dimension >= 4 (below this, tiling overhead dominates)
+    if (cShape.some((d) => d < 4)) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    // Choose blockShape: tile all carry dimensions.
+    // Constraint: product(blockShape) ≤ 256 (maxComputeWorkgroupSizeX).
+    const rank = cShape.length;
+    let blockShape: number[];
+    if (rank === 1) {
+      blockShape = [Math.min(256, cShape[0])];
+    } else if (rank === 2) {
+      // For 2D, pick from candidates where b0*b1 ≤ 256
+      const candidates = [
+        [16, 16],
+        [16, 8],
+        [8, 8],
+      ];
+      blockShape = candidates.find(
+        (c) => c[0] <= cShape[0] && c[1] <= cShape[1] && c[0] * c[1] <= 256,
+      ) ?? [8, 8];
+    } else {
+      // rank ≥ 3: tile first 2 dims only, rest handled per element
+      // Punt for now — complex to get right. Fall through.
+      newEqns.push(eqn);
+      continue;
+    }
+
+    // Check shmem budget: (numConsts_tiled + numCarries) * blockElements * 4
+    // plus body intermediates. Conservative: 2× for intermediates.
+    const blockElements = blockShape.reduce((a, b) => a * b, 1);
+    const numTiledConsts = constIsTiled.filter(Boolean).length;
+    // Compute shmem budget using exact sums of byte widths.
+    // In the worst case (no register tiling), block_map allocates a shared
+    // memory array for every tiled input, carry, and intermediate trace var.
+    let shmemBytes = 0;
+    // 1. Tiled consts and carry inputs
+    for (let ci = 0; ci < numConsts; ci++) {
+      if (constIsTiled[ci])
+        shmemBytes += blockElements * byteWidth(consts[ci].aval.dtype);
+    }
+    for (const c of carries) {
+      shmemBytes += blockElements * byteWidth(c.aval.dtype);
+    }
+    // 2. Loop body intermediates
+    for (const e of bodyJaxpr.eqns) {
+      for (const ob of e.outBinders) {
+        if (ob.aval.shape.length > 0) {
+          shmemBytes += blockElements * byteWidth(ob.aval.dtype);
+        }
+      }
+    }
+
+    const maxShmem =
+      backend.capabilities.maxComputeWorkgroupStorageSize ?? 16384;
+    if (shmemBytes > maxShmem) {
+      newEqns.push(eqn);
+      continue;
+    }
+
+    changed = true;
+    lastForiRewritten = true;
+
+    if (DEBUG >= 1) {
+      console.info(
+        `foriLoop→block_map: shape=[${cShape}], block=[${blockShape}], ` +
+          `iters=${upper - lower}, consts=${numConsts}(${numTiledConsts} tiled)`,
+      );
+    }
+
+    // Tile shape for the block_map body
+    const tileShape =
+      rank === 1 ? [blockShape[0]] : [blockShape[0], blockShape[1]];
+
+    // Retile the foriLoop body jaxpr to operate on tile-sized data
+    const tiledBodyJaxpr = retileJaxpr(bodyJaxpr, cShape, tileShape);
+
+    // Build the outer BlockMap body jaxpr.
+    // Inputs: [tiled_const0, ..., tiled_carry0, ...]
+    // Body: one ForiLoop equation operating on tiles
+    // Outputs: [tiled_result0, ...]
+    const bmBodyInBinders: Var[] = [];
+    const foriInputAtoms: Atom[] = [];
+
+    // Const inputs to the inner foriLoop (tiled or scalar)
+    for (let ci = 0; ci < numConsts; ci++) {
+      const orig = eqn.inputs[ci];
+      const aval = constIsTiled[ci]
+        ? new ShapedArray(tileShape, orig.aval.dtype, orig.aval.weakType)
+        : orig.aval;
+      const v = new Var(aval);
+      bmBodyInBinders.push(v);
+      foriInputAtoms.push(v);
+    }
+
+    // Carry inputs to the inner foriLoop (always tiled)
+    for (let ci = 0; ci < carries.length; ci++) {
+      const orig = carries[ci];
+      const v = new Var(
+        new ShapedArray(tileShape, orig.aval.dtype, orig.aval.weakType),
+      );
+      bmBodyInBinders.push(v);
+      foriInputAtoms.push(v);
+    }
+
+    // ForiLoop output vars (tile-sized carries)
+    const foriOutVars: Var[] = [];
+    for (const outVar of eqn.outBinders) {
+      foriOutVars.push(
+        new Var(
+          new ShapedArray(tileShape, outVar.aval.dtype, outVar.aval.weakType),
+        ),
+      );
+    }
+
+    const foriEqn = new JaxprEqn(
+      Primitive.ForiLoop,
+      foriInputAtoms,
+      { jaxpr: tiledBodyJaxpr, numConsts, lower, upper },
+      foriOutVars,
+    );
+
+    const bmBodyJaxpr = new Jaxpr(bmBodyInBinders, [foriEqn], foriOutVars);
+
+    // Compute inAxes: tiled inputs map to grid axes, scalar inputs broadcast
+    const gridAxes: (number | null)[] = range(rank).map((i) => i);
+    const nullAxes: (number | null)[] = range(rank).map(() => null);
+    const inAxes: (number | null)[][] = [];
+    for (let ci = 0; ci < numConsts; ci++) {
+      inAxes.push(constIsTiled[ci] ? [...gridAxes] : [...nullAxes]);
+    }
+    for (let ci = 0; ci < carries.length; ci++) {
+      inAxes.push([...gridAxes]);
+    }
+
+    // outAxes: all outputs tiled along grid axes
+    const outAxes: (number | null)[][] = eqn.outBinders.map(() => [
+      ...gridAxes,
+    ]);
+
+    const blockMapEqn = new JaxprEqn(
+      Primitive.BlockMap,
+      eqn.inputs,
+      {
+        jaxpr: bmBodyJaxpr,
+        blockShape,
+        inAxes,
+        outAxes,
+        numConsts: 0, // BlockMap's own consts (none — all passed as inputs)
+        numInputs: numConsts + carries.length,
+      } satisfies PrimitiveParams<typeof Primitive.BlockMap>,
+      eqn.outBinders,
+    );
+    newEqns.push(blockMapEqn);
+  }
+
+  if (!changed) return jaxpr;
+  return new Jaxpr(jaxpr.inBinders, newEqns, jaxpr.outs);
+}
+
 /**
  * Rewrite a body jaxpr: replace all `Primitive.BlockIndex` equations with a
  * reference to a new synthetic input (appended as the last inBinder).
@@ -1797,6 +2177,7 @@ export function jitCompile(
   // Save/restore dim bindings for nested jitCompile calls (e.g., grad(foriLoop)
   // creates Scan body that contains ForiLoop, each triggering jitCompile).
   const prevDimBindings = _currentDimBindings;
+  const prevSkipFori = _skipForiRewrite;
   _currentDimBindings = dimBindings;
 
   try {
@@ -1813,6 +2194,15 @@ export function jitCompile(
     // dispatch for conv bodies, which is slower than generic-dot.
     lastConvRewritten = false;
     jaxpr = rewriteConvToBlockMap(jaxpr, backend.type);
+    // Rewrite eligible ForiLoop equations to BlockMap on WebGPU.
+    // Must run after flatten/simplify so body shapes are concrete.
+    if (!_skipForiRewrite) lastForiRewritten = false;
+    jaxpr = rewriteForiLoopToBlockMap(jaxpr, backend);
+    // Prevent rewrite in nested body compilations (scan, assocScan, blockMap
+    // bodies). Block_map steps are rejected by both command tape and
+    // mega-module, so rewriting foriLoops inside these bodies would force
+    // fallback paths — a performance regression, not improvement.
+    _skipForiRewrite = true;
     const nargs = jaxpr.inBinders.length;
     const builder = new JitProgramBuilder(backend, nargs);
 
@@ -2737,6 +3127,7 @@ export function jitCompile(
     return jp;
   } finally {
     _currentDimBindings = prevDimBindings;
+    _skipForiRewrite = prevSkipFori;
   }
 }
 

@@ -4,6 +4,7 @@
 
   import {
     calculateMandelbrot,
+    calculateMandelbrotForiLoop,
     calculateMandelbrotJitLoop,
     calculateMandelbrotScan,
     height,
@@ -81,6 +82,19 @@
       }}
     >
       jit(lax.scan)
+    </button>
+
+    <button
+      onmousedown={async () => {
+        const start = performance.now();
+        const arr = calculateMandelbrotForiLoop(100);
+        const result = (await arr.data()) as Int32Array;
+        arr.dispose();
+        milliseconds = performance.now() - start;
+        renderMandelbrot(result);
+      }}
+    >
+      jit(foriLoop)
     </button>
   </div>
 

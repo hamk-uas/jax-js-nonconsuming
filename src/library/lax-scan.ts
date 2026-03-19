@@ -351,6 +351,15 @@ export interface ScanOptions {
  * dXs.dispose();
  * ```
  *
+ * **Performance Note (WebGPU):** `scan` involves declarative multi-step execution. While it
+ * optimizes heavily within a compiled loop (especially for reductions), bodies with complex
+ * cross-element data hazards may fall back to multi-dispatch execution with VRAM roundtrips.
+ * If you are executing simple strictly pointwise operations sequentially without tracking
+ * history (`Y = null`), consider `lax.foriLoop` instead — when its rewrite guards are met
+ * (pointwise-only body, rank 1–2 same-shape carries, concrete bounds, WebGPU backend),
+ * it compiles into a single fused GPU dispatch. See `lax.foriLoop` docs for the full
+ * list of requirements.
+ *
  * @see {@link https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html | JAX lax.scan}
  */
 export function scan<

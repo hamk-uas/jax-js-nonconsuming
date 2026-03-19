@@ -1,0 +1,537 @@
+{
+  "_meta": {
+    "generated": "2026-03-19T10:40:35.268Z",
+    "description": "Continuous regression model for WebGPU cost estimation. Maps adapter.limits observables to physical cost parameters without discrete tier quantization.",
+    "architecture": "Vendor-conditioned log-linear regression on maxBufferSize. Two-stage classifier: features bitmap → vendor family, maxBufferSize → discrete vs IGP. Apple uses generation-specific lookup via adapterInfo.architecture.",
+    "trainingSet": "49 GPUs",
+    "validation": {
+      "meanBwError": "24.4%",
+      "meanTfError": "38.6%",
+      "p90TfError": "78.3%"
+    },
+    "vendorClassCounts": {
+      "discrete-modern": 24,
+      "discrete-legacy": 2,
+      "apple": 14,
+      "igp": 7,
+      "mobile": 2
+    }
+  },
+  "featureClassifier": {
+    "_doc": "Two-stage decision tree: (1) features-bitmap → family, (2) maxBufferSize → discrete vs IGP. Evaluate conditions top-to-bottom, first match wins.",
+    "igpThreshold_bytes": 5368709120,
+    "rules": [
+      {
+        "condition": "etc2 && astc && f16",
+        "vendorClass": "apple",
+        "description": "Apple Silicon (M1–M4): ETC2+ASTC mobile formats + shader-f16, no BC. Note: maxBufferSize doesn't discriminate within Apple — use adapterInfo.architecture for generation-specific lookup when available (Chrome only)."
+      },
+      {
+        "condition": "etc2 && astc && !f16",
+        "vendorClass": "mobile",
+        "description": "Mobile SoC (Adreno/Mali): ETC2+ASTC without shader-f16"
+      },
+      {
+        "condition": "bc && maxBufferSize <= igpThreshold",
+        "vendorClass": "igp",
+        "description": "Integrated graphics (Intel UHD/Iris Xe, AMD APU): desktop features but ≤4GB effective VRAM"
+      },
+      {
+        "condition": "bc && f16 && subgroups",
+        "vendorClass": "discrete-modern",
+        "description": "Modern desktop discrete (Turing+, RDNA2+, Arc): BC + f16 + subgroups + >4GB VRAM"
+      },
+      {
+        "condition": "bc && timestamp-query",
+        "vendorClass": "discrete-legacy",
+        "description": "Older desktop discrete (RDNA1): BC + timestamp-query but no f16, >4GB VRAM"
+      },
+      {
+        "condition": "bc",
+        "vendorClass": "discrete-minimal",
+        "description": "Minimal desktop: only BC compression, >4GB VRAM"
+      },
+      {
+        "condition": "true",
+        "vendorClass": "unknown",
+        "description": "Absolute fallback: no recognizable features"
+      }
+    ]
+  },
+  "directObservables": {
+    "_doc": "Cost model parameters that can be read directly from adapter.limits (no regression needed).",
+    "S_opt": {
+      "source": "device.limits.maxComputeWorkgroupStorageSize",
+      "description": "Shared memory ceiling in bytes. Use directly as S_opt. Typical values: 16384 (mobile), 32768 (desktop).",
+      "safeDefault": 16384
+    },
+    "maxStorageBuffers": {
+      "source": "device.limits.maxStorageBuffersPerShaderStage",
+      "description": "Hard binding limit for P2 pass. Used directly (not inferred).",
+      "safeDefault": 8
+    },
+    "maxWorkgroupSize": {
+      "source": "device.limits.maxComputeWorkgroupSizeX",
+      "description": "Max threads per workgroup. 256 (desktop) or 128 (some mobile).",
+      "safeDefault": 256
+    }
+  },
+  "appleLookup": {
+    "common-4": {
+      "n": 3,
+      "bw_range": [120, 400],
+      "tf_range": [3.62, 14.5],
+      "bw_geomean": 235.75882,
+      "tf_geomean": 7.246665,
+      "gpus": ["Apple_M4_Max_40C", "Apple_M4_Pro_20C", "Apple_M4_10C"]
+    },
+    "common-3": {
+      "n": 3,
+      "bw_range": [100, 400],
+      "tf_range": [3.05, 12.2],
+      "bw_geomean": 181.712058,
+      "tf_geomean": 5.893059,
+      "gpus": ["Apple_M3_Max_40C", "Apple_M3_Pro_18C", "Apple_M3_10C"]
+    },
+    "common-2": {
+      "n": 4,
+      "bw_range": [100, 800],
+      "tf_range": [3.58, 27.2],
+      "bw_geomean": 282.842725,
+      "tf_geomean": 9.74148,
+      "gpus": [
+        "Apple_M2_Ultra_76C",
+        "Apple_M2_Max_38C",
+        "Apple_M2_Pro_19C",
+        "Apple_M2_10C"
+      ]
+    },
+    "common-1": {
+      "n": 4,
+      "bw_range": [68.2, 800],
+      "tf_range": [2.61, 20.8],
+      "bw_geomean": 257.03429,
+      "tf_geomean": 7.360971,
+      "gpus": [
+        "Apple_M1_Ultra_64C",
+        "Apple_M1_Max_32C",
+        "Apple_M1_Pro_16C",
+        "Apple_M1_8C"
+      ]
+    },
+    "_safari_fallback": {
+      "_doc": "Used when adapterInfo.architecture is not available (Safari). Conservative: P25 rather than median, because cost model should not over-estimate capability.",
+      "bw_p25": 120,
+      "tf_p25": 3.62,
+      "bw_median": 273,
+      "tf_median": 7.25
+    }
+  },
+  "vendorModels": {
+    "discrete-modern": {
+      "regressionUsable": true,
+      "bufToBw": {
+        "a": -12.026943,
+        "b": 0.784129,
+        "r2": 0.649214
+      },
+      "bwToTf": {
+        "a": -4.308606,
+        "b": 1.191885,
+        "r2": 0.549618
+      },
+      "bufToTf": {
+        "a": -24.972061,
+        "b": 1.206539,
+        "r2": 0.594685
+      },
+      "median": {
+        "bw_median": 512,
+        "tf_median": 21.75,
+        "bw_range": [256, 1008],
+        "tf_range": [6.45, 82.58],
+        "bw_geomean": 503.336324,
+        "tf_geomean": 22.340936
+      },
+      "C_dispatch_us": 25,
+      "R_opt_words": 128,
+      "F_subgroup": 32,
+      "wgsl_compile_base_ms": 5,
+      "wgsl_compile_per_kb_ms": 2
+    },
+    "discrete-legacy": {
+      "regressionUsable": false,
+      "bufToBw": {
+        "a": -29.025722,
+        "b": 1.535837,
+        "r2": 1
+      },
+      "bwToTf": {
+        "a": -5.810199,
+        "b": 1.324773,
+        "r2": 1
+      },
+      "bufToTf": {
+        "a": -44.262694,
+        "b": 2.034636,
+        "r2": 1
+      },
+      "median": {
+        "bw_median": 448,
+        "tf_median": 9.75,
+        "bw_range": [288, 448],
+        "tf_range": [5.43, 9.75],
+        "bw_geomean": 359.199109,
+        "tf_geomean": 7.27616
+      },
+      "C_dispatch_us": 25,
+      "R_opt_words": 96,
+      "F_subgroup": 32,
+      "wgsl_compile_base_ms": 5,
+      "wgsl_compile_per_kb_ms": 2
+    },
+    "apple": {
+      "regressionUsable": true,
+      "bufToBw": {
+        "a": -38.348665,
+        "b": 1.875667,
+        "r2": 0.615751
+      },
+      "bwToTf": {
+        "a": -3.099216,
+        "b": 0.934484,
+        "r2": 0.968269
+      },
+      "bufToTf": {
+        "a": -38.857177,
+        "b": 1.749432,
+        "r2": 0.593937
+      },
+      "median": {
+        "bw_median": 273,
+        "tf_median": 7.25,
+        "bw_range": [68.2, 800],
+        "tf_range": [2.61, 27.2],
+        "bw_geomean": 240.740945,
+        "tf_geomean": 7.577891
+      },
+      "C_dispatch_us": 20,
+      "R_opt_words": 128,
+      "F_subgroup": 32,
+      "wgsl_compile_base_ms": 8,
+      "wgsl_compile_per_kb_ms": 3
+    },
+    "igp": {
+      "regressionUsable": true,
+      "bufToBw": {
+        "a": -15.875494,
+        "b": 0.919532,
+        "r2": 0.618385
+      },
+      "bwToTf": {
+        "a": -7.097216,
+        "b": 1.77405,
+        "r2": 0.960852
+      },
+      "bufToTf": {
+        "a": -32.613552,
+        "b": 1.51031,
+        "r2": 0.509311
+      },
+      "median": {
+        "bw_median": 68.2,
+        "tf_median": 1.69,
+        "bw_range": [33.6, 120],
+        "tf_range": [0.46, 4.3],
+        "bw_geomean": 69.91007,
+        "tf_geomean": 1.5489
+      },
+      "C_dispatch_us": 20,
+      "R_opt_words": 48,
+      "F_subgroup": 16,
+      "wgsl_compile_base_ms": 5,
+      "wgsl_compile_per_kb_ms": 2
+    },
+    "mobile": {
+      "regressionUsable": false,
+      "bufToBw": {
+        "a": 4.0473113,
+        "b": 0,
+        "r2": 0
+      },
+      "bwToTf": {
+        "a": -11.476908,
+        "b": 3.053869,
+        "r2": 1
+      },
+      "bufToTf": {
+        "a": 0.88304986,
+        "b": 0,
+        "r2": 0
+      },
+      "median": {
+        "bw_median": 64,
+        "tf_median": 3.4,
+        "bw_range": [51.2, 64],
+        "tf_range": [1.72, 3.4],
+        "bw_geomean": 57.24334,
+        "tf_geomean": 2.418264
+      },
+      "C_dispatch_us": 35,
+      "R_opt_words": 64,
+      "F_subgroup": 16,
+      "wgsl_compile_base_ms": 10,
+      "wgsl_compile_per_kb_ms": 4
+    }
+  },
+  "globalFallback": {
+    "bufToBw": {
+      "a": -16.381322,
+      "b": 0.957754,
+      "r2": 0.651547
+    },
+    "bwToTf": {
+      "a": -4.512533,
+      "b": 1.207289,
+      "r2": 0.884679
+    },
+    "bufToTf": {
+      "a": -24.615406,
+      "b": 1.170468,
+      "r2": 0.590636
+    },
+    "median": {
+      "bw_median": 384,
+      "tf_median": 12.74,
+      "bw_range": [33.6, 1008],
+      "tf_range": [0.46, 82.58],
+      "bw_geomean": 277.556212,
+      "tf_geomean": 9.773789
+    },
+    "C_dispatch_us": 25,
+    "R_opt_words": 96,
+    "F_subgroup": 32,
+    "wgsl_compile_base_ms": 8,
+    "wgsl_compile_per_kb_ms": 3
+  },
+  "_runtimeUsage": {
+    "_doc": "Pseudocode for runtime inference at device init",
+    "steps": [
+      "// 1. Classify vendor from features + maxBufferSize",
+      "const vc = classifyVendor(device.features, device.limits.maxBufferSize);",
+      "const model = RUNTIME_MODEL.vendorModels[vc] ?? RUNTIME_MODEL.globalFallback;",
+      "",
+      "// 2. For Apple: prefer exact architecture lookup",
+      "if (vc === 'apple' && adapterInfo?.architecture) {",
+      "  const gen = RUNTIME_MODEL.appleLookup[adapterInfo.architecture];",
+      "  if (gen) return { B_mem: gen.bw_geomean, T_alu: gen.tf_geomean, ...model };",
+      "  // Safari fallback: use conservative P25",
+      "  const fb = RUNTIME_MODEL.appleLookup._safari_fallback;",
+      "  return { B_mem: fb.bw_p25, T_alu: fb.tf_p25, ...model };",
+      "}",
+      "",
+      "// 3. For classes with good regression: continuous inference",
+      "if (model.regressionUsable) {",
+      "  const logBuf = Math.log(device.limits.maxBufferSize);",
+      "  const logBw  = model.bufToBw.a + model.bufToBw.b * logBuf;",
+      "  const logTf  = model.bwToTf.a + model.bwToTf.b * logBw;",
+      "  return { B_mem: Math.exp(logBw), T_alu: Math.exp(logTf), ...model };",
+      "}",
+      "",
+      "// 4. For low-data classes: median fallback",
+      "return { B_mem: model.median.bw_geomean, T_alu: model.median.tf_geomean, ...model };"
+    ]
+  },
+  "_sufficientStats": {
+    "_doc": "Welford mean-centered OLS sufficient statistics in log-space. b = ssXY/ssXX, a = mean_y - b*mean_x, r² = ssXY²/(ssXX*ssYY). To add a new GPU, use scripts/refit-model.mjs.",
+    "_seededNamesLost": "Non-Apple classes (discrete-modern: 24, discrete-legacy: 2, igp: 7, mobile: 2) were seeded from TechPowerUp spec-sheet aggregates without recording individual GPU names. Welford sufficient statistics are destructive — the original data points cannot be recovered. Duplicate protection cannot guard these 35 original entries; it only guards GPUs added after this file was created. New additions are tracked in each class's gpus array.",
+    "perClass": {
+      "discrete-modern": {
+        "n": 24,
+        "gpus": [],
+        "bufToBw": {
+          "mean_x": 23.271925,
+          "mean_y": 6.2212586,
+          "ssXX": 3.9512744,
+          "ssXY": 3.0983106,
+          "ssYY": 3.7421797
+        },
+        "bwToTf": {
+          "mean_x": 6.2212586,
+          "mean_y": 3.1064207,
+          "ssXX": 3.7421797,
+          "ssXY": 4.4602488,
+          "ssYY": 9.6723713
+        },
+        "bufToTf": {
+          "mean_x": 23.271925,
+          "mean_y": 3.1064207,
+          "ssXX": 3.9512744,
+          "ssXY": 4.767366,
+          "ssYY": 9.6723713
+        }
+      },
+      "discrete-legacy": {
+        "n": 2,
+        "gpus": [],
+        "bufToBw": {
+          "mean_x": 22.730016,
+          "mean_y": 5.8838769,
+          "ssXX": 0.041380487,
+          "ssXY": 0.063553681,
+          "ssYY": 0.09760809
+        },
+        "bwToTf": {
+          "mean_x": 5.8838769,
+          "mean_y": 1.9846032,
+          "ssXX": 0.09760809,
+          "ssXY": 0.12930857,
+          "ssYY": 0.17130452
+        },
+        "bufToTf": {
+          "mean_x": 22.730016,
+          "mean_y": 1.9846032,
+          "ssXX": 0.041380487,
+          "ssXY": 0.084194208,
+          "ssYY": 0.17130452
+        }
+      },
+      "apple": {
+        "n": 14,
+        "gpus": [
+          "Apple_M4_Max_40C",
+          "Apple_M4_Pro_20C",
+          "Apple_M4_10C",
+          "Apple_M3_Max_40C",
+          "Apple_M3_Pro_18C",
+          "Apple_M3_10C",
+          "Apple_M2_Ultra_76C",
+          "Apple_M2_Max_38C",
+          "Apple_M2_Pro_19C",
+          "Apple_M2_10C",
+          "Apple_M1_Ultra_64C",
+          "Apple_M1_Max_32C",
+          "Apple_M1_Pro_16C",
+          "Apple_M1_8C"
+        ],
+        "bufToBw": {
+          "mean_x": 23.368962,
+          "mean_y": 5.4837214,
+          "ssXX": 1.3727229,
+          "ssXY": 2.5747708,
+          "ssYY": 7.84312
+        },
+        "bwToTf": {
+          "mean_x": 5.4837214,
+          "mean_y": 2.025235,
+          "ssXX": 7.84312,
+          "ssXY": 7.3292722,
+          "ssYY": 7.0735397
+        },
+        "bufToTf": {
+          "mean_x": 23.368962,
+          "mean_y": 2.025235,
+          "ssXX": 1.3727229,
+          "ssXY": 2.4014855,
+          "ssYY": 7.0735397
+        }
+      },
+      "igp": {
+        "n": 7,
+        "gpus": [],
+        "bufToBw": {
+          "mean_x": 21.883647,
+          "mean_y": 4.2472097,
+          "ssXX": 0.82363374,
+          "ssXY": 0.75735719,
+          "ssYY": 1.1261815
+        },
+        "bwToTf": {
+          "mean_x": 4.2472097,
+          "mean_y": 0.43754482,
+          "ssXX": 1.1261815,
+          "ssXY": 1.9979019,
+          "ssYY": 3.6887876
+        },
+        "bufToTf": {
+          "mean_x": 21.883647,
+          "mean_y": 0.43754482,
+          "ssXX": 0.82363374,
+          "ssXY": 1.2439425,
+          "ssYY": 3.6887876
+        }
+      },
+      "mobile": {
+        "n": 2,
+        "gpus": [],
+        "bufToBw": {
+          "mean_x": 20.794415,
+          "mean_y": 4.0473113,
+          "ssXX": 0,
+          "ssXY": 0,
+          "ssYY": 0.024896522
+        },
+        "bwToTf": {
+          "mean_x": 4.0473113,
+          "mean_y": 0.88304986,
+          "ssXX": 0.024896522,
+          "ssXY": 0.076030714,
+          "ssYY": 0.23218783
+        },
+        "bufToTf": {
+          "mean_x": 20.794415,
+          "mean_y": 0.88304986,
+          "ssXX": 0,
+          "ssXY": 0,
+          "ssYY": 0.23218783
+        }
+      }
+    },
+    "global": {
+      "n": 49,
+      "bufToBw": {
+        "mean_x": 22.978083,
+        "mean_y": 5.6260235,
+        "ssXX": 28.444679,
+        "ssXY": 27.242999,
+        "ssYY": 40.046333
+      },
+      "bwToTf": {
+        "mean_x": 5.6260235,
+        "mean_y": 2.2797042,
+        "ssXX": 40.046333,
+        "ssXY": 48.347507,
+        "ssYY": 65.978113
+      },
+      "bufToTf": {
+        "mean_x": 22.978083,
+        "mean_y": 2.2797042,
+        "ssXX": 28.444679,
+        "ssXY": 33.293586,
+        "ssYY": 65.978113
+      }
+    },
+    "appleGenerations": {
+      "common-4": {
+        "n": 3,
+        "sum_log_bw": 16.388428,
+        "sum_log_tf": 5.9416241
+      },
+      "common-3": {
+        "n": 3,
+        "sum_log_bw": 15.60727,
+        "sum_log_tf": 5.3213256
+      },
+      "common-2": {
+        "n": 4,
+        "sum_log_bw": 22.579564,
+        "sum_log_tf": 9.1055722
+      },
+      "common-1": {
+        "n": 4,
+        "sum_log_bw": 22.196838,
+        "sum_log_tf": 7.9847676
+      }
+    }
+  }
+}

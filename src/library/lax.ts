@@ -645,6 +645,20 @@ export function uncheckedDynamicSlice(
 
 /**
  * Sequential loop with a carried state.
+ *
+ * **Performance Note (WebGPU):** Under `jit()`, the compiler may rewrite this into a
+ * fused `BlockMap` that executes the entire loop in a single GPU dispatch. The rewrite
+ * applies when **all** of the following hold:
+ * - Backend is WebGPU (WASM already compiles foriLoop natively via mega-module)
+ * - Loop bounds are concrete integers with ≥ 2 iterations
+ * - Body consists entirely of pointwise elementwise operations (no matmul, reduce, scan, etc.)
+ * - All carries have the same concrete shape, rank 1–2, with each dimension ≥ 4
+ * - Constants are either same-shape-as-carry or scalar
+ * - Total shared memory for tiles fits within `maxComputeWorkgroupStorageSize`
+ * - The foriLoop is at the top level of the jit-compiled function (not nested in scan/blockMap)
+ *
+ * When the rewrite fires, the loop runs in GPU register threads (`var<private>`) without
+ * VRAM roundtrips. Use `_lastForiRewritten()` (test-only) or `setDebug(1)` to verify.
  */
 export function foriLoop<C extends tree.JsTree<Array>>(
   lower: number | Dim,

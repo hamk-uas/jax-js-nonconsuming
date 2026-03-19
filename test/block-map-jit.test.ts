@@ -7,6 +7,7 @@
 
 import {
   _fusedCacheCompileCount,
+  _lastForiRewritten,
   defaultDevice,
   DType,
   getBackend,
@@ -943,6 +944,104 @@ describe("lax.blockMap — boundary blocks", () => {
       [10, 11],
     ]);
     f_jit.dispose();
+  });
+
+  test("jit(blockMap(foriLoop)) multi-carry preserves old values", () => {
+    // Mandelbrot-like pattern with 2 carries: a_new = a² - b² + x,
+    // b_new = 2*a*b + y. In the fused shader, carry inputs and outputs
+    // alias the same shmem. Without snapshot, body kernel writing a_new
+    // overwrites shmem_a before the kernel computing b_new reads it—
+    // b_new then uses new_a instead of old_a.
+    type Carry = { a: np.Array; b: np.Array };
+    const f = (x: np.Array, y: np.Array) =>
+      lax.blockMap(
+        (block: { x: np.Array; y: np.Array }) => {
+          const result = lax.foriLoop(
+            0,
+            3,
+            (_i: np.Array, carry: Carry): Carry => {
+              const { a, b } = carry;
+              using asq = a.mul(a);
+              using bsq = b.mul(b);
+              using diff = asq.sub(bsq);
+              const a_new = diff.add(block.x);
+              using cross = a.mul(b);
+              using scaled = cross.mul(np.array(2));
+              const b_new = scaled.add(block.y);
+              return { a: a_new, b: b_new };
+            },
+            { a: np.zerosLike(block.x), b: np.zerosLike(block.x) },
+          );
+          using _a = result.a;
+          return result.b;
+        },
+        { x, y },
+        { blockShape: [4], inAxes: [0], outAxes: [0] },
+      );
+
+    // Reference: eager execution (no fused shader, correct semantics)
+    using xs = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], {
+      dtype: DType.Float32,
+    });
+    using ys = np.array([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08], {
+      dtype: DType.Float32,
+    });
+    using expected = f(xs, ys);
+
+    using f_jit = jit(f);
+    using result = f_jit(xs, ys);
+    expect(result).toBeAllclose(expected);
+  });
+
+  test("jit(blockMap(foriLoop)) multi-carry WebGPU fused shader", () => {
+    if (!hasWebGPU) return;
+
+    // Same test as above but on WebGPU to exercise the fused shader path
+    // where carry input/output shmem aliasing can cause incorrect results.
+    type Carry = { a: np.Array; b: np.Array };
+    const f = (x: np.Array, y: np.Array) =>
+      lax.blockMap(
+        (block: { x: np.Array; y: np.Array }) => {
+          const result = lax.foriLoop(
+            0,
+            3,
+            (_i: np.Array, carry: Carry): Carry => {
+              const { a, b } = carry;
+              using asq = a.mul(a);
+              using bsq = b.mul(b);
+              using diff = asq.sub(bsq);
+              const a_new = diff.add(block.x);
+              using cross = a.mul(b);
+              using scaled = cross.mul(np.array(2));
+              const b_new = scaled.add(block.y);
+              return { a: a_new, b: b_new };
+            },
+            { a: np.zerosLike(block.x), b: np.zerosLike(block.x) },
+          );
+          using _a = result.a;
+          return result.b;
+        },
+        { x, y },
+        { blockShape: [4], inAxes: [0], outAxes: [0] },
+      );
+
+    const xVals = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+    const yVals = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08];
+
+    // Compute reference on WASM (known correct)
+    defaultDevice("wasm");
+    using xs_w = np.array(xVals, { dtype: DType.Float32 });
+    using ys_w = np.array(yVals, { dtype: DType.Float32 });
+    using f_wasm = jit(f);
+    using expected = f_wasm(xs_w, ys_w);
+
+    // Switch to WebGPU and compare
+    defaultDevice("webgpu");
+    using xs_g = np.array(xVals, { dtype: DType.Float32 });
+    using ys_g = np.array(yVals, { dtype: DType.Float32 });
+    using f_jit = jit(f);
+    using result = f_jit(xs_g, ys_g);
+    expect(result).toBeAllclose(expected);
   });
 
   // =========================================================================
@@ -2383,5 +2482,153 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
       expect(js[b][0]).toBeCloseTo(1, 4);
       expect(js[b][N - 1]).toBeCloseTo(N, 4);
     }
+  });
+});
+
+// ==========================================================================
+// Automatic ForiLoop → BlockMap rewrite (WebGPU)
+// ==========================================================================
+
+describe("rewriteForiLoopToBlockMap", () => {
+  afterEach(() => setDebug(0));
+
+  test("1D elementwise foriLoop is rewritten on WebGPU", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+
+    const f = (x: np.Array) =>
+      lax.foriLoop(
+        0,
+        5,
+        (_i: np.Array, carry: np.Array) => carry.add(x),
+        np.zerosLike(x),
+      );
+
+    using xs = np.ones([64], { dtype: DType.Float32 });
+    using f_jit = jit(f);
+    using result = f_jit(xs);
+
+    expect(_lastForiRewritten()).toBe(true);
+    // 5 iterations of adding 1.0 → each element = 5.0
+    expect(result).toBeAllclose(np.full([64], 5));
+  });
+
+  test("2D elementwise foriLoop is rewritten on WebGPU", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+
+    type Carry = { a: np.Array; b: np.Array };
+    const f = (x: np.Array, y: np.Array) =>
+      lax.foriLoop(
+        0,
+        3,
+        (_i: np.Array, carry: Carry): Carry => {
+          const { a, b } = carry;
+          using asq = a.mul(a);
+          using bsq = b.mul(b);
+          using diff = asq.sub(bsq);
+          const a_new = diff.add(x);
+          using cross = a.mul(b);
+          using scaled = cross.mul(2);
+          const b_new = scaled.add(y);
+          return { a: a_new, b: b_new };
+        },
+        { a: np.zerosLike(x), b: np.zerosLike(x) },
+      );
+
+    // Compute reference on WASM (foriLoop is NOT rewritten on WASM)
+    defaultDevice("wasm");
+    using xs_w = np.array(
+      [
+        [0.1, 0.2, 0.3, 0.4],
+        [0.5, 0.6, 0.7, 0.8],
+        [0.1, 0.2, 0.3, 0.4],
+        [0.5, 0.6, 0.7, 0.8],
+      ],
+      { dtype: DType.Float32 },
+    );
+    using ys_w = np.array(
+      [
+        [0.01, 0.02, 0.03, 0.04],
+        [0.05, 0.06, 0.07, 0.08],
+        [0.01, 0.02, 0.03, 0.04],
+        [0.05, 0.06, 0.07, 0.08],
+      ],
+      { dtype: DType.Float32 },
+    );
+    using f_wasm = jit(f);
+    const expected = f_wasm(xs_w, ys_w);
+    using expected_a = expected.a;
+    using expected_b = expected.b;
+
+    // Verify WASM does NOT rewrite
+    expect(_lastForiRewritten()).toBe(false);
+
+    // Switch to WebGPU: should rewrite and produce same results
+    defaultDevice("webgpu");
+    using xs_g = np.array(
+      [
+        [0.1, 0.2, 0.3, 0.4],
+        [0.5, 0.6, 0.7, 0.8],
+        [0.1, 0.2, 0.3, 0.4],
+        [0.5, 0.6, 0.7, 0.8],
+      ],
+      { dtype: DType.Float32 },
+    );
+    using ys_g = np.array(
+      [
+        [0.01, 0.02, 0.03, 0.04],
+        [0.05, 0.06, 0.07, 0.08],
+        [0.01, 0.02, 0.03, 0.04],
+        [0.05, 0.06, 0.07, 0.08],
+      ],
+      { dtype: DType.Float32 },
+    );
+    using f_gpu = jit(f);
+    const result = f_gpu(xs_g, ys_g);
+    using result_a = result.a;
+    using result_b = result.b;
+
+    expect(_lastForiRewritten()).toBe(true);
+    expect(result_a).toBeAllclose(expected_a);
+    expect(result_b).toBeAllclose(expected_b);
+  });
+
+  test("foriLoop with non-elementwise body is NOT rewritten", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+
+    // Dot product in body → not elementwise → no rewrite
+    const f = (A: np.Array, B: np.Array) =>
+      lax.foriLoop(
+        0,
+        3,
+        (_i: np.Array, carry: np.Array) => np.matmul(carry, B),
+        A,
+      );
+
+    using a = np.ones([4, 4], { dtype: DType.Float32 });
+    using b = np.eye(4, { dtype: DType.Float32 });
+    using f_jit = jit(f);
+    using _result = f_jit(a, b);
+    expect(_lastForiRewritten()).toBe(false);
+  });
+
+  test("foriLoop with scalar carries is NOT rewritten", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+
+    const f = (x: np.Array) =>
+      lax.foriLoop(
+        0,
+        5,
+        (_i: np.Array, carry: np.Array) => carry.add(x),
+        np.array(0, { dtype: DType.Float32 }),
+      );
+
+    using x = np.array(1, { dtype: DType.Float32 });
+    using f_jit = jit(f);
+    using _result = f_jit(x);
+    expect(_lastForiRewritten()).toBe(false);
   });
 });

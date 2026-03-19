@@ -83,6 +83,36 @@ function moveBatchAxis(
   }
 }
 
+function padRankAfterBatch(
+  x: Tracer,
+  targetNdim: number,
+  origX?: Tracer,
+): Tracer {
+  if (x.ndim >= targetNdim) return x;
+  const reshaped = reshape(x, [
+    x.shape[0],
+    ...rep(targetNdim - x.ndim, 1),
+    ...x.shape.slice(1),
+  ]);
+  if (origX !== undefined && x !== origX) {
+    x[Symbol.dispose]();
+  }
+  return reshaped;
+}
+
+function alignAndPadBatchAxes(
+  axisSize: number,
+  args: Tracer[],
+  dims: (number | null)[],
+  targetNdim: number,
+): Tracer[] {
+  return args.map((x, i) => {
+    if (dims[i] === null) return x;
+    const moved = moveBatchAxis(axisSize, dims[i], 0, x);
+    return padRankAfterBatch(moved, targetNdim, x);
+  });
+}
+
 class BatchTracer extends Tracer {
   constructor(
     trace: Trace,
@@ -232,21 +262,7 @@ function broadcastBatcher<P extends Primitive>(prim: P): VmapRule<P> {
     // Move the batch axes to the front. If needed, expand arrays so that all
     // inputs have the same number of dimensions.
     const origArgs = args;
-    args = args.map((x, i) => {
-      if (dims[i] === null) return x;
-      const moved = moveBatchAxis(axisSize, dims[i], 0, x);
-      if (moved.ndim < nd) {
-        const reshaped = moved.reshape([
-          moved.shape[0],
-          ...rep(nd - moved.ndim, 1),
-          ...moved.shape.slice(1),
-        ]);
-        // Dispose moveBatchAxis intermediate replaced by reshape
-        if (moved !== x) moved[Symbol.dispose]();
-        return reshaped;
-      }
-      return moved;
-    });
+    args = alignAndPadBatchAxes(axisSize, args, dims, nd);
     const result = bind1(prim, args, params);
     // Dispose moveBatchAxis/reshape intermediates after they've been consumed
     for (let i = 0; i < args.length; i++) {
@@ -346,16 +362,30 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     const outBdim = xBdim - axis.filter((ax) => ax < xBdim).length;
     return [[reduce(x, op, newAxis)], [outBdim]];
   },
-  [Primitive.Dot](axisSize, [x, y], [xBdim, yBdim]) {
+  [Primitive.Dot](axisSize, [origX, origY], [xBdim, yBdim]) {
     // Move batch axes to the front so block_map's per-thread validity check
     // works correctly: with batch outermost, each thread handles exactly one
     // batch element's worth of data.  The old strategy (batch at ndim-2)
     // scattered batch-0 elements across multiple threads, causing boundary
     // blocks to zero out valid data assigned to "invalid" threads.
-    const origX = x,
-      origY = y;
-    x = moveBatchAxis(axisSize, xBdim, 0, x);
-    y = moveBatchAxis(axisSize, yBdim, 0, y);
+
+    // core.dot executes a standard right-to-left broadcast over a multiplication
+    // and then reduces the last axis. Under vmap, x and y may have different ranks
+    // despite sharing a batch size at axis 0. Standard broadcast will misalign the
+    // dimensions (e.g. [B, M, K] and [B, K] -> tries to align M and B).
+    // alignAndPadBatchAxes pads the lower rank tensor with size-1 axes right
+    // after the batch axis to preserve mathematical alignment.
+    const maxNdim = Math.max(
+      origX.ndim + (xBdim === null ? 1 : 0),
+      origY.ndim + (yBdim === null ? 1 : 0),
+    );
+    const [x, y] = alignAndPadBatchAxes(
+      axisSize,
+      [origX, origY],
+      [xBdim, yBdim],
+      maxNdim,
+    );
+
     const z = dot(x, y);
     if (x !== origX) x[Symbol.dispose]();
     if (y !== origY) y[Symbol.dispose]();

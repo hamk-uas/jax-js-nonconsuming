@@ -4,6 +4,7 @@ import {
   jacrev,
   jit,
   jvp,
+  lax,
   numpy as np,
   vmap,
 } from "@hamk-uas/jax-js-nonconsuming";
@@ -189,6 +190,93 @@ suite("jax.vmap()", () => {
     expect(r2.js()).toEqual([26, 44]);
   });
 
+  test("vmap lax.dot directly", () => {
+    // Invoke lax.dot (Primitive.Dot) inside vmap, bypassing np.dot shape preprocessing
+    using A = np.array([
+      [
+        [0, 1, 2],
+        [3, 4, 5],
+      ],
+      [
+        [6, 7, 8],
+        [9, 10, 11],
+      ],
+    ]);
+    using b = np.array([
+      [0, 1, 2],
+      [3, 4, 5],
+    ]);
+    const f = (x: np.Array, y: np.Array) =>
+      lax.dot(x, y, { lhsContractingDims: [1], rhsContractingDims: [0] });
+    using result = vmap(f)(A, b);
+    expect(result.shape).toEqual([2, 2]);
+    expect(result.js()).toEqual([
+      [5, 14],
+      [86, 122],
+    ]);
+  });
+
+  test("vmap np.dot matrix-vector", () => {
+    // np.dot(A, b) with A=[M,K], b=[K] batched over B elements.
+    // The vmap rule for Primitive.Dot natively aligns ranks for broadcasting underneath vmap.
+    using A = np.array([
+      [
+        [0, 1, 2],
+        [3, 4, 5],
+      ],
+      [
+        [6, 7, 8],
+        [9, 10, 11],
+      ],
+    ]);
+    using b = np.array([
+      [0, 1, 2],
+      [3, 4, 5],
+    ]);
+    using result = vmap(np.dot)(A, b);
+    // A[0]=[0,1,2; 3,4,5], b[0]=[0,1,2] → [5, 14]
+    // A[1]=[6,7,8; 9,10,11], b[1]=[3,4,5] → [86, 122]
+    expect(result.shape).toEqual([2, 2]);
+    expect(result.js()).toEqual([
+      [5, 14],
+      [86, 122],
+    ]);
+  });
+
+  test("vmap np.dot vector-matrix", () => {
+    // np.dot(a, B) with a=[K], B=[K,M] batched over B elements.
+    // np.dot(1D, 2D) sums over last of a, second-to-last of B. -> [M] output
+    using a = np.array([
+      [1, 2],
+      [3, 4],
+    ]); // batched over 2
+    using B = np.array([
+      [
+        [1, 0, 0],
+        [0, 1, 0],
+      ],
+      [
+        [0, 0, 1],
+        [0, 1, 0],
+      ],
+    ]); // batched over 2
+    using result = vmap(np.dot)(a, B);
+    expect(result.shape).toEqual([2, 3]);
+    expect(result.js()).toEqual([
+      [1, 2, 0],
+      [0, 4, 3],
+    ]);
+  });
+
+  test("vmap np.dot higher-rank batched", () => {
+    // batched np.dot(A, b) with A=[C, M, K], b=[K] batched over B elements.
+    using A = np.ones([2, 5, 4, 3]); // b=2, C=5, M=4, K=3
+    using b = np.ones([2, 3]); // b=2, K=3
+    using result = vmap(np.dot)(A, b);
+    // Each inner dot is 4x3 @ 3 -> 4, so 5x4 outputs, over 2 batch elements -> [2, 5, 4]
+    expect(result.shape).toEqual([2, 5, 4]);
+  });
+
   test("can vectorize over iteration and slice", () => {
     const f = (x: np.Array) => [...x];
     using batchedF = jit(vmap(f, 0));
@@ -295,5 +383,20 @@ suite("jax.hessian()", () => {
       [0, 1, 0],
     ]);
     expect(H).toBeAllclose(expected);
+  });
+});
+
+suite("vmap dot unbatched inputs", () => {
+  test("vmap np.dot with unbatched matrix and batched vector", () => {
+    using A = np.ones([4, 3]); // unbatched matrix
+    using b = np.ones([2, 3]); // batched vector (B=2, K=3)
+    using result = vmap(np.dot, [null, 0])(A, b);
+    expect(result.shape).toEqual([2, 4]);
+  });
+  test("vmap np.dot with batched matrix and unbatched vector", () => {
+    using A = np.ones([2, 4, 3]); // batched matrix (B=2)
+    using b = np.ones([3]); // unbatched vector
+    using result = vmap(np.dot, [0, null])(A, b);
+    expect(result.shape).toEqual([2, 4]);
   });
 });

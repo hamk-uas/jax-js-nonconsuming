@@ -12,6 +12,7 @@ into `.github/copilot-instructions.md`.
 | P4  | Conv2d WebGPU fused shader | Medium          | Fused-shader codegen for conv bodies in `block-map.ts`. WASM path done (1.02–1.36×) |
 | P6  | Benchmark validation       | Medium          | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions              |
 | P7  | Cooperative matrix (WMMA)  | Blocked (~2026) | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable               |
+| P8  | Command tape block_map     | Low             | Add `block_map` to WebGPU command tape to unlock `foriLoop→blockMap` in `Scan`      |
 
 ## P4: Conv2d WebGPU Fused Shader
 

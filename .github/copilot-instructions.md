@@ -433,7 +433,8 @@ All public symbols must be exported from `src/index.ts`. Key exports: `jit`, `gr
 `lax`, `nn`, `random`, `scipySpecial`, `scipyLinalg`, `tree`, `ScanPath`, `profileGpu`,
 `profileGpuDetailed`, `setCodeCapture`, `CodeCaptureEntry`, `getWebGPUDevice`.
 
-Internal-only exports (underscore prefix, not public API): `_lastConvClass`, `_lastConvRewritten`.
+Internal-only exports (underscore prefix, not public API): `_lastConvClass`, `_lastConvRewritten`,
+`_lastForiRewritten`.
 
 ## Observability & code capture
 
@@ -630,6 +631,18 @@ bodies; generic-dot is faster). WASM: 1.02–1.36× speedup growing with spatial
 32²–128²), WebGPU is **dispatch-bound at ~2.5ms** with <1% GPU utilization. Kernel quality is
 irrelevant until tensor sizes are large enough to dominate dispatch cost. Im2col materialization was
 attempted and rejected (41% regression from 150MB VRAM bandwidth overhead for 3×3).
+
+**ForiLoop→BlockMap rewrite** (`rewriteForiLoopToBlockMap()` in `jit.ts`): Rewrites eligible
+`ForiLoop` equations to `BlockMap` wrapping `ForiLoop` BEFORE `splitGraphDataflow`. **WebGPU only**
+— WASM mega-module already compiles foriLoop natively. Guards: concrete bounds, ≥2 iterations,
+retilable body (strict `pointwisePrimitives` whitelist check to prevent shape-preserving but
+non-pointwise ops), all carries same concrete shape (rank ≥ 1, each dim ≥ 4), consts either
+same-shape or scalar, shmem budget ≤ `backend.capabilities.maxComputeWorkgroupStorageSize` (exact
+`byteWidth` tally of all inner `outBinders`). The inner ForiLoop operates on tile-sized data; on
+WebGPU the fused shader emits a native WGSL `for` loop — 1 dispatch regardless of iteration count.
+Block size: static limits 1D → `min(256, N)`, 2D → `[16,16]`/`[16,8]`/`[8,8]`.
+`_lastForiRewritten()` tracks actual rewrite. Recursion prevented by `_skipForiRewrite` flag
+(block_map nodes not currently schedulable via WebGPU Command Tape in nested contexts).
 
 ---
 
@@ -990,6 +1003,7 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Halo zero-copy backends                                     | WebGPU: signed bounds checks in fused shader; WASM: compiled clamped-copy with interior fast path (skip `memory.fill`); JS fallback: per-block clamped slicing. No pre-pad allocation on any backend                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | Stencil body synthesis for halo-VJP                         | Forward bodies use Shrink (from `sliceInDim`), not UDS. `analyzeLinearStencil` walks body for {Shrink, Add, Mul(Lit)} targeting single halo input; `Add(stencilTerms, Lit)` allowed (additive bias drops out in adjoint). Gather-based VJP synthesizes reversed-stencil backward body via `makeJaxpr`; non-linear/unrecognized bodies fall back to pad+add. Multi-input guard: if any non-haloed tangent input is differentiated, falls through to pad+add. JVP threads `originalJaxpr`+`originalNumConsts` through BlockMap params so transpose analyzes clean forward body, not JVP-doubled body                                                       |
 | Conv→BlockMap jaxpr rewrite (C.3)                           | `rewriteConvToBlockMap()` rewrites eligible 3×3/5×5 Conv to BlockMap BEFORE `splitGraphDataflow`. Guards: stride=1, SAME-equiv padding, spatial≥16, v=0, backend≠webgpu. Body uses VALID conv (SAME guard prevents recursion). `_lastConvRewritten()` tracks actual rewrite. 1.02–1.36× WASM speedup (grows with spatial size)                                                                                                                                                                                                                                                                                                                           |
+| ForiLoop→BlockMap jaxpr rewrite                             | `rewriteForiLoopToBlockMap()` rewrites eligible ForiLoop to BlockMap wrapping ForiLoop BEFORE `splitGraphDataflow`. WebGPU only (WASM mega-module already compiles natively). Guards: concrete bounds, ≥2 iters, retilable body (strict `pointwisePrimitives` whitelist check), same concrete shape (rank≥1, dim≥4), consts same-shape or scalar, shmem ≤ `backend.capabilities.maxComputeWorkgroupStorageSize` (exact `byteWidth` tally). `_lastForiRewritten()` tracks rewrite. `_skipForiRewrite` blocks nested rewrites (block_map rejected by tape).                                                                                                |
 | WebGPU-only tests in GPU-enforced suite                     | Tests requiring WebGPU excluded from default vitest config; run under gpu-test.sh where adapter is guaranteed. Pre-commit runs them automatically (NVIDIA on feature, both GPUs on main)                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Scan-in-command-tape (`TapeScan`)                           | Non-fallback scan paths (compiled-loop, preencoded-routine, preencoded-multi-step) execute within the tape's command buffer. Scan dispatchers receive a `tapeCtx` with shared encoder, deferred destroys, and `Set<GPUBuffer>` for pooled transient buffers. Scan buffer indices excluded from arena coloring via `buildConflictGraphAndColor`                                                                                                                                                                                                                                                                                                           |
 | Declarative `WebGPUYOutputSource` for compiled-loop scan    | Hybrid Y output model. Computed Ys (carry-live, internal) are written directly inline by the steps that produce them (via `outputYIdxs`). Passthrough Ys (carry-snapshot, xs) are written in a dedicated writeback phase driven by source descriptors. Enables any numCarry/numY combination.                                                                                                                                                                                                                                                                                                                                                            |

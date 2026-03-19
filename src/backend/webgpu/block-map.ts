@@ -2822,6 +2822,44 @@ export function blockMapFusedShaderSource(
           pushIndent,
         );
 
+        // Snapshot ALL carries at the start of each loop iteration.
+        // Private (register) carries: full array copied to immutable `let`.
+        //   Cost: tileElems (typically 16–64) register copies — negligible vs kernel work.
+        //   WGSL `let` on small fixed-size arrays compiles to register moves that the
+        //   driver can often elide entirely when the snapshot is consumed once.
+        // Non-private (shmem) carries: scalar `let` snapshot (same pattern as standard path).
+        // Prevents read-after-write hazards when multiple body kernels reference carries.
+        for (let ci = 0; ci < numCarries; ci++) {
+          const bodyOutId = fl.bodyOutputIds[ci];
+          const carryInputIdx = numBodyConsts + 1 + ci;
+          const snapName = `_rt_carry_snap_${ci}`;
+
+          if (fl.privateShmemIds.has(bodyOutId)) {
+            // Private carry: full array snapshot into registers
+            emit(`let ${snapName} = rt_carry_${ci};`);
+            if (carryInputIdx < fl.bodyInputIds.length) {
+              privateVarNames.set(fl.bodyInputIds[carryInputIdx], snapName);
+            }
+          } else {
+            // Non-private (shmem) carry: scalar snapshot.
+            // Currently unreachable — all carries are seeded into privateShmemIds
+            // when threadTile is set. Kept as a defensive path in case the
+            // privatization seeding logic changes.
+            const parentOutId = fs.outputs[ci];
+            const dtype = shmemMap.get(parentOutId)?.dtype ?? DType.Float32;
+            const ty = dtypeToWgsl(dtype);
+            const shmemName = idToReadName.get(parentOutId)!;
+            emit(`let ${snapName}: ${ty} = ${shmemName}[tidx];`);
+            if (carryInputIdx < bodyInputInfo.length) {
+              bodyInputInfo[carryInputIdx] = {
+                ...bodyInputInfo[carryInputIdx],
+                name: snapName,
+                isScalar: true,
+              };
+            }
+          }
+        }
+
         // Body kernel steps
         for (let bsi = 0; bsi < fl.bodyKernels.length; bsi++) {
           if (fl.bodyBarriers.has(bsi)) {
@@ -3278,11 +3316,46 @@ export function blockMapFusedShaderSource(
         }
         emit("workgroupBarrier();");
 
+        // Carry snapshot: carry inputs and carry outputs alias the same
+        // shmem array. Within one iteration, a body kernel that writes
+        // carry output X overwrites shmem before a later kernel reads
+        // carry input X (expecting the OLD value). Snapshot each carry
+        // into a `let` binding at the start of each iteration so all
+        // body kernel reads see pre-iteration values.
+        const carrySnapNames: string[] = [];
+        const carrySnapDtypes: string[] = [];
+        for (let ci = 0; ci < numCarries; ci++) {
+          const parentOutId = fs.outputs[ci];
+          const dtype = shmemMap.get(parentOutId)?.dtype ?? DType.Float32;
+          const ty = dtypeToWgsl(dtype);
+          const snapName = `_fl${entry.flIdx}_snap${ci}`;
+          carrySnapNames.push(snapName);
+          carrySnapDtypes.push(ty);
+          // Remap bodyInputInfo so body kernels read from snapshots
+          const biIdx = numBodyConsts + 1 + ci;
+          if (biIdx < bodyInputInfo.length) {
+            bodyInputInfo[biIdx] = {
+              ...bodyInputInfo[biIdx],
+              name: snapName,
+              isScalar: true,
+            };
+          }
+        }
+
         // Emit WGSL for loop
         emit(
           `for (var ${fl.loopVar}: i32 = ${foriLower}; ${fl.loopVar} < ${foriUpper}; ${fl.loopVar}++) {`,
           pushIndent,
         );
+
+        // Emit carry snapshots at the start of each iteration
+        for (let ci = 0; ci < numCarries; ci++) {
+          const parentOutId = fs.outputs[ci];
+          const shmemName = idToReadName.get(parentOutId)!;
+          emit(
+            `let ${carrySnapNames[ci]}: ${carrySnapDtypes[ci]} = ${shmemName}[tidx];`,
+          );
+        }
 
         // Generate body kernel steps
         for (let bsi = 0; bsi < fl.bodyKernels.length; bsi++) {
