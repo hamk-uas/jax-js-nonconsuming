@@ -1,11 +1,13 @@
 import { DType } from "./alu";
 import {
+  calibrateGpu,
   defaultDevice,
   Device,
   devices,
   getBackend,
   getWebGPUDevice,
   init,
+  _setCalibrationState,
   setCodeCapture,
 } from "./backend";
 import type {
@@ -13,6 +15,7 @@ import type {
   CodeCaptureEntry,
   GpuTimingResult,
 } from "./backend";
+import type { PerformanceBeliefState } from "./microbench";
 import { type Dim, hasSymbolicDims, isSymbolicDim, SymDim } from "./dim";
 import { Array, ArrayLike } from "./frontend/array";
 import { aotLinearize } from "./frontend/artifacts";
@@ -75,7 +78,9 @@ export {
   type AotLinearizeResult,
   type BackendCapabilities,
   type CacheSizes,
+  calibrateGpu,
   type CodeCaptureEntry,
+  _setCalibrationState,
   type ConvClass,
   type Dim,
   type GpuTimingResult,
@@ -110,6 +115,7 @@ export {
   numpy,
   type OwnedFunction,
   type PrimalArtifact,
+  type PerformanceBeliefState,
   type PullbackArtifact,
   getWebGPUDevice,
   random,

@@ -9,8 +9,9 @@ import {
   Kernel,
   Reduction,
 } from "../alu";
-import { Backend, Slot } from "../backend";
-import { aluCompare, PendingExecute } from "./array";
+import { Backend, BackendCapabilities, Slot, staticCapabilityFingerprint } from "../backend";
+import { evaluateTotalCost, type CostFeatures } from "../tuner";
+import { aluCompare, IPendingExecute } from "./array";
 import { executeBlockMap } from "./block-map-executor";
 import {
   _registerCacheSizeGetter,
@@ -452,6 +453,11 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
   let changed = false;
   const newEqns: JaxprEqn[] = [];
 
+  if (DEBUG >= 1) {
+    const foriCount = jaxpr.eqns.filter(e => e.primitive === Primitive.ForiLoop).length;
+    console.info(`rewriteForiLoopToBlockMap: ${jaxpr.eqns.length} eqns, ${foriCount} ForiLoop`);
+  }
+
   for (const eqn of jaxpr.eqns) {
     if (eqn.primitive !== Primitive.ForiLoop) {
       newEqns.push(eqn);
@@ -463,12 +469,14 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
 
     // Guard: concrete bounds
     if (typeof lower !== "number" || typeof upper !== "number") {
+      if (DEBUG >= 1) console.info(`  fori rewrite SKIP: non-concrete bounds`);
       newEqns.push(eqn);
       continue;
     }
 
     // Guard: at least 2 iterations (overhead of block_map setup)
     if (upper - lower < 2) {
+      if (DEBUG >= 1) console.info(`  fori rewrite SKIP: <2 iterations`);
       newEqns.push(eqn);
       continue;
     }
@@ -476,11 +484,13 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
     // Guard: all carries must have same concrete shape, rank >= 1
     const carries = eqn.inputs.slice(numConsts); // init carries
     if (carries.length === 0) {
+      if (DEBUG >= 1) console.info(`  fori rewrite SKIP: no carries`);
       newEqns.push(eqn);
       continue;
     }
     const carryShape = carries[0].aval.shape;
     if (hasSymbolicDims(carryShape) || carryShape.length === 0) {
+      if (DEBUG >= 1) console.info(`  fori rewrite SKIP: symbolic/scalar carry`);
       newEqns.push(eqn);
       continue;
     }
@@ -498,6 +508,21 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
     // Guard: body must be retilable (all outputs carry-shaped or scalar,
     // no structural ops or routines)
     if (!isForiBodyRetilable(bodyJaxpr, cShape)) {
+      if (DEBUG >= 1) {
+        for (const e of bodyJaxpr.eqns) {
+          if (!pointwisePrimitives.has(e.primitive)) {
+            console.info(`  fori rewrite SKIP: non-pointwise primitive #${e.primitive}`);
+            break;
+          }
+          for (const ob of e.outBinders) {
+            const s = ob.aval.shape;
+            if (s.length > 0 && !(s.length === cShape.length && s.every((d, i) => d === cShape[i]))) {
+              console.info(`  fori rewrite SKIP: shape mismatch [${s}] vs carry [${cShape}]`);
+              break;
+            }
+          }
+        }
+      }
       newEqns.push(eqn);
       continue;
     }
@@ -520,6 +545,7 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
       break;
     }
     if (!constGuardOk) {
+      if (DEBUG >= 1) console.info(`  fori rewrite SKIP: const shape mismatch`);
       newEqns.push(eqn);
       continue;
     }
@@ -530,22 +556,69 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
       continue;
     }
 
-    // Choose blockShape: tile all carry dimensions.
-    // Constraint: product(blockShape) ≤ 256 (maxComputeWorkgroupSizeX).
+    // Choose blockShape: tile all carry dimensions using CostEquation.
     const rank = cShape.length;
     let blockShape: number[];
+    const maxWg = backend.capabilities.maxComputeWorkgroupSizeX ?? 256;
+    
     if (rank === 1) {
-      blockShape = [Math.min(256, cShape[0])];
+      let bestCost = Infinity;
+      let bestB = 64;
+      for (const b of [256, 128, 64, 32]) {
+        if (b > maxWg) continue;
+        const features: CostFeatures = {
+          nDispatch: 1,
+          nBuffers: 2,
+          countAlu: b * 4,
+          countMem: b * 8, // read + write
+          depthPriv: 4, // pointwise body: add/mul/sub/clip — minimal registers
+          sizeShmem: b * 4, // 1 array
+          sizeWgsl: 4096,
+          parallelism: b,
+          produceCount: b,
+        };
+        const cost = evaluateTotalCost(features, backend.capabilities);
+        if (cost < bestCost) {
+          bestCost = cost;
+          bestB = b;
+        }
+      }
+      blockShape = [Math.min(bestB, cShape[0])];
+      if (DEBUG >= 4) console.info(`rewriteForiLoopToBlockMap: 1D blockShape=[${blockShape}]`);
     } else if (rank === 2) {
-      // For 2D, pick from candidates where b0*b1 ≤ 256
+      // For 2D, pick from candidates via cost equation
       const candidates = [
+        [32, 32],
         [16, 16],
         [16, 8],
         [8, 8],
       ];
-      blockShape = candidates.find(
-        (c) => c[0] <= cShape[0] && c[1] <= cShape[1] && c[0] * c[1] <= 256,
-      ) ?? [8, 8];
+      let bestCost = Infinity;
+      let bestC = [8, 8];
+      for (const c of candidates) {
+        if (c[0] * c[1] > maxWg) continue;
+        if (c[0] > cShape[0] || c[1] > cShape[1]) continue;
+        
+        const bSize = c[0] * c[1];
+        const features: CostFeatures = {
+          nDispatch: 1,
+          nBuffers: 2,
+          countAlu: bSize * 4,
+          countMem: bSize * 8,
+          depthPriv: 4, // pointwise body: add/mul/sub/clip — minimal registers
+          sizeShmem: bSize * 4 * 2, // 2D buffers
+          sizeWgsl: 4096,
+          parallelism: bSize,
+          produceCount: bSize,
+        };
+        const cost = evaluateTotalCost(features, backend.capabilities);
+        if (cost < bestCost) {
+          bestCost = cost;
+          bestC = c;
+        }
+      }
+      blockShape = bestC;
+      if (DEBUG >= 4) console.info(`rewriteForiLoopToBlockMap: 2D blockShape=[${blockShape}]`);
     } else {
       // rank ≥ 3: tile first 2 dims only, rest handled per element
       // Punt for now — complex to get right. Fall through.
@@ -581,6 +654,7 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
     const maxShmem =
       backend.capabilities.maxComputeWorkgroupStorageSize ?? 16384;
     if (shmemBytes > maxShmem) {
+      if (DEBUG >= 1) console.info(`  fori rewrite SKIP: shmem ${shmemBytes} > ${maxShmem}`);
       newEqns.push(eqn);
       continue;
     }
@@ -1188,7 +1262,7 @@ export class JitProgram {
   execute(
     inputs: Slot[],
     dimBindings?: ReadonlyMap<string, number>,
-  ): { outputs: Slot[]; pending: PendingExecute[] } {
+  ): { outputs: Slot[]; pending: IPendingExecute[] } {
     // Tell the backend which buffer sizes we'll need and our peak memory,
     // so it can evict stale pool entries and cap retained bytes.
     this.backend.configurePool?.(this.poolHints);
@@ -1261,11 +1335,7 @@ export class JitProgram {
           : null;
       }
       if (this._commandTape) {
-        const outputSlots = (this.backend as WebGPUBackend).executeCommandTape(
-          this._commandTape,
-          inputs,
-        );
-        return { outputs: outputSlots, pending: [] };
+        return (this.backend as WebGPUBackend).executeCommandTape(this._commandTape, inputs);
       }
     }
 
@@ -1280,7 +1350,7 @@ export class JitProgram {
     }
 
     // Batch direct dispatch: collect execute steps and flush as a single
-    // beginBatch/endBatch block.  Avoids PendingExecute object allocation
+    // beginBatch/endBatch block.  Avoids IPendingExecute object allocation
     // and Map overhead while preserving ref-count safety.
     type BatchEntry = {
       source: Kernel | Routine;
@@ -1310,7 +1380,7 @@ export class JitProgram {
       batch.length = 0;
     };
 
-    const flushSubPending = (sub: PendingExecute[]) => {
+    const flushSubPending = (sub: IPendingExecute[]) => {
       if (sub.length === 0) return;
       flushPendingBatched(sub, this.backend);
     };
@@ -1819,14 +1889,14 @@ export class JitProgram {
     }
     return {
       outputs: outputSlots,
-      pending: [] as PendingExecute[],
+      pending: [] as IPendingExecute[],
     };
   }
 }
 
 /** Flush pending ops with batched dispatch when the backend supports it. */
 function flushPendingBatched(
-  pending: PendingExecute[],
+  pending: IPendingExecute[],
   backend: Backend,
 ): void {
   if (pending.length === 0) return;
@@ -2169,7 +2239,20 @@ export function jitCompile(
   jaxpr: Jaxpr,
   dimBindings?: ReadonlyMap<string, number>,
 ): JitProgram {
-  const cacheKey = backend.type + "," + FpHash.hash(jaxpr);
+  // Cache key includes static device fingerprint + calibrated performance
+  // parameters so that tile/block config selections change when the hardware
+  // profile is updated by microbenchmark calibration (P10).
+  const caps = backend.capabilities;
+  let capsKey = "";
+  if (caps.calibrated) {
+    const r = (v: number | undefined) => v != null ? Number(v.toPrecision(3)) : 0;
+    capsKey = "," + staticCapabilityFingerprint(caps)
+      + ",d" + r(caps.dispatchOverheadUs)
+      + "b" + r(caps.bandwidthGBs)
+      + "t" + r(caps.tflops)
+      + "r" + (caps.rOptWords ?? 0);
+  }
+  const cacheKey = backend.type + "," + FpHash.hash(jaxpr) + capsKey;
 
   const cached = jitCompileCache.get(cacheKey);
   if (cached) return cached;

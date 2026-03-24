@@ -1,0 +1,151 @@
+
+> @hamk-uas/jax-js-nonconsuming@0.9.3 test /home/olli/jax-js-nonconsuming
+> vitest
+
+
+[1m[46m RUN [49m[22m [36mv4.0.9 [39m[90m/home/olli/jax-js-nonconsuming[39m
+
+[90mstdout[2m | test/block-map.test.ts[2m > [22m[2mlax.blockMap — halo[2m > [22m[2mT8.5: jit(blockMap) with halo [1,1]
+[22m[39msplitGraphDataflow: 1 black / 1 eqns (reductions=0 cascade=0 diamonds=0 cheapDiamonds=0 cleanShape=0 heterogeneous=0 routines=0 special=1 p2=0)
+[90mstdout[2m | test/block-map.test.ts[2m > [22m[2mlax.blockMap — halo[2m > [22m[2mT8.5: jit(blockMap) with halo [1,1]
+[22m[39msplitGraphDataflow: 1 black / 1 eqns (reductions=0 cascade=1 diamonds=0 cheapDiamonds=0 cleanShape=0 heterogeneous=0 routines=0 special=0 p2=0)
+[90mstdout[2m | test/block-map.test.ts[2m > [22m[2mlax.blockMap — halo[2m > [22m[2mT8.7: jit(blockMap) with asymmetric halo [0, 2]
+[22m[39msplitGraphDataflow: 1 black / 1 eqns (reductions=0 cascade=0 diamonds=0 cheapDiamonds=0 cleanShape=0 heterogeneous=0 routines=0 special=1 p2=0)
+[90mstdout[2m | test/block-map.test.ts[2m > [22m[2mlax.blockMap — halo[2m > [22m[2mT8.7: jit(blockMap) with asymmetric halo [0, 2]
+[22m[39msplitGraphDataflow: 1 black / 1 eqns (reductions=0 cascade=1 diamonds=0 cheapDiamonds=0 cleanShape=0 heterogeneous=0 routines=0 special=0 p2=0)
+ [32m✓[39m [30m[43m chromium [49m[39m test/lax-scan.test.ts [2m([22m[2m207 tests[22m[2m | [22m[33m91 skipped[39m[2m)[22m[33m 428[2mms[22m[39m
+[90mstdout[2m | test/block-map.test.ts[2m > [22m[2mlax.blockMap — halo[2m > [22m[2mT8.15: gather path selection for linear stencil
+[22m[39m=========== JIT Compile ===========
+{ lambda a:float32[8], b:float32[8] .
+  let c:float32[8]{Alloc} = broadcast [ shape=8
+                                        axis=0 ] 1 {in[Borrow] out[Alloc]}
+      d:float32[8]{Alloc} = block_map [ jaxpr={ lambda a:float32[6] .
+                                          let b:float32[4]{Alloc} = shrink [ slice=2,6 ] a {in[Borrow] out[Alloc]}
+                                              c:float32[4]{Alloc} = shrink [ slice=1,5 ] a {in[Borrow] out[Alloc]}
+                                              d:float32[4]{Alloc} = add b c {in[Borrow,Borrow] out[Alloc]}
+                                          in ( d ) }
+                                        blockShape=4
+                                        inAxes=0
+                                        outAxes=0
+                                        numConsts=0
+                                        numInputs=1
+                                        halo=1,1 ] c {in[Borrow] out[Alloc]}
+  in ( d ) }
+[90mstdout[2m | test/block-map.test.ts[2m > [22m[2mlax.blockMap — halo[2m > [22m[2mT8.15: gather path selection for linear stencil
+[22m[39m=========== JIT Compile ===========
+{ lambda a:float32[6] .
+  let b:float32[4]{Alloc} = shrink [ slice=2,6 ] a {in[Borrow] out[Alloc]}
+      c:float32[4]{Alloc} = shrink [ slice=1,5 ] a {in[Borrow] out[Alloc]}
+      d:float32[4]{Alloc} = add b c {in[Borrow,Borrow] out[Alloc]}
+  in ( d ) }
+[90mstdout[2m | test/block-map.test.ts[2m > [22m[2mlax.blockMap — halo[2m > [22m[2mT8.15: gather path selection for linear stencil
+[22m[39m[jitCompile] 1.6ms, 2 steps, 3 eqns
+[90mstdout[2m | test/block-map.test.ts[2m > [22m[2mlax.blockMap — halo[2m > [22m[2mT8.15: gather path selection for linear stencil
+[22m[39m[jitCompile] 3.2ms, 5 steps, 2 eqns
+[90mstdout[2m | test/block-map.test.ts[2m > [22m[2mlax.blockMap — halo[2m > [22m[2mT8.15: gather path selection for linear stencil
+[22m[39mblock_map: using compiled WASM loop path
+ [32m✓[39m [30m[43m chromium [49m[39m test/block-map.test.ts [2m([22m[2m52 tests[22m[2m)[22m[33m 480[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/dtype-f64.test.ts [2m([22m[2m22 tests[22m[2m)[22m[33m 555[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/lax-associative-scan.test.ts [2m([22m[2m61 tests[22m[2m | [22m[33m20 skipped[39m[2m)[22m[33m 601[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/transform-compositions.test.ts [2m([22m[2m96 tests[22m[2m)[22m[33m 643[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/block-map-jit.test.ts [2m([22m[2m101 tests[22m[2m)[22m[33m 959[2mms[22m[39m
+     [33m[2m✓[22m[39m grad(tiledMatmul) matches grad(np.matmul) [33m 347[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/numpy-linalg.test.ts [2m([22m[2m78 tests[22m[2m | [22m[33m27 skipped[39m[2m)[22m[33m 1158[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/tracing.test.ts [2m([22m[2m41 tests[22m[2m)[22m[32m 150[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m src/backend/backend.test.ts [2m([22m[2m28 tests[22m[2m | [22m[33m14 skipped[39m[2m)[22m[32m 203[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/nn.test.ts [2m([22m[2m136 tests[22m[2m | [22m[33m68 skipped[39m[2m)[22m[33m 306[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m src/frontend/array.test.ts [2m([22m[2m98 tests[22m[2m | [22m[33m49 skipped[39m[2m)[22m[33m 315[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m packages/loaders/src/tokenizers.test.ts [2m([22m[2m22 tests[22m[2m)[22m[33m 621[2mms[22m[39m
+     [33m[2m✓[22m[39m r50k_base [33m 342[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/mandelbrot-demo.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 244[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/random.test.ts [2m([22m[2m95 tests[22m[2m | [22m[33m45 skipped[39m[2m)[22m[33m 1465[2mms[22m[39m
+         [33m[2m✓[22m[39m samples match expected probabilities [33m 326[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/block-map-phase2.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 65[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/numpy.test.ts [2m([22m[2m1001 tests[22m[2m | [22m[33m494 skipped[39m[2m)[22m[33m 1430[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/conv.test.ts [2m([22m[2m124 tests[22m[2m | [22m[33m62 skipped[39m[2m)[22m[33m 1742[2mms[22m[39m
+     [33m[2m✓[22m[39m C.3: 3x3 SAME conv block_map path with larger spatial (32x32) [33m 981[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/mega-module.test.ts [2m([22m[2m40 tests[22m[2m | [22m[33m8 skipped[39m[2m)[22m[32m 57[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/basic.test.ts [2m([22m[2m25 tests[22m[2m)[22m[32m 58[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/polymorphic-shapes.test.ts [2m([22m[2m23 tests[22m[2m)[22m[32m 83[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/lax.test.ts [2m([22m[2m69 tests[22m[2m | [22m[33m31 skipped[39m[2m)[22m[32m 87[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/numpy-fft.test.ts [2m([22m[2m12 tests[22m[2m | [22m[33m6 skipped[39m[2m)[22m[32m 104[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m packages/optax/test/adamw.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 48[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/argreduce.test.ts [2m([22m[2m28 tests[22m[2m | [22m[33m14 skipped[39m[2m)[22m[32m 85[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/lax-linalg.test.ts [2m([22m[2m108 tests[22m[2m | [22m[33m43 skipped[39m[2m)[22m[33m 2215[2mms[22m[39m
+       [33m[2m✓[22m[39m grad through QR is consistent across batch elements [33m 370[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/autoref.test.ts [2m([22m[2m18 tests[22m[2m)[22m[32m 61[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/wasm-parallel.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 98[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/where-branching.test.ts [2m([22m[2m52 tests[22m[2m | [22m[33m26 skipped[39m[2m)[22m[32m 131[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/cache-sizes.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 26[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/wasm-allocator.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 37[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/scipy-special.test.ts [2m([22m[2m20 tests[22m[2m | [22m[33m10 skipped[39m[2m)[22m[32m 31[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/ad-gaps.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 22[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/multi-kernel.test.ts [2m([22m[2m23 tests[22m[2m | [22m[33m3 skipped[39m[2m)[22m[32m 34[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/code-capture.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 31[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m src/frontend/convolution.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 36[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/platform-test/deno.test.ts [2m([22m[2m9 tests[22m[2m | [22m[33m3 skipped[39m[2m)[22m[32m 19[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m packages/optax/test/sgd.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 19[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/effect-checker.test.ts [2m([22m[2m23 tests[22m[2m)[22m[32m 28[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/dtype-f16.test.ts [2m([22m[2m22 tests[22m[2m | [22m[33m11 skipped[39m[2m)[22m[32m 31[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/leak-diagnostic.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 26[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/scipy-linalg.test.ts [2m([22m[2m24 tests[22m[2m | [22m[33m8 skipped[39m[2m)[22m[32m 68[2mms[22m[39m
+[90mstdout[2m | test/scan-backends.test.ts[2m > [22m[2mlax.scan backend coverage
+[22m[39mAvailable devices: [
+  "cpu",
+  "wasm",
+]
+ [32m✓[39m [30m[43m chromium [49m[39m test/scan-backends.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 25[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m packages/onnx/src/model.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 28[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m packages/optax/test/transform.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 22[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m packages/optax/test/treeUtils.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 21[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/scatter-add.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 23[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/command-tape-arena.test.ts [2m([22m[2m17 tests[22m[2m)[22m[32m 26[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/reverse.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 13[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/artifacts.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 17[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/recycle.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 18[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m packages/optax/test/clipByGlobalNorm.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 17[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/platform-test/node.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 18[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m src/backend/wasm/builtins.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 9[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/tree-utils.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 18[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/jit-dedup.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 16[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m src/alu.test.ts [2m([22m[2m19 tests[22m[2m)[22m[32m 9[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/check-leaks.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/block-map-prototype.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/dtype.test.ts [2m([22m[2m20 tests[22m[2m)[22m[32m 21[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m src/tree.test.ts [2m([22m[2m16 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/devices.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m src/shape.test.ts [2m([22m[2m38 tests[22m[2m)[22m[32m 20[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/refcount.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 13[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m src/library/numpy/einsum.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m packages/optax/test/combine.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m packages/loaders/src/safetensors.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 1[2mms[22m[39m
+[90mstdout[2m | test/timing-tiled-matmul.test.ts[2m > [22m[2mPhase 3 tiledMatmul benchmark
+[22m[39mWebGPU not available
+ [32m✓[39m [30m[43m chromium [49m[39m test/timing-tiled-matmul.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m src/backend/wasm/wasmblr.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m src/pprint.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+[90mstdout[2m | unknown test
+[22m[39m
+Evaluating for intel (0.4 TFLOPS) [arch: gen_12lp]
+[90mstdout[2m | unknown test
+[22m[39mBr=64 Bc=64 tt=8,8 -> cost=8.0719e-6, threads=64, dp=106, totR=6784
+[90mstdout[2m | unknown test
+[22m[39mBr=64 Bc=64 tt=4,4 -> cost=7.4269e-6, threads=256, dp=58, totR=14848
+[90mstdout[2m | unknown test
+[22m[39mBr=32 Bc=32 tt=4,4 -> cost=2.8866e-5, threads=64, dp=58, totR=3712
+[90mstdout[2m | unknown test
+[22m[39mBr=32 Bc=32 tt=2,2 -> cost=2.8441e-5, threads=256, dp=46, totR=11776
+[90mstdout[2m | unknown test
+[22m[39mBr=16 Bc=16 tt=1,1 -> cost=1.1236e-4, threads=256, dp=43, totR=11008
+ [32m✓[39m [30m[43m chromium [49m[39m test/test_cost.test.ts [2m([22m[2m0 test[22m[2m)[22m[32m 0[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/profile-gpu.test.ts [2m([22m[2m4 tests[22m[2m | [22m[33m3 skipped[39m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/repl-sourcemap.test.ts [2m([22m[2m24 tests[22m[2m)[22m[32m 12[2mms[22m[39m
+ [32m✓[39m [30m[43m chromium [49m[39m test/refit-model.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 12[2mms[22m[39m
+ [2m[90m↓[39m[22m [30m[43m chromium [49m[39m test/with-batch-command-tape-gpu.test.ts [2m([22m[2m1 test[22m[2m | [22m[33m1 skipped[39m[2m)[22m
+ [2m[90m↓[39m[22m [30m[43m chromium [49m[39m test/microbench.test.ts [2m([22m[2m6 tests[22m[2m | [22m[33m6 skipped[39m[2m)[22m
+
+[2m Test Files [22m [1m[32m73 passed[39m[22m[2m | [22m[33m2 skipped[39m[90m (75)[39m
+[2m      Tests [22m [1m[32m2023 passed[39m[22m[2m | [22m[33m1043 skipped[39m[90m (3066)[39m
+[2m   Start at [22m 10:04:34
+[2m   Duration [22m 6.35s[2m (transform 0ms, setup 22.21s, collect 3.99s, tests 15.21s, environment 0ms, prepare 258.52s)[22m
+

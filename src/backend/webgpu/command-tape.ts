@@ -22,6 +22,8 @@ import { isSymbolicSize } from "../../shape";
 export interface TapeDispatch {
   /** Pre-compiled GPU pipeline. */
   pipeline: GPUComputePipeline;
+  /** Un-compiled raw shader struct (kept for PendingCommandTape.prepare). */
+  shader: import("./codegen.js").ShaderInfo;
   /** Bind group layout for storage bindings (@group(0)). */
   bindGroupLayout: GPUBindGroupLayout;
   /** Indices into the flat buffer table for inputs. */
@@ -172,6 +174,8 @@ export interface WebGPUCommandTape {
   inputTableIdxs: number[];
   /** Mapping: external output position → table index. */
   outputTableIdxs: number[];
+  /** Sizes of the outputs */
+  outputSizes: number[];
   /** Table indices that own allocated buffers (for cleanup on error). */
   allocatedIdxs: number[];
   /** Uniform buffers owned by this tape (kept alive for bind group references). */

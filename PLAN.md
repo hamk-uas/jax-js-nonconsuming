@@ -13,6 +13,8 @@ into `.github/copilot-instructions.md`.
 | P6  | Benchmark validation       | Medium          | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions              |
 | P7  | Cooperative matrix (WMMA)  | Blocked (~2026) | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable               |
 | P8  | Command tape block_map     | Low             | Add `block_map` to WebGPU command tape to unlock `foriLoop→blockMap` in `Scan`      |
+| P9  | Continuous Cost Modeling   | High            | Migrate heuristic logic in `lax.ts`, `tuner.ts`, and `scan-plan.ts` (Phase 2 & 3)   |
+| P10 | Microbenchmark Auto-Tuning | High            | Replace static profiles with Bayesian updates of hardware characteristics via microbench |
 
 ## P4: Conv2d WebGPU Fused Shader
 
@@ -51,6 +53,42 @@ overhead to show speedup.
 | 3×3 4ch 16×16 | 162 µs    | 166 µs      | 1.02×     |
 | 3×3 4ch 32×32 | 500 µs    | 643 µs      | **1.29×** |
 | 3×3 8ch 64×64 | 7,504 µs  | 10,192 µs   | **1.36×** |
+
+## P9: Continuous Cost Modeling
+
+**Status:** Phase 2 complete. Phase 2b (aggregate register pressure model) addresses gen-9 igp regression. The runtime model drives JIT path selection natively.
+
+**Objective:** Replaced ad-hoc heuristic thresholds with continuous execution cost penalties using the `evaluateTotalCost` logic. Legacy string heuristics across the JIT orchestrator have been retired:
+- **`lax.ts` (`chooseTileConfig`)**: Uses evaluated cost parameters with per-vendor `rOptWords` and aggregate workgroup register pressure to prevent catastrophic register spills on small-GRF GPUs (gen-9, mobile).
+- **`jit.ts` (`foriLoopToBlockMap`)**: Selects `blockShape` bounds across search space by simulating dispatch constraints. 
+- **`tuner.ts`**: Cooperative group sizes and local tiles execute total cost calculations. `dangerAggregate` penalty models `threads × depthPriv / aggregateBudget` cliff.
+- **`scan-plan.ts`**: Candidates dynamically scaled via associative cost array prior to probing runtime compilation.
+- **`backend.ts` / `webgpu.ts`**: `rOptWords` plumbed from runtime model `R_opt_words` through `BackendCapabilities`.
+
+## P10: Microbenchmark-Driven Auto-Tuning
+
+**Status:** Phase 1 complete — core infrastructure implemented. Phase 2 (Async JIT & Tuning Migration) in planning.
+
+### Architectural Flaws to Address (Phase 2):
+
+1. **Microbenchmark Scale**: Workloads are currently too small (e.g., ~32MB payload). Overhead from `queue.submit` dominates the timing, skewing the metrics (`BW_global`, `TFLOPS`) to a fraction of their correct values.
+2. **Eager Initialization**: Calibration synchronously blocks the `init("webgpu")` pipeline (taking 160-400ms), violating the intended lazy-trigger design.
+3. **Ghost Metric - `barrierCostFactor`**: Implemented during benchmarking but silently ignored by the `evaluateTotalCost` JIT cost model.
+4. **State Leakage in Tests**: `_setCalibrationState("off")` flips a boolean but leaves poisoned metrics in `BackendCapabilities`, breaking isolation for subsequent tests.
+
+### Phase 2: Async JIT and Target Architecture
+
+**Objective:** Stop trusting static, init-time GPU classification heuristics as the absolute truth. Migrate to a three-layer profiling system, driven by an **Async JIT** architecture.
+
+**The Case for Async JIT:**
+Currently, `jit` compiled executions and WebGPU pipeline creations (`device.createComputePipeline`) operate synchronously. This blocks the main thread, causing severe UI jank, and prevents integration of large-scale, asynchronous microbenchmark tuning directly into the JIT lifecycle.
+- **Goal**: Transition from synchronous pipeline compilation to asynchronous (`createComputePipelineAsync`). JIT calls should return immediately by leveraging lazy execution or returning Promise-wrapped execution handles.
+- **Impact**: Calibration can correctly trigger "just-in-time" on the first async JIT pass without bottlenecking startup script execution.
+
+1. **Refactor Workload Methodology**: Increase payload volume for `BW_global` and `Tflops` iteratively until the irreducible `queue.submit` overhead drops below a 5% margin of error, or subtract a baseline linear fit.
+2. **Remove Eager Calibration**: Rip out `calibrateGpu()` from `src/backend.ts` `init()`. Shift its invocation to the new async compilation phase of the JIT cycle (`jitCompileAsync()`).
+3. **Plumb the Ghost Metric**: Wire `barrierCostFactor` actively into `tuner.ts` `evaluateTotalCost` so that `dangerShmem` or shared-memory sync operations accurately model empirical reality.
+4. **Fix Test Isolation**: Ensure `_setCalibrationState()` completely swaps back to the immutable `deriveHardwareProfile` priors, not just the `calibrated: false` boolean.
 
 ## Deferred Items
 

@@ -8,7 +8,7 @@
 
 import { byteWidth } from "../alu";
 import type { Backend, Slot } from "../backend";
-import type { PendingExecute } from "./array";
+import type { PendingExecute, IPendingExecute } from "./array";
 import { Array as JaxArray } from "./array";
 import { _associativeScanCoreImpl, ShapedArray } from "./core";
 import type { Jaxpr } from "./jaxpr";
@@ -60,7 +60,7 @@ export interface ExecuteScanParams {
 
 export interface ExecuteScanResult {
   outputs: Slot[];
-  pending: PendingExecute[];
+  pending: IPendingExecute[];
 }
 
 /**
@@ -139,7 +139,7 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
   const ysOutputSlots = outputSlots.slice(numCarry);
 
   // Track pending operations
-  const pending: PendingExecute[] = [];
+  const pending: IPendingExecute[] = [];
 
   // Sub-batch GPU commands: instead of one queue.submit() per iteration,
   // batch SCAN_BATCH_SIZE iterations into one submit. This reduces O(2N)
@@ -408,7 +408,7 @@ export interface ExecuteAssocScanParams {
 export interface ExecuteAssocScanResult {
   /** Final output slots — same as input for native paths, replaced for fallback. */
   outputs: Slot[];
-  pending: PendingExecute[];
+  pending: IPendingExecute[];
 }
 
 /**
@@ -977,7 +977,7 @@ function transposeAxisFromFront(
 }
 
 /** Flush all pending GPU/WASM operations, batching dispatches when possible. */
-function flushPending(pending: PendingExecute[]): void {
+function flushPending(pending: IPendingExecute[]): void {
   if (pending.length === 0) return;
   const backend = pending[0].backend;
   backend.beginBatch?.();

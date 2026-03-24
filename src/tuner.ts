@@ -236,6 +236,88 @@ class TuneDims {
   }
 }
 
+// ── Continuous Cost Modeling ────────────────────────────────────────────
+
+export interface CostFeatures {
+  nDispatch: number;
+  nBuffers: number;
+  countAlu: number;
+  countMem: number;
+  depthPriv: number; // Max local var depth (estimated words)
+  sizeShmem: number; // bytes
+  sizeWgsl: number;  // bytes approx
+
+  produceCount?: number; // Elements effectively produced by this evaluated block
+  parallelism?: number;  // Effective threads working together
+}
+
+export function evaluateTotalCost(features: CostFeatures, caps: Partial<BackendCapabilities>): number {
+  // 1. Predictors from Capabilities
+  const cDispatch = caps.dispatchOverheadUs ? caps.dispatchOverheadUs / 1000 : 0.025; // ms (default 25us)
+  const bMem = caps.bandwidthGBs ?? 50; // GB/s roughly equals bytes/ns = million bytes/ms
+  const tAlu = caps.tflops ?? 1.5; // TFLOPS
+  
+  // Wavefront/Subgroup alignment
+  const isIntel = caps.adapterVendor?.toLowerCase().includes("intel") || caps.inferredVendorClass === "igp";
+  const fSubgroup = isIntel ? 16 : 32;
+
+  // Per-thread register budget from hardware profile (R_opt_words).
+  // Critical: igp=48, mobile=64, discrete-legacy=96, discrete-modern/apple=128.
+  const rOpt = caps.rOptWords ?? 128;
+  const sOpt = 16384; // 16KB optimal occupancy
+  // We heavily discount cCompile in runtime configuration comparisons to prevent it from squashing throughput traits.
+  const cCompile = (8 + (features.sizeWgsl / 1024) * 3) * 0.0001; 
+
+  // 2. Base Execution Model
+  // countMem bytes / (bMem GB/s) -> ms
+  const memCost = features.countMem / (bMem * 1e6); 
+  
+  // countAlu / (tAlu * 1e9 * fSubgroup) -> ms
+  const aluCost = features.countAlu / (tAlu * 1e9 * fSubgroup);
+
+  // If parallelism is tracked, compute algorithmic latency bounds
+  // (e.g. latency bound of reduction vs throughput bound of standard elementwise)
+  const latencyCost = features.parallelism ? (features.countAlu / features.parallelism) * 1e-6 : 0;
+  // If cooperative groups imply barriers, add the cost of synchronizing threads.
+  // Hardware barriers are O(1) events (all threads in a workgroup sync
+  // simultaneously), not O(n). Use constant cost per barrier — scaling
+  // linearly with thread count incorrectly penalizes large cooperative groups
+  // that actually improve reduction throughput.
+  const bFactor = caps.barrierCostFactor ?? 1.0;
+  const barrierLatency = features.parallelism && features.parallelism > 1 ? bFactor * 0.0001 : 0;
+
+  const costExecution = (features.nDispatch * cDispatch) + memCost + aluCost + latencyCost + barrierLatency;
+
+  // 3. Danger Multipliers (Exponential Cliffs)
+  // Penalty(x) = exp(max(0, x - 1) * steepness)
+  const penalty = (ratio: number, steepness = 4) => Math.exp(Math.max(0, ratio - 1) * steepness);
+
+  const dangerPriv = penalty(features.depthPriv / rOpt, 5); // per-thread register spilling
+  const dangerShmem = penalty(features.sizeShmem / sOpt, 2); // gradual occupancy drop
+  const dangerBind = penalty(features.nBuffers / 8, 3); // Binding pressure
+
+  // Aggregate workgroup register pressure: total registers across all threads
+  // must fit in the hardware GRF. On gen-9 igps (rOpt=48), 256 threads × 58
+  // regs = 14,848 words massively overflows the register file → TDR.
+  // Budget = rOpt × maxConcurrentThreads. Small-GRF GPUs (igp/mobile) can
+  // sustain fewer concurrent threads before spilling catastrophically.
+  const threads = features.parallelism ?? 1;
+  const aggregateRegs = threads * features.depthPriv;
+  const maxConcurrentThreads = rOpt <= 48 ? 64 : rOpt <= 64 ? 128 : 256;
+  const aggregateBudget = rOpt * maxConcurrentThreads;
+  const dangerAggregate = penalty(aggregateRegs / aggregateBudget, 3);
+
+  const dangerMultiplier = dangerPriv * dangerShmem * dangerBind * dangerAggregate;
+
+  let totalCost = (costExecution + cCompile) * dangerMultiplier;
+  
+  // Normalization scaling (Reward larger structural spans)
+  if (features.produceCount) {
+    totalCost /= features.produceCount;
+  }
+  return totalCost;
+}
+
 /** Tuning step that does not apply any optimization. */
 export function tuneNullopt(kernel: Kernel): TuneResult {
   const o = kernel.outputs[0];
@@ -390,37 +472,50 @@ export function tuneWebgpu(
   }
 
   // Apply cooperative groups for large parallel reductions.
-  // When the sequential reduction is large enough, split it into
-  // groupSize parallel threads that combine via shared memory.
-  // Threshold must be high: cooperative groups trade throughput for latency
-  // by multiplying thread count by groupSize. For matmul-like kernels with
-  // many output elements, each thread is better off doing its own sequential
-  // reduction in registers than sharing work via expensive barriers+shmem.
-  // Only beneficial for very large single-output reductions (e.g., sum(huge)).
+  // Evaluate the best group size via total cost equation.
   if (dim.reduce < dim.unroll) {
     const seqReduce = prod(dim.st.shape.slice(dim.reduce, dim.unroll));
     if (seqReduce >= 2048) {
-      const maxWg = Math.min(caps?.maxComputeWorkgroupSizeX ?? 256, 256);
-      let groupSize = maxWg;
-      while (
-        groupSize > 1 &&
-        (seqReduce % groupSize !== 0 || seqReduce / groupSize < 2)
-      ) {
-        groupSize >>= 1;
+      const bSize = Math.min(caps?.maxComputeWorkgroupSizeX ?? 256, 256);
+      let bestCost = Infinity;
+      let bestGroup = 1;
+
+      for (let g = bSize; g >= 1; g >>= 1) {
+        if (g > 1 && (seqReduce % g !== 0 || seqReduce / g < 2)) continue;
+
+        // Estimate execution cost
+        const features: CostFeatures = {
+          nDispatch: 1,
+          nBuffers: 2,
+          countAlu: seqReduce,
+          countMem: seqReduce * 4,
+          depthPriv: 8,
+          sizeShmem: g * 4, // shared memory bytes
+          sizeWgsl: 4096,
+          parallelism: g,
+          produceCount: 1,
+        };
+        const cost = evaluateTotalCost(features, caps ?? {});
+
+        if (cost < bestCost) {
+          bestCost = cost;
+          bestGroup = g;
+        }
       }
-      if (groupSize > 1) {
-        dim.applyGroups(groupSize);
+
+      if (bestGroup > 1) {
+        if (DEBUG >= 4) console.info(`tuneWebgpu: cooperative groups seqReduce=${seqReduce} → g=${bestGroup}`);
+        dim.applyGroups(bestGroup);
       }
     }
   }
 
   // Try to do loop unrolling on the reduce axis, with an upcast limit.
-  // Skip doing this on mobile browsers, as it may reduce performance.
+  // Skip doing this on mobile devices, as it may reduce performance.
   // WebGPU returns maxComputeWorkgroupSizeX=256 for many desktops (Intel Gen-9, Apple Silicon)
   // so we should not use > 256 as a strict mobile check.
-  const isMobile =
-    typeof navigator !== "undefined" &&
-    /Mobi|Android/i.test(navigator.userAgent);
+  const isMobile = caps?.inferredVendorClass === "mobile" || 
+    (typeof navigator !== "undefined" && /Mobi|Android/i.test(navigator.userAgent));
   if (
     !isMobile &&
     dim.reduce < dim.unroll &&
@@ -449,19 +544,50 @@ export function tuneWebgpu(
   // Skip local tiling when cooperative groups are active — the workgroup
   // is already dedicated to the shared-memory reduction.
   if (dim.groups === dim.reduce) {
-    const maxWg = caps?.maxComputeWorkgroupSizeX ?? 256;
     for (const ax of sorted(upcastedAxis)) {
       // After applyLocal permutations, upcastedAxis indices may point at
       // axes that are already in the local range. Skip them to avoid
       // decrementing dim.local past global axes into the local range.
       if (ax >= dim.local && ax < dim.groups) continue;
+      
       const s = dim.st.shape[ax];
       const currentLocal = prod(dim.st.shape.slice(dim.local, dim.groups));
-      for (const amount of [8, 4]) {
-        if (s % amount === 0 && currentLocal * amount <= maxWg) {
-          dim.applyLocal(ax, amount);
-          break;
+      
+      let bestCost = Infinity;
+      let bestAmount = 1;
+      
+      // Evaluate amount=8,4,2,1 — pick the cheapest per-element cost.
+      for (const amount of [8, 4, 2, 1]) {
+        if (s % amount !== 0) continue;
+        
+        const localThreads = currentLocal * amount;
+        if (caps && localThreads > (caps.maxComputeWorkgroupSizeX ?? 256)) continue;
+        
+        const features: CostFeatures = {
+          nDispatch: 1,
+          nBuffers: 2,
+          countAlu: localThreads * 2,
+          countMem: localThreads * 8,
+          depthPriv: 10 + amount,
+          sizeShmem: 0,
+          sizeWgsl: 4096 + amount * 32,
+          parallelism: localThreads,
+          produceCount: localThreads,
+        };
+        const cost = evaluateTotalCost(features, caps ?? {});
+        
+        if (cost < bestCost) {
+          bestCost = cost;
+          bestAmount = amount;
         }
+      }
+
+      // Apply to this axis and CONTINUE to the next axis — multi-axis local
+      // tiling is essential for matmul-like kernels where both output
+      // dimensions benefit from workgroup-level parallelism.
+      if (bestAmount > 1) {
+        if (DEBUG >= 4) console.info(`tuneWebgpu: local tiling axis=${ax} → amount=${bestAmount}`);
+        dim.applyLocal(ax, bestAmount);
       }
     }
   }

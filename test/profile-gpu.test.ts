@@ -4,6 +4,7 @@ import {
   jit,
   numpy as np,
   profileGpu,
+  profiler,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, test } from "vitest";
 
@@ -33,9 +34,20 @@ describe("profileGpu", () => {
       expect(timing.totalMs).toBeGreaterThanOrEqual(0);
       expect(typeof timing.truncated).toBe("boolean");
       expect(timing.truncated).toBe(false);
+      expect(timing.passes.some((pass) => pass.grid != null)).toBe(true);
       for (const pass of timing.passes) {
         expect(typeof pass.durationMs).toBe("number");
         expect(pass.durationMs).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    test("throws when tracing is already active", async () => {
+      defaultDevice("webgpu");
+      profiler.startTrace();
+      try {
+        await expect(profileGpu(() => 42)).rejects.toThrow(/stopTrace|tracing/i);
+      } finally {
+        profiler.stopTrace();
       }
     });
 
