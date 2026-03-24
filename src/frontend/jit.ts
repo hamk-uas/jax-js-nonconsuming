@@ -576,32 +576,76 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
       continue;
     }
 
+    const maxWg = backend.capabilities.maxComputeWorkgroupSizeX ?? 256;
+    const maxInvocations =
+      backend.capabilities.maxComputeInvocationsPerWorkgroup ?? maxWg;
+    const maxShmem =
+      backend.capabilities.maxComputeWorkgroupStorageSize ?? 16384;
+
+    const estimateShmemBytes = (shape: number[]): number => {
+      const blockElements = shape.reduce((a, b) => a * b, 1);
+      let shmemBytes = 0;
+
+      for (let ci = 0; ci < numConsts; ci++) {
+        if (constIsTiled[ci]) {
+          shmemBytes += blockElements * byteWidth(consts[ci].aval.dtype);
+        }
+      }
+      for (const c of carries) {
+        shmemBytes += blockElements * byteWidth(c.aval.dtype);
+      }
+      for (const e of bodyJaxpr.eqns) {
+        for (const ob of e.outBinders) {
+          if (ob.aval.shape.length > 0) {
+            shmemBytes += blockElements * byteWidth(ob.aval.dtype);
+          }
+        }
+      }
+
+      return shmemBytes;
+    };
+
+    const isFeasibleBlockShape = (shape: number[]): boolean => {
+      const blockElements = shape.reduce((a, b) => a * b, 1);
+      return (
+        blockElements <= maxWg &&
+        blockElements <= maxInvocations &&
+        estimateShmemBytes(shape) <= maxShmem
+      );
+    };
+
     // Choose blockShape: tile all carry dimensions using CostEquation.
     const rank = cShape.length;
     let blockShape: number[];
-    const maxWg = backend.capabilities.maxComputeWorkgroupSizeX ?? 256;
 
     if (rank === 1) {
       let bestCost = Infinity;
       let bestB = 64;
       for (const b of [256, 128, 64, 32]) {
-        if (b > maxWg) continue;
+        const candidateB = Math.min(b, cShape[0]);
+        if (!isFeasibleBlockShape([candidateB])) continue;
         const features: CostFeatures = {
           nDispatch: 1,
           nBuffers: 2,
-          countAlu: b * 4,
-          countMem: b * 8, // read + write
+          countAlu: candidateB * 4,
+          countMem: candidateB * 8, // read + write
           depthPriv: 4, // pointwise body: add/mul/sub/clip — minimal registers
-          sizeShmem: b * 4, // 1 array
+          sizeShmem: candidateB * 4, // 1 array
           sizeWgsl: 4096,
-          parallelism: b,
-          produceCount: b,
+          parallelism: candidateB,
+          produceCount: candidateB,
         };
         const cost = evaluateTotalCost(features, backend.capabilities);
         if (cost < bestCost) {
           bestCost = cost;
-          bestB = b;
+          bestB = candidateB;
         }
+      }
+      if (bestCost === Infinity) {
+        if (DEBUG >= 1)
+          console.info(`  fori rewrite SKIP: no feasible 1D block shape`);
+        newEqns.push(eqn);
+        continue;
       }
       blockShape = [Math.min(bestB, cShape[0])];
       if (DEBUG >= 4)
@@ -619,8 +663,8 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
       let bestCost = Infinity;
       let bestC = [8, 8];
       for (const c of candidates) {
-        if (c[0] * c[1] > maxWg) continue;
         if (c[0] > cShape[0] || c[1] > cShape[1]) continue;
+        if (!isFeasibleBlockShape(c)) continue;
 
         const bSize = c[0] * c[1];
         const features: CostFeatures = {
@@ -640,6 +684,12 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
           bestC = c;
         }
       }
+      if (bestCost === Infinity) {
+        if (DEBUG >= 1)
+          console.info(`  fori rewrite SKIP: no feasible 2D block shape`);
+        newEqns.push(eqn);
+        continue;
+      }
       blockShape = bestC;
       if (DEBUG >= 4)
         console.info(
@@ -652,33 +702,9 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
       continue;
     }
 
-    // Check shmem budget: (numConsts_tiled + numCarries) * blockElements * 4
-    // plus body intermediates. Conservative: 2× for intermediates.
-    const blockElements = blockShape.reduce((a, b) => a * b, 1);
+    // Safety check: blockShape was filtered for feasibility above.
     const numTiledConsts = constIsTiled.filter(Boolean).length;
-    // Compute shmem budget using exact sums of byte widths.
-    // In the worst case (no register tiling), block_map allocates a shared
-    // memory array for every tiled input, carry, and intermediate trace var.
-    let shmemBytes = 0;
-    // 1. Tiled consts and carry inputs
-    for (let ci = 0; ci < numConsts; ci++) {
-      if (constIsTiled[ci])
-        shmemBytes += blockElements * byteWidth(consts[ci].aval.dtype);
-    }
-    for (const c of carries) {
-      shmemBytes += blockElements * byteWidth(c.aval.dtype);
-    }
-    // 2. Loop body intermediates
-    for (const e of bodyJaxpr.eqns) {
-      for (const ob of e.outBinders) {
-        if (ob.aval.shape.length > 0) {
-          shmemBytes += blockElements * byteWidth(ob.aval.dtype);
-        }
-      }
-    }
-
-    const maxShmem =
-      backend.capabilities.maxComputeWorkgroupStorageSize ?? 16384;
+    const shmemBytes = estimateShmemBytes(blockShape);
     if (shmemBytes > maxShmem) {
       if (DEBUG >= 1)
         console.info(`  fori rewrite SKIP: shmem ${shmemBytes} > ${maxShmem}`);

@@ -8,6 +8,8 @@
 import {
   _fusedCacheCompileCount,
   _lastForiRewritten,
+  _setCalibrationState,
+  clearCaches,
   defaultDevice,
   DType,
   getBackend,
@@ -2592,6 +2594,71 @@ describe("rewriteForiLoopToBlockMap", () => {
     expect(_lastForiRewritten()).toBe(true);
     expect(result_a).toBeAllclose(expected_a);
     expect(result_b).toBeAllclose(expected_b);
+  });
+
+  test("mandelbrot-shaped foriLoop still rewrites on WebGPU", () => {
+    if (!hasWebGPU) return;
+    defaultDevice("webgpu");
+    clearCaches();
+    _setCalibrationState("off");
+
+    try {
+      type Carry = { a: np.Array; b: np.Array; v: np.Array };
+      const f = jit(
+        (
+          a: np.Array,
+          b: np.Array,
+          v: np.Array,
+          x: np.Array,
+          y: np.Array,
+        ): np.Array => {
+          const result = lax.foriLoop(
+            0,
+            100,
+            (_i: np.Array, carry: Carry): Carry => {
+              const { a, b, v } = carry;
+              using asq = a.mul(a);
+              using bsq = b.mul(b);
+              using magSq = asq.add(bsq);
+              using mask = magSq.less(100).astype(np.float32);
+              const nextV = v.add(mask);
+              using diff = asq.sub(bsq);
+              using shiftedA = diff.add(x);
+              const nextA = np.clip(shiftedA, -50, 50);
+              using cross = a.mul(b);
+              using scaledCross = cross.mul(2);
+              using shiftedB = scaledCross.add(y);
+              const nextB = np.clip(shiftedB, -50, 50);
+              return { a: nextA, b: nextB, v: nextV };
+            },
+            { a, b, v },
+          );
+          result.a.dispose();
+          result.b.dispose();
+          x.dispose();
+          y.dispose();
+          return result.v;
+        },
+      );
+
+      using xs = np.linspace(-2, 0.5, 750);
+      using ys = np.linspace(-1, 1, 600);
+      using gridX = np.broadcastTo(xs, [600, 750]);
+      using reshapedYs = ys.reshape([600, 1]);
+      using gridY = np.broadcastTo(reshapedYs, [600, 750]);
+      using a0 = np.zeros(gridX.shape);
+      using b0 = np.zeros(gridY.shape);
+      using v0 = np.zeros(gridX.shape);
+      using result = f(a0, b0, v0, gridX, gridY);
+
+      expect(_lastForiRewritten()).toBe(true);
+      expect(result.shape).toEqual([600, 750]);
+
+      f.dispose();
+    } finally {
+      clearCaches();
+      _setCalibrationState("pending");
+    }
   });
 
   test("foriLoop with non-elementwise body is NOT rewritten", () => {
