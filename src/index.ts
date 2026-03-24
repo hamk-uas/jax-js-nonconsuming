@@ -55,6 +55,15 @@ import {
 import * as jvpModule from "./frontend/jvp";
 import * as linearizeModule from "./frontend/linearize";
 import * as vmapModule from "./frontend/vmap";
+import { captureJitReport, formatJitReport } from "./jit-capture";
+import type {
+  CapturedCode,
+  CapturedKernel,
+  CapturedProgram,
+  CapturedRoutine,
+  CapturedSubProgram,
+  JitReport,
+} from "./jit-capture";
 import * as lax from "./library/lax";
 import * as nn from "./library/nn";
 import * as numpy from "./library/numpy";
@@ -75,6 +84,12 @@ export {
   type AotLinearizeResult,
   type BackendCapabilities,
   type CacheSizes,
+  type CapturedCode,
+  type CapturedKernel,
+  type CapturedProgram,
+  type CapturedRoutine,
+  type CapturedSubProgram,
+  captureJitReport,
   type CodeCaptureEntry,
   type ConvClass,
   type Dim,
@@ -90,6 +105,7 @@ export {
   DType,
   type EffectVerificationResult,
   _fusedCacheCompileCount,
+  formatJitReport,
   getBackend,
   getCacheSizes,
   hasSymbolicDims,
@@ -100,6 +116,7 @@ export {
   type JsTree,
   type JsTreeDef,
   type JitStepCounts,
+  type JitReport,
   _lastConvClass,
   _lastConvRewritten,
   _lastForiRewritten,
