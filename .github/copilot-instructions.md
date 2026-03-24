@@ -447,6 +447,9 @@ runtime i32 param).
   `BatchTracer.ref` must call `this.val.ref`)
 - Sequential `.data()` calls on WebGPU: each `mapAsync` costs ~12ms on eGPU. Use `tree.data()` /
   `tree.consumeData()` / `Promise.all()` to overlap readbacks
+- WebGPU requires a secure context — `navigator.gpu` is `undefined` on `about:blank` in Chromium.
+  Vitest's dev server (localhost) provides this automatically; direct Playwright probes to
+  `about:blank` will falsely report no WebGPU support
 
 ## Adding new primitives (checklist)
 
@@ -989,6 +992,28 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 3. Benchmark against generic-dot on both NVIDIA and Intel
 4. Remove the `backend ≠ webgpu` guard in `rewriteConvToBlockMap()`
 
+**Conv2d baseline data (March 2026):**
+
+All cases compile to exactly **1 kernel** (fused im2col + matmul + epilogue).
+
+_WebGPU — NVIDIA RTX 4070 Ti SUPER (TB3 eGPU):_
+
+| Case              | GFLOP | JIT ms | GFLOP/s | % Peak |
+| ----------------- | ----- | ------ | ------- | ------ |
+| 3×3 1×32ch 64×64  | 0.151 | 2.64   | 57.3    | 0.3%   |
+| 3×3 1×64ch 64×64  | 0.302 | 2.22   | 136.1   | 0.6%   |
+| 3×3 1×128ch 32×32 | 0.302 | 2.53   | 119.4   | 0.5%   |
+| 3×3 8×64ch 64×64  | 2.416 | 2.77   | 872.6   | 3.9%   |
+| 3×3 8×128ch 64×64 | 9.664 | 7.20   | 1342.0  | 5.9%   |
+
+_WASM block_map speedup (vs generic-dot):_
+
+| Size          | block_map | generic-dot | Speedup   |
+| ------------- | --------- | ----------- | --------- |
+| 3×3 4ch 16×16 | 162 µs    | 166 µs      | 1.02×     |
+| 3×3 4ch 32×32 | 500 µs    | 643 µs      | **1.29×** |
+| 3×3 8ch 64×64 | 7,504 µs  | 10,192 µs   | **1.36×** |
+
 **Key finding:** WebGPU conv2d is dispatch-bound at ~2.5ms for single-batch shapes (<1% GPU
 utilization). Fused-shader conv needs to eliminate dispatch overhead to show speedup. WASM block_map
 already shows 1.02–1.36× speedup (grows with spatial size).
@@ -1028,6 +1053,9 @@ Phase 1 (scalar f32 add/mul/min/max) is complete and ships. Phase 2 extends the 
 prefix scan to arbitrary associative functions (pytree bodies, matrix compose). Requires packed
 representation or multi-field descriptor for general reduction values. Phase 1 remaining
 opportunities: subgroup-parallel lookback; raking pattern (multiple elements/thread).
+
+**References:** Smith, Levien, & Owens — "Decoupled Fallback" (2024):
+https://github.com/b0nes164/Decoupled-Fallback-Paper · https://github.com/b0nes164/GPUPrefixSums
 
 ## Non-goals
 

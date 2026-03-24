@@ -10,8 +10,10 @@
 
   const installText = {
     npm: `npm install github:hamk-uas/jax-js-nonconsuming`,
-    pin: `npm install github:hamk-uas/jax-js-nonconsuming#v0.2.0`,
+    pin: `npm install github:hamk-uas/jax-js-nonconsuming#v0.3.0`,
   };
+  const pnpmConfigText =
+    '"pnpm": { "onlyBuiltDependencies": ["@hamk-uas/jax-js-nonconsuming"] }';
 
   let installMode = $state<"npm" | "pin">("npm");
 
@@ -171,6 +173,12 @@
             <span class="text-primary/50 select-none">&gt;&nbsp;</span
             >{installText[installMode]}
           </div>
+          <p class="text-gray-600 text-sm mt-3">
+            pnpm users: add
+            <code class="bg-primary/10 px-1 rounded">{pnpmConfigText}</code>
+            to your <code class="bg-primary/10 px-1 rounded">package.json</code>
+            so pnpm allows the Git dependency's prepare build.
+          </p>
         </div>
       </div>
 

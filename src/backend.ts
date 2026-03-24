@@ -574,8 +574,12 @@ export async function calibrateGpu(): Promise<void> {
     backend.applyCalibration(beliefState);
     _calibrationState = "done";
   } catch (e) {
-    // Calibration failure is non-fatal — fall back to static profile.
-    console.warn("[microbench] calibration failed, using static profile:", e);
+    // Calibration failure is non-fatal — keep real hardware limits and use
+    // conservative built-in performance defaults.
+    console.warn(
+      "[microbench] calibration failed, using conservative defaults:",
+      e,
+    );
     _calibrationState = "done";
   }
 }
