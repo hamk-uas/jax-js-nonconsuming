@@ -27,6 +27,8 @@ import { Routine } from "./routine";
 export interface CapturedKernel {
   /** Step index in the program. */
   stepIdx: number;
+  /** Human-readable label (e.g. "k0_add", "k1_reduce_mul"). */
+  label?: string;
   /** Number of kernel inputs. */
   nargs: number;
   /** Kernel size expression (number or symbolic string). */
@@ -61,6 +63,8 @@ export interface CapturedRoutine {
 export interface CapturedSubProgram {
   stepIdx: number;
   type: string;
+  /** Human-readable label of the body program. */
+  label?: string;
   /** Summary of the sub-program's steps. */
   stepCounts: JitStepCounts;
   /** Recursive capture of the sub-program. */
@@ -81,6 +85,8 @@ export interface CapturedCode {
 export interface CapturedProgram {
   /** Backend device type. */
   device: string;
+  /** Human-readable label (e.g. "mandelbrot#a3f1"). */
+  label?: string;
   /** Number of inputs. */
   numInputs: number;
   /** Number of outputs. */
@@ -140,6 +146,7 @@ function captureProgram(prog: JitProgram): CapturedProgram {
         const k = step.source;
         kernels.push({
           stepIdx: i,
+          label: k.label,
           nargs: k.nargs,
           size: String(k.size),
           multiOutput: k.isMultiOutput,
@@ -171,6 +178,7 @@ function captureProgram(prog: JitProgram): CapturedProgram {
       subPrograms.push({
         stepIdx: i,
         type: `scan(${step.plan.path})`,
+        label: step.bodyProgram.label,
         stepCounts: step.bodyProgram.stepCounts(),
         program: captureProgram(step.bodyProgram),
       });
@@ -178,6 +186,7 @@ function captureProgram(prog: JitProgram): CapturedProgram {
       subPrograms.push({
         stepIdx: i,
         type: `fori_loop(${step.lower}..${step.upper})`,
+        label: step.bodyProgram.label,
         stepCounts: step.bodyProgram.stepCounts(),
         program: captureProgram(step.bodyProgram),
       });
@@ -185,6 +194,7 @@ function captureProgram(prog: JitProgram): CapturedProgram {
       subPrograms.push({
         stepIdx: i,
         type: `block_map(blockShape=[${step.blockShape}])`,
+        label: step.bodyProgram.label,
         stepCounts: step.bodyProgram.stepCounts(),
         program: captureProgram(step.bodyProgram),
       });
@@ -192,6 +202,7 @@ function captureProgram(prog: JitProgram): CapturedProgram {
       subPrograms.push({
         stepIdx: i,
         type: `assoc_scan(${step.plan.path})`,
+        label: step.bodyProgram.label,
         stepCounts: step.bodyProgram.stepCounts(),
         program: captureProgram(step.bodyProgram),
       });
@@ -203,6 +214,7 @@ function captureProgram(prog: JitProgram): CapturedProgram {
 
   return {
     device: prog.backend.type,
+    label: prog.label,
     numInputs: prog.inputs.length,
     numOutputs: prog.outputs.length,
     numSteps: prog.steps.length,
@@ -367,6 +379,7 @@ export function formatJitReport(report: JitReport): string {
   // Program overview
   const { program: p } = report;
   emit("Program:");
+  if (p.label) emit(`${indent(1)}label: "${p.label}"`);
   emit(`${indent(1)}device: ${p.device}`);
   emit(`${indent(1)}inputs: ${p.numInputs}`);
   emit(`${indent(1)}outputs: ${p.numOutputs}`);
@@ -401,8 +414,9 @@ export function formatJitReport(report: JitReport): string {
   if (p.kernels.length > 0) {
     emit("Kernels:");
     for (const k of p.kernels) {
+      const kLabel = k.label ? ` "${k.label}"` : "";
       emit(
-        `${indent(1)}[step ${k.stepIdx}] size=${k.size} nargs=${k.nargs} outputs=${k.numOutputs}`,
+        `${indent(1)}[step ${k.stepIdx}]${kLabel} size=${k.size} nargs=${k.nargs} outputs=${k.numOutputs}`,
       );
       for (let oi = 0; oi < k.outputs.length; oi++) {
         const o = k.outputs[oi];
@@ -432,7 +446,8 @@ export function formatJitReport(report: JitReport): string {
   if (p.subPrograms.length > 0) {
     emit("Sub-Programs:");
     for (const sp of p.subPrograms) {
-      emit(`${indent(1)}[step ${sp.stepIdx}] ${sp.type}`);
+      const spLabel = sp.label ? ` "${sp.label}"` : "";
+      emit(`${indent(1)}[step ${sp.stepIdx}] ${sp.type}${spLabel}`);
       const sc = sp.stepCounts;
       const active = Object.entries(sc).filter(([, v]) => v > 0);
       emit(
@@ -441,8 +456,9 @@ export function formatJitReport(report: JitReport): string {
       // Recursively format body kernels
       if (sp.program.kernels.length > 0) {
         for (const k of sp.program.kernels) {
+          const kLabel = k.label ? ` "${k.label}"` : "";
           emit(
-            `${indent(2)}kernel: size=${k.size} nargs=${k.nargs} outputs=${k.numOutputs}`,
+            `${indent(2)}kernel:${kLabel} size=${k.size} nargs=${k.nargs} outputs=${k.numOutputs}`,
           );
           for (let oi = 0; oi < k.outputs.length; oi++) {
             const o = k.outputs[oi];

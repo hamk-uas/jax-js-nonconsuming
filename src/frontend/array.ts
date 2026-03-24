@@ -1305,7 +1305,7 @@ export class Array extends Tracer {
       [Primitive.Cholesky]: Array.#routine(Primitive.Cholesky),
       [Primitive.LU]: Array.#routine(Primitive.LU),
       [Primitive.QR]: Array.#routine(Primitive.QR),
-      [Primitive.Jit](args, { jaxpr, name: _name, numConsts, dynamicAxes }) {
+      [Primitive.Jit](args, { jaxpr, name, numConsts, dynamicAxes }) {
         if (jaxpr.inBinders.length !== args.length) {
           throw new Error(
             `jit expects ${jaxpr.inBinders.length} args, got ${args.length}`,
@@ -1353,7 +1353,7 @@ export class Array extends Tracer {
           dimBindings = bindings;
         }
 
-        const jp = jitCompile(backend, jaxpr, dimBindings);
+        const jp = jitCompile(backend, jaxpr, dimBindings, name);
         const { outputs, pending } = jp.execute(slots, dimBindings);
 
         // Batch output pending ops into one submit so the next jit call
@@ -1568,7 +1568,7 @@ export class Array extends Tracer {
         const xsArgs = allArgs.slice(numConsts + numCarry);
 
         // JIT-compile body for fused per-iteration execution
-        const bodyProgram = jitCompile(backend, jaxpr);
+        const bodyProgram = jitCompile(backend, jaxpr, undefined, "scan_body");
 
         // Determine scan plan (P0: always fallback)
         const plan = planScan(

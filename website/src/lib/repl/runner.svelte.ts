@@ -378,7 +378,7 @@ async function _runProgram(
             if (meta.numSteps != null) parts.push(`steps=${meta.numSteps}`);
           }
           lines.push(
-            `[${prog.backend}] program${parts.length ? "  " + parts.join("  ") : ""}`,
+            `[${prog.backend}] program${prog.label ? ` "${prog.label}"` : ""}${parts.length ? "  " + parts.join("  ") : ""}`,
           );
           if (prog.code) {
             lines.push(prog.code);

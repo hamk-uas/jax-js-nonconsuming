@@ -1108,6 +1108,12 @@ export class JitProgram {
   readonly poolHints: PoolHints;
   /** Total number of distinct JitIds (for fast Slot[] scope). */
   readonly slotCount: number;
+  /**
+   * Human-readable label for this program.
+   * E.g. "mandelbrot#a3f1", "closure#7e2b", "scan_body#c0d4".
+   * Set by jitCompile. Combines function name with short hash prefix.
+   */
+  label?: string;
   /** Cached mega-module: undefined = not attempted, null = unsupported. */
   private _megaModule?: WasmMegaModule | null;
   /** M6.2c: worker pool registration state for parallel mega-module dispatch.
@@ -1151,7 +1157,10 @@ export class JitProgram {
           const outputsNice = step.outputs.map((id) => `%${id}`).join(", ");
           const executeText = `execute (${inputsNice}) -> ${outputsNice}`;
           if (step.source instanceof Kernel) {
-            return PPrint.pp(`${executeText}, kernel`).concat(
+            const kLabel = step.source.label
+              ? `, kernel "${step.source.label}"`
+              : ", kernel";
+            return PPrint.pp(`${executeText}${kLabel}`).concat(
               step.source.pprint().indent(2),
             );
           } else if (step.source instanceof Routine) {
@@ -1209,13 +1218,16 @@ export class JitProgram {
           );
       }
     });
-    const display = PPrint.prototype.concat(
+    const displayParts: PPrint[] = [];
+    if (this.label) displayParts.push(PPrint.pp(`label = "${this.label}"`));
+    displayParts.push(
       PPrint.pp(`device = ${this.backend.type}`),
       PPrint.pp("inputs = [" + this.inputs.join(", ") + "]"),
       PPrint.pp("outputs = [" + this.outputs.join(", ") + "]"),
       PPrint.pp("steps ="),
       PPrint.prototype.concat(...steps).indent(2),
     );
+    const display = PPrint.prototype.concat(...displayParts);
     return PPrint.pp("{ ").stack(display.stack(PPrint.pp(" }")));
   }
 
@@ -2268,6 +2280,7 @@ export function jitCompile(
   backend: Backend,
   jaxpr: Jaxpr,
   dimBindings?: ReadonlyMap<string, number>,
+  label?: string,
 ): JitProgram {
   // Cache key includes static device fingerprint + calibrated performance
   // parameters so that tile/block config selections change when the hardware
@@ -2359,6 +2372,23 @@ export function jitCompile(
     // ---- Pending kernel batching ----
     // Defer black-node kernel dispatch to batch same-size non-reduction kernels
     // into multi-output Kernel steps, reducing dispatch overhead.
+    let kernelOrdinal = 0;
+    /** Derive a semantic label for a kernel from its root AluOp(s). */
+    const labelKernel = (kernel: Kernel): void => {
+      const idx = kernelOrdinal++;
+      if (kernel.outputs.length === 1) {
+        const o = kernel.outputs[0];
+        const opName = o.exp.op.toLowerCase();
+        if (o.reduction) {
+          kernel.label = `k${idx}_reduce_${o.reduction.op.toLowerCase()}`;
+        } else {
+          kernel.label = `k${idx}_${opName}`;
+        }
+      } else {
+        const ops = kernel.outputs.map((o) => o.exp.op.toLowerCase());
+        kernel.label = `k${idx}_multi(${ops.join(",")})`;
+      }
+    };
     interface PendingKernelEntry {
       outVar: Var;
       exp: AluExp;
@@ -2382,6 +2412,7 @@ export function jitCompile(
             entry.exp,
             entry.reduction,
           );
+          labelKernel(kernel);
           setConcreteHint(kernel, entry.size);
           const outId = builder.pushKernel(kernel, entry.inputArgs);
           ctx.set(entry.outVar, { type: "imm", arg: outId });
@@ -2425,6 +2456,7 @@ export function jitCompile(
               reduction: e.reduction,
             }));
             const kernel = Kernel.multi(nargs, size, outputDescs);
+            labelKernel(kernel);
             setConcreteHint(kernel, size);
             const outIds = builder.pushMultiKernel(kernel, group[0].inputArgs);
             for (let j = 0; j < group.length; j++) {
@@ -2442,6 +2474,7 @@ export function jitCompile(
           entry.exp,
           entry.reduction,
         );
+        labelKernel(kernel);
         setConcreteHint(kernel, entry.size);
         const outId = builder.pushKernel(kernel, entry.inputArgs);
         ctx.set(entry.outVar, { type: "imm", arg: outId });
@@ -2506,7 +2539,12 @@ export function jitCompile(
         }
 
         // Compile body jaxpr
-        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
+        const bodyProgram = jitCompile(
+          backend,
+          bodyJaxpr,
+          _currentDimBindings,
+          "scan_body",
+        );
 
         // Determine scan plan
         const scanPlan = planScan(
@@ -2675,7 +2713,12 @@ export function jitCompile(
         }
 
         // Compile the body jaxpr → JitProgram (for fallback path)
-        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
+        const bodyProgram = jitCompile(
+          backend,
+          bodyJaxpr,
+          _currentDimBindings,
+          "assoc_scan_body",
+        );
 
         // Plan the assoc scan — try compiled-loop (WASM), fallback otherwise
         const assocPlan = planAssociativeScan(
@@ -2872,6 +2915,7 @@ export function jitCompile(
           backend,
           compiledBodyJaxpr,
           _currentDimBindings,
+          "block_map_body",
         );
         lastConvClass = savedConvClass;
         lastConvRewritten = savedConvRewritten;
@@ -2945,7 +2989,12 @@ export function jitCompile(
           ctx.set(outVar, { type: "imm", arg: outId });
         }
 
-        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
+        const bodyProgram = jitCompile(
+          backend,
+          bodyJaxpr,
+          _currentDimBindings,
+          "workgroup_assoc_scan_body",
+        );
 
         builder.steps.push({
           type: "workgroup_assoc_scan",
@@ -2996,7 +3045,12 @@ export function jitCompile(
         }
 
         // Compile body jaxpr
-        const bodyProgram = jitCompile(backend, bodyJaxpr, _currentDimBindings);
+        const bodyProgram = jitCompile(
+          backend,
+          bodyJaxpr,
+          _currentDimBindings,
+          "fori_loop_body",
+        );
 
         const carrySizeBytes = eqn.outBinders.map(
           (v) => (v.aval.size as number) * byteWidth(v.aval.dtype),
@@ -3238,6 +3292,12 @@ export function jitCompile(
       outputIds,
       builder.slotCount,
     );
+    // Derive program label: "<name>#<hash4>" where name comes from the
+    // caller (e.g. jit(fn) passes fn.name) and hash4 is a 4-char hex prefix
+    // of the jaxpr hash for disambiguation.
+    const hashHex = FpHash.hash(jaxpr).toString(16).slice(0, 4);
+    jp.label = `${label || "program"}#${hashHex}`;
+
     if (DEBUG >= 4) console.info(jp.toString());
     if (DEBUG >= 1)
       console.info(
@@ -3247,6 +3307,7 @@ export function jitCompile(
       _emitCodeCapture({
         backend: backend.type,
         kind: "program",
+        label: jp.label,
         code: jp.toString(),
         metadata: {
           numSteps: jp.steps.length,
