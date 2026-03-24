@@ -84,6 +84,17 @@ describe.skipIf(!hasWebGPU)("microbench calibration", () => {
     expect(backend.capabilities.calibrated).toBeFalsy();
   });
 
+  test('init("webgpu") consumes pending calibration automatically', async () => {
+    const backend = getBackend("webgpu");
+
+    _setCalibrationState("pending");
+    expect(backend.capabilities.calibrated).toBeFalsy();
+
+    await init("webgpu");
+
+    expect(backend.capabilities.calibrated).toBe(true);
+  });
+
   test("_setCalibrationState resets for test isolation", async () => {
     // Calibrate first
     _setCalibrationState("pending");

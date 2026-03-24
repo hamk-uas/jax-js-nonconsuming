@@ -184,8 +184,9 @@ export async function init(...devicesToInit: Device[]): Promise<Device[]> {
   if (devicesToInit.length === 0) {
     devicesToInit = devices;
   }
+  const requestedDevices = new Set(devicesToInit);
   const promises: Promise<void>[] = [];
-  for (const device of new Set(devicesToInit)) {
+  for (const device of requestedDevices) {
     if (!initializedBackends.has(device)) {
       promises.push(
         (async () => {
@@ -198,6 +199,12 @@ export async function init(...devicesToInit: Device[]): Promise<Device[]> {
     }
   }
   await Promise.all(promises);
+
+  // WebGPU calibration must happen on an async boundary before sync JIT
+  // compilation becomes reachable. `init("webgpu")` is that boundary.
+  if (requestedDevices.has("webgpu") && initializedBackends.has("webgpu")) {
+    await _ensureCalibrated();
+  }
 
   return Array.from(initializedBackends.keys());
 }
@@ -556,8 +563,9 @@ export function _setCalibrationState(state: "pending" | "off"): void {
  * hardware characteristics (bandwidth, TFLOPS, dispatch overhead, register
  * budget) and updates the backend capabilities with empirical values.
  *
- * This is automatically triggered on the first WebGPU JIT call. Call this
- * explicitly for deterministic upfront calibration.
+ * This runs automatically during `init("webgpu")` when calibration is still
+ * pending. Call it explicitly when you want deterministic control over when
+ * calibration happens.
  */
 export async function calibrateGpu(): Promise<void> {
   if (_calibrationState === "done" || _calibrationState === "off") return;
@@ -585,8 +593,8 @@ export async function calibrateGpu(): Promise<void> {
 }
 
 /**
- * Ensure calibration has run before the first WebGPU JIT compilation.
- * Called internally by `jitCompile` when the backend is WebGPU.
+ * Ensure calibration has run before sync WebGPU JIT compilation becomes
+ * reachable. Called internally from the async WebGPU initialization path.
  */
 export async function _ensureCalibrated(): Promise<void> {
   if (_calibrationState === "pending") {
