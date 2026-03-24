@@ -9,7 +9,12 @@ import {
   Kernel,
   Reduction,
 } from "../alu";
-import { Backend, Slot } from "../backend";
+import {
+  _emitCodeCapture,
+  _isCodeCaptureEnabled,
+  Backend,
+  Slot,
+} from "../backend";
 import { aluCompare, PendingExecute } from "./array";
 import { executeBlockMap } from "./block-map-executor";
 import {
@@ -3123,6 +3128,19 @@ export function jitCompile(
       console.info(
         `[jitCompile] ${(performance.now() - _jitT0).toFixed(1)}ms, ${builder.steps.length} steps, ${jaxpr.eqns.length} eqns`,
       );
+    if (_isCodeCaptureEnabled()) {
+      _emitCodeCapture({
+        backend: backend.type,
+        kind: "program",
+        code: jp.toString(),
+        metadata: {
+          numSteps: jp.steps.length,
+          numInputs: jp.inputs.length,
+          numOutputs: jp.outputs.length,
+          ...jp.stepCounts(),
+        },
+      });
+    }
     jitCompileCache.set(cacheKey, jp);
     return jp;
   } finally {

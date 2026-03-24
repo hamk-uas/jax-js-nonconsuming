@@ -69,7 +69,7 @@ export interface CapturedSubProgram {
 
 /** Captured shader/WASM code emitted during compilation. */
 export interface CapturedCode {
-  backend: "webgpu" | "wasm";
+  backend: "webgpu" | "wasm" | "cpu" | "webgl";
   kind: string;
   label?: string;
   code?: string;

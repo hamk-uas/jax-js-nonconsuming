@@ -361,35 +361,64 @@ async function _runProgram(
 
     // Emit consolidated code capture report
     if (runner.captureCode && capturedEntries.length > 0) {
+      // Separate program-level entries (step structure) from code entries (shaders/WASM)
+      const programs = capturedEntries.filter((e) => e.kind === "program");
+      const codeOnly = capturedEntries.filter((e) => e.kind !== "program");
+
       const lines: string[] = [];
-      lines.push(`Compiled Code (${capturedEntries.length} entries)`);
-      lines.push("=".repeat(50));
-      for (const entry of capturedEntries) {
-        lines.push("");
-        lines.push(
-          `[${entry.backend}] ${entry.kind}${entry.label ? " — " + entry.label : ""}`,
-        );
-        if (entry.metadata) {
-          const meta = entry.metadata;
+
+      // Program step listings — show how kernels are called
+      if (programs.length > 0) {
+        for (const prog of programs) {
+          const meta = prog.metadata;
           const parts: string[] = [];
-          if (meta.numInputs != null)
-            parts.push(`in=${meta.numInputs as number}`);
-          if (meta.numOutputs != null)
-            parts.push(`out=${meta.numOutputs as number}`);
-          if (meta.simd) parts.push("SIMD");
-          if (meta.reduction) parts.push("reduction");
-          if (meta.numSteps != null)
-            parts.push(`steps=${meta.numSteps as number}`);
-          if (meta.numKernels != null)
-            parts.push(`kernels=${meta.numKernels as number}`);
-          if (meta.byteLength != null)
-            parts.push(`${meta.byteLength as number} bytes`);
-          if (parts.length > 0) lines.push("  " + parts.join("  "));
+          if (meta) {
+            if (meta.numInputs != null) parts.push(`in=${meta.numInputs}`);
+            if (meta.numOutputs != null) parts.push(`out=${meta.numOutputs}`);
+            if (meta.numSteps != null) parts.push(`steps=${meta.numSteps}`);
+          }
+          lines.push(
+            `[${prog.backend}] program${parts.length ? "  " + parts.join("  ") : ""}`,
+          );
+          if (prog.code) {
+            lines.push(prog.code);
+          }
         }
-        if (entry.code) {
-          lines.push("  " + entry.code.split("\n").join("\n  "));
+        if (codeOnly.length > 0) lines.push("");
+      }
+
+      // Shader / WASM code entries
+      if (codeOnly.length > 0) {
+        lines.push(`Compiled Code (${codeOnly.length} entries)`);
+        lines.push("=".repeat(50));
+        for (const entry of codeOnly) {
+          lines.push("");
+          lines.push(
+            `[${entry.backend}] ${entry.kind}${entry.label ? " — " + entry.label : ""}`,
+          );
+          if (entry.metadata) {
+            const meta = entry.metadata;
+            const parts: string[] = [];
+            if (meta.numInputs != null)
+              parts.push(`in=${meta.numInputs as number}`);
+            if (meta.numOutputs != null)
+              parts.push(`out=${meta.numOutputs as number}`);
+            if (meta.simd) parts.push("SIMD");
+            if (meta.reduction) parts.push("reduction");
+            if (meta.numSteps != null)
+              parts.push(`steps=${meta.numSteps as number}`);
+            if (meta.numKernels != null)
+              parts.push(`kernels=${meta.numKernels as number}`);
+            if (meta.byteLength != null)
+              parts.push(`${meta.byteLength as number} bytes`);
+            if (parts.length > 0) lines.push("  " + parts.join("  "));
+          }
+          if (entry.code) {
+            lines.push("  " + entry.code.split("\n").join("\n  "));
+          }
         }
       }
+
       runner.consoleLines.push({
         level: "report",
         data: ["Compiled Code"],
