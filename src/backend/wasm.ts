@@ -449,6 +449,7 @@ export class WasmBackend implements Backend {
         _emitCodeCapture({
           backend: "wasm",
           kind: "kernel",
+          label: kernel.label,
           code: wat,
           metadata: {
             numInputs: kernel.nargs,

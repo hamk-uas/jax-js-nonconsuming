@@ -2305,7 +2305,13 @@ export function jitCompile(
   const cacheKey = backend.type + "," + FpHash.hash(jaxpr) + capsKey;
 
   const cached = jitCompileCache.get(cacheKey);
-  if (cached) return cached;
+  if (cached) {
+    if (!cached.label) {
+      const hashHex = FpHash.hash(jaxpr).toString(16).slice(0, 4);
+      cached.label = `${label || "program"}#${hashHex}`;
+    }
+    return cached;
+  }
 
   // Save/restore dim bindings for nested jitCompile calls (e.g., grad(foriLoop)
   // creates Scan body that contains ForiLoop, each triggering jitCompile).

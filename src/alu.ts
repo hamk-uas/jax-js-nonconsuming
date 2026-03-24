@@ -1570,7 +1570,9 @@ export class Kernel implements FpHashable {
     exp = exp.simplify();
     const dtype = reduction ? reduction.epilogue.dtype : exp.dtype;
     const bytes = sizeExprMul(size, byteWidth(dtype));
-    return new Kernel(nargs, size, [{ exp, reduction, dtype, bytes }]);
+    const kernel = new Kernel(nargs, size, [{ exp, reduction, dtype, bytes }]);
+    kernel.label = Kernel.#fallbackLabel(kernel);
+    return kernel;
   }
 
   /** Create a multi-output kernel. None of the outputs may have reductions. */
@@ -1590,7 +1592,20 @@ export class Kernel implements FpHashable {
         return { exp, reduction, dtype, bytes };
       },
     );
-    return new Kernel(nargs, size, outputs);
+    const kernel = new Kernel(nargs, size, outputs);
+    kernel.label = Kernel.#fallbackLabel(kernel);
+    return kernel;
+  }
+
+  static #fallbackLabel(kernel: Kernel): string {
+    const semantics =
+      kernel.outputs.length === 1
+        ? kernel.outputs[0].reduction
+          ? `reduce_${kernel.outputs[0].reduction.op.toLowerCase()}`
+          : kernel.outputs[0].exp.op.toLowerCase()
+        : `multi(${kernel.outputs.map((o) => o.exp.op.toLowerCase()).join(",")})`;
+    const hash4 = FpHash.hash(kernel).toString(16).slice(0, 4);
+    return `${semantics}#${hash4}`;
   }
 
   hash(state: FpHash): void {
