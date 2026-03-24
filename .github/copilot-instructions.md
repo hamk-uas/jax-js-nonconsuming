@@ -302,12 +302,19 @@ hardware-determined and irreducible without reducing dispatch count.
 
 ### Cost model & device characterization
 
-Before calibration, the runtime only has a **strong static constraint profile**: real device limits,
-feature flags, and adapter strings from WebGPU. The performance cost model does **not** currently
-populate a richer static prior from `runtime_model.json` or a live `deriveHardwareProfile()`
-implementation. Instead, `evaluateTotalCost()` falls back to conservative built-in defaults for
-dispatch overhead, bandwidth, TFLOPS, barrier factor, and `rOptWords` until `calibrateGpu()`
-measures them.
+**Pre-calibration state:** Before `calibrateGpu()` runs (auto-triggered during `init("webgpu")`),
+the runtime has only a **strong static constraint profile**: real device limits, feature flags, and
+adapter strings. Performance fields (`bandwidthGBs`, `tflops`, `dispatchOverheadUs`, `rOptWords`)
+are absent from `BackendCapabilities`. `resolvePerformanceBelief(caps)` in `src/tuner.ts` fills
+`CONSERVATIVE_WEBGPU_PERF_DEFAULTS` (dispatch=25µs, bandwidth=50GB/s, tflops=1.5, rOptWords=128)
+when no calibrated values exist. `_setCalibrationState("off")` for tests calls `resetCalibration()`
+which deletes all performance fields for clean isolation.
+
+**Continuous cost modeling (P9, complete):** All ad-hoc heuristic thresholds have been replaced with
+continuous execution cost penalties via `evaluateTotalCost`. Legacy string heuristics retired
+across: `chooseTileConfig` (lax.ts), `foriLoopToBlockMap` (jit.ts), `tuneWebgpu` (tuner.ts),
+assoc-scan block-size selection (scan-plan.ts). `dangerAggregate` penalty models
+`threads × depthPriv / aggregateBudget` cliff for small-GRF GPUs (gen-9, mobile).
 
 `evaluateTotalCost(features, caps)` in `src/tuner.ts` scores kernel/tile configurations:
 
@@ -969,16 +976,74 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 
 ## Future performance work
 
-| ID  | Title                      | Priority        | Description                                                                         |
-| --- | -------------------------- | --------------- | ----------------------------------------------------------------------------------- |
-| P2  | Relaxed SIMD FMA           | Medium          | `f32x4.relaxed_madd` for 2× WASM dot-product throughput. Safari unsupported         |
-| P3  | i64 in wasmblr             | Medium          | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins               |
-| P4  | Conv2d WebGPU fused shader | Medium          | Fused-shader codegen for conv bodies in `block-map.ts`. WASM path done (1.02–1.36×) |
-| P6  | Benchmark validation       | Medium          | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions              |
-| P7  | Cooperative matrix (WMMA)  | Blocked (~2026) | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable               |
+| ID  | Title                        | Priority        | Description                                                                         |
+| --- | ---------------------------- | --------------- | ----------------------------------------------------------------------------------- |
+| P2  | Relaxed SIMD FMA             | Medium          | `f32x4.relaxed_madd` for 2× WASM dot-product throughput. Safari unsupported         |
+| P3  | i64 in wasmblr               | Medium          | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins               |
+| P4  | Conv2d WebGPU fused shader   | Medium          | Fused-shader codegen for conv bodies in `block-map.ts`. WASM path done (1.02–1.36×) |
+| P6  | Benchmark validation         | Medium          | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions              |
+| P7  | Cooperative matrix (WMMA)    | Blocked (~2026) | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable               |
+| P8  | Command tape block_map       | Low             | Add `block_map` to WebGPU command tape to unlock `foriLoop→blockMap` in `Scan`      |
+| P10 | Microbenchmark scale + async | High            | Increase microbench payloads; wire `barrierCostFactor`; explore async JIT pipeline  |
 
-See `PLAN.md` for deferred items (O6 multi-reduction, O8d fori_loop tape, Decoupled Fallback
-Phase 2) and non-goals.
+### P4: Conv2d WebGPU fused shader (steps to unblock)
+
+1. Extend fused-shader codegen in `src/backend/webgpu/block-map.ts` to handle conv body patterns
+2. Verify single-dispatch conv via `_lastConvRewritten()` + `profileGpuDetailed()`
+3. Benchmark against generic-dot on both NVIDIA and Intel
+4. Remove the `backend ≠ webgpu` guard in `rewriteConvToBlockMap()`
+
+**Key finding:** WebGPU conv2d is dispatch-bound at ~2.5ms for single-batch shapes (<1% GPU
+utilization). Fused-shader conv needs to eliminate dispatch overhead to show speedup. WASM block_map
+already shows 1.02–1.36× speedup (grows with spatial size).
+
+### P10: Microbenchmark auto-tuning (remaining Phase 2 items)
+
+Phase 1 is complete (core infrastructure in `src/microbench.ts`, auto-calibration at
+`init("webgpu")`, conservative defaults for pre-calibration). Remaining open items:
+
+1. **Microbenchmark scale**: Workloads are too small (~32MB payload). `queue.submit` overhead
+   dominates timing, skewing `BW_global` and `TFLOPS`. Increase payload volume iteratively until
+   overhead drops below 5% margin, or subtract a baseline linear fit.
+2. **Ghost metric — `barrierCostFactor`**: Measured by microbench but silently ignored by
+   `evaluateTotalCost`. Wire it into `dangerShmem` or shared-memory sync cost.
+3. **Async JIT architecture** (exploratory): Transition from synchronous
+   `device.createComputePipeline` to `createComputePipelineAsync`. JIT calls return immediately via
+   lazy execution or Promise-wrapped handles. Would enable in-flight calibration refinement without
+   blocking the main thread.
+
+## Deferred items
+
+### O6: Multi-Reduction Kernels (deprioritized)
+
+Fuse independent same-size reductions sharing inputs into a single dispatch. Two strategies analyzed
+(multi-output + chained reduction), both require new AluExp nodes. Block-map fused shader already
+handles compose bodies — O6 only helps standalone JitPrograms with multiple independent same-input
+reductions (narrow use case).
+
+### O8d: fori_loop Unrolling into Command Tape (not started, low priority)
+
+Unroll `fori_loop` iterations into the command tape dispatch sequence. Currently, `fori_loop` with
+concrete bounds is supported by WASM mega-module but rejected by the WebGPU command tape.
+
+### Decoupled Fallback Phase 2: General Bodies (deferred)
+
+Phase 1 (scalar f32 add/mul/min/max) is complete and ships. Phase 2 extends the single-dispatch O(N)
+prefix scan to arbitrary associative functions (pytree bodies, matrix compose). Requires packed
+representation or multi-field descriptor for general reduction values. Phase 1 remaining
+opportunities: subgroup-parallel lookback; raking pattern (multiple elements/thread).
+
+## Non-goals
+
+- **General einsum rank-adaptation:** Only matters for exotic subscript patterns not covered by
+  `einsumFastPath`. All common batch-matmul patterns already work.
+- **Sort/Argsort/LU jaxprification:** Fundamentally data-dependent algorithms (comparison-based,
+  data-dependent pivoting). Cannot be expressed as fixed arithmetic traces.
+- **GPU/WASM ratio ≤ 2× for small-matrix DLM:** Irreducible GPU API costs (`queue.submit`) prevent
+  matching WASM mega-module latency at small N.
+- **Binding limit optimization on high-limit hardware:** On Deno/NVIDIA with `maxArgs = 1,048,575`,
+  the P2 split pass has no effect. Browser `maxArgs ≈ 9` causes additional fragmentation, but
+  dominant overhead is P1 structural rules.
 
 ---
 
