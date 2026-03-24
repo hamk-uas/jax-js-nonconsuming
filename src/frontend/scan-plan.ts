@@ -2192,7 +2192,12 @@ function tryBuildBlockMapAssocScanPlan(
   // and generate inlined Kogge-Stone rounds in the fused shader.
   let localScanBodyProgram: JitProgram;
   try {
-    localScanBodyProgram = jitCompile(backend, localScanBodyJaxpr, dimBindings);
+    localScanBodyProgram = jitCompile(
+      backend,
+      localScanBodyJaxpr,
+      dimBindings,
+      "workgroup_assoc_scan_body",
+    );
   } catch (e) {
     if (DEBUG >= 1) {
       console.log("[assoc-scan] block-map path: body jitCompile failed:", e);
@@ -2282,7 +2287,12 @@ function tryBuildBlockMapAssocScanPlan(
 
   let applyVmapProgram: JitProgram;
   try {
-    applyVmapProgram = jitCompile(backend, applyVmapClosed.jaxpr, dimBindings);
+    applyVmapProgram = jitCompile(
+      backend,
+      applyVmapClosed.jaxpr,
+      dimBindings,
+      "assoc_scan_apply_vmap",
+    );
   } catch (e) {
     if (DEBUG >= 1) {
       console.log(

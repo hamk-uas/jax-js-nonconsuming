@@ -1480,6 +1480,13 @@ export class Kernel implements FpHashable {
   /** The outputs produced by this kernel. */
   readonly outputs: KernelOutput[];
 
+  /**
+   * Human-readable label combining semantic meaning with ordinal.
+   * E.g. "k0_add", "k1_reduce_mul", "k2_multi(add,cast)".
+   * Set by jitCompile after construction. NOT included in hash().
+   */
+  label?: string;
+
   // ---- multi-output accessors ----
 
   /** Number of outputs. */
@@ -1601,6 +1608,7 @@ export class Kernel implements FpHashable {
   }
 
   pprint(): PPrint {
+    const tag = this.label ? `"${this.label}" ` : "";
     if (this.outputs.length === 1) {
       let details = PPrint.pp(`exp = ${this.outputs[0].exp}`);
       details = details.concat(PPrint.pp(`size = ${this.size}`));
@@ -1609,7 +1617,7 @@ export class Kernel implements FpHashable {
           PPrint.pp(`reduction = ${this.outputs[0].reduction}`),
         );
       }
-      return PPrint.pp("{ ").stack(details).stack(PPrint.pp(" }"));
+      return PPrint.pp(`${tag}{ `).stack(details).stack(PPrint.pp(" }"));
     }
     // Multi-output
     let details = PPrint.pp(`size = ${this.size}`);
@@ -1623,7 +1631,7 @@ export class Kernel implements FpHashable {
         );
       }
     }
-    return PPrint.pp("{ ").stack(details).stack(PPrint.pp(" }"));
+    return PPrint.pp(`${tag}{ `).stack(details).stack(PPrint.pp(" }"));
   }
 
   toString(): string {
