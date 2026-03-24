@@ -20,6 +20,10 @@ import type { ArrayLike } from "./frontend/array";
 import { jit, makeJaxpr } from "./frontend/jaxpr";
 import { jitCompile, JitProgram, type JitStepCounts } from "./frontend/jit";
 import { Routine } from "./routine";
+import {
+  CONSERVATIVE_WEBGPU_PERF_DEFAULTS,
+  resolvePerformanceBelief,
+} from "./tuner";
 
 // ── Report types ──────────────────────────────────────────────────────────
 
@@ -350,13 +354,12 @@ export function formatJitReport(report: JitReport): string {
   emit("=== JIT Compilation Report ===");
   emit("");
 
-  // Backend info — use capsR for calibration-branch fields not in base type
+  // Backend info
   const caps = report.capabilities;
-  const capsR = caps as Record<string, string | number | boolean | undefined>;
   emit("Backend:");
-  if (capsR.inferredVendorClass != null) {
-    emit(`${indent(1)}inferredVendorClass: ${capsR.inferredVendorClass}`);
-  }
+  emit(
+    `${indent(1)}inferredVendorClass: ${caps.inferredVendorClass ?? "unknown"}`,
+  );
   emit(
     `${indent(1)}maxComputeWorkgroupSizeX: ${caps.maxComputeWorkgroupSizeX ?? "?"}`,
   );
@@ -368,15 +371,19 @@ export function formatJitReport(report: JitReport): string {
   );
   emit(`${indent(1)}shaderF16: ${caps.shaderF16 ?? false}`);
   emit(`${indent(1)}subgroups: ${caps.subgroups ?? false}`);
-  if (capsR.calibrated) {
+  const belief = resolvePerformanceBelief(caps);
+  if (caps.calibrated) {
     emit(`${indent(1)}calibrated: true`);
-    if (capsR.bandwidthGBs != null)
-      emit(`${indent(1)}bandwidthGBs: ${capsR.bandwidthGBs}`);
-    if (capsR.tflops != null) emit(`${indent(1)}tflops: ${capsR.tflops}`);
-    if (capsR.dispatchOverheadUs != null)
-      emit(`${indent(1)}dispatchOverheadUs: ${capsR.dispatchOverheadUs}`);
-    if (capsR.rOptWords != null)
-      emit(`${indent(1)}rOptWords: ${capsR.rOptWords}`);
+    emit(`${indent(1)}bandwidthGBs: ${belief.bandwidthGBs}`);
+    emit(`${indent(1)}tflops: ${belief.tflops}`);
+    emit(`${indent(1)}dispatchOverheadUs: ${belief.dispatchOverheadUs}`);
+    emit(`${indent(1)}rOptWords: ${belief.rOptWords}`);
+  } else {
+    emit(`${indent(1)}calibrated: false`);
+    emit(`${indent(1)}performanceBelief: conservative-defaults`);
+    emit(
+      `${indent(1)}conservativeDefaults: dispatch=${CONSERVATIVE_WEBGPU_PERF_DEFAULTS.dispatchOverheadUs}us bw=${CONSERVATIVE_WEBGPU_PERF_DEFAULTS.bandwidthGBs}GB/s tflops=${CONSERVATIVE_WEBGPU_PERF_DEFAULTS.tflops} rOpt=${CONSERVATIVE_WEBGPU_PERF_DEFAULTS.rOptWords}`,
+    );
   }
   emit("");
 

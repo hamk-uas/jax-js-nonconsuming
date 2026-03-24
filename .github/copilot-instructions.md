@@ -300,6 +300,50 @@ hardware-determined and irreducible without reducing dispatch count.
 | n = 128     | ~3.0x         | ~1.8x         |
 | n = 256     | ~3.8x         | ~1.9x         |
 
+### Cost model & device characterization
+
+Before calibration, the runtime only has a **strong static constraint profile**: real device limits,
+feature flags, and adapter strings from WebGPU. The performance cost model does **not** currently
+populate a richer static prior from `runtime_model.json` or a live `deriveHardwareProfile()`
+implementation. Instead, `evaluateTotalCost()` falls back to conservative built-in defaults for
+dispatch overhead, bandwidth, TFLOPS, barrier factor, and `rOptWords` until `calibrateGpu()`
+measures them.
+
+`evaluateTotalCost(features, caps)` in `src/tuner.ts` scores kernel/tile configurations:
+
+```
+totalCost = (costExecution + cCompile) × dangerMultiplier / produceCount
+```
+
+- **costExecution** = dispatch overhead + memory cost + ALU cost + latency + barrier cost
+- **dangerMultiplier** = `dangerPriv × dangerShmem × dangerBind × dangerAggregate` — exponential
+  cliff penalties for register spill (`depthPriv/rOptWords`), shared memory exceeding 16 KB, binding
+  pressure (>8 buffers), and aggregate workgroup register overflow
+  (`threads × depthPriv / aggregateBudget`)
+- **produceCount** normalizes cost per output element
+
+`CostFeatures`:
+`{nDispatch, nBuffers, countAlu, countMem, depthPriv, sizeShmem, sizeWgsl, produceCount?, parallelism?}`
+
+**Consumers:** `chooseTileConfig` (lax.ts), `tuneWebgpu` (tuner.ts), `foriLoopToBlockMap` (jit.ts),
+associative scan block-size selection (scan-plan.ts).
+
+`scripts/output/runtime_model.json` stores vendor-conditioned log-linear regression coefficients
+(maxBufferSize → bandwidth → TFLOPS) and per-class `R_opt_words`. `scripts/refit-model.mjs`
+incrementally adds new GPU samples via Welford sufficient statistics.
+
+### Microbenchmark calibration (P10)
+
+`src/microbench.ts` runs 5 isolated GPU microbenchmarks on raw WebGPU API (no JIT) to measure
+hardware characteristics: dispatch overhead (linear regression on no-op dispatch counts), bandwidth
+(16MB copy kernel), TFLOPS (FMA-heavy kernel), barrier cost (shared-memory vs local reduction
+ratio), R_opt (escalating register counts, 60% throughput cliff detection). Results stored in
+`PerformanceBeliefState`. Auto-triggered during `init("webgpu")`, or explicit via
+`await calibrateGpu()`. `_setCalibrationState("off")` disables for tests.
+
+When calibrated, JIT cache keys include `staticCapabilityFingerprint(caps)` + rounded performance
+values. The belief state is frozen for the session (no cache thrashing).
+
 ## JIT compiler
 
 **Pipeline:** `makeJaxpr(f)` → `jaxpr.flatten().simplify()` → `splitGraphDataflow()` →
@@ -431,10 +475,10 @@ All public symbols must be exported from `src/index.ts`. Key exports: `jit`, `gr
 `jvp`, `vjp`, `vmap`, `jacfwd`, `jacrev`, `hessian`, `linearize`, `makeJaxpr`, `init`,
 `defaultDevice`, `devicePut`, `blockUntilReady`, `scatterAdd`, `clearCaches`, `checkLeaks`, `numpy`,
 `lax`, `nn`, `random`, `scipySpecial`, `scipyLinalg`, `tree`, `ScanPath`, `profileGpu`,
-`profileGpuDetailed`, `setCodeCapture`, `CodeCaptureEntry`, `getWebGPUDevice`.
+`profileGpuDetailed`, `setCodeCapture`, `CodeCaptureEntry`, `getWebGPUDevice`, `calibrateGpu`.
 
 Internal-only exports (underscore prefix, not public API): `_lastConvClass`, `_lastConvRewritten`,
-`_lastForiRewritten`.
+`_lastForiRewritten`, `_setCalibrationState`.
 
 ## Observability & code capture
 
@@ -447,6 +491,13 @@ binary emission. `cg.toWat()` produces human-readable WAT source text. Off by de
 
 **`profileGpuDetailed(fn)`** — expert profiling API returning per-pass GPU duration, dispatch grid
 dimensions, workgroup size, shader label/hash, and pipeline cache hit/miss flags.
+
+**`startProfiling()` / `stopProfiling()`** — internal backend hooks behind `profileGpu()`. WebGPU
+`startProfiling()` allocates a timestamp query set, enables per-compute-pass timestamp writes via
+`_beginComputePass()`, and accumulates pass metadata (`grid`, `workgroupSize`, `label`) for
+`stopProfiling()` to resolve. Not public API. Uses 2 timestamp queries per pass, so the 4096-query
+WebGPU limit caps one profiling session at 2048 recorded passes (`truncated=true` beyond that).
+Profiling is intentionally not composable with `startTrace()`; stop tracing first.
 
 **Hook points:** WebGPU: `ShaderPipelineCache.prepare()` on cache miss. WASM: 14 sites across
 kernels, mega-module, scan, assoc-scan, block-map, and routines (all on cache miss).

@@ -8,12 +8,15 @@ export async function benchFlops(
 ): Promise<number | undefined> {
   // Race the actual benchmark against a timeout so weak GPUs that trigger
   // TDR (GPU timeout / device-lost) don't hang the page.
-  return Promise.race([
+  let timer: ReturnType<typeof setTimeout>;
+  const result = await Promise.race([
     benchFlopsInner(n, device, dtype),
-    new Promise<undefined>((resolve) =>
-      setTimeout(() => resolve(undefined), timeoutMs),
-    ),
+    new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), timeoutMs);
+    }),
   ]);
+  clearTimeout(timer!);
+  return result;
 }
 
 async function benchFlopsInner(
@@ -166,12 +169,32 @@ export async function measurePerf(): Promise<PerfResults> {
     gpuDim = 512;
   }
 
+  // Intel iGPUs need a longer timeout: calibration (~3s) + JIT compilation
+  // (~1s) + warmup dispatches eat most of the default 8s budget, leaving
+  // insufficient time for the timed batches.
+  const gpuTimeout = isIntel && !isIntelArc ? 20000 : 8000;
+
+  const fp32Result = await benchFlops(
+    gpuDim,
+    "webgpu",
+    "float32" as DType,
+    gpuTimeout,
+  );
+
+  // Flush JIT caches + buffer pool between dtype benchmarks to ensure the
+  // fp16 run starts with a clean GPU state (no stale pipeline / pool
+  // contention from fp32). Replaces the former blind 300ms setTimeout.
+  if (hasF16 && fp32Result !== undefined) {
+    const jax = await import("@hamk-uas/jax-js-nonconsuming");
+    jax.clearCaches();
+  }
+
   return {
     flops: {
       Wasm: await benchFlops(128, "wasm", "float32" as DType),
-      WebGPU: await benchFlops(gpuDim, "webgpu", "float32" as DType),
+      WebGPU: fp32Result,
       "WebGPU-fp16": hasF16
-        ? await benchFlops(gpuDim, "webgpu", "float16" as DType)
+        ? await benchFlops(gpuDim, "webgpu", "float16" as DType, gpuTimeout)
         : undefined,
     },
     browser: "Your browser (live)",

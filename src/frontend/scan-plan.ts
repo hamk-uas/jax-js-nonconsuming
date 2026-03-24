@@ -35,6 +35,7 @@ import {
   isSymbolicDim,
   resolveShape,
 } from "../shape";
+import { type CostFeatures, evaluateTotalCost } from "../tuner";
 import { DEBUG } from "../utils";
 import type { ScanPath } from "../utils";
 import { Primitive, ShapedArray } from "./core";
@@ -2040,11 +2041,29 @@ export function planAssociativeScan(
       }
     }
 
-    // Try progressively smaller block sizes until the fused shader fits in
-    // shared memory. The fused shader's shmem usage scales linearly with
-    // blockSize (ping-pong + reduction workspaces), so halving B roughly
-    // halves shmem. Minimum B=32 keeps the Kogge-Stone round count ≤5.
-    for (const BLOCK_SIZE of [256, 128, 64, 32]) {
+    // Score the allowed block sizes based on Continuous Cost Modeling logic.
+    // The fused shader's shmem usage scales linearly with blockSize.
+    // Minimum B=32 keeps the Kogge-Stone round count ≤5.
+    const candidates = [256, 128, 64, 32].map((b) => {
+      // Rough estimation:
+      const shmemUsage = b * neededBindings * 4;
+      const features: CostFeatures = {
+        nDispatch: 1,
+        nBuffers: neededBindings,
+        countAlu: b * neededBindings,
+        countMem: b * neededBindings * 8, // read + write
+        depthPriv: 16,
+        sizeShmem: shmemUsage,
+        sizeWgsl: 4096,
+        parallelism: b,
+        produceCount: b,
+      };
+      return { b, cost: evaluateTotalCost(features, backend.capabilities) };
+    });
+
+    candidates.sort((x, y) => x.cost - y.cost);
+
+    for (const { b: BLOCK_SIZE } of candidates) {
       try {
         const blockMapPlan = tryBuildBlockMapAssocScanPlan(
           backend,

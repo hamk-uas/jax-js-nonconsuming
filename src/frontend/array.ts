@@ -91,7 +91,17 @@ export const fudgeArray = pureArray as (x: ArrayLike) => Array;
  * This holds a reference to all input buffers used in the operation. After the
  * operation is dispatched, the references should be released.
  */
-export class PendingExecute {
+export interface IPendingExecute {
+  readonly backend: Backend;
+  prepared: any;
+  submitted: boolean;
+  updateRc(delta: number): void;
+  prepare(): Promise<void>;
+  prepareSync(): void;
+  submit(): void;
+}
+
+export class PendingExecute implements IPendingExecute {
   prepared: Executable | null = null;
   submitted = false;
   #promise: Promise<void> | null = null; // for prepare
@@ -180,7 +190,7 @@ type ArrayConstructorArgs = {
   weakType: boolean;
   backend: Backend;
   committed: boolean;
-  pending?: Iterable<PendingExecute>;
+  pending?: Iterable<IPendingExecute>;
 };
 
 /**
@@ -201,7 +211,7 @@ export class Array extends Tracer {
   #backend: Backend;
   #committed: boolean; // if array is committed to device (passed explicitly)
   #rc: number; // reference count for this specific Array object
-  #pendingSet: Set<PendingExecute> | null; // only if source is `Slot`
+  #pendingSet: Set<IPendingExecute> | null; // only if source is `Slot`
 
   /**
    * @ignore
@@ -329,7 +339,7 @@ export class Array extends Tracer {
   }
 
   /** Get the pending executes as a list, trimming if already submitted. */
-  get #pending(): PendingExecute[] {
+  get #pending(): IPendingExecute[] {
     if (!this.#pendingSet) return [];
     for (const p of this.#pendingSet) {
       if (p.submitted) this.#pendingSet.delete(p);
@@ -1348,17 +1358,18 @@ export class Array extends Tracer {
 
         // Batch output pending ops into one submit so the next jit call
         // finds no unflushed ops (#pending getter filters submitted ops).
-        backend.beginBatch?.();
-        try {
-          for (const exe of pending) {
-            exe.prepareSync();
-            exe.submit();
+        if (pending.length > 0) {
+          backend.beginBatch?.();
+          try {
+            for (const exe of pending) {
+              exe.prepareSync();
+              exe.submit();
+            }
+          } finally {
+            backend.endBatch?.();
           }
-        } finally {
-          backend.endBatch?.();
+          for (const exe of pending) exe.updateRc(+outputs.length - 1);
         }
-
-        for (const exe of pending) exe.updateRc(+outputs.length - 1);
 
         return outputs.map((source, i) => {
           const outShape = dimBindings

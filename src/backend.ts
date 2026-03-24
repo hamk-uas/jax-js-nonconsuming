@@ -41,7 +41,58 @@ export interface BackendCapabilities {
   readonly adapterVendor?: string;
   /** WebGPU: true if timestamp-query feature is available. */
   readonly timestampQuery?: boolean;
+
+  /** Measured or injected memory bandwidth in GB/s. Absent before calibration in the current runtime path. */
+  readonly bandwidthGBs?: number;
+  /** Measured or injected compute throughput in TFLOPS. Absent before calibration in the current runtime path. */
+  readonly tflops?: number;
+  /** Measured or injected base dispatch overhead in microseconds. Absent before calibration in the current runtime path. */
+  readonly dispatchOverheadUs?: number;
+  /**
+   * Optional coarse vendor class for heuristics. The current runtime path does
+   * not derive this automatically before calibration, so it is usually absent.
+   */
+  readonly inferredVendorClass?:
+    | "apple"
+    | "discrete-modern"
+    | "discrete-legacy"
+    | "igp"
+    | "mobile"
+    | "discrete-minimal"
+    | "unknown";
+  /**
+   * Measured or injected per-thread register budget (words) before spill likely
+   * begins. Absent before calibration in the current runtime path.
+   */
+  readonly rOptWords?: number;
+  /** Measured or injected relative cost multiplier for workgroup barriers. */
+  readonly barrierCostFactor?: number;
+
+  /**
+   * Whether microbenchmark calibration has been applied to this backend.
+   * When false, the tuner falls back to conservative built-in defaults while
+   * still using the real hardware limits and feature flags above.
+   */
+  readonly calibrated?: boolean;
 }
+
+/**
+ * A stable fingerprint of immutable device capabilities used in cache keys.
+ * Includes only structural limits that don't change across calibration runs.
+ * Optional coarse classification is included only when present.
+ */
+export function staticCapabilityFingerprint(caps: BackendCapabilities): string {
+  return [
+    caps.maxComputeWorkgroupSizeX ?? 0,
+    caps.maxComputeInvocationsPerWorkgroup ?? 0,
+    caps.maxComputeWorkgroupStorageSize ?? 0,
+    caps.inferredVendorClass ?? "unknown",
+    caps.shaderF16 ? 1 : 0,
+    caps.subgroups ? 1 : 0,
+    caps.atomicF32Add ? 1 : 0,
+  ].join(",");
+}
+
 export const devices: Device[] = ["cpu", "wasm", "webgpu", "webgl"];
 
 // ── Code capture API (Phase A0) ──────────────────────────────────────────
@@ -134,8 +185,9 @@ export async function init(...devicesToInit: Device[]): Promise<Device[]> {
   if (devicesToInit.length === 0) {
     devicesToInit = devices;
   }
+  const requestedDevices = new Set(devicesToInit);
   const promises: Promise<void>[] = [];
-  for (const device of new Set(devicesToInit)) {
+  for (const device of requestedDevices) {
     if (!initializedBackends.has(device)) {
       promises.push(
         (async () => {
@@ -148,6 +200,13 @@ export async function init(...devicesToInit: Device[]): Promise<Device[]> {
     }
   }
   await Promise.all(promises);
+
+  // WebGPU calibration must happen on an async boundary before sync JIT
+  // compilation becomes reachable. `init("webgpu")` is that boundary.
+  if (requestedDevices.has("webgpu") && initializedBackends.has("webgpu")) {
+    await _ensureCalibrated();
+  }
+
   return Array.from(initializedBackends.keys());
 }
 
@@ -475,4 +534,71 @@ export function getWebGPUDevice(): GPUDevice {
     );
   }
   return backend.device;
+}
+
+// ── Microbenchmark calibration (P10) ─────────────────────────────────────
+
+/**
+ * Calibration state for the WebGPU backend.
+ * - "pending": not yet calibrated, will run during init("webgpu")
+ * - "running": calibration in progress
+ * - "done": calibration complete, belief state frozen
+ * - "off": calibration disabled
+ */
+let _calibrationState: "pending" | "running" | "done" | "off" = "pending";
+
+/** Internal test hook for forcing calibration state. Not a stable public API. */
+export function _setCalibrationState(state: "pending" | "off"): void {
+  _calibrationState = state;
+  // Reset the calibrated flag on the WebGPU backend for test isolation.
+  const backend = initializedBackends.get("webgpu") as
+    | import("./backend/webgpu").WebGPUBackend
+    | undefined;
+  if (backend && backend.capabilities.calibrated) {
+    backend.resetCalibration();
+  }
+}
+
+/**
+ * Run microbenchmark calibration on the WebGPU backend. Measures fundamental
+ * hardware characteristics (bandwidth, TFLOPS, dispatch overhead, register
+ * budget) and updates the backend capabilities with empirical values.
+ *
+ * This runs automatically during `init("webgpu")` when calibration is still
+ * pending. Call it explicitly when you want deterministic control over when
+ * calibration happens.
+ */
+export async function calibrateGpu(): Promise<void> {
+  if (_calibrationState === "done" || _calibrationState === "off") return;
+
+  const backend = initializedBackends.get("webgpu") as
+    | WebGPUBackend
+    | undefined;
+  if (!backend) {
+    throw new Error(
+      "WebGPU backend not initialized, call init('webgpu') first",
+    );
+  }
+
+  _calibrationState = "running";
+  try {
+    const { runMicrobenchmarks } = await import("./microbench");
+    const beliefState = await runMicrobenchmarks(backend.device);
+    backend.applyCalibration(beliefState);
+    _calibrationState = "done";
+  } catch (e) {
+    // Calibration failure is non-fatal — fall back to static profile.
+    console.warn("[microbench] calibration failed, using static profile:", e);
+    _calibrationState = "done";
+  }
+}
+
+/**
+ * Ensure calibration has run before sync WebGPU JIT compilation becomes
+ * reachable. Called internally from the async WebGPU initialization path.
+ */
+export async function _ensureCalibrated(): Promise<void> {
+  if (_calibrationState === "pending") {
+    await calibrateGpu();
+  }
 }

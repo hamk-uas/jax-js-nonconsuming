@@ -12,7 +12,7 @@ import { type Backend, Executable, type Slot } from "../backend";
 import type { BlockMapWasmParams, GeneralScanStep } from "../backend/wasm";
 import type { PackedLeafLayout } from "../backend/webgpu/codegen";
 import { DEBUG, prod } from "../utils";
-import type { PendingExecute } from "./array";
+import type { IPendingExecute } from "./array";
 import { _registerJitCacheDisposer } from "./check-leaks";
 import type { Jaxpr } from "./jaxpr";
 import type { JitProgram, JitStep } from "./jit";
@@ -66,7 +66,7 @@ export interface ExecuteBlockMapParams {
 
 export interface ExecuteBlockMapResult {
   outputs: Slot[];
-  pending: PendingExecute[];
+  pending: IPendingExecute[];
 }
 
 /**
@@ -577,7 +577,7 @@ function executeBlockMapFallback(
   const gridRank = blockShape.length;
   const numBlocks = gridShape.reduce((a, b) => a * b, 1);
   const numOutputs = bodyJaxpr.outs.length;
-  const pending: PendingExecute[] = [];
+  const pending: IPendingExecute[] = [];
 
   // When hasBlockIndex, the rewritten body jaxpr has one extra inBinder
   // at the end for the block index. Exclude it from input avals.
@@ -859,7 +859,7 @@ export function computeLinearOffset(
 
 /** Flush pending operations. */
 export function flushPending(
-  pending: PendingExecute[],
+  pending: IPendingExecute[],
   backend: Backend,
 ): void {
   if (pending.length === 0) return;

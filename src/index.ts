@@ -1,5 +1,7 @@
 import { DType } from "./alu";
 import {
+  _setCalibrationState,
+  calibrateGpu,
   defaultDevice,
   Device,
   devices,
@@ -70,6 +72,7 @@ import * as numpy from "./library/numpy";
 import * as random from "./library/random";
 import * as scipyLinalg from "./library/scipy-linalg";
 import * as scipySpecial from "./library/scipy-special";
+import type { PerformanceBeliefState } from "./microbench";
 import { startTrace, stopTrace } from "./tracing";
 import * as tree from "./tree";
 import type { JsTree, JsTreeDef, MapJsTree } from "./tree";
@@ -84,6 +87,7 @@ export {
   type AotLinearizeResult,
   type BackendCapabilities,
   type CacheSizes,
+  calibrateGpu,
   type CapturedCode,
   type CapturedKernel,
   type CapturedProgram,
@@ -91,6 +95,7 @@ export {
   type CapturedSubProgram,
   captureJitReport,
   type CodeCaptureEntry,
+  _setCalibrationState,
   type ConvClass,
   type Dim,
   type GpuTimingResult,
@@ -113,10 +118,10 @@ export {
   Jaxpr,
   jitCompile,
   JitProgram,
+  type JitReport,
   type JsTree,
   type JsTreeDef,
   type JitStepCounts,
-  type JitReport,
   _lastConvClass,
   _lastConvRewritten,
   _lastForiRewritten,
@@ -127,6 +132,7 @@ export {
   numpy,
   type OwnedFunction,
   type PrimalArtifact,
+  type PerformanceBeliefState,
   type PullbackArtifact,
   getWebGPUDevice,
   random,
