@@ -52,7 +52,14 @@ export interface BackendCapabilities {
    * The vendor class mapped from feature flags and limits (e.g., "apple", "discrete-modern", "igp").
    * See `deriveHardwareProfile()` in `src/backend/webgpu.ts` for classification rules.
    */
-  readonly inferredVendorClass?: "apple" | "discrete-modern" | "discrete-legacy" | "igp" | "mobile" | "discrete-minimal" | "unknown";
+  readonly inferredVendorClass?:
+    | "apple"
+    | "discrete-modern"
+    | "discrete-legacy"
+    | "igp"
+    | "mobile"
+    | "discrete-minimal"
+    | "unknown";
   /**
    * Per-thread register budget (words) before spill likely begins.
    * From runtime model R_opt_words. Defaults to 128 for unknown hardware.
@@ -554,9 +561,13 @@ export function _setCalibrationState(state: "pending" | "off"): void {
 export async function calibrateGpu(): Promise<void> {
   if (_calibrationState === "done" || _calibrationState === "off") return;
 
-  const backend = initializedBackends.get("webgpu") as WebGPUBackend | undefined;
+  const backend = initializedBackends.get("webgpu") as
+    | WebGPUBackend
+    | undefined;
   if (!backend) {
-    throw new Error("WebGPU backend not initialized, call init('webgpu') first");
+    throw new Error(
+      "WebGPU backend not initialized, call init('webgpu') first",
+    );
   }
 
   _calibrationState = "running";

@@ -43,7 +43,9 @@ const WARMUP_ITERATIONS = 3;
 const MEASURE_ITERATIONS = 5;
 
 /** Run the full microbenchmark suite on a GPUDevice. */
-export async function runMicrobenchmarks(device: GPUDevice): Promise<PerformanceBeliefState> {
+export async function runMicrobenchmarks(
+  device: GPUDevice,
+): Promise<PerformanceBeliefState> {
   if (DEBUG >= 1) console.log("[microbench] starting calibration");
   const t0 = performance.now();
 
@@ -69,8 +71,8 @@ export async function runMicrobenchmarks(device: GPUDevice): Promise<Performance
     const elapsed = (performance.now() - t0).toFixed(1);
     console.log(
       `[microbench] calibration done in ${elapsed}ms: ` +
-      `dispatch=${dispatchOverheadUs.toFixed(1)}µs bw=${bandwidthGBs.toFixed(1)}GB/s ` +
-      `tflops=${tflops.toFixed(3)} barrier=${barrierCostFactor.toFixed(2)} rOpt=${rOptWords}`
+        `dispatch=${dispatchOverheadUs.toFixed(1)}µs bw=${bandwidthGBs.toFixed(1)}GB/s ` +
+        `tflops=${tflops.toFixed(3)} barrier=${barrierCostFactor.toFixed(2)} rOpt=${rOptWords}`,
     );
   }
   return state;
@@ -79,7 +81,11 @@ export async function runMicrobenchmarks(device: GPUDevice): Promise<Performance
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /** Create a compute pipeline from inline WGSL. */
-function createPipeline(device: GPUDevice, wgsl: string, label: string): GPUComputePipeline {
+function createPipeline(
+  device: GPUDevice,
+  wgsl: string,
+  label: string,
+): GPUComputePipeline {
   const module = device.createShaderModule({ code: wgsl, label });
   return device.createComputePipeline({
     layout: "auto",
@@ -150,9 +156,15 @@ async function measureDispatchOverhead(device: GPUDevice): Promise<number> {
   // Linear regression: ms = base + count * C_dispatch_ms
   // Use least-squares on the (count, ms) pairs.
   const n = results.length;
-  let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+  let sumX = 0,
+    sumY = 0,
+    sumXY = 0,
+    sumXX = 0;
   for (const { count, ms } of results) {
-    sumX += count; sumY += ms; sumXY += count * ms; sumXX += count * count;
+    sumX += count;
+    sumY += ms;
+    sumXY += count * ms;
+    sumXX += count * count;
   }
   const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
   const dispatchUs = Math.max(1, slope * 1000); // ms → µs, floor at 1µs
@@ -175,11 +187,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
-async function measureBandwidth(device: GPUDevice, cDispatchUs: number): Promise<number> {
+async function measureBandwidth(
+  device: GPUDevice,
+  cDispatchUs: number,
+): Promise<number> {
   // Use a buffer larger than typical L2 caches (e.g., RTX 4070 Ti has 48MB L2).
   // 4M vec4s = 64MB buffer -> 128MB total footprint per pass.
   // We cap the allocation to device.limits.maxBufferSize / 2 if needed.
-  const limitMaxTokens = Math.floor((device.limits.maxBufferSize ?? 268435456) / 2 / 16);
+  const limitMaxTokens = Math.floor(
+    (device.limits.maxBufferSize ?? 268435456) / 2 / 16,
+  );
   const numVec4 = Math.min(4 * 1024 * 1024, limitMaxTokens); // up to 64MB per buffer
   const byteSize = numVec4 * 16;
   const workgroups = Math.ceil(numVec4 / 256);
@@ -208,7 +225,7 @@ async function measureBandwidth(device: GPUDevice, cDispatchUs: number): Promise
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     for (let i = 0; i < 10; i++) {
-        pass.dispatchWorkgroups(workgroups);
+      pass.dispatchWorkgroups(workgroups);
     }
     pass.end();
   });
@@ -217,7 +234,7 @@ async function measureBandwidth(device: GPUDevice, cDispatchUs: number): Promise
   dstBuf.destroy();
 
   // Subtract base dispatch overhead to uncover true throughput.
-  const effectiveMs = Math.max(0.1, ms - (cDispatchUs / 1000));
+  const effectiveMs = Math.max(0.1, ms - cDispatchUs / 1000);
 
   // byteSize read + byteSize written; convert ms → seconds
   const bwGBs = (2 * byteSize * 10) / (effectiveMs / 1000) / 1e9;
@@ -242,7 +259,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
-async function measureTflops(device: GPUDevice, cDispatchUs: number): Promise<number> {
+async function measureTflops(
+  device: GPUDevice,
+  cDispatchUs: number,
+): Promise<number> {
   // Launch 2M threads. Each does 4096 FMAs.
   // 2M * 4096 * 2 = 17.1 GFLOPs per dispatch.
   const numThreads = 2048 * 1024;
@@ -261,7 +281,7 @@ async function measureTflops(device: GPUDevice, cDispatchUs: number): Promise<nu
     entries: [{ binding: 0, resource: { buffer: outBuf } }],
   });
 
-  // dispatch 10 times to accumulate ~171 GFLOPs. 
+  // dispatch 10 times to accumulate ~171 GFLOPs.
   // Intel @ 1 TFLOPS ≈ 171ms. RTX 4070Ti @ 22 TFLOPS ≈ 7.7ms.
   const ms = await timedGpuMs(device, (enc) => {
     const pass = enc.beginComputePass();
@@ -275,7 +295,7 @@ async function measureTflops(device: GPUDevice, cDispatchUs: number): Promise<nu
 
   outBuf.destroy();
 
-  const effectiveMs = Math.max(0.1, ms - (cDispatchUs / 1000));
+  const effectiveMs = Math.max(0.1, ms - cDispatchUs / 1000);
   const tflops = (totalFlops * 10) / (effectiveMs / 1000) / 1e12;
   return Math.max(0.01, tflops); // floor at 0.01 TFLOPS
 }
@@ -327,8 +347,16 @@ async function measureBarrierCost(device: GPUDevice): Promise<number> {
     usage: GPUBufferUsage.STORAGE,
   });
 
-  const barrierPipeline = createPipeline(device, BARRIER_SHADER, "microbench-barrier");
-  const noBarrierPipeline = createPipeline(device, NO_BARRIER_SHADER, "microbench-no-barrier");
+  const barrierPipeline = createPipeline(
+    device,
+    BARRIER_SHADER,
+    "microbench-barrier",
+  );
+  const noBarrierPipeline = createPipeline(
+    device,
+    NO_BARRIER_SHADER,
+    "microbench-no-barrier",
+  );
 
   const barrierBG = device.createBindGroup({
     layout: barrierPipeline.getBindGroupLayout(0),
@@ -410,7 +438,11 @@ async function measureRopt(device: GPUDevice): Promise<number> {
   for (const regs of regCounts) {
     let pipeline: GPUComputePipeline;
     try {
-      pipeline = createPipeline(device, makeRegShader(regs), `microbench-reg-${regs}`);
+      pipeline = createPipeline(
+        device,
+        makeRegShader(regs),
+        `microbench-reg-${regs}`,
+      );
     } catch {
       // Shader compilation failure at high register counts — stop probing.
       break;
@@ -421,13 +453,17 @@ async function measureRopt(device: GPUDevice): Promise<number> {
       entries: [{ binding: 0, resource: { buffer: outBuf } }],
     });
 
-    const ms = await timedGpuMs(device, (enc) => {
-      const pass = enc.beginComputePass();
-      pass.setPipeline(pipeline);
-      pass.setBindGroup(0, bg);
-      pass.dispatchWorkgroups(workgroups);
-      pass.end();
-    }, 3); // fewer iterations since we have many probes
+    const ms = await timedGpuMs(
+      device,
+      (enc) => {
+        const pass = enc.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bg);
+        pass.dispatchWorkgroups(workgroups);
+        pass.end();
+      },
+      3,
+    ); // fewer iterations since we have many probes
 
     // Throughput: FMA ops / ms (higher is better)
     const fmaOps = numThreads * regs * 4; // 4 rounds of FMAs

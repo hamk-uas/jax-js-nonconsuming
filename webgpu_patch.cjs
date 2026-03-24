@@ -1,6 +1,6 @@
-const fs = require('fs');
+const fs = require("fs");
 
-let webgpu = fs.readFileSync('src/backend/webgpu.ts', 'utf8');
+let webgpu = fs.readFileSync("src/backend/webgpu.ts", "utf8");
 
 // We will inject PendingCommandTape right before WebGPUBackend!
 
@@ -76,5 +76,8 @@ class PendingCommandTape implements IPendingExecute {
 }
 `;
 
-webgpu = webgpu.replace('export class WebGPUBackend implements Backend {', pendingCode + '\nexport class WebGPUBackend implements Backend {');
-fs.writeFileSync('src/backend/webgpu.ts', webgpu);
+webgpu = webgpu.replace(
+  "export class WebGPUBackend implements Backend {",
+  pendingCode + "\nexport class WebGPUBackend implements Backend {",
+);
+fs.writeFileSync("src/backend/webgpu.ts", webgpu);

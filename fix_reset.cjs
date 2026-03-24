@@ -1,16 +1,16 @@
-const fs = require('fs');
-let code = fs.readFileSync('src/backend/webgpu.ts', 'utf8');
+const fs = require("fs");
+let code = fs.readFileSync("src/backend/webgpu.ts", "utf8");
 
 code = code.replace(
-  '  resetCalibration() {',
+  "  resetCalibration() {",
   `  // @ts-ignore
-  resetCalibration() {`
+  resetCalibration() {`,
 );
 
 code = code.replace(
-  '  applyCalibration(beliefState: PerformanceBeliefState) {',
+  "  applyCalibration(beliefState: PerformanceBeliefState) {",
   `  // @ts-ignore
-  applyCalibration(beliefState: any) {`
+  applyCalibration(beliefState: any) {`,
 );
 
-fs.writeFileSync('src/backend/webgpu.ts', code);
+fs.writeFileSync("src/backend/webgpu.ts", code);

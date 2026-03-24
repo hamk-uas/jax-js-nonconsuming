@@ -9,8 +9,8 @@ import {
   Kernel,
   Reduction,
 } from "../alu";
-import { Backend, BackendCapabilities, Slot, staticCapabilityFingerprint } from "../backend";
-import { evaluateTotalCost, type CostFeatures } from "../tuner";
+import { Backend, Slot, staticCapabilityFingerprint } from "../backend";
+import { type CostFeatures, evaluateTotalCost } from "../tuner";
 import { aluCompare, IPendingExecute } from "./array";
 import { executeBlockMap } from "./block-map-executor";
 import {
@@ -454,8 +454,12 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
   const newEqns: JaxprEqn[] = [];
 
   if (DEBUG >= 1) {
-    const foriCount = jaxpr.eqns.filter(e => e.primitive === Primitive.ForiLoop).length;
-    console.info(`rewriteForiLoopToBlockMap: ${jaxpr.eqns.length} eqns, ${foriCount} ForiLoop`);
+    const foriCount = jaxpr.eqns.filter(
+      (e) => e.primitive === Primitive.ForiLoop,
+    ).length;
+    console.info(
+      `rewriteForiLoopToBlockMap: ${jaxpr.eqns.length} eqns, ${foriCount} ForiLoop`,
+    );
   }
 
   for (const eqn of jaxpr.eqns) {
@@ -490,7 +494,8 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
     }
     const carryShape = carries[0].aval.shape;
     if (hasSymbolicDims(carryShape) || carryShape.length === 0) {
-      if (DEBUG >= 1) console.info(`  fori rewrite SKIP: symbolic/scalar carry`);
+      if (DEBUG >= 1)
+        console.info(`  fori rewrite SKIP: symbolic/scalar carry`);
       newEqns.push(eqn);
       continue;
     }
@@ -511,13 +516,22 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
       if (DEBUG >= 1) {
         for (const e of bodyJaxpr.eqns) {
           if (!pointwisePrimitives.has(e.primitive)) {
-            console.info(`  fori rewrite SKIP: non-pointwise primitive #${e.primitive}`);
+            console.info(
+              `  fori rewrite SKIP: non-pointwise primitive #${e.primitive}`,
+            );
             break;
           }
           for (const ob of e.outBinders) {
             const s = ob.aval.shape;
-            if (s.length > 0 && !(s.length === cShape.length && s.every((d, i) => d === cShape[i]))) {
-              console.info(`  fori rewrite SKIP: shape mismatch [${s}] vs carry [${cShape}]`);
+            if (
+              s.length > 0 &&
+              !(
+                s.length === cShape.length && s.every((d, i) => d === cShape[i])
+              )
+            ) {
+              console.info(
+                `  fori rewrite SKIP: shape mismatch [${s}] vs carry [${cShape}]`,
+              );
               break;
             }
           }
@@ -560,7 +574,7 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
     const rank = cShape.length;
     let blockShape: number[];
     const maxWg = backend.capabilities.maxComputeWorkgroupSizeX ?? 256;
-    
+
     if (rank === 1) {
       let bestCost = Infinity;
       let bestB = 64;
@@ -584,7 +598,10 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
         }
       }
       blockShape = [Math.min(bestB, cShape[0])];
-      if (DEBUG >= 4) console.info(`rewriteForiLoopToBlockMap: 1D blockShape=[${blockShape}]`);
+      if (DEBUG >= 4)
+        console.info(
+          `rewriteForiLoopToBlockMap: 1D blockShape=[${blockShape}]`,
+        );
     } else if (rank === 2) {
       // For 2D, pick from candidates via cost equation
       const candidates = [
@@ -598,7 +615,7 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
       for (const c of candidates) {
         if (c[0] * c[1] > maxWg) continue;
         if (c[0] > cShape[0] || c[1] > cShape[1]) continue;
-        
+
         const bSize = c[0] * c[1];
         const features: CostFeatures = {
           nDispatch: 1,
@@ -618,7 +635,10 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
         }
       }
       blockShape = bestC;
-      if (DEBUG >= 4) console.info(`rewriteForiLoopToBlockMap: 2D blockShape=[${blockShape}]`);
+      if (DEBUG >= 4)
+        console.info(
+          `rewriteForiLoopToBlockMap: 2D blockShape=[${blockShape}]`,
+        );
     } else {
       // rank ≥ 3: tile first 2 dims only, rest handled per element
       // Punt for now — complex to get right. Fall through.
@@ -654,7 +674,8 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
     const maxShmem =
       backend.capabilities.maxComputeWorkgroupStorageSize ?? 16384;
     if (shmemBytes > maxShmem) {
-      if (DEBUG >= 1) console.info(`  fori rewrite SKIP: shmem ${shmemBytes} > ${maxShmem}`);
+      if (DEBUG >= 1)
+        console.info(`  fori rewrite SKIP: shmem ${shmemBytes} > ${maxShmem}`);
       newEqns.push(eqn);
       continue;
     }
@@ -1335,7 +1356,10 @@ export class JitProgram {
           : null;
       }
       if (this._commandTape) {
-        return (this.backend as WebGPUBackend).executeCommandTape(this._commandTape, inputs);
+        return (this.backend as WebGPUBackend).executeCommandTape(
+          this._commandTape,
+          inputs,
+        );
       }
     }
 
@@ -2245,12 +2269,19 @@ export function jitCompile(
   const caps = backend.capabilities;
   let capsKey = "";
   if (caps.calibrated) {
-    const r = (v: number | undefined) => v != null ? Number(v.toPrecision(3)) : 0;
-    capsKey = "," + staticCapabilityFingerprint(caps)
-      + ",d" + r(caps.dispatchOverheadUs)
-      + "b" + r(caps.bandwidthGBs)
-      + "t" + r(caps.tflops)
-      + "r" + (caps.rOptWords ?? 0);
+    const r = (v: number | undefined) =>
+      v != null ? Number(v.toPrecision(3)) : 0;
+    capsKey =
+      "," +
+      staticCapabilityFingerprint(caps) +
+      ",d" +
+      r(caps.dispatchOverheadUs) +
+      "b" +
+      r(caps.bandwidthGBs) +
+      "t" +
+      r(caps.tflops) +
+      "r" +
+      (caps.rOptWords ?? 0);
   }
   const cacheKey = backend.type + "," + FpHash.hash(jaxpr) + capsKey;
 

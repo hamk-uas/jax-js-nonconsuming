@@ -1,8 +1,8 @@
-const fs = require('fs');
-let code = fs.readFileSync('src/backend/webgpu.ts', 'utf8');
+const fs = require("fs");
+let code = fs.readFileSync("src/backend/webgpu.ts", "utf8");
 
 code = code.replace(
-  '  readonly capabilities: BackendCapabilities;',
+  "  readonly capabilities: BackendCapabilities;",
   `  readonly capabilities: BackendCapabilities;
 
   // Added dynamically by JIT calibration
@@ -18,7 +18,7 @@ code = code.replace(
     this.capabilities.rOptWords = beliefState.rOptWords;
     this.capabilities.calibrated = true;
     _clearJitCompileCache();
-  }`
+  }`,
 );
 
-fs.writeFileSync('src/backend/webgpu.ts', code);
+fs.writeFileSync("src/backend/webgpu.ts", code);

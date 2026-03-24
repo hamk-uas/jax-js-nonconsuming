@@ -1,5 +1,6 @@
 import { DType } from "./alu";
 import {
+  _setCalibrationState,
   calibrateGpu,
   defaultDevice,
   Device,
@@ -7,7 +8,6 @@ import {
   getBackend,
   getWebGPUDevice,
   init,
-  _setCalibrationState,
   setCodeCapture,
 } from "./backend";
 import type {
@@ -15,7 +15,6 @@ import type {
   CodeCaptureEntry,
   GpuTimingResult,
 } from "./backend";
-import type { PerformanceBeliefState } from "./microbench";
 import { type Dim, hasSymbolicDims, isSymbolicDim, SymDim } from "./dim";
 import { Array, ArrayLike } from "./frontend/array";
 import { aotLinearize } from "./frontend/artifacts";
@@ -58,12 +57,22 @@ import {
 import * as jvpModule from "./frontend/jvp";
 import * as linearizeModule from "./frontend/linearize";
 import * as vmapModule from "./frontend/vmap";
+import { captureJitReport, formatJitReport } from "./jit-capture";
+import type {
+  CapturedCode,
+  CapturedKernel,
+  CapturedProgram,
+  CapturedRoutine,
+  CapturedSubProgram,
+  JitReport,
+} from "./jit-capture";
 import * as lax from "./library/lax";
 import * as nn from "./library/nn";
 import * as numpy from "./library/numpy";
 import * as random from "./library/random";
 import * as scipyLinalg from "./library/scipy-linalg";
 import * as scipySpecial from "./library/scipy-special";
+import type { PerformanceBeliefState } from "./microbench";
 import { startTrace, stopTrace } from "./tracing";
 import * as tree from "./tree";
 import type { JsTree, JsTreeDef, MapJsTree } from "./tree";
@@ -79,6 +88,12 @@ export {
   type BackendCapabilities,
   type CacheSizes,
   calibrateGpu,
+  type CapturedCode,
+  type CapturedKernel,
+  type CapturedProgram,
+  type CapturedRoutine,
+  type CapturedSubProgram,
+  captureJitReport,
   type CodeCaptureEntry,
   _setCalibrationState,
   type ConvClass,
@@ -95,6 +110,7 @@ export {
   DType,
   type EffectVerificationResult,
   _fusedCacheCompileCount,
+  formatJitReport,
   getBackend,
   getCacheSizes,
   hasSymbolicDims,
@@ -102,6 +118,7 @@ export {
   Jaxpr,
   jitCompile,
   JitProgram,
+  type JitReport,
   type JsTree,
   type JsTreeDef,
   type JitStepCounts,

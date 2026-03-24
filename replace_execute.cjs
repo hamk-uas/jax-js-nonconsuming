@@ -1,9 +1,10 @@
-const fs = require('fs');
+const fs = require("fs");
 
-let code = fs.readFileSync('src/backend/webgpu.ts', 'utf8');
+let code = fs.readFileSync("src/backend/webgpu.ts", "utf8");
 
 // I will find executeCommandTape completely and rewrite it:
-const searchStart = "  executeCommandTape(tape: WebGPUCommandTape, inputSlots: Slot[]): Slot[] {";
+const searchStart =
+  "  executeCommandTape(tape: WebGPUCommandTape, inputSlots: Slot[]): Slot[] {";
 
 const replacementCode = `  executeCommandTape(tape: WebGPUCommandTape, inputSlots: Slot[]): { outputs: Slot[]; pending: IPendingExecute[] } {
     // We execute synchronously only what is strictly necessary to return valid Slots!
@@ -59,22 +60,25 @@ let braceCount = 0;
 let inMethod = false;
 let endIndex = -1;
 for (let i = startIndex; i < code.length; i++) {
-   if (code[i] === '{') {
-     braceCount++;
-     inMethod = true;
-   }
-   if (code[i] === '}') {
-     braceCount--;
-     if (inMethod && braceCount === 0) {
-       endIndex = i;
-       break;
-     }
-   }
+  if (code[i] === "{") {
+    braceCount++;
+    inMethod = true;
+  }
+  if (code[i] === "}") {
+    braceCount--;
+    if (inMethod && braceCount === 0) {
+      endIndex = i;
+      break;
+    }
+  }
 }
 
 let methodBody = code.substring(startIndex, endIndex);
 
-methodBody = methodBody.replace('executeCommandTape(tape: WebGPUCommandTape, inputSlots: Slot[]): Slot[] {', '_executeCommandTapeDeferred(tape: WebGPUCommandTape, inputSlots: Slot[], outputSlots: Slot[], outputTableIdxs: number[]) {');
+methodBody = methodBody.replace(
+  "executeCommandTape(tape: WebGPUCommandTape, inputSlots: Slot[]): Slot[] {",
+  "_executeCommandTapeDeferred(tape: WebGPUCommandTape, inputSlots: Slot[], outputSlots: Slot[], outputTableIdxs: number[]) {",
+);
 
 // Remove output slot creation from the deferred body
 const endBlockReplace = `    // Create output slots
@@ -92,21 +96,32 @@ const endBlockReplace = `    // Create output slots
     return outputs;`;
 
 if (methodBody.includes(endBlockReplace)) {
-    methodBody = methodBody.replace(endBlockReplace, `    // Populate pre-created output slots!
+  methodBody = methodBody.replace(
+    endBlockReplace,
+    `    // Populate pre-created output slots!
     for (let i = 0; i < outputTableIdxs.length; i++) {
       const idx = outputTableIdxs[i];
       this.buffers.get(outputSlots[i])!.buffer = buffers[idx];
-    }`);
+    }`,
+  );
 } else {
-    console.log("Could not find end block, checking manually");
-    // fallback replacing
-    methodBody = methodBody.replace(/\/\/ Create output slots[\s\S]+return outputs;/, `    // Populate pre-created output slots!
+  console.log("Could not find end block, checking manually");
+  // fallback replacing
+  methodBody = methodBody.replace(
+    /\/\/ Create output slots[\s\S]+return outputs;/,
+    `    // Populate pre-created output slots!
     for (let i = 0; i < outputTableIdxs.length; i++) {
       const idx = outputTableIdxs[i];
       this.buffers.get(outputSlots[i])!.buffer = buffers[idx];
-    }`);
+    }`,
+  );
 }
 
-const newCode = code.substring(0, startIndex) + replacementCode + '\n    ' + methodBody.substring(methodBody.indexOf('{') + 1) + code.substring(endIndex);
+const newCode =
+  code.substring(0, startIndex) +
+  replacementCode +
+  "\n    " +
+  methodBody.substring(methodBody.indexOf("{") + 1) +
+  code.substring(endIndex);
 
-fs.writeFileSync('src/backend/webgpu.ts', newCode);
+fs.writeFileSync("src/backend/webgpu.ts", newCode);

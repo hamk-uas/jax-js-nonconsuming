@@ -1,7 +1,17 @@
-import { init, defaultDevice, jit, numpy as np, lax, setDebug, _lastForiRewritten, clearCaches, getWebGPUDevice } from "@hamk-uas/jax-js-nonconsuming";
+import {
+  _lastForiRewritten,
+  defaultDevice,
+  getWebGPUDevice,
+  init,
+  jit,
+  lax,
+  numpy as np,
+  setDebug,
+} from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, it } from "vitest";
 
-const width = 1000, height = 800;
+const width = 1000,
+  height = 800;
 
 function calculateMandelbrotForiLoop(iters: number): np.Array {
   using x = np.linspace(-2, 0.5, width);
@@ -9,10 +19,17 @@ function calculateMandelbrotForiLoop(iters: number): np.Array {
   const [X, Y] = np.meshgrid([x, y]);
 
   using f = jit(
-    (A: np.Array, B: np.Array, V: np.Array, X: np.Array, Y: np.Array): np.Array => {
+    (
+      A: np.Array,
+      B: np.Array,
+      V: np.Array,
+      X: np.Array,
+      Y: np.Array,
+    ): np.Array => {
       type Carry = { A: np.Array; B: np.Array; V: np.Array };
       const result = lax.foriLoop(
-        0, iters,
+        0,
+        iters,
         (_i: np.Array, carry: Carry): Carry => {
           const { A, B, V } = carry;
           using Asq = A.mul(A);
@@ -54,18 +71,24 @@ defaultDevice("webgpu");
 describe("mandelbrot foriLoop perf diagnostic", () => {
   it("measures performance", async () => {
     const device = getWebGPUDevice();
-    console.log(`maxComputeWorkgroupStorageSize: ${device.limits.maxComputeWorkgroupStorageSize}`);
-    console.log(`maxComputeWorkgroupSizeX: ${device.limits.maxComputeWorkgroupSizeX}`);
+    console.log(
+      `maxComputeWorkgroupStorageSize: ${device.limits.maxComputeWorkgroupStorageSize}`,
+    );
+    console.log(
+      `maxComputeWorkgroupSizeX: ${device.limits.maxComputeWorkgroupSizeX}`,
+    );
     console.log(`adapterInfo: ${JSON.stringify(device.adapterInfo)}`);
-    
+
     setDebug(1);
     // 1st run - compilation
     const t1 = performance.now();
     {
       using result = calculateMandelbrotForiLoop(100);
-      const data = await result.data();
+      await result.data();
       const elapsed1 = performance.now() - t1;
-      console.log(`1st run: ${elapsed1.toFixed(1)} ms, shape=${result.shape}, foriRewritten=${_lastForiRewritten()}`);
+      console.log(
+        `1st run: ${elapsed1.toFixed(1)} ms, shape=${result.shape}, foriRewritten=${_lastForiRewritten()}`,
+      );
     }
 
     setDebug(0);
@@ -74,7 +97,7 @@ describe("mandelbrot foriLoop perf diagnostic", () => {
     const t2 = performance.now();
     {
       using result = calculateMandelbrotForiLoop(100);
-      const data = await result.data();
+      await result.data();
       const elapsed2 = performance.now() - t2;
       console.log(`2nd run: ${elapsed2.toFixed(1)} ms`);
     }
@@ -83,7 +106,7 @@ describe("mandelbrot foriLoop perf diagnostic", () => {
     const t3 = performance.now();
     {
       using result = calculateMandelbrotForiLoop(100);
-      const data = await result.data();
+      await result.data();
       const elapsed3 = performance.now() - t3;
       console.log(`3rd run: ${elapsed3.toFixed(1)} ms`);
     }

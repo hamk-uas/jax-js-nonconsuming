@@ -7,6 +7,7 @@
  * Requires WebGPU — skipped when no WebGPU adapter is available.
  */
 import {
+  _setCalibrationState,
   calibrateGpu,
   clearCaches,
   defaultDevice,
@@ -14,11 +15,8 @@ import {
   init,
   jit,
   numpy as np,
-  _setCalibrationState,
-  type PerformanceBeliefState,
-  type BackendCapabilities,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 // init with calibration off so we control timing
 _setCalibrationState("off");
@@ -53,8 +51,12 @@ describe.skipIf(!hasWebGPU)("microbench calibration", () => {
     expect(capsAfter.rOptWords).toBeGreaterThanOrEqual(16);
 
     // Immutable limits should be preserved
-    expect(capsAfter.maxComputeWorkgroupSizeX).toBe(capsBefore.maxComputeWorkgroupSizeX);
-    expect(capsAfter.maxComputeWorkgroupStorageSize).toBe(capsBefore.maxComputeWorkgroupStorageSize);
+    expect(capsAfter.maxComputeWorkgroupSizeX).toBe(
+      capsBefore.maxComputeWorkgroupSizeX,
+    );
+    expect(capsAfter.maxComputeWorkgroupStorageSize).toBe(
+      capsBefore.maxComputeWorkgroupStorageSize,
+    );
     expect(capsAfter.shaderF16).toBe(capsBefore.shaderF16);
     expect(capsAfter.subgroups).toBe(capsBefore.subgroups);
   });

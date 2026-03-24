@@ -1,11 +1,17 @@
-const fs = require('fs');
-let code = fs.readFileSync('src/backend/webgpu.ts', 'utf8');
+const fs = require("fs");
+let code = fs.readFileSync("src/backend/webgpu.ts", "utf8");
 
-if (!code.includes('IPendingExecute')) {
-    code = code.replace('import type { Backend, ExecutionContext } from "../backend.js";', 'import type { Backend, ExecutionContext } from "../backend.js";\nimport type { IPendingExecute } from "../frontend/array.js";');
+if (!code.includes("IPendingExecute")) {
+  code = code.replace(
+    'import type { Backend, ExecutionContext } from "../backend.js";',
+    'import type { Backend, ExecutionContext } from "../backend.js";\nimport type { IPendingExecute } from "../frontend/array.js";',
+  );
 }
 
-code = code.replace(/class PendingCommandTape implements IPendingExecute \{[\s\S]*?submit\(\) \{[\s\S]*?\}\n\}/g, '');
+code = code.replace(
+  /class PendingCommandTape implements IPendingExecute \{[\s\S]*?submit\(\) \{[\s\S]*?\}\n\}/g,
+  "",
+);
 
 const finalPendingClass = `
 class PendingCommandTape implements IPendingExecute {
@@ -70,5 +76,8 @@ class PendingCommandTape implements IPendingExecute {
 }
 `;
 
-code = code.replace('export class WebGPUBackend implements Backend {', finalPendingClass + '\nexport class WebGPUBackend implements Backend {');
-fs.writeFileSync('src/backend/webgpu.ts', code);
+code = code.replace(
+  "export class WebGPUBackend implements Backend {",
+  finalPendingClass + "\nexport class WebGPUBackend implements Backend {",
+);
+fs.writeFileSync("src/backend/webgpu.ts", code);

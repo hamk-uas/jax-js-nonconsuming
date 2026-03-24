@@ -172,9 +172,14 @@ export async function measurePerf(): Promise<PerfResults> {
   // Intel iGPUs need a longer timeout: calibration (~3s) + JIT compilation
   // (~1s) + warmup dispatches eat most of the default 8s budget, leaving
   // insufficient time for the timed batches.
-  const gpuTimeout = (isIntel && !isIntelArc) ? 20000 : 8000;
+  const gpuTimeout = isIntel && !isIntelArc ? 20000 : 8000;
 
-  const fp32Result = await benchFlops(gpuDim, "webgpu", "float32" as DType, gpuTimeout);
+  const fp32Result = await benchFlops(
+    gpuDim,
+    "webgpu",
+    "float32" as DType,
+    gpuTimeout,
+  );
 
   // Flush JIT caches + buffer pool between dtype benchmarks to ensure the
   // fp16 run starts with a clean GPU state (no stale pipeline / pool

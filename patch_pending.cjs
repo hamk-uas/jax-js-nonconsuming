@@ -1,5 +1,5 @@
-const fs = require('fs');
-let code = fs.readFileSync('src/backend/webgpu.ts', 'utf8');
+const fs = require("fs");
+let code = fs.readFileSync("src/backend/webgpu.ts", "utf8");
 
 const classCode = `
 class PendingCommandTape implements IPendingExecute {
@@ -65,5 +65,8 @@ class PendingCommandTape implements IPendingExecute {
 }
 `;
 
-code = code.replace('export class WebGPUBackend implements Backend {', classCode + '\nexport class WebGPUBackend implements Backend {');
-fs.writeFileSync('src/backend/webgpu.ts', code);
+code = code.replace(
+  "export class WebGPUBackend implements Backend {",
+  classCode + "\nexport class WebGPUBackend implements Backend {",
+);
+fs.writeFileSync("src/backend/webgpu.ts", code);

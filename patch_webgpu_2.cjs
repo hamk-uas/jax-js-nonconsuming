@@ -1,8 +1,8 @@
-const fs = require('fs');
-let code = fs.readFileSync('src/backend/webgpu.ts', 'utf8');
+const fs = require("fs");
+let code = fs.readFileSync("src/backend/webgpu.ts", "utf8");
 
 code = code.replace(
-  '  #getLayout(shader: ShaderInfo): GPUPipelineLayout {',
+  "  #getLayout(shader: ShaderInfo): GPUPipelineLayout {",
   `
   getLayout(shader: ShaderInfo): GPUBindGroupLayout {
     const key = \`\${shader.numInputs}:\${shader.numOutputs}\`;
@@ -53,16 +53,24 @@ code = code.replace(
     return cached;
   }
 
-  #getLayout(shader: ShaderInfo): GPUPipelineLayout {`
+  #getLayout(shader: ShaderInfo): GPUPipelineLayout {`,
 );
 
-let start = code.indexOf('    const bindGroupLayouts: GPUBindGroupLayout[] = [');
-let end = code.indexOf('    const layout = this.device.createPipelineLayout({ bindGroupLayouts });', start);
+let start = code.indexOf(
+  "    const bindGroupLayouts: GPUBindGroupLayout[] = [",
+);
+let end = code.indexOf(
+  "    const layout = this.device.createPipelineLayout({ bindGroupLayouts });",
+  start,
+);
 console.log(start, end);
 
 if (start !== -1 && end !== -1) {
   let toReplace = code.substring(start, end);
-  code = code.replace(toReplace, `    const bindGroupLayouts = shader.hasUniform || (shader.numUniformConsts ?? 0) > 0 ? [this.getLayout(shader), this.getUniformLayout(shader)] : [this.getLayout(shader)];\n\n`);
+  code = code.replace(
+    toReplace,
+    `    const bindGroupLayouts = shader.hasUniform || (shader.numUniformConsts ?? 0) > 0 ? [this.getLayout(shader), this.getUniformLayout(shader)] : [this.getLayout(shader)];\n\n`,
+  );
 }
 
-fs.writeFileSync('src/backend/webgpu.ts', code);
+fs.writeFileSync("src/backend/webgpu.ts", code);

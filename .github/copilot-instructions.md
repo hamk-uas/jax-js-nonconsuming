@@ -484,8 +484,7 @@ All public symbols must be exported from `src/index.ts`. Key exports: `jit`, `gr
 `jvp`, `vjp`, `vmap`, `jacfwd`, `jacrev`, `hessian`, `linearize`, `makeJaxpr`, `init`,
 `defaultDevice`, `devicePut`, `blockUntilReady`, `scatterAdd`, `clearCaches`, `checkLeaks`, `numpy`,
 `lax`, `nn`, `random`, `scipySpecial`, `scipyLinalg`, `tree`, `ScanPath`, `profileGpu`,
-`profileGpuDetailed`, `setCodeCapture`, `CodeCaptureEntry`, `getWebGPUDevice`,
-`calibrateGpu`.
+`profileGpuDetailed`, `setCodeCapture`, `CodeCaptureEntry`, `getWebGPUDevice`, `calibrateGpu`.
 
 Internal-only exports (underscore prefix, not public API): `_lastConvClass`, `_lastConvRewritten`,
 `_lastForiRewritten`, `_setCalibrationState`.

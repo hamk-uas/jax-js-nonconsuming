@@ -45,7 +45,9 @@ describe("profileGpu", () => {
       defaultDevice("webgpu");
       profiler.startTrace();
       try {
-        await expect(profileGpu(() => 42)).rejects.toThrow(/stopTrace|tracing/i);
+        await expect(profileGpu(() => 42)).rejects.toThrow(
+          /stopTrace|tracing/i,
+        );
       } finally {
         profiler.stopTrace();
       }

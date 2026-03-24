@@ -356,19 +356,7 @@ function _beginComputePass(
 
 /** Implementation of `Backend` that uses WebGPU in browsers. */
 
-
-
-
-
-
-
-
-
-
-
-
-
-class PendingCommandTape implements IPendingExecute {
+class _PendingCommandTape implements IPendingExecute {
   prepared: any = null;
   submitted = false;
   #promise: Promise<void> | null = null;
@@ -379,11 +367,12 @@ class PendingCommandTape implements IPendingExecute {
     readonly tape: WebGPUCommandTape,
     readonly inputSlots: Slot[],
     readonly outputSlots: Slot[],
-    readonly outputTableIdxs: number[]
+    readonly outputTableIdxs: number[],
   ) {}
 
   updateRc(delta: number) {
-    if (this.#rc <= 0) throw new Error("internal: PendingCommandTape used rc<=0");
+    if (this.#rc <= 0)
+      throw new Error("internal: PendingCommandTape used rc<=0");
     this.#rc += delta;
   }
 
@@ -397,19 +386,35 @@ class PendingCommandTape implements IPendingExecute {
       const promises: Promise<any>[] = [];
       for (const op of this.tape.ops) {
         if (op.type === "dispatch") {
-           promises.push(this.backend.pipelines.prepare(op.dispatch.shader));
+          promises.push(this.backend.pipelines.prepare(op.dispatch.shader));
         } else if (op.type === "scan") {
-            const scan = op.scan as any;
-            if (scan.mode === "compiled-loop" && scan.nativeShader) promises.push(this.backend.pipelines.prepare(scan.nativeShader));
-            if (scan.mode === "preencoded-multi-step") {
-                if (scan.passShaders) scan.passShaders.forEach((s: any) => promises.push(this.backend.pipelines.prepare(s)));
-                if (scan.stepPipelines) scan.stepPipelines.forEach((s: any) => promises.push(this.backend.pipelines.prepare(s.shader)));
-                if (scan.yStackPipeline) promises.push(this.backend.pipelines.prepare(scan.yStackPipeline.shader));
-                if (scan.reductionPipeline) promises.push(this.backend.pipelines.prepare(scan.reductionPipeline.shader));
-            }
-            if (scan.mode === "preencoded-routine") {
-                if (scan.passShaders) scan.passShaders.forEach((s: any) => promises.push(this.backend.pipelines.prepare(s)));
-            }
+          const scan = op.scan as any;
+          if (scan.mode === "compiled-loop" && scan.nativeShader)
+            promises.push(this.backend.pipelines.prepare(scan.nativeShader));
+          if (scan.mode === "preencoded-multi-step") {
+            if (scan.passShaders)
+              scan.passShaders.forEach((s: any) =>
+                promises.push(this.backend.pipelines.prepare(s)),
+              );
+            if (scan.stepPipelines)
+              scan.stepPipelines.forEach((s: any) =>
+                promises.push(this.backend.pipelines.prepare(s.shader)),
+              );
+            if (scan.yStackPipeline)
+              promises.push(
+                this.backend.pipelines.prepare(scan.yStackPipeline.shader),
+              );
+            if (scan.reductionPipeline)
+              promises.push(
+                this.backend.pipelines.prepare(scan.reductionPipeline.shader),
+              );
+          }
+          if (scan.mode === "preencoded-routine") {
+            if (scan.passShaders)
+              scan.passShaders.forEach((s: any) =>
+                promises.push(this.backend.pipelines.prepare(s)),
+              );
+          }
         }
       }
       await Promise.all(promises);
@@ -425,7 +430,12 @@ class PendingCommandTape implements IPendingExecute {
     this.submitted = true;
     if (this.#rc <= 0) return;
 
-    this.backend._executeCommandTapeDeferred(this.tape, this.inputSlots, this.outputSlots, this.outputTableIdxs);
+    this.backend._executeCommandTapeDeferred(
+      this.tape,
+      this.inputSlots,
+      this.outputSlots,
+      this.outputTableIdxs,
+    );
   }
 }
 
@@ -435,7 +445,7 @@ export class WebGPUBackend implements Backend {
   readonly capabilities: BackendCapabilities;
 
   // Added dynamically by JIT calibration
-  // @ts-ignore
+
   resetCalibration() {
     // Clear all calibrated metrics to prevent stale values from poisoning
     // cost model decisions across test isolation boundaries.
@@ -448,7 +458,6 @@ export class WebGPUBackend implements Backend {
     delete caps.barrierCostFactor;
   }
 
-  // @ts-ignore
   applyCalibration(beliefState: any) {
     Object.assign(this.capabilities as any, beliefState);
     (this.capabilities as any).calibrated = true;
@@ -2623,8 +2632,8 @@ export class WebGPUBackend implements Backend {
         tableSize: nextIdx,
         inputTableIdxs,
         outputTableIdxs,
-      outputSizes: outputTableIdxs.map(idx => knownSizes.get(idx)!),
-      allocatedIdxs,
+        outputSizes: outputTableIdxs.map((idx) => knownSizes.get(idx)!),
+        allocatedIdxs,
         uniformBuffers,
         constSlab,
         arenaSlabs: null,
@@ -2690,7 +2699,7 @@ export class WebGPUBackend implements Backend {
       tableSize: nextIdx,
       inputTableIdxs,
       outputTableIdxs,
-      outputSizes: outputTableIdxs.map(idx => knownSizes.get(idx)!),
+      outputSizes: outputTableIdxs.map((idx) => knownSizes.get(idx)!),
       allocatedIdxs,
       uniformBuffers,
       constSlab,
@@ -2737,7 +2746,10 @@ export class WebGPUBackend implements Backend {
    *
    * Error-safe: if any step throws, all allocated GPU buffers are cleaned up.
    */
-  executeCommandTape(tape: WebGPUCommandTape, inputSlots: Slot[]): { outputs: Slot[]; pending: IPendingExecute[] } {
+  executeCommandTape(
+    tape: WebGPUCommandTape,
+    inputSlots: Slot[],
+  ): { outputs: Slot[]; pending: IPendingExecute[] } {
     // Execute the tape immediately and return results.
     // Must NOT use PendingCommandTape/beginBatch — deferred execution breaks
     // intra-tape pool reuse (ownEncoder=false → freed buffers deferred →
@@ -2750,7 +2762,10 @@ export class WebGPUBackend implements Backend {
    * Execute a command tape immediately with ownEncoder=true, creating output
    * slots directly.  This is the hot path for cached JitProgram execution.
    */
-  _executeCommandTapeImmediate(tape: WebGPUCommandTape, inputSlots: Slot[]): Slot[] {
+  _executeCommandTapeImmediate(
+    tape: WebGPUCommandTape,
+    inputSlots: Slot[],
+  ): Slot[] {
     // Parallel arrays indexed by table position:
     //   buffers[i]   — GPUBuffer for this table entry
     //   sizes[i]     — original (unpadded) byte size for output slot creation
@@ -3223,9 +3238,17 @@ export class WebGPUBackend implements Backend {
    * Deferred command tape execution — used by PendingCommandTape.submit().
    * Populates pre-created output slots instead of creating new ones.
    */
-  _executeCommandTapeDeferred(tape: WebGPUCommandTape, inputSlots: Slot[], outputSlots: Slot[], outputTableIdxs: number[]) {
+  _executeCommandTapeDeferred(
+    tape: WebGPUCommandTape,
+    inputSlots: Slot[],
+    outputSlots: Slot[],
+    _outputTableIdxs: number[],
+  ) {
     // Delegate to the immediate path, then transfer buffers to pre-created slots.
-    const immediateOutputs = this._executeCommandTapeImmediate(tape, inputSlots);
+    const immediateOutputs = this._executeCommandTapeImmediate(
+      tape,
+      inputSlots,
+    );
     for (let i = 0; i < outputSlots.length; i++) {
       const entry = this.buffers.get(outputSlots[i]);
       if (entry) {
@@ -5002,7 +5025,6 @@ class ShaderPipelineCache {
     this.#layoutCache = new Map();
   }
 
-
   getLayout(shader: ShaderInfo): GPUBindGroupLayout {
     const key = `${shader.numInputs}:${shader.numOutputs}`;
     let cached = this.#bindGroup0Cache.get(key);
@@ -5069,7 +5091,10 @@ class ShaderPipelineCache {
     const cached = this.#layoutCache.get(key);
     if (cached) return cached;
 
-    const bindGroupLayouts = shader.hasUniform || (shader.numUniformConsts ?? 0) > 0 ? [this.getLayout(shader), this.getUniformLayout(shader)] : [this.getLayout(shader)];
+    const bindGroupLayouts =
+      shader.hasUniform || (shader.numUniformConsts ?? 0) > 0
+        ? [this.getLayout(shader), this.getUniformLayout(shader)]
+        : [this.getLayout(shader)];
 
     const layout = this.device.createPipelineLayout({ bindGroupLayouts });
     this.#layoutCache.set(key, layout);

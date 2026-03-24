@@ -8,7 +8,7 @@
 
 import { byteWidth } from "../alu";
 import type { Backend, Slot } from "../backend";
-import type { PendingExecute, IPendingExecute } from "./array";
+import type { IPendingExecute } from "./array";
 import { Array as JaxArray } from "./array";
 import { _associativeScanCoreImpl, ShapedArray } from "./core";
 import type { Jaxpr } from "./jaxpr";

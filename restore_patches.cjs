@@ -1,9 +1,9 @@
-const fs = require('fs');
-let code = fs.readFileSync('src/backend/webgpu.ts', 'utf8');
+const fs = require("fs");
+let code = fs.readFileSync("src/backend/webgpu.ts", "utf8");
 
 // 1. applyCalibration / resetCalibration
 code = code.replace(
-  '  readonly limits = {',
+  "  readonly limits = {",
   `  resetCalibration() {
     this._microcalibrated = false;
   }
@@ -18,12 +18,12 @@ code = code.replace(
     _clearJitCompileCache();
   }
 
-  readonly limits = {`
+  readonly limits = {`,
 );
 
 // 2. mallocDeferred
 code = code.replace(
-  '  malloc(size: number, outSlot: TypedSlot): void {',
+  "  malloc(size: number, outSlot: TypedSlot): void {",
   `  mallocDeferred(size: number, outSlot: TypedSlot): void {
     outSlot.size = size;
     outSlot.sizeBytes = size * bytesPerElement(outSlot.dtype);
@@ -33,7 +33,7 @@ code = code.replace(
     }
   }
 
-  malloc(size: number, outSlot: TypedSlot): void {`
+  malloc(size: number, outSlot: TypedSlot): void {`,
 );
 
 // 3. compileCommandTape prep replacements
@@ -50,7 +50,7 @@ code = code.replace(
         tape.push({
           type: "execute",
           step,
-          shader,`
+          shader,`,
 );
 
 // In step type "assoc_scan" phase 1:
@@ -59,7 +59,7 @@ code = code.replace(
   `tape.push({
             type: "execute",
             step,
-            shader: shader1,`
+            shader: shader1,`,
 );
 
 // In step type "assoc_scan" phase 2:
@@ -68,7 +68,7 @@ code = code.replace(
   `tape.push({
             type: "execute",
             step,
-            shader: shader2,`
+            shader: shader2,`,
 );
 
 // In step type "block_map"
@@ -77,7 +77,7 @@ code = code.replace(
   `tape.push({
           type: "execute",
           step,
-          shader,`
+          shader,`,
 );
 
 // In step type "routine"
@@ -86,7 +86,7 @@ code = code.replace(
   `tape.push({
           type: "execute",
           step,
-          shader,`
+          shader,`,
 );
 
 // In step type "workgroup_assoc_scan"
@@ -95,9 +95,8 @@ code = code.replace(
   `tape.push({
           type: "execute",
           step,
-          shader,`
+          shader,`,
 );
-
 
 // Malloc using mallocDeferred instead of malloc if no initialData
 // In compileCommandTape malloc switch:
@@ -112,8 +111,7 @@ code = code.replace(
           type: "malloc",
           step,
           slot: step.outBlks[0],
-        });`
+        });`,
 );
 
-
-fs.writeFileSync('src/backend/webgpu.ts', code);
+fs.writeFileSync("src/backend/webgpu.ts", code);

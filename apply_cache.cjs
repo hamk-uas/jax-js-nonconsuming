@@ -1,14 +1,14 @@
-const fs = require('fs');
-let code = fs.readFileSync('src/backend/webgpu.ts', 'utf8');
+const fs = require("fs");
+let code = fs.readFileSync("src/backend/webgpu.ts", "utf8");
 
 code = code.replace(
-  '  #layoutCache: Map<string, GPUPipelineLayout>;',
-  '  #layoutCache: Map<string, GPUPipelineLayout>;\n  #bindGroup0Cache: Map<string, GPUBindGroupLayout>;\n  #bindGroup1Cache: Map<string, GPUBindGroupLayout>;'
+  "  #layoutCache: Map<string, GPUPipelineLayout>;",
+  "  #layoutCache: Map<string, GPUPipelineLayout>;\n  #bindGroup0Cache: Map<string, GPUBindGroupLayout>;\n  #bindGroup1Cache: Map<string, GPUBindGroupLayout>;",
 );
 
 code = code.replace(
-  '    this.#layoutCache = new Map();\n  }',
-  '    this.#layoutCache = new Map();\n    this.#bindGroup0Cache = new Map();\n    this.#bindGroup1Cache = new Map();\n  }'
+  "    this.#layoutCache = new Map();\n  }",
+  "    this.#layoutCache = new Map();\n    this.#bindGroup0Cache = new Map();\n    this.#bindGroup1Cache = new Map();\n  }",
 );
 
 const layoutCodeReplacement = `  getLayout(shader: ShaderInfo): GPUBindGroupLayout {
@@ -63,13 +63,13 @@ const layoutCodeReplacement = `  getLayout(shader: ShaderInfo): GPUBindGroupLayo
   #getLayout(shader: ShaderInfo): GPUPipelineLayout {`;
 
 code = code.replace(
-  '  #getLayout(shader: ShaderInfo): GPUPipelineLayout {',
-  layoutCodeReplacement.replace(/\\\\/g, "")
+  "  #getLayout(shader: ShaderInfo): GPUPipelineLayout {",
+  layoutCodeReplacement.replace(/\\\\/g, ""),
 );
 
 code = code.replace(
-  '      const layout = this.device.createPipelineLayout({ bindGroupLayouts });',
-  '      const layout = this.device.createPipelineLayout({\n        bindGroupLayouts: shader.hasUniform || (shader.numUniformConsts ?? 0) > 0\n          ? [this.getLayout(shader), this.getUniformLayout(shader)]\n          : [this.getLayout(shader)]\n      });'
+  "      const layout = this.device.createPipelineLayout({ bindGroupLayouts });",
+  "      const layout = this.device.createPipelineLayout({\n        bindGroupLayouts: shader.hasUniform || (shader.numUniformConsts ?? 0) > 0\n          ? [this.getLayout(shader), this.getUniformLayout(shader)]\n          : [this.getLayout(shader)]\n      });",
 );
 
-fs.writeFileSync('src/backend/webgpu.ts', code);
+fs.writeFileSync("src/backend/webgpu.ts", code);

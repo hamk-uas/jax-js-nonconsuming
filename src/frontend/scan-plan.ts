@@ -29,13 +29,13 @@ import type {
 } from "../backend/webgpu";
 import type { WebGPUBackend } from "../backend/webgpu";
 import { Routine, Routines } from "../routine";
-import { evaluateTotalCost, type CostFeatures } from "../tuner";
 import {
   type Dim,
   hasSymbolicDims,
   isSymbolicDim,
   resolveShape,
 } from "../shape";
+import { type CostFeatures, evaluateTotalCost } from "../tuner";
 import { DEBUG } from "../utils";
 import type { ScanPath } from "../utils";
 import { Primitive, ShapedArray } from "./core";
@@ -2046,7 +2046,7 @@ export function planAssociativeScan(
     // Minimum B=32 keeps the Kogge-Stone round count ≤5.
     const candidates = [256, 128, 64, 32].map((b) => {
       // Rough estimation:
-      const shmemUsage = b * neededBindings * 4; 
+      const shmemUsage = b * neededBindings * 4;
       const features: CostFeatures = {
         nDispatch: 1,
         nBuffers: neededBindings,
@@ -2060,7 +2060,7 @@ export function planAssociativeScan(
       };
       return { b, cost: evaluateTotalCost(features, backend.capabilities) };
     });
-    
+
     candidates.sort((x, y) => x.cost - y.cost);
 
     for (const { b: BLOCK_SIZE } of candidates) {

@@ -1,8 +1,11 @@
-const fs = require('fs');
-let code = fs.readFileSync('src/backend/webgpu.ts', 'utf8');
+const fs = require("fs");
+let code = fs.readFileSync("src/backend/webgpu.ts", "utf8");
 
 // I need to add IPendingExecute to imports from array.ts
-code = code.replace(/import \{ SyncReader \} from "\.\.\/backend\.js";/, 'import { SyncReader } from "../backend.js";\nimport type { IPendingExecute } from "../frontend/array.js";');
+code = code.replace(
+  /import \{ SyncReader \} from "\.\.\/backend\.js";/,
+  'import { SyncReader } from "../backend.js";\nimport type { IPendingExecute } from "../frontend/array.js";',
+);
 
 const classDef = `class PendingCommandTape implements IPendingExecute {
   prepared: any = null;
@@ -80,11 +83,11 @@ const classDef = `class PendingCommandTape implements IPendingExecute {
 `;
 
 code = code.replace(
-  '  executeCommandTape(',
-  `${classDef}\n  executeCommandTape(`
+  "  executeCommandTape(",
+  `${classDef}\n  executeCommandTape(`,
 );
 
 // We need to replace the body of executeCommandTape to just construct buffers, but DEFER the command generation!
 // Let's refactor executeCommandTape directly.
 
-fs.writeFileSync('src/backend/webgpu.ts', code);
+fs.writeFileSync("src/backend/webgpu.ts", code);

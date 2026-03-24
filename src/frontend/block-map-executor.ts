@@ -12,7 +12,7 @@ import { type Backend, Executable, type Slot } from "../backend";
 import type { BlockMapWasmParams, GeneralScanStep } from "../backend/wasm";
 import type { PackedLeafLayout } from "../backend/webgpu/codegen";
 import { DEBUG, prod } from "../utils";
-import type { PendingExecute, IPendingExecute } from "./array";
+import type { IPendingExecute } from "./array";
 import { _registerJitCacheDisposer } from "./check-leaks";
 import type { Jaxpr } from "./jaxpr";
 import type { JitProgram, JitStep } from "./jit";

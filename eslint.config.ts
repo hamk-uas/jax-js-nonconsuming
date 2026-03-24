@@ -14,6 +14,8 @@ export default defineConfig([
     "coverage/",
     "tmp/",
     "*.config.mjs",
+    "*.cjs",
+    "apply_shader_cache.mjs",
   ]),
   js.configs.recommended,
   ts.configs.recommendedTypeChecked,
