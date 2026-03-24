@@ -98,7 +98,7 @@ const jacobiSolve = jit(function jacobiSolve(
       return [next, null];
     },
     p,
-    null as unknown as np.Array,
+    null,
     { length: JACOBI_ITERS },
   );
   return result;

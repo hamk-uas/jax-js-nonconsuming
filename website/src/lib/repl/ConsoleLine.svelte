@@ -1,8 +1,8 @@
 <script lang="ts">
-  import type { CodeCaptureEntry } from "@hamk-uas/jax-js-nonconsuming";
   import {
     ChevronDownIcon,
     ChevronRightIcon,
+    CodeIcon,
     ImageIcon,
     InfoIcon,
     TriangleAlertIcon,
@@ -17,61 +17,19 @@
   let expanded = $state(true);
   let text = $derived(line.data.join(" "));
   let multiline = $derived(text.includes("\n"));
-
-  function kindColor(kind: string): string {
-    switch (kind) {
-      case "kernel":
-        return "bg-blue-100 text-blue-800";
-      case "mega-module":
-        return "bg-purple-100 text-purple-800";
-      case "scan":
-        return "bg-green-100 text-green-800";
-      case "assoc-scan":
-        return "bg-teal-100 text-teal-800";
-      case "block-map":
-        return "bg-orange-100 text-orange-800";
-      case "routine":
-        return "bg-red-100 text-red-800";
-      default:
-        return "bg-gray-100 text-gray-800";
-    }
-  }
-
-  function metaSummary(entry: CodeCaptureEntry): string {
-    const parts: string[] = [];
-    const m = entry.metadata;
-    if (!m) return "";
-    if (m.numInputs != null) parts.push(`in=${m.numInputs}`);
-    if (m.numOutputs != null) parts.push(`out=${m.numOutputs}`);
-    if (m.simd) parts.push("SIMD");
-    if (m.reduction) parts.push("reduction");
-    if (m.numSteps != null) parts.push(`steps=${m.numSteps}`);
-    if (m.numKernels != null) parts.push(`kernels=${m.numKernels}`);
-    if (m.byteLength != null) parts.push(`${m.byteLength} bytes`);
-    return parts.join("  ");
-  }
 </script>
 
-{#if line.level === "code" && line.codeEntry}
-  {@const entry = line.codeEntry}
-  <details class="border-t border-gray-200 py-0.5 text-[13px]">
+{#if line.level === "report" && line.reportText}
+  <details class="border-t border-indigo-200 py-0.5 text-[13px]">
     <summary
-      class="px-1 cursor-pointer hover:bg-gray-50 select-none flex items-center gap-x-2"
+      class="px-1 cursor-pointer hover:bg-indigo-50 select-none flex items-center gap-x-2"
     >
+      <CodeIcon size={14} class="shrink-0 text-indigo-500" />
       <span
-        class="inline-block px-1.5 py-0.5 rounded text-[11px] font-medium {kindColor(
-          entry.kind,
-        )}"
+        class="inline-block px-1.5 py-0.5 rounded text-[11px] font-medium bg-indigo-100 text-indigo-800"
       >
-        {entry.kind}
+        {line.data[0] ?? "Compiled Code"}
       </span>
-      <span class="text-gray-500">{entry.backend}</span>
-      {#if entry.label}
-        <span class="text-gray-700">{entry.label}</span>
-      {/if}
-      {#if entry.metadata}
-        <span class="text-gray-400">{metaSummary(entry)}</span>
-      {/if}
       {#if showTime}
         <span
           class="hidden md:block ml-auto shrink-0 font-mono text-gray-400 select-none"
@@ -80,11 +38,9 @@
         </span>
       {/if}
     </summary>
-    {#if entry.code}
-      <pre
-        class="px-2 py-1 overflow-x-auto bg-gray-50 border-t border-gray-200 text-[12px] leading-tight max-h-80 overflow-y-auto"
-        style:scrollbar-width="thin"><code>{entry.code}</code></pre>
-    {/if}
+    <pre
+      class="px-2 py-1 overflow-x-auto bg-gray-50 border-t border-gray-200 text-[12px] leading-tight max-h-[32rem] overflow-y-auto"
+      style:scrollbar-width="thin"><code>{line.reportText}</code></pre>
   </details>
 {:else}
   <div
