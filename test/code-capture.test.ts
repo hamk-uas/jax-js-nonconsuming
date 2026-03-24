@@ -53,6 +53,15 @@ await deviceSuite(
         expect(typeof e.code).toBe("string");
         expect(e.code!.length).toBeGreaterThan(0);
       }
+
+      const labeled = entries.filter(
+        (e) => e.kind === "kernel" || e.kind === "program",
+      );
+      expect(labeled.length).toBeGreaterThanOrEqual(1);
+      for (const e of labeled) {
+        expect(typeof e.label).toBe("string");
+        expect(e.label!.length).toBeGreaterThan(0);
+      }
     });
 
     test("setCodeCapture(null) disables capture", () => {

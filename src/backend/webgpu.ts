@@ -751,7 +751,10 @@ export class WebGPUBackend implements Backend {
     let result = this.#cachedShaderMap.get(cacheKey);
     if (!result) {
       result = pipelineSource(this.device, kernel, this.capabilities);
+      if (kernel.label) result.label = kernel.label;
       this.#cachedShaderMap.set(cacheKey, result);
+    } else if (!result.label && kernel.label) {
+      result.label = kernel.label;
     }
     return result;
   }
@@ -4939,6 +4942,7 @@ class ShaderPipelineCache {
       _emitCodeCapture({
         backend: "webgpu",
         kind: "kernel",
+        label: shader.label,
         code: shader.code,
         workgroupSize: Array.isArray(shader.workgroupSize)
           ? (shader.workgroupSize as [number, number, number])
@@ -4994,6 +4998,7 @@ class ShaderPipelineCache {
       _emitCodeCapture({
         backend: "webgpu",
         kind: "kernel",
+        label: shader.label,
         code: shader.code,
         workgroupSize: Array.isArray(shader.workgroupSize)
           ? (shader.workgroupSize as [number, number, number])

@@ -23,6 +23,8 @@ export interface PackedLeafLayout {
 
 export interface ShaderInfo {
   code: string; // WGSL shader source code.
+  /** Human-readable label for this shader when it corresponds to a Kernel. */
+  label?: string;
   numInputs: number;
   numOutputs: number;
   hasUniform: boolean;
