@@ -20,6 +20,10 @@ import type { ArrayLike } from "./frontend/array";
 import { jit, makeJaxpr } from "./frontend/jaxpr";
 import { jitCompile, JitProgram, type JitStepCounts } from "./frontend/jit";
 import { Routine } from "./routine";
+import {
+  CONSERVATIVE_WEBGPU_PERF_DEFAULTS,
+  resolvePerformanceBelief,
+} from "./tuner";
 
 // ── Report types ──────────────────────────────────────────────────────────
 
@@ -367,12 +371,19 @@ export function formatJitReport(report: JitReport): string {
   );
   emit(`${indent(1)}shaderF16: ${caps.shaderF16 ?? false}`);
   emit(`${indent(1)}subgroups: ${caps.subgroups ?? false}`);
+  const belief = resolvePerformanceBelief(caps);
   if (caps.calibrated) {
     emit(`${indent(1)}calibrated: true`);
-    emit(`${indent(1)}bandwidthGBs: ${caps.bandwidthGBs}`);
-    emit(`${indent(1)}tflops: ${caps.tflops}`);
-    emit(`${indent(1)}dispatchOverheadUs: ${caps.dispatchOverheadUs}`);
-    emit(`${indent(1)}rOptWords: ${caps.rOptWords}`);
+    emit(`${indent(1)}bandwidthGBs: ${belief.bandwidthGBs}`);
+    emit(`${indent(1)}tflops: ${belief.tflops}`);
+    emit(`${indent(1)}dispatchOverheadUs: ${belief.dispatchOverheadUs}`);
+    emit(`${indent(1)}rOptWords: ${belief.rOptWords}`);
+  } else {
+    emit(`${indent(1)}calibrated: false`);
+    emit(`${indent(1)}performanceBelief: conservative-defaults`);
+    emit(
+      `${indent(1)}conservativeDefaults: dispatch=${CONSERVATIVE_WEBGPU_PERF_DEFAULTS.dispatchOverheadUs}us bw=${CONSERVATIVE_WEBGPU_PERF_DEFAULTS.bandwidthGBs}GB/s tflops=${CONSERVATIVE_WEBGPU_PERF_DEFAULTS.tflops} rOpt=${CONSERVATIVE_WEBGPU_PERF_DEFAULTS.rOptWords}`,
+    );
   }
   emit("");
 

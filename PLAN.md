@@ -111,12 +111,13 @@ the JIT lifecycle.
 1. **Refactor Workload Methodology**: Increase payload volume for `BW_global` and `Tflops`
    iteratively until the irreducible `queue.submit` overhead drops below a 5% margin of error, or
    subtract a baseline linear fit.
-2. **Remove Eager Calibration**: Rip out `calibrateGpu()` from `src/backend.ts` `init()`. Shift its
-   invocation to the new async compilation phase of the JIT cycle (`jitCompileAsync()`).
+2. **Clarify Non-Calibrated Mode**: Keep pre-calibration behavior limited to real device constraints
+   plus conservative built-in cost defaults unless a true static hardware prior is implemented and
+   wired at runtime.
 3. **Plumb the Ghost Metric**: Wire `barrierCostFactor` actively into `tuner.ts` `evaluateTotalCost`
    so that `dangerShmem` or shared-memory sync operations accurately model empirical reality.
-4. **Fix Test Isolation**: Ensure `_setCalibrationState()` completely swaps back to the immutable
-   `deriveHardwareProfile` priors, not just the `calibrated: false` boolean.
+4. **Fix Test Isolation**: Ensure `_setCalibrationState()` completely restores the
+   conservative-default pre-calibration state, not just the `calibrated: false` boolean.
 
 ## Deferred Items
 

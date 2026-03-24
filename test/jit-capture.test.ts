@@ -116,6 +116,7 @@ await deviceSuite(
       expect(text).toContain("Step Counts:");
       expect(text).toContain("Full Program Listing:");
       expect(text).toContain("float32");
+      expect(text).toContain("performanceBelief: conservative-defaults");
     });
 
     test("captureJitReport captures sub-programs (scan)", async () => {

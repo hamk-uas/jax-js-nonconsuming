@@ -27,6 +27,37 @@ import type { BackendCapabilities } from "./backend";
 import { ShapeTracker, type SizeExpr, unravelAlu } from "./shape";
 import { DEBUG, deepEqual, lexCompare, prod, range, sorted } from "./utils";
 
+export const CONSERVATIVE_WEBGPU_PERF_DEFAULTS = {
+  dispatchOverheadUs: 25,
+  bandwidthGBs: 50,
+  tflops: 1.5,
+  rOptWords: 128,
+  barrierCostFactor: 1.0,
+} as const;
+
+export function resolvePerformanceBelief(caps: Partial<BackendCapabilities>): {
+  dispatchOverheadUs: number;
+  bandwidthGBs: number;
+  tflops: number;
+  rOptWords: number;
+  barrierCostFactor: number;
+  source: "measured" | "conservative-defaults";
+} {
+  return {
+    dispatchOverheadUs:
+      caps.dispatchOverheadUs ??
+      CONSERVATIVE_WEBGPU_PERF_DEFAULTS.dispatchOverheadUs,
+    bandwidthGBs:
+      caps.bandwidthGBs ?? CONSERVATIVE_WEBGPU_PERF_DEFAULTS.bandwidthGBs,
+    tflops: caps.tflops ?? CONSERVATIVE_WEBGPU_PERF_DEFAULTS.tflops,
+    rOptWords: caps.rOptWords ?? CONSERVATIVE_WEBGPU_PERF_DEFAULTS.rOptWords,
+    barrierCostFactor:
+      caps.barrierCostFactor ??
+      CONSERVATIVE_WEBGPU_PERF_DEFAULTS.barrierCostFactor,
+    source: caps.calibrated ? "measured" : "conservative-defaults",
+  };
+}
+
 export interface TuneResult {
   /** New expression with GlobalView ops and gidx/ridx lowered. */
   exp: AluExp;
@@ -255,12 +286,12 @@ export function evaluateTotalCost(
   features: CostFeatures,
   caps: Partial<BackendCapabilities>,
 ): number {
+  const belief = resolvePerformanceBelief(caps);
+
   // 1. Predictors from Capabilities
-  const cDispatch = caps.dispatchOverheadUs
-    ? caps.dispatchOverheadUs / 1000
-    : 0.025; // ms (default 25us)
-  const bMem = caps.bandwidthGBs ?? 50; // GB/s roughly equals bytes/ns = million bytes/ms
-  const tAlu = caps.tflops ?? 1.5; // TFLOPS
+  const cDispatch = belief.dispatchOverheadUs / 1000;
+  const bMem = belief.bandwidthGBs; // GB/s roughly equals bytes/ns = million bytes/ms
+  const tAlu = belief.tflops; // TFLOPS
 
   // Wavefront/Subgroup alignment
   const isIntel =
@@ -270,7 +301,7 @@ export function evaluateTotalCost(
 
   // Per-thread register budget from hardware profile (R_opt_words).
   // Critical: igp=48, mobile=64, discrete-legacy=96, discrete-modern/apple=128.
-  const rOpt = caps.rOptWords ?? 128;
+  const rOpt = belief.rOptWords;
   const sOpt = 16384; // 16KB optimal occupancy
   // We heavily discount cCompile in runtime configuration comparisons to prevent it from squashing throughput traits.
   const cCompile = (8 + (features.sizeWgsl / 1024) * 3) * 0.0001;
@@ -292,7 +323,7 @@ export function evaluateTotalCost(
   // simultaneously), not O(n). Use constant cost per barrier — scaling
   // linearly with thread count incorrectly penalizes large cooperative groups
   // that actually improve reduction throughput.
-  const bFactor = caps.barrierCostFactor ?? 1.0;
+  const bFactor = belief.barrierCostFactor;
   const barrierLatency =
     features.parallelism && features.parallelism > 1 ? bFactor * 0.0001 : 0;
 

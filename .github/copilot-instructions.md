@@ -302,21 +302,12 @@ hardware-determined and irreducible without reducing dispatch count.
 
 ### Cost model & device characterization
 
-`deriveHardwareProfile(device)` in `src/backend/webgpu.ts` runs once at backend init. Two-stage
-classifier: (1) feature-flag bitmap (`texture-compression-bc`, `shader-f16`, `subgroups`, etc.) →
-vendor class, (2) `maxBufferSize` threshold → IGP vs discrete. Fallback: if no feature rules match
-(e.g. gen-9 Intel on Linux lacks `texture-compression-bc`), `adapterInfo.vendor` string is used.
-Zero-value guard ensures `bandwidthGBs`/`tflops` never produce 0 → Infinity costs.
-
-| Vendor Class       | `rOptWords` | Typical Hardware                                |
-| ------------------ | ----------- | ----------------------------------------------- |
-| `apple`            | 128         | Apple Silicon (M1–M4)                           |
-| `discrete-modern`  | 128         | NVIDIA RTX 30xx+, AMD RDNA2+ with f16+subgroups |
-| `discrete-legacy`  | 96          | Older discrete with timestamp-query             |
-| `igp`              | 48          | Intel integrated (gen-9 through Arc)            |
-| `mobile`           | 64          | Qualcomm Adreno, ARM Mali                       |
-| `discrete-minimal` | 96          | Discrete without f16/subgroups/timestamp        |
-| `unknown`          | 64          | Conservative default                            |
+Before calibration, the runtime only has a **strong static constraint profile**: real device limits,
+feature flags, and adapter strings from WebGPU. The performance cost model does **not** currently
+populate a richer static prior from `runtime_model.json` or a live `deriveHardwareProfile()`
+implementation. Instead, `evaluateTotalCost()` falls back to conservative built-in defaults for
+dispatch overhead, bandwidth, TFLOPS, barrier factor, and `rOptWords` until `calibrateGpu()`
+measures them.
 
 `evaluateTotalCost(features, caps)` in `src/tuner.ts` scores kernel/tile configurations:
 

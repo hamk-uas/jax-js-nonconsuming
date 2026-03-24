@@ -42,15 +42,15 @@ export interface BackendCapabilities {
   /** WebGPU: true if timestamp-query feature is available. */
   readonly timestampQuery?: boolean;
 
-  /** Estimated memory bandwidth in GB/s. Derived from vendor-conditioned log-linear regression on maxBufferSize. */
+  /** Measured or injected memory bandwidth in GB/s. Absent before calibration in the current runtime path. */
   readonly bandwidthGBs?: number;
-  /** Estimated compute throughput in TFLOPS. Derived from bandwidth via covariance regression. */
+  /** Measured or injected compute throughput in TFLOPS. Absent before calibration in the current runtime path. */
   readonly tflops?: number;
-  /** Estimated base dispatch overhead in microseconds. */
+  /** Measured or injected base dispatch overhead in microseconds. Absent before calibration in the current runtime path. */
   readonly dispatchOverheadUs?: number;
   /**
-   * The vendor class mapped from feature flags and limits (e.g., "apple", "discrete-modern", "igp").
-   * See `deriveHardwareProfile()` in `src/backend/webgpu.ts` for classification rules.
+   * Optional coarse vendor class for heuristics. The current runtime path does
+   * not derive this automatically before calibration, so it is usually absent.
    */
   readonly inferredVendorClass?:
     | "apple"
@@ -61,17 +61,17 @@ export interface BackendCapabilities {
     | "discrete-minimal"
     | "unknown";
   /**
-   * Per-thread register budget (words) before spill likely begins.
-   * From runtime model R_opt_words. Defaults to 128 for unknown hardware.
+   * Measured or injected per-thread register budget (words) before spill likely
+   * begins. Absent before calibration in the current runtime path.
    */
   readonly rOptWords?: number;
-  /** Estimated relative cost multiplier for workgroup barriers. */
+  /** Measured or injected relative cost multiplier for workgroup barriers. */
   readonly barrierCostFactor?: number;
 
   /**
    * Whether microbenchmark calibration has been applied to this backend.
-   * When true, bandwidthGBs/tflops/dispatchOverheadUs/rOptWords are
-   * empirically measured rather than estimated from static heuristics.
+   * When false, the tuner falls back to conservative built-in defaults while
+   * still using the real hardware limits and feature flags above.
    */
   readonly calibrated?: boolean;
 }
@@ -79,6 +79,7 @@ export interface BackendCapabilities {
 /**
  * A stable fingerprint of immutable device capabilities used in cache keys.
  * Includes only structural limits that don't change across calibration runs.
+ * Optional coarse classification is included only when present.
  */
 export function staticCapabilityFingerprint(caps: BackendCapabilities): string {
   return [
@@ -539,14 +540,14 @@ export function getWebGPUDevice(): GPUDevice {
 
 /**
  * Calibration state for the WebGPU backend.
- * - "pending": not yet calibrated, will run on first WebGPU JIT call
+ * - "pending": not yet calibrated, will run during init("webgpu")
  * - "running": calibration in progress
  * - "done": calibration complete, belief state frozen
  * - "off": calibration disabled
  */
 let _calibrationState: "pending" | "running" | "done" | "off" = "pending";
 
-/** Set calibration state. Used by tests to reset between runs. */
+/** Internal test hook for forcing calibration state. Not a stable public API. */
 export function _setCalibrationState(state: "pending" | "off"): void {
   _calibrationState = state;
   // Reset the calibrated flag on the WebGPU backend for test isolation.
