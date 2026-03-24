@@ -1,8 +1,4 @@
-import type {
-  CodeCaptureEntry,
-  Device,
-  numpy as np,
-} from "@hamk-uas/jax-js-nonconsuming";
+import type { Device, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 import type { Plugin } from "@rollup/browser";
 
 import { arrayToDataUrl } from "./displayImage";
@@ -17,10 +13,11 @@ import {
 export type { LeakMarker };
 
 export type ConsoleLine = {
-  level: "log" | "info" | "warn" | "error" | "image" | "code";
+  level: "log" | "info" | "warn" | "error" | "image" | "report";
   data: string[];
   time: number;
-  codeEntry?: CodeCaptureEntry;
+  /** Formatted JIT report text (for level === "report"). */
+  reportText?: string;
 };
 
 // Intercepted methods similar to console.log().
@@ -325,13 +322,23 @@ async function _runProgram(
       }
     }
 
+    // Collect code capture entries when checkbox is enabled
+    type CapturedEntry = {
+      backend: string;
+      kind: string;
+      label?: string;
+      code?: string;
+      metadata?: Record<string, unknown>;
+    };
+    const capturedEntries: CapturedEntry[] = [];
     if (runner.captureCode) {
       jax.setCodeCapture((entry) => {
-        runner.consoleLines.push({
-          level: "code",
-          data: [],
-          time: Date.now(),
-          codeEntry: entry,
+        capturedEntries.push({
+          backend: entry.backend,
+          kind: entry.kind,
+          label: entry.label,
+          code: entry.code,
+          metadata: entry.metadata,
         });
       });
     }
@@ -347,8 +354,49 @@ async function _runProgram(
       {
         console: mockConsole,
         displayImage: displayImage,
+        captureJitReport: jax.captureJitReport,
+        formatJitReport: jax.formatJitReport,
       },
     );
+
+    // Emit consolidated code capture report
+    if (runner.captureCode && capturedEntries.length > 0) {
+      const lines: string[] = [];
+      lines.push(`Compiled Code (${capturedEntries.length} entries)`);
+      lines.push("=".repeat(50));
+      for (const entry of capturedEntries) {
+        lines.push("");
+        lines.push(
+          `[${entry.backend}] ${entry.kind}${entry.label ? " — " + entry.label : ""}`,
+        );
+        if (entry.metadata) {
+          const meta = entry.metadata;
+          const parts: string[] = [];
+          if (meta.numInputs != null)
+            parts.push(`in=${meta.numInputs as number}`);
+          if (meta.numOutputs != null)
+            parts.push(`out=${meta.numOutputs as number}`);
+          if (meta.simd) parts.push("SIMD");
+          if (meta.reduction) parts.push("reduction");
+          if (meta.numSteps != null)
+            parts.push(`steps=${meta.numSteps as number}`);
+          if (meta.numKernels != null)
+            parts.push(`kernels=${meta.numKernels as number}`);
+          if (meta.byteLength != null)
+            parts.push(`${meta.byteLength as number} bytes`);
+          if (parts.length > 0) lines.push("  " + parts.join("  "));
+        }
+        if (entry.code) {
+          lines.push("  " + entry.code.split("\n").join("\n  "));
+        }
+      }
+      runner.consoleLines.push({
+        level: "report",
+        data: ["Compiled Code"],
+        time: Date.now(),
+        reportText: lines.join("\n"),
+      });
+    }
 
     if (detailedLeakTrackingStarted && jax.checkLeaks?.stop) {
       try {
