@@ -335,10 +335,6 @@ totalCost = (costExecution + cCompile) × dangerMultiplier / produceCount
 **Consumers:** `chooseTileConfig` (lax.ts), `tuneWebgpu` (tuner.ts), `foriLoopToBlockMap` (jit.ts),
 associative scan block-size selection (scan-plan.ts).
 
-`scripts/output/runtime_model.json` stores vendor-conditioned log-linear regression coefficients
-(maxBufferSize → bandwidth → TFLOPS) and per-class `R_opt_words`. `scripts/refit-model.mjs`
-incrementally adds new GPU samples via Welford sufficient statistics.
-
 ### Microbenchmark calibration (P10)
 
 `src/microbench.ts` runs 5 isolated GPU microbenchmarks on raw WebGPU API (no JIT) to measure

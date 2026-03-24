@@ -294,9 +294,7 @@ export function evaluateTotalCost(
   const tAlu = belief.tflops; // TFLOPS
 
   // Wavefront/Subgroup alignment
-  const isIntel =
-    caps.adapterVendor?.toLowerCase().includes("intel") ||
-    caps.inferredVendorClass === "igp";
+  const isIntel = caps.adapterVendor?.toLowerCase().includes("intel") ?? false;
   const fSubgroup = isIntel ? 16 : 32;
 
   // Per-thread register budget from hardware profile (R_opt_words).
@@ -566,9 +564,8 @@ export function tuneWebgpu(
   // WebGPU returns maxComputeWorkgroupSizeX=256 for many desktops (Intel Gen-9, Apple Silicon)
   // so we should not use > 256 as a strict mobile check.
   const isMobile =
-    caps?.inferredVendorClass === "mobile" ||
-    (typeof navigator !== "undefined" &&
-      /Mobi|Android/i.test(navigator.userAgent));
+    typeof navigator !== "undefined" &&
+    /Mobi|Android/i.test(navigator.userAgent);
   if (
     !isMobile &&
     dim.reduce < dim.unroll &&

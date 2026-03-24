@@ -7,7 +7,6 @@ const capsIntelOld: Partial<BackendCapabilities> = {
   tflops: 0.4,
   adapterVendor: "intel",
   adapterArchitecture: "gen_12lp",
-  inferredVendorClass: "igp",
   maxComputeWorkgroupSizeX: 256,
 };
 

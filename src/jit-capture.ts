@@ -358,9 +358,6 @@ export function formatJitReport(report: JitReport): string {
   const caps = report.capabilities;
   emit("Backend:");
   emit(
-    `${indent(1)}inferredVendorClass: ${caps.inferredVendorClass ?? "unknown"}`,
-  );
-  emit(
     `${indent(1)}maxComputeWorkgroupSizeX: ${caps.maxComputeWorkgroupSizeX ?? "?"}`,
   );
   emit(

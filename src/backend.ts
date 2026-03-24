@@ -49,18 +49,6 @@ export interface BackendCapabilities {
   /** Measured or injected base dispatch overhead in microseconds. Absent before calibration in the current runtime path. */
   readonly dispatchOverheadUs?: number;
   /**
-   * Optional coarse vendor class for heuristics. The current runtime path does
-   * not derive this automatically before calibration, so it is usually absent.
-   */
-  readonly inferredVendorClass?:
-    | "apple"
-    | "discrete-modern"
-    | "discrete-legacy"
-    | "igp"
-    | "mobile"
-    | "discrete-minimal"
-    | "unknown";
-  /**
    * Measured or injected per-thread register budget (words) before spill likely
    * begins. Absent before calibration in the current runtime path.
    */
@@ -86,7 +74,6 @@ export function staticCapabilityFingerprint(caps: BackendCapabilities): string {
     caps.maxComputeWorkgroupSizeX ?? 0,
     caps.maxComputeInvocationsPerWorkgroup ?? 0,
     caps.maxComputeWorkgroupStorageSize ?? 0,
-    caps.inferredVendorClass ?? "unknown",
     caps.shaderF16 ? 1 : 0,
     caps.subgroups ? 1 : 0,
     caps.atomicF32Add ? 1 : 0,
