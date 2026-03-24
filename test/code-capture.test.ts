@@ -34,7 +34,7 @@ await deviceSuite(
       expect(entries.length).toBeGreaterThanOrEqual(1);
       for (const e of entries) {
         expect(e.backend).toBe(device === "webgpu" ? "webgpu" : "wasm");
-        expect(["kernel", "mega-module"]).toContain(e.kind);
+        expect(["kernel", "mega-module", "program"]).toContain(e.kind);
       }
     });
 

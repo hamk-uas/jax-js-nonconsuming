@@ -100,14 +100,15 @@ export const devices: Device[] = ["cpu", "wasm", "webgpu", "webgl"];
 
 /** A compiled code unit captured by `setCodeCapture`. */
 export type CodeCaptureEntry = {
-  backend: "webgpu" | "wasm";
+  backend: "webgpu" | "wasm" | "cpu" | "webgl";
   kind:
     | "kernel"
     | "mega-module"
     | "scan"
     | "assoc-scan"
     | "block-map"
-    | "routine";
+    | "routine"
+    | "program";
   label?: string;
   /** WGSL source (WebGPU) or WAT source (WASM). */
   code?: string;
