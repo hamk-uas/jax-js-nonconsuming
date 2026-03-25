@@ -18,7 +18,7 @@ await init();
 
 // Named functions for identity-based dedup testing.
 // Use raw number literals (not np.array([1])) so the jit body const goes
-// through pureArray → anonymousConstArrays → properly builder-owned.
+// through pureArray → getOrMakeConstTracer → properly builder-owned.
 function addOne(x: np.Array) {
   return x.add(1);
 }

@@ -10,7 +10,7 @@ import {
 } from "../tree";
 import { checkAxis, unzip2, zip } from "../utils";
 import {
-  anonymousConstArrays,
+  _liftedTangentZeros,
   arange,
   Array,
   eye,
@@ -135,15 +135,7 @@ class JVPTrace extends Trace {
 
   lift(val: Tracer): Tracer {
     const zero = zerosLike(val);
-    // Mark the zero tangent as anonymous so getOrMakeConstTracer takes full
-    // ownership (no extra .ref). These are freshly created internals that
-    // nobody else holds a reference to. Without this, the ClosedJaxpr from
-    // jvpJaxpr/transposeJaxpr would leak the zero array (rc=2 from .ref,
-    // dispose only drops to 1).
-    if (zero instanceof Array) anonymousConstArrays.add(zero);
-    // Track the zero tangent for cleanup in jvpFlat. Lifted JVPTracers
-    // (from fullRaise) aren't tracked in intermediates, so their zero
-    // tangents would leak if not disposed explicitly.
+    _liftedTangentZeros.add(zero);
     const data = this.main.globalData as JvpGlobalData | null;
     if (data) data.liftedTangents.push(zero);
     return new JVPTracer(this, val, zero);
@@ -1096,12 +1088,9 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
 
       // iT is the zero tangent for the loop counter — always dead in the
       // JVP'd body (loop counters don't participate in differentiation).
-      // makeJaxpr resets _peArrayCreationTracker to null, so iT is not
-      // tracked by the PE collector. If the JaxprBuilder never captures it
-      // (dead input), the anonymous const lifecycle won't dispose it.
-      // Remove from anonymous set and dispose explicitly to prevent leak.
+      // If the JaxprBuilder never captured it, its creation ref remains.
+      // Dispose explicitly to prevent leak.
       if (iT instanceof Array) {
-        anonymousConstArrays.delete(iT);
         iT.dispose();
       }
 

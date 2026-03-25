@@ -37,7 +37,6 @@ import {
 import { reverse, scatterAdd } from "./frontend/core";
 import * as jaxprModule from "./frontend/jaxpr";
 import {
-  _setDebugAnonymousConsts,
   _setVerifyEffects,
   ClosedJaxpr,
   type EffectVerificationResult,
@@ -141,7 +140,6 @@ export {
   scatterAdd,
   setCodeCapture,
   _setVerifyEffects,
-  _setDebugAnonymousConsts,
   setDebug,
   scipyLinalg,
   scipySpecial,

@@ -279,13 +279,10 @@ export function aotLinearize(
     : buildBackwardJaxpr(forwardJaxpr);
 
   // Phase 3: Dispose PE intermediates.
-  // Protect primal outputs from disposal.
+  // Protect consts whose only remaining ref is the CJ's .ref (rc≤1).
+  // Consts at rc>1 still carry a ref from instantiateConst that the
+  // collector must clean up; protecting them would leak that extra ref.
   const protectedVals = new Set<Tracer>(primalsOut);
-  // Protect forward jaxpr consts whose creation ref was already consumed by
-  // user disposal (rc <= 1). Without protection, collector.dispose would kill
-  // the ClosedJaxpr's sole ownership ref. Healthy consts (rc >= 2) get their
-  // creation ref balanced here — collector.dispose decrements from 2 to 1,
-  // leaving only the ClosedJaxpr's .ref from partialEvalGraphToJaxpr.
   for (const c of forwardJaxpr.consts) {
     if (c.refCount <= 1) protectedVals.add(c);
   }

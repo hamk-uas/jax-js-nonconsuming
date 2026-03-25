@@ -22,7 +22,6 @@ import {
   unzip2,
 } from "../utils";
 import {
-  anonymousConstArrays,
   array,
   eye,
   fullInternal,
@@ -80,7 +79,6 @@ import {
   where,
 } from "./core";
 import {
-  _incrementBuilderRef,
   abstractEvalRules,
   ClosedJaxpr,
   evalJaxpr,
@@ -276,7 +274,7 @@ class ResidualCollector {
   }
 
   /**
-   * Dispose PE intermediates that aren't protected (outputs, aux, low-rc consts).
+   * Dispose PE intermediates that aren't protected (outputs, aux, retained consts).
    *
    * During PE, all-known evaluations create concrete arrays. Output values
    * (in protectedVals) are returned to the caller. ClosedJaxpr consts have
@@ -795,14 +793,11 @@ class PartialEvalTrace extends Trace {
     }
 
     // Evaluate full loop with zeros for tangents
-    const synthesizedZeroInputs: Tracer[] = [];
     const fullInputs = tracers.map((t) => {
       if (t.pval.isKnown) {
         return (t.pval.val as Tracer).ref;
       } else {
-        const z = zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
-        synthesizedZeroInputs.push(z);
-        return z;
+        return zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
       }
     });
 
@@ -847,14 +842,12 @@ class PartialEvalTrace extends Trace {
       retainedKnownOutputs.add(fullOuts[i]);
     }
 
-    const synthesizedSet = new Set(synthesizedZeroInputs);
+    // Clean up fullInputs: balance the .ref taken at creation (known inputs)
+    // and the creation ref of synthesized zeros (unknown inputs).
+    // If an outer JaxprTrace captured a value via getOrMakeConstTracer,
+    // that builder holds an independent .ref — disposing here is safe.
     for (const inp of fullInputs) {
-      // Dispose the .ref() taken at fullInputs creation. Skip synthesized
-      // zeros (disposed by PE collector) and retained outputs (still alive).
-      // Don't guard on inp.refCount — non-Array tracers (BatchTracer, etc.)
-      // report refCount=0 from the base Tracer class, but their .dispose()
-      // correctly cascades to the inner value.
-      if (!retainedKnownOutputs.has(inp) && !synthesizedSet.has(inp)) {
+      if (!retainedKnownOutputs.has(inp)) {
         inp.dispose();
       }
     }
@@ -914,14 +907,11 @@ class PartialEvalTrace extends Trace {
     const numPrimalY = numY / 2;
 
     // Run primal-only computation using known inputs + zeros for tangent
-    const synthesizedZeroInputs: Tracer[] = [];
     const fullInputs = tracers.map((t) => {
       if (t.pval.isKnown) {
         return (t.pval.val as Tracer).ref;
       } else {
-        const z = zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
-        synthesizedZeroInputs.push(z);
-        return z;
+        return zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
       }
     });
 
@@ -993,18 +983,13 @@ class PartialEvalTrace extends Trace {
       retainedKnownOutputs.add(fullOuts[numCarry + i]);
     }
 
-    // Clean up explicitly .ref'd known inputs. Do NOT dispose synthesized
-    // zeros — bind() may have captured them via getOrMakeConstTracer at an
-    // outer JaxprTrace level, and disposing here would undo that builder's
-    // .ref, leaving the builder with a dangling reference. The zeros'
-    // lifecycle is managed by the ClosedJaxpr that captured them.
-    const synthesizedSet = new Set(synthesizedZeroInputs);
+    // Clean up fullInputs: balance the .ref taken at line 920 (known inputs)
+    // and the creation ref of synthesized zeros (unknown inputs).
+    // For both: if an outer JaxprTrace captured the value via
+    // getOrMakeConstTracer, that builder holds an independent .ref, so
+    // disposing here is safe (rc stays ≥ 1 from the builder's ownership).
     for (const inp of fullInputs) {
-      if (
-        !retainedKnownOutputs.has(inp) &&
-        !synthesizedSet.has(inp) &&
-        inp.refCount > 0
-      ) {
+      if (!retainedKnownOutputs.has(inp) && inp.refCount > 0) {
         inp.dispose();
       }
     }
@@ -1065,14 +1050,11 @@ class PartialEvalTrace extends Trace {
     const numOrigLeaves = numLeaves / 2;
 
     // Run full scan with zeros for unknown inputs
-    const synthesizedZeroInputs: Tracer[] = [];
     const fullInputs = tracers.map((t) => {
       if (t.pval.isKnown) {
         return (t.pval.val as Tracer).ref;
       } else {
-        const z = zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
-        synthesizedZeroInputs.push(z);
-        return z;
+        return zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
       }
     });
 
@@ -1108,15 +1090,12 @@ class PartialEvalTrace extends Trace {
     const retainedKnownOutputs = new Set<Tracer>(
       fullOuts.slice(0, numOrigLeaves),
     );
-    // Same fix as #partialEvalScan: don't dispose synthesized zeros that
-    // may have been captured by an outer JaxprTrace builder.
-    const synthesizedSet = new Set(synthesizedZeroInputs);
+    // Clean up fullInputs: balance the .ref taken at creation (known inputs)
+    // and the creation ref of synthesized zeros (unknown inputs).
+    // If an outer JaxprTrace captured a value via getOrMakeConstTracer,
+    // that builder holds an independent .ref — disposing here is safe.
     for (const inp of fullInputs) {
-      if (
-        !retainedKnownOutputs.has(inp) &&
-        !synthesizedSet.has(inp) &&
-        inp.refCount > 0
-      ) {
+      if (!retainedKnownOutputs.has(inp) && inp.refCount > 0) {
         inp.dispose();
       }
     }
@@ -1180,14 +1159,11 @@ class PartialEvalTrace extends Trace {
     const numPrimalOuts = numOutputs / 2;
 
     // Run full block_map with zeros substituted for unknown inputs.
-    const synthesizedZeroInputs: Tracer[] = [];
     const fullInputs = tracers.map((t) => {
       if (t.pval.isKnown) {
         return (t.pval.val as Tracer).ref;
       } else {
-        const z = zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
-        synthesizedZeroInputs.push(z);
-        return z;
+        return zerosInternal(t.pval.aval.shape, t.pval.aval.dtype);
       }
     });
 
@@ -1233,13 +1209,12 @@ class PartialEvalTrace extends Trace {
     const retainedKnownOutputs = new Set<Tracer>(
       fullOuts.slice(0, numPrimalOuts),
     );
-    const synthesizedSet = new Set(synthesizedZeroInputs);
+    // Clean up fullInputs: balance the .ref taken at creation (known inputs)
+    // and the creation ref of synthesized zeros (unknown inputs).
+    // If an outer JaxprTrace captured a value via getOrMakeConstTracer,
+    // that builder holds an independent .ref — disposing here is safe.
     for (const inp of fullInputs) {
-      if (
-        !retainedKnownOutputs.has(inp) &&
-        !synthesizedSet.has(inp) &&
-        inp.refCount > 0
-      ) {
+      if (!retainedKnownOutputs.has(inp) && inp.refCount > 0) {
         inp.dispose();
       }
     }
@@ -1377,13 +1352,11 @@ function partialEvalGraphToJaxpr(
   typecheckJaxpr(jaxpr); // sanity check
 
   // Give ClosedJaxpr independent ownership of its consts before PETracer
-  // cleanup. Without this .ref, the constPETracer disposal cascade (below)
-  // consumes the only ref from instantiateConst, leaving ClosedJaxpr with
-  // a borrowed reference. When ClosedJaxpr.dispose() is called (e.g., from
-  // fVjp.dispose() in grad), it would free user-owned arrays.
+  // cleanup. PE consts always get .ref because the PETracer disposal cascade
+  // will consume the creation ref.
   for (const c of consts) {
+    // jax-js-lint: allow-ref
     (c as Tracer).ref;
-    _incrementBuilderRef(c as Tracer);
   }
 
   // Cleanup PETracer wrappers:
@@ -1492,7 +1465,6 @@ function evalJaxprTransposed(
   jaxpr: Jaxpr,
   args: (Tracer | UndefPrimal)[],
   cotangents: Tracer[],
-  { markAnonymous = false }: { markAnonymous?: boolean } = {},
 ): Tracer[] {
   // Track which variables are known (primal) vs unknown (tangent).
   // A variable is known if ALL its inputs are known (primal values propagate).
@@ -1554,13 +1526,10 @@ function evalJaxprTransposed(
       return ct;
     } else {
       const z = zerosInternal(v.aval.shape, v.aval.dtype);
-      // Mark as anonymous so getOrMakeConstTracer (when inside a makeJaxpr
-      // trace like transposeJaxpr) skips .ref — the ClosedJaxpr becomes
-      // the sole owner and dispose() fully frees the backing Slot.
-      // Only safe when the enclosing makeJaxpr builder is the sole capturer;
-      // when evalJaxprTransposed runs directly inside an outer jit trace,
-      // arrays may escape to the outer trace and need normal .ref there.
-      if (markAnonymous && z instanceof JaxArray) anonymousConstArrays.add(z);
+      // Tracked in internalArrays for cleanup. If an outer makeJaxpr builder
+      // captures this via getOrMakeConstTracer, it takes an independent .ref.
+      // The internalArrays cleanup balances the creation ref; the builder's
+      // ClosedJaxpr.dispose() balances the .ref.
       internalArrays.add(z);
       return z;
     }
@@ -1610,9 +1579,8 @@ function evalJaxprTransposed(
     const primalsIn = eqn.inputs.map((v) => {
       if (v instanceof Lit) {
         const lit = array(v.value, { dtype: v.dtype });
-        if (markAnonymous && lit instanceof JaxArray) {
-          anonymousConstArrays.add(lit);
-        }
+        // Tracked in internalArrays for cleanup. If an outer makeJaxpr builder
+        // captures this, it takes an independent .ref via getOrMakeConstTracer.
         internalArrays.add(lit);
         return lit;
       }
@@ -4250,9 +4218,7 @@ function transposeJaxpr(jaxpr: Jaxpr, undefPrimals: boolean[]): ClosedJaxpr {
         if (undefPrimals[i]) args.push(new UndefPrimal(inTypes[i]));
         else args.push(forwardIn[forwardInIdx++]);
       }
-      return evalJaxprTransposed(jaxpr, args, cotangents, {
-        markAnonymous: true,
-      });
+      return evalJaxprTransposed(jaxpr, args, cotangents);
     },
     { validateRefs: false },
   )(forwardInTypes, outTypes);
@@ -4302,9 +4268,7 @@ export function buildBackwardJaxpr(forwardJaxpr: ClosedJaxpr): ClosedJaxpr {
         if (undefPrimals[i]) args.push(new UndefPrimal(inTypes[i]));
         else args.push(forwardIn[forwardInIdx++]);
       }
-      return evalJaxprTransposed(jaxpr, args, cotangents, {
-        markAnonymous: true,
-      });
+      return evalJaxprTransposed(jaxpr, args, cotangents);
     },
     { validateRefs: false },
   )(forwardInTypes, outTypes);
@@ -4326,6 +4290,9 @@ function vjpFlat(
   } = linearizeFlatUtil(f, primalsIn);
 
   // Phase 2: Dispose PE intermediates.
+  // Protect consts whose only remaining ref is the CJ's .ref (rc≤1).
+  // Consts at rc>1 still carry a ref from instantiateConst that the
+  // collector must clean up; protecting them would leak that extra ref.
   const protectedVals = new Set<Tracer>(primalsOut);
   for (const c of forwardJaxpr.consts) {
     if (c.refCount <= 1) protectedVals.add(c);

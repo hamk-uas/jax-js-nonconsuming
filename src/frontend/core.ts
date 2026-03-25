@@ -818,8 +818,6 @@ export function insideAbstractTrace(): boolean {
 /**
  * True while user body code is executing inside a makeJaxpr call.
  * Set around the `fn(tracers)` call, NOT during JaxprBuilder.build().
- * Used by markAnonymousIfTracing to detect inline np.array() constants
- * that should be builder-owned (anonymous) in the resulting ClosedJaxpr.
  */
 let _inMakeJaxprBody = false;
 export function inMakeJaxprBody(): boolean {

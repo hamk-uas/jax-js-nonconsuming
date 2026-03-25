@@ -88,7 +88,23 @@ differentiation (`grad`, `jvp`, `vjp`), JIT compilation, and composable transfor
   work.
 - **Non-consuming operations** — ops leave inputs alive. No `.ref` needed in user code. Silent leaks
   over crashes; `checkLeaks` + ESLint plugin compensate.
+- **Ownership-correct in both modes** — code must dispose correctly in eager mode and under `jit()`
+  tracing. `jit()` is a pure performance optimization; it must not change ownership semantics.
 - **Compounding returns** — every compiler improvement makes all operations faster.
+
+### Ownership invariants (maintainer rubric)
+
+For transform and tracing internals, use this short review rubric before merging:
+
+1. **Conserve handles** — every handle created or received has exactly one terminal path: transfer,
+   dispose, or explicit retained ownership.
+2. **Make retention boundaries explicit** — if a value outlives lexical scope (captured consts,
+   caches, pending work, closures, artifacts), retain an independent handle intentionally.
+3. **Release retained handles symmetrically** — retained handles must have a single release path,
+   including error paths (`try/finally` parity).
+
+This rubric is orthogonal to the non-consuming user API. It applies to internal ownership plumbing
+where `.ref` still exists as a low-level mechanism.
 
 ### Development priorities
 
@@ -183,6 +199,9 @@ canonical text for edits.
 Operations **do not consume** inputs. Arrays stay alive until `.dispose()`'d. `.data()` reads
 without consuming.
 
+This differs from upstream JAX's historical consuming-array model: user code in this fork should not
+need `.ref` to reuse inputs. Internal ownership machinery still uses `.ref` for retained handles.
+
 ```ts
 using x = np.array([1, 2, 3]);
 using y = x.mul(np.array([2, 2, 2]));
@@ -201,6 +220,19 @@ must be ownership-correct in both modes.
 - `consumeData()` = read + dispose in one call
 - `tree.data(pytree)` = read all leaves in parallel (overlapping `mapAsync` calls)
 - `tree.consumeData(pytree)` = read all leaves in parallel + dispose
+
+**Internal ownership rules for restructuring work:**
+
+- If a transform, cache, artifact, or builder needs a value past the current lexical scope, it must
+  take an independent retained handle intentionally.
+- Cache-owned values stay cache-owned. `transposeJaxprCache` callers must not dispose returned
+  `ClosedJaxpr`s.
+- If eager-mode ownership is wrong, `jit()` is not the fix. Trace-only success usually means the
+  compiler is masking a real retain/release mismatch.
+- Captured consts, PE residuals, and artifact wrappers must each have one clear owner and one clear
+  release path.
+- Temporary suppression of `using` or `.dispose()` semantics is technical debt, not an acceptable
+  long-term ownership boundary.
 
 **GPU readback latency:** Each `GPUBuffer.mapAsync()` round-trip costs ~12ms on eGPU (TB4). When
 reading multiple outputs, use `tree.data()` / `tree.consumeData()` or `Promise.all()` to overlap
@@ -1085,7 +1117,8 @@ https://github.com/b0nes164/Decoupled-Fallback-Paper · https://github.com/b0nes
 - **JIT flow:** `makeJaxpr` → `flatten().simplify()` → `splitGraphDataflow()` → `jitCompile()` →
   `JitProgram.execute()`
 - **Ownership debugging:** Check artifact disposal timing, `transposeJaxprCache` (cache-owned),
-  `getOrMakeConstTracer` `.ref` balance, `evalJaxprTransposed` `argPrimals` set
+  `getOrMakeConstTracer` `.ref` balance, `ResidualCollector` release timing, `[Symbol.dispose]`
+  behavior in `array.ts`, and `evalJaxprTransposed` `argPrimals` set
 - **Multi-output kernel access:** `kernel.outputs[0].exp`, `.reduction`, `.dtype`, `.bytes` — no
   single-output shims
 

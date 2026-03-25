@@ -140,18 +140,9 @@ export default defineConfig([
       "jax-js/no-nested-array-leak": "off",
     },
   },
-  // `new Array({source: ...})` in exported factory functions must be wrapped
-  // in `markAnonymousIfTracing()` to prevent leaks in jit/grad/scan bodies.
-  {
-    files: ["src/frontend/array.ts"],
-    rules: {
-      "jax-js/require-mark-anonymous": "error",
-    },
-  },
-  // Internal framework code must not import zeros()/ones() — they call
-  // markAnonymousIfTracing() which causes over-disposal when called during
-  // tracing (e.g. linearize.ts creating tangent zeros). Use fullInternal()
-  // or a local zerosInternal() helper instead.
+  // Internal framework code must not import zeros()/ones() — they wrap
+  // fullInternal() which is the correct primitive for tracing contexts.
+  // Use fullInternal() or a local zerosInternal() helper instead.
   {
     files: [
       "src/frontend/**/*.ts",
@@ -168,13 +159,13 @@ export default defineConfig([
               name: "./array",
               importNames: ["zeros", "ones"],
               message:
-                "Use fullInternal() instead. zeros()/ones() call markAnonymousIfTracing() which causes over-disposal when called during tracing.",
+                "Use fullInternal() instead. zeros()/ones() are public API wrappers not intended for internal tracing contexts.",
             },
             {
               name: "../frontend/array",
               importNames: ["zeros", "ones"],
               message:
-                "Use fullInternal() instead. zeros()/ones() call markAnonymousIfTracing() which causes over-disposal when called during tracing.",
+                "Use fullInternal() instead. zeros()/ones() are public API wrappers not intended for internal tracing contexts.",
             },
           ],
         },

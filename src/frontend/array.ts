@@ -203,6 +203,20 @@ type ArrayConstructorArgs = {
  * this into your code's namespace if you're already using the JavaScript
  * "Array" type by name.
  */
+/**
+ * WeakSet of JaxArrays created during any `makeJaxpr` body execution.
+ * These have an unowned creation ref (rc=1 at birth) that is NOT balanced
+ * by any external owner. `makeJaxpr` balances these after building the CJ.
+ */
+export const _arraysCreatedInMakeJaxprBody = new WeakSet<object>();
+
+/**
+ * WeakSet of zero tangent arrays created by JVPTrace.lift().
+ * Their creation ref is balanced by liftedTangents cleanup in jvpFlat.
+ * makeJaxpr must NOT double-balance them.
+ */
+export const _liftedTangentZeros = new WeakSet<object>();
+
 export class Array extends Tracer {
   #dtype: DType;
   #weakType: boolean;
@@ -247,6 +261,14 @@ export class Array extends Tracer {
     // and PE tracking, so this constructor hook catches them.
     if (_peArrayCreationTracker) {
       _peArrayCreationTracker.push(this);
+    }
+
+    // Track Arrays created during makeJaxpr body execution.
+    // These have an unowned creation ref that must be balanced when the
+    // outermost makeJaxpr builds its ClosedJaxpr — builders hold independent
+    // .ref handles, but the creation rc=1 has no owner.
+    if (inMakeJaxprBody()) {
+      _arraysCreatedInMakeJaxprBody.add(this);
     }
   }
 
@@ -312,29 +334,9 @@ export class Array extends Tracer {
 
   /**
    * Override Tracer's no-op to actually dispose concrete Arrays.
-   *
-   * During PE tracing, concrete Arrays are created by PE's all-known evaluation
-   * path and tracked in knownIntermediates. Their lifecycle is managed by
-   * ResidualCollector.dispose() after PE completes. If `using` declarations in JVP
-   * helpers also dispose these arrays, the double-dispose causes
-   * UseAfterFreeError when the ClosedJaxpr later accesses its consts.
-   *
-   * We detect PE scope via _peArrayCreationTracker (non-null when inside PE).
-   * JVP-only traces (no PE) still dispose normally — those intermediates have
-   * real Slots that need cleanup.
-   *
-   * During makeJaxpr body tracing (e.g., scan body within jit), anonymous-const-
-   * marked Arrays (from np.eye, np.zeros, etc.) may be captured as ClosedJaxpr
-   * constants via getOrMakeConstTracer. Their lifecycle is managed by
-   * ClosedJaxpr.dispose()'s anonymous extra dispose. If `using` also fires
-   * during tracing, it reduces the refcount below what ClosedJaxpr.dispose()
-   * expects, causing UseAfterFreeError when nested ClosedJaxprs (scan body +
-   * outer jit) both try to dispose the same const. Non-anonymous arrays
-   * (e.g., JVP tangent zeros from fullInternal) must still be disposable.
+   * Called by `using` declarations at block scope exit.
    */
   [Symbol.dispose]() {
-    if (_peArrayCreationTracker) return;
-    if (inMakeJaxprBody() && anonymousConstArrays.has(this)) return;
     if (this.#rc > 0) this.dispose();
   }
 
@@ -2125,12 +2127,10 @@ export function array(
     }
     return values;
   } else if (ArrayBuffer.isView(values)) {
-    return markAnonymousIfTracing(
-      arrayFromData(values, shape ?? [values.length], {
-        dtype,
-        device,
-      }),
-    );
+    return arrayFromData(values, shape ?? [values.length], {
+      dtype,
+      device,
+    });
   } else {
     // Assume this is a nested array object, infer the shape.
     if (!shape) {
@@ -2148,23 +2148,17 @@ export function array(
         `Jagged shape: ${JSON.stringify(shape)} vs ${flat.length}`,
       );
     }
-    if (size === 0)
-      return markAnonymousIfTracing(zeros(shape, { dtype, device }));
-    if (size === 1)
-      return markAnonymousIfTracing(full(shape, flat[0], { dtype, device }));
+    if (size === 0) return zeros(shape, { dtype, device });
+    if (size === 1) return full(shape, flat[0], { dtype, device });
     if (typeof flat[0] === "boolean") {
       dtype = dtype ?? DType.Bool;
       const data = new Int32Array(flat.map((x) => (x ? 1 : 0)));
-      return markAnonymousIfTracing(
-        arrayFromData(data, shape, { dtype, device }),
-      );
+      return arrayFromData(data, shape, { dtype, device });
     } else {
       const weakType = dtype == undefined && shape.length === 0;
       dtype = dtype ?? DType.Float32;
       const data = dtypedJsArray(dtype, flat as number[]);
-      return markAnonymousIfTracing(
-        arrayFromData(data, shape, { dtype, device }, weakType),
-      );
+      return arrayFromData(data, shape, { dtype, device }, weakType);
     }
   }
 }
@@ -2249,46 +2243,9 @@ function dataToJs(
 }
 
 /** If x is a value, lift it into an array, otherwise leave it be. */
-/**
- * WeakSet tracking arrays created by pureArray from raw (non-Tracer) values.
- * These arrays are "anonymous" — created transiently by fudgeArray/pureArray
- * inside library functions, with no user code holding a reference.
- * getOrMakeConstTracer checks this to avoid calling .ref on anonymous consts,
- * which would leak when the ClosedJaxpr is disposed.
- */
-export const anonymousConstArrays = new WeakSet<Array>();
-
-/**
- * Tags an array as anonymous builder-owned when created inside a makeJaxpr
- * body execution.  Arrays created during tracing (e.g. inline `np.array([3])`
- * inside a jit/grad/scan body) have no external owner — the enclosing
- * ClosedJaxpr should be the sole owner via getOrMakeConstTracer's
- * ownedByBuilder path.
- *
- * Only fires when inMakeJaxprBody() is true (during user function execution).
- * NOT true during JaxprBuilder.build() / _inlineLiterals, which create
- * internal arrays that must not be marked anonymous.
- *
- * Safe because arrays captured from OUTSIDE the body were created before
- * makeJaxpr body execution started (inMakeJaxprBody() was false at their
- * creation time) and are therefore not marked here.
- *
- * Marking MUST happen at creation time (before any getOrMakeConstTracer
- * call), not after tracing completes.
- */
-const markAnonymousIfTracing = (arr: Array): Array => {
-  if (inMakeJaxprBody()) anonymousConstArrays.add(arr);
-  return arr;
-};
-
 export function pureArray(x: TracerValue): Tracer {
-  if (x instanceof Tracer) {
-    return x;
-  } else {
-    const arr = array(x);
-    anonymousConstArrays.add(arr as Array);
-    return arr;
-  }
+  if (x instanceof Tracer) return x;
+  return array(x);
 }
 
 class EvalTrace extends Trace {
@@ -2319,23 +2276,14 @@ export function fullInternal(
   fillValue: number | boolean,
   device?: Device,
 ) {
-  // Mark anonymous so ClosedJaxpr.dispose() can balance the extra .ref from
-  // getOrMakeConstTracer.  Safe because:
-  //  1. All evalJaxpr call sites .ref consts → evalJaxpr never directly
-  //     disposes ClosedJaxpr.consts.
-  //  2. ClosedJaxpr.dispose() guards the anonymous extra with refCount > 0
-  //     → no UAF when the const was already freed.
-  //  3. !inMakeJaxprBody() guard defers the extra to the outermost level.
-  return markAnonymousIfTracing(
-    new Array({
-      source: AluExp.const(aval.dtype, fillValue),
-      st: ShapeTracker.fromShape(aval.shape as number[]),
-      dtype: aval.dtype,
-      weakType: aval.weakType,
-      backend: getBackend(device),
-      committed: device != undefined,
-    }),
-  );
+  return new Array({
+    source: AluExp.const(aval.dtype, fillValue),
+    st: ShapeTracker.fromShape(aval.shape as number[]),
+    dtype: aval.dtype,
+    weakType: aval.weakType,
+    backend: getBackend(device),
+    committed: device != undefined,
+  });
 }
 
 export function zerosLike(val: TracerValue, opts?: DTypeShapeAndDevice): Array {
@@ -2367,12 +2315,12 @@ export function fullLike(
 
 /** Return a new array of given shape and type, filled with zeros. */
 export function zeros(shape: number[], opts?: DTypeAndDevice): Array {
-  return markAnonymousIfTracing(full(shape, 0, opts));
+  return full(shape, 0, opts);
 }
 
 /** Return a new array of given shape and type, filled with ones. */
 export function ones(shape: number[], opts?: DTypeAndDevice): Array {
-  return markAnonymousIfTracing(full(shape, 1, opts));
+  return full(shape, 1, opts);
 }
 
 /** Return a new array of given shape and type, filled with `fill_value`. */
@@ -2394,10 +2342,6 @@ export function full(
   } else {
     throw new TypeError(`Invalid type for full: ${fillValue}`);
   }
-  // full() is NOT wrapped in markAnonymousIfTracing: it may be called by
-  // library internals during tracing (transitively via other APIs).  The
-  // user-facing wrappers zeros() and ones() apply the marking instead.
-  // jax-js-lint: allow-unmarked
   return fullInternal(
     new ShapedArray(shape, dtype, weakType),
     fillValue,
@@ -2449,16 +2393,14 @@ export function eye(
     AluExp.mod(AluVar.idx, AluExp.i32(numCols + 1)),
     AluExp.i32(1),
   );
-  return markAnonymousIfTracing(
-    new Array({
-      source: AluExp.cast(dtype, exp),
-      st: ShapeTracker.fromShape([numRows, numCols]),
-      dtype,
-      weakType,
-      backend: getBackend(device),
-      committed: device != undefined,
-    }),
-  );
+  return new Array({
+    source: AluExp.cast(dtype, exp),
+    st: ShapeTracker.fromShape([numRows, numCols]),
+    dtype,
+    weakType,
+    backend: getBackend(device),
+    committed: device != undefined,
+  });
 }
 
 /** Return the identity matrix, with ones on the main diagonal. */
@@ -2510,16 +2452,14 @@ export function arange(
     AluExp.mul(AluExp.cast(dtype, AluVar.idx), AluExp.const(dtype, step)),
   );
   const st = ShapeTracker.fromShape([size]);
-  return markAnonymousIfTracing(
-    new Array({
-      source: exp,
-      st,
-      dtype,
-      weakType: false,
-      backend: getBackend(device),
-      committed: device != undefined,
-    }),
-  );
+  return new Array({
+    source: exp,
+    st,
+    dtype,
+    weakType: false,
+    backend: getBackend(device),
+    committed: device != undefined,
+  });
 }
 
 /**
@@ -2625,16 +2565,14 @@ export function linspace(
     ),
   );
   const st = ShapeTracker.fromShape([num]);
-  return markAnonymousIfTracing(
-    new Array({
-      source: exp,
-      st,
-      dtype,
-      weakType: false,
-      backend: getBackend(device),
-      committed: device != undefined,
-    }),
-  );
+  return new Array({
+    source: exp,
+    st,
+    dtype,
+    weakType: false,
+    backend: getBackend(device),
+    committed: device != undefined,
+  });
 }
 
 /**

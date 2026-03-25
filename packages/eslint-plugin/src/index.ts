@@ -6,7 +6,6 @@ import noMakeDisposableAlias from "./rules/no-make-disposable-alias";
 import noNestedArrayLeak from "./rules/no-nested-array-leak";
 import noUnnecessaryRef from "./rules/no-unnecessary-ref";
 import noUseAfterDispose from "./rules/no-use-after-dispose";
-import requireMarkAnonymous from "./rules/require-mark-anonymous";
 import requireRetainedRelease from "./rules/require-retained-release";
 import requireScanResultDispose from "./rules/require-scan-result-dispose";
 import requireTryFinallySymmetry from "./rules/require-try-finally-symmetry";
@@ -26,7 +25,6 @@ const plugin: ESLint.Plugin = {
     "no-unnecessary-ref": noUnnecessaryRef,
     "no-array-chain": noArrayChain,
     "no-nested-array-leak": noNestedArrayLeak,
-    "require-mark-anonymous": requireMarkAnonymous,
     "require-scan-result-dispose": requireScanResultDispose,
     "require-retained-release": requireRetainedRelease,
     "require-try-finally-symmetry": requireTryFinallySymmetry,
@@ -113,7 +111,6 @@ const internalTransforms: Linter.Config = {
     "jax-js/require-retained-release": "warn",
     "jax-js/require-try-finally-symmetry": "warn",
     "jax-js/require-wrapper-dispose-symmetry": "warn",
-    "jax-js/require-mark-anonymous": "warn",
   },
 };
 
