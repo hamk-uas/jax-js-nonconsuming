@@ -46,7 +46,6 @@ import {
 } from "./convolution";
 import {
   _associativeScanCoreImpl,
-  _peArrayCreationTracker,
   AbstractValue,
   CompareOp,
   add as coreAdd,
@@ -57,11 +56,13 @@ import {
   shrink as coreShrink,
   getAval,
   inMakeJaxprBody,
+  inPartialEvalScope,
   ndim,
   newMain,
   Primitive,
   PrimitiveParams,
   promoteAvals,
+  registerPartialEvalCreatedArray,
   routinePrimitives,
   ShapedArray,
   Trace,
@@ -193,6 +194,17 @@ type ArrayConstructorArgs = {
   pending?: Iterable<IPendingExecute>;
 };
 
+/** Known claimants of an Array's creation ref. */
+export type CreationRefClaimant = "jvp-lifted-tangents" | "jacfwd-eye-matrix";
+
+/** All possible states of an Array's creation-ref owner field. */
+export type CreationRefOwner =
+  | "none"
+  | "partial-eval"
+  | "makeJaxpr-body"
+  | CreationRefClaimant
+  | "balanced";
+
 /**
  * A multidimensional numeric array with data stored on CPU or GPU.
  *
@@ -203,20 +215,6 @@ type ArrayConstructorArgs = {
  * this into your code's namespace if you're already using the JavaScript
  * "Array" type by name.
  */
-/**
- * WeakSet of JaxArrays created during any `makeJaxpr` body execution.
- * These have an unowned creation ref (rc=1 at birth) that is NOT balanced
- * by any external owner. `makeJaxpr` balances these after building the CJ.
- */
-export const _arraysCreatedInMakeJaxprBody = new WeakSet<object>();
-
-/**
- * WeakSet of zero tangent arrays created by JVPTrace.lift().
- * Their creation ref is balanced by liftedTangents cleanup in jvpFlat.
- * makeJaxpr must NOT double-balance them.
- */
-export const _liftedTangentZeros = new WeakSet<object>();
-
 export class Array extends Tracer {
   #dtype: DType;
   #weakType: boolean;
@@ -225,6 +223,18 @@ export class Array extends Tracer {
   #backend: Backend;
   #committed: boolean; // if array is committed to device (passed explicitly)
   #rc: number; // reference count for this specific Array object
+  /**
+   * Named owner of this Array's creation ref (rc=1 at birth).
+   *
+   * - "none": no subsystem claimed the creation ref yet.
+   * - "partial-eval": born during PE scope; PE cleanup path manages it.
+   * - "makeJaxpr-body": born during makeJaxpr body execution; if captured as
+   *   a const and still outstanding at build time, makeJaxpr must balance it.
+   * - claimant states: a specific subsystem owns the creation ref and must
+   *   balance it on its own cleanup path.
+   * - "balanced": makeJaxpr already paid the compensating dispose.
+   */
+  #creationRefOwner: CreationRefOwner;
   #pendingSet: Set<IPendingExecute> | null; // only if source is `Slot`
 
   /**
@@ -242,6 +252,7 @@ export class Array extends Tracer {
     this.#backend = args.backend;
     this.#committed = args.committed;
     this.#rc = 1;
+    this.#creationRefOwner = "none";
 
     this.#pendingSet = new Set(args.pending);
     if (this.#pendingSet.size === 0) {
@@ -259,17 +270,17 @@ export class Array extends Tracer {
     // Track Arrays created during PE scope for intermediate disposal.
     // Anonymous constants (np.array([...]) inside grad body) bypass bind()
     // and PE tracking, so this constructor hook catches them.
-    if (_peArrayCreationTracker) {
-      _peArrayCreationTracker.push(this);
+    // When inside both PE and makeJaxpr, the inner makeJaxpr wins (below).
+    if (inPartialEvalScope()) {
+      this.#creationRefOwner = "partial-eval";
+      if (!inMakeJaxprBody()) registerPartialEvalCreatedArray(this);
     }
 
     // Track Arrays created during makeJaxpr body execution.
     // These have an unowned creation ref that must be balanced when the
     // outermost makeJaxpr builds its ClosedJaxpr — builders hold independent
     // .ref handles, but the creation rc=1 has no owner.
-    if (inMakeJaxprBody()) {
-      _arraysCreatedInMakeJaxprBody.add(this);
-    }
+    if (inMakeJaxprBody()) this.#creationRefOwner = "makeJaxpr-body";
   }
 
   /** @ignore */
@@ -313,6 +324,64 @@ export class Array extends Tracer {
   /** Get the current reference count (for debugging memory management). */
   get refCount(): number {
     return this.#rc;
+  }
+
+  override isAliveForCleanup(): boolean {
+    return this.#rc > 0;
+  }
+
+  /**
+   * Whether this Array has an unowned creation ref (rc=1 from birth)
+   * that needs balancing by makeJaxpr after building the ClosedJaxpr.
+   */
+  get hasUnownedCreationRef(): boolean {
+    return this.#creationRefOwner === "makeJaxpr-body";
+  }
+
+  /**
+   * True if this array was created inside a partial-eval scope
+   * (i.e., during grad/vjp forward tracing).
+   */
+  get hasPartialEvalCreationRef(): boolean {
+    return this.#creationRefOwner === "partial-eval";
+  }
+
+  /**
+   * Debug-only view of the current creation-ref owner. Used by ownership
+   * characterization tests to pin claimant-specific transitions.
+   */
+  get _creationRefOwnerForDebug(): CreationRefOwner {
+    return this.#creationRefOwner;
+  }
+
+  /**
+   * Claim ownership of this Array's creation ref for a specific subsystem.
+   * After this call, makeJaxpr will NOT balance the creation ref.
+   */
+  claimCreationRef(owner: CreationRefClaimant): void {
+    if (
+      this.#creationRefOwner === "none" ||
+      this.#creationRefOwner === "partial-eval" ||
+      this.#creationRefOwner === "makeJaxpr-body"
+    ) {
+      this.#creationRefOwner = owner;
+      return;
+    }
+    throw new Error(
+      `internal: invalid creation-ref claim transition ${this.#creationRefOwner} -> ${owner}`,
+    );
+  }
+
+  /**
+   * Mark that makeJaxpr paid the compensating dispose for a body-created
+   * array's creation ref. Prevents double-balancing by outer builders.
+   */
+  markCreationRefBalancedByMakeJaxpr(): void {
+    if (this.#creationRefOwner !== "makeJaxpr-body")
+      throw new Error(
+        `internal: invalid makeJaxpr balance transition from ${this.#creationRefOwner}`,
+      );
+    this.#creationRefOwner = "balanced";
   }
 
   dispose() {

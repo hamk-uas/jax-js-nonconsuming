@@ -1294,7 +1294,8 @@ describe("lax.tiledMatmul", () => {
       return np.sum(result);
     };
 
-    using A_flat = np.arange(256).astype(DType.Float32);
+    using A_int = np.arange(256);
+    using A_flat = A_int.astype(DType.Float32);
     using A = A_flat.reshape([16, 16]);
     using g_tiled = grad(f_tiled)(A);
     using g_ref = grad(f_ref)(A);

@@ -1,4 +1,9 @@
-# Ownership Restructuring Plan
+# Ownership Restructuring Plan (Completed ADR)
+
+> **Status: COMPLETE.** All phases (1–5a) are done. The current ownership architecture is documented
+> in `.github/copilot-instructions.md` under "Internal ownership architecture." This file is
+> retained as an Architecture Decision Record for the rationale behind design choices (e.g., why the
+> adopt model was rejected in favor of explicit lexical balancing).
 
 ## Objective
 
@@ -12,37 +17,38 @@ executor, cache) with one clear release path.
 
 ## Ground Truth
 
-_(Updated after Step 3d: phantom-ref machinery deleted, explicit lexical balancing active.)_
+_(Updated after Phase 3d.75: named creation-ref owners landed.)_
 
 The remaining ownership friction is concentrated in the tracing pipeline:
 
 - `src/frontend/array.ts` no longer carries a disposal suppression guard. `[Symbol.dispose]()`
-  always runs normally. Two WeakSets provide creation-ref tracking: `_arraysCreatedInMakeJaxprBody`
-  (marks arrays born during any `makeJaxpr` body) and `_liftedTangentZeros` (marks zero tangents
-  from `JVPTrace.lift()`, whose creation ref is owned by `liftedTangents` cleanup).
-- `src/frontend/linearize.ts` has an active `ResidualCollector` with `dispose(protectedVals)`. It
-  cleans up dead PE temporaries that are not in the protection set. Forward jaxpr consts at rc≤1 are
+  always runs normally. Each Array carries a named creation-ref owner state. Arrays born during a
+  `makeJaxpr` body start in `makeJaxpr-body`; explicit claimants such as JVP lift zeros and `jacfwd`
+  eye matrices transition to claimant-specific owner states instead of a generic boolean.
+- `src/frontend/linearize.ts` uses `disposePeIntermediates(peIntermediates, protectedVals)` to clean
+  up dead PE temporaries that are not in the protection set. Forward jaxpr consts at rc≤1 are
   protected (their only remaining ref is the CJ's `.ref`); consts at rc>1 still carry a ref from
-  `instantiateConst` that the collector balances.
+  `instantiateConst` that the helper balances.
 - `src/frontend/jaxpr.ts` captures constants through `getOrMakeConstTracer` (`.ref`s the value). For
   raw values (`pureArray` results), the creation ref is immediately balanced after taking `.ref`.
-  For non-raw arrays created during `makeJaxpr` body execution (tracked by
-  `_arraysCreatedInMakeJaxprBody`), a per-builder `constsNeedingCreationRefBalance` Set tracks which
-  consts need their creation ref balanced. The balancing happens in `makeJaxpr` after
-  `builder.build()`, using a `refCount > 1` pre-build filter to distinguish stranded creation refs
-  from explicitly user-balanced ones (e.g., `jacfwd`'s `eyeMatrix.dispose()`).
+  For non-raw arrays still in the `makeJaxpr-body` owner state, a per-builder
+  `constsNeedingCreationRefBalance` Set tracks which consts need their creation ref balanced. The
+  balancing happens in `makeJaxpr` after `builder.build()`, using a `refCount > 1` pre-build filter
+  to distinguish stranded creation refs from explicitly user-balanced ones (e.g., `jacfwd`'s
+  `eyeMatrix.dispose()`).
 - `src/frontend/artifacts.ts` wrappers reach const lifecycle indirectly through
-  `ClosedJaxpr.dispose()`. They do NOT reference `_peArrayCreationTracker` or creation-ref tracking
-  directly.
+  `ClosedJaxpr.dispose()`. They do NOT reference creation-ref tracking directly.
 
 The system works because:
 
 1. `getOrMakeConstTracer`'s `.ref` keeps consts alive through `ClosedJaxpr` ownership.
 2. Creation refs for body-created arrays are balanced by `makeJaxpr`'s post-build loop.
 3. Creation refs for raw values are balanced immediately by `getOrMakeConstTracer`.
-4. `ResidualCollector.dispose()` cleans up dead PE temporaries (reactivated in Step 3b).
-5. `_liftedTangentZeros` prevents double-balancing of JVP lift zeros (their creation ref is owned by
-   `liftedTangents` cleanup in `jvpFlat`).
+4. `disposePeIntermediates(...)` cleans up dead PE temporaries (reactivated in Step 3b, simplified
+   in Phase 5).
+5. claimant-specific `claimCreationRef(...)` prevents double-balancing of JVP lift zeros (their
+   creation ref is owned by `liftedTangents` cleanup in `jvpFlat`) and jacfwd's `eyeMatrix`
+   (explicitly disposed by caller).
 
 ## Target Invariants
 
@@ -81,10 +87,11 @@ These patterns are the architectural debt collectors for this refactor:
   explicit lexical balancing replaces disposal suppression.)_
 - ~~**Dead `ResidualCollector.dispose()`** (`linearize.ts`): `return;` as first statement.~~
   _(Resolved in Step 3b: collector reactivated.)_
-- **`_peArrayCreationTracker` guard in `JVPTracer`** (`jvp.ts:123`):
-  `!_peArrayCreationTracker && ...`
-- **`_peArrayCreationTracker` guard in Sort JVP** (`jvp.ts:419`):
-  `if (!_peArrayCreationTracker) idx.dispose();`
+- ~~**`_peArrayCreationTracker` guard in `JVPTracer`** (`jvp.ts:123`):
+  `!_peArrayCreationTracker && ...`~~ _(Deleted in Step 3e: PE-scope suppression removed.)_
+- ~~**`_peArrayCreationTracker` guard in Sort JVP** (`jvp.ts:419`):
+  `if (!_peArrayCreationTracker) idx.dispose();`~~ _(Deleted in Step 3e: unconditional disposal with
+  retained handoff.)_
 - ~~**`_anonymousExtraDispose` phantom-ref balancing** (`jaxpr.ts`): fires or defers phantom
   creation ref disposal based on builder ref count and `refCount === 1`.~~ _(Deleted in Step 3d.)_
 - ~~**`_deferredConstCreationDisposes` queue** (`jaxpr.ts`): processes phantom disposals after
@@ -99,14 +106,14 @@ These patterns are the architectural debt collectors for this refactor:
 
 ### Risk Summary
 
-| Area                                     | Risk             | Why                                                                                                                                                                                          |
-| ---------------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Reactivate `ResidualCollector.dispose()` | **DONE** (3b)    | Reactivated with rc≤1 protection set. 42/42 characterization tests pass.                                                                                                                     |
-| Delete phantom-ref machinery             | **DONE** (3d)    | Three-layer state machine replaced by explicit creation-ref balancing via `constsNeedingCreationRefBalance` + `_arraysCreatedInMakeJaxprBody` + `_liftedTangentZeros`. All 2,064 tests pass. |
-| Evaluation-time Lit ownership            | **DONE** (3c/3d) | `evalJaxpr` Lit no longer marked anonymous — `litArrays` cleanup is sufficient. `evalJaxprTransposed` zeros/Lit tracked in `internalArrays` (independent lifecycle).                         |
-| WS2–WS3 entanglement                     | **DONE** (3d)    | `anonymousConstArrays` deleted entirely. PE suppression guard deleted. Const lifecycle is now independent of PE tracking.                                                                    |
-| Wrapper/cache boundaries                 | **LOW**          | Artifact wrappers don't directly reference suppression machinery. Mostly verification.                                                                                                       |
-| Removing `[Symbol.dispose]` guard        | **DONE** (3d)    | Guard deleted. Creation refs balanced by makeJaxpr post-build loop.                                                                                                                          |
+| Area                                     | Risk             | Why                                                                                                                                                                                                         |
+| ---------------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Reactivate `ResidualCollector.dispose()` | **DONE** (3b)    | Reactivated with rc≤1 protection set. 42/42 characterization tests pass.                                                                                                                                    |
+| Delete phantom-ref machinery             | **DONE** (3d)    | Three-layer state machine replaced by explicit creation-ref balancing via `constsNeedingCreationRefBalance`. Phase 3d.75 later upgrades the per-instance model to named owner states. All 2,072 tests pass. |
+| Evaluation-time Lit ownership            | **DONE** (3c/3d) | `evalJaxpr` Lit no longer marked anonymous — `litArrays` cleanup is sufficient. `evalJaxprTransposed` zeros/Lit tracked in `internalArrays` (independent lifecycle).                                        |
+| WS2–WS3 entanglement                     | **DONE** (3d)    | `anonymousConstArrays` deleted entirely. PE suppression guard deleted. Const lifecycle is now independent of PE tracking.                                                                                   |
+| Wrapper/cache boundaries                 | **LOW**          | Artifact wrappers don't directly reference suppression machinery. Mostly verification.                                                                                                                      |
+| Removing `[Symbol.dispose]` guard        | **DONE** (3d)    | Guard deleted. Creation refs balanced by makeJaxpr post-build loop.                                                                                                                                         |
 
 ### Key Finding: PE Intermediates (Fixed in Step 3b)
 
@@ -150,9 +157,10 @@ suite also retains a smaller set of explicitly named `vjp` edge-case leak tests.
 treated as evidence that bare `vjp()` generally leaks; they are scoped characterizations of specific
 workaround-era paths that still need explanation during Phase 3.
 
-**Bare grad(scan(f)) crashes:** `grad(f)` where `f` uses `lax.scan` with an anonymous const init
+~~**Bare grad(scan(f)) crashes:** `grad(f)` where `f` uses `lax.scan` with an anonymous const init
 (`np.array(0)`) throws `UseAfterFreeError` — the anonymous const gets disposed during the backward
-pass. `jit(grad(f))` works fine because JIT manages lifetimes.
+pass. `jit(grad(f))` works fine because JIT manages lifetimes.~~ _(Fixed: scan transpose rule now
+uses identity-based cleanup for borrowed cotangents.)_
 
 **Known-leak taxonomy:** The harness now distinguishes three buckets:
 
@@ -178,7 +186,7 @@ jit function dispose — all pass with zero leaks.
 | 6. Inlined literal ownership       | 4     | scalar consts cleaned up; bare grad still leaks                            |
 | 7. Eval-time Lit materialization   | 4     | jit(grad) ok; bare grad leaks and a specific vjp Lit path leaks            |
 | 8. ResidualCollector code paths    | 4     | grad leaks; one nonlinear vjp edge case also leaks; hasAux paths exercised |
-| 9. Scan transform compositions     | 4     | bare grad(scan) crashes; jit(grad(scan)) ok                                |
+| 9. Scan transform compositions     | 4     | ~~bare grad(scan) crashes~~; jit(grad(scan)) ok                            |
 | 10. Ownership edge cases           | 4     | clearCaches/jit.dispose cleanup verified                                   |
 
 #### checkLeaks Scoping Pattern for KNOWN LEAK Tests
@@ -211,11 +219,18 @@ Completed cleanup:
 ### Phase 3: Make PE retention and captured-const ownership explicit (MERGED WS2+WS3)
 
 **STATUS: Steps 3a--3c DONE. Step 3c.5 DONE. Phase 3c.75 feasibility analysis DONE (Alternative A
-selected: explicit lexical balancing). Step 3d ready to implement. Step 3e not started.**
+selected: explicit lexical balancing). Step 3d DONE. Phase 3d.5 DONE (global WeakSets replaced by an
+intermediate per-instance state model). Phase 3d.75 DONE (named creation-ref owners). Step 3e DONE
+(JVP PE-scope suppressions removed). Phase 3e.5 DONE (explicit JVP handoffs and liveness-first
+collector cleanup). Phase 3e.75 DONE (explicit tracer cleanup capability and deterministic JVP
+handoff probe). Phase 4 DONE (wrapper/cache boundaries audited, including artifact pending-state
+handoff). Phase 4.25 DONE. Phase 5a DONE (\_peArrayCreationTracker replaced by explicit partial-eval
+owner state plus scoped birth tracking) (explicit rollback path and residual-pack independence
+checks).**
 
 Steps 3a–3b fixed 12 of 13 original KNOWN LEAK characterization tests. The remaining KNOWN LEAK
-(`bare grad(scan(f))`) is a separate UseAfterFreeError from anonymous-const disposal during the
-backward pass of scan — outside the scope of PE/collector ownership.
+(`bare grad(scan(f))`) was a separate UseAfterFreeError from the scan transpose rule disposing
+borrowed cotangents — fixed separately via identity-based cleanup.
 
 **Step 3a–3b changes landed:**
 
@@ -539,8 +554,8 @@ when the tracer is cleaned up. No separate fix needed.
 - `CJ.dispose()` still calls `.dispose()` on consts (balances builder .ref)
 - `liftedTangents` cleanup in `jvpFlat` (balances creation ref for lift zeros)
 - `litArrays` cleanup in `evalJaxpr` (balances creation ref for Lit arrays)
-- `ResidualCollector.dispose()` (handles PE dead intermediates — unchanged)
-- `_peArrayCreationTracker` machinery (PE scope tracking — orthogonal)
+- `disposePeIntermediates(...)` (handles PE dead intermediates — unchanged in role)
+- partial-eval owner + scoped birth-list machinery (PE scope tracking — orthogonal)
 - `JVPTracer[Symbol.dispose]` PE guard (orthogonal to phantom-ref)
 
 **What changes:**
@@ -563,8 +578,8 @@ when the tracer is cleaned up. No separate fix needed.
    behavior — jit and eager should leak identically.
 
 3. **Bare `grad(f)` is unaffected.** During bare `grad(f)`, `inMakeJaxprBody()` is false, so the
-   `[Symbol.dispose]` guard was never active. The `ResidualCollector` and PE tracker handle cleanup.
-   No change.
+   `[Symbol.dispose]` guard was never active. The PE cleanup path and scoped PE tracking handle
+   cleanup. No change.
 
 4. **Bare `grad(scan(f))` crash is unaffected.** This is a separate UAF from scan's anonymous init
    array being disposed during the backward pass. Orthogonal to phantom-ref machinery.
@@ -660,19 +675,198 @@ explicit creation-ref balancing mechanism:
    post-build creation-ref balance loop. No phantom-ref pathway exists.
 3. ✅ `_inlineLiterals`'s `.dispose()` and `CJ.dispose()`'s `.dispose()` each balance exactly one
    builder `.ref`.
-4. ✅ `jit(f)` and bare `f` produce identical behavior — verified by 42/42 characterization tests
-   and 2,064/2,064 full suite tests.
+4. ✅ Global WeakSets replaced by a per-instance named owner state and claimant-specific
+   `claimCreationRef(...)` API. The `refCount > 1` pre-build check is precise and documented.
+   Characterization tests validate both leak-freedom and claimant-specific transitions.
 
-**Step 3e: Remove `_peArrayCreationTracker` guards from JVP paths.**
+### Phase 3d.5: Consolidate Step 3d mechanisms — remove global WeakSets (DONE)
 
-- `JVPTracer[Symbol.dispose]` guard (`jvp.ts:123`): replace with explicit disposal execution.
-- Sort JVP `idx.dispose()` guard (`jvp.ts:419`): replace with explicit ownership transfer to
-  Artifact.
+Step 3d deleted the phantom-ref state machine successfully, but its first replacement still used two
+global WeakSets (`_arraysCreatedInMakeJaxprBody`, `_liftedTangentZeros`) as external registries for
+ownership decisions. Phase 3d.5 removed those registries and moved the decision onto each Array
+instance. Phase 3d.75 then upgraded that intermediate instance-flag model to the final named-owner
+state machine.
+
+This phase is complete and kept here as historical context for why 3d.75 existed.
+
+#### Design analysis
+
+Step 3d uses three mechanisms to detect and balance stranded creation refs:
+
+1. `_arraysCreatedInMakeJaxprBody` WeakSet — tags every Array born during `makeJaxpr` body execution
+   (set in Array constructor). Distinguishes body-created arrays (stranded creation ref) from
+   externally closed-over arrays (creation ref owned by caller).
+2. `_liftedTangentZeros` WeakSet — exempts zero tangents created by `JVPTrace.lift()`, whose
+   creation ref is owned by `jvpFlat`'s `liftedTangents` cleanup loop.
+3. `refCount > 1` pre-build filter — after body execution completes, checks whether the creation ref
+   is still outstanding (any `dispose()` calls during the body are already reflected).
+
+**Immediate balancing at capture site was evaluated and rejected.** After `.ref` in
+`getOrMakeConstTracer`, immediately calling `.dispose()` to balance the creation ref breaks user
+code that creates, uses, and disposes arrays inside traced bodies. Specifically, `jacfwd` creates
+`eyeMatrix`, which gets captured during `vmap(pushfwd)(eyeMatrix)`, then explicitly calls
+`eyeMatrix.dispose()`. If the capture site already balanced the creation ref, `jacfwd`'s dispose
+becomes a second balance of an unowned ref, causing the builder's retained handle to become dangling
+when `ClosedJaxpr.dispose()` later frees it. Any pattern like
+`const t = np.array(...); use(t); t.dispose();` inside a traced body has the same conflict.
+
+**Deferred balancing (post-build) must be retained.** The balance must happen after all body
+execution completes, so that user `dispose()` calls during the body are reflected in the refcount.
+
+**`refCount > 1` is precise, not heuristic.** At pre-build time, each const in
+`constsNeedingCreationRefBalance` has exactly 1 builder ref (from `.ref` in `getOrMakeConstTracer`).
+If `refCount == 1`, the only outstanding ref is the builder ref — the creation ref was already
+balanced during body execution (e.g., `jacfwd`'s `eyeMatrix.dispose()`). If `refCount > 1`, the
+creation ref is still outstanding. Internal `.ref` calls inside traced bodies are forbidden by the
+non-consuming API (`no-unnecessary-ref` lint rule), so the only refs present are the creation ref
+and the builder ref. This check is retained and documented.
+
+#### Resulting intermediate model
+
+- Birth-context moved from the WeakSet to per-instance state on `Array`.
+- JVP lift zeros and `jacfwd` eye matrices stopped using global exemptions and instead claimed
+  ownership explicitly.
+- `getOrMakeConstTracer` was reduced to a per-instance predicate rather than a global registry
+  lookup.
+- The `refCount > 1` pre-build filter was retained and documented as precise rather than heuristic.
+- The deliberate jit/eager divergence for leaked body-created arrays remained explicit and
+  documented.
+- Characterization coverage was added for body-created consts, nested builders, JVP lift zeros, and
+  `jacfwd`.
+
+That intermediate model shipped briefly and was then superseded by Phase 3d.75's named-owner state
+machine below.
+
+### Phase 3d.75: Replace anonymous creation-ref claims with named owner states (DONE)
+
+Phase 3d.5 removed the global WeakSets, but it still introduced one shortcut: `claimCreationRef()`
+mutated a boolean and erased owner identity. Phase 3d.75 fixes that by storing a named creation-ref
+owner state on each Array.
+
+This cleanup is complete and Step 3e can now build on the stronger owner model.
+
+- **Named owner state landed.** `Array` now stores a private owner state instead of a boolean. The
+  current states are `none`, `makeJaxpr-body`, `jvp-lifted-tangents`, `jacfwd-eye-matrix`, and
+  `balanced`.
+- **Claiming is claimant-specific.** `claimCreationRef(...)` now requires the claimant identity. The
+  only current claimants are `JVPTrace.lift()` and `jacfwd()`.
+- **Invalid transitions now fail loudly.** Double-claiming or balancing from the wrong state throws
+  an internal error instead of silently mutating the flag.
+- **The post-build loop now records a balance transition.** `makeJaxpr` balances only arrays still
+  in the `makeJaxpr-body` state and then marks them `balanced`.
+- **Characterization coverage expanded.** Tests now validate owner-state transitions directly for
+  body-created arrays and claimant-specific calls for both JVP lift zeros and `jacfwd` eye matrices.
+
+**Step 3e: Remove `_peArrayCreationTracker` guards from JVP paths. (DONE)**
+
+- `JVPTracer[Symbol.dispose]` no longer suppresses disposal during PE. It still skips nested lower
+  abstract traces, but lexical disposal now executes normally in PE and relies on explicit retained
+  handles plus `ResidualCollector`'s already-disposed tolerance.
+- Sort JVP now disposes its local `idx` unconditionally after `gather(...)`. Any retained ownership
+  needed by PE/Jaxpr capture is taken explicitly by the downstream const-capture path rather than by
+  a PE-scope suppression guard.
+- Characterization coverage now includes `bare grad(sort(...).sum())` and
+  `jit(grad(sort(...).sum()))` as Step 3e regressions.
+
+### Phase 3e.5: Remove ownership-through-side-effects from JVP cleanup (DONE)
+
+Step 3e removed the remaining PE suppression guards successfully, but it still leaves one important
+shortcut in place: some JVP cleanup paths now depend on downstream machinery tolerating or
+implicitly rescuing early disposal, rather than transferring ownership locally and explicitly.
+
+This cleanup is complete.
+
+- **Sort/Argsort JVP now use a local retained handoff.** The gather step takes an explicit temporary
+  retained handle of `idx`, then releases that handle locally. The rule's own local owner is
+  disposed separately, so downstream PE/Jaxpr capture no longer has to rescue the original local
+  reference by side effect.
+- **ResidualCollector cleanup is liveness-first.** Collector disposal now skips already-dead
+  concrete arrays and dead PETracer wrappers before the fallback `try/catch` path. The catch remains
+  as hardening for stale nested-transform wrappers, not the normal mechanism that makes JVP lexical
+  disposal safe.
+- **Characterization now pins the handoff path.** Ownership characterization includes a Sort JVP
+  regression that observes the retained-handoff path directly, in addition to the existing
+  `grad(sort(...))` leak-freedom checks.
+
+### Phase 3e.75: Replace broad cleanup heuristics with explicit ownership probes (DONE)
+
+Phase 3e.5 fixed the runtime behavior, but it introduced two shortcuts that needed cleanup before
+moving into wrapper/cache boundary work. That cleanup is now complete.
+
+- **Collector liveness is now an explicit tracer capability.** `Tracer.isAliveForCleanup()` is now
+  the cleanup contract. Concrete arrays and cleanup-relevant wrapper tracers override it explicitly,
+  and the PE cleanup path no longer probes ad hoc `isAlive` fields.
+- **The Sort JVP retained-handoff regression is now deterministic.** The characterization test no
+  longer monkeypatches `Array.prototype.ref` or infers behavior from dtype/shape coincidence. It
+  uses a dedicated internal JVP retained-handoff observer to verify the specific `sort-idx` handoff.
+- **The handoff helper stays JVP-local.** The retained-handoff helper is now explicitly scoped as a
+  JVP-local helper rather than a generic ownership utility. That keeps the
+  retained/borrowed/transferred vocabulary centralized instead of accidentally introducing a second
+  generic ownership dialect.
+
+Validation: `pnpm exec vitest run test/ownership-characterization.test.ts` passes with 56/56 tests.
 
 ### Phase 4: Verify wrapper and cache boundaries
 
-- Verify artifact wrappers (`ResidualPackImpl`, `PrimalArtifactImpl`, `PullbackArtifactImpl`) own
-  only their local conditionally retained state.
+- Artifact wrapper slice: `PrimalArtifactImpl.run()` now returns independently retained primal
+  outputs and independently retained residual packs, so callers can dispose one run's outputs
+  without corrupting later runs. `PrimalArtifactImpl[Symbol.dispose]()` now releases the artifact's
+  stored primal outputs, and `aotLinearize()` tears down partially built wrapper state on failure.
+  Validated by `test/artifacts.test.ts` plus the combined `test/artifacts.test.ts` +
+  `test/ownership-characterization.test.ts` slice.
+- Cache-boundary slice: the BlockMap JVP wrapper `ClosedJaxpr` is now disposed immediately after the
+  `Primitive.BlockMap` bind handoff. Only the underlying `Jaxpr` remains relevant for
+  transpose-cache keys; the wrapper's builder-owned const handles are local state and must not be
+  kept alive as pseudo-cache-owned artifacts. Validated by the combined
+  `test/block-map-phase2.test.ts` + `test/artifacts.test.ts` +
+  `test/ownership-characterization.test.ts` slice.
+- Cache-boundary slice: BlockMap transpose rules no longer dispose cache-owned `transposeJaxpr(...)`
+  results. Three paths had been balancing them like local wrapper state: the standard BlockMap
+  transpose path and both halo-VJP paths. That was only benign while the cached transposed bodies
+  happened to carry no captured consts. The fix keeps those `ClosedJaxpr`s cache-owned, updates the
+  nearby comments to say so explicitly, and adds repeated-`grad(blockMap)` regressions with captured
+  consts for both plain and halo BlockMap bodies. Validated by
+  `test/ownership-characterization.test.ts` + `test/block-map-phase2.test.ts`
+  - `test/block-map.test.ts` (122/122).
+- Immediate cleanup completed: the captured-const BlockMap cache regressions now also cover
+  `jit(grad(blockMap))`, including a halo case, so the same cache-owned contract is exercised
+  through both eager and jitted entrypoints. Validated by
+  `test/ownership-characterization.test.ts` + `test/block-map-phase2.test.ts` +
+  `test/block-map.test.ts` (124/124).
+- Non-BlockMap cache-coverage slice: the direct `Primitive.Jit` transpose path is now pinned with
+  captured-const regressions for both `grad(jit(f))` and `jit(grad(jit(f)))`, so cached transpose
+  const ownership is exercised through the Jit transpose rule as well as the outer compiled
+  entrypoint. Validated by `test/ownership-characterization.test.ts` +
+  `test/transform-compositions.test.ts` (160/160).
+- Immediate cleanup completed: the Jit transpose release path is now pinned more precisely.
+  `grad(jit(f))` with captured consts does not leave transpose-held concrete arrays alive once the
+  inner jit wrapper is disposed, while `jit(grad(jit(f)))` is explicitly covered by a
+  `clearCaches()` teardown regression. Validated by `test/ownership-characterization.test.ts` +
+  `test/cache-sizes.test.ts` (78/78).
+- Immediate cleanup completed: direct cache-accounting assertions now cover the same Jit transpose
+  teardown scenarios in `test/cache-sizes.test.ts`, so the release path is pinned both through leak
+  behavior and through explicit `transposeJaxprCache` size changes before/after `clearCaches()`.
+  Validated by `test/cache-sizes.test.ts` + `test/ownership-characterization.test.ts` (80/80).
+- Scan cache-coverage slice: `jit(grad(scan(f)))` with captured consts is now pinned for both
+  repeated reuse and direct `transposeJaxprCache` accounting, so the cache-owned transposed scan
+  body is exercised through the same ownership vocabulary as Jit and BlockMap. Validated by
+  `test/ownership-characterization.test.ts` + `test/cache-sizes.test.ts` (82/82).
+- Immediate cleanup completed: the scan-family transpose callers now have matching captured-const
+  reuse and direct cache-accounting coverage for both `AssociativeScan` and the supported
+  `blockMap(workgroupAssociativeScan)` path. This also exposed and fixed a real bug in the
+  `WorkgroupAssociativeScan` transpose rule: its doubled-body undef mask was being mapped directly
+  from primitive inputs instead of the body's `[consts, aP, aT, bP, bT]` layout, which dropped the
+  tangent-`b` cotangent outputs. Validated by `test/ownership-characterization.test.ts` +
+  `test/cache-sizes.test.ts` (86/86).
+- Artifact-boundary slice: reusable AOT artifacts now flush forward-pass pending backend work before
+  exposing artifact-owned primal outputs and residual consts, matching the existing `vjpFlat()`
+  ownership boundary. This closes the last Phase 4 borrowed-state leak at the `ResidualPackImpl` /
+  `PullbackArtifactImpl` boundary and is pinned by an explicit leak-characterization regression in
+  `test/artifacts.test.ts`. Validated by `test/artifacts.test.ts` +
+  `test/ownership-characterization.test.ts`.
+- Immediate cleanup completed: the eager pending-work flush now goes through one shared helper used
+  by `evalJaxprTransposed()`, `vjpFlat()`, and `aotLinearize()`, so the concrete-output handoff rule
+  is defined once instead of duplicated across eager transform entrypoints.
 - Make boundary vocabulary explicit during the audit: values crossing wrapper/executor/cache
   boundaries should be describable as **borrowed**, **retained**, or **transferred**. Do not
   introduce a second consuming-semantics runtime to express this.
@@ -680,65 +874,118 @@ explicit creation-ref balancing mechanism:
 - Audit `try/finally` parity around wrapper disposal and backward-pass cleanup.
 - Can proceed in parallel with Phase 3.
 
+### Phase 4.25: Tighten artifact rollback and per-run independence checks
+
+The first Phase 4 wrapper fix is correct, but it introduced two short-term debts that should be
+cleaned up before continuing into the remaining cache-boundary audit. That cleanup is now complete.
+
+- **`aotLinearize()` rollback now uses one explicit teardown path.** Partial artifact state is now
+  represented explicitly and cleaned up through a single helper, reducing the chance that future
+  wrapper-owned state additions miss error-path disposal.
+- **Residual-pack independence is now pinned.** Artifact tests now prove that disposing one run's
+  residual pack does not break another run's residual pack when feeding
+  `PullbackArtifactImpl.run()`.
+
+Validation: `pnpm exec vitest run test/artifacts.test.ts test/ownership-characterization.test.ts`
+passes with 69/69 tests.
+
+### Phase 4.5: Pin the BlockMap wrapper/cache handoff contract
+
+The latest BlockMap JVP cache-boundary fix is directionally correct, but it still leaves one piece
+of short-term debt that should be cleaned up immediately before Phase 5. Right now the regression
+coverage proves leak-freedom for repeated `grad(blockMap)` calls, but it does not yet pin the more
+specific ownership contract that made the fix necessary: the wrapper `ClosedJaxpr` is local state
+that must be disposed after `bind(...)`, while transpose-cache results remain cache-owned and must
+not be disposed by callers.
+
+This cleanup is now complete.
+
+- Ownership-characterization regressions now exercise the BlockMap JVP path under both bare
+  `grad(blockMap)` and `jit(grad(blockMap))`, so wrapper-local disposal and cache-owned transpose
+  reuse are pinned in the same vocabulary as the rest of the transpose-cache audit.
+- The nearby BlockMap JVP boundary comment now states the contract explicitly: wrapper `ClosedJaxpr`
+  = local/transferred state, transpose-cache entries = cache-owned retained state.
+
+Validation:
+`pnpm exec vitest run test/ownership-characterization.test.ts test/block-map-phase2.test.ts` passes
+with 68/68 tests.
+
 ### Phase 5: Remove remaining suppression paths and clean up
 
 Step 3d deletes the phantom-ref state machine (`anonymousConstArrays`, `_constCreationBuilderRefs`,
 `_deferredConstCreationDisposes`, `_anonymousExtraDispose`, `[Symbol.dispose]` guard). What remains
 for Phase 5:
 
-- Delete `_peArrayCreationTracker` infrastructure (definition in `core.ts:1589`, setter, all
-  save/restore sites in `linearize.ts` and `jaxpr.ts`) — only after Step 3e replaces the JVP-path
-  guards with explicit ownership transfers.
-- Evaluate whether `ResidualCollector` can be simplified or removed after the PE-tracker guards are
-  gone. It may still be needed for dead PE intermediate cleanup.
-- Remove stale comments and debug logging for all deleted machinery.
+- Immediate cleanup completed: `_peArrayCreationTracker` and its jaxpr save/restore coupling are
+  deleted. The replacement is narrower: arrays born during forward PE carry an explicit
+  `partial-eval` creation owner, a scoped PE birth list records only arrays created in that scope,
+  and `PartialEvalTrace.pure/lift` plus `disposePeIntermediates(...)` handle cleanup from there.
+- Immediate cleanup completed: the partial-eval scope globals now restore through one
+  `withPartialEvalScope(...)` helper, and the birth list is no longer exposed as a raw getter. Array
+  creation registers through `registerPartialEvalCreatedArray(...)`, which keeps the scoped list
+  private to `core.ts`.
+- Immediate cleanup completed: `ResidualCollector` no longer carries the dead `literalIntermediates`
+  plumbing. Literal-created arrays already flow through `knownIntermediates`, so the extra list and
+  constructor parameter were pure bookkeeping with no behavioral role.
+- Immediate cleanup completed: the thin `ResidualCollector` wrapper is gone. `linearizeFlatUtil()`
+  now returns raw `peIntermediates`, and both `vjpFlat()` and `aotLinearize()` call the shared
+  `disposePeIntermediates(...)` helper directly.
+- Immediate cleanup completed: stale `ResidualCollector`, `partialEvalFlat`, and old PE-tracker
+  commentary has been removed from the active code paths and Phase 5 inventory, so the docs now name
+  the helper-based cleanup path that actually exists.
 - Every deletion above requires proving the replacement invariant in tests first.
 
 ## Key State Machine References
 
 For implementors — exact locations of the machinery to modify or remove.
 
-_(Updated after Step 3d. Struck-through items have been deleted.)_
+_(Updated after Phase 3d.75. Struck-through items have been deleted.)_
 
-| Mechanism                             | File           | Status              | Role                                                                       |
-| ------------------------------------- | -------------- | ------------------- | -------------------------------------------------------------------------- |
-| ~~`[Symbol.dispose]` guard~~          | `array.ts`     | **Deleted (3d)**    | Was: suppress disposal during tracing                                      |
-| `_arraysCreatedInMakeJaxprBody`       | `array.ts`     | **New (3d)**        | Marks arrays born during makeJaxpr body for creation-ref balancing         |
-| `_liftedTangentZeros`                 | `array.ts`     | **New (3d)**        | Marks JVP lift zeros — creation ref owned by liftedTangents cleanup        |
-| `constsNeedingCreationRefBalance`     | `jaxpr.ts`     | **New (3d)**        | Per-builder Set tracking consts with stranded creation refs                |
-| `_peArrayCreationTracker`             | `core.ts`      | Active              | Track PE-scope array creations                                             |
-| `_setPACT`                            | `core.ts`      | Active              | Setter for tracker                                                         |
-| PE tracker activation                 | `linearize.ts` | Active              | Install tracker in `partialEvalFlat`                                       |
-| PE tracker save/restore               | `jaxpr.ts`     | Active              | Nested `makeJaxpr` isolation                                               |
-| `ResidualCollector`                   | `linearize.ts` | Active              | Active disposal for dead PE intermediates                                  |
-| `ResidualCollector.dispose()` call    | `linearize.ts` | Active              | Called in `vjpFlat`                                                        |
-| ~~`anonymousConstArrays` definition~~ | `array.ts`     | **Deleted (3d)**    | Was: WeakSet identity tracking                                             |
-| ~~`markAnonymousIfTracing`~~          | `array.ts`     | **Deleted (3d)**    | Was: `.add()` for arrays created in traced code                            |
-| ~~`pureArray` anonymous mark~~        | `array.ts`     | **Deleted (3d)**    | Was: `.add()` for pureArray results                                        |
-| `getOrMakeConstTracer`                | `jaxpr.ts`     | **Modified (3d)**   | `.ref` + `wasRaw` disposal + creation-ref tracking                         |
-| ~~`evalJaxpr` Lit anonymous marking~~ | `jaxpr.ts`     | **Deleted (3d)**    | Was: enters anonymous-const state machine during evaluation                |
-| ~~`_incrementBuilderRef`~~            | `jaxpr.ts`     | **Deleted (3d)**    | Was: builder ref count increment                                           |
-| ~~`_decrementBuilderRef`~~            | `jaxpr.ts`     | **Deleted (3d)**    | Was: builder ref count decrement                                           |
-| ~~`_anonymousExtraDispose`~~          | `jaxpr.ts`     | **Deleted (3d)**    | Was: phantom-ref fire/defer logic                                          |
-| ~~`_deferredConstCreationDisposes`~~  | `jaxpr.ts`     | **Deleted (3d)**    | Was: deferred disposal queue processing                                    |
-| `ClosedJaxpr.dispose()`               | `jaxpr.ts`     | **Simplified (3d)** | Just `.dispose()` on consts — no phantom-ref fire                          |
-| ~~`#inlinedAnonymousConsts`~~         | `jaxpr.ts`     | **Deleted (3d)**    | Was: literals removed by `_inlineLiterals`                                 |
-| `JVPTracer[Symbol.dispose]` guard     | `jvp.ts`       | Active (Step 3e)    | PE-scope suppress                                                          |
-| Sort JVP idx guard                    | `jvp.ts`       | Active (Step 3e)    | PE-scope suppress                                                          |
-| ~~JVP lift zero anonymous add~~       | `jvp.ts`       | **Replaced (3d)**   | Now uses `_liftedTangentZeros.add(zero)` instead of `anonymousConstArrays` |
-| ~~ForiLoop JVP anonymous delete~~     | `jvp.ts`       | **Deleted (3d)**    | Was: `.delete()` from anonymousConstArrays                                 |
-| `evalJaxprTransposed` zeros           | `linearize.ts` | Unchanged           | Tracked in `internalArrays` (no longer anonymous)                          |
-| `evalJaxprTransposed` lit             | `linearize.ts` | Unchanged           | Tracked in `internalArrays` (no longer anonymous)                          |
+| Mechanism                              | File           | Status               | Role                                                                               |
+| -------------------------------------- | -------------- | -------------------- | ---------------------------------------------------------------------------------- |
+| ~~`[Symbol.dispose]` guard~~           | `array.ts`     | **Deleted (3d)**     | Was: suppress disposal during tracing                                              |
+| ~~`_arraysCreatedInMakeJaxprBody`~~    | `array.ts`     | **Deleted (3d.5)**   | Was: global WeakSet marking body-born arrays. Replaced first by instance state     |
+| ~~`_liftedTangentZeros`~~              | `array.ts`     | **Deleted (3d.5)**   | Was: global WeakSet exempting JVP zeros. Replaced first by `claimCreationRef(...)` |
+| `#creationRefOwner`                    | `array.ts`     | **New (3d.75)**      | Named owner state for each array's creation ref                                    |
+| `claimCreationRef(...)`                | `array.ts`     | **New (3d.75)**      | Explicit claimant-specific transfer of creation-ref ownership                      |
+| `constsNeedingCreationRefBalance`      | `jaxpr.ts`     | **New (3d)**         | Per-builder Set tracking consts with stranded creation refs                        |
+| `inPartialEvalScope()`                 | `core.ts`      | **New (5a)**         | Marks forward PE body execution for array-birth ownership tagging                  |
+| `registerPartialEvalCreatedArray(...)` | `core.ts`      | **New (5a)**         | Scoped PE birth-list registration for arrays created before PE lifting             |
+| `withPartialEvalScope(...)`            | `core.ts`      | **New (5a)**         | Scoped PE owner/birth-list restoration around forward PE bodies                    |
+| `partial-eval` creation owner          | `array.ts`     | **New (5a)**         | Named owner state for arrays born during forward PE                                |
+| PE birth-list activation               | `linearize.ts` | **New (5a)**         | Install scoped birth list around `buildForwardJaxpr` body execution                |
+| `disposePeIntermediates(...)`          | `linearize.ts` | Active               | Shared disposal helper for dead PE intermediates                                   |
+| ~~`anonymousConstArrays` definition~~  | `array.ts`     | **Deleted (3d)**     | Was: WeakSet identity tracking                                                     |
+| ~~`markAnonymousIfTracing`~~           | `array.ts`     | **Deleted (3d)**     | Was: `.add()` for arrays created in traced code                                    |
+| ~~`pureArray` anonymous mark~~         | `array.ts`     | **Deleted (3d)**     | Was: `.add()` for pureArray results                                                |
+| `getOrMakeConstTracer`                 | `jaxpr.ts`     | **Modified (3d)**    | `.ref` + `wasRaw` disposal + creation-ref tracking                                 |
+| ~~`evalJaxpr` Lit anonymous marking~~  | `jaxpr.ts`     | **Deleted (3d)**     | Was: enters anonymous-const state machine during evaluation                        |
+| ~~`_incrementBuilderRef`~~             | `jaxpr.ts`     | **Deleted (3d)**     | Was: builder ref count increment                                                   |
+| ~~`_decrementBuilderRef`~~             | `jaxpr.ts`     | **Deleted (3d)**     | Was: builder ref count decrement                                                   |
+| ~~`_anonymousExtraDispose`~~           | `jaxpr.ts`     | **Deleted (3d)**     | Was: phantom-ref fire/defer logic                                                  |
+| ~~`_deferredConstCreationDisposes`~~   | `jaxpr.ts`     | **Deleted (3d)**     | Was: deferred disposal queue processing                                            |
+| `ClosedJaxpr.dispose()`                | `jaxpr.ts`     | **Simplified (3d)**  | Just `.dispose()` on consts — no phantom-ref fire                                  |
+| ~~`#inlinedAnonymousConsts`~~          | `jaxpr.ts`     | **Deleted (3d)**     | Was: literals removed by `_inlineLiterals`                                         |
+| ~~`JVPTracer[Symbol.dispose]` guard~~  | `jvp.ts`       | **Deleted (3e)**     | Was: PE-scope suppress                                                             |
+| ~~Sort JVP idx guard~~                 | `jvp.ts`       | **Deleted (3e)**     | Was: PE-scope suppress                                                             |
+| ~~JVP lift zero anonymous add~~        | `jvp.ts`       | **Replaced (3d.75)** | Now uses `zero.claimCreationRef("jvp-lifted-tangents")`                            |
+| ~~ForiLoop JVP anonymous delete~~      | `jvp.ts`       | **Deleted (3d)**     | Was: `.delete()` from anonymousConstArrays                                         |
+| `evalJaxprTransposed` zeros            | `linearize.ts` | Unchanged            | Tracked in `internalArrays` (no longer anonymous)                                  |
+| `evalJaxprTransposed` lit              | `linearize.ts` | Unchanged            | Tracked in `internalArrays` (no longer anonymous)                                  |
 
 ## File Focus
 
-- `src/frontend/array.ts` — `_arraysCreatedInMakeJaxprBody`, `_liftedTangentZeros`
-- `src/frontend/linearize.ts` — `ResidualCollector`, `_peArrayCreationTracker` activation,
-  transposition
+- `src/frontend/array.ts` — `#creationRefOwner`, `claimCreationRef(...)`,
+  `markCreationRefBalancedByMakeJaxpr()`
+- `src/frontend/linearize.ts` — `disposePeIntermediates(...)`, partial-eval owner/birth-list
+  cleanup, transposition
 - `src/frontend/jaxpr.ts` — `getOrMakeConstTracer`, `constsNeedingCreationRefBalance`,
   `ClosedJaxpr.dispose()`, makeJaxpr creation-ref balancing loop
-- `src/frontend/jvp.ts` — PE-scope guards in `JVPTracer` and JVP rules, `_liftedTangentZeros` usage
-- `src/frontend/core.ts` — `_peArrayCreationTracker` definition
+- `src/frontend/jvp.ts` — `JVPTracer[Symbol.dispose]()`, Sort/Argsort JVP rules,
+  `claimCreationRef("jvp-lifted-tangents")`
+- `src/frontend/vmap.ts` — `jacfwd`'s `claimCreationRef("jacfwd-eye-matrix")`
+- `src/frontend/core.ts` — `inPartialEvalScope()`, `registerPartialEvalCreatedArray(...)`,
+  `withPartialEvalScope(...)`
 - `src/frontend/artifacts.ts` — artifact wrapper ownership boundaries
 - `test/tracing.test.ts`, `test/refcount.test.ts` — existing ownership tests
 - `test/leak-repro.test.ts` — reproduction tests from prior investigation
@@ -747,14 +994,16 @@ _(Updated after Step 3d. Struck-through items have been deleted.)_
 
 Run focused checks during the refactor, then the broader suite before landing:
 
-1. `pnpm vitest run test/tracing.test.ts`
-2. `pnpm vitest run test/refcount.test.ts`
-3. `pnpm vitest run test/leak-repro.test.ts`
-4. `pnpm vitest run test/lax-scan.test.ts`
-5. `pnpm vitest run test/transform-compositions.test.ts`
-6. `pnpm build`
-7. `pnpm check`
-8. `pnpm test`
+1. `pnpm vitest run test/ownership-characterization.test.ts`
+2. `pnpm vitest run test/tracing.test.ts`
+3. `pnpm vitest run test/refcount.test.ts`
+4. `pnpm vitest run test/leak-repro.test.ts`
+5. `pnpm vitest run test/lax-scan.test.ts`
+6. `pnpm vitest run test/transform-compositions.test.ts`
+7. `pnpm build`
+8. `pnpm check`
+9. `pnpm lint`
+10. `pnpm test`
 
 Add focused regression tests whenever a bug is reproduced through `using`, explicit `.dispose()`,
 captured consts, or nested transform composition.
@@ -797,6 +1046,7 @@ Workaround signatures for downstream cleanup:
 - Delete any helper that mirrors hidden tracing ownership instead of taking a real retained handle.
 - ~~Delete any comments that justify disposal suppression once explicit ownership is in place.~~
   _(Done: phantom-ref comments removed with the code.)_
-- Delete `_peArrayCreationTracker` checks in JVP rules once PE retention is explicit. _(Step 3e)_
+- ~~Delete `_peArrayCreationTracker` checks in JVP rules once PE retention is explicit.~~ _(Done in
+  Step 3e.)_
 - ~~Delete `anonymousConstArrays` checks in `[Symbol.dispose]` once const ownership is explicit.~~
   _(Done: entire `anonymousConstArrays` WeakSet deleted.)_

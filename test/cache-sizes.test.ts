@@ -12,6 +12,7 @@ import {
   grad,
   init,
   jit,
+  lax,
   numpy as np,
   vmap,
 } from "@hamk-uas/jax-js-nonconsuming";
@@ -126,6 +127,150 @@ describe("getCacheSizes", () => {
     expect(after.jvpJaxpr).toBeGreaterThan(before.jvpJaxpr);
     expect(after.transposeJaxpr).toBeGreaterThan(before.transposeJaxpr);
     jit(squareSum).dispose();
+  });
+
+  it("grad(jit(f)) keeps transpose cache entry until clearCaches", () => {
+    using weights = np.array([2.0, 3.0, 5.0]);
+    const inner = (x: np.Array) => x.mul(weights).sum();
+    using jf = jit(inner);
+
+    const before = getCacheSizes();
+    {
+      using x = np.array([1.0, 1.0, 1.0]);
+      using dx = grad(jf)(x) as np.Array;
+      expect(dx).toBeAllclose([2, 3, 5]);
+    }
+    const afterGrad = getCacheSizes();
+    expect(afterGrad.transposeJaxpr).toBeGreaterThan(before.transposeJaxpr);
+
+    jf.dispose();
+    const afterDispose = getCacheSizes();
+    expect(afterDispose.transposeJaxpr).toBe(afterGrad.transposeJaxpr);
+
+    clearCaches();
+    const afterClear = getCacheSizes();
+    expect(afterClear.transposeJaxpr).toBe(0);
+  });
+
+  it("jit(grad(jit(f))) keeps transpose cache entry until clearCaches", () => {
+    using weights = np.array([2.0, 3.0, 5.0]);
+    const inner = (x: np.Array) => x.mul(weights).sum();
+    using jf = jit(inner);
+    using jitGrad = jit(grad(jf));
+
+    const before = getCacheSizes();
+    {
+      using x = np.array([1.0, 1.0, 1.0]);
+      using dx = jitGrad(x) as np.Array;
+      expect(dx).toBeAllclose([2, 3, 5]);
+    }
+    const afterGrad = getCacheSizes();
+    expect(afterGrad.transposeJaxpr).toBeGreaterThan(before.transposeJaxpr);
+
+    const afterDispose = getCacheSizes();
+    expect(afterDispose.transposeJaxpr).toBe(afterGrad.transposeJaxpr);
+
+    clearCaches();
+    const afterClear = getCacheSizes();
+    expect(afterClear.transposeJaxpr).toBe(0);
+  });
+
+  it("jit(grad(scan(f))) with captured const keeps transpose cache entry until clearCaches", () => {
+    using weights = np.array([2.0, 3.0, 5.0]);
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      using weighted = x.mul(weights) as np.Array;
+      const newCarry = carry.add(weighted);
+      return [newCarry, newCarry];
+    };
+    const f = (xs: np.Array) => {
+      using init = np.array([0.0, 0.0, 0.0]);
+      const [carry] = lax.scan(step, init, xs);
+      return carry.sum();
+    };
+    using jitGrad = jit(grad(f));
+
+    const before = getCacheSizes();
+    {
+      using xs = np.array([
+        [1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0],
+      ]);
+      using dx = jitGrad(xs) as np.Array;
+      expect(dx).toBeAllclose([
+        [2, 3, 5],
+        [2, 3, 5],
+      ]);
+    }
+    const afterGrad = getCacheSizes();
+    expect(afterGrad.transposeJaxpr).toBeGreaterThan(before.transposeJaxpr);
+
+    const afterDispose = getCacheSizes();
+    expect(afterDispose.transposeJaxpr).toBe(afterGrad.transposeJaxpr);
+
+    clearCaches();
+    const afterClear = getCacheSizes();
+    expect(afterClear.transposeJaxpr).toBe(0);
+  });
+
+  it("jit(grad(associativeScan)) with captured const keeps transpose cache entry until clearCaches", () => {
+    using one = np.array(1.0);
+    const f = (xs: np.Array) => {
+      using scanned = lax.associativeScan((a: np.Array, b: np.Array) => {
+        using summed = a.add(b) as np.Array;
+        return summed.mul(one);
+      }, xs);
+      return scanned.sum();
+    };
+    using jitGrad = jit(grad(f));
+
+    const before = getCacheSizes();
+    {
+      using xs = np.array([1.0, 1.0, 1.0, 1.0]);
+      using dx = jitGrad(xs) as np.Array;
+      expect(dx).toBeAllclose([4, 3, 2, 1]);
+    }
+    const afterGrad = getCacheSizes();
+    expect(afterGrad.transposeJaxpr).toBeGreaterThan(before.transposeJaxpr);
+
+    const afterDispose = getCacheSizes();
+    expect(afterDispose.transposeJaxpr).toBe(afterGrad.transposeJaxpr);
+
+    clearCaches();
+    const afterClear = getCacheSizes();
+    expect(afterClear.transposeJaxpr).toBe(0);
+  });
+
+  it("jit(grad(blockMap(workgroupAssociativeScan))) with captured const keeps transpose cache entry until clearCaches", () => {
+    using one = np.array(1.0);
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(
+        (block: np.Array) =>
+          lax.workgroupAssociativeScan((a: np.Array, b: np.Array) => {
+            using summed = a.add(b) as np.Array;
+            return summed.mul(one);
+          }, block),
+        xs,
+        { blockShape: [4] },
+      );
+      return mapped.sum();
+    };
+    using jitGrad = jit(grad(f));
+
+    const before = getCacheSizes();
+    {
+      using xs = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+      using dx = jitGrad(xs) as np.Array;
+      expect(dx).toBeAllclose([4, 3, 2, 1, 4, 3, 2, 1]);
+    }
+    const afterGrad = getCacheSizes();
+    expect(afterGrad.transposeJaxpr).toBeGreaterThan(before.transposeJaxpr);
+
+    const afterDispose = getCacheSizes();
+    expect(afterDispose.transposeJaxpr).toBe(afterGrad.transposeJaxpr);
+
+    clearCaches();
+    const afterClear = getCacheSizes();
+    expect(afterClear.transposeJaxpr).toBe(0);
   });
 
   it("vmap(jit(f)) populates vmapJaxpr cache", () => {

@@ -13,6 +13,10 @@ import type { Tracer } from "./core";
 import type { ClosedJaxpr } from "./jaxpr";
 import { evalJaxpr } from "./jaxpr";
 import {
+  disposePeIntermediates,
+  flushPendingConcreteArrays,
+} from "./linearize";
+import {
   buildBackwardJaxpr,
   collectConcreteArrays,
   linearizeFlatUtil,
@@ -82,9 +86,9 @@ export interface PrimalArtifact extends Disposable {
  * - The forward jaxpr (ClosedJaxpr) — whose consts are the residual arrays
  * - Stored primal outputs from the initial trace
  *
- * Each `run()` call creates a new ResidualPack with .ref'd copies of the
- * residual arrays. The pack holds independent ownership — callers must
- * dispose it when done.
+ * Each `run()` call creates new .ref'd views of both the stored primal outputs
+ * and the residual arrays. The returned values hold independent ownership —
+ * callers must dispose them when done.
  */
 class PrimalArtifactImpl implements PrimalArtifact {
   #forwardJaxpr: ClosedJaxpr;
@@ -108,17 +112,19 @@ class PrimalArtifactImpl implements PrimalArtifact {
   } {
     if (this.#disposed)
       throw new ReferenceError("PrimalArtifact already disposed");
-    // Create a ResidualPack with .ref'd copies of the forward jaxpr's consts.
-    // Each run() call produces an independent pack with its own ownership.
+    // Each run() returns independently retained views. Callers may dispose the
+    // returned outputs/residuals without affecting later runs of the artifact.
+    const primalsOut = this.#storedPrimalsOut.map((p) => p.ref);
     const residualArrays = this.#forwardJaxpr.consts.map((c) => c.ref);
     return {
-      primalsOut: this.#storedPrimalsOut,
+      primalsOut,
       residuals: new ResidualPackImpl(residualArrays),
     };
   }
 
   [Symbol.dispose](): void {
     if (!this.#disposed) {
+      for (const p of this.#storedPrimalsOut) p.dispose();
       this.#forwardJaxpr.dispose();
       this.#disposed = true;
     }
@@ -213,6 +219,22 @@ class NoOpPullbackArtifactImpl implements PullbackArtifact {
   }
 }
 
+type AotLinearizePartialState = {
+  forwardJaxpr: ClosedJaxpr;
+  primalsOut: Tracer[];
+  backwardJaxpr: ClosedJaxpr | null;
+};
+
+function disposeAotLinearizePartialState(
+  state: AotLinearizePartialState,
+): void {
+  if (state.backwardJaxpr) state.backwardJaxpr.dispose();
+  for (const p of state.primalsOut) {
+    if (p.isAliveForCleanup()) p.dispose();
+  }
+  state.forwardJaxpr.dispose();
+}
+
 // ---------------------------------------------------------------------------
 // aotLinearize — top-level factory
 // ---------------------------------------------------------------------------
@@ -252,7 +274,7 @@ export interface AotLinearizeOptions {
  * Pipeline:
  * 1. JVP the function and partial-evaluate → forward jaxpr + primal outputs
  * 2. Transpose the forward jaxpr → backward jaxpr
- * 3. Dispose PE intermediates via ResidualCollector
+ * 3. Dispose PE intermediates via disposePeIntermediates(...)
  * 4. Wrap results in PrimalArtifact + PullbackArtifact
  *
  * Ownership after return:
@@ -270,34 +292,47 @@ export function aotLinearize(
   const {
     primalsOut,
     jaxpr: forwardJaxpr,
-    collector,
+    peIntermediates,
   } = linearizeFlatUtil(f, exampleArgs);
 
-  // Phase 2: Transpose → backward jaxpr (unless skipBackward)
-  const backwardJaxpr = options?.skipBackward
-    ? null
-    : buildBackwardJaxpr(forwardJaxpr);
+  const state: AotLinearizePartialState = {
+    forwardJaxpr,
+    primalsOut,
+    backwardJaxpr: null,
+  };
 
-  // Phase 3: Dispose PE intermediates.
-  // Protect consts whose only remaining ref is the CJ's .ref (rc≤1).
-  // Consts at rc>1 still carry a ref from instantiateConst that the
-  // collector must clean up; protecting them would leak that extra ref.
-  const protectedVals = new Set<Tracer>(primalsOut);
-  for (const c of forwardJaxpr.consts) {
-    if (c.refCount <= 1) protectedVals.add(c);
-  }
-  if (options?.auxStore?.value != null) {
-    for (const arr of collectConcreteArrays(options.auxStore.value)) {
-      protectedVals.add(arr);
+  try {
+    // Phase 2: Transpose → backward jaxpr (unless skipBackward)
+    state.backwardJaxpr = options?.skipBackward
+      ? null
+      : buildBackwardJaxpr(forwardJaxpr);
+
+    // Phase 3: Dispose PE intermediates.
+    // Protect consts whose only remaining ref is the CJ's .ref (rc≤1).
+    // Consts at rc>1 still carry a ref from instantiateConst that the
+    // collector must clean up; protecting them would leak that extra ref.
+    const protectedVals = new Set<Tracer>(primalsOut);
+    for (const c of forwardJaxpr.consts) {
+      if (c.refCount <= 1) protectedVals.add(c);
     }
+    if (options?.auxStore?.value != null) {
+      for (const arr of collectConcreteArrays(options.auxStore.value)) {
+        protectedVals.add(arr);
+      }
+    }
+    disposePeIntermediates(peIntermediates, protectedVals);
+
+    flushPendingConcreteArrays(primalsOut);
+
+    // Phase 4: Create artifacts
+    const primal = new PrimalArtifactImpl(forwardJaxpr, primalsOut);
+    const pullback = state.backwardJaxpr
+      ? new PullbackArtifactImpl(state.backwardJaxpr)
+      : new NoOpPullbackArtifactImpl();
+
+    return { primal, pullback };
+  } catch (error) {
+    disposeAotLinearizePartialState(state);
+    throw error;
   }
-  collector.dispose(protectedVals);
-
-  // Phase 4: Create artifacts
-  const primal = new PrimalArtifactImpl(forwardJaxpr, primalsOut);
-  const pullback = backwardJaxpr
-    ? new PullbackArtifactImpl(backwardJaxpr)
-    : new NoOpPullbackArtifactImpl();
-
-  return { primal, pullback };
 }

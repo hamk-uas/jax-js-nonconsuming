@@ -14,14 +14,21 @@
  * - `using` inside traced bodies fires normally (harmless: builder already holds .ref).
  * - Fire-and-forget arrays (no `using`) leak identically in jit and eager modes.
  *
+ * Phase 3d.5 (instance flag consolidation): global WeakSets replaced by per-instance
+ * #hasUnownedCreationRef flag and claimCreationRef() API. All ownership decisions
+ * now live on the Array instance, not in external registries.
+ *
  * See PLAN.md for the full restructuring plan.
  *
  * Run: pnpm vitest run test/ownership-characterization.test.ts
  */
 import {
+  _setJvpRetainedHandoffObserver,
   checkLeaks,
   clearCaches,
   grad,
+  jacfwd,
+  Array as JaxArray,
   jit,
   jvp,
   lax,
@@ -328,6 +335,156 @@ describe("transposeJaxprCache contract", () => {
     expect(r2).toBeAllclose([2, 4, 6]);
     expect(r3).toBeAllclose([2, 4, 6]);
   });
+
+  test("grad(jit(f)) with captured const reuses cache-owned transpose consts", () => {
+    using weights = np.array([2, 3, 5]);
+    const inner = (x: np.Array) => x.mul(weights).sum();
+    using jf = jit(inner);
+    const df = grad(jf);
+    using x = np.array([1, 2, 3]);
+
+    using r1 = df(x);
+    using r2 = df(x);
+
+    expect(r1).toBeAllclose([2, 3, 5]);
+    expect(r2).toBeAllclose([2, 3, 5]);
+  });
+
+  test("jit(grad(jit(f))) with captured const keeps transpose cache alive across calls", () => {
+    using weights = np.array([2, 3, 5]);
+    const inner = (x: np.Array) => x.mul(weights).sum();
+    using jf = jit(inner);
+    using jitGrad = jit(grad(jf));
+    using x = np.array([1, 2, 3]);
+
+    using r1 = jitGrad(x);
+    using r2 = jitGrad(x);
+    using r3 = jitGrad(x);
+
+    expect(r1).toBeAllclose([2, 3, 5]);
+    expect(r2).toBeAllclose([2, 3, 5]);
+    expect(r3).toBeAllclose([2, 3, 5]);
+  });
+
+  test("bare grad(blockMap) disposes wrapper jaxpr while reusing transpose cache", () => {
+    const body = (block: np.Array) => np.multiply(block, block);
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(body, xs, { blockShape: [2] });
+      return np.sum(mapped);
+    };
+    const df = grad(f);
+    using x = np.array([1, 2, 3, 4]);
+
+    using r1 = df(x);
+    using r2 = df(x);
+
+    expect(r1).toBeAllclose([2, 4, 6, 8]);
+    expect(r2).toBeAllclose([2, 4, 6, 8]);
+  });
+
+  test("jit(grad(blockMap)) keeps wrapper-local disposal separate from cache-owned transpose state", () => {
+    const body = (block: np.Array) => np.multiply(block, block);
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(body, xs, { blockShape: [2] });
+      return np.sum(mapped);
+    };
+    using jitGrad = jit(grad(f));
+    using x = np.array([1, 2, 3, 4]);
+
+    using r1 = jitGrad(x);
+    using r2 = jitGrad(x);
+    using r3 = jitGrad(x);
+
+    expect(r1).toBeAllclose([2, 4, 6, 8]);
+    expect(r2).toBeAllclose([2, 4, 6, 8]);
+    expect(r3).toBeAllclose([2, 4, 6, 8]);
+  });
+
+  test("bare grad(blockMap) with captured const reuses cache-owned transpose consts", () => {
+    using weights = np.array([2, 3]);
+    const body = (block: np.Array) => np.multiply(block, weights);
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(body, xs, { blockShape: [2] });
+      return np.sum(mapped);
+    };
+    const df = grad(f);
+    using x = np.array([1, 2, 3, 4]);
+
+    using r1 = df(x);
+    using r2 = df(x);
+
+    expect(r1).toBeAllclose([2, 3, 2, 3]);
+    expect(r2).toBeAllclose([2, 3, 2, 3]);
+  });
+
+  test("jit(grad(blockMap)) with captured const reuses cache-owned transpose consts", () => {
+    using weights = np.array([2, 3]);
+    const body = (block: np.Array) => np.multiply(block, weights);
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(body, xs, { blockShape: [2] });
+      return np.sum(mapped);
+    };
+    using jitGrad = jit(grad(f));
+    using x = np.array([1, 2, 3, 4]);
+
+    using r1 = jitGrad(x);
+    using r2 = jitGrad(x);
+    using r3 = jitGrad(x);
+
+    expect(r1).toBeAllclose([2, 3, 2, 3]);
+    expect(r2).toBeAllclose([2, 3, 2, 3]);
+    expect(r3).toBeAllclose([2, 3, 2, 3]);
+  });
+
+  test("bare grad(blockMap halo) with captured const keeps cached transpose alive across calls", () => {
+    using weights = np.array([2, 3, 5, 7]);
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(
+        (block: np.Array) => {
+          using center = lax.sliceInDim(block, 1, 5, 0);
+          using scaled = np.multiply(center, weights);
+          return scaled.ref; // jax-js-lint: allow-ref
+        },
+        xs,
+        { blockShape: [4], halo: [[1, 1]] },
+      );
+      return np.sum(mapped);
+    };
+    const df = grad(f);
+    using x = np.array([1, 2, 3, 4, 5, 6, 7, 8]);
+
+    using r1 = df(x);
+    using r2 = df(x);
+
+    expect(r1).toBeAllclose([2, 3, 5, 7, 2, 3, 5, 7]);
+    expect(r2).toBeAllclose([2, 3, 5, 7, 2, 3, 5, 7]);
+  });
+
+  test("jit(grad(blockMap halo)) with captured const keeps cached transpose alive across calls", () => {
+    using weights = np.array([2, 3, 5, 7]);
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(
+        (block: np.Array) => {
+          using center = lax.sliceInDim(block, 1, 5, 0);
+          using scaled = np.multiply(center, weights);
+          return scaled.ref; // jax-js-lint: allow-ref
+        },
+        xs,
+        { blockShape: [4], halo: [[1, 1]] },
+      );
+      return np.sum(mapped);
+    };
+    using jitGrad = jit(grad(f));
+    using x = np.array([1, 2, 3, 4, 5, 6, 7, 8]);
+
+    using r1 = jitGrad(x);
+    using r2 = jitGrad(x);
+    using r3 = jitGrad(x);
+
+    expect(r1).toBeAllclose([2, 3, 5, 7, 2, 3, 5, 7]);
+    expect(r2).toBeAllclose([2, 3, 5, 7, 2, 3, 5, 7]);
+    expect(r3).toBeAllclose([2, 3, 5, 7, 2, 3, 5, 7]);
+  });
 });
 
 // ============================================================
@@ -519,7 +676,7 @@ describe("ResidualCollector code paths", () => {
 // ============================================================
 
 describe("scan transform compositions", () => {
-  test("KNOWN LEAK: bare grad(scan(f)) — UseAfterFreeError or PE leak", () => {
+  test("bare grad(scan(f)) — correct gradients, no crash", () => {
     const outerResult = checkLeaks.stop();
     expect(outerResult.leaked).toBe(0);
 
@@ -533,23 +690,13 @@ describe("scan transform compositions", () => {
       return carry;
     };
     const x = np.array([1, 2, 3, 4]);
-    let _threw = false;
-    try {
-      const r = grad(f)(x);
-      // If it doesn’t throw, it still leaks PE intermediates.
-      expect(r).toBeAllclose([1, 1, 1, 1]);
-      r.dispose();
-    } catch (e) {
-      // CHARACTERIZATION: bare grad(scan) may throw UseAfterFreeError
-      // because anonymous const `np.array(0)` gets disposed during backward pass.
-      _threw = true;
-      expect(String(e)).toMatch(/disposed|UseAfterFree/i);
-    }
+    const r = grad(f)(x);
+    expect(r).toBeAllclose([1, 1, 1, 1]);
+    r.dispose();
     x.dispose();
 
     const report = checkLeaks.stop();
-    // Whether it throws or succeeds, there are leaked slots.
-    expect(report.leaked).toBeGreaterThan(0);
+    expect(report.leaked).toBe(0);
 
     checkLeaks.start();
   });
@@ -568,6 +715,37 @@ describe("scan transform compositions", () => {
     using xs = np.array([1, 2, 3]);
     using r = jitGradF(xs);
     expect(r).toBeAllclose([12, 12, 12]);
+  });
+
+  test("jit(grad(scan(f))) with captured const reuses cache-owned transpose consts", () => {
+    using weights = np.array([2, 3, 5]);
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      using weighted = x.mul(weights);
+      const newCarry = carry.add(weighted);
+      return [newCarry, newCarry];
+    };
+    const f = (xs: np.Array) => {
+      using init = np.array([0, 0, 0]);
+      const [carry] = lax.scan(step, init, xs);
+      return carry.sum();
+    };
+    using jitGradF = jit(grad(f));
+    using xs = np.array([
+      [1, 1, 1],
+      [1, 1, 1],
+    ]);
+
+    using r1 = jitGradF(xs);
+    using r2 = jitGradF(xs);
+
+    expect(r1).toBeAllclose([
+      [2, 3, 5],
+      [2, 3, 5],
+    ]);
+    expect(r2).toBeAllclose([
+      [2, 3, 5],
+      [2, 3, 5],
+    ]);
   });
 
   test("jit(vmap(grad(scan(f)))) — zero leaks", () => {
@@ -590,6 +768,49 @@ describe("scan transform compositions", () => {
       [1, 1, 1],
       [1, 1, 1],
     ]);
+  });
+
+  test("jit(grad(associativeScan)) with captured const reuses cache-owned transpose consts", () => {
+    using one = np.array(1);
+    const f = (xs: np.Array) => {
+      using scanned = lax.associativeScan((a: np.Array, b: np.Array) => {
+        using summed = a.add(b);
+        return summed.mul(one);
+      }, xs);
+      return scanned.sum();
+    };
+    using jitGradF = jit(grad(f));
+    using xs = np.array([1, 1, 1, 1]);
+
+    using r1 = jitGradF(xs);
+    using r2 = jitGradF(xs);
+
+    expect(r1).toBeAllclose([4, 3, 2, 1]);
+    expect(r2).toBeAllclose([4, 3, 2, 1]);
+  });
+
+  test("jit(grad(blockMap(workgroupAssociativeScan))) with captured const reuses cache-owned transpose consts", () => {
+    using one = np.array(1);
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(
+        (block: np.Array) =>
+          lax.workgroupAssociativeScan((a: np.Array, b: np.Array) => {
+            using summed = a.add(b);
+            return summed.mul(one);
+          }, block),
+        xs,
+        { blockShape: [4] },
+      );
+      return mapped.sum();
+    };
+    using jitGradF = jit(grad(f));
+    using xs = np.array([1, 1, 1, 1, 1, 1, 1, 1]);
+
+    using r1 = jitGradF(xs);
+    using r2 = jitGradF(xs);
+
+    expect(r1).toBeAllclose([4, 3, 2, 1, 4, 3, 2, 1]);
+    expect(r2).toBeAllclose([4, 3, 2, 1, 4, 3, 2, 1]);
   });
 
   test("scan with valueAndGrad body — zero leaks (eager)", () => {
@@ -690,5 +911,268 @@ describe("ownership edge cases", () => {
     expect(report.leaked).toBe(0);
 
     checkLeaks.start();
+  });
+
+  test("grad(jit(f)) captured transpose consts do not survive jit wrapper disposal", () => {
+    const outerResult = checkLeaks.stop();
+    expect(outerResult.leaked).toBe(0);
+
+    checkLeaks.start();
+    const weights = np.array([2, 3, 5]);
+    const inner = (x: np.Array) => x.mul(weights).sum();
+    const jf = jit(inner);
+    const df = grad(jf);
+    const x = np.array([1, 1, 1]);
+    const r = df(x);
+    expect(r).toBeAllclose([2, 3, 5]);
+    r.dispose();
+    x.dispose();
+    jf.dispose();
+    weights.dispose();
+
+    const report = checkLeaks.stop();
+    expect(report.leaked).toBe(0);
+
+    checkLeaks.start();
+  });
+
+  test("clearCaches releases transpose-cache retained consts from jit(grad(jit(f)))", () => {
+    const outerResult = checkLeaks.stop();
+    expect(outerResult.leaked).toBe(0);
+
+    checkLeaks.start();
+    const weights = np.array([2, 3, 5]);
+    const inner = (x: np.Array) => x.mul(weights).sum();
+    const jf = jit(inner);
+    const jitGrad = jit(grad(jf));
+    const x = np.array([1, 1, 1]);
+    const r = jitGrad(x);
+    expect(r).toBeAllclose([2, 3, 5]);
+    r.dispose();
+    x.dispose();
+
+    jitGrad.dispose();
+    jf.dispose();
+    clearCaches();
+    weights.dispose();
+
+    const report = checkLeaks.stop();
+    expect(report.leaked).toBe(0);
+
+    checkLeaks.start();
+  });
+});
+
+// ============================================================
+// Category 8: Phase 3d.75 validation gate
+//
+// These tests validate the named-owner creation-ref model.
+// See PLAN.md Phase 3d.75.
+// ============================================================
+
+describe("Phase 3d.75 — named creation-ref owners", () => {
+  test("inline np.array() captured as const — owner transitions to balanced", () => {
+    let captured: np.Array | null = null;
+    const f = (x: np.Array) => {
+      const c = np.array([3]);
+      captured = c;
+      return x.add(c);
+    };
+    using arg = np.array([1, 2, 3]);
+    const { jaxpr } = makeJaxpr(f)(arg);
+    expect((captured as any)?._creationRefOwnerForDebug).toBe("balanced");
+    jaxpr.dispose();
+  });
+
+  test("jacfwd — eyeMatrix disposed by user, no double-balance", () => {
+    // jacfwd creates eyeMatrix, captures it, then calls eyeMatrix.dispose().
+    // The jacfwd claimant state prevents makeJaxpr from also balancing it.
+    const f = (x: np.Array) => x.mul(x).sum();
+    using x = np.array([1, 2, 3]);
+    using jac = jacfwd(f)(x);
+    expect(jac).toBeAllclose([2, 4, 6]);
+  });
+
+  test("jit(jacfwd) — no double-balance under tracing", () => {
+    const f = (x: np.Array) => x.mul(x).sum();
+    using jitJac = jit(jacfwd(f));
+    using x = np.array([1, 2, 3]);
+    using jac = jitJac(x);
+    expect(jac).toBeAllclose([2, 4, 6]);
+  });
+
+  test("JVP lift zeros — creation ref owned by liftedTangents, no double-balance", () => {
+    const f = (x: np.Array) => {
+      using two = np.array(2);
+      return x.mul(two);
+    };
+    using x = np.array([1, 2, 3]);
+    const [primals, tangents] = jvp(f, [x], [np.ones([3])]);
+    using p = primals as np.Array;
+    using t = tangents as np.Array;
+    expect(p).toBeAllclose([2, 4, 6]);
+    expect(t).toBeAllclose([2, 2, 2]);
+  });
+
+  test("grad uses JVP lift zeros internally — zero leaks", () => {
+    const f = (x: np.Array) => x.mul(x).sum();
+    using gf = jit(grad(f));
+    using x = np.array([1, 2, 3]);
+    using r = gf(x);
+    expect(r).toBeAllclose([2, 4, 6]);
+  });
+
+  test("bare grad(sort(...).sum()) — zero leaks after Sort JVP ownership fix", () => {
+    const f = (x: np.Array) => x.sort().sum();
+    using x = np.array([3, 1, 2]);
+    using r = grad(f)(x);
+    expect(r).toBeAllclose([1, 1, 1]);
+  });
+
+  test("jit(grad(sort(...).sum())) — zero leaks after Sort JVP ownership fix", () => {
+    const f = (x: np.Array) => x.sort().sum();
+    using jf = jit(grad(f));
+    using x = np.array([3, 1, 2]);
+    using r = jf(x);
+    expect(r).toBeAllclose([1, 1, 1]);
+  });
+
+  test("sort jvp takes an explicit retained idx handoff", () => {
+    const handoffs: string[] = [];
+    _setJvpRetainedHandoffObserver((kind) => {
+      handoffs.push(kind);
+    });
+
+    try {
+      const f = (x: np.Array) => x.sort().sum();
+      using x = np.array([3, 1, 2]);
+      using r = grad(f)(x);
+      expect(r).toBeAllclose([1, 1, 1]);
+    } finally {
+      _setJvpRetainedHandoffObserver(null);
+    }
+
+    expect(handoffs).toContain("sort-idx");
+  });
+
+  test("array closed over from outer scope — creation ref NOT balanced by builder", () => {
+    // External array captured as const keeps owner "none" throughout.
+    using outer = np.array([10, 20, 30]);
+    expect((outer as any)._creationRefOwnerForDebug).toBe("none");
+    const rcBefore = outer.refCount;
+    const f = (x: np.Array) => x.add(outer);
+    using arg = np.array([1, 2, 3]);
+    const { jaxpr } = makeJaxpr(f)(arg);
+
+    // After makeJaxpr, outer has builder ref (+1) — but its creation ref
+    // was never in the balance set.
+    expect(outer.refCount).toBe(rcBefore + 1);
+    expect((outer as any)._creationRefOwnerForDebug).toBe("none");
+    jaxpr.dispose();
+    expect(outer.refCount).toBe(rcBefore);
+    expect((outer as any)._creationRefOwnerForDebug).toBe("none");
+  });
+
+  test("nested makeJaxpr — inner-created array balanced only by inner builder", () => {
+    // An array created inside an inner makeJaxpr body gets its flag set
+    // to true. Only the inner builder captures and balances it.
+    const inner = (x: np.Array) => x.add(np.array(42));
+    const outer = (x: np.Array) => {
+      using tmp = np.array([1, 2, 3]);
+      const { jaxpr: innerJaxpr } = makeJaxpr(inner)(tmp);
+      innerJaxpr.dispose();
+      return x.mul(np.array(2));
+    };
+    using arg = np.array([1]);
+    const { jaxpr } = makeJaxpr(outer)(arg);
+    jaxpr.dispose();
+  });
+
+  test("same array captured by two sequential jit calls — no double-balance", () => {
+    // Test that the flag is cleared after the first makeJaxpr's post-build
+    // balance, so a second jit compilation doesn't re-balance.
+    const outerResult = checkLeaks.stop();
+    expect(outerResult.leaked).toBe(0);
+
+    checkLeaks.start();
+    const f = (x: np.Array) => {
+      using c = np.array([1, 1, 1]);
+      return x.add(c);
+    };
+    const jf1 = jit(f);
+    const jf2 = jit(f);
+    const x = np.array([10, 20, 30]);
+    const r1 = jf1(x);
+    const r2 = jf2(x);
+    expect(r1).toBeAllclose([11, 21, 31]);
+    expect(r2).toBeAllclose([11, 21, 31]);
+    r1.dispose();
+    r2.dispose();
+    x.dispose();
+    jf1.dispose();
+    jf2.dispose();
+    clearCaches();
+
+    const report = checkLeaks.stop();
+    expect(report.leaked).toBe(0);
+    checkLeaks.start();
+  });
+
+  test("claimCreationRef rejects double-claim transitions", () => {
+    using arr = np.array([1]);
+    (arr as any).claimCreationRef("jacfwd-eye-matrix");
+    expect((arr as any)._creationRefOwnerForDebug).toBe("jacfwd-eye-matrix");
+    expect(() => (arr as any).claimCreationRef("jvp-lifted-tangents")).toThrow(
+      /invalid creation-ref claim transition/,
+    );
+  });
+
+  test("jvp records the lifted-tangents claimant", () => {
+    const claims: string[] = [];
+    const arrayProto = JaxArray.prototype as any;
+    const originalClaim = arrayProto.claimCreationRef as (
+      owner: string,
+    ) => void;
+    arrayProto.claimCreationRef = function patchedClaim(owner: string) {
+      claims.push(owner);
+      return originalClaim.call(this, owner);
+    };
+    try {
+      const f = (x: np.Array) => {
+        using two = np.array(2);
+        return x.mul(two);
+      };
+      using x = np.array([1, 2, 3]);
+      using dx = np.ones([3]);
+      const [primals, tangents] = jvp(f, [x], [dx]);
+      using p = primals as np.Array;
+      using t = tangents as np.Array;
+      expect(p).toBeAllclose([2, 4, 6]);
+      expect(t).toBeAllclose([2, 2, 2]);
+    } finally {
+      arrayProto.claimCreationRef = originalClaim;
+    }
+    expect(claims).toContain("jvp-lifted-tangents");
+  });
+
+  test("jacfwd records the eye-matrix claimant", () => {
+    const claims: string[] = [];
+    const arrayProto = JaxArray.prototype as any;
+    const originalClaim = arrayProto.claimCreationRef as (
+      owner: string,
+    ) => void;
+    arrayProto.claimCreationRef = function patchedClaim(owner: string) {
+      claims.push(owner);
+      return originalClaim.call(this, owner);
+    };
+    try {
+      const f = (x: np.Array) => x.mul(x).sum();
+      using x = np.array([1, 2, 3]);
+      using jac = jacfwd(f)(x);
+      expect(jac).toBeAllclose([2, 4, 6]);
+    } finally {
+      arrayProto.claimCreationRef = originalClaim;
+    }
+    expect(claims).toContain("jacfwd-eye-matrix");
   });
 });

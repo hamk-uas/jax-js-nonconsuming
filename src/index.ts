@@ -174,6 +174,9 @@ export const jvp = jvpModule.jvp as <
     : never
   : [ReturnType<F>, ReturnType<F>];
 
+export const _setJvpRetainedHandoffObserver =
+  jvpModule._setJvpRetainedHandoffObserver;
+
 /**
  * @function
  * Vectorize an operation on a batched axis for one or more inputs.

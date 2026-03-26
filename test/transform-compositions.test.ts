@@ -750,7 +750,8 @@ suite("linearize compositions", () => {
   });
 
   test("grad(linearize(f).lin) — differentiate through the linear part", () => {
-    const [, lin] = linearize(fn, [X]);
+    const [y, lin] = linearize(fn, [X]);
+    using _y = y;
     using _lin = lin;
     using t1 = lin(1);
     expect(t1).toBeAllclose(F1);

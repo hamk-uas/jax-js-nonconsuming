@@ -132,6 +132,20 @@ describe("lax.blockMap - Phase 2 AD", () => {
     expect(g).toBeAllclose([2, 4, 6, 8, 10]);
   });
 
+  test("bare grad(blockMap) cache reuse stays leak-free", () => {
+    const body = (block: np.Array) => np.multiply(block, block);
+    const f = (xs: np.Array) => {
+      using mapped = lax.blockMap(body, xs, { blockShape: [2] });
+      return np.sum(mapped);
+    };
+    const df = grad(f);
+    using x = np.array([1, 2, 3, 4], { dtype: DType.Float32 });
+    using g1 = df(x);
+    using g2 = df(x);
+    expect(g1).toBeAllclose([2, 4, 6, 8]);
+    expect(g2).toBeAllclose([2, 4, 6, 8]);
+  });
+
   test("vmap(grad(blockMap)) batched gradients", () => {
     const body = (block: np.Array) => np.multiply(block, block);
     const f = (xs: np.Array) => {

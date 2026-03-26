@@ -221,18 +221,31 @@ must be ownership-correct in both modes.
 - `tree.data(pytree)` = read all leaves in parallel (overlapping `mapAsync` calls)
 - `tree.consumeData(pytree)` = read all leaves in parallel + dispose
 
-**Internal ownership rules for restructuring work:**
+**Internal ownership architecture:**
 
-- If a transform, cache, artifact, or builder needs a value past the current lexical scope, it must
-  take an independent retained handle intentionally.
+Each Array carries a named creation-ref owner state (`#creationRefOwner`): `"none"` |
+`"partial-eval"` | `"makeJaxpr-body"` | `"jvp-lifted-tangents"` | `"jacfwd-eye-matrix"` |
+`"balanced"`. Invalid transitions throw internal errors.
+
+| Subsystem             | Mechanism                                                                                                | Release site                                                                                                                       |
+| --------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| **Const capture**     | `getOrMakeConstTracer` takes `.ref`; `constsNeedingCreationRefBalance` Set tracks stranded creation refs | `ClosedJaxpr.dispose()` releases builder ref; `makeJaxpr` post-build loop balances creation refs (`refCount > 1` pre-build filter) |
+| **PE intermediates**  | `withPartialEvalScope(...)` + scoped birth list; arrays born in PE carry `partial-eval` owner            | `disposePeIntermediates(protectedVals)` cleans dead temporaries; rc≤1 consts are protected                                         |
+| **Eval-time Lit**     | `evalJaxpr` tracks in `litArrays`; `evalJaxprTransposed` tracks zeros/Lit in `internalArrays`            | Cleanup at function exit balances creation refs                                                                                    |
+| **JVP lift zeros**    | `claimCreationRef("jvp-lifted-tangents")`                                                                | `liftedTangents` cleanup in `jvpFlat`                                                                                              |
+| **jacfwd eye matrix** | `claimCreationRef("jacfwd-eye-matrix")`                                                                  | Explicit `eyeMatrix.dispose()` by caller                                                                                           |
+| **Scan transpose**    | Identity-based cleanup: `ctCarrySafeInit[i] !== ctCarryInit[i]`                                          | Only dispose freshly-created zeros, not borrowed cts                                                                               |
+| **Artifact wrappers** | `PrimalArtifactImpl.run()` returns independently retained outputs/residuals                              | Explicit teardown path; pending-work flush via shared helper                                                                       |
+
+Key invariants:
+
+- `jit()` and bare execution produce identical leak counts — no tracing-context disposal
+  suppression.
+- `[Symbol.dispose]()` always runs normally; there are no tracing guards.
 - Cache-owned values stay cache-owned. `transposeJaxprCache` callers must not dispose returned
   `ClosedJaxpr`s.
-- If eager-mode ownership is wrong, `jit()` is not the fix. Trace-only success usually means the
-  compiler is masking a real retain/release mismatch.
-- Captured consts, PE residuals, and artifact wrappers must each have one clear owner and one clear
-  release path.
-- Temporary suppression of `using` or `.dispose()` semantics is technical debt, not an acceptable
-  long-term ownership boundary.
+- If eager-mode ownership is wrong, `jit()` is not the fix. Trace-only success means the compiler is
+  masking a real retain/release mismatch.
 
 **GPU readback latency:** Each `GPUBuffer.mapAsync()` round-trip costs ~12ms on eGPU (TB4). When
 reading multiple outputs, use `tree.data()` / `tree.consumeData()` or `Promise.all()` to overlap
@@ -1116,9 +1129,10 @@ https://github.com/b0nes164/Decoupled-Fallback-Paper · https://github.com/b0nes
 
 - **JIT flow:** `makeJaxpr` → `flatten().simplify()` → `splitGraphDataflow()` → `jitCompile()` →
   `JitProgram.execute()`
-- **Ownership debugging:** Check artifact disposal timing, `transposeJaxprCache` (cache-owned),
-  `getOrMakeConstTracer` `.ref` balance, `ResidualCollector` release timing, `[Symbol.dispose]`
-  behavior in `array.ts`, and `evalJaxprTransposed` `argPrimals` set
+- **Ownership debugging:** Check `#creationRefOwner` state transitions in `array.ts`,
+  `constsNeedingCreationRefBalance` tracking in `jaxpr.ts`, `getOrMakeConstTracer` `.ref` balance,
+  `disposePeIntermediates` protection set in `linearize.ts`, `transposeJaxprCache` (cache-owned),
+  artifact disposal timing, and `evalJaxprTransposed` `internalArrays` cleanup
 - **Multi-output kernel access:** `kernel.outputs[0].exp`, `.reduction`, `.dtype`, `.bytes` — no
   single-output shims
 

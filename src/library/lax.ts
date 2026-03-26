@@ -945,6 +945,16 @@ export function tiledMatmul(
   B: Array,
   options?: TiledMatmulOptions,
 ): Array {
+  // tiledMatmul is a WebGPU-specific optimization. On non-WebGPU backends,
+  // fall back to a simple dot product — blockMap + foriLoop traces hundreds
+  // of IR nodes whose intermediates leak through grad on WASM/CPU.
+  if (getBackend().type !== "webgpu") {
+    return dot(A, B, {
+      lhsContractingDims: [1],
+      rhsContractingDims: [0],
+    });
+  }
+
   // --- Strategy 3: Zero-shmem Micro-panel Tiling ---
   // Gen-9 and Gen-11 have very few Execution Units and suffer profoundly from
   // workgroupBarrier() synchronizations. Furthermore, their emulated f16

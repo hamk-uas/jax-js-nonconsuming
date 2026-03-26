@@ -828,6 +828,36 @@ export function _setInMakeJaxprBody(v: boolean): void {
 }
 
 /**
+ * True while user code is executing inside the forward partial-eval scope.
+ * Arrays born here are PE-owned until they are either lifted into the PE trace
+ * or disposed lexically before escaping the scope.
+ */
+let _inPartialEvalScope = false;
+export function inPartialEvalScope(): boolean {
+  return _inPartialEvalScope;
+}
+
+let _partialEvalCreatedArrays: Tracer[] | null = null;
+export function registerPartialEvalCreatedArray(value: Tracer): void {
+  _partialEvalCreatedArrays?.push(value);
+}
+export function withPartialEvalScope<T>(
+  createdArrays: Tracer[],
+  fn: () => T,
+): T {
+  const previousPeScope = _inPartialEvalScope;
+  const previousPeCreatedArrays = _partialEvalCreatedArrays;
+  _inPartialEvalScope = true;
+  _partialEvalCreatedArrays = createdArrays;
+  try {
+    return fn();
+  } finally {
+    _inPartialEvalScope = previousPeScope;
+    _partialEvalCreatedArrays = previousPeCreatedArrays;
+  }
+}
+
+/**
  * Returns true if any abstract trace exists below the given level on the stack.
  *
  * Used by jvpFlat to decide whether its own intermediate cleanup is safe.
@@ -970,6 +1000,16 @@ export abstract class Tracer {
   /** Current reference count (only meaningful on concrete Arrays). */
   get refCount(): number {
     return 0;
+  }
+
+  /**
+   * Whether this tracer still owns a live cleanup obligation.
+   *
+   * Cleanup code should use this instead of probing ad hoc fields like
+   * `refCount` or `isAlive` directly.
+   */
+  isAliveForCleanup(): boolean {
+    return true;
   }
 
   /** The shape of the array. */
@@ -1576,17 +1616,6 @@ export function getAval(x: TracerValue): AbstractValue {
   } else {
     throw new TypeError(`Unknown value: ${x}`);
   }
-}
-
-/**
- * When non-null, bind() pushes EvalTrace-level results (level 0) into this
- * array. Used by partialEvalFlat to track intermediate concrete Arrays created
- * during PE scope — these bypass PE tracking and would otherwise leak.
- * Activated in the Array constructor when set (not null).
- */
-export let _peArrayCreationTracker: Tracer[] | null = null;
-export function _setPACT(v: Tracer[] | null) {
-  _peArrayCreationTracker = v;
 }
 
 export function bind<P extends Primitive>(

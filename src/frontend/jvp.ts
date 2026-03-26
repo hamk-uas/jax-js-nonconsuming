@@ -9,22 +9,12 @@ import {
   unflatten as treeUnflatten,
 } from "../tree";
 import { checkAxis, unzip2, zip } from "../utils";
-import {
-  _liftedTangentZeros,
-  arange,
-  Array,
-  eye,
-  pureArray,
-  tril,
-  triu,
-  zerosLike,
-} from "./array";
+import { arange, Array, eye, pureArray, tril, triu, zerosLike } from "./array";
 import {
   _registerCacheSizeGetter,
   _registerJitCacheDisposer,
 } from "./check-leaks";
 import {
-  _peArrayCreationTracker,
   AbstractValue,
   argsort,
   asin,
@@ -109,20 +99,17 @@ class JVPTracer extends Tracer {
   /**
    * Override Tracer's no-op to cascade disposal to primal and tangent.
    *
-   * During PE tracing, JVPTracers may wrap concrete Arrays tracked in
-   * PE's knownIntermediates. Disposing via `using` would conflict with
-   * PE's lifecycle management, so we skip when inside PE scope.
-   *
    * Also skip when a lower abstract trace exists. In nested abstract
    * compositions (e.g., makeJaxpr(jvp(...))), core.bind may call
    * Symbol.dispose on raised raw-literal arguments. Cascading here would free
    * primals/tangents that have already been captured as Jaxpr consts.
+   *
+   * During PE tracing, lexical disposal is now allowed. Known PE values are
+   * either independently retained by instantiateConst/.ref or later swept by
+   * the PE cleanup path, which already tolerates already-disposed wrappers.
    */
   [Symbol.dispose]() {
-    if (
-      !_peArrayCreationTracker &&
-      !hasAbstractTraceBelow(this._trace.main.level)
-    ) {
+    if (!hasAbstractTraceBelow(this._trace.main.level)) {
       this.dispose();
     }
   }
@@ -135,7 +122,10 @@ class JVPTrace extends Trace {
 
   lift(val: Tracer): Tracer {
     const zero = zerosLike(val);
-    _liftedTangentZeros.add(zero);
+    // Claim ownership of the zero tangent's creation ref. The creation ref
+    // is balanced by liftedTangents cleanup in jvpFlat — makeJaxpr must NOT
+    // double-balance it.
+    zero.claimCreationRef("jvp-lifted-tangents");
     const data = this.main.globalData as JvpGlobalData | null;
     if (data) data.liftedTangents.push(zero);
     return new JVPTracer(this, val, zero);
@@ -177,6 +167,40 @@ type JvpRule<P extends Primitive> = (
   tangents: Tracer[],
   params: PrimitiveParams<P>,
 ) => [Tracer[], Tracer[]];
+
+type JvpRetainedHandoffKind = "sort-idx" | "argsort-idx";
+
+let _jvpRetainedHandoffObserver:
+  | ((kind: JvpRetainedHandoffKind, value: Tracer) => void)
+  | null = null;
+
+export function _setJvpRetainedHandoffObserver(
+  observer: ((kind: JvpRetainedHandoffKind, value: Tracer) => void) | null,
+): void {
+  _jvpRetainedHandoffObserver = observer;
+}
+
+/**
+ * JVP-local helper for handing a retained handle to downstream tracing/capture.
+ *
+ * This makes ownership transfer local and explicit at the handoff site
+ * instead of relying on downstream users to retain the original local owner
+ * before it is disposed.
+ */
+function withLocalJvpRetainedHandoff<T extends Tracer, R>(
+  kind: JvpRetainedHandoffKind,
+  value: T,
+  use: (retained: T) => R,
+): R {
+  // jax-js-lint: allow-ref
+  const retained = value.ref;
+  try {
+    _jvpRetainedHandoffObserver?.(kind, retained);
+    return use(retained);
+  } finally {
+    retained.dispose();
+  }
+}
 
 /** Rule that applies the same operation to primals and tangents. */
 function linearTangentsJvp<P extends Primitive>(primitive: P): JvpRule<P> {
@@ -404,16 +428,24 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Sort]([x], [dx]) {
     // Propagate both primals and derivatives along the sorted order.
     const [y, idx] = argsort(x);
-    const gatherResult = gather(dx, [idx], [-1], -1);
-    // During PE tracing (grad path), idx becomes a ClosedJaxpr const whose
-    // lifecycle is managed by ResidualCollector.dispose(). Eagerly disposing
-    // here would free it before the VJP pullback can use it.
-    if (!_peArrayCreationTracker) idx.dispose();
-    return [[y], [gatherResult]];
+    try {
+      const gatherResult = withLocalJvpRetainedHandoff(
+        "sort-idx",
+        idx,
+        (retainedIdx) => gather(dx, [retainedIdx], [-1], -1),
+      );
+      return [[y], [gatherResult]];
+    } finally {
+      idx.dispose();
+    }
   },
   [Primitive.Argsort]([x], [dx]) {
     const [y, idx] = argsort(x);
-    const gatherResult = gather(dx, [idx], [-1], -1);
+    const gatherResult = withLocalJvpRetainedHandoff(
+      "argsort-idx",
+      idx,
+      (retainedIdx) => gather(dx, [retainedIdx], [-1], -1),
+    );
     const zerosIdx = zerosLike(idx);
     return [
       [y, idx],
@@ -501,8 +533,8 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     using luSliceL = sliceAxis(luMatrix, -1, [0, k]);
     // Note: lLower/uUpper are NOT declared with `using` when m<=k / n<=k
     // because in that case they alias lPadded/uPadded directly. During PE
-    // tracing, [Symbol.dispose] is a no-op, so .ref's extra refcount would
-    // never be balanced. Instead we let ResidualCollector.dispose() handle them.
+    // tracing, explicit disposal here would fight the PE cleanup path, so the
+    // PE intermediate cleanup handles those aliases instead.
     const lLower = tril(luSliceL as any, -1);
     const lPaddedNeedsDispose = m > k;
     const lPadded = lPaddedNeedsDispose
@@ -938,9 +970,13 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
       },
     );
 
-    // wrappedBody.jaxpr is stored in the BlockMap params and may be used as
-    // a transposeJaxprCache key by the transpose rule. Do NOT dispose — let
-    // the cache cleanup handle it when the Jaxpr becomes unreachable.
+    // Ownership boundary: the wrapper ClosedJaxpr is local/transferred state
+    // used only to build the Primitive.BlockMap params. Once bind() returns,
+    // any tracing/capture that needed wrappedBody.consts has taken its own
+    // retained ownership. Only wrappedBody.jaxpr participates in later
+    // transpose-cache lookups; the wrapper's builder-owned const handles must
+    // be balanced locally instead of being treated as cache-owned state.
+    wrappedBody.dispose();
 
     const numOutP = doubledOut.length / 2;
     return [doubledOut.slice(0, numOutP), doubledOut.slice(numOutP)];
@@ -1229,8 +1265,8 @@ function jvpFlat(
   // Dispose zero tangents created by JVPTrace.lift() for lifted inputs.
   // These are freshly created by the JVP trace (not owned by PE or other
   // abstract traces), so they must be cleaned up unconditionally.
-  // Use .dispose() instead of [Symbol.dispose]() because the latter is
-  // suppressed during PE scope (_peArrayCreationTracker guard).
+  // Use .dispose() directly so this cleanup does not depend on scope-exit
+  // semantics or wrapper-level disposal hooks.
   {
     const outputTangents = new Set<Tracer>(result[1]);
     for (const z of jvpData.liftedTangents) {

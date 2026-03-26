@@ -144,6 +144,10 @@ class BatchTracer extends Tracer {
     this.val.dispose();
   }
 
+  override isAliveForCleanup(): boolean {
+    return this.val.isAliveForCleanup();
+  }
+
   fullLower(): Tracer {
     if (this.batchDim === null) {
       return this.val.fullLower();
@@ -1154,6 +1158,11 @@ export function jacfwd(f: any) {
       return tangents;
     };
     const eyeMatrix = eye(size, undefined, { dtype: x.dtype });
+    // Claim the creation ref: this function takes explicit ownership and
+    // will dispose eyeMatrix below. Without this, if tracing captures
+    // eyeMatrix as a const, makeJaxpr would also try to balance the
+    // creation ref, causing a double-balance.
+    eyeMatrix.claimCreationRef("jacfwd-eye-matrix");
     const result = vmap(pushfwd, [0])(eyeMatrix);
     eyeMatrix.dispose();
     return result;

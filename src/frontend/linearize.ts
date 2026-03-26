@@ -35,8 +35,6 @@ import {
   _registerJitCacheDisposer,
 } from "./check-leaks";
 import {
-  _peArrayCreationTracker,
-  _setPACT,
   AbstractValue,
   add,
   bind,
@@ -77,6 +75,7 @@ import {
   triSolve,
   UseAfterFreeError,
   where,
+  withPartialEvalScope,
 } from "./core";
 import {
   abstractEvalRules,
@@ -134,10 +133,10 @@ class PartialVal {
  * produce a forward jaxpr together with PE intermediates for ownership disposal.
  *
  * This is the core of partial evaluation. The returned intermediates must be
- * disposed by the caller via `ResidualCollector.dispose()` (or a future
- * `ResidualCollector`) to balance rc=1 from creation.
+ * disposed by the caller via `disposePeIntermediates(...)` to balance rc=1
+ * from creation.
  *
- * Extracted from `partialEvalFlat` in M1.1 to enable composition with
+ * Extracted as the reusable forward PE builder in M1.1 to enable composition with
  * `buildBackwardJaxpr` and future artifact types.
  */
 function buildForwardJaxpr(
@@ -147,12 +146,10 @@ function buildForwardJaxpr(
   jaxpr: ClosedJaxpr;
   pvalsOut: PartialVal[];
   peIntermediates: Tracer[];
-  literalIntermediates: Tracer[];
 } {
   let jaxpr: ClosedJaxpr;
   let pvalsOut: PartialVal[];
   let knownIntermediates: Tracer[];
-  let literalIntermediates: Tracer[];
   {
     using main = newMain(PartialEvalTrace);
     main.isAbstract = true;
@@ -162,20 +159,11 @@ function buildForwardJaxpr(
       .filter((t) => !t.pval.isKnown)
       .map((t) => t.ref);
 
-    // Track all Array constructions during PE scope for intermediate disposal.
-    // This catches: (1) EvalTrace-level bind results from JVP rules,
-    // (2) anonymous constants (np.array([...]) inside grad body) that bypass
-    // bind() and PE tracking. Save/restore handles nested PE scopes (e.g.
-    // grad(grad(f))).
-    const previousTracker = _peArrayCreationTracker;
     const peCreatedArrays: Tracer[] = [];
-    _setPACT(peCreatedArrays);
     let outs: any;
     try {
-      outs = f(...tracersIn);
+      outs = withPartialEvalScope(peCreatedArrays, () => f(...tracersIn));
     } catch (e) {
-      _setPACT(previousTracker);
-      // Dispose any arrays created during the partial trace before the throw.
       for (const t of peCreatedArrays) {
         try {
           t.dispose();
@@ -185,7 +173,6 @@ function buildForwardJaxpr(
       }
       throw e;
     }
-    _setPACT(previousTracker);
 
     const tracersOut: PartialEvalTracer[] = outs.map((out: TracerValue) =>
       fullRaise(trace, out),
@@ -216,8 +203,6 @@ function buildForwardJaxpr(
     }
 
     knownIntermediates = trace.knownIntermediates;
-    literalIntermediates = trace.literalIntermediates;
-    // Merge PE-scope Array creations into knownIntermediates for disposal.
     knownIntermediates.push(...peCreatedArrays);
   }
 
@@ -225,22 +210,9 @@ function buildForwardJaxpr(
     jaxpr,
     pvalsOut,
     peIntermediates: knownIntermediates,
-    literalIntermediates,
   };
 }
 
-/** Thin wrapper for backward compatibility. Delegates to `buildForwardJaxpr`. */
-function _partialEvalFlat(
-  f: (...args: any[]) => any,
-  pvalsIn: PartialVal[],
-): {
-  jaxpr: ClosedJaxpr;
-  pvalsOut: PartialVal[];
-  peIntermediates: Tracer[];
-  literalIntermediates: Tracer[];
-} {
-  return buildForwardJaxpr(f, pvalsIn);
-}
 /**
  * Unwrap tracer wrappers (BatchTracer, etc.) to find the underlying concrete
  * Array. Chases the `.val` chain until it reaches a non-wrapper value.
@@ -257,68 +229,39 @@ function unwrapToConcreteArray(t: Tracer): Tracer {
 }
 
 /**
- * Collects PE intermediates from a forward partial-evaluation pass and
- * provides a `dispose(protectedVals)` method for deterministic cleanup.
+ * Dispose PE intermediates that aren't protected (outputs, aux, retained consts).
  *
- * Owns the list of PE intermediates and literal intermediates and disposes
- * those that are NOT in the protected set (outputs, aux captures, low-rc
- * consts).  Extracted in M1.3.
+ * During PE, all-known evaluations create concrete arrays. Output values
+ * (in protectedVals) are returned to the caller. ClosedJaxpr consts have
+ * independent ownership via .ref in partialEvalGraphToJaxpr. Everything
+ * else (pure intermediates AND computed consts) needs one dispose here
+ * to balance the rc=1 from creation.
  */
-class ResidualCollector {
-  readonly peIntermediates: Tracer[];
-  readonly literalIntermediates: Tracer[];
-
-  constructor(peIntermediates: Tracer[], literalIntermediates: Tracer[]) {
-    this.peIntermediates = peIntermediates;
-    this.literalIntermediates = literalIntermediates;
+export function disposePeIntermediates(
+  peIntermediates: Tracer[],
+  protectedVals: Set<Tracer>,
+): void {
+  if (insideAbstractTrace()) return;
+  const allProtected = new Set<Tracer>(protectedVals);
+  for (const v of protectedVals) {
+    const concrete = unwrapToConcreteArray(v);
+    if (concrete !== v) allProtected.add(concrete);
   }
-
-  /**
-   * Dispose PE intermediates that aren't protected (outputs, aux, retained consts).
-   *
-   * During PE, all-known evaluations create concrete arrays. Output values
-   * (in protectedVals) are returned to the caller. ClosedJaxpr consts have
-   * independent ownership via .ref in partialEvalGraphToJaxpr. Everything
-   * else (pure intermediates AND computed consts) needs one dispose here
-   * to balance the rc=1 from creation.
-   */
-  dispose(protectedVals: Set<Tracer>): void {
-    if (insideAbstractTrace()) return;
-    // Build a protection set that includes both the wrapper tracers and their
-    // underlying concrete arrays. PE-created arrays (peIntermediates) are raw
-    // Arrays, but protectedVals may contain BatchTracers wrapping those arrays.
-    // Without unwrapping, identity checks fail through the wrapper layer.
-    //
-    // CRITICAL: Multiple wrappers can share the same underlying concrete array
-    // (e.g., Reduce with axis=[] returns the input as-is, so both the
-    // intermediate and the output wrap the same raw Array). We must protect
-    // the concrete array from disposal via ANY wrapper, not just the one
-    // in protectedVals.
-    const allProtected = new Set<Tracer>(protectedVals);
-    for (const v of protectedVals) {
-      const concrete = unwrapToConcreteArray(v);
-      if (concrete !== v) allProtected.add(concrete);
-    }
-    const targets = this.peIntermediates;
-    const disposed = new Set<Tracer>();
-    for (const t of targets) {
-      if (allProtected.has(t)) continue;
-      if (disposed.has(t)) continue;
-      // Before disposing a wrapper, check if its underlying concrete array
-      // is protected. If so, skip this disposal entirely — cascading would
-      // free the protected array.
-      const concrete = unwrapToConcreteArray(t);
-      if (concrete !== t && allProtected.has(concrete)) continue;
-      disposed.add(t);
-      // Mark the unwrapped concrete array as disposed too, so the raw Array
-      // entry in peIntermediates (from _peArrayCreationTracker) won't
-      // double-free it.
-      if (concrete !== t) disposed.add(concrete);
-      try {
-        t.dispose();
-      } catch {
-        // Already disposed.
-      }
+  const disposed = new Set<Tracer>();
+  for (const t of peIntermediates) {
+    if (allProtected.has(t)) continue;
+    if (disposed.has(t)) continue;
+    if (!t.isAliveForCleanup()) continue;
+    const concrete = unwrapToConcreteArray(t);
+    if (concrete !== t && allProtected.has(concrete)) continue;
+    if (concrete !== t && !concrete.isAliveForCleanup()) continue;
+    disposed.add(t);
+    if (concrete !== t) disposed.add(concrete);
+    try {
+      t.dispose();
+    } catch {
+      // Hardening for stale nested-transform wrappers. Normal cleanup should
+      // have been filtered by explicit protection and liveness checks above.
     }
   }
 }
@@ -338,11 +281,20 @@ export function collectConcreteArrays(value: any): Tracer[] {
   return result;
 }
 
-/** Result of linearizeFlatUtil: forward jaxpr + primals + disposal collector. */
+export function flushPendingConcreteArrays(arrays: Tracer[]): void {
+  if (insideAbstractTrace()) return;
+  for (const arr of arrays) {
+    if (arr instanceof JaxArray) {
+      arr._flushPendingSync();
+    }
+  }
+}
+
+/** Result of linearizeFlatUtil: forward jaxpr + primals + PE cleanup state. */
 export interface ForwardResult {
   primalsOut: Tracer[];
   jaxpr: ClosedJaxpr;
-  collector: ResidualCollector;
+  peIntermediates: Tracer[];
 }
 
 /**
@@ -352,8 +304,8 @@ export interface ForwardResult {
  * evaluating the "transposed" linearized Jaxpr, pulling back cotangents instead
  * of pushing forward tangents.
  *
- * Uses `buildForwardJaxpr` (M1.1) and returns a `ResidualCollector` (M1.3)
- * instead of raw intermediate arrays.
+ * Uses `buildForwardJaxpr` (M1.1) and returns the PE intermediate list for
+ * deterministic cleanup.
  */
 export function linearizeFlatUtil(
   f: (...args: any[]) => any,
@@ -369,18 +321,13 @@ export function linearizeFlatUtil(
     const [primalsOut, tangentsOut] = jvp(f, x.slice(0, k), x.slice(k, 2 * k));
     return [...primalsOut, ...tangentsOut];
   };
-  const { jaxpr, pvalsOut, peIntermediates, literalIntermediates } =
-    buildForwardJaxpr(fJvp, pvalsIn);
+  const { jaxpr, pvalsOut, peIntermediates } = buildForwardJaxpr(fJvp, pvalsIn);
   const primalPvals = pvalsOut.slice(0, pvalsOut.length / 2);
   if (!primalPvals.every((pval) => pval.isKnown)) {
     throw new Error("Not all primal values are known after partial evaluation");
   }
   const primalsOut = primalPvals.map((pval) => pval.val!);
-  const collector = new ResidualCollector(
-    peIntermediates,
-    literalIntermediates,
-  );
-  return { primalsOut, jaxpr, collector };
+  return { primalsOut, jaxpr, peIntermediates };
 }
 
 function linearizeFlat(
@@ -537,6 +484,11 @@ class PartialEvalTracer extends Tracer {
   get isAlive(): boolean {
     return this.#rc > 0;
   }
+
+  override isAliveForCleanup(): boolean {
+    return this.#rc > 0;
+  }
+
   dispose() {
     if (this.#rc <= 0) {
       throw new UseAfterFreeError(this);
@@ -569,14 +521,15 @@ class PartialEvalTrace extends Trace {
 
   pure(val: TracerValue): Tracer {
     const arr = pureArray(val);
-    // Track literal-created Arrays so ResidualCollector can clean them up.
+    // Track literal-created Arrays so the PE cleanup path can release them.
     // pureArray() returns existing Tracers as-is, so non-Tracer inputs (numbers,
     // TypedArrays) produce genuinely new allocations that need disposal.
     // Without this, literals used as args in JVP rules (0.0, 1.0, etc.) leak
     // a backend slot each.
     if (!(val instanceof Tracer)) {
       this.knownIntermediates.push(arr);
-      this.literalIntermediates.push(arr);
+    } else if (val instanceof JaxArray && val.hasPartialEvalCreationRef) {
+      this.knownIntermediates.push(arr);
     }
     return new PartialEvalTracer(this, PartialVal.known(arr), null);
   }
@@ -591,19 +544,6 @@ class PartialEvalTrace extends Trace {
       arr = [];
       if (!this.main.globalData) (this.main as any).globalData = {};
       this.main.globalData._knownIntermediates = arr;
-    }
-    return arr;
-  }
-
-  // Track Arrays created from non-Tracer literals in pure(). These are safe
-  // to dispose even while tracing, unlike general knownIntermediates which can
-  // include tracer-backed values from nested transforms.
-  get literalIntermediates(): Tracer[] {
-    let arr = this.main.globalData?._literalIntermediates;
-    if (!arr) {
-      arr = [];
-      if (!this.main.globalData) (this.main as any).globalData = {};
-      this.main.globalData._literalIntermediates = arr;
     }
     return arr;
   }
@@ -629,7 +569,8 @@ class PartialEvalTrace extends Trace {
       // Translate known value into unknown "Const" recipe for abstract eval.
       // .ref gives ClosedJaxpr independent ownership of the const value.
       // The matching dispose happens in partialEvalGraphToJaxpr cleanup
-      // (for reachable consts) or partialEvalFlat (for unreachable ones).
+      // (for reachable consts) or the forward-PE cleanup path (for unreachable
+      // ones).
       const pval = PartialVal.unknown(ShapedArray.fromAval(tracer.aval));
       const val = tracer.pval.val!.ref;
       const constTracer = new PartialEvalTracer(this, pval, {
@@ -841,6 +782,9 @@ class PartialEvalTrace extends Trace {
     for (let i = 0; i < numCarry; i++) {
       retainedKnownOutputs.add(fullOuts[i]);
     }
+    for (const out of retainedKnownOutputs) {
+      this.knownIntermediates.push(out);
+    }
 
     // Clean up fullInputs: balance the .ref taken at creation (known inputs)
     // and the creation ref of synthesized zeros (unknown inputs).
@@ -982,6 +926,9 @@ class PartialEvalTrace extends Trace {
     for (let i = 0; i < numPrimalY; i++) {
       retainedKnownOutputs.add(fullOuts[numCarry + i]);
     }
+    for (const out of retainedKnownOutputs) {
+      this.knownIntermediates.push(out);
+    }
 
     // Clean up fullInputs: balance the .ref taken at line 920 (known inputs)
     // and the creation ref of synthesized zeros (unknown inputs).
@@ -1090,6 +1037,9 @@ class PartialEvalTrace extends Trace {
     const retainedKnownOutputs = new Set<Tracer>(
       fullOuts.slice(0, numOrigLeaves),
     );
+    for (const out of retainedKnownOutputs) {
+      this.knownIntermediates.push(out);
+    }
     // Clean up fullInputs: balance the .ref taken at creation (known inputs)
     // and the creation ref of synthesized zeros (unknown inputs).
     // If an outer JaxprTrace captured a value via getOrMakeConstTracer,
@@ -1209,6 +1159,9 @@ class PartialEvalTrace extends Trace {
     const retainedKnownOutputs = new Set<Tracer>(
       fullOuts.slice(0, numPrimalOuts),
     );
+    for (const out of retainedKnownOutputs) {
+      this.knownIntermediates.push(out);
+    }
     // Clean up fullInputs: balance the .ref taken at creation (known inputs)
     // and the creation ref of synthesized zeros (unknown inputs).
     // If an outer JaxprTrace captured a value via getOrMakeConstTracer,
@@ -1617,13 +1570,7 @@ function evalJaxprTransposed(
   // results carry unsubmitted PEs while intermediates are disposed, shared
   // PE refcounts never reach zero and the slots they reference leak.
   // Submitting first releases those cross-references cleanly.
-  if (!insideAbstractTrace()) {
-    for (const r of results) {
-      if (r instanceof JaxArray) {
-        r._flushPendingSync();
-      }
-    }
-  }
+  flushPendingConcreteArrays(results);
 
   // Always restore input-known primals to their initial refcount.
   // This balances temporary .ref borrows from getOrComputePrimal even when
@@ -1936,7 +1883,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         },
       );
 
-      transposedBody.dispose();
+      // transposedBody comes from transposeJaxprCache. The BlockMap bind
+      // consumes only its Jaxpr/const contents, but the ClosedJaxpr wrapper is
+      // cache-owned retained state and must not be disposed here.
 
       const numUndefConsts = constOutAxes.length;
       const constCts = transposedOut.slice(0, numUndefConsts);
@@ -2069,7 +2018,6 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       );
 
       bwdBodyJaxpr.dispose();
-      transposedBody.dispose();
 
       // Assemble outVals. In the doubled args:
       //   [doubledConsts..., primalInputs..., tangentInputs...]
@@ -2310,7 +2258,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       }
     }
 
-    transposedBody.dispose();
+    // transposedBody comes from transposeJaxprCache. Its retained wrapper
+    // stays cache-owned across calls; only the local padded accumulators above
+    // are caller-owned and disposed in this path.
 
     // Assemble outputs in the correct order.
     const numUndefConsts = constOutAxes.length;
@@ -2950,13 +2900,14 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
     const ctCarryAll = cts.slice(0, numCarry);
     const ctYsAll = cts.slice(numCarry);
-    // In JVP-doubled scan, first half of carry cts are primal (dispose)
+    // In JVP-doubled scan, first half of carry cts are primal
+    // Do NOT dispose cts-derived values here — they may be external
+    // cotangents owned by evalJaxprTransposed (the caller). Internal ones
+    // are tracked in internalArrays and cleaned up by the caller.
     const ctCarryInit = ctCarryAll.slice(numPrimalCarry);
-    for (let i = 0; i < numPrimalCarry; i++) ctCarryAll[i].dispose();
     // Tangent ys are the second half
     const numYPrimal = Math.floor(numY / 2);
     const tangentCtYs = ctYsAll.slice(numYPrimal);
-    for (let i = 0; i < numYPrimal; i++) ctYsAll[i].dispose();
 
     // Tangent const avals (for zero-init of accumulator)
     const numPrimalInputs = jaxpr.inBinders.filter(
@@ -2969,14 +2920,16 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     const ctConstsZeroInit = Array.from({ length: numTangentConsts }, (_, i) =>
       zerosInternal(tangentConstsAvals[i].shape, tangentConstsAvals[i].dtype),
     );
-    const ctCarrySafeInit = ctCarryInit.map(
-      (c, i) =>
-        c ||
-        zerosInternal(
+    const ctCarrySafeInit = ctCarryInit.map((c, i) => {
+      if (c) {
+        return c;
+      } else {
+        return zerosInternal(
           carryResiduals[carryResiduals.length - numTangentCarry + i].shape,
           carryResiduals[carryResiduals.length - numTangentCarry + i].dtype,
-        ),
-    );
+        );
+      }
+    });
 
     // Build backward scan body avals
     const bwdCarryAvals = [
@@ -3113,11 +3066,16 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       finalCtCarry[i].dispose();
     for (let i = ctXIdx; i < ctXsStacked.length; i++) ctXsStacked[i].dispose();
 
-    // Dispose intermediate arrays consumed by the backward scan
+    // Dispose intermediate arrays owned by this rule.
+    // stackedPrimalCarries: created by the forward scan bind (owned).
+    // ctConstsZeroInit: freshly-created zeros (owned).
+    // ctCarrySafeInit: only dispose entries we created (not borrowed cts).
+    // tangentCtYs: borrowed from cts — NOT disposed (caller owns them).
     for (const t of stackedPrimalCarries) t.dispose();
-    for (const t of tangentCtYs) t.dispose();
     for (const t of ctConstsZeroInit) t.dispose();
-    for (const t of ctCarrySafeInit) t.dispose();
+    for (let i = 0; i < ctCarrySafeInit.length; i++) {
+      if (ctCarrySafeInit[i] !== ctCarryInit[i]) ctCarrySafeInit[i].dispose();
+    }
 
     // Clean up owned jaxprs
     tangentBody.dispose();
@@ -3545,7 +3503,26 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     const numOrigElems = numElems; // numElems is already halved after JVP doubling
 
     const undefMask = args.map((x) => x instanceof UndefPrimal);
-    const bodyUndefPrimals = bodyJaxpr.inBinders.map((_, i) => undefMask[i]);
+    const bodyUndefPrimals: boolean[] = [];
+    for (let i = 0; i < bodyJaxpr.inBinders.length; i++) {
+      if (i < numConsts) {
+        bodyUndefPrimals.push(undefMask[i]);
+      } else if (i < numConsts + numElems) {
+        bodyUndefPrimals.push(undefMask[numConsts + (i - numConsts)]);
+      } else if (i < numConsts + numElems * 2) {
+        bodyUndefPrimals.push(
+          undefMask[numConsts + numElems + (i - numConsts - numElems)],
+        );
+      } else if (i < numConsts + numElems * 3) {
+        bodyUndefPrimals.push(
+          undefMask[numConsts + (i - numConsts - numElems * 2)],
+        );
+      } else {
+        bodyUndefPrimals.push(
+          undefMask[numConsts + numElems + (i - numConsts - numElems * 3)],
+        );
+      }
+    }
 
     const numTangentConsts = bodyUndefPrimals
       .slice(0, numConsts)
@@ -3909,15 +3886,16 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     const { jaxpr: primalForwardJaxpr } = makeJaxpr(
       (...primalInputs: Tracer[]): Tracer[] => {
         const fullInputs: Tracer[] = [];
+        const localTemps: JaxArray[] = [];
         let primalIdx = 0;
         for (let i = 0; i < jaxpr.inBinders.length; i++) {
           if (bodyUndefPrimals[i]) {
-            fullInputs.push(
-              zerosInternal(
-                jaxpr.inBinders[i].aval.shape,
-                jaxpr.inBinders[i].aval.dtype,
-              ),
+            const zero = zerosInternal(
+              jaxpr.inBinders[i].aval.shape,
+              jaxpr.inBinders[i].aval.dtype,
             );
+            if (zero instanceof JaxArray) localTemps.push(zero);
+            fullInputs.push(zero);
           } else {
             fullInputs.push(primalInputs[primalIdx++]);
           }
@@ -3925,6 +3903,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         const outs = evalJaxpr(jaxpr, fullInputs);
         const primalOuts = outs.slice(0, numCarryHalf);
         for (let i = numCarryHalf; i < outs.length; i++) outs[i].dispose();
+        for (const temp of localTemps) temp.dispose();
         return primalOuts;
       },
       { validateRefs: false },
@@ -4004,10 +3983,8 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
           iIn,
           ...carryIn,
         ]);
-        const iNext = bind(Primitive.Add, [
-          iIn,
-          array(1, { dtype: iDtype }),
-        ])[0];
+        using one = array(1, { dtype: iDtype });
+        const iNext = bind(Primitive.Add, [iIn, one])[0];
         return [iNext, ...forwardOuts, iIn, ...carryIn];
       },
     )(
@@ -4286,7 +4263,7 @@ function vjpFlat(
   const {
     primalsOut,
     jaxpr: forwardJaxpr,
-    collector,
+    peIntermediates,
   } = linearizeFlatUtil(f, primalsIn);
 
   // Phase 2: Dispose PE intermediates.
@@ -4302,18 +4279,12 @@ function vjpFlat(
       protectedVals.add(arr);
     }
   }
-  collector.dispose(protectedVals);
+  disposePeIntermediates(peIntermediates, protectedVals);
 
   // CRITICAL: Flush primals' pending backend dispatches. PE tracing created
   // concrete forward-pass arrays with lazy PendingExecute chains. Submitting
   // them here prevents orphaned Slot references.
-  if (!insideAbstractTrace()) {
-    for (const p of primalsOut) {
-      if (p instanceof JaxArray) {
-        p._flushPendingSync();
-      }
-    }
-  }
+  flushPendingConcreteArrays(primalsOut);
 
   // Phase 3: Call-time transposition.
   //

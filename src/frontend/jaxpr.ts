@@ -25,20 +25,11 @@ import {
   unzip2,
   zip,
 } from "../utils";
-import {
-  _arraysCreatedInMakeJaxprBody,
-  _liftedTangentZeros,
-  array,
-  Array,
-  ArrayLike,
-  pureArray,
-} from "./array";
+import { array, Array, ArrayLike, pureArray } from "./array";
 import { _jitFunctionDisposers } from "./check-leaks";
 import { checkConvShape, checkPoolShape } from "./convolution";
 import {
-  _peArrayCreationTracker,
   _setInMakeJaxprBody,
-  _setPACT,
   AbstractValue,
   bind,
   flattenFun,
@@ -920,6 +911,10 @@ class JaxprTracer extends Tracer {
     return this.#rc;
   }
 
+  override isAliveForCleanup(): boolean {
+    return this.#rc > 0;
+  }
+
   // JaxprTracer can be created from a constant; if the constant is lifted
   // multiple times we need to increment the reference count each time. We can't
   // use `.ref` for this as that might raise a `UseAfterFreeError` when rc=0.
@@ -961,11 +956,7 @@ class JaxprTrace extends Trace {
       // the builder holds an independent retained handle.
       if (wasRaw) {
         tval.dispose();
-      } else if (
-        tval instanceof Array &&
-        _arraysCreatedInMakeJaxprBody.has(tval) &&
-        !_liftedTangentZeros.has(tval)
-      ) {
+      } else if (tval instanceof Array && tval.hasUnownedCreationRef) {
         // Non-raw JaxArray created during makeJaxpr body (e.g., fudgeArray(1),
         // np.array([3]) inside traced function). Its creation ref has no
         // external owner. Track it for balancing by makeJaxpr after build().
@@ -1740,13 +1731,6 @@ export function makeJaxpr(
       trace.newArg(typeof aval === "object" ? aval : pureArray(aval)),
     );
 
-    // Save/restore _peArrayCreationTracker so that Arrays created during
-    // inner makeJaxpr tracing (e.g., zerosLike tangents from JVP rules)
-    // don't leak into an outer partialEvalFlat's tracker.  These inner
-    // Arrays become ClosedJaxpr consts (with .ref ownership) and must not
-    // be disposed by the outer PE's ResidualCollector.dispose().
-    const prevTracker = _peArrayCreationTracker;
-    _setPACT(null);
     const prevBody = inMakeJaxprBody();
     _setInMakeJaxprBody(true);
     let outs: any;
@@ -1754,7 +1738,6 @@ export function makeJaxpr(
       outs = fFlat(...tracersIn);
     } finally {
       _setInMakeJaxprBody(prevBody);
-      _setPACT(prevTracker);
     }
     const tracersOut = outs.map(
       (out: Tracer) => fullRaise(trace, out) as JaxprTracer,
@@ -1765,10 +1748,11 @@ export function makeJaxpr(
     // and disposes their builder ref — but those arrays still need their
     // creation ref balanced.
     //
-    // Filter to only arrays with refCount > 1: at this point, each const
-    // has exactly 1 builder ref. If refCount = 1, the creation ref was
-    // already balanced (e.g., jacfwd disposes eyeMatrix explicitly).
-    // If refCount > 1, the creation ref is stranded and needs balancing.
+    // At pre-build time, each const has exactly 1 builder ref (from .ref in
+    // getOrMakeConstTracer). Any additional ref is the creation ref, still
+    // outstanding because no user/framework dispose() balanced it during body
+    // execution. refCount==1 means the creation ref was already balanced
+    // (e.g., jacfwd disposes eyeMatrix explicitly before body returns).
     const constsToBalance: Tracer[] = [];
     for (const c of builder.constsNeedingCreationRefBalance) {
       if (c.refCount > 1) {
@@ -1783,10 +1767,15 @@ export function makeJaxpr(
     // ref) and then captured via getOrMakeConstTracer (.ref). The builder
     // refs are balanced by ClosedJaxpr.dispose() and _inlineLiterals.
     // The creation ref has no owner — balance it here.
+    //
+    // Deliberate jit/eager divergence: in eager mode, body-created arrays
+    // with no dispose() leak silently. In JIT mode, makeJaxpr balances
+    // them here to prevent GPU slot exhaustion. checkLeaks + ESLint catch
+    // both at dev time. See PLAN.md Phase 3d.5 Step 5 for rationale.
     for (const c of constsToBalance) {
       if (c.refCount > 0) {
         c.dispose();
-        _arraysCreatedInMakeJaxprBody.delete(c);
+        if (c instanceof Array) c.markCreationRefBalancedByMakeJaxpr();
       }
     }
 

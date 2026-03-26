@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { init, numpy as np } from "../src";
+import { checkLeaks, init, numpy as np } from "../src";
 import { aotLinearize } from "../src/frontend/artifacts";
 import type {
   AotLinearizeResult,
@@ -119,6 +119,29 @@ describe("PullbackArtifact", () => {
     pullback[Symbol.dispose]();
   });
 
+  it("residual packs from separate runs are independently owned", async () => {
+    const f = (x: any) => [np.sin(x)];
+    using x = np.array([1.0]);
+    const { primal, pullback } = aotLinearize(f, [x]);
+
+    const first = primal.run([x]);
+    const second = primal.run([x]);
+
+    first.residuals[Symbol.dispose]();
+    first.primalsOut.forEach((p: any) => p.dispose());
+
+    using ct = np.array([2.0]);
+    const grads = pullback.run(second.residuals, [ct]);
+    const gradVal = await (grads[0] as any).data();
+    expect(gradVal[0]).toBeCloseTo(2 * Math.cos(1.0), 4);
+
+    grads.forEach((g: any) => g.dispose());
+    second.residuals[Symbol.dispose]();
+    second.primalsOut.forEach((p: any) => p.dispose());
+    primal[Symbol.dispose]();
+    pullback[Symbol.dispose]();
+  });
+
   it("after dispose throws ReferenceError", () => {
     const f = (x: any) => [np.sin(x)];
     using x = np.array([1.0]);
@@ -151,6 +174,27 @@ describe("PrimalArtifact", () => {
     pullback[Symbol.dispose]();
   });
 
+  it("run returns independently owned primal outputs across calls", async () => {
+    const f = (x: any) => [x.mul(x)];
+    using x = np.array([3.0]);
+    const { primal, pullback } = aotLinearize(f, [x]);
+
+    const first = primal.run([x]);
+    const firstVal = await (first.primalsOut[0] as any).data();
+    expect(firstVal[0]).toBeCloseTo(9.0, 4);
+    first.residuals[Symbol.dispose]();
+    first.primalsOut.forEach((p: any) => p.dispose());
+
+    const second = primal.run([x]);
+    const secondVal = await (second.primalsOut[0] as any).data();
+    expect(secondVal[0]).toBeCloseTo(9.0, 4);
+
+    second.residuals[Symbol.dispose]();
+    second.primalsOut.forEach((p: any) => p.dispose());
+    primal[Symbol.dispose]();
+    pullback[Symbol.dispose]();
+  });
+
   it("after dispose throws ReferenceError", () => {
     const f = (x: any) => [np.sin(x)];
     using x = np.array([1.0]);
@@ -165,6 +209,36 @@ describe("PrimalArtifact", () => {
 });
 
 describe("aotLinearize integration", () => {
+  it("artifact lifecycle is leak-free when disposed correctly", () => {
+    const outerResult = checkLeaks.stop();
+    expect(outerResult.leaked).toBe(0);
+
+    checkLeaks.start();
+    const x = np.array([1.0, 2.0, 3.0]);
+    const f = (arg: any) => {
+      using sinArg = np.sin(arg);
+      using weighted = sinArg.mul(arg);
+      return [weighted.sum()];
+    };
+    const { primal, pullback } = aotLinearize(f, [x]);
+    const { primalsOut, residuals } = primal.run([x]);
+
+    const ct = np.array(1.0);
+    const grads = pullback.run(residuals, [ct]);
+
+    grads.forEach((g: any) => g.dispose());
+    ct.dispose();
+    residuals[Symbol.dispose]();
+    primalsOut.forEach((p: any) => p.dispose());
+    primal[Symbol.dispose]();
+    pullback[Symbol.dispose]();
+    x.dispose();
+
+    const report = checkLeaks.stop();
+    expect(report.leaked).toBe(0);
+    checkLeaks.start();
+  });
+
   it("produces correct grad for polynomial x^3", async () => {
     const f = (x: any) => {
       using x2 = x.mul(x) as any;
