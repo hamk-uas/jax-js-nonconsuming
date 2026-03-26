@@ -520,9 +520,10 @@ function householderQR2D(a: Array): [Array, Array] {
   const Q = numpy.eye(m, { dtype });
   const R: Array = a;
 
-  // Don't use `using` — under PE tracing (grad), these concrete arrays
-  // become jaxpr consts referenced by the backward pass. Disposing them
-  // at block exit would free the buffers while the AD system still needs them.
+  // Under PE tracing (grad/jit), these concrete arrays become jaxpr
+  // consts referenced by the backward pass. They must NOT be disposed
+  // while tracing — the ClosedJaxpr manages their lifetime via
+  // creation-ref balancing. In eager mode, we dispose them explicitly.
   const arange_m = numpy.arange(m);
   const arange_n = numpy.arange(n);
 
@@ -592,8 +593,12 @@ function householderQR2D(a: Array): [Array, Array] {
     Q.dispose();
   }
 
-  arange_m.dispose();
-  arange_n.dispose();
+  // In eager mode, dispose the arange index arrays explicitly.
+  // During tracing, the jaxpr owns them via creation-ref balancing — do not dispose.
+  if (!core.inMakeJaxprBody()) {
+    arange_m.dispose();
+    arange_n.dispose();
+  }
 
   let Qthin: Array = Q_out;
   let Rupper: Array = R_out;
