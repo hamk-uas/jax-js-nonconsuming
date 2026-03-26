@@ -14,7 +14,7 @@ import { expect, test } from "vitest";
 
 import { deviceSuite } from "./device-suite.js";
 
-await deviceSuite((device) => {
+await deviceSuite((_device) => {
   // ── 1×1 conv fast path tests ─────────────────────────────────────────────────
   test("1x1 conv fast path: 1d matches generic path", () => {
     using x = np.ones([1, 4, 8]); // [N, C_in, W]
@@ -598,8 +598,7 @@ await deviceSuite((device) => {
     using jitted = f(x, w);
     f.dispose();
     expect(_lastConvClass()).toBe("block-map-3x3");
-    // Rewrite fires on cpu/wasm but not webgpu (per-block dispatch is slower)
-    expect(_lastConvRewritten()).toBe(device !== "webgpu");
+    expect(_lastConvRewritten()).toBe(true);
     expect(jitted.shape).toEqual(eager.shape);
     // Block_map tiles the spatial dims; values must match generic path exactly.
     const jitVals = jitted.dataSync();
@@ -619,7 +618,7 @@ await deviceSuite((device) => {
     using jitted = f(x, w);
     f.dispose();
     expect(_lastConvClass()).toBe("block-map-5x5");
-    expect(_lastConvRewritten()).toBe(device !== "webgpu");
+    expect(_lastConvRewritten()).toBe(true);
     expect(jitted.shape).toEqual(eager.shape);
     const jitVals = jitted.dataSync();
     const eagerVals = eager.dataSync();
@@ -638,7 +637,7 @@ await deviceSuite((device) => {
     using jitted = f(x, w);
     f.dispose();
     expect(_lastConvClass()).toBe("block-map-3x3");
-    expect(_lastConvRewritten()).toBe(device !== "webgpu");
+    expect(_lastConvRewritten()).toBe(true);
     expect(jitted.shape).toEqual([1, 8, 32, 32]);
     const jitVals = jitted.dataSync();
     const eagerVals = eager.dataSync();

@@ -2037,9 +2037,13 @@ export function blockMapFusedShaderSource(
             const name = stepInputNames[bufIdx];
             const zero = `${dtypeToWgsl(dtype)}(0)`;
             if (inHasHalo[inputIdx]) {
-              // Zero-copy halo: signed index with bounds check.
-              // in_base includes the pack offset when leaf packing is active,
-              // so bounds must be in packed coordinates: [packOff, packOff+total).
+              // Zero-copy halo: per-axis coordinate bounds check.
+              // The flat-index range check (rawExpr >= lo && rawExpr < hi) is
+              // unsound for multi-axis halos when non-mapped dimensions exist —
+              // OOB on one axis can produce valid-looking flat indices via
+              // cross-axis wrapping (e.g., im2col conv bodies).
+              // Instead, decompose the body-local flat index into per-axis
+              // coordinates and check each halo-mapped axis individually.
               const shift = inHaloShift[inputIdx];
               const total = inTotalElems[inputIdx];
               const packOff = inPackOffset[inputIdx];
@@ -2048,7 +2052,40 @@ export function blockMapFusedShaderSource(
               const rawExpr = `(i32(in_base_${inputIdx}) + ${remapped} - ${shift})`;
               const safeExpr = `clamp(${rawExpr}, ${lo}, ${hi - 1})`;
               const readExpr = `${name}[${safeExpr}]`;
-              const haloValid = `(${rawExpr} >= ${lo} && ${rawExpr} < ${hi})`;
+
+              const axes = params.inAxes[inputIdx];
+              const bShape = inBodyShapes[inputIdx];
+              const bStrides = inBodyStrides[inputIdx];
+              const validParts: string[] = [];
+              for (let g = 0; g < gridRank; g++) {
+                if (axes[g] === null) continue;
+                const [loH, hiH] = params.halo?.[inputIdx]?.[g] ?? [0, 0];
+                if (loH === 0 && hiH === 0) continue;
+                const ax = axes[g]!;
+                const globalDim = params.inputShapes[inputIdx][ax];
+                // Extract body-local coordinate along this axis
+                let coordExpr: string;
+                if (bStrides[ax] === 1) {
+                  coordExpr = `((${indexExpr}) % ${bShape[ax]})`;
+                } else if (ax === 0) {
+                  coordExpr = `((${indexExpr}) / ${bStrides[ax]})`;
+                } else {
+                  coordExpr = `(((${indexExpr}) / ${bStrides[ax]}) % ${bShape[ax]})`;
+                }
+                // Global coordinate = block_start + body_coord - halo_lo
+                const blockStart =
+                  gridOffset > 0
+                    ? `i32((block_i${g} + ${gridOffset}u) * ${blockShape[g]}u)`
+                    : `(i32(block_i${g}) * ${blockShape[g]})`;
+                validParts.push(
+                  `(${blockStart} + ${coordExpr} - ${loH} >= 0 && ${blockStart} + ${coordExpr} - ${loH} < ${globalDim})`,
+                );
+              }
+
+              const haloValid =
+                validParts.length > 0
+                  ? validParts.join(" && ")
+                  : `(${rawExpr} >= ${lo} && ${rawExpr} < ${hi})`;
               const validExpr = hasBoundary
                 ? `(valid && ${haloValid})`
                 : haloValid;

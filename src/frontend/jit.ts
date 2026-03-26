@@ -151,14 +151,11 @@ function classifyConv(params: ConvParams, kernelShape: number[]): ConvClass {
  * naturally falls through to generic-dot because VALID padding fails the
  * SAME-equivalence guard (recursion guard).
  *
- * Only runs on CPU and WASM backends — WebGPU block_map falls back to per-block
- * dispatch for conv bodies (no fused shader yet), which is slower than generic-dot.
+ * Runs on all backends. On WebGPU, the block_map fused shader handles the
+ * im2col+dot body pattern (per-element reduction codegen).
  */
-function rewriteConvToBlockMap(jaxpr: Jaxpr, backendType: string): Jaxpr {
-  // Skip on WebGPU: block_map executor falls back to per-block dispatch for
-  // conv bodies (no fused shader yet), which is slower than generic-dot.
-  // CPU and WASM both have efficient block_map execution paths.
-  if (backendType === "webgpu" || !convRewriteEnabled) return jaxpr;
+function rewriteConvToBlockMap(jaxpr: Jaxpr, _backendType: string): Jaxpr {
+  if (!convRewriteEnabled) return jaxpr;
 
   let changed = false;
   const newEqns: JaxprEqn[] = [];
