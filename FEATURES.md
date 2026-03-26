@@ -58,7 +58,7 @@ functions.
 | `custom_gradient`    | 🔴      | core engine feature                              |
 | `closure_convert`    | 🔴      | core engine feature                              |
 | `checkpoint`         | 🔴      | core engine feature                              |
-| `vmap`               | �       | all primitives have vmap rules                   |
+| `vmap`               | 🟢      | all primitives have vmap rules                   |
 | `shard_map`          | ⚪️      | device sharding                                  |
 | `smap`               | ⚪️      | device sharding                                  |
 | `pmap`               | ⚪️      | device sharding                                  |
@@ -150,8 +150,8 @@ Most operations behave the same way as they do in JAX.
 | `argwhere`            | 🟠      | sorting                                                  |
 | `around`              | ⚪️      | alias of `round`                                         |
 | `array`               | 🟢      |                                                          |
-| `array_equal`         | �       |                                                          |
-| `array_equiv`         | �       |                                                          |
+| `array_equal`         | 🟢      |                                                          |
+| `array_equiv`         | 🟢      |                                                          |
 | `array_repr`          | 🔴      |                                                          |
 | `array_split`         | 🟠      | `split` is supported                                     |
 | `array_str`           | 🔴      |                                                          |
@@ -165,19 +165,19 @@ Most operations behave the same way as they do in JAX.
 | `atleast_1d`          | ⚪️      | confusing, use `reshape`                                 |
 | `atleast_2d`          | ⚪️      | confusing, use `reshape`                                 |
 | `atleast_3d`          | ⚪️      | confusing, use `reshape`                                 |
-| `average`             | �       |                                                          |
+| `average`             | 🟢      |                                                          |
 | `bartlett`            | 🟠      |                                                          |
 | `bincount`            | 🟠      |                                                          |
-| `bitwise_and`         | �       |                                                          |
-| `bitwise_count`       | �       |                                                          |
-| `bitwise_invert`      | �       | alias of `invert`                                        |
-| `bitwise_left_shift`  | �       | alias of `left_shift`                                    |
-| `bitwise_not`         | �       | alias of `invert`                                        |
-| `bitwise_or`          | �       |                                                          |
-| `bitwise_right_shift` | �       | alias of `right_shift`                                   |
-| `bitwise_xor`         | �       |                                                          |
+| `bitwise_and`         | 🟢      |                                                          |
+| `bitwise_count`       | 🔴      |                                                          |
+| `bitwise_invert`      | 🟢      | alias of `invert`                                        |
+| `bitwise_left_shift`  | 🟢      | alias of `left_shift`                                    |
+| `bitwise_not`         | 🟢      | alias of `invert`                                        |
+| `bitwise_or`          | 🟢      |                                                          |
+| `bitwise_right_shift` | 🟢      | alias of `right_shift`                                   |
+| `bitwise_xor`         | 🟢      |                                                          |
 | `blackman`            | 🟠      |                                                          |
-| `block`               | �       |                                                          |
+| `block`               | 🟢      |                                                          |
 | `broadcast_arrays`    | 🟢      |                                                          |
 | `broadcast_shapes`    | 🟢      |                                                          |
 | `broadcast_to`        | 🟢      |                                                          |
@@ -195,14 +195,14 @@ Most operations behave the same way as they do in JAX.
 | `conjugate`           | ⚪️      | complex numbers                                          |
 | `convolve`            | 🟢      | `lax.conv_general_dilated` is supported                  |
 | `copy`                | ⚪️      | not needed — operations don't consume inputs             |
-| `copysign`            | �       |                                                          |
+| `copysign`            | 🟠      |                                                          |
 | `corrcoef`            | 🟢      |                                                          |
 | `correlate`           | 🟢      | `lax.conv_general_dilated` is supported                  |
 | `cos`                 | 🟢      |                                                          |
 | `cosh`                | 🟢      |                                                          |
 | `count_nonzero`       | 🟠      |                                                          |
 | `cov`                 | 🟢      |                                                          |
-| `cross`               | �       |                                                          |
+| `cross`               | 🟠      | 2D and 3D vector cross products                          |
 | `cumprod`             | 🟠      |                                                          |
 | `cumsum`              | 🟡      | Quadratic-time                                           |
 | `cumulative_prod`     | 🟠      |                                                          |
@@ -285,7 +285,7 @@ Most operations behave the same way as they do in JAX.
 | `insert`              | 🟠      |                                                          |
 | `interp`              | 🟠      |                                                          |
 | `intersect1d`         | 🔴      | sorting                                                  |
-| `invert`              | �       |                                                          |
+| `invert`              | 🟢      |                                                          |
 | `isclose`             | ⚪️      | use `allclose`                                           |
 | `iscomplex`           | ⚪️      | complex numbers                                          |
 | `iscomplexobj`        | ⚪️      | complex numbers                                          |
@@ -306,7 +306,7 @@ Most operations behave the same way as they do in JAX.
 | `kron`                | 🟠      |                                                          |
 | `lcm`                 | 🔴      |                                                          |
 | `ldexp`               | 🟢      |                                                          |
-| `left_shift`          | �       |                                                          |
+| `left_shift`          | 🟢      |                                                          |
 | `less`                | 🟢      |                                                          |
 | `less_equal`          | 🟢      |                                                          |
 | `lexsort`             | 🔴      | sorting                                                  |
@@ -326,7 +326,7 @@ Most operations behave the same way as they do in JAX.
 | `mask_indices`        | 🟠      |                                                          |
 | `matmul`              | 🟢      | batch broadcasting, 1D vector support                    |
 | `matrix_transpose`    | 🟢      |                                                          |
-| `matvec`              | �       |                                                          |
+| `matvec`              | 🟢      |                                                          |
 | `max`                 | 🟢      |                                                          |
 | `maximum`             | 🟢      |                                                          |
 | `mean`                | 🟢      |                                                          |
@@ -402,13 +402,13 @@ Most operations behave the same way as they do in JAX.
 | `reshape`             | 🟢      |                                                          |
 | `resize`              | 🟠      |                                                          |
 | `result_type`         | 🟠      | see `promote_types`                                      |
-| `right_shift`         | �       |                                                          |
-| `rint`                | �       |                                                          |
+| `right_shift`         | 🟢      |                                                          |
+| `rint`                | 🟠      |                                                          |
 | `roll`                | 🟠      |                                                          |
 | `rollaxis`            | 🟠      |                                                          |
 | `roots`               | 🔴      |                                                          |
 | `rot90`               | 🟠      |                                                          |
-| `round`               | �       |                                                          |
+| `round`               | 🟠      |                                                          |
 | `s_`                  | ⚪️      | Python-specific                                          |
 | `save`                | ⚪️      | file I/O                                                 |
 | `savez`               | ⚪️      | file I/O                                                 |
@@ -470,7 +470,7 @@ Most operations behave the same way as they do in JAX.
 | `var`                 | 🟢      |                                                          |
 | `vdot`                | 🟢      |                                                          |
 | `vecdot`              | 🟢      |                                                          |
-| `vecmat`              | �       |                                                          |
+| `vecmat`              | 🟢      |                                                          |
 | `vectorize`           | 🟠      |                                                          |
 | `vsplit`              | 🟠      | `split` is supported                                     |
 | `vstack`              | 🟢      |                                                          |
@@ -516,7 +516,7 @@ Cholesky, LU (with partial pivoting), triangular solve, and QR decomposition. St
 | ------------------ | ------- | ---------------------------------------------------------------------------- |
 | `cholesky`         | 🟢      |                                                                              |
 | `cond`             | 🔴      |                                                                              |
-| `cross`            | �       |                                                                              |
+| `cross`            | 🟠      | Simpler wrapper around `numpy.cross()`                                       |
 | `det`              | 🟢      |                                                                              |
 | `diagonal`         | 🟢      |                                                                              |
 | `eig`              | 🔴      |                                                                              |
@@ -534,7 +534,7 @@ Cholesky, LU (with partial pivoting), triangular solve, and QR decomposition. St
 | `norm`             | 🟠      |                                                                              |
 | `outer`            | 🟢      |                                                                              |
 | `pinv`             | 🔴      |                                                                              |
-| `qr`               | �       | Differentiable (Householder QR)                                              |
+| `qr`               | 🟢      | Differentiable (Householder QR)                                              |
 | `slogdet`          | 🟢      |                                                                              |
 | `solve`            | 🟢      | Differentiable (direct LU→triSolve)                                          |
 | `svd`              | 🔴      |                                                                              |
@@ -543,7 +543,7 @@ Cholesky, LU (with partial pivoting), triangular solve, and QR decomposition. St
 | `tensorinv`        | 🔴      |                                                                              |
 | `tensorsolve`      | 🔴      |                                                                              |
 | `trace`            | 🟢      |                                                                              |
-| `vector_norm`      | �       |                                                                              |
+| `vector_norm`      | 🟢      |                                                                              |
 | `vecdot`           | 🟢      |                                                                              |
 
 ## [`jax.lax` module](https://docs.jax.dev/en/latest/jax.lax.html)

@@ -430,11 +430,11 @@ await deviceSuite((device) => {
       expect(reconstructed).toBeAllclose(A, { atol: 1e-5 });
     });
 
-    // foriLoop AD leaks on CPU; cleaned by JIT caches on WASM/WebGPU.
-    test.skipIf(device === "cpu")("gradient through QR", () => {
+    test("gradient through QR", () => {
       const f = (A: np.Array) => {
         const [Q, R] = np.linalg.qr(A);
         Q.dispose();
+        using _R = R;
         return R.sum();
       };
       using A = np.array([
