@@ -4093,6 +4093,13 @@ function pipelineSource(
       } else if (op === AluOp.Max) {
         if (dtype === DType.Bool) source = `(${a} || ${b})`;
         else source = `max(${strip1(a)}, ${strip1(b)})`;
+      } else if (op === AluOp.BitCombine) {
+        if (arg === "and") source = `(${a} & ${b})`;
+        else if (arg === "or") source = `(${a} | ${b})`;
+        else source = dtype === DType.Bool ? `(${a} != ${b})` : `(${a} ^ ${b})`;
+      } else if (op === AluOp.BitShift) {
+        if (arg === "shl") source = `(${a} << ${b})`;
+        else source = `(${a} >> ${b})`;
       } else if (op === AluOp.Cmplt) source = `(${a} < ${b})`;
       else if (op === AluOp.Cmpne) {
         // Edge case: WebGPU doesn't handle NaN correctly, it's unspecified.

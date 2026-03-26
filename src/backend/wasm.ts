@@ -393,7 +393,7 @@ export class WasmBackend implements Backend {
     start?: number,
     count?: number,
   ): Promise<Uint8Array<ArrayBuffer>> {
-    return this.readSync(slot, start, count);
+    return this.#readData(slot, start, count);
   }
 
   readSync(
@@ -401,10 +401,23 @@ export class WasmBackend implements Backend {
     start?: number,
     count?: number,
   ): Uint8Array<ArrayBuffer> {
+    return this.#readData(slot, start, count);
+  }
+
+  #readData(
+    slot: Slot,
+    start?: number,
+    count?: number,
+  ): Uint8Array<ArrayBuffer> {
     const buffer = this.#getBuffer(slot);
     if (start === undefined) start = 0;
     if (count === undefined) count = buffer.byteLength - start;
-    return buffer.slice(start, start + count);
+    if (buffer.buffer instanceof SharedArrayBuffer) {
+      // For SharedArrayBuffer, we need to copy the data to ArrayBuffer.
+      return new Uint8Array(buffer.slice(start, start + count));
+    } else {
+      return buffer.slice(start, start + count);
+    }
   }
 
   copyBufferToBuffer(
@@ -2011,6 +2024,13 @@ export function translateExpCore(
           }
           cg.select();
         } else throw new UnsupportedOpError(op, dtype, "wasm");
+      } else if (op === AluOp.BitCombine) {
+        if (arg === "and") cg.i32.and();
+        else if (arg === "or") cg.i32.or();
+        else cg.i32.xor();
+      } else if (op === AluOp.BitShift) {
+        if (arg === "shl") cg.i32.shl();
+        else cg.i32.shr_u();
       } else if (op === AluOp.Cmplt) {
         const srcDtype = src[0].dtype;
         if (isFloatDtype(srcDtype)) dtyF(cg, op, srcDtype).lt();

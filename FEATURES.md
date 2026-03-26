@@ -168,14 +168,14 @@ Most operations behave the same way as they do in JAX.
 | `average`             | �       |                                                          |
 | `bartlett`            | 🟠      |                                                          |
 | `bincount`            | 🟠      |                                                          |
-| `bitwise_and`         | 🔴      |                                                          |
-| `bitwise_count`       | 🔴      |                                                          |
-| `bitwise_invert`      | 🔴      |                                                          |
-| `bitwise_left_shift`  | 🔴      |                                                          |
-| `bitwise_not`         | 🔴      |                                                          |
-| `bitwise_or`          | 🔴      |                                                          |
-| `bitwise_right_shift` | 🔴      |                                                          |
-| `bitwise_xor`         | 🔴      |                                                          |
+| `bitwise_and`         | �       |                                                          |
+| `bitwise_count`       | �       |                                                          |
+| `bitwise_invert`      | �       | alias of `invert`                                        |
+| `bitwise_left_shift`  | �       | alias of `left_shift`                                    |
+| `bitwise_not`         | �       | alias of `invert`                                        |
+| `bitwise_or`          | �       |                                                          |
+| `bitwise_right_shift` | �       | alias of `right_shift`                                   |
+| `bitwise_xor`         | �       |                                                          |
 | `blackman`            | 🟠      |                                                          |
 | `block`               | �       |                                                          |
 | `broadcast_arrays`    | 🟢      |                                                          |
@@ -285,7 +285,7 @@ Most operations behave the same way as they do in JAX.
 | `insert`              | 🟠      |                                                          |
 | `interp`              | 🟠      |                                                          |
 | `intersect1d`         | 🔴      | sorting                                                  |
-| `invert`              | 🔴      |                                                          |
+| `invert`              | �       |                                                          |
 | `isclose`             | ⚪️      | use `allclose`                                           |
 | `iscomplex`           | ⚪️      | complex numbers                                          |
 | `iscomplexobj`        | ⚪️      | complex numbers                                          |
@@ -306,7 +306,7 @@ Most operations behave the same way as they do in JAX.
 | `kron`                | 🟠      |                                                          |
 | `lcm`                 | 🔴      |                                                          |
 | `ldexp`               | 🟢      |                                                          |
-| `left_shift`          | 🔴      |                                                          |
+| `left_shift`          | �       |                                                          |
 | `less`                | 🟢      |                                                          |
 | `less_equal`          | 🟢      |                                                          |
 | `lexsort`             | 🔴      | sorting                                                  |
@@ -402,7 +402,7 @@ Most operations behave the same way as they do in JAX.
 | `reshape`             | 🟢      |                                                          |
 | `resize`              | 🟠      |                                                          |
 | `result_type`         | 🟠      | see `promote_types`                                      |
-| `right_shift`         | 🔴      |                                                          |
+| `right_shift`         | �       |                                                          |
 | `rint`                | �       |                                                          |
 | `roll`                | 🟠      |                                                          |
 | `rollaxis`            | 🟠      |                                                          |
@@ -543,7 +543,7 @@ Cholesky, LU (with partial pivoting), triangular solve, and QR decomposition. St
 | `tensorinv`        | 🔴      |                                                                              |
 | `tensorsolve`      | 🔴      |                                                                              |
 | `trace`            | 🟢      |                                                                              |
-| `vector_norm`      | 🟠      |                                                                              |
+| `vector_norm`      | �       |                                                                              |
 | `vecdot`           | 🟢      |                                                                              |
 
 ## [`jax.lax` module](https://docs.jax.dev/en/latest/jax.lax.html)

@@ -564,3 +564,45 @@ export function solve(a: ArrayLike, b: ArrayLike): Array {
 export { tensordot } from "./numpy";
 export { trace } from "./numpy";
 export { vecdot } from "./numpy";
+
+/**
+ * Compute the vector norm of an array.
+ *
+ * @param x - Input array.
+ * @param ord - Order of the norm (default 2). Supports `Infinity`, `-Infinity`, `0`, or any real number.
+ * @param axis - Axis/axes to reduce over (default: all axes).
+ * @param keepdims - Whether to keep reduced dimensions as size 1.
+ * @returns The norm of `x`, reduced over the given axes.
+ */
+export function vectorNorm(
+  x: ArrayLike,
+  {
+    ord = 2,
+    axis = null,
+    keepdims = false,
+  }: {
+    ord?: number;
+    axis?: number | number[] | null;
+    keepdims?: boolean;
+  } = {},
+): Array {
+  x = fudgeArray(x);
+  const ax = axis ?? null;
+
+  if (ord === Infinity) {
+    using absX = np.abs(x);
+    return np.max(absX, ax, { keepdims });
+  } else if (ord === -Infinity) {
+    using absX = np.abs(x);
+    return np.min(absX, ax, { keepdims });
+  } else if (ord === 0) {
+    using neq = x.notEqual(0);
+    using casted = neq.astype(x.dtype);
+    return casted.sum(ax, { keepdims });
+  } else {
+    using absX = np.abs(x);
+    using powered = np.power(absX, ord);
+    using summed = powered.sum(ax, { keepdims });
+    return np.power(summed, 1 / ord);
+  }
+}

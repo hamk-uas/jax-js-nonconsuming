@@ -3127,6 +3127,78 @@ await deviceSuite((device) => {
     });
   });
 
+  suite("jax.numpy.bitwiseAnd()", () => {
+    test("uint32 and", () => {
+      using a = np.array([0xff00ff00, 0x0f0f0f0f], { dtype: np.uint32 });
+      using b = np.array([0x00ff00ff, 0xf0f0f0f0], { dtype: np.uint32 });
+      using result = np.bitwiseAnd(a, b);
+      expect(result.js()).toEqual([0x00000000, 0x00000000]);
+    });
+
+    test("bool and", () => {
+      using a = np.array([true, true, false, false]);
+      using b = np.array([true, false, true, false]);
+      using result = np.bitwiseAnd(a, b);
+      expect(result.js()).toEqual([true, false, false, false]);
+    });
+  });
+
+  suite("jax.numpy.bitwiseOr()", () => {
+    test("uint32 or", () => {
+      using a = np.array([0xff00ff00, 7], { dtype: np.uint32 });
+      using b = np.array([0x00ff00ff, 3], { dtype: np.uint32 });
+      using result = np.bitwiseOr(a, b);
+      expect(result.js()).toEqual([0xffffffff, 7]);
+    });
+  });
+
+  suite("jax.numpy.bitwiseXor()", () => {
+    test("uint32 xor", () => {
+      using a = np.array([0xaaaaaaaa, 7], { dtype: np.uint32 });
+      using b = np.array([0x55555555, 3], { dtype: np.uint32 });
+      using result = np.bitwiseXor(a, b);
+      expect(result.js()).toEqual([0xffffffff, 4]);
+    });
+  });
+
+  suite("jax.numpy.invert()", () => {
+    test("uint32 invert", () => {
+      using x = np.array([0, 0xffffffff], { dtype: np.uint32 });
+      using result = np.invert(x);
+      expect(result.js()).toEqual([0xffffffff, 0]);
+    });
+
+    test("bool invert", () => {
+      using x = np.array([true, false]);
+      using result = np.invert(x);
+      expect(result.js()).toEqual([false, true]);
+    });
+
+    test("int32 invert", () => {
+      using x = np.array([0, -3], { dtype: np.int32 });
+      using result = np.invert(x);
+      expect(result.js()).toEqual([-1, 2]);
+    });
+  });
+
+  suite("jax.numpy.leftShift()", () => {
+    test("basic left shift", () => {
+      using a = np.array([1, 1, 1], { dtype: np.uint32 });
+      using b = np.array([0, 8, 16], { dtype: np.uint32 });
+      using result = np.leftShift(a, b);
+      expect(result.js()).toEqual([1, 256, 65536]);
+    });
+  });
+
+  suite("jax.numpy.rightShift()", () => {
+    test("basic right shift", () => {
+      using a = np.array([256, 65536, 0xffff0000], { dtype: np.uint32 });
+      using b = np.array([0, 1, 8], { dtype: np.uint32 });
+      using result = np.rightShift(a, b);
+      expect(result.js()).toEqual([256, 32768, 0x00ffff00]);
+    });
+  });
+
   suite("jax.numpy.copysign()", () => {
     test("basic copysign", () => {
       using a = np.array([1, -2, 3, -4]);
