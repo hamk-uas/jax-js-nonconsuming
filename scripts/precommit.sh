@@ -97,6 +97,7 @@ gpu_only_tests=(
   test/pool-memory.test.ts
   test/blocked-data-movement.test.ts
   test/repro-stub.test.ts
+  test/conv.test.ts
 )
 if [[ "$profile" == "full" ]]; then
   scripts/gpu-test.sh run "${gpu_only_tests[@]}"

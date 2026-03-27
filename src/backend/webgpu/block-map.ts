@@ -1763,8 +1763,11 @@ export function blockMapFusedShaderSource(
    * Decompose a body-local flat index expression into per-axis coordinate
    * expressions for input i.  Returns an array indexed by axis dimension,
    * where each entry is the WGSL expression for that coordinate.
-   * Shared by `inRemap` (global stride recomputation) and the halo bounds
-   * check (per-axis OOB detection) so the divide/modulo work is emitted once.
+   *
+   * Used by `inRemap` (global stride recomputation) and the halo bounds
+   * check (per-axis OOB detection).  When both need coordinates for the
+   * same input, the caller computes them once and passes the result to
+   * `inRemap` via `precomputedCoords` to avoid duplicate GPU ALU.
    */
   function inCoordExprs(i: number, flatExpr: string): string[] {
     const bShape = inBodyShapes[i];
@@ -1788,11 +1791,18 @@ export function blockMapFusedShaderSource(
    * When body strides match global strides, returns the expression unchanged.
    * When they differ, decomposes into n-D coords and recomputes with global strides.
    * Uses i32 arithmetic to match the gen() output type.
+   *
+   * When `precomputedCoords` is provided (from the halo path), those coordinate
+   * expressions are used directly, avoiding a redundant inCoordExprs call.
    */
-  function inRemap(i: number, flatExpr: string): string {
+  function inRemap(
+    i: number,
+    flatExpr: string,
+    precomputedCoords?: string[],
+  ): string {
     if (!inNeedsRemap[i]) return flatExpr;
     const gStrides = inBufStrides[i];
-    const coords = inCoordExprs(i, flatExpr);
+    const coords = precomputedCoords ?? inCoordExprs(i, flatExpr);
     const nd = coords.length;
     // globalIdx = sum(coord[d] * globalStride[d])
     const terms: string[] = [];
@@ -1996,6 +2006,9 @@ export function blockMapFusedShaderSource(
   }
 
   // --- Generate codegen entries ---
+  // Counter for unique WGSL variable names across kernel steps when emitting
+  // shared halo coordinate let-bindings (avoids name collisions in shader scope).
+  let haloCoordVarSeq = 0;
   for (const entry of codegenEntries) {
     if (entry.type === "kernel") {
       const si = entry.kernelIdx;
@@ -2036,6 +2049,10 @@ export function blockMapFusedShaderSource(
         stepInputIsBlockIndex.push(false);
       }
 
+      // Per kernel step: track emitted halo coordinate let-bindings so the
+      // same (inputIdx, indexExpr) pair emits WGSL let declarations only once.
+      const emittedHaloCoords = new Map<string, string[]>();
+
       const gen_resolve = (
         bufIdx: number,
         indexExpr: string,
@@ -2045,17 +2062,38 @@ export function blockMapFusedShaderSource(
         if (stepInputIsGlobal[bufIdx]) {
           const inputIdx = stepInputBodyIdx[bufIdx];
           if (inputIdx >= 0) {
-            const remapped = inRemap(inputIdx, indexExpr);
             const name = stepInputNames[bufIdx];
             const zero = `${dtypeToWgsl(dtype)}(0)`;
             if (inHasHalo[inputIdx]) {
               // Zero-copy halo: per-axis coordinate bounds check.
-              // The flat-index range check (rawExpr >= lo && rawExpr < hi) is
-              // unsound for multi-axis halos when non-mapped dimensions exist —
-              // OOB on one axis can produce valid-looking flat indices via
-              // cross-axis wrapping (e.g., im2col conv bodies).
-              // Instead, reuse inCoordExprs to get per-axis coordinates and
-              // check each halo-mapped axis individually.
+              // When both stride remap and halo are needed (the conv case),
+              // compute per-axis coordinates ONCE and emit WGSL let bindings
+              // so the GPU executes the divide/modulo ALU only once.
+              // Both the global-index remap and the per-axis OOB check then
+              // reference the same bound variables.
+              let coordVars: string[];
+              if (inNeedsRemap[inputIdx]) {
+                const coordKey = `${inputIdx}:${indexExpr}`;
+                const cached = emittedHaloCoords.get(coordKey);
+                if (cached) {
+                  coordVars = cached;
+                } else {
+                  const rawCoords = inCoordExprs(inputIdx, indexExpr);
+                  const tag = haloCoordVarSeq++;
+                  coordVars = rawCoords.map((expr, d) => {
+                    const vn = `_hc${tag}_${d}`;
+                    emit(`let ${vn}: i32 = ${expr};`);
+                    return vn;
+                  });
+                  emittedHaloCoords.set(coordKey, coordVars);
+                }
+              } else {
+                // No remap needed; coordinates only used for halo check.
+                coordVars = inCoordExprs(inputIdx, indexExpr);
+              }
+              // Build remapped index from shared coordinates.
+              const remapped = inRemap(inputIdx, indexExpr, coordVars);
+
               const shift = inHaloShift[inputIdx];
               const total = inTotalElems[inputIdx];
               const packOff = inPackOffset[inputIdx];
@@ -2066,7 +2104,6 @@ export function blockMapFusedShaderSource(
               const readExpr = `${name}[${safeExpr}]`;
 
               const axes = params.inAxes[inputIdx];
-              const coords = inCoordExprs(inputIdx, indexExpr);
               const validParts: string[] = [];
               for (let g = 0; g < gridRank; g++) {
                 if (axes[g] === null) continue;
@@ -2074,7 +2111,7 @@ export function blockMapFusedShaderSource(
                 if (loH === 0 && hiH === 0) continue;
                 const ax = axes[g]!;
                 const globalDim = params.inputShapes[inputIdx][ax];
-                const coordExpr = coords[ax];
+                const coordExpr = coordVars[ax];
                 // Global coordinate = block_start + body_coord - halo_lo
                 const blockStart =
                   gridOffset > 0
@@ -2094,6 +2131,7 @@ export function blockMapFusedShaderSource(
                 : haloValid;
               return `select(${zero}, ${readExpr}, ${validExpr})`;
             }
+            const remapped = inRemap(inputIdx, indexExpr);
             const readExpr = `${name}[i32(in_base_${inputIdx}) + ${remapped}]`;
             return hasBoundary
               ? `select(${zero}, ${readExpr}, valid)`
