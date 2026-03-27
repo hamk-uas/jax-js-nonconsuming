@@ -154,7 +154,7 @@ function classifyConv(params: ConvParams, kernelShape: number[]): ConvClass {
  * Runs on all backends. On WebGPU, the block_map fused shader handles the
  * im2col+dot body pattern (per-element reduction codegen).
  */
-function rewriteConvToBlockMap(jaxpr: Jaxpr, _backendType: string): Jaxpr {
+function rewriteConvToBlockMap(jaxpr: Jaxpr): Jaxpr {
   if (!convRewriteEnabled) return jaxpr;
 
   let changed = false;
@@ -2352,10 +2352,8 @@ export function jitCompile(
     // Rewrite eligible Conv equations to BlockMap before dataflow analysis.
     // This ensures splitGraphDataflow treats them as special black primitives,
     // materializing their inputs properly.
-    // Only activates on WASM — WebGPU block_map falls back to per-block
-    // dispatch for conv bodies, which is slower than generic-dot.
     lastConvRewritten = false;
-    jaxpr = rewriteConvToBlockMap(jaxpr, backend.type);
+    jaxpr = rewriteConvToBlockMap(jaxpr);
     // Rewrite eligible ForiLoop equations to BlockMap on WebGPU.
     // Must run after flatten/simplify so body shapes are concrete.
     if (!_skipForiRewrite) lastForiRewritten = false;

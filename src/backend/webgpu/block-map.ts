@@ -1760,6 +1760,30 @@ export function blockMapFusedShaderSource(
   }
 
   /**
+   * Decompose a body-local flat index expression into per-axis coordinate
+   * expressions for input i.  Returns an array indexed by axis dimension,
+   * where each entry is the WGSL expression for that coordinate.
+   * Shared by `inRemap` (global stride recomputation) and the halo bounds
+   * check (per-axis OOB detection) so the divide/modulo work is emitted once.
+   */
+  function inCoordExprs(i: number, flatExpr: string): string[] {
+    const bShape = inBodyShapes[i];
+    const bStrides = inBodyStrides[i];
+    const nd = bShape.length;
+    const coords: string[] = new Array(nd);
+    for (let d = 0; d < nd; d++) {
+      if (bStrides[d] === 1) {
+        coords[d] = `((${flatExpr}) % ${bShape[d]})`;
+      } else if (d === 0) {
+        coords[d] = `((${flatExpr}) / ${bStrides[d]})`;
+      } else {
+        coords[d] = `(((${flatExpr}) / ${bStrides[d]}) % ${bShape[d]})`;
+      }
+    }
+    return coords;
+  }
+
+  /**
    * Remap a body-local flat index expression to a global flat index for input i.
    * When body strides match global strides, returns the expression unchanged.
    * When they differ, decomposes into n-D coords and recomputes with global strides.
@@ -1767,29 +1791,17 @@ export function blockMapFusedShaderSource(
    */
   function inRemap(i: number, flatExpr: string): string {
     if (!inNeedsRemap[i]) return flatExpr;
-    const bShape = inBodyShapes[i];
-    const bStrides = inBodyStrides[i];
     const gStrides = inBufStrides[i];
-    const nd = bShape.length;
-    // Decompose body-local flat index → n-D coords → global flat index
-    // coord[d] = (flatExpr / bodyStride[d]) % bodyShape[d]
+    const coords = inCoordExprs(i, flatExpr);
+    const nd = coords.length;
     // globalIdx = sum(coord[d] * globalStride[d])
     const terms: string[] = [];
     for (let d = 0; d < nd; d++) {
       if (gStrides[d] === 0) continue;
-      let coordExpr: string;
-      if (bStrides[d] === 1) {
-        coordExpr = `((${flatExpr}) % ${bShape[d]})`;
-      } else if (d === 0) {
-        // First dim: no mod needed (it's the leading dimension)
-        coordExpr = `((${flatExpr}) / ${bStrides[d]})`;
-      } else {
-        coordExpr = `(((${flatExpr}) / ${bStrides[d]}) % ${bShape[d]})`;
-      }
       if (gStrides[d] === 1) {
-        terms.push(coordExpr);
+        terms.push(coords[d]);
       } else {
-        terms.push(`${coordExpr} * ${gStrides[d]}`);
+        terms.push(`${coords[d]} * ${gStrides[d]}`);
       }
     }
     return terms.length > 0 ? terms.join(" + ") : "0";
@@ -2042,8 +2054,8 @@ export function blockMapFusedShaderSource(
               // unsound for multi-axis halos when non-mapped dimensions exist —
               // OOB on one axis can produce valid-looking flat indices via
               // cross-axis wrapping (e.g., im2col conv bodies).
-              // Instead, decompose the body-local flat index into per-axis
-              // coordinates and check each halo-mapped axis individually.
+              // Instead, reuse inCoordExprs to get per-axis coordinates and
+              // check each halo-mapped axis individually.
               const shift = inHaloShift[inputIdx];
               const total = inTotalElems[inputIdx];
               const packOff = inPackOffset[inputIdx];
@@ -2054,8 +2066,7 @@ export function blockMapFusedShaderSource(
               const readExpr = `${name}[${safeExpr}]`;
 
               const axes = params.inAxes[inputIdx];
-              const bShape = inBodyShapes[inputIdx];
-              const bStrides = inBodyStrides[inputIdx];
+              const coords = inCoordExprs(inputIdx, indexExpr);
               const validParts: string[] = [];
               for (let g = 0; g < gridRank; g++) {
                 if (axes[g] === null) continue;
@@ -2063,15 +2074,7 @@ export function blockMapFusedShaderSource(
                 if (loH === 0 && hiH === 0) continue;
                 const ax = axes[g]!;
                 const globalDim = params.inputShapes[inputIdx][ax];
-                // Extract body-local coordinate along this axis
-                let coordExpr: string;
-                if (bStrides[ax] === 1) {
-                  coordExpr = `((${indexExpr}) % ${bShape[ax]})`;
-                } else if (ax === 0) {
-                  coordExpr = `((${indexExpr}) / ${bStrides[ax]})`;
-                } else {
-                  coordExpr = `(((${indexExpr}) / ${bStrides[ax]}) % ${bShape[ax]})`;
-                }
+                const coordExpr = coords[ax];
                 // Global coordinate = block_start + body_coord - halo_lo
                 const blockStart =
                   gridOffset > 0

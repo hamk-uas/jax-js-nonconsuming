@@ -3,14 +3,17 @@
 import {
   _lastConvClass,
   _lastConvRewritten,
+  defaultDevice,
   DType,
   grad,
+  init,
   jit,
   lax,
   numpy as np,
+  profileGpu,
   vmap,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 
 import { deviceSuite } from "./device-suite.js";
 
@@ -682,5 +685,51 @@ await deviceSuite((_device) => {
     // Gradient should be non-zero (weights are non-trivial)
     const vals = gradResult.dataSync();
     expect(vals.some((v: number) => v !== 0)).toBe(true);
+  });
+});
+
+// ── WebGPU-only: assert fused single-dispatch path ──────────────────────────
+// Verifies that the C.3 block_map conv path produces a fused shader (1 dispatch)
+// rather than regressing to per-block fallback (many dispatches).
+const devicesAvailable = await init("webgpu");
+const hasWebGPU = devicesAvailable.includes("webgpu");
+
+describe.skipIf(!hasWebGPU)("C.3 WebGPU fused dispatch", () => {
+  test("3x3 SAME conv uses single fused dispatch", async () => {
+    defaultDevice("webgpu");
+    using x = np.arange(1 * 2 * 16 * 16).reshape([1, 2, 16, 16]);
+    using w = np.arange(3 * 2 * 3 * 3).reshape([3, 2, 3, 3]);
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1, 1], "SAME"),
+    );
+    // Warm up JIT cache
+    {
+      using _ = f(x, w);
+    }
+    expect(_lastConvClass()).toBe("block-map-3x3");
+    expect(_lastConvRewritten()).toBe(true);
+    // Profile the warmed-up call: fused path = 1 dispatch
+    const { result, timing } = await profileGpu(() => f(x, w));
+    (result as np.Array).dispose();
+    f.dispose();
+    expect(timing.passes.length).toBe(1);
+  });
+
+  test("5x5 SAME conv uses single fused dispatch", async () => {
+    defaultDevice("webgpu");
+    using x = np.arange(1 * 2 * 16 * 16).reshape([1, 2, 16, 16]);
+    using w = np.arange(3 * 2 * 5 * 5).reshape([3, 2, 5, 5]);
+    const f = jit((a: typeof x, b: typeof w) =>
+      lax.convGeneralDilated(a, b, [1, 1], "SAME"),
+    );
+    {
+      using _ = f(x, w);
+    }
+    expect(_lastConvClass()).toBe("block-map-5x5");
+    expect(_lastConvRewritten()).toBe(true);
+    const { result, timing } = await profileGpu(() => f(x, w));
+    (result as np.Array).dispose();
+    f.dispose();
+    expect(timing.passes.length).toBe(1);
   });
 });
