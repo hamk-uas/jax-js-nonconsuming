@@ -100,6 +100,7 @@ export {
   type GpuTimingResult,
   init,
   Array,
+  type ArrayLike,
   checkLeaks,
   clearCaches,
   ClosedJaxpr,

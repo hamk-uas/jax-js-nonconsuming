@@ -1,6 +1,6 @@
 {
   "name": "@hamk-uas/jax-js-nonconsuming",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "Numerical computing and ML in the browser",
   "keywords": [
     "machine learning",
@@ -64,7 +64,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint",
-    "prepare": "tsdown && (husky || true)",
+    "prepare": "(tsdown || (tsdown --no-dts && tsc --declaration --emitDeclarationOnly --outDir dist)) && (husky || true)",
     "test": "vitest",
     "test:report": "vitest run --reporter=json --outputFile tmp/vitest-report.json",
     "test:policy:strict": "pnpm run test:report && node scripts/check-test-status.mjs --mode strict --report tmp/vitest-report.json --manifest .ci/expected-failures.json",
