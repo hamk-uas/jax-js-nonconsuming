@@ -435,27 +435,62 @@ export function stopGradient(x: ArrayLike): Array {
 }
 
 /**
- * Update a contiguous slice of `dst` along `axis` starting at `offset`.
+ * Replace a contiguous slice of `dst` with `src`, returning a new array.
  *
- * Equivalent to `dst.at[axis, offset:offset+src.shape[axis]].set(src)` in
- * NumPy-style semantics. Returns a new array with the slice replaced.
+ * **Single-axis form** (existing):
+ * ```ts
+ * lax.dynamicUpdateSlice(dst, src, offset, axis?)
+ * ```
+ * Equivalent to `dst.at[axis, offset:offset+src.shape[axis]].set(src)`.
+ *
+ * **ND form** (new):
+ * ```ts
+ * lax.dynamicUpdateSlice(dst, src, [startRow, startCol, ...])
+ * ```
+ * Equivalent to `dst.at[s0:s0+h0, s1:s1+h1, ...].set(src)` where
+ * `si = startIndices[i]` and `hi = src.shape[i]`.
  *
  * @param dst  - Target array.
- * @param src  - Source array with matching shape on all non-updated axes.
- * @param offset - Start index along `axis`.
- * @param axis - Axis to update (default 0).
+ * @param src  - Source array (same rank as dst for ND form, or matching non-axis dims for single-axis).
+ * @param offsetOrStartIndices - Single axis offset (number) or ND start indices (number[]).
+ * @param axis - Axis to update (only for single-axis form, default 0).
  */
 export function dynamicUpdateSlice(
   dst: ArrayLike,
   src: ArrayLike,
   offset: number,
-  axis: number = 0,
+  axis?: number,
+): Array;
+export function dynamicUpdateSlice(
+  dst: ArrayLike,
+  src: ArrayLike,
+  startIndices: number[],
+): Array;
+export function dynamicUpdateSlice(
+  dst: ArrayLike,
+  src: ArrayLike,
+  offsetOrStartIndices: number | number[],
+  axis?: number,
 ): Array {
-  return core.dynamicUpdateSlice(
+  if (typeof offsetOrStartIndices === "number") {
+    // Single-axis form: dynamicUpdateSlice(dst, src, offset, axis?)
+    return core.dynamicUpdateSlice(
+      fudgeArray(dst),
+      fudgeArray(src),
+      offsetOrStartIndices,
+      axis ?? 0,
+    ) as Array;
+  }
+  // ND form: dynamicUpdateSlice(dst, src, startIndices)
+  if (axis !== undefined) {
+    throw new Error(
+      "lax.dynamicUpdateSlice: axis parameter is not supported with ND startIndices",
+    );
+  }
+  return core.dynamicUpdateSliceGeneral(
     fudgeArray(dst),
     fudgeArray(src),
-    offset,
-    axis,
+    offsetOrStartIndices,
   ) as Array;
 }
 

@@ -658,6 +658,25 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     if (src !== origSrc) src[Symbol.dispose]();
     return [[result], [0]];
   },
+  [Primitive.DynamicUpdateSliceGeneral](
+    axisSize,
+    [dst, src],
+    [dstBdim, srcBdim],
+    { startIndices },
+  ) {
+    // Move both batch dims to front, shift all axes by 1
+    const origDst = dst,
+      origSrc = src;
+    dst = moveBatchAxis(axisSize, dstBdim, 0, dst);
+    src = moveBatchAxis(axisSize, srcBdim, 0, src);
+    // Batch axis has offset 0 (src and dst share batch dim at position 0)
+    const result = bind1(Primitive.DynamicUpdateSliceGeneral, [dst, src], {
+      startIndices: [0, ...startIndices],
+    });
+    if (dst !== origDst) dst[Symbol.dispose]();
+    if (src !== origSrc) src[Symbol.dispose]();
+    return [[result], [0]];
+  },
   [Primitive.ScatterAdd](
     axisSize,
     [target, indices, updates],

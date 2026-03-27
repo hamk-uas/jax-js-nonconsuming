@@ -44,6 +44,7 @@ import {
   conv,
   currentTraceLevel,
   dynamicUpdateSlice,
+  dynamicUpdateSliceGeneral,
   flattenFun,
   flattenFunWithAux,
   flip,
@@ -2620,6 +2621,35 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         using sliced = shrink(ct, slices) as Tracer;
         ctSrc = reshape(sliced, srcShape) as Tracer;
       }
+    }
+
+    return [ctDst, ctSrc];
+  },
+  [Primitive.DynamicUpdateSliceGeneral]([ct], [dst, src], { startIndices }) {
+    // ND DUS is linear in both dst and src (same-rank only):
+    //   ct_dst = DUSGeneral(ct, zeros_like_src, startIndices)
+    //   ct_src = shrink(ct, per-axis ranges)
+    let ctDst: Tracer | null = null;
+    let ctSrc: Tracer | null = null;
+
+    const srcShape = (
+      src instanceof UndefPrimal ? src.aval.shape : (src as Tracer).shape
+    ) as number[];
+    const dstShape = (
+      dst instanceof UndefPrimal ? dst.aval.shape : (dst as Tracer).shape
+    ) as number[];
+
+    if (dst instanceof UndefPrimal) {
+      using z = zerosInternal(srcShape, ct.dtype) as Tracer;
+      ctDst = dynamicUpdateSliceGeneral(ct, z, startIndices) as Tracer;
+    }
+
+    if (src instanceof UndefPrimal) {
+      const slices = dstShape.map(
+        (s, i) =>
+          [startIndices[i], startIndices[i] + srcShape[i]] as [number, number],
+      );
+      ctSrc = shrink(ct, slices) as Tracer;
     }
 
     return [ctDst, ctSrc];

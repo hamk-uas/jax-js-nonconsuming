@@ -1590,6 +1590,66 @@ export class Array extends Tracer {
           "dynamicUpdateSlice: unsupported dst/src shapes for update",
         );
       },
+      [Primitive.DynamicUpdateSliceGeneral](
+        [dst, src],
+        { startIndices }: { startIndices: number[] },
+      ) {
+        // ND eager update: copy dst, then patch the ND sub-block with src.
+        // Uses stride-based addressing for O(srcElements) copy cost.
+        const dstShape = dst.shape as number[];
+        const srcShape = src.shape as number[];
+        const rank = dstShape.length;
+
+        // Bounds validation (mirrors jaxpr.ts abstract eval)
+        for (let i = 0; i < rank; i++) {
+          if (startIndices[i] + srcShape[i] > dstShape[i]) {
+            throw new Error(
+              `dynamicUpdateSliceGeneral: out of bounds on axis ${i}: ` +
+                `start ${startIndices[i]} + src extent ${srcShape[i]} > dst extent ${dstShape[i]}`,
+            );
+          }
+        }
+
+        const dstData = dst.dataSync();
+        const srcData = src.dataSync();
+        // resultData is a copy of dstData
+        const TypedArr = dstData.constructor as any;
+        const resultData = new TypedArr(dstData);
+
+        // Precompute dst strides (row-major)
+        const dstStrides = new JsArray(rank);
+        dstStrides[rank - 1] = 1;
+        for (let i = rank - 2; i >= 0; i--) {
+          dstStrides[i] = dstStrides[i + 1] * dstShape[i + 1];
+        }
+
+        // Walk src elements using stride-based addressing
+        const srcElements = prod(srcShape);
+        const coords: number[] = new JsArray(rank).fill(0);
+        for (let flat = 0; flat < srcElements; flat++) {
+          // Compute dst offset from coords + startIndices
+          let dstOff = 0;
+          for (let d = 0; d < rank; d++) {
+            dstOff += (coords[d] + startIndices[d]) * dstStrides[d];
+          }
+          resultData[dstOff] = srcData[flat];
+
+          // Increment coords (innermost first)
+          for (let d = rank - 1; d >= 0; d--) {
+            coords[d]++;
+            if (coords[d] < srcShape[d]) break;
+            coords[d] = 0;
+          }
+        }
+
+        return [
+          array(resultData, {
+            shape: dstShape,
+            dtype: dst.dtype,
+            device: dst.device,
+          }),
+        ];
+      },
       [Primitive.ScatterAdd]([target, indices, updates], { axis }) {
         // Eager scatter_add: target[indices[i]] += updates[i] along axis.
         // Returns a new array — target is NOT consumed.

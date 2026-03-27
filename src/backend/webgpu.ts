@@ -2513,6 +2513,9 @@ export class WebGPUBackend implements Backend {
             outerFibers: step.outerFibers,
             srcFiberBytes: step.srcFiberBytes,
             dstFiberBytes: step.dstFiberBytes,
+            srcBaseOffset: step.srcBaseOffset ?? 0,
+            ndOuterExtents: step.ndOuterExtents,
+            ndDstStrides: step.ndDstStrides,
           };
           ops.push({ type: "dus", dus });
           break;
@@ -3024,19 +3027,47 @@ export class WebGPUBackend implements Backend {
               const u = this.#encodeCopyAuto(
                 encoder,
                 srcBuf,
-                srcOff,
+                srcOff + d.srcBaseOffset,
                 outBuf,
                 outOff + d.offsetBytes,
                 d.sliceBytes,
               );
               if (u) copyUniforms.push(u);
+            } else if (d.ndOuterExtents) {
+              // ND fiber loop: coordinate decomposition for non-constant dst stride
+              const extents = d.ndOuterExtents;
+              const dstStrides = d.ndDstStrides!;
+              const rowBytes = d.srcFiberBytes;
+              // Precompute radix divisors: divisors[k] = prod(extents[k+1:])
+              const divisors = new Array<number>(extents.length);
+              divisors[extents.length - 1] = 1;
+              for (let k = extents.length - 2; k >= 0; k--)
+                divisors[k] = divisors[k + 1] * extents[k + 1];
+              for (let i = 0; i < d.outerFibers; i++) {
+                let rem = i;
+                let dstFiberOff = d.offsetBytes;
+                for (let k = 0; k < extents.length; k++) {
+                  const coord = Math.floor(rem / divisors[k]);
+                  rem = rem % divisors[k];
+                  dstFiberOff += coord * dstStrides[k];
+                }
+                const u = this.#encodeCopyAuto(
+                  encoder,
+                  srcBuf,
+                  srcOff + i * rowBytes,
+                  outBuf,
+                  outOff + dstFiberOff,
+                  rowBytes,
+                );
+                if (u) copyUniforms.push(u);
+              }
             } else {
               // Fiber-by-fiber copy for non-contiguous axis > 0
               for (let i = 0; i < d.outerFibers; i++) {
                 const u = this.#encodeCopyAuto(
                   encoder,
                   srcBuf,
-                  srcOff + i * d.srcFiberBytes,
+                  srcOff + d.srcBaseOffset + i * d.srcFiberBytes,
                   outBuf,
                   outOff + i * d.dstFiberBytes + d.offsetBytes,
                   d.srcFiberBytes,

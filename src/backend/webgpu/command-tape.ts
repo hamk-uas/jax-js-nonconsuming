@@ -115,6 +115,12 @@ export interface TapeDUS {
   srcFiberBytes: number;
   /** Bytes per fiber in dst (stride between fibers). */
   dstFiberBytes: number;
+  /** Byte offset into src where fiber reads begin (default 0). */
+  srcBaseOffset: number;
+  /** ND outer extents for non-constant dst stride (optional). */
+  ndOuterExtents?: number[];
+  /** ND dst byte strides per outer dim (optional, same length as ndOuterExtents). */
+  ndDstStrides?: number[];
 }
 
 /** Pre-resolved scatter_add: copy target → output, then dispatch atomic kernel. */

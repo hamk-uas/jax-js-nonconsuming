@@ -617,6 +617,9 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.DynamicUpdateSlice]: linearTangentsJvp(
     Primitive.DynamicUpdateSlice,
   ),
+  [Primitive.DynamicUpdateSliceGeneral]: linearTangentsJvp(
+    Primitive.DynamicUpdateSliceGeneral,
+  ),
   [Primitive.Scan](
     primals,
     tangents,

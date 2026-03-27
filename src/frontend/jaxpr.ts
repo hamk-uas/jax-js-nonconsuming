@@ -81,6 +81,15 @@ const primitiveInputEffects: Partial<
     effects[0] = MemoryEffect.Mutate;
     return effects;
   },
+  // DynamicUpdateSliceGeneral mutates its first input (dst) in place.
+  [Primitive.DynamicUpdateSliceGeneral]: (n: number) => {
+    const effects = globalThis.Array.from(
+      { length: n },
+      () => MemoryEffect.Borrow,
+    );
+    effects[0] = MemoryEffect.Mutate;
+    return effects;
+  },
   // ScatterAdd mutates its first input (target) in place; indices + updates are Borrow.
   [Primitive.ScatterAdd]: (n: number) => {
     const effects = globalThis.Array.from(
@@ -1377,6 +1386,36 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
         throw new TypeError("dynamicUpdateSlice: stacked out of bounds");
     } else {
       throw new TypeError("dynamicUpdateSlice: unsupported shapes");
+    }
+    return [new ShapedArray(dst.shape, dst.dtype, dst.weakType)];
+  },
+  [Primitive.DynamicUpdateSliceGeneral]([dst, src], { startIndices }) {
+    if (!(dst instanceof ShapedArray) || !(src instanceof ShapedArray)) {
+      throw new TypeError(
+        "dynamicUpdateSliceGeneral expects shaped array inputs",
+      );
+    }
+    const dstShape = dst.shape;
+    const srcShape = src.shape;
+    if (dstShape.length !== srcShape.length) {
+      throw new TypeError(
+        "dynamicUpdateSliceGeneral: dst and src must have same rank",
+      );
+    }
+    if (startIndices.length !== dstShape.length) {
+      throw new TypeError(
+        `dynamicUpdateSliceGeneral: expected ${dstShape.length} start indices, got ${startIndices.length}`,
+      );
+    }
+    for (let i = 0; i < dstShape.length; i++) {
+      if (
+        startIndices[i] + concreteDim(srcShape[i], "DUS_General") >
+        concreteDim(dstShape[i], "DUS_General")
+      ) {
+        throw new TypeError(
+          `dynamicUpdateSliceGeneral: out of bounds on axis ${i}`,
+        );
+      }
     }
     return [new ShapedArray(dst.shape, dst.dtype, dst.weakType)];
   },

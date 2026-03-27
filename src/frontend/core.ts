@@ -95,8 +95,10 @@ export enum Primitive {
   Flip = "flip",
   Shrink = "shrink",
   Pad = "pad",
-  // Update a contiguous slice along an axis: dst[axis=offset:offset+len] = src
+  // Update a contiguous slice along a single axis: dst[axis=offset:offset+len] = src
   DynamicUpdateSlice = "dynamic_update_slice",
+  // Update a contiguous slice with ND start indices: dst[starts[0]:..., starts[1]:..., ...] = src
+  DynamicUpdateSliceGeneral = "dynamic_update_slice_general",
   // Extract a contiguous slice using dynamic start indices
   DynamicSlice = "dynamic_slice",
   // Like DynamicSlice but without min/max clamping (caller guarantees in-bounds)
@@ -153,6 +155,8 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.Pad]: { width: Pair[] };
   // Update a contiguous slice along a single axis: dst[axis=offset:offset+src.shape[axis]] = src
   [Primitive.DynamicUpdateSlice]: { offset: number; axis: number };
+  // Update a contiguous ND slice: dst[starts[0]:..., starts[1]:..., ...] = src
+  [Primitive.DynamicUpdateSliceGeneral]: { startIndices: number[] };
   [Primitive.DynamicSlice]: { sliceSizes: number[] };
   [Primitive.UncheckedDynamicSlice]: { sliceSizes: number[] };
   // Scatter-add: target[indices[i]] += updates[i] along axis
@@ -645,6 +649,44 @@ export function dynamicUpdateSlice(
     );
   }
   return bind1(Primitive.DynamicUpdateSlice, [dst, src], { offset, axis });
+}
+
+/**
+ * ND dynamic update slice: replace dst[starts[0]:..., starts[1]:..., ...] with src.
+ * src.shape must satisfy src.shape[i] + startIndices[i] <= dst.shape[i] for all i,
+ * and src.ndim must equal dst.ndim.
+ */
+export function dynamicUpdateSliceGeneral(
+  dst: TracerValue,
+  src: TracerValue,
+  startIndices: number[],
+) {
+  const dstNdim = ndim(dst);
+  const srcNdim = ndim(src);
+  if (srcNdim !== dstNdim) {
+    throw new Error(
+      `dynamicUpdateSliceGeneral: src and dst must have same rank, got src=${srcNdim} dst=${dstNdim}`,
+    );
+  }
+  if (startIndices.length !== dstNdim) {
+    throw new Error(
+      `dynamicUpdateSliceGeneral: expected ${dstNdim} start indices, got ${startIndices.length}`,
+    );
+  }
+  // Clone before coercion to avoid mutating the caller's array
+  const indices = startIndices.slice();
+  for (let i = 0; i < indices.length; i++) {
+    const s = Math.floor(indices[i]);
+    if (!Number.isInteger(s) || s < 0) {
+      throw new Error(
+        `dynamicUpdateSliceGeneral: start index ${i} must be a nonnegative integer, got ${startIndices[i]}`,
+      );
+    }
+    indices[i] = s;
+  }
+  return bind1(Primitive.DynamicUpdateSliceGeneral, [dst, src], {
+    startIndices: indices,
+  });
 }
 
 /**
