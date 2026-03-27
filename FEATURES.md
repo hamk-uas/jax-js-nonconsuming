@@ -553,6 +553,11 @@ A few functions in `jax.lax` have been implemented:
 - `conv_general_dilated()` for convolutions
 - `dot()` for general tensor contractions
 - `dynamic_index_in_dim()` for scalar array indexing with full autodiff
+- `dynamic_slice()` for arbitrary-start multi-axis slicing with runtime indices
+- `dynamic_update_slice()` for contiguous block updates — single-axis or ND with static per-axis
+  offsets. Full autodiff (JVP, grad, vmap). Under JIT: zero-copy for axis-0, fiber-loop for axis >
+  0, ND-aware stride decomposition for multi-axis. See `docs/array-manipulation-patterns.md` for
+  usage patterns and migration guidance
 - `slice_in_dim()` for contiguous axis slicing (zero-copy view)
 - `scan()` for sequential loops with carry state (supports JIT, autodiff with √N checkpointing that
   auto-bypasses for small carries ≤4 MB, vmap, and native compilation on WASM/WebGPU)

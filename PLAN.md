@@ -361,11 +361,66 @@ secretly contains domain-specific modes.
 
 ---
 
-## Non-Blocking Follow-Up: Structural Update API
+## Non-Blocking Follow-Up: Structural Update API (Priority 1 Complete)
 
 The `expm` work does not depend on this, but the downstream ports have exposed a real adjacent
 usability gap: JAX code that uses `.at[...]` for multi-axis structural updates does not always have
 an equally clean public replacement here.
+
+### What shipped in v0.11.0
+
+**ND `dynamicUpdateSlice` with static offsets** — the Priority 1 item is complete.
+
+`lax.dynamicUpdateSlice` now accepts two forms:
+
+```typescript
+// Single-axis form (unchanged):
+lax.dynamicUpdateSlice(dst, src, offset, axis?): Array
+
+// ND form (new):
+lax.dynamicUpdateSlice(dst, src, startIndices: number[]): Array
+```
+
+The implementation adds a new `DynamicUpdateSliceGeneral` primitive (the original single-axis
+`DynamicUpdateSlice` is preserved unchanged). TypeScript overloads dispatch at the public API
+boundary.
+
+**What it provides:**
+
+- Multi-axis block updates with static JS-number per-axis offsets
+- Full AD: JVP (linearTangentsJvp), reverse-mode (transpose via shrink), vmap
+- JIT: single ND-aware DUS step with precomputed radix divisors; axes where `src` spans the full
+  `dst` extent are optimized away; single-axis fast path activates automatically
+- WebGPU command tape support with ND stride decomposition
+- Eager mode: stride-based patching
+
+**Design deviation from plan:** The plan proposed renaming the single-axis API to
+`dynamicUpdateSliceInDim`. This rename was not taken. Instead, TypeScript overloads distinguish the
+two forms by argument type (`number` vs `number[]`). This avoids a breaking change for all existing
+callers while still providing the ND API.
+
+### Migration bundle for downstream consumers (v0.11.0)
+
+**Deterministic mapping — no breaking changes.** Existing single-axis calls continue to work
+unchanged.
+
+| Pattern                                                          | Action                                                                |
+| ---------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `lax.dynamicUpdateSlice(dst, src, offset, axis)`                 | No change needed. Works as before.                                    |
+| Two chained single-axis `dynamicUpdateSlice` for 2D block update | Replace with `lax.dynamicUpdateSlice(dst, src, [rowStart, colStart])` |
+| One-hot matmul/add to simulate column/row writes                 | Replace with `lax.dynamicUpdateSlice` (see patterns doc)              |
+| Manual piecemeal construction with repeated single-axis patching | Evaluate whether a single ND call is cleaner                          |
+
+**Workaround signatures (debt collector):**
+
+- If downstream has a helper like `updateBlock2D(dst, src, row, col)` that chains two single-axis
+  `dynamicUpdateSlice` calls, delete it and use the ND form directly.
+- If downstream uses `np.matmul(newCol, oneHotRow)` + `np.add(A, patch)` to simulate a column write,
+  replace with `lax.dynamicUpdateSlice(A, np.reshape(newCol, [m, 1]), [0, j])`.
+- If downstream builds a 2D patch via `np.zeros` + repeated single-element writes, consider
+  `np.array([[...]])` + single ND `dynamicUpdateSlice`.
+
+**Full migration guidance and usage patterns:** See `docs/array-manipulation-patterns.md`.
 
 ### What the downstream evidence actually shows
 
@@ -384,103 +439,9 @@ Not all piecemeal construction is equally problematic:
 - Internal lowering may use mutate/recycle paths under `jit()`.
 - No in-place mutation API or ownership-changing builder.
 
-### Priority 1: ND `dynamicUpdateSlice` with static offsets
+### Priority 1: ND `dynamicUpdateSlice` with static offsets ✅ Complete
 
-The most impactful gap is that the current `dynamicUpdateSlice` only operates on one axis at a time.
-A 2D interior block update requires chaining two sequential single-axis calls, which is awkward and
-prevents the JIT from recognizing a single contiguous update.
-
-#### Target API
-
-Add an ND overload that accepts per-axis JS-number offsets:
-
-```typescript
-// New ND API (static offsets, one per dimension):
-lax.dynamicUpdateSlice(dst: ArrayLike, src: ArrayLike, startIndices: number[]): Array
-
-// Renamed convenience wrapper (current single-axis behavior):
-lax.dynamicUpdateSliceInDim(dst: ArrayLike, src: ArrayLike, offset: number, axis?: number): Array
-```
-
-This is a breaking rename for the current `lax.dynamicUpdateSlice` callers. The AEP migration bundle
-applies:
-
-| Old call                                         | New call                                              |
-| ------------------------------------------------ | ----------------------------------------------------- |
-| `lax.dynamicUpdateSlice(dst, src, offset, axis)` | `lax.dynamicUpdateSliceInDim(dst, src, offset, axis)` |
-
-Internal callers in this repo (scan codegen, block-map, `padConcrete`) must be updated as part of
-the change. Downstream callers (`dlm-js`, `diffSVMC`) get a deterministic mapping.
-
-#### Primitive changes
-
-Generalize the existing `Primitive.DynamicUpdateSlice`:
-
-Current:
-
-```
-inputs:  [dst, src]
-params:  { offset: number; axis: number }
-```
-
-New:
-
-```
-inputs:  [dst, src]
-params:  { startIndices: number[]; sliceSizes: number[] }
-// startIndices: one JS number per dimension
-// sliceSizes: == src.shape, kept for validation
-```
-
-Start indices remain in params (not inputs) because they are plain JS numbers, not traced values.
-This keeps the primitive simple and avoids changing JIT step types or AD rules unnecessarily.
-
-#### JIT compilation
-
-Because all start indices are concrete numbers at trace time, the JIT compiler computes
-`offsetBytes` at compile time and emits the existing zero-copy `dus` step. The current axis-fiber
-decomposition generalizes to ND by computing a single flat byte offset from all start indices ×
-strides. No new JIT step type is needed.
-
-**Command tape:** The `TapeDUS` structure continues to store static `offsetBytes`. ND just means a
-different offset calculation at tape build time.
-
-**Mega-module:** The WASM mega-module currently rejects `dus` steps. ND static offsets do not change
-that status; fixing mega-module DUS is orthogonal.
-
-#### AD rules
-
-DUS is linear in `(dst, src)`. Start indices are integer params, not differentiable inputs.
-
-**JVP:** `linearTangentsJvp` continues to work: same primitive applied to both primals and tangents
-with identical params.
-
-**Transpose:** The current transpose uses `offset` and `axis` from params to compute `shrink`
-ranges. The ND generalization computes per-axis shrink ranges from `startIndices` and `sliceSizes`
-in params. Structurally the same, just generalized from 1 axis to N axes.
-
-**Vmap:** The existing vmap rule shifts the DUS axis and decomposes axis != 0 into
-shrink+concatenate. The ND version adjusts the relevant entry in `startIndices` rather than the
-single `offset` param, and shifts axis indices by +1 when batch dims are added.
-
-#### Effect system
-
-The `Mutate` effect annotation stays on input 0 (dst). `effectDrivenAllocate` continues to use it
-for zero-copy recycling. No new inputs → no effect changes.
-
-#### Implementation order
-
-1. **Rename public API:** `dynamicUpdateSlice` → `dynamicUpdateSliceInDim`, add new ND
-   `dynamicUpdateSlice`. Update all internal callers.
-2. **Generalize primitive:** Change `DynamicUpdateSlice` params from `{ offset, axis }` to
-   `{ startIndices, sliceSizes }`. Update `core.ts`, `jaxpr.ts` (shape rule), `array.ts` (eager
-   impl).
-3. **JIT:** Compute flat byte offset from ND start indices × strides. Emit existing `dus` step.
-4. **AD rules:** Generalize JVP params passthrough, transpose shrink ranges, vmap axis handling.
-5. **Downstream validation:** Refactor one or two real `diffSVMC` / `dlm-js` piecemeal construction
-   sites. Benchmark on real shapes.
-
-Steps 1–4 are the minimum viable change. Step 5 validates the design.
+Shipped in v0.11.0. See migration bundle above.
 
 ### Priority 2: Convenience helpers for common patterns
 
@@ -530,9 +491,10 @@ it. The current verified downstream patterns all use plain JS numbers.
 3. Reuse the existing `np.linalg.solve` machinery for Padé `expm` rather than adding solver debt.
 4. Implement public `scipyLinalg.expm(a)` as the JAX-parity path only.
 5. Validate AD behavior as part of the public API contract.
-6. Add ND `dynamicUpdateSlice` with static JS-number offsets and rename the single-axis version to
-   `dynamicUpdateSliceInDim`. This is the verified downstream usability gap.
-7. Evaluate convenience helpers and broader scatter coverage after the ND primitive ships.
+6. ~~Add ND `dynamicUpdateSlice` with static JS-number offsets.~~ ✅ Done (v0.11.0). Shipped as
+   TypeScript overload (no rename). See migration bundle in PLAN.md and usage patterns in
+   `docs/array-manipulation-patterns.md`.
+7. Evaluate convenience helpers and broader scatter coverage after downstream adoption.
 8. Extend `dynamicUpdateSlice` to accept traced offsets only if downstream code demonstrates a real
    need for it.
 9. Only consider promoting the Taylor path into this repo later if repeated downstream demand
