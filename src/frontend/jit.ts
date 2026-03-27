@@ -924,6 +924,12 @@ export type JitStep =
       outerFibers: number; // product(shape[0:axis]), 1 for axis=0
       srcFiberBytes: number; // bytes per fiber in src (stride between fibers)
       dstFiberBytes: number; // bytes per fiber in dst (stride between fibers)
+      srcBaseOffset?: number; // byte offset into src where fiber reads begin (default 0)
+      // ND stride info for multi-axis updates where dst fiber stride is non-constant.
+      // When present, the executor decomposes fiber index into coordinates via
+      // ndOuterExtents and computes per-fiber dst offset from ndDstStrides.
+      ndOuterExtents?: number[]; // srcShape[0..rank-2] — extents per outer dim
+      ndDstStrides?: number[]; // dst byte strides per outer dim (same length)
     }
   | {
       type: "scatter_add";
@@ -1592,17 +1598,46 @@ export class JitProgram {
                 : resolveSizeExpr(step.sliceBytes, dimBindings!);
             this.backend.copyBufferToBuffer!(
               srcSlot,
-              0,
+              step.srcBaseOffset ?? 0,
               outSlot,
               step.offsetBytes,
               concreteSliceSize,
             );
+          } else if (step.ndOuterExtents) {
+            // ND fiber loop: coordinate decomposition for non-constant dst stride.
+            // src is row-major contiguous, so fibers are evenly spaced.
+            const extents = step.ndOuterExtents;
+            const dstStrides = step.ndDstStrides!;
+            const rowBytes = step.srcFiberBytes; // innermost row size
+            // Precompute radix divisors: divisors[k] = prod(extents[k+1:])
+            const divisors = new Array<number>(extents.length);
+            divisors[extents.length - 1] = 1;
+            for (let k = extents.length - 2; k >= 0; k--)
+              divisors[k] = divisors[k + 1] * extents[k + 1];
+            for (let i = 0; i < step.outerFibers; i++) {
+              // Decompose fiber index into coordinates → dst offset
+              let rem = i;
+              let dstOff = step.offsetBytes;
+              for (let k = 0; k < extents.length; k++) {
+                const coord = Math.floor(rem / divisors[k]);
+                rem = rem % divisors[k];
+                dstOff += coord * dstStrides[k];
+              }
+              this.backend.copyBufferToBuffer!(
+                srcSlot,
+                i * rowBytes,
+                outSlot,
+                dstOff,
+                rowBytes,
+              );
+            }
           } else {
             // Fiber-by-fiber copy for non-contiguous axis > 0
+            const srcBase = step.srcBaseOffset ?? 0;
             for (let i = 0; i < step.outerFibers; i++) {
               this.backend.copyBufferToBuffer!(
                 srcSlot,
-                i * step.srcFiberBytes,
+                srcBase + i * step.srcFiberBytes,
                 outSlot,
                 i * step.dstFiberBytes + step.offsetBytes,
                 step.srcFiberBytes,
@@ -2693,6 +2728,191 @@ export function jitCompile(
         continue;
       }
 
+      // DynamicUpdateSliceGeneral: emit a full dst→output copy, then a single ND-aware
+      // DUS step that patches the src region using ndOuterExtents/ndDstStrides for
+      // non-constant-stride coordinate decomposition.
+      if (eqn.primitive === Primitive.DynamicUpdateSliceGeneral) {
+        flushPendingKernels();
+        const params = eqn.params as PrimitiveParams<
+          typeof Primitive.DynamicUpdateSliceGeneral
+        >;
+        const { startIndices } = params;
+
+        // Resolve src input
+        const srcInput = eqn.inputs[1];
+        let srcId: JitId;
+        if (srcInput instanceof Var) {
+          const jv = ctx.get(srcInput)!;
+          if (jv.type !== "imm")
+            throw new Error("jit: DUS_General src input is not imm");
+          srcId = jv.arg;
+        } else {
+          srcId = builder.pushLit(srcInput as Lit);
+        }
+
+        // Resolve dst input
+        const dstInput = eqn.inputs[0];
+        let currentDstId: JitId;
+        if (dstInput instanceof Var) {
+          const jv = ctx.get(dstInput)!;
+          if (jv.type !== "imm")
+            throw new Error("jit: DUS_General dst input is not imm");
+          currentDstId = jv.arg;
+        } else {
+          currentDstId = builder.pushLit(dstInput as Lit);
+        }
+
+        const outVar = eqn.outBinders[0];
+        const outShape = outVar.aval.shape as number[];
+        const srcShape = srcInput.aval.shape as number[];
+        const rank = outShape.length;
+        const elemBytes = byteWidth(outVar.aval.dtype);
+
+        // Find axes that actually need updates (offset > 0 or src smaller than dst)
+        const activeAxes: number[] = [];
+        for (let ax = 0; ax < rank; ax++) {
+          if (startIndices[ax] !== 0 || srcShape[ax] !== outShape[ax]) {
+            activeAxes.push(ax);
+          }
+        }
+
+        if (activeAxes.length === 0) {
+          // src == dst shape and all offsets 0: just a full copy.
+          // Emit a single axis=0 DUS with offset 0.
+          const dstSizeBytes = sizeExprMul(outVar.aval.sizeExpr, elemBytes);
+          const sliceBytes = dstSizeBytes;
+          const outId = builder.pushBuffer(dstSizeBytes);
+          ctx.set(outVar, { type: "imm", arg: outId });
+          builder.steps.push({
+            type: "dus",
+            dst: currentDstId,
+            src: srcId,
+            output: outId,
+            offsetBytes: 0,
+            sliceBytes,
+            dstSizeBytes,
+            outerFibers: 1,
+            srcFiberBytes: 0,
+            dstFiberBytes: 0,
+          });
+        } else if (activeAxes.length === 1) {
+          // Single active axis: emit one DUS step directly (fast path).
+          const axis = activeAxes[0];
+          const offset = startIndices[axis];
+          const innerSize = outShape.slice(axis + 1).reduce((a, b) => a * b, 1);
+          const offsetBytes = offset * innerSize * elemBytes;
+          const sliceBytes = sizeExprMul(srcInput.aval.sizeExpr, elemBytes);
+          const dstSizeBytes = sizeExprMul(outVar.aval.sizeExpr, elemBytes);
+          const outerFibers =
+            axis === 0 ? 1 : srcShape.slice(0, axis).reduce((a, b) => a * b, 1);
+          const srcFiberBytes =
+            axis === 0 ? 0 : srcShape[axis] * innerSize * elemBytes;
+          const dstFiberBytes =
+            axis === 0 ? 0 : outShape[axis] * innerSize * elemBytes;
+
+          const outId = builder.pushBuffer(dstSizeBytes);
+          ctx.set(outVar, { type: "imm", arg: outId });
+          builder.steps.push({
+            type: "dus",
+            dst: currentDstId,
+            src: srcId,
+            output: outId,
+            offsetBytes,
+            sliceBytes,
+            dstSizeBytes,
+            outerFibers,
+            srcFiberBytes,
+            dstFiberBytes,
+          });
+        } else {
+          // Multi-axis ND update: copy dst → output, then patch src into output
+          // using a single DUS step with ND stride info.
+          const dstSizeBytes = sizeExprMul(outVar.aval.sizeExpr, elemBytes);
+          const outId = builder.pushBuffer(dstSizeBytes);
+          ctx.set(outVar, { type: "imm", arg: outId });
+
+          // Step 1: copy entire dst → output (full buffer copy)
+          builder.steps.push({
+            type: "dus",
+            dst: currentDstId,
+            src: currentDstId,
+            output: outId,
+            offsetBytes: 0,
+            sliceBytes: dstSizeBytes,
+            dstSizeBytes,
+            outerFibers: 1,
+            srcFiberBytes: 0,
+            dstFiberBytes: 0,
+          });
+
+          // Step 2: patch src into output.
+          // Precompute dst byte strides (row-major)
+          const dstByteStrides: number[] = [];
+          {
+            dstByteStrides.length = rank;
+            dstByteStrides[rank - 1] = elemBytes;
+            for (let k = rank - 2; k >= 0; k--) {
+              dstByteStrides[k] = dstByteStrides[k + 1] * outShape[k + 1];
+            }
+          }
+
+          // Compute base offset in dst from startIndices
+          let ndOffsetBytes = 0;
+          for (let ax = 0; ax < rank; ax++) {
+            ndOffsetBytes += startIndices[ax] * dstByteStrides[ax];
+          }
+
+          const totalFibers = srcShape
+            .slice(0, rank - 1)
+            .reduce((a, b) => a * b, 1);
+          const rowBytes = srcShape[rank - 1] * elemBytes;
+
+          // Check if all outer axes match (constant stride fast path)
+          let singleFiberOk = true;
+          for (let k = 0; k < rank - 1; k++) {
+            if (srcShape[k] !== outShape[k]) {
+              singleFiberOk = false;
+              break;
+            }
+          }
+
+          if (singleFiberOk) {
+            // Constant dst stride — use standard fiber loop
+            builder.steps.push({
+              type: "dus",
+              dst: outId,
+              src: srcId,
+              output: outId,
+              offsetBytes: ndOffsetBytes,
+              sliceBytes: sizeExprMul(srcInput.aval.sizeExpr, elemBytes),
+              dstSizeBytes,
+              outerFibers: totalFibers,
+              srcFiberBytes: rowBytes,
+              dstFiberBytes: outShape[rank - 1] * elemBytes,
+            });
+          } else {
+            // Non-constant dst stride — single step with ND stride info.
+            // The executor decomposes fiber indices into coordinates and
+            // computes per-fiber dst offsets from ndDstStrides.
+            builder.steps.push({
+              type: "dus",
+              dst: outId,
+              src: srcId,
+              output: outId,
+              offsetBytes: ndOffsetBytes,
+              sliceBytes: sizeExprMul(srcInput.aval.sizeExpr, elemBytes),
+              dstSizeBytes,
+              outerFibers: totalFibers,
+              srcFiberBytes: rowBytes,
+              dstFiberBytes: 0, // unused when ndOuterExtents present
+              ndOuterExtents: srcShape.slice(0, rank - 1),
+              ndDstStrides: dstByteStrides.slice(0, rank - 1),
+            });
+          }
+        }
+        continue;
+      }
+
       // Handle Primitive.AssociativeScan — creates an assoc_scan JitStep
       // that runs the Kogge-Stone loop at execution time.
       if (eqn.primitive === Primitive.AssociativeScan) {
@@ -3711,6 +3931,11 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
       "internal: DynamicUpdateSlice is handled specially in jitCompile",
     );
   },
+  [Primitive.DynamicUpdateSliceGeneral]() {
+    throw new Error(
+      "internal: DynamicUpdateSliceGeneral is handled specially in jitCompile",
+    );
+  },
   [Primitive.Scan]() {
     throw new Error(
       "internal: Scan is handled specially in jitCompile, not via jitRules",
@@ -3998,6 +4223,7 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     // be black nodes with materialized inputs.
     Primitive.Scan,
     Primitive.DynamicUpdateSlice,
+    Primitive.DynamicUpdateSliceGeneral,
     Primitive.ScatterAdd,
     Primitive.AssociativeScan,
     Primitive.Reverse,

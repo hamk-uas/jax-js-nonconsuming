@@ -361,6 +361,166 @@ secretly contains domain-specific modes.
 
 ---
 
+## Non-Blocking Follow-Up: Structural Update API
+
+The `expm` work does not depend on this, but the downstream ports have exposed a real adjacent
+usability gap: JAX code that uses `.at[...]` for multi-axis structural updates does not always have
+an equally clean public replacement here.
+
+### What the downstream evidence actually shows
+
+Not all piecemeal construction is equally problematic:
+
+- **Small fixed matrix assembly** from known scalar entries via `np.array([...])` or
+  `np.stack([...])` is fine and does not need new primitives.
+- **One-hot matrix algebra** (matmul/add with one-hot vectors to fake indexing) is the real
+  anti-pattern. Downstream code uses this because the current update API is single-axis only.
+- **Traced write offsets** are not yet a verified downstream need. Both `diffSVMC` and `dlm-js` use
+  plain JS loop indices, not traced values from `lax.foriLoop`.
+
+### Design constraints
+
+- Public update helpers must continue to return new arrays (non-consuming semantics).
+- Internal lowering may use mutate/recycle paths under `jit()`.
+- No in-place mutation API or ownership-changing builder.
+
+### Priority 1: ND `dynamicUpdateSlice` with static offsets
+
+The most impactful gap is that the current `dynamicUpdateSlice` only operates on one axis at a time.
+A 2D interior block update requires chaining two sequential single-axis calls, which is awkward and
+prevents the JIT from recognizing a single contiguous update.
+
+#### Target API
+
+Add an ND overload that accepts per-axis JS-number offsets:
+
+```typescript
+// New ND API (static offsets, one per dimension):
+lax.dynamicUpdateSlice(dst: ArrayLike, src: ArrayLike, startIndices: number[]): Array
+
+// Renamed convenience wrapper (current single-axis behavior):
+lax.dynamicUpdateSliceInDim(dst: ArrayLike, src: ArrayLike, offset: number, axis?: number): Array
+```
+
+This is a breaking rename for the current `lax.dynamicUpdateSlice` callers. The AEP migration bundle
+applies:
+
+| Old call                                         | New call                                              |
+| ------------------------------------------------ | ----------------------------------------------------- |
+| `lax.dynamicUpdateSlice(dst, src, offset, axis)` | `lax.dynamicUpdateSliceInDim(dst, src, offset, axis)` |
+
+Internal callers in this repo (scan codegen, block-map, `padConcrete`) must be updated as part of
+the change. Downstream callers (`dlm-js`, `diffSVMC`) get a deterministic mapping.
+
+#### Primitive changes
+
+Generalize the existing `Primitive.DynamicUpdateSlice`:
+
+Current:
+
+```
+inputs:  [dst, src]
+params:  { offset: number; axis: number }
+```
+
+New:
+
+```
+inputs:  [dst, src]
+params:  { startIndices: number[]; sliceSizes: number[] }
+// startIndices: one JS number per dimension
+// sliceSizes: == src.shape, kept for validation
+```
+
+Start indices remain in params (not inputs) because they are plain JS numbers, not traced values.
+This keeps the primitive simple and avoids changing JIT step types or AD rules unnecessarily.
+
+#### JIT compilation
+
+Because all start indices are concrete numbers at trace time, the JIT compiler computes
+`offsetBytes` at compile time and emits the existing zero-copy `dus` step. The current axis-fiber
+decomposition generalizes to ND by computing a single flat byte offset from all start indices ×
+strides. No new JIT step type is needed.
+
+**Command tape:** The `TapeDUS` structure continues to store static `offsetBytes`. ND just means a
+different offset calculation at tape build time.
+
+**Mega-module:** The WASM mega-module currently rejects `dus` steps. ND static offsets do not change
+that status; fixing mega-module DUS is orthogonal.
+
+#### AD rules
+
+DUS is linear in `(dst, src)`. Start indices are integer params, not differentiable inputs.
+
+**JVP:** `linearTangentsJvp` continues to work: same primitive applied to both primals and tangents
+with identical params.
+
+**Transpose:** The current transpose uses `offset` and `axis` from params to compute `shrink`
+ranges. The ND generalization computes per-axis shrink ranges from `startIndices` and `sliceSizes`
+in params. Structurally the same, just generalized from 1 axis to N axes.
+
+**Vmap:** The existing vmap rule shifts the DUS axis and decomposes axis != 0 into
+shrink+concatenate. The ND version adjusts the relevant entry in `startIndices` rather than the
+single `offset` param, and shifts axis indices by +1 when batch dims are added.
+
+#### Effect system
+
+The `Mutate` effect annotation stays on input 0 (dst). `effectDrivenAllocate` continues to use it
+for zero-copy recycling. No new inputs → no effect changes.
+
+#### Implementation order
+
+1. **Rename public API:** `dynamicUpdateSlice` → `dynamicUpdateSliceInDim`, add new ND
+   `dynamicUpdateSlice`. Update all internal callers.
+2. **Generalize primitive:** Change `DynamicUpdateSlice` params from `{ offset, axis }` to
+   `{ startIndices, sliceSizes }`. Update `core.ts`, `jaxpr.ts` (shape rule), `array.ts` (eager
+   impl).
+3. **JIT:** Compute flat byte offset from ND start indices × strides. Emit existing `dus` step.
+4. **AD rules:** Generalize JVP params passthrough, transpose shrink ranges, vmap axis handling.
+5. **Downstream validation:** Refactor one or two real `diffSVMC` / `dlm-js` piecemeal construction
+   sites. Benchmark on real shapes.
+
+Steps 1–4 are the minimum viable change. Step 5 validates the design.
+
+### Priority 2: Convenience helpers for common patterns
+
+After the ND primitive ships, evaluate whether common downstream patterns justify thin helpers:
+
+```typescript
+// Set a single element at [i, j]:
+lax.dynamicUpdateSlice(A, np.array([[value]]), [i, j]);
+
+// This works but is verbose. A helper like:
+lax.setElement(A, [i, j], value);
+// could reduce boilerplate for scalar writes without new primitives.
+```
+
+Keep these as pure frontend sugar over `dynamicUpdateSlice`, not new primitives. Judge by clarity
+and downstream adoption, not by literal JAX syntax parity.
+
+### Future: Traced write offsets (only if downstream proves the need)
+
+If a downstream use case demonstrates that traced loop indices need to flow into
+`dynamicUpdateSlice`, the primitive can be further generalized to accept traced scalar start indices
+as inputs (mirroring `DynamicSlice`). That change would require:
+
+- Moving start indices from params to inputs
+- Custom JVP rule (primal starts for tangent output)
+- Transpose via `dynamicSlice` with traced starts
+- Runtime-resolved DUS JIT step (similar to scan uniform offsets)
+- Command tape and vmap updates for traced start inputs
+
+This is well-understood architecturally but should only be built when downstream code actually needs
+it. The current verified downstream patterns all use plain JS numbers.
+
+### Future: Broader scatter coverage
+
+- `scatterAdd` exists today.
+- `scatterSet` and other scatter-style writes may be worth adding later.
+- Evaluate demand after ND `dynamicUpdateSlice` ships and downstream code has been refactored.
+
+---
+
 ## Summary Of Work Items
 
 1. Prototype the Taylor path in `diffSVMC` using existing public primitives, with `lax.foriLoop` as
@@ -370,5 +530,10 @@ secretly contains domain-specific modes.
 3. Reuse the existing `np.linalg.solve` machinery for Padé `expm` rather than adding solver debt.
 4. Implement public `scipyLinalg.expm(a)` as the JAX-parity path only.
 5. Validate AD behavior as part of the public API contract.
-6. Only consider promoting the Taylor path into this repo later if repeated downstream demand
+6. Add ND `dynamicUpdateSlice` with static JS-number offsets and rename the single-axis version to
+   `dynamicUpdateSliceInDim`. This is the verified downstream usability gap.
+7. Evaluate convenience helpers and broader scatter coverage after the ND primitive ships.
+8. Extend `dynamicUpdateSlice` to accept traced offsets only if downstream code demonstrates a real
+   need for it.
+9. Only consider promoting the Taylor path into this repo later if repeated downstream demand
    justifies a separate non-parity API.
