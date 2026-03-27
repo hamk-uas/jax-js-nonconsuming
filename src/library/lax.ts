@@ -659,6 +659,14 @@ export function uncheckedDynamicSlice(
  *
  * When the rewrite fires, the loop runs in GPU register threads (`var<private>`) without
  * VRAM roundtrips. Use `_lastForiRewritten()` (test-only) or `setDebug(1)` to verify.
+ *
+ * **Autodiff limitations:**
+ * - `grad(jit(f))` is **not supported** when `f` contains `foriLoop`. Use `jit(grad(f))` instead.
+ * - Reverse-mode with symbolic (Dim) bounds requires `lower = 0`; general symbolic lower bounds
+ *   are not yet supported in the transpose rule.
+ *
+ * **Dynamic bounds:** The type signature accepts `Dim` for both bounds, but eager-mode execution
+ * requires concrete numbers. Symbolic `Dim` bounds are resolved at runtime only under `jit()`.
  */
 export function foriLoop<C extends tree.JsTree<Array>>(
   lower: number | Dim,

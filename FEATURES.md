@@ -568,7 +568,9 @@ A few functions in `jax.lax` have been implemented:
   (`var<workgroup>`-based A/B tile loading with per-thread accumulation loops; supports non-aligned
   dimensions via `padConcrete`, full autodiff)
 - `foriLoop()` for fixed-iteration loops inside block bodies (carry state via shared memory,
-  compiled into WGSL `for` loops)
+  compiled into WGSL `for` loops). Supports JVP, reverse-mode, and vmap. Limitations: `grad(jit(f))`
+  is not supported (use `jit(grad(f))`); reverse-mode with symbolic bounds requires `lower = 0`;
+  eager mode requires concrete bounds even though the type accepts `Dim`
 - `workgroupAssociativeScan()` for intra-block parallel prefix scans inside `blockMap` (Kogge-Stone
   within a single workgroup using ping-pong shared memory)
 - `linalg.triangular_solve()` for triangular system solving
