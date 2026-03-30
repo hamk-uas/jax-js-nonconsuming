@@ -60,6 +60,7 @@ const CTRL_AUX_RESULT = 5;
 const CTRL_INPUTS = 6;
 /** Maximum number of mega-module inputs. */
 const MAX_INPUTS = 64;
+export const ORCHESTRATOR_MAX_INPUTS = MAX_INPUTS;
 /** Total Int32 slots in the control buffer. */
 const CTRL_TOTAL = CTRL_INPUTS + MAX_INPUTS; // 70
 

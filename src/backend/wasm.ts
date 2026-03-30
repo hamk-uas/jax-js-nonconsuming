@@ -36,7 +36,10 @@ import {
   wasm_threefry2x32,
 } from "./wasm/builtins";
 import type { WasmMegaModule } from "./wasm/mega-module";
-import { OrchestratorWorker } from "./wasm/orchestrator";
+import {
+  OrchestratorWorker,
+  ORCHESTRATOR_MAX_INPUTS,
+} from "./wasm/orchestrator";
 import {
   getArgsortModule,
   getCholeskyModule,
@@ -68,6 +71,11 @@ interface WasmBuffer {
 
 interface WasmProgram {
   module: WebAssembly.Module;
+}
+
+interface MegaArenaLease {
+  ptr: number;
+  release(): void;
 }
 
 /** A single step in the native scan body (after analysis). */
@@ -204,6 +212,10 @@ export class WasmBackend implements Backend {
   #buffers: Map<Slot, WasmBuffer>;
   /** Cache WebAssembly instances keyed by module for reuse in dispatch. */
   #instanceCache: WeakMap<WebAssembly.Module, WebAssembly.Instance>;
+  /** Reusable scratch arena for mega-module internal buffers. */
+  #megaArenaPtr: number = 0;
+  #megaArenaSize: number = 0;
+  #megaArenaInUse: boolean = false;
   /**
    * Whether this thread can spin-wait for Workers to complete.
    *
@@ -330,6 +342,45 @@ export class WasmBackend implements Backend {
     return this.#canSpinWaitWorkers;
   }
 
+  #acquireMegaArena(size: number): MegaArenaLease | null {
+    if (size === 0) return null;
+
+    if (!this.#megaArenaInUse) {
+      if (this.#megaArenaPtr === 0 || this.#megaArenaSize < size) {
+        if (this.#megaArenaPtr !== 0) {
+          this.#allocator.free(this.#megaArenaPtr);
+        }
+        this.#megaArenaPtr = this.#allocator.malloc(size);
+        this.#megaArenaSize = size;
+      }
+      this.#megaArenaInUse = true;
+      return {
+        ptr: this.#megaArenaPtr,
+        release: () => {
+          this.#megaArenaInUse = false;
+        },
+      };
+    }
+
+    const ptr = this.#allocator.malloc(size);
+    let released = false;
+    return {
+      ptr,
+      release: () => {
+        if (released) return;
+        released = true;
+        this.#allocator.free(ptr);
+      },
+    };
+  }
+
+  #releaseMegaArenaCache(): void {
+    if (this.#megaArenaInUse || this.#megaArenaPtr === 0) return;
+    this.#allocator.free(this.#megaArenaPtr);
+    this.#megaArenaPtr = 0;
+    this.#megaArenaSize = 0;
+  }
+
   /**
    * Tear down background workers (worker pool + orchestrator).
    * Called during test teardown to allow vitest/Playwright to exit cleanly.
@@ -344,6 +395,7 @@ export class WasmBackend implements Backend {
       this.#orchestrator.destroy();
       this.#orchestrator = null;
     }
+    this.#releaseMegaArenaCache();
   }
 
   slotCount(): number {
@@ -1122,70 +1174,78 @@ export class WasmBackend implements Backend {
     const resultBufSize = megaModule.numOutputs * 4;
     const resultBufPtr = this.#allocator.malloc(resultBufSize);
 
-    // E1: Allocate arena for internal buffers (one contiguous block)
     const arena = megaModule.arenaLayout;
-    const arenaPtr = arena ? this.#allocator.malloc(arena.totalSize) : 0;
+    const arenaLease = arena ? this.#acquireMegaArena(arena.totalSize) : null;
+    const arenaPtr = arenaLease?.ptr ?? 0;
 
-    const orch = this.#getOrchestrator();
-    if (orch && inputPtrs.length <= 64) {
-      // --- Orchestrator path (M6.2b): off-main-thread execution ---
-      // Register the module if not already known to the orchestrator.
-      const moduleId = orch.registerModuleSync(megaModule.module);
-      // Dispatch to orchestrator. The main thread spin-waits here,
-      // servicing alloc/free proxy requests via the control buffer.
-      orch.dispatch(
-        moduleId,
-        arena ? [...inputPtrs, arenaPtr] : inputPtrs,
-        resultBufPtr,
-        (size: number) => this.#allocator.malloc(size),
-        (ptr: number) => this.#allocator.free(ptr),
-      );
-    } else {
-      // --- Direct execution path (fallback / no orchestrator) ---
-      // Get or create cached instance (with alloc/free imports)
-      let instance = this.#instanceCache.get(megaModule.module);
-      if (!instance) {
-        instance = new WebAssembly.Instance(megaModule.module, {
-          env: {
-            memory: this.#memory,
-            alloc: (size: number) => this.#allocator.malloc(size),
-            free: (ptr: number) => this.#allocator.free(ptr),
-          },
-        });
-        this.#instanceCache.set(megaModule.module, instance);
-      }
-
-      // Call mega_execute(input0_ptr, ..., inputN_ptr, [arenaPtr,] resultBufPtr)
-      const func = instance.exports.mega_execute as (...args: number[]) => void;
-      if (arena) {
-        func(...inputPtrs, arenaPtr, resultBufPtr);
+    try {
+      const orch = this.#getOrchestrator();
+      const totalDispatchInputs = inputPtrs.length + (arena ? 1 : 0);
+      if (orch && totalDispatchInputs <= ORCHESTRATOR_MAX_INPUTS) {
+        // --- Orchestrator path (M6.2b): off-main-thread execution ---
+        // Register the module if not already known to the orchestrator.
+        const moduleId = orch.registerModuleSync(megaModule.module);
+        // Dispatch to orchestrator. The main thread spin-waits here,
+        // servicing alloc/free proxy requests via the control buffer.
+        orch.dispatch(
+          moduleId,
+          arena ? [...inputPtrs, arenaPtr] : inputPtrs,
+          resultBufPtr,
+          (size: number) => this.#allocator.malloc(size),
+          (ptr: number) => this.#allocator.free(ptr),
+        );
       } else {
-        func(...inputPtrs, resultBufPtr);
+        // --- Direct execution path (fallback / no orchestrator) ---
+        // Get or create cached instance (with alloc/free imports)
+        let instance = this.#instanceCache.get(megaModule.module);
+        if (!instance) {
+          instance = new WebAssembly.Instance(megaModule.module, {
+            env: {
+              memory: this.#memory,
+              alloc: (size: number) => this.#allocator.malloc(size),
+              free: (ptr: number) => this.#allocator.free(ptr),
+            },
+          });
+          this.#instanceCache.set(megaModule.module, instance);
+        }
+
+        // Call mega_execute(input0_ptr, ..., inputN_ptr, [arenaPtr,] resultBufPtr)
+        const func = instance.exports.mega_execute as (
+          ...args: number[]
+        ) => void;
+        if (arena) {
+          func(...inputPtrs, arenaPtr, resultBufPtr);
+        } else {
+          func(...inputPtrs, resultBufPtr);
+        }
       }
+
+      // Read output pointers from result buffer and create Slots.
+      // All outputs are new allocations (pass-through outputs are rejected
+      // at compile time by compileToMegaModule).
+      const view = new DataView(
+        this.#memory.buffer,
+        resultBufPtr,
+        resultBufSize,
+      );
+      const outputSlots: Slot[] = [];
+
+      for (let i = 0; i < megaModule.numOutputs; i++) {
+        const ptr = view.getInt32(i * 4, true); // little-endian
+        const slot = this.#nextSlot++;
+        this.#buffers.set(slot, {
+          ptr,
+          size: megaModule.outputSizes[i],
+          ref: 1,
+        });
+        outputSlots.push(slot);
+      }
+
+      return outputSlots;
+    } finally {
+      this.#allocator.free(resultBufPtr);
+      arenaLease?.release();
     }
-
-    // Read output pointers from result buffer and create Slots.
-    // All outputs are new allocations (pass-through outputs are rejected
-    // at compile time by compileToMegaModule).
-    const view = new DataView(this.#memory.buffer, resultBufPtr, resultBufSize);
-    const outputSlots: Slot[] = [];
-
-    for (let i = 0; i < megaModule.numOutputs; i++) {
-      const ptr = view.getInt32(i * 4, true); // little-endian
-      const slot = this.#nextSlot++;
-      this.#buffers.set(slot, {
-        ptr,
-        size: megaModule.outputSizes[i],
-        ref: 1,
-      });
-      outputSlots.push(slot);
-    }
-
-    // Free the result buffer and arena
-    this.#allocator.free(resultBufPtr);
-    if (arena) this.#allocator.free(arenaPtr);
-
-    return outputSlots;
   }
 
   // ---------------------------------------------------------------------------
@@ -1246,90 +1306,105 @@ export class WasmBackend implements Backend {
       locals[i] = this.#getPtr(inputSlots[i]);
     }
 
-    // E1: Allocate arena for internal buffers (one contiguous block)
     const arena = megaModule.arenaLayout;
-    const arenaPtr = arena ? this.#allocator.malloc(arena.totalSize) : 0;
+    const arenaLease = arena ? this.#acquireMegaArena(arena.totalSize) : null;
+    const arenaPtr = arenaLease?.ptr ?? 0;
 
-    // Walk step metadata, executing each step
-    for (const step of megaModule.stepInfos) {
-      switch (step.type) {
-        case "malloc": {
-          // E1: Arena-eligible mallocs use pre-planned offset.
-          if (arena && arena.mallocOffsets.has(step.outputIdx)) {
-            locals[step.outputIdx] =
-              arenaPtr + arena.mallocOffsets.get(step.outputIdx)!;
-          } else {
-            const ptr = this.#allocator.malloc(step.size);
-            locals[step.outputIdx] = ptr;
-          }
-          if (step.initialData) {
-            new Uint8Array(
-              this.#memory.buffer,
-              locals[step.outputIdx],
-              step.initialData.byteLength,
-            ).set(step.initialData);
-          }
-          break;
-        }
-
-        case "free":
-          // E1: Skip free for arena-managed buffers.
-          if (arena && arena.arenaLocalIdxs.has(step.inputIdx)) {
-            locals[step.inputIdx] = 0;
+    try {
+      // Walk step metadata, executing each step
+      for (const step of megaModule.stepInfos) {
+        switch (step.type) {
+          case "malloc": {
+            // E1: Arena-eligible mallocs use pre-planned offset.
+            if (arena && arena.mallocOffsets.has(step.outputIdx)) {
+              locals[step.outputIdx] =
+                arenaPtr + arena.mallocOffsets.get(step.outputIdx)!;
+            } else {
+              const ptr = this.#allocator.malloc(step.size);
+              locals[step.outputIdx] = ptr;
+            }
+            if (step.initialData) {
+              new Uint8Array(
+                this.#memory.buffer,
+                locals[step.outputIdx],
+                step.initialData.byteLength,
+              ).set(step.initialData);
+            }
             break;
           }
-          this.#allocator.free(locals[step.inputIdx]);
-          locals[step.inputIdx] = 0;
-          break;
 
-        case "recycle":
-          locals[step.toIdx] = locals[step.fromIdx];
-          locals[step.fromIdx] = 0;
-          break;
+          case "free":
+            // E1: Skip free for arena-managed buffers.
+            if (arena && arena.arenaLocalIdxs.has(step.inputIdx)) {
+              locals[step.inputIdx] = 0;
+              break;
+            }
+            this.#allocator.free(locals[step.inputIdx]);
+            locals[step.inputIdx] = 0;
+            break;
 
-        case "kernel": {
-          const args = [...step.inputIdxs, ...step.outputIdxs].map(
-            (idx) => locals[idx],
-          );
+          case "recycle":
+            locals[step.toIdx] = locals[step.fromIdx];
+            locals[step.fromIdx] = 0;
+            break;
 
-          if (step.kernelSize >= PARALLEL_THRESHOLD) {
-            // Parallel dispatch across workers
-            pool.dispatchSync(
-              moduleId,
-              instance,
-              step.kernelSize,
-              args,
-              step.kernelIdx,
+          case "kernel": {
+            const args = [...step.inputIdxs, ...step.outputIdxs].map(
+              (idx) => locals[idx],
             );
-          } else {
-            // Serial dispatch on main thread only
-            const fn = instance.exports[`kernel_${step.kernelIdx}`] as (
-              ...a: number[]
-            ) => void;
-            fn(0, step.kernelSize, ...args);
+
+            if (step.kernelSize >= PARALLEL_THRESHOLD) {
+              // Parallel dispatch across workers
+              pool.dispatchSync(
+                moduleId,
+                instance,
+                step.kernelSize,
+                args,
+                step.kernelIdx,
+              );
+            } else {
+              // Serial dispatch on main thread only
+              const fn = instance.exports[`kernel_${step.kernelIdx}`] as (
+                ...a: number[]
+              ) => void;
+              fn(0, step.kernelSize, ...args);
+            }
+            break;
           }
-          break;
         }
       }
+
+      // Read output pointers from locals and create Slots
+      const outputSlots: Slot[] = [];
+      for (let i = 0; i < megaModule.numOutputs; i++) {
+        const outputLocalIdx = megaModule.outputLocalIdxs[i];
+        const ptr = locals[outputLocalIdx];
+        const slot = this.#nextSlot++;
+        this.#buffers.set(slot, {
+          ptr,
+          size: megaModule.outputSizes[i],
+          ref: 1,
+        });
+        locals[outputLocalIdx] = 0;
+        outputSlots.push(slot);
+      }
+
+      return outputSlots;
+    } finally {
+      for (
+        let localIdx = megaModule.numInputs;
+        localIdx < locals.length;
+        localIdx++
+      ) {
+        if (arena && arena.arenaLocalIdxs.has(localIdx)) continue;
+        const ptr = locals[localIdx];
+        if (ptr !== 0) {
+          this.#allocator.free(ptr);
+          locals[localIdx] = 0;
+        }
+      }
+      arenaLease?.release();
     }
-
-    // Read output pointers from locals and create Slots
-    const outputSlots: Slot[] = [];
-    for (let i = 0; i < megaModule.numOutputs; i++) {
-      const ptr = locals[megaModule.outputLocalIdxs[i]];
-      const slot = this.#nextSlot++;
-      this.#buffers.set(slot, {
-        ptr,
-        size: megaModule.outputSizes[i],
-        ref: 1,
-      });
-      outputSlots.push(slot);
-    }
-
-    // E1: Free arena (single deallocation replaces N individual frees)
-    if (arena) this.#allocator.free(arenaPtr);
-
-    return outputSlots;
   }
 
   /**
