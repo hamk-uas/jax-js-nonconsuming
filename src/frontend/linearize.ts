@@ -4600,19 +4600,32 @@ function customVjpPath(
     throw new Error("customVjp functions do not support hasAux in vjp()");
   }
 
+  // Flatten primal inputs to capture the input tree for cotangent validation.
+  const [, primalsInTree] = treeFlatten(primalsIn);
+
   // Forward: call user's fwd function normally.
   const [outputs, residuals] = cvd.fwd(...primalsIn);
 
-  // Detach residuals from the trace so they become constants in any outer
-  // differentiation context.
-  const detachedOwned: Tracer[] = [];
+  // Independently retain residual Array leaves so the pullback survives even
+  // if the caller disposes the primal outputs (which may alias residuals).
+  // Detach from the trace via stopGradient so residuals become constants in
+  // any outer differentiation context.
+  const retainedResiduals: Tracer[] = [];
   const detachedResiduals = treeMap((leaf: any) => {
     if (leaf instanceof Tracer) {
       const sg = stopGradient(leaf);
-      // In eager mode, stopGradient returns the same object.
-      // We must only take ownership of truly new objects to prevent double-free.
-      if (sg !== leaf) detachedOwned.push(sg as Tracer);
-      return sg;
+      if (sg !== leaf) {
+        // Tracing mode: stopGradient produced a new wrapper — own it.
+        retainedResiduals.push(sg as Tracer);
+        return sg;
+      }
+      // Eager mode: stopGradient is identity. Take an independent ref so
+      // the residual stays alive regardless of what the caller does with
+      // the output.
+      // jax-js-lint: allow-ref — residual retention for pullback lifetime
+      const retained = leaf.ref;
+      retainedResiduals.push(retained);
+      return retained;
     }
     return leaf;
   }, residuals);
@@ -4620,19 +4633,19 @@ function customVjpPath(
   // Build the VJP function.
   const vjpFn = ((cotangents: any) => {
     const rawCts = cvd.bwd(detachedResiduals, cotangents);
-    const ctsArray = Array.isArray(rawCts) ? rawCts : [rawCts];
-    if (ctsArray.length !== primalsIn.length) {
-      throw new Error(
-        `customVjp backward function returned ${ctsArray.length} cotangents, but expected ${primalsIn.length}`,
-      );
+    // Validate cotangent structure: must match the primal input tree.
+    const ctsArray = globalThis.Array.isArray(rawCts) ? rawCts : [rawCts];
+    const [ctsFlat, ctsTree] = treeFlatten(ctsArray);
+    if (!primalsInTree.equals(ctsTree)) {
+      throw new TreeMismatchError("customVjp backward", primalsInTree, ctsTree);
     }
-    return ctsArray;
+    return ctsFlat;
   }) as OwnedFunction<(...cotangents: any) => any>;
 
-  // Dispose detached residuals when the vjpFn is disposed.
+  // Release retained residuals when the vjpFn is disposed.
   vjpFn.dispose = () => {
     if (!insideAbstractTrace()) {
-      for (const a of detachedOwned) a.dispose();
+      for (const a of retainedResiduals) a.dispose();
     }
   };
   vjpFn[Symbol.dispose] = vjpFn.dispose;

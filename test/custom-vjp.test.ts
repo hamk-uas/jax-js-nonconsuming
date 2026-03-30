@@ -256,4 +256,45 @@ describe("customVjp", () => {
     expect(bwdCalled).toBe(true);
     expect(dx).toBeAllclose(5.0);
   });
+
+  test("pullback survives after output disposal (residual aliasing)", () => {
+    // Residuals may alias the output. The pullback must independently retain
+    // residual leaves so it works even after the caller disposes the output.
+    const f = customVjp(
+      (x: np.Array) => {
+        const y = x.mul(x); // output
+        return [y, y]; // residual aliases output
+      },
+      (res: np.Array, g: np.Array) => {
+        // bwd: res * g  (res is the aliased output y = x^2)
+        return np.multiply(res, g);
+      },
+    );
+
+    using x = np.array(3.0);
+    const [y, vjpFn] = vjp(f, [x]);
+    // Dispose output BEFORE calling pullback — must not crash.
+    (y as np.Array).dispose();
+    using ones = np.ones([]);
+    const cts = vjpFn(ones);
+    using dx = (cts as np.Array[])[0];
+    // y = x^2 = 9, custom bwd: res * g = 9 * 1 = 9
+    expect(dx).toBeAllclose(9.0);
+    vjpFn.dispose();
+  });
+
+  test("backward with wrong cotangent structure throws", () => {
+    const f = customVjp(
+      (x: np.Array) => [x, null],
+      // Return an object instead of an array — wrong structure
+      (_res: null, g: np.Array) => ({ wrong: g }),
+    );
+
+    using x = np.array([1.0, 2.0]);
+    const [y, vjpFn] = vjp(f, [x]);
+    using _yArr = y as np.Array;
+    using ones = np.ones([2]);
+    expect(() => vjpFn(ones)).toThrow(/customVjp backward/);
+    vjpFn.dispose();
+  });
 });
