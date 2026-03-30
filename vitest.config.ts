@@ -13,6 +13,10 @@ export default defineConfig({
       // two module graphs where `instanceof Tracer` fails and leak
       // detection sees mismatched singletons.
       "@hamk-uas/jax-js-nonconsuming": path.resolve(__dirname, "src/index.ts"),
+      "@hamk-uas/jax-js-nonconsuming-jaxopt": path.resolve(
+        __dirname,
+        "packages/jaxopt/src/index.ts",
+      ),
       "@hamk-uas/jax-js-nonconsuming-optax": path.resolve(
         __dirname,
         "packages/optax/src/index.ts",

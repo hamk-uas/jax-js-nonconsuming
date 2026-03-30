@@ -1743,6 +1743,56 @@ export class TreeMismatchError extends TypeError {
 
 type Store<T> = { value: T | undefined };
 
+const customJvpDefSymbol = Symbol("customJvpDef");
+const customVjpDefSymbol = Symbol("customVjpDef");
+const customJvpFlatInTreeSymbol = Symbol("customJvpFlatInTree");
+const customJvpOutTreeStoreSymbol = Symbol("customJvpOutTreeStore");
+
+export function getCustomJvpDef(f: any): any {
+  return f?.[customJvpDefSymbol];
+}
+
+export function setCustomJvpDef(f: any, def: any): void {
+  f[customJvpDefSymbol] = def;
+}
+
+export function getCustomVjpDef(f: any): any {
+  return f?.[customVjpDefSymbol];
+}
+
+export function setCustomVjpDef(f: any, def: any): void {
+  f[customVjpDefSymbol] = def;
+}
+
+export function getCustomJvpFlatInTree(f: any): JsTreeDef | undefined {
+  return f?.[customJvpFlatInTreeSymbol];
+}
+
+export function getCustomJvpOutTreeStore(f: any): Store<JsTreeDef> | undefined {
+  return f?.[customJvpOutTreeStoreSymbol];
+}
+
+export function propagateCustomDerivativeMetadata(
+  source: any,
+  target: any,
+  options?: { flatInTree?: JsTreeDef; outTreeStore?: Store<JsTreeDef> },
+): void {
+  const customJvpDef = getCustomJvpDef(source);
+  if (customJvpDef !== undefined) {
+    target[customJvpDefSymbol] = customJvpDef;
+    if (options?.flatInTree !== undefined) {
+      target[customJvpFlatInTreeSymbol] = options.flatInTree;
+    }
+    if (options?.outTreeStore !== undefined) {
+      target[customJvpOutTreeStoreSymbol] = options.outTreeStore;
+    }
+  }
+  const customVjpDef = getCustomVjpDef(source);
+  if (customVjpDef !== undefined) {
+    target[customVjpDefSymbol] = customVjpDef;
+  }
+}
+
 /** Flatten a function of `JsTree` input/output for use in tracing. */
 export function flattenFun(f: any, inTree: JsTreeDef): [any, Store<JsTreeDef>] {
   const store: Store<JsTreeDef> = { value: undefined };
@@ -1753,6 +1803,10 @@ export function flattenFun(f: any, inTree: JsTreeDef): [any, Store<JsTreeDef>] {
     store.value = outTree;
     return outFlat;
   };
+  propagateCustomDerivativeMetadata(f, flatFun, {
+    flatInTree: inTree,
+    outTreeStore: store,
+  });
   return [flatFun, store];
 }
 
@@ -1777,6 +1831,10 @@ export function flattenFunWithAux(
     auxStore.value = aux;
     return outFlat;
   };
+  propagateCustomDerivativeMetadata(f, flatFun, {
+    flatInTree: inTree,
+    outTreeStore: store,
+  });
   return [flatFun, store, auxStore];
 }
 

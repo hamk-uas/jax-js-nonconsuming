@@ -428,6 +428,72 @@ export const hessian = linearizeModule.hessian as <
 ) => (...args: MapJsTree<Parameters<F>, Array, ArrayLike>) => ReturnType<F>;
 
 /**
+ * Create a function with a custom vector-Jacobian product (VJP) rule.
+ *
+ * When the returned function is differentiated via {@link vjp}, {@link grad},
+ * or {@link valueAndGrad}, the supplied `bwd` function is invoked instead of
+ * the standard autodiff backward pass.  This enables implicit
+ * differentiation, numerically stable gradients, and memory-efficient
+ * backpropagation.
+ *
+ * @param fwd  Forward function returning `[outputs, residuals]`.
+ * @param bwd  Backward function `(residuals, cotangents) => inputCotangents`.
+ *
+ * @example
+ * ```ts
+ * const stableLog1pExp = customVjp(
+ *   (x) => {
+ *     const out = np.log(np.add(np.array(1), np.exp(x)));
+ *     return [out, x];
+ *   },
+ *   (x, g) => np.multiply(g, np.subtract(np.array(1), np.exp(np.negative(x)))),
+ * );
+ *
+ * const dx = grad(stableLog1pExp)(np.array(100.0)); // 1.0, not NaN
+ * ```
+ */
+export const customVjp = linearizeModule.customVjp;
+
+/**
+ * Create a function with a custom Jacobian-vector product (JVP) rule.
+ *
+ * Defines how forward-mode differentiation behaves for a function.
+ * Unlike {@link customVjp}, a custom JVP rule automatically provides
+ * correct reverse-mode derivatives via transpose.
+ *
+ * @param fn       The primal function.
+ * @param jvpRule  Custom JVP rule `(primals, tangents) => [primalOut, tangentOut]`.
+ *
+ * @example
+ * ```ts
+ * const stableLog1pExp = customJvp(
+ *   (x) => np.log(np.add(np.array(1), np.exp(x))),
+ *   ([x], [dx]) => {
+ *     const y = np.log(np.add(np.array(1), np.exp(x)));
+ *     const dy = np.multiply(dx, np.subtract(np.array(1), np.exp(np.negative(x))));
+ *     return [y, dy];
+ *   },
+ * );
+ * ```
+ */
+export const customJvp = linearizeModule.customJvp;
+
+/**
+ * Solve a linear system `matvec(x) = b` with implicit differentiation.
+ *
+ * Reverse-mode differentiation uses the transpose solve instead of
+ * differentiating through the solver's internal iterations.
+ *
+ * @param matvec  Linear operator `A`: maps `x → Ax`.
+ * @param b       Right-hand side.
+ * @param solve   Forward solver `(matvec, b) → x`.
+ * @param opts    Optional transpose solve and symmetry settings.
+ */
+export const customLinearSolve = linearizeModule.customLinearSolve;
+
+export type { CustomLinearSolveOpts } from "./frontend/linearize";
+
+/**
  * Wait until all `Array` leaves are ready by calling `Array.blockUntilReady()`.
  *
  * This can be used to wait for the results of an intermediate computation to

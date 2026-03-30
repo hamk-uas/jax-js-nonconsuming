@@ -35,6 +35,10 @@ import {
   flattenFunWithAux,
   fullRaise,
   gather,
+  getCustomJvpDef,
+  getCustomJvpFlatInTree,
+  getCustomJvpOutTreeStore,
+  getCustomVjpDef,
   hasAbstractTraceBelow,
   idiv,
   less,
@@ -1289,6 +1293,50 @@ export function jvp<F extends (...x: any[]) => any>(
   tangents: JsTree<TracerValue>[],
   { hasAux = false } = {},
 ): [any, any, any?] {
+  // --- custom_jvp fast path ---
+  // If `f` was created by `customJvp(fn, jvpRule)`, call the user-supplied
+  // JVP rule directly instead of tracing through `fn`.
+  const cjd = getCustomJvpDef(f) as { fn: any; jvpRule: any } | undefined;
+  if (cjd) {
+    if (hasAux) {
+      throw new Error("customJvp functions do not support hasAux in jvp()");
+    }
+    const flatInTree = getCustomJvpFlatInTree(f);
+    const flatOutTreeStore = getCustomJvpOutTreeStore(f);
+    if (flatInTree) {
+      if (flatOutTreeStore === undefined) {
+        throw new Error(
+          "internal: flattened customJvp function missing outTree store",
+        );
+      }
+      // Flat calling convention: use the custom rule once, then populate the
+      // flattened wrapper's outTree store from the primal result.
+      const primalsUser = treeUnflatten(flatInTree, primals);
+      const tangentsUser = treeUnflatten(flatInTree, tangents);
+      const [primalOutUser, tangentOutUser] = cjd.jvpRule(
+        primalsUser,
+        tangentsUser,
+      );
+      const [primalOutFlat, outTree] = treeFlatten(primalOutUser);
+      flatOutTreeStore.value = outTree;
+      const [tangentOutFlat, tangentTree] = treeFlatten(tangentOutUser);
+      if (!outTree.equals(tangentTree)) {
+        throw new TreeMismatchError("customJvp", outTree, tangentTree);
+      }
+      return [primalOutFlat, tangentOutFlat];
+    }
+    // Direct call: jvp(customJvpFn, primals, tangents)
+    const [primalOut, tangentOut] = cjd.jvpRule(primals, tangents);
+    return [primalOut, tangentOut];
+  }
+
+  if (getCustomVjpDef(f)) {
+    throw new Error(
+      "Function has a customVjp but was differentiated in forward-mode (jvp/jacfwd). " +
+        "customVjp only defines reverse-mode rules. Implement customJvp for this path.",
+    );
+  }
+
   const [primalsFlat, inTree] = treeFlatten(primals);
   const [tangentsFlat, inTree2] = treeFlatten(tangents);
   if (!inTree.equals(inTree2)) {

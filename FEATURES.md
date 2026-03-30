@@ -27,57 +27,58 @@ In the tables below, we use a color legend to refer to functions in JAX:
 [API docs](https://hamk-uas.github.io/jax-js-nonconsuming/docs/modules/_jax-js_jax.html) for these
 functions.
 
-| API                  | Support | Notes                                            |
-| -------------------- | ------- | ------------------------------------------------ |
-| `config`             | ⚪️      | no separate config object                        |
-| `default_device`     | 🟢      | devices are strings; there is only 1 GPU on web  |
-| `jit`                | 🟢      |                                                  |
-| `make_jaxpr`         | 🟢      |                                                  |
-| `eval_shape`         | 🟠      |                                                  |
-| `ShapeDtypeStruct`   | 🟠      |                                                  |
-| `device_put`         | 🟢      | async-only for performance                       |
-| `device_get`         | ⚪️      | no separate "host" device                        |
-| `default_backend`    | ⚪️      | XLA feature                                      |
-| `named_call`         | ⚪️      | XLA feature                                      |
-| `named_scope`        | ⚪️      | XLA feature                                      |
-| `block_until_ready`  | 🟢      |                                                  |
-| `copy_to_host_async` | ⚪️      | no separate "host" device                        |
-| `make_mesh`          | ⚪️      | device sharding                                  |
-| `set_mesh`           | ⚪️      | device sharding                                  |
-| `grad`               | 🟢      |                                                  |
-| `value_and_grad`     | 🟢      |                                                  |
-| `jacobian`           | 🟢      |                                                  |
-| `jacfwd`             | 🟢      |                                                  |
-| `jacrev`             | 🟢      |                                                  |
-| `hessian`            | 🟢      |                                                  |
-| `jvp`                | 🟢      |                                                  |
-| `linearize`          | 🟢      |                                                  |
-| `aotLinearize`       | 🟢      | jax-js extension: AOT forward/backward artifacts |
-| `linear_transpose`   | 🟠      |                                                  |
-| `vjp`                | 🟢      |                                                  |
-| `custom_gradient`    | 🔴      | core engine feature                              |
-| `closure_convert`    | 🔴      | core engine feature                              |
-| `checkpoint`         | 🔴      | core engine feature                              |
-| `vmap`               | 🟢      | all primitives have vmap rules                   |
-| `shard_map`          | ⚪️      | device sharding                                  |
-| `smap`               | ⚪️      | device sharding                                  |
-| `pmap`               | ⚪️      | device sharding                                  |
-| `devices`            | 🟢      | semantics differ, returns all devices            |
-| `local_devices`      | ⚪️      | device sharding                                  |
-| `process_index`      | ⚪️      | device sharding                                  |
-| `device_count`       | ⚪️      | device sharding                                  |
-| `local_device_count` | ⚪️      | device sharding                                  |
-| `process_count`      | ⚪️      | device sharding                                  |
-| `process_indices`    | ⚪️      | device sharding                                  |
-| `custom_jvp`         | 🔴      | core engine feature                              |
-| `custom_vjp`         | 🔴      | core engine feature                              |
-| `custom_batching`    | 🔴      | core engine feature                              |
-| `Array`              | 🟢      |                                                  |
-| `checkLeaks`         | 🟢      | leak diagnostic (slot count delta + stack trace) |
-| `clearCaches`        | 🟢      | flush JIT caches to free GPU/WASM memory         |
-| `getCacheSizes`      | 🟢      | inspect JIT cache entry counts                   |
-| `scatterAdd`         | 🟢      | scatter-add with autodiff (JVP, transpose, vmap) |
-| `withBatch`          | 🟢      | batch GPU dispatches into single queue.submit()  |
+| API                  | Support | Notes                                                  |
+| -------------------- | ------- | ------------------------------------------------------ |
+| `config`             | ⚪️      | no separate config object                              |
+| `default_device`     | 🟢      | devices are strings; there is only 1 GPU on web        |
+| `jit`                | 🟢      |                                                        |
+| `make_jaxpr`         | 🟢      |                                                        |
+| `eval_shape`         | 🟠      |                                                        |
+| `ShapeDtypeStruct`   | 🟠      |                                                        |
+| `device_put`         | 🟢      | async-only for performance                             |
+| `device_get`         | ⚪️      | no separate "host" device                              |
+| `default_backend`    | ⚪️      | XLA feature                                            |
+| `named_call`         | ⚪️      | XLA feature                                            |
+| `named_scope`        | ⚪️      | XLA feature                                            |
+| `block_until_ready`  | 🟢      |                                                        |
+| `copy_to_host_async` | ⚪️      | no separate "host" device                              |
+| `make_mesh`          | ⚪️      | device sharding                                        |
+| `set_mesh`           | ⚪️      | device sharding                                        |
+| `grad`               | 🟢      |                                                        |
+| `value_and_grad`     | 🟢      |                                                        |
+| `jacobian`           | 🟢      |                                                        |
+| `jacfwd`             | 🟢      |                                                        |
+| `jacrev`             | 🟢      |                                                        |
+| `hessian`            | 🟢      |                                                        |
+| `jvp`                | 🟢      |                                                        |
+| `linearize`          | 🟢      |                                                        |
+| `aotLinearize`       | 🟢      | jax-js extension: AOT forward/backward artifacts       |
+| `linear_transpose`   | 🟠      |                                                        |
+| `vjp`                | 🟢      |                                                        |
+| `custom_gradient`    | 🔴      | core engine feature                                    |
+| `closure_convert`    | 🔴      | core engine feature                                    |
+| `checkpoint`         | 🔴      | core engine feature                                    |
+| `vmap`               | 🟢      | all primitives have vmap rules                         |
+| `shard_map`          | ⚪️      | device sharding                                        |
+| `smap`               | ⚪️      | device sharding                                        |
+| `pmap`               | ⚪️      | device sharding                                        |
+| `devices`            | 🟢      | semantics differ, returns all devices                  |
+| `local_devices`      | ⚪️      | device sharding                                        |
+| `process_index`      | ⚪️      | device sharding                                        |
+| `device_count`       | ⚪️      | device sharding                                        |
+| `local_device_count` | ⚪️      | device sharding                                        |
+| `process_count`      | ⚪️      | device sharding                                        |
+| `process_indices`    | ⚪️      | device sharding                                        |
+| `custom_jvp`         | �       | custom forward-mode AD rules (+ reverse via transpose) |
+| `custom_vjp`         | 🟢      | custom reverse-mode AD rules                           |
+| `customLinearSolve`  | 🟢      | implicit differentiation for linear solves             |
+| `custom_batching`    | 🔴      | core engine feature                                    |
+| `Array`              | 🟢      |                                                        |
+| `checkLeaks`         | 🟢      | leak diagnostic (slot count delta + stack trace)       |
+| `clearCaches`        | 🟢      | flush JIT caches to free GPU/WASM memory               |
+| `getCacheSizes`      | 🟢      | inspect JIT cache entry counts                         |
+| `scatterAdd`         | 🟢      | scatter-add with autodiff (JVP, transpose, vmap)       |
+| `withBatch`          | 🟢      | batch GPU dispatches into single queue.submit()        |
 
 Array primitives need to be called with methods like `a.add(b)` / `a.mul(b)` instead of `a + b` and
 `a * b` as in Python, which has overloading.

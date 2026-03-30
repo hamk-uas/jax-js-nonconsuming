@@ -42,6 +42,7 @@ import {
   Primitive,
   PrimitiveParams,
   promoteAvals,
+  propagateCustomDerivativeMetadata,
   ShapedArray,
   Trace,
   Tracer,
@@ -1960,6 +1961,8 @@ export function jit<F extends (...args: any[]) => any>(
   // frees ClosedJaxpr consts and clears the cache — the next call will
   // re-trace and create fresh consts.
   _jitFunctionDisposers.add(result.dispose);
+
+  propagateCustomDerivativeMetadata(f, result);
 
   // Store in registry for dedup of subsequent jit(f, opts) calls.
   let registry = byOpts;

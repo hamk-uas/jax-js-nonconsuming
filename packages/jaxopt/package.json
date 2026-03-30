@@ -1,0 +1,44 @@
+{
+  "name": "@hamk-uas/jax-js-nonconsuming-jaxopt",
+  "version": "0.1.0",
+  "description": "Hardware-accelerated optimization with implicit differentiation for jax-js",
+  "keywords": [
+    "optimization",
+    "L-BFGS-B",
+    "implicit differentiation",
+    "jax",
+    "numerical computing"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hamk-uas/jax-js-nonconsuming.git"
+  },
+  "type": "module",
+  "files": [
+    "/dist/*.{js,cjs,d.ts,d.cts}"
+  ],
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./dist/index.d.ts": {
+      "import": "./dist/index.d.ts",
+      "require": "./dist/index.d.cts"
+    }
+  },
+  "types": "dist/index.d.ts",
+  "module": "dist/index.js",
+  "license": "MIT",
+  "scripts": {
+    "prepublishOnly": "pnpm -C ../.. build",
+    "postpublish": "git tag jaxopt/v$npm_package_version && git push --tags"
+  },
+  "peerDependencies": {
+    "@hamk-uas/jax-js-nonconsuming": ">=0.11.0"
+  },
+  "devDependencies": {
+    "@hamk-uas/jax-js-nonconsuming": "workspace:^"
+  }
+}

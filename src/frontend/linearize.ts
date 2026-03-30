@@ -28,6 +28,7 @@ import {
   Array as JaxArray,
   onesLike,
   pureArray,
+  zerosLike,
 } from "./array";
 import { aotLinearize } from "./artifacts";
 import {
@@ -50,6 +51,7 @@ import {
   flip,
   fullRaise,
   gather,
+  getCustomVjpDef,
   insideAbstractTrace,
   max,
   min,
@@ -64,6 +66,8 @@ import {
   reshape,
   reverse,
   scatterAdd,
+  setCustomJvpDef,
+  setCustomVjpDef,
   ShapedArray,
   shrink,
   split,
@@ -4338,6 +4342,14 @@ export function vjp(
   primalsIn: any[],
   { hasAux = false } = {},
 ): [any, OwnedFunction<(...cotangents: any) => any>, any?] {
+  // --- custom_vjp fast path ---
+  // If `f` was created by `customVjp(fwd, bwd)`, bypass the standard
+  // linearize + transpose pipeline and use the user-supplied backward pass.
+  const cvd = getCustomVjpDef(f) as CustomVjpDef | undefined;
+  if (cvd) {
+    return customVjpPath(cvd, primalsIn, hasAux);
+  }
+
   const [primalsInFlat, inTree] = treeFlatten(primalsIn);
   let fFlat, outTree, aux;
   if (hasAux) {
@@ -4550,4 +4562,345 @@ export function jacrev(f: any) {
 // See also: jacfwd()
 export function hessian(f: any) {
   return jacfwd(grad(f));
+}
+
+// ---------------------------------------------------------------------------
+// custom_vjp: user-defined VJP rules
+// ---------------------------------------------------------------------------
+
+/**
+ * Internal descriptor attached to functions wrapped by {@link customVjp}.
+ * @internal
+ */
+interface CustomVjpDef {
+  fwd: (...args: any[]) => [any, any];
+  bwd: (residuals: any, cotangents: any) => any;
+}
+
+/**
+ * Internal path used by {@link vjp} when the target function carries a
+ * `__customVjpDef` descriptor.
+ *
+ * 1. Calls `fwd(primals...)` → `[outputs, residuals]`.
+ * 2. Applies `stopGradient` to every Array leaf in `residuals` so that
+ *    the standard autodiff machinery treats them as constants.
+ * 3. Returns `[outputs, vjpFn]` where `vjpFn(g) = bwd(residuals, g)`.
+ *
+ * `hasAux` is intentionally unsupported here — `customVjp` wraps a
+ * *pair* of functions (`fwd`/`bwd`), not a single function with aux.
+ *
+ * @internal
+ */
+function customVjpPath(
+  cvd: CustomVjpDef,
+  primalsIn: any[],
+  hasAux: boolean,
+): [any, OwnedFunction<(...cotangents: any) => any>, any?] {
+  if (hasAux) {
+    throw new Error("customVjp functions do not support hasAux in vjp()");
+  }
+
+  // Forward: call user's fwd function normally.
+  const [outputs, residuals] = cvd.fwd(...primalsIn);
+
+  // Detach residuals from the trace so they become constants in any outer
+  // differentiation context.
+  const detachedOwned: Tracer[] = [];
+  const detachedResiduals = treeMap((leaf: any) => {
+    if (leaf instanceof Tracer) {
+      const sg = stopGradient(leaf);
+      // In eager mode, stopGradient returns the same object.
+      // We must only take ownership of truly new objects to prevent double-free.
+      if (sg !== leaf) detachedOwned.push(sg as Tracer);
+      return sg;
+    }
+    return leaf;
+  }, residuals);
+
+  // Build the VJP function.
+  const vjpFn = ((cotangents: any) => {
+    const rawCts = cvd.bwd(detachedResiduals, cotangents);
+    const ctsArray = Array.isArray(rawCts) ? rawCts : [rawCts];
+    if (ctsArray.length !== primalsIn.length) {
+      throw new Error(
+        `customVjp backward function returned ${ctsArray.length} cotangents, but expected ${primalsIn.length}`,
+      );
+    }
+    return ctsArray;
+  }) as OwnedFunction<(...cotangents: any) => any>;
+
+  // Dispose detached residuals when the vjpFn is disposed.
+  vjpFn.dispose = () => {
+    if (!insideAbstractTrace()) {
+      for (const a of detachedOwned) a.dispose();
+    }
+  };
+  vjpFn[Symbol.dispose] = vjpFn.dispose;
+
+  return [outputs, vjpFn];
+}
+
+/**
+ * Create a function with a custom vector-Jacobian product (VJP) rule.
+ *
+ * This is the jax-js equivalent of JAX's `jax.custom_vjp`. It lets you
+ * define exactly how reverse-mode differentiation should behave for a
+ * function, which is essential for:
+ *
+ * - **Implicit differentiation** (optimizers, fixed-point solvers)
+ * - **Numerically stable gradients** (log-sum-exp, softmax)
+ * - **Memory-efficient backprop** (checkpointing, not saving intermediates)
+ *
+ * @param fwd  Forward function. Called with the same arguments as the
+ *             original function. Must return `[outputs, residuals]` where
+ *             `residuals` is any pytree of values needed by the backward
+ *             pass. The `outputs` are returned to the caller.
+ *
+ * @param bwd  Backward function. Called with `(residuals, cotangents)` where
+ *             `residuals` is the second element returned by `fwd`, and
+ *             `cotangents` has the same pytree structure as `outputs`.
+ *             Must return an array (or pytree) of cotangents with the same
+ *             structure as the *positional arguments* to `fwd`.
+ *
+ * @returns A function with the same signature as `(...args) => outputs`.
+ *          When differentiated via `vjp()`, `grad()`, or `valueAndGrad()`,
+ *          the custom `bwd` function is invoked instead of the standard
+ *          autodiff backward pass.
+ *
+ * @example
+ * ```ts
+ * // Numerically stable log1pexp with custom gradient
+ * const log1pexp = customVjp(
+ *   // fwd: compute output + save residuals for backward
+ *   (x: np.Array) => {
+ *     const out = np.log(np.add(np.array(1), np.exp(x)));
+ *     return [out, x];  // save x as residual
+ *   },
+ *   // bwd: compute gradient using residuals
+ *   (x: np.Array, g: np.Array) => {
+ *     return np.multiply(g, np.subtract(np.array(1), np.exp(np.negative(x))));
+ *   },
+ * );
+ *
+ * const dx = grad(log1pexp)(np.array(100.0));
+ * // → 1.0 (correct), not NaN (what autodiff of log(1+exp(100)) gives)
+ * ```
+ *
+ * @example
+ * ```ts
+ * // Implicit differentiation for an optimizer
+ * const solve = customVjp(
+ *   (params: np.Array) => {
+ *     const solution = runOptimizer(params);  // opaque solve
+ *     return [solution, { solution, params }];
+ *   },
+ *   (res, g) => {
+ *     // Use the implicit function theorem: dx_star/dtheta = -(dF/dx)^-1 (dF/dtheta)
+ *     const { solution, params } = res;
+ *     const implicitGrad = computeImplicitGrad(solution, params, g);
+ *     return implicitGrad;
+ *   },
+ * );
+ * ```
+ */
+export function customVjp<F extends (...args: any[]) => any>(
+  fwd: (...args: Parameters<F>) => [ReturnType<F>, any],
+  bwd: (residuals: any, cotangents: ReturnType<F>) => any,
+): (...args: Parameters<F>) => ReturnType<F> {
+  const wrapped = (...args: Parameters<F>): ReturnType<F> => {
+    const [outputs] = fwd(...args);
+    return outputs;
+  };
+
+  // Tag the function so vjp/grad/valueAndGrad can detect it.
+  setCustomVjpDef(wrapped, { fwd, bwd } satisfies CustomVjpDef);
+
+  return wrapped as (...args: Parameters<F>) => ReturnType<F>;
+}
+
+// ---------------------------------------------------------------------------
+// custom_jvp: user-defined JVP rules
+// ---------------------------------------------------------------------------
+
+/**
+ * Internal descriptor attached to functions wrapped by {@link customJvp}.
+ * @internal
+ */
+interface CustomJvpDef {
+  fn: (...args: any[]) => any;
+  jvpRule: (primals: any[], tangents: any[]) => [any, any];
+}
+
+/**
+ * Create a function with a custom Jacobian-vector product (JVP) rule.
+ *
+ * This is the jax-js equivalent of JAX's `jax.custom_jvp`. It lets you
+ * define exactly how forward-mode differentiation should behave for a
+ * function, which is essential for:
+ *
+ * - **Numerically stable derivatives** (log-sum-exp, softmax)
+ * - **Custom local linearization** rules
+ * - **Both forward- and reverse-mode** — a custom JVP rule automatically
+ *   provides a custom VJP via transpose
+ *
+ * @param fn   The primal function to wrap.
+ *
+ * @param jvpRule  The custom JVP rule. Called with `(primals, tangents)` where
+ *                 each is an array of the same positional arguments as `fn`.
+ *                 Must return `[primalOut, tangentOut]`.
+ *
+ * @returns A function with the same signature as `fn`. When differentiated
+ *          via `jvp()`, `jacfwd()`, `grad()`, or `vjp()`, the custom
+ *          `jvpRule` is invoked instead of tracing through `fn`.
+ *
+ * @example
+ * ```ts
+ * // Numerically stable log1pexp with custom JVP
+ * const log1pexp = customJvp(
+ *   (x: np.Array) => np.log(np.add(np.array(1), np.exp(x))),
+ *   ([x], [dx]) => {
+ *     const primal = np.log(np.add(np.array(1), np.exp(x)));
+ *     const tangent = np.multiply(dx, np.subtract(np.array(1), np.exp(np.negative(x))));
+ *     return [primal, tangent];
+ *   },
+ * );
+ *
+ * // Works with both forward- and reverse-mode AD:
+ * const [y, dy] = jvp(log1pexp, [np.array(100.0)], [np.array(1.0)]);
+ * const dx = grad(log1pexp)(np.array(100.0));  // also works via transpose
+ * ```
+ */
+export function customJvp<F extends (...args: any[]) => any>(
+  fn: F,
+  jvpRule: (
+    primals: Parameters<F>,
+    tangents: Parameters<F>,
+  ) => [ReturnType<F>, ReturnType<F>],
+): F {
+  const wrapped = ((...args: any[]) => {
+    return fn(...args);
+  }) as unknown as F;
+
+  // Tag the function so jvp/jacfwd can detect it. vjp/grad also benefit
+  // because the standard linearize→transpose pipeline will trace through
+  // the custom JVP rule, producing correct reverse-mode derivatives.
+  setCustomJvpDef(wrapped, { fn, jvpRule } as unknown as CustomJvpDef);
+
+  return wrapped;
+}
+
+// ---------------------------------------------------------------------------
+// customLinearSolve: implicit differentiation for linear solves
+// ---------------------------------------------------------------------------
+
+/**
+ * Options for {@link customLinearSolve}.
+ */
+export interface CustomLinearSolveOpts {
+  /**
+   * Transpose solve function. Called as `transposeSolve(vecmat, g)` during
+   * reverse-mode differentiation, where `vecmat` is the transpose of `matvec`
+   * and `g` is the output cotangent.
+   *
+   * Required when `symmetric` is false. For symmetric operators, the forward
+   * `solve` function is reused for the transpose.
+   */
+  transposeSolve?: (vecmat: (x: any) => any, b: any) => any;
+  /** If true, `matvec` is known to be symmetric (A = A^T). */
+  symmetric?: boolean;
+}
+
+/**
+ * Solve a linear system with implicit differentiation.
+ *
+ * Computes `x = solve(matvec, b)` such that `matvec(x) ≈ b`, and provides
+ * an analytically correct VJP that avoids differentiating through the
+ * solve implementation. This is essential for:
+ *
+ * - **Matrix-free solves** (CG, GMRES, iterative methods)
+ * - **Implicit layers** (DEQ, fixed-point networks)
+ * - **Optimization** (Newton steps, trust-region subproblems)
+ *
+ * ### Mathematical background
+ *
+ * Given `A x = b` where `A` is the linear operator represented by `matvec`:
+ * - Forward: `x = A^{-1} b` (computed by `solve`)
+ * - VJP: for output cotangent `g`, the cotangent of `b` is `A^{-T} g`
+ *   (computed by `transposeSolve` or `solve` if symmetric)
+ *
+ * The key insight is that we never need to differentiate through the
+ * solver's internal iterations — only through `matvec` (to get its
+ * transpose) and through one solve call in the backward pass.
+ *
+ * @param matvec  Linear operator `A`: maps `x → A x`. Must be a pure
+ *                function of `x` (no side effects).
+ * @param b       Right-hand side of the linear system.
+ * @param solve   Forward solver: `solve(matvec, b) → x` such that
+ *                `matvec(x) ≈ b`.
+ * @param opts    Optional settings for transpose solve and symmetry.
+ *
+ * @returns The solution `x`.
+ *
+ * @example
+ * ```ts
+ * // Conjugate gradient solve with implicit differentiation
+ * const x = customLinearSolve(
+ *   (v) => np.matmul(A, v),  // matvec: x → A x
+ *   b,                        // right-hand side
+ *   (matvec, b) => cg(matvec, b, { maxIter: 100 }),
+ * );
+ * // grad() through this avoids differentiating through CG iterations
+ * ```
+ */
+export function customLinearSolve(
+  matvec: (x: any) => any,
+  b: any,
+  solve: (matvec: (x: any) => any, b: any) => any,
+  opts?: CustomLinearSolveOpts,
+): any {
+  const symmetric = opts?.symmetric ?? false;
+  const transposeSolve = opts?.transposeSolve;
+
+  // Wrap the solve as a customVjp function of b so that reverse-mode
+  // differentiation uses the implicit function theorem instead of
+  // differentiating through the solver's internal iterations.
+  //
+  // For A x = b:
+  //   VJP w.r.t. b:  g → A^{-T} g  (transpose solve)
+  const implicitSolve = customVjp(
+    // fwd: solve the system, save nothing (we close over matvec/solve)
+    (b_in: any) => {
+      const x_out = solve(matvec, b_in);
+      return [x_out, null];
+    },
+    // bwd: solve the transpose system
+    (_res: null, g: any) => {
+      if (symmetric) {
+        // For symmetric A (A = A^T), transpose solve is the same as forward.
+        return solve(matvec, g);
+      }
+      if (!transposeSolve) {
+        throw new Error(
+          "customLinearSolve requires opts.transposeSolve when opts.symmetric is false",
+        );
+      }
+      // For non-symmetric A, build the transpose operator via vjp of matvec,
+      // then call the user-provided transposeSolve. Since matvec is linear,
+      // one transpose artifact can be reused for the entire backward solve.
+      const transposeSeed = treeMap((leaf: any) => zerosLike(leaf), g);
+      const [, vecmatVjp] = vjp(matvec, [transposeSeed]);
+      treeDispose(transposeSeed);
+      try {
+        const vecmat = (v: any) => {
+          const [result] = vecmatVjp(v);
+          return result;
+        };
+        return transposeSolve(vecmat, g);
+      } finally {
+        vecmatVjp.dispose();
+      }
+    },
+  );
+
+  return implicitSolve(b);
 }
