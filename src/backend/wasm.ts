@@ -37,8 +37,8 @@ import {
 } from "./wasm/builtins";
 import type { WasmMegaModule } from "./wasm/mega-module";
 import {
-  OrchestratorWorker,
   ORCHESTRATOR_MAX_INPUTS,
+  OrchestratorWorker,
 } from "./wasm/orchestrator";
 import {
   getArgsortModule,
