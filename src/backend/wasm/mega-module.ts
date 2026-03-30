@@ -72,6 +72,29 @@ export type MegaStepInfo =
       outputIdxs: number[];
     };
 
+/**
+ * Arena layout for mega-module internal buffers (E1).
+ * Replaces per-step alloc/free calls with pre-planned offsets within
+ * a single contiguous arena buffer, eliminating JS↔WASM boundary
+ * crossings for internal temporaries.
+ */
+export interface MegaModuleArenaLayout {
+  /** Total arena size in bytes (64-byte aligned). */
+  readonly totalSize: number;
+  /**
+   * Maps arena-eligible malloc local index → byte offset within the arena.
+   * Only malloc steps whose buffer is eventually freed (not an output)
+   * are included.
+   */
+  readonly mallocOffsets: ReadonlyMap<number, number>;
+  /**
+   * Set of all local indices that hold arena pointers at any point
+   * during execution (includes recycle chain targets).
+   * Used to skip free calls for arena-managed buffers.
+   */
+  readonly arenaLocalIdxs: ReadonlySet<number>;
+}
+
 /** Result of compiling a JitProgram into a mega-module. */
 export interface WasmMegaModule {
   /** The compiled WebAssembly module. */
@@ -117,6 +140,13 @@ export interface WasmMegaModule {
    * handled by mega_execute and have no parallel stepInfos representation.
    */
   readonly canParallelize: boolean;
+  /**
+   * Arena layout for internal buffers (E1).
+   * When non-null, the mega_execute WASM function expects an arenaPtr
+   * parameter, and the parallel path uses pre-planned offsets instead
+   * of per-step allocator calls for arena-eligible buffers.
+   */
+  readonly arenaLayout: MegaModuleArenaLayout | null;
 }
 
 /**
@@ -173,6 +203,202 @@ export function canCompileToMegaModule(steps: JitStep[]): boolean {
     }
   }
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Arena layout computation (E1)
+// ---------------------------------------------------------------------------
+
+/** 64-byte alignment matches WasmAllocator minimum size class and SIMD. */
+const ARENA_ALIGN = 64;
+
+function alignUp(size: number, alignment: number): number {
+  return (size + alignment - 1) & ~(alignment - 1);
+}
+
+/**
+ * Compute arena layout for a mega-module's internal buffers.
+ *
+ * Walks the step list to identify buffers that are malloc'd and eventually
+ * freed (directly or through recycle chains) within the same program.
+ * These "internal" buffers are assigned fixed offsets within a single
+ * contiguous arena, eliminating per-step alloc/free calls.
+ *
+ * Output buffers (which persist past execution) are NOT arena-eligible
+ * and continue to use the normal allocator.
+ *
+ * Uses first-fit interval packing with free-region reuse for compact layout.
+ *
+ * @returns Arena layout, or null if no buffers are arena-eligible.
+ */
+function computeArenaLayout(
+  steps: JitStep[],
+  outputIds: JitId[],
+): {
+  totalSize: number;
+  offsets: Map<JitId, number>;
+  arenaJitIds: Set<JitId>;
+} | null {
+  const outputIdSet = new Set(outputIds);
+
+  // Step 1: Find all top-level malloc'd buffers and their sizes.
+  // (fori_loop body mallocs are handled separately inside WASM.)
+  const mallocInfo = new Map<JitId, { size: number; stepIdx: number }>();
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (step.type === "malloc" && !isSymbolicSize(step.size)) {
+      mallocInfo.set(step.output, { size: step.size as number, stepIdx: i });
+    }
+  }
+
+  // Step 2: Build recycle forward chains.
+  // After recycle(A→B), A is dead and B holds A's pointer.
+  const recycleForward = new Map<JitId, JitId>();
+  for (const step of steps) {
+    if (step.type === "recycle") {
+      recycleForward.set(step.input, step.output);
+    }
+  }
+
+  // Follow a recycle chain to its terminal JitId.
+  function findTerminal(id: JitId): JitId {
+    let current = id;
+    while (recycleForward.has(current)) {
+      current = recycleForward.get(current)!;
+    }
+    return current;
+  }
+
+  // Step 3: Find which terminals are freed and at which step.
+  const freeStepIdx = new Map<JitId, number>();
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (step.type === "free") {
+      freeStepIdx.set(step.input, i);
+    }
+  }
+
+  // Step 4: Determine arena eligibility.
+  // A malloc is arena-eligible if its terminal (after recycle chain)
+  // is freed, and neither the original nor the terminal is a program output.
+  const arenaEligible = new Map<
+    JitId,
+    { size: number; birthStep: number; deathStep: number }
+  >();
+
+  for (const [jitId, info] of mallocInfo) {
+    if (outputIdSet.has(jitId)) continue;
+
+    const terminal = findTerminal(jitId);
+    if (outputIdSet.has(terminal)) continue;
+
+    const deathStep = freeStepIdx.get(terminal);
+    if (deathStep === undefined) continue;
+
+    arenaEligible.set(jitId, {
+      size: info.size,
+      birthStep: info.stepIdx,
+      deathStep,
+    });
+  }
+
+  if (arenaEligible.size === 0) return null;
+
+  // Step 5: Compute offsets using first-fit with reuse.
+  // Process events in execution order for correct interval packing.
+  const birthEvents = new Map<number, JitId[]>();
+  const deathEvents = new Map<number, JitId[]>();
+
+  for (const [jitId, info] of arenaEligible) {
+    let births = birthEvents.get(info.birthStep);
+    if (!births) {
+      births = [];
+      birthEvents.set(info.birthStep, births);
+    }
+    births.push(jitId);
+
+    let deaths = deathEvents.get(info.deathStep);
+    if (!deaths) {
+      deaths = [];
+      deathEvents.set(info.deathStep, deaths);
+    }
+    deaths.push(jitId);
+  }
+
+  const offsets = new Map<JitId, number>();
+  const activeSlots = new Map<JitId, { offset: number; alignedSize: number }>();
+  // Free pool: available regions, sorted by offset for first-fit.
+  const freePool: { offset: number; size: number }[] = [];
+  let watermark = 0;
+
+  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+    // Process deaths first — free regions before allocating new ones
+    // at the same step index.
+    const dying = deathEvents.get(stepIdx);
+    if (dying) {
+      for (const jitId of dying) {
+        const slot = activeSlots.get(jitId)!;
+        activeSlots.delete(jitId);
+        freePool.push({ offset: slot.offset, size: slot.alignedSize });
+      }
+      // Sort by offset for first-fit and merge adjacent regions.
+      freePool.sort((a, b) => a.offset - b.offset);
+      for (let i = freePool.length - 2; i >= 0; i--) {
+        if (freePool[i].offset + freePool[i].size === freePool[i + 1].offset) {
+          freePool[i].size += freePool[i + 1].size;
+          freePool.splice(i + 1, 1);
+        }
+      }
+    }
+
+    // Process births.
+    const born = birthEvents.get(stepIdx);
+    if (born) {
+      for (const jitId of born) {
+        const info = arenaEligible.get(jitId)!;
+        const alignedSize = alignUp(info.size, ARENA_ALIGN);
+
+        // First-fit from free pool.
+        let assigned = false;
+        for (let i = 0; i < freePool.length; i++) {
+          if (freePool[i].size >= alignedSize) {
+            const offset = freePool[i].offset;
+            offsets.set(jitId, offset);
+            activeSlots.set(jitId, { offset, alignedSize });
+
+            if (freePool[i].size > alignedSize) {
+              freePool[i].offset += alignedSize;
+              freePool[i].size -= alignedSize;
+            } else {
+              freePool.splice(i, 1);
+            }
+            assigned = true;
+            break;
+          }
+        }
+
+        if (!assigned) {
+          offsets.set(jitId, watermark);
+          activeSlots.set(jitId, { offset: watermark, alignedSize });
+          watermark += alignedSize;
+        }
+      }
+    }
+  }
+
+  // Step 6: Build arenaJitIds — all JitIds that ever hold an arena pointer.
+  // Includes original malloc targets and their recycle chain successors.
+  const arenaJitIds = new Set<JitId>();
+  for (const jitId of arenaEligible.keys()) {
+    arenaJitIds.add(jitId);
+    let current = jitId;
+    while (recycleForward.has(current)) {
+      current = recycleForward.get(current)!;
+      arenaJitIds.add(current);
+    }
+  }
+
+  return { totalSize: watermark, offsets, arenaJitIds };
 }
 
 /**
@@ -287,6 +513,10 @@ export function compileToMegaModule(
   };
   collectKernelOps(steps);
 
+  // --- E1: Compute arena layout for internal buffers ---
+  const arenaResult = computeArenaLayout(steps, outputIds);
+  const hasArena = arenaResult != null && arenaResult.totalSize > 0;
+
   // --- Generate WASM module ---
   const traceEnabled = _isCodeCaptureEnabled();
   const cg = new CodeGenerator();
@@ -295,7 +525,8 @@ export function compileToMegaModule(
   // Configure memory import (shared/non-shared)
   configureMemoryImport(cg);
 
-  // Import allocator functions
+  // Import allocator functions (still needed for non-arena mallocs: outputs,
+  // initialData buffers, and fori_loop body internals)
   const allocFunc = cg.importFunction("env", "alloc", [cg.i32], [cg.i32]);
   const freeFunc = cg.importFunction("env", "free", [cg.i32], []);
 
@@ -369,15 +600,17 @@ export function compileToMegaModule(
     }
   }
 
-  // Build function: mega_execute(input0..inputN, resultBufPtr) -> void
+  // Build function:
+  //   Without arena: mega_execute(input0..inputN, resultBufPtr) -> void
+  //   With arena:    mega_execute(input0..inputN, arenaPtr, resultBufPtr) -> void
   const numInputParams = inputIds.length;
-  const totalParams = numInputParams + 1; // +1 for resultBufPtr
+  const totalParams = numInputParams + 1 + (hasArena ? 1 : 0);
   const paramTypes = rep(totalParams, cg.i32);
 
   const megaFunc = cg.function(paramTypes, [], () => {
     // Create a WASM local for each JitId.
     // Input JitIds are initialized from function params.
-    // Others are initialized when created (malloc, recycle).
+    // Others are initialized when created (malloc, recycle, or arena offset).
     const jitIdLocals = new Map<JitId, number>();
 
     // Map input JitIds to function params
@@ -393,8 +626,10 @@ export function compileToMegaModule(
       }
     }
 
-    // Result buffer pointer is the last param
-    const resultBufParam = numInputParams;
+    // Arena base pointer param (only present when hasArena, comes before resultBuf)
+    const arenaParam = hasArena ? numInputParams : -1;
+    // Result buffer pointer is always the last param
+    const resultBufParam = numInputParams + (hasArena ? 1 : 0);
 
     // Emit code for each step
     for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
@@ -406,10 +641,24 @@ export function compileToMegaModule(
             throw new Error("Mega-module: symbolic malloc sizes not supported");
           }
           const size = step.size as number;
-          // local.set(jitId, call $alloc(size))
-          cg.i32.const(size);
-          cg.call(allocFunc);
-          cg.local.set(jitIdLocals.get(step.output)!);
+
+          // E1: Arena-eligible mallocs use a compile-time offset from arenaPtr.
+          // Non-arena mallocs (outputs, initialData) still use the allocator.
+          const arenaOffset = arenaResult?.offsets.get(step.output);
+          if (hasArena && arenaOffset !== undefined) {
+            // local.set(jitId, arenaPtr + offset)
+            cg.local.get(arenaParam);
+            if (arenaOffset > 0) {
+              cg.i32.const(arenaOffset);
+              cg.i32.add();
+            }
+            cg.local.set(jitIdLocals.get(step.output)!);
+          } else {
+            // local.set(jitId, call $alloc(size))
+            cg.i32.const(size);
+            cg.call(allocFunc);
+            cg.local.set(jitIdLocals.get(step.output)!);
+          }
 
           // If pre-filled constant data is present, emit inline i32.store
           // instructions to write it directly into the allocated buffer.
@@ -440,6 +689,10 @@ export function compileToMegaModule(
         }
 
         case "free": {
+          // E1: Skip free for arena-managed buffers.
+          if (hasArena && arenaResult!.arenaJitIds.has(step.input)) {
+            break;
+          }
           // call $free(local.get(jitId))
           cg.local.get(jitIdLocals.get(step.input)!);
           cg.call(freeFunc);
@@ -448,6 +701,7 @@ export function compileToMegaModule(
 
         case "recycle": {
           // local.set(new, local.get(old)) — zero cost
+          // (Recycle is always a local rename, arena or not.)
           cg.local.get(jitIdLocals.get(step.input)!);
           cg.local.set(jitIdLocals.get(step.output)!);
           break;
@@ -520,9 +774,12 @@ export function compileToMegaModule(
   if (DEBUG >= 1) {
     const reductions = kernelExports.filter((k) => k.isReduction).length;
     const elementwise = kernelExports.length - reductions;
+    const arenaInfo = hasArena
+      ? `, arena ${arenaResult!.totalSize} bytes (${arenaResult!.offsets.size} buffers)`
+      : "";
     console.info(
       `mega-module: ${steps.length} steps, ${kernelExports.length} kernels ` +
-        `(${elementwise} elementwise, ${reductions} reduction), all extracted, ${bytes.length} bytes`,
+        `(${elementwise} elementwise, ${reductions} reduction), all extracted, ${bytes.length} bytes${arenaInfo}`,
     );
   }
   if (DEBUG >= 2) {
@@ -634,6 +891,20 @@ export function compileToMegaModule(
     numLocals,
     outputLocalIdxs,
     canParallelize: !hasForiLoop,
+    arenaLayout: hasArena
+      ? {
+          totalSize: arenaResult!.totalSize,
+          mallocOffsets: new Map(
+            [...arenaResult!.offsets.entries()].map(([jitId, offset]) => [
+              jitIdToIdx.get(jitId)!,
+              offset,
+            ]),
+          ),
+          arenaLocalIdxs: new Set(
+            [...arenaResult!.arenaJitIds].map((id) => jitIdToIdx.get(id)!),
+          ),
+        }
+      : null,
   };
 }
 

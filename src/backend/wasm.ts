@@ -1122,6 +1122,10 @@ export class WasmBackend implements Backend {
     const resultBufSize = megaModule.numOutputs * 4;
     const resultBufPtr = this.#allocator.malloc(resultBufSize);
 
+    // E1: Allocate arena for internal buffers (one contiguous block)
+    const arena = megaModule.arenaLayout;
+    const arenaPtr = arena ? this.#allocator.malloc(arena.totalSize) : 0;
+
     const orch = this.#getOrchestrator();
     if (orch && inputPtrs.length <= 64) {
       // --- Orchestrator path (M6.2b): off-main-thread execution ---
@@ -1131,7 +1135,7 @@ export class WasmBackend implements Backend {
       // servicing alloc/free proxy requests via the control buffer.
       orch.dispatch(
         moduleId,
-        inputPtrs,
+        arena ? [...inputPtrs, arenaPtr] : inputPtrs,
         resultBufPtr,
         (size: number) => this.#allocator.malloc(size),
         (ptr: number) => this.#allocator.free(ptr),
@@ -1151,9 +1155,13 @@ export class WasmBackend implements Backend {
         this.#instanceCache.set(megaModule.module, instance);
       }
 
-      // Call mega_execute(input0_ptr, ..., inputN_ptr, resultBufPtr)
+      // Call mega_execute(input0_ptr, ..., inputN_ptr, [arenaPtr,] resultBufPtr)
       const func = instance.exports.mega_execute as (...args: number[]) => void;
-      func(...inputPtrs, resultBufPtr);
+      if (arena) {
+        func(...inputPtrs, arenaPtr, resultBufPtr);
+      } else {
+        func(...inputPtrs, resultBufPtr);
+      }
     }
 
     // Read output pointers from result buffer and create Slots.
@@ -1173,8 +1181,9 @@ export class WasmBackend implements Backend {
       outputSlots.push(slot);
     }
 
-    // Free the result buffer
+    // Free the result buffer and arena
     this.#allocator.free(resultBufPtr);
+    if (arena) this.#allocator.free(arenaPtr);
 
     return outputSlots;
   }
@@ -1237,16 +1246,26 @@ export class WasmBackend implements Backend {
       locals[i] = this.#getPtr(inputSlots[i]);
     }
 
+    // E1: Allocate arena for internal buffers (one contiguous block)
+    const arena = megaModule.arenaLayout;
+    const arenaPtr = arena ? this.#allocator.malloc(arena.totalSize) : 0;
+
     // Walk step metadata, executing each step
     for (const step of megaModule.stepInfos) {
       switch (step.type) {
         case "malloc": {
-          const ptr = this.#allocator.malloc(step.size);
-          locals[step.outputIdx] = ptr;
+          // E1: Arena-eligible mallocs use pre-planned offset.
+          if (arena && arena.mallocOffsets.has(step.outputIdx)) {
+            locals[step.outputIdx] =
+              arenaPtr + arena.mallocOffsets.get(step.outputIdx)!;
+          } else {
+            const ptr = this.#allocator.malloc(step.size);
+            locals[step.outputIdx] = ptr;
+          }
           if (step.initialData) {
             new Uint8Array(
               this.#memory.buffer,
-              ptr,
+              locals[step.outputIdx],
               step.initialData.byteLength,
             ).set(step.initialData);
           }
@@ -1254,6 +1273,11 @@ export class WasmBackend implements Backend {
         }
 
         case "free":
+          // E1: Skip free for arena-managed buffers.
+          if (arena && arena.arenaLocalIdxs.has(step.inputIdx)) {
+            locals[step.inputIdx] = 0;
+            break;
+          }
           this.#allocator.free(locals[step.inputIdx]);
           locals[step.inputIdx] = 0;
           break;
@@ -1301,6 +1325,9 @@ export class WasmBackend implements Backend {
       });
       outputSlots.push(slot);
     }
+
+    // E1: Free arena (single deallocation replaces N individual frees)
+    if (arena) this.#allocator.free(arenaPtr);
 
     return outputSlots;
   }
