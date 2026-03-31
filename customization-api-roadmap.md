@@ -267,29 +267,23 @@ export function customLinearSolve<T>(
 ): T;
 ```
 
-#### 2. `customRoot`
+#### 2. `customRoot` ✅
 
-Purpose:
+**Status: Implemented.** See `src/frontend/linearize.ts` and `test/custom-root.test.ts`.
 
-1. implicit differentiation for root-finding and fixed-point problems,
-2. clean semantic support for solver-like abstractions.
+Uses the Implicit Function Theorem via
+`stopGradient(x*) + customLinearSolve(∂f/∂x, f(stopGradient(x*)))`. Gradients flow through `f`'s
+closure parameters; the solver is opaque.
 
-Why high priority:
-
-1. directly relevant to `jaxopt`-style libraries,
-2. can avoid tracing through long iterative procedures,
-3. is often the mathematically right abstraction for optimization wrappers.
-
-Suggested shape:
+Final shape:
 
 ```ts
-export function customRoot<T>(
-  f: (x: T) => T,
-  initialGuess: T,
-  solve: (f: (x: T) => T, initialGuess: T) => T,
-  tangentSolve: (g: (x: T) => T, y: T) => T,
-  opts?: { hasAux?: boolean },
-): T;
+export function customRoot(
+  f: (x: any) => any,
+  initialGuess: any,
+  solve: (f: (x: any) => any, initialGuess: any) => any,
+  tangentSolve: (g: (x: any) => any, y: any) => any,
+): any;
 ```
 
 #### 3. `linearTranspose`

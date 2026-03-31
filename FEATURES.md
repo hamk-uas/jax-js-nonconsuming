@@ -72,6 +72,7 @@ functions.
 | `custom_jvp`         | �       | custom forward-mode AD rules (+ reverse via transpose) |
 | `custom_vjp`         | 🟢      | custom reverse-mode AD rules                           |
 | `customLinearSolve`  | 🟢      | implicit differentiation for linear solves             |
+| `customRoot`         | 🟢      | implicit differentiation for root-finding (IFT)        |
 | `custom_batching`    | 🔴      | core engine feature                                    |
 | `Array`              | 🟢      |                                                        |
 | `checkLeaks`         | 🟢      | leak diagnostic (slot count delta + stack trace)       |

@@ -4,6 +4,7 @@
 import { AluOp, type DType, isFloatDtype } from "../alu";
 import { defaultDevice } from "../backend";
 import { type Dim, dimSub, hasSymbolicDims } from "../dim";
+import { jvp, lowerAux } from "./jvp";
 import {
   dispose as treeDispose,
   flatten as treeFlatten,
@@ -94,7 +95,6 @@ import {
   typecheckJaxpr,
   Var,
 } from "./jaxpr";
-import { jvp, lowerAux } from "./jvp";
 import { analyzeLinearStencil, reverseStencilSlice } from "./stencil-analysis";
 import { jacfwd, moveaxis, vmap } from "./vmap";
 
@@ -4916,4 +4916,118 @@ export function customLinearSolve(
   );
 
   return implicitSolve(b);
+}
+
+/**
+ * Solve a root-finding problem with implicit differentiation.
+ *
+ * Computes `x* = solve(f, initialGuess)` such that `f(x*) ≈ 0`, and provides
+ * an analytically correct VJP via the Implicit Function Theorem (IFT) that
+ * avoids differentiating through the solver's internal iterations.
+ *
+ * ### Mathematical background
+ *
+ * Given the optimality condition `f(x*, θ) = 0` where `θ` are parameters
+ * captured in `f`'s closure:
+ *
+ * - By the IFT: `dx∗/dθ = -(∂f/∂x)⁻¹ · (∂f/∂θ)`
+ * - VJP: for output cotangent `g`, the cotangent of `θ` is
+ *   `-(∂f/∂θ)ᵀ · (∂f/∂x)⁻ᵀ · g`
+ *
+ * The key insight is that we never differentiate through the solver — only
+ * through `f` (to access its closure parameters) and through one linear
+ * solve in the backward pass.
+ *
+ * ### Implementation
+ *
+ * Uses the identity: `x* = x* - (∂f/∂x)⁻¹ · f(x*)` (a Newton step
+ * that is a no-op at convergence since `f(x*) ≈ 0`). The `stopGradient`
+ * on `x*` blocks gradient flow through the solver, while evaluating
+ * `f(stopGradient(x*))` establishes the AD dependency on `f`'s closure
+ * parameters. The `customLinearSolve` handles the `(∂f/∂x)⁻¹` factor
+ * and its transpose in the backward pass.
+ *
+ * @param f  Optimality function: `f(x*) ≈ 0` at the solution. May close
+ *           over differentiable parameters — gradients flow through them
+ *           via the IFT.
+ * @param initialGuess  Starting point for the solver.
+ * @param solve  Forward solver: `solve(f, x0) → x*` such that `f(x*) ≈ 0`.
+ *               Not differentiated through.
+ * @param tangentSolve  Linear solver: `tangentSolve(g, y) → x` such that
+ *                      `g(x) = y`. Used both in the forward pass (with
+ *                      `g = ∂f/∂x`) and in the backward pass (with
+ *                      `g = (∂f/∂x)ᵀ`).
+ *
+ * @returns The solution `x*`.
+ *
+ * @example
+ * ```ts
+ * // Find x such that A·x - b = 0 (i.e., solve A·x = b)
+ * const A = np.array([[2, 1], [1, 3]]);
+ * const b = np.array([5, 7]);
+ *
+ * const x = customRoot(
+ *   (x) => np.subtract(np.matmul(A, x), b),   // f(x) = Ax - b
+ *   np.zeros([2]),                              // initial guess
+ *   (f, x0) => iterativeSolver(f, x0),         // any root-finding solver
+ *   (g, y) => iterativeSolver(g, y),            // linear system solver
+ * );
+ * // grad() through this avoids differentiating through the solver
+ * ```
+ */
+export function customRoot(
+  f: (x: any) => any,
+  initialGuess: any,
+  solve: (f: (x: any) => any, initialGuess: any) => any,
+  tangentSolve: (g: (x: any) => any, y: any) => any,
+): any {
+  // Step 1: Solve f(x) = 0. This is opaque to AD.
+  const xStar = solve(f, initialGuess);
+
+  // Step 2: Freeze x* to block gradient flow through the solver.
+  const xFrozen = treeMap((leaf: any) => stopGradient(leaf), xStar);
+
+  // Step 3: Evaluate f at frozen x*. This carries the AD graph through
+  // f's closure parameters — the only path for gradients to reach them.
+  // Since f(x*) ≈ 0 at convergence, this doesn't change the output value.
+  const fAtStar = f(xFrozen);
+
+  // Step 4: Define the Jacobian-vector product ∂f/∂x · v at x*.
+  // This is the "linear operator" for customLinearSolve.
+  const matvec = (v: any) => {
+    const [, tangentOut] = jvp((x: any) => f(x), [xFrozen], [v]);
+    return tangentOut;
+  };
+
+  // Step 5: Solve (∂f/∂x) · correction = f(x*) via customLinearSolve.
+  // Forward: correction ≈ 0 (since f(x*) ≈ 0).
+  // Backward (VJP with cotangent g):
+  //   cotangent of f(x*) = (∂f/∂x)^{-T} · (-g)
+  //   → flows through f to closure params θ: cotangent(θ) = (∂f/∂θ)^T · (∂f/∂x)^{-T} · (-g)
+  //   = -(dx*/dθ)^T · g  — exactly the IFT VJP. ✓
+  const correction = customLinearSolve(matvec, fAtStar, tangentSolve, {
+    transposeSolve: tangentSolve,
+  });
+
+  // Step 6: result = x* - correction ≈ x* - 0 = x* (value unchanged).
+  // The AD graph through fAtStar → customLinearSolve → subtraction
+  // implements the IFT for gradient computation.
+  const result = treeMap(
+    (x: any, c: any) => {
+      const negC = neg(c);
+      const sum = add(x, negC);
+      negC.dispose();
+      return sum;
+    },
+    xFrozen,
+    correction,
+  );
+
+  // Dispose intermediates. In eager mode these are concrete arrays;
+  // in tracing mode, dispose is always safe (non-consuming model).
+  treeDispose(fAtStar);
+  treeDispose(correction);
+  treeDispose(xFrozen);
+
+  return result;
 }

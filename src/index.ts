@@ -494,6 +494,20 @@ export const customLinearSolve = linearizeModule.customLinearSolve;
 export type { CustomLinearSolveOpts } from "./frontend/linearize";
 
 /**
+ * Solve a root-finding problem with implicit differentiation.
+ *
+ * Computes `x* = solve(f, x0)` such that `f(x*) ≈ 0`, and provides an
+ * analytically correct VJP via the Implicit Function Theorem that avoids
+ * differentiating through the solver's internal iterations.
+ *
+ * @param f  Optimality function: `f(x*) ≈ 0` at the solution.
+ * @param initialGuess  Starting point for the solver.
+ * @param solve  Forward solver: `solve(f, x0) → x*`.
+ * @param tangentSolve  Linear solver: `tangentSolve(g, y) → x` s.t. `g(x) = y`.
+ */
+export const customRoot = linearizeModule.customRoot;
+
+/**
  * Wait until all `Array` leaves are ready by calling `Array.blockUntilReady()`.
  *
  * This can be used to wait for the results of an intermediate computation to
