@@ -4991,11 +4991,28 @@ export function customRoot(
   // f's closure parameters — the only path for gradients to reach them.
   // Since f(x*) ≈ 0 at convergence, this doesn't change the output value.
   const fAtStar = f(xFrozen);
+  const [xFrozenFlat] = treeFlatten(xFrozen);
+  const borrowedPrimalLeaves = new Set<Tracer>();
+  for (const leaf of xFrozenFlat) {
+    if (leaf instanceof Tracer) borrowedPrimalLeaves.add(leaf);
+  }
 
   // Step 4: Define the Jacobian-vector product ∂f/∂x · v at x*.
   // This is the "linear operator" for customLinearSolve.
   const matvec = (v: any) => {
-    const [, tangentOut] = jvp((x: any) => f(x), [xFrozen], [v]);
+    const [primals, tangentOut] = jvp((x: any) => f(x), [xFrozen], [v]);
+    const [primalsFlat] = treeFlatten(primals);
+    const seen = new Set<Tracer>();
+    for (const leaf of primalsFlat) {
+      if (
+        leaf instanceof Tracer &&
+        !borrowedPrimalLeaves.has(leaf) &&
+        !seen.has(leaf)
+      ) {
+        seen.add(leaf);
+        leaf.dispose();
+      }
+    }
     return tangentOut;
   };
 
