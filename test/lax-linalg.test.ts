@@ -1,4 +1,5 @@
 import {
+  clearCaches,
   type Device,
   grad,
   jit,
@@ -596,7 +597,7 @@ await deviceSuite((device) => {
     test("foriLoop grad with np.power (clearCaches regression)", () => {
       // Regression: clearCaches() crashed with UseAfterFreeError when
       // grad() inside foriLoop body traces through jit-wrapped np.power,
-      // because the jvpJaxprCache holds consts from a disposed body jaxpr.
+      // because the jvpJaxprCache held consts from a disposed body jaxpr.
       const objective = (p: np.Array): np.Array =>
         np.sum(np.power(p.sub(1.0), 2));
       const body = (_i: np.Array, x: np.Array): np.Array => {
@@ -607,6 +608,7 @@ await deviceSuite((device) => {
       using result = lax.foriLoop(0, 3, body, np.array([5.0, 5.0]));
       const data = result.js() as number[];
       expect(data[0]).toBeCloseTo(3.048, 2);
+      expect(() => clearCaches()).not.toThrow();
     });
 
     test("gradient through QR decomposition", () => {
