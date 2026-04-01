@@ -970,7 +970,13 @@ const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
 
 _registerJitCacheDisposer(() => {
   for (const inner of vmapJaxprCache.values()) {
-    for (const jaxpr of inner.values()) jaxpr.dispose();
+    for (const jaxpr of inner.values()) {
+      try {
+        jaxpr.dispose();
+      } catch {
+        // Already disposed — tolerate during bulk cleanup.
+      }
+    }
     inner.clear();
   }
   vmapJaxprCache.clear();

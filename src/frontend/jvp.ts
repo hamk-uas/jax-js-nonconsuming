@@ -1178,7 +1178,16 @@ const jvpJaxprCacheByBackend = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
 _registerJitCacheDisposer(() => {
   for (const inner of jvpJaxprCacheByBackend.values()) {
     for (const cj of inner.values()) {
-      cj.dispose();
+      // Guard against consts already disposed by earlier cache cleaners
+      // or by foriLoop/scan closedJaxpr.dispose(). When grad(foriLoop)
+      // traces through a jit-wrapped function (e.g., np.power), the
+      // foriLoop body jaxpr is disposed first, freeing const Arrays that
+      // also appear in the cached JVP jaxpr.
+      try {
+        cj.dispose();
+      } catch {
+        // Already disposed — tolerate during bulk cleanup.
+      }
     }
   }
   jvpJaxprCacheByBackend.clear();
