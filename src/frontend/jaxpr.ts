@@ -47,6 +47,7 @@ import {
   Trace,
   Tracer,
   TracerValue,
+  UseAfterFreeError,
 } from "./core";
 
 /**
@@ -891,6 +892,16 @@ export class ClosedJaxpr {
   dispose() {
     for (const c of this.consts) c.dispose();
   }
+}
+
+function retainClosedJaxpr(closedJaxpr: ClosedJaxpr): ClosedJaxpr {
+  return new ClosedJaxpr(
+    closedJaxpr.jaxpr,
+    closedJaxpr.consts.map((c) => {
+      // jax-js-lint: allow-ref
+      return c.ref;
+    }),
+  );
 }
 
 /** Tracer that records its operations to dynamically construct a Jaxpr. */
@@ -1904,7 +1915,10 @@ export function jit<F extends (...args: any[]) => any>(
     if (existing) return existing;
   }
 
-  const cache = new Map<string, ReturnType<ReturnType<typeof makeJaxpr>>>();
+  type JitCacheEntry = ReturnType<ReturnType<typeof makeJaxpr>> & {
+    transientOwner: ClosedJaxpr;
+  };
+  const cache = new Map<string, JitCacheEntry>();
   const staticArgnums = new Set(opts?.staticArgnums ?? []);
 
   const dynamicAxes = opts?.dynamic_axes;
@@ -1938,16 +1952,17 @@ export function jit<F extends (...args: any[]) => any>(
       cache,
       [defaultDevice(), ...jaxprArgs],
       () => {
-        const cached = makeJaxpr(f, opts)(...jaxprArgs);
+        const traced = makeJaxpr(f, opts)(...jaxprArgs);
         // Cache-owned ClosedJaxprs need independent const ownership.
-        // Without this retained handle, an enclosing traced scope
-        // (e.g. foriLoop/scan) can dispose shared consts and leave
-        // the jit cache holding dead refs.
-        for (const c of cached.jaxpr.consts) {
-          // jax-js-lint: allow-ref
-          c.ref;
-        }
-        return cached;
+        // Execute against a retained wrapper, but keep the original traced
+        // ClosedJaxpr around as the transient owner of the builder-held refs.
+        // Outer traced scopes may consume that transient ownership before
+        // cache teardown, so disposal must tolerate already-freed consts.
+        return {
+          ...traced,
+          jaxpr: retainClosedJaxpr(traced.jaxpr),
+          transientOwner: traced.jaxpr,
+        };
       },
     );
 
@@ -1961,8 +1976,17 @@ export function jit<F extends (...args: any[]) => any>(
   }) as OwnedFunction<F>;
 
   result.dispose = () => {
-    for (const { jaxpr } of cache.values()) {
-      jaxpr.dispose();
+    for (const { jaxpr, transientOwner } of cache.values()) {
+      try {
+        jaxpr.dispose();
+      } catch (error) {
+        if (!(error instanceof UseAfterFreeError)) throw error;
+      }
+      try {
+        transientOwner.dispose();
+      } catch (error) {
+        if (!(error instanceof UseAfterFreeError)) throw error;
+      }
     }
     cache.clear();
   };
