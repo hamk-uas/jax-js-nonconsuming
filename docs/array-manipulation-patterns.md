@@ -207,6 +207,10 @@ This is the right pattern for small analytical constructions (Jacobians, rotatio
 Cramer's rule). The library uses it internally for analytical inverse, Cholesky, and QR at small
 sizes.
 
+This remains the right pattern inside transformed bodies as well. Small fixed constructions such as
+`np.array([[a, b], [c, d]])` or `x.mul(np.array([3]))` inside `jit(...)`, `grad(...)`, or
+`valueAndGrad(...)` do not need to be hoisted out just to avoid cache or tracing leaks.
+
 This also covers small downstream constructions such as `diffSVMC`'s current Yasso 5x5 matrix
 assembly from known scalar entries. That code may still benefit from better update ergonomics in the
 future, but it is not performance-equivalent to one-hot algebra and does not need to be rewritten
