@@ -227,15 +227,16 @@ Each Array carries a named creation-ref owner state (`#creationRefOwner`): `"non
 `"partial-eval"` | `"makeJaxpr-body"` | `"jvp-lifted-tangents"` | `"jacfwd-eye-matrix"` |
 `"balanced"`. Invalid transitions throw internal errors.
 
-| Subsystem             | Mechanism                                                                                                | Release site                                                                                                                       |
-| --------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| **Const capture**     | `getOrMakeConstTracer` takes `.ref`; `constsNeedingCreationRefBalance` Set tracks stranded creation refs | `ClosedJaxpr.dispose()` releases builder ref; `makeJaxpr` post-build loop balances creation refs (`refCount > 1` pre-build filter) |
-| **PE intermediates**  | `withPartialEvalScope(...)` + scoped birth list; arrays born in PE carry `partial-eval` owner            | `disposePeIntermediates(protectedVals)` cleans dead temporaries; rc≤1 consts are protected                                         |
-| **Eval-time Lit**     | `evalJaxpr` tracks in `litArrays`; `evalJaxprTransposed` tracks zeros/Lit in `internalArrays`            | Cleanup at function exit balances creation refs                                                                                    |
-| **JVP lift zeros**    | `claimCreationRef("jvp-lifted-tangents")`                                                                | `liftedTangents` cleanup in `jvpFlat`                                                                                              |
-| **jacfwd eye matrix** | `claimCreationRef("jacfwd-eye-matrix")`                                                                  | Explicit `eyeMatrix.dispose()` by caller                                                                                           |
-| **Scan transpose**    | Identity-based cleanup: `ctCarrySafeInit[i] !== ctCarryInit[i]`                                          | Only dispose freshly-created zeros, not borrowed cts                                                                               |
-| **Artifact wrappers** | `PrimalArtifactImpl.run()` returns independently retained outputs/residuals                              | Explicit teardown path; pending-work flush via shared helper                                                                       |
+| Subsystem              | Mechanism                                                                                                | Release site                                                                                                                       |
+| ---------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| **Const capture**      | `getOrMakeConstTracer` takes `.ref`; `constsNeedingCreationRefBalance` Set tracks stranded creation refs | `ClosedJaxpr.dispose()` releases builder ref; `makeJaxpr` post-build loop balances creation refs (`refCount > 1` pre-build filter) |
+| **PE intermediates**   | `withPartialEvalScope(...)` + scoped birth list; arrays born in PE carry `partial-eval` owner            | `disposePeIntermediates(protectedVals)` cleans dead temporaries; rc≤1 consts are protected                                         |
+| **Eval-time Lit**      | `evalJaxpr` tracks in `litArrays`; `evalJaxprTransposed` tracks zeros/Lit in `internalArrays`            | Cleanup at function exit balances creation refs                                                                                    |
+| **Eval-time identity** | `evalJaxpr` `valueBindCount` Map tracks per-value binding count (identity-sharing)                       | `consumeRead` only disposes when all Var bindings for a value are exhausted; error path uses `disposed` Set to prevent double-free |
+| **JVP lift zeros**     | `claimCreationRef("jvp-lifted-tangents")`                                                                | `liftedTangents` cleanup in `jvpFlat`                                                                                              |
+| **jacfwd eye matrix**  | `claimCreationRef("jacfwd-eye-matrix")`                                                                  | Explicit `eyeMatrix.dispose()` by caller                                                                                           |
+| **Scan transpose**     | Identity-based cleanup: `ctCarrySafeInit[i] !== ctCarryInit[i]`                                          | Only dispose freshly-created zeros, not borrowed cts                                                                               |
+| **Artifact wrappers**  | `PrimalArtifactImpl.run()` returns independently retained outputs/residuals                              | Explicit teardown path; pending-work flush via shared helper                                                                       |
 
 Key invariants:
 
@@ -474,6 +475,8 @@ runtime i32 param).
 
 ## Common pitfalls
 
+- `np.array(existingArray)` returns the SAME object (identity), not a copy. Disposing the "copy"
+  disposes the original. Use `.ref` for independent handles or avoid wrapping existing Arrays.
 - Forgetting `.dispose()` → silent memory leak
 - Exporting a symbol from library but not `src/index.ts` → missing from published types
 - Changing WebGPU shaders without browser tests → silent breakage
