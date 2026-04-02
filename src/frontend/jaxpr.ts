@@ -796,6 +796,12 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
   // Track arrays created from Lit values for disposal (they have no owning Var).
   const litArrays: Tracer[] = [];
 
+  // Track how many live Var bindings reference each value by identity.
+  // Identity-returning primitives (stopGradient, convert_element_type when
+  // types match) cause multiple Vars to share the same Array.  consumeRead
+  // must not dispose a value while other Vars still reference it.
+  const valueBindCount = new Map<Tracer, number>();
+
   const read = (x: Atom) => {
     if (x instanceof Var) {
       return env.get(x)!;
@@ -815,6 +821,7 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
     if (refCount || inputVars.has(v)) {
       env.set(v, val);
       remainingRefs.set(v, refCount);
+      valueBindCount.set(val, (valueBindCount.get(val) ?? 0) + 1);
     } else {
       val.dispose(); // If variable not used, dispose immediately.
     }
@@ -826,8 +833,14 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
       const left = remainingRefs.get(x)!;
       remainingRefs.set(x, left - 1);
       if (left === 1 && !outputVars.has(x) && !inputVars.has(x)) {
-        env.get(x)?.dispose();
+        const val = env.get(x);
         env.delete(x);
+        if (val !== undefined) {
+          const binds = valueBindCount.get(val)! - 1;
+          valueBindCount.set(val, binds);
+          // Only dispose when no other Var bindings reference this value.
+          if (binds === 0) val.dispose();
+        }
       }
     }
   };
@@ -857,11 +870,18 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
     return results;
   } catch (error) {
     // Clean up any remaining intermediates on error, to avoid leaking memory.
-    // Skip input vars — caller owns those.
+    // Skip input vars — caller owns those.  Use a disposed set to avoid
+    // double-free when identity-sharing makes two Vars reference one value.
+    const disposed = new Set<Tracer>();
     for (const [v, val] of env.entries()) {
-      if (!inputVars.has(v)) val.dispose();
+      if (!inputVars.has(v) && !disposed.has(val)) {
+        disposed.add(val);
+        val.dispose();
+      }
     }
-    for (const a of litArrays) a.dispose();
+    for (const a of litArrays) {
+      if (!disposed.has(a)) a.dispose();
+    }
     throw error;
   }
 }
