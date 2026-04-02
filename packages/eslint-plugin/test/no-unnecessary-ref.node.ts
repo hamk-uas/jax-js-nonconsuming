@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { ESLint } from "eslint";
+import ts from "typescript-eslint";
 
 import plugin from "../src/index";
 
@@ -117,6 +118,84 @@ function f(x) {
 }
 `;
   const messages = await lintRef(code);
+  assert.equal(messages.length, 0);
+});
+
+test("no-unnecessary-ref: allows .ref when returning a borrowed typed param", async () => {
+  const eslint = new ESLint({
+    overrideConfigFile: true,
+    overrideConfig: [
+      {
+        languageOptions: {
+          ecmaVersion: "latest",
+          sourceType: "module",
+          parser: ts.parser as any,
+        },
+        plugins: {
+          "jax-js": plugin as any,
+        },
+        rules: {
+          "jax-js/no-unnecessary-ref": "error",
+        },
+      },
+    ],
+  });
+
+  const code = `
+import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+
+function f(x: np.Array) {
+  return { x: x.ref };
+}
+`;
+
+  const [result] = await eslint.lintText(code, {
+    filePath: "ref-return-test.js",
+  });
+  const messages = result.messages.filter(
+    (m) => m.ruleId === "jax-js/no-unnecessary-ref",
+  );
+  assert.equal(messages.length, 0);
+});
+
+test("no-unnecessary-ref: allows .ref when a helper wraps the returned borrowed typed param", async () => {
+  const eslint = new ESLint({
+    overrideConfigFile: true,
+    overrideConfig: [
+      {
+        languageOptions: {
+          ecmaVersion: "latest",
+          sourceType: "module",
+          parser: ts.parser as any,
+        },
+        plugins: {
+          "jax-js": plugin as any,
+        },
+        rules: {
+          "jax-js/no-unnecessary-ref": "error",
+        },
+      },
+    ],
+  });
+
+  const code = `
+import { numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+
+function wrap(v: unknown) {
+  return v;
+}
+
+function f(x: np.Array) {
+  return wrap({ x: x.ref });
+}
+`;
+
+  const [result] = await eslint.lintText(code, {
+    filePath: "ref-return-helper-test.js",
+  });
+  const messages = result.messages.filter(
+    (m) => m.ruleId === "jax-js/no-unnecessary-ref",
+  );
   assert.equal(messages.length, 0);
 });
 

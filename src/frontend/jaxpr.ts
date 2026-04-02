@@ -1937,7 +1937,18 @@ export function jit<F extends (...args: any[]) => any>(
     const { jaxpr, treedef: outTree } = runWithCache(
       cache,
       [defaultDevice(), ...jaxprArgs],
-      () => makeJaxpr(f, opts)(...jaxprArgs),
+      () => {
+        const cached = makeJaxpr(f, opts)(...jaxprArgs);
+        // Cache-owned ClosedJaxprs need independent const ownership.
+        // Without this retained handle, an enclosing traced scope
+        // (e.g. foriLoop/scan) can dispose shared consts and leave
+        // the jit cache holding dead refs.
+        for (const c of cached.jaxpr.consts) {
+          // jax-js-lint: allow-ref
+          c.ref;
+        }
+        return cached;
+      },
     );
 
     const outs = bind(Primitive.Jit, [...jaxpr.consts, ...argsFlat], {

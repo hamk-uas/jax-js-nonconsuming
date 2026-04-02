@@ -1,5 +1,6 @@
 import type { Rule } from "eslint";
 
+import { isRequiredBorrowedParamReturnRef } from "../borrowed-param-return";
 import { getMemberName, hasAllowComment } from "../types";
 
 const rule: Rule.RuleModule = {
@@ -30,6 +31,7 @@ const rule: Rule.RuleModule = {
           parentType === "BinaryExpression"
         )
           return;
+        if (isRequiredBorrowedParamReturnRef(node)) return;
         if (hasAllowComment(context, node, "jax-js-lint: allow-ref")) return;
         context.report({
           node: node.property,

@@ -1,6 +1,7 @@
 import type { ESLint, Linter } from "eslint";
 
 import noArrayChain from "./rules/no-array-chain";
+import noBorrowedParamReturn from "./rules/no-borrowed-param-return";
 import noDisposeThenReassignParam from "./rules/no-dispose-then-reassign-param";
 import noMakeDisposableAlias from "./rules/no-make-disposable-alias";
 import noNestedArrayLeak from "./rules/no-nested-array-leak";
@@ -15,10 +16,11 @@ import requireWrapperDisposeSymmetry from "./rules/require-wrapper-dispose-symme
 const plugin: ESLint.Plugin = {
   meta: {
     name: "@hamk-uas/eslint-plugin-jax-js",
-    version: "0.1.2",
+    version: "0.1.3",
   },
   rules: {
     "require-using": requireUsing,
+    "no-borrowed-param-return": noBorrowedParamReturn,
     "no-use-after-dispose": noUseAfterDispose,
     "no-dispose-then-reassign-param": noDisposeThenReassignParam,
     "no-make-disposable-alias": noMakeDisposableAlias,
@@ -70,6 +72,7 @@ const strict: Linter.Config = {
   plugins: { "jax-js": plugin },
   rules: {
     "jax-js/require-using": "error",
+    "jax-js/no-borrowed-param-return": "error",
     "jax-js/no-use-after-dispose": "error",
     "jax-js/no-dispose-then-reassign-param": "error",
     "jax-js/no-make-disposable-alias": "error",
