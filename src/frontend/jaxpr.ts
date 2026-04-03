@@ -910,7 +910,17 @@ export class ClosedJaxpr {
 
   /** Dispose of the constants in this Jaxpr. */
   dispose() {
-    for (const c of this.consts) c.dispose();
+    for (const c of this.consts) {
+      try {
+        c.dispose();
+      } catch {
+        // Continue disposing remaining consts even if one is already freed.
+        // When retained and transient ClosedJaxprs share const objects,
+        // some consts reach rc=0 on the first dispose call. The second
+        // dispose call must not bail early — later consts may still need
+        // their refs released.
+      }
+    }
   }
 }
 
