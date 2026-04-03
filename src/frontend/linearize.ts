@@ -4207,10 +4207,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
   },
 };
 
-const transposeJaxprCache = new Map<
-  Jaxpr,
-  Map<string, CachedJaxprArtifact>
->();
+const transposeJaxprCache = new Map<Jaxpr, Map<string, CachedJaxprArtifact>>();
 
 // Register for cleanup during checkLeaks.stop() to avoid leaking
 // cached const environments across test boundaries.

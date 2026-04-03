@@ -70,7 +70,6 @@ import {
 import {
   buildCachedJaxprArtifact,
   CachedJaxprArtifact,
-  ClosedJaxpr,
   evalJaxpr,
   Jaxpr,
   jaxprAsFun,
@@ -1214,9 +1213,8 @@ function jvpJaxpr(jaxpr: Jaxpr): CachedJaxprArtifact {
   // sacrifice some performance versus wrapping jit() outside.
   const inAvals = jaxpr.inBinders.map((v) => v.aval);
   const artifact = buildCachedJaxprArtifact(
-    makeJaxpr(
-      (primals: Tracer[], tangents: Tracer[]) =>
-        jvpFlat(jaxprAsFun(jaxpr), primals, tangents),
+    makeJaxpr((primals: Tracer[], tangents: Tracer[]) =>
+      jvpFlat(jaxprAsFun(jaxpr), primals, tangents),
     )(inAvals, inAvals),
   );
 

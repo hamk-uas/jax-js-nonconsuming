@@ -334,7 +334,6 @@ describe("ClosedJaxpr disposal", () => {
     expect(() => jaxpr.dispose()).not.toThrow();
     expect(liveConst.refCount).toBe(1);
   });
-
 });
 
 // ============================================================

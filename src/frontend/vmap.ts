@@ -47,7 +47,6 @@ import {
 import {
   buildCachedJaxprArtifact,
   CachedJaxprArtifact,
-  ClosedJaxpr,
   Jaxpr,
   jaxprAsFun,
   makeJaxpr,

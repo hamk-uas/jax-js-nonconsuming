@@ -2031,13 +2031,13 @@ export function jit<F extends (...args: any[]) => any>(
     // Include backend type: cached const environments are concrete arrays living on
     // whichever device was active at first trace. Cross-device reuse would
     // read stale data from the wrong backend.
-    const { jaxpr, constEnv, treedef: outTree } = runWithCache(
-      cache,
-      [defaultDevice(), ...jaxprArgs],
-      () => {
-        return buildCachedJaxprArtifact(makeJaxpr(f, opts)(...jaxprArgs));
-      },
-    );
+    const {
+      jaxpr,
+      constEnv,
+      treedef: outTree,
+    } = runWithCache(cache, [defaultDevice(), ...jaxprArgs], () => {
+      return buildCachedJaxprArtifact(makeJaxpr(f, opts)(...jaxprArgs));
+    });
 
     const outs = bind(Primitive.Jit, [...constEnv.values, ...argsFlat], {
       name: f.name || "closure",
