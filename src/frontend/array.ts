@@ -192,6 +192,7 @@ type ArrayConstructorArgs = {
   backend: Backend;
   committed: boolean;
   pending?: Iterable<IPendingExecute>;
+  creationRefOwner?: CreationRefOwner;
 };
 
 /** Known claimants of an Array's creation ref. */
@@ -252,7 +253,7 @@ export class Array extends Tracer {
     this.#backend = args.backend;
     this.#committed = args.committed;
     this.#rc = 1;
-    this.#creationRefOwner = "none";
+    this.#creationRefOwner = args.creationRefOwner ?? "none";
 
     this.#pendingSet = new Set(args.pending);
     if (this.#pendingSet.size === 0) {
@@ -271,16 +272,18 @@ export class Array extends Tracer {
     // Anonymous constants (np.array([...]) inside grad body) bypass bind()
     // and PE tracking, so this constructor hook catches them.
     // When inside both PE and makeJaxpr, the inner makeJaxpr wins (below).
-    if (inPartialEvalScope()) {
-      this.#creationRefOwner = "partial-eval";
-      if (!inMakeJaxprBody()) registerPartialEvalCreatedArray(this);
-    }
+    if (args.creationRefOwner === undefined) {
+      if (inPartialEvalScope()) {
+        this.#creationRefOwner = "partial-eval";
+        if (!inMakeJaxprBody()) registerPartialEvalCreatedArray(this);
+      }
 
-    // Track Arrays created during makeJaxpr body execution.
-    // These have an unowned creation ref that must be balanced when the
-    // outermost makeJaxpr builds its ClosedJaxpr — builders hold independent
-    // .ref handles, but the creation rc=1 has no owner.
-    if (inMakeJaxprBody()) this.#creationRefOwner = "makeJaxpr-body";
+      // Track Arrays created during makeJaxpr body execution.
+      // These have an unowned creation ref that must be balanced when the
+      // outermost makeJaxpr builds its ClosedJaxpr — builders hold independent
+      // .ref handles, but the creation rc=1 has no owner.
+      if (inMakeJaxprBody()) this.#creationRefOwner = "makeJaxpr-body";
+    }
   }
 
   /** @ignore */
@@ -311,6 +314,7 @@ export class Array extends Tracer {
       backend: args.backend ?? this.#backend,
       committed: args.committed ?? this.#committed,
       pending: args.pending ?? this.#pending ?? undefined,
+      creationRefOwner: args.creationRefOwner,
     });
   }
 
@@ -319,6 +323,16 @@ export class Array extends Tracer {
     this.#rc++;
     if (_trackRefsEnabled) _lastRefMap.set(this, new Error());
     return this;
+  }
+
+  /**
+   * Internal-only retained handle that returns an independent Array wrapper.
+   * Unlike `.ref`, this does not share wrapper-local rc state with the
+   * original object; it retains the underlying backend/pending resources and
+   * hands that ownership to a fresh wrapper.
+   */
+  get retainedHandle() {
+    return this.#reshape(this.#st, "balanced");
   }
 
   /** Get the current reference count (for debugging memory management). */
@@ -442,12 +456,12 @@ export class Array extends Tracer {
     }
   }
 
-  #reshape(st: ShapeTracker): Array {
+  #reshape(st: ShapeTracker, creationRefOwner?: CreationRefOwner): Array {
     this.#check();
     const pending = this.#pending;
     for (const exe of pending) exe.updateRc(+1);
     if (typeof this.#source === "number") this.#backend.incRef(this.#source);
-    return this.#newArrayFrom({ st, pending });
+    return this.#newArrayFrom({ st, pending, creationRefOwner });
   }
 
   /**

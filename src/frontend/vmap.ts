@@ -44,7 +44,14 @@ import {
   _registerCacheSizeGetter,
   _registerJitCacheDisposer,
 } from "./check-leaks";
-import { ClosedJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
+import {
+  buildCachedJaxprArtifact,
+  CachedJaxprArtifact,
+  ClosedJaxpr,
+  Jaxpr,
+  jaxprAsFun,
+  makeJaxpr,
+} from "./jaxpr";
 import { jvp } from "./jvp";
 
 function mappedAval(batchDim: number, aval: AbstractValue) {
@@ -610,10 +617,10 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.QR]: lastDimsBatcher(Primitive.QR, 2, 2),
   [Primitive.Jit](axisSize, args, dims, { name, jaxpr }) {
     const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims);
-    const outs = bind(Primitive.Jit, [...newJaxpr.consts, ...args], {
+    const outs = bind(Primitive.Jit, [...newJaxpr.constEnv.values, ...args], {
       name: `${name}_vmap`,
       jaxpr: newJaxpr.jaxpr,
-      numConsts: newJaxpr.consts.length,
+      numConsts: newJaxpr.constEnv.length,
     });
     return [outs, rep(outs.length, 0)];
   },
@@ -764,7 +771,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
 
     // Build scan args with moved arrays
     const scanArgs = [
-      ...vmappedBody.consts,
+      ...vmappedBody.constEnv.values,
       ...movedConsts,
       ...movedCarry,
       ...movedXs,
@@ -778,7 +785,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     const results = bind(Primitive.Scan, scanArgs, {
       jaxpr: vmappedBody.jaxpr,
       numCarry,
-      numConsts: vmappedBody.consts.length + numConsts,
+      numConsts: vmappedBody.constEnv.length + numConsts,
       length,
       reverse,
     });
@@ -846,7 +853,11 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
 
     const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims);
 
-    const newArgs = [...vmappedBody.consts, ...movedConsts, ...movedElems];
+    const newArgs = [
+      ...vmappedBody.constEnv.values,
+      ...movedConsts,
+      ...movedElems,
+    ];
 
     const results = bind(Primitive.AssociativeScan, newArgs, {
       jaxpr: vmappedBody.jaxpr,
@@ -941,11 +952,15 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
 
     const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims);
 
-    const foriArgs = [...vmappedBody.consts, ...movedConsts, ...movedCarry];
+    const foriArgs = [
+      ...vmappedBody.constEnv.values,
+      ...movedConsts,
+      ...movedCarry,
+    ];
 
     const results = bind(Primitive.ForiLoop, foriArgs, {
       jaxpr: vmappedBody.jaxpr,
-      numConsts: vmappedBody.consts.length + numConsts,
+      numConsts: vmappedBody.constEnv.length + numConsts,
       lower,
       upper,
       ...(isJvpTransformed ? { isJvpTransformed } : {}),
@@ -966,11 +981,11 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   },
 };
 
-const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
+const vmapJaxprCache = new Map<Jaxpr, Map<string, CachedJaxprArtifact>>();
 
 _registerJitCacheDisposer(() => {
   for (const inner of vmapJaxprCache.values()) {
-    for (const jaxpr of inner.values()) jaxpr.dispose();
+    for (const artifact of inner.values()) artifact.constEnv.dispose();
     inner.clear();
   }
   vmapJaxprCache.clear();
@@ -985,8 +1000,8 @@ export function vmapJaxpr(
   jaxpr: Jaxpr,
   axisSize: number,
   dims: (number | null)[],
-): ClosedJaxpr {
-  // Include backend type: consts in the cached ClosedJaxpr are concrete arrays
+): CachedJaxprArtifact {
+  // Include backend type: consts in the cached const environment are concrete arrays
   // living on whichever device was active at first vmap. Cross-device reuse
   // would read stale data from the wrong backend.
   const cacheKey = defaultDevice() + "," + JSON.stringify([axisSize, dims]);
@@ -1005,13 +1020,15 @@ export function vmapJaxpr(
     shape.splice(dims[i], 0, axisSize); // Insert the mapped axis into the shape.
     return new ShapedArray(shape, v.aval.dtype, v.aval.weakType);
   });
-  const { jaxpr: newJaxpr } = makeJaxpr((args: Tracer[]) =>
-    vmapFlat(jaxprAsFun(jaxpr), dims, args),
-  )(inAvals);
+  const artifact = buildCachedJaxprArtifact(
+    makeJaxpr((args: Tracer[]) => vmapFlat(jaxprAsFun(jaxpr), dims, args))(
+      inAvals,
+    ),
+  );
 
   if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, new Map());
-  vmapJaxprCache.get(jaxpr)!.set(cacheKey, newJaxpr);
-  return newJaxpr;
+  vmapJaxprCache.get(jaxpr)!.set(cacheKey, artifact);
+  return artifact;
 }
 
 function vmapFlat(

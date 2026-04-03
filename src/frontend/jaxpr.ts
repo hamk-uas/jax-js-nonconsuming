@@ -891,12 +891,23 @@ export function jaxprAsFun(jaxpr: Jaxpr): (...args: Tracer[]) => Tracer[] {
   return (...args: Tracer[]) => evalJaxpr(jaxpr, args);
 }
 
+export type ClosedJaxprConstOwnership = "borrowed" | "owned";
+
 /** Jaxpr with a collection of associated, traced constants. */
 export class ClosedJaxpr {
   constructor(
     readonly jaxpr: Jaxpr,
     readonly consts: Tracer[],
+    readonly constOwnership: ClosedJaxprConstOwnership = "borrowed",
   ) {}
+
+  static borrowed(jaxpr: Jaxpr, consts: Tracer[]): ClosedJaxpr {
+    return new ClosedJaxpr(jaxpr, consts, "borrowed");
+  }
+
+  static owned(jaxpr: Jaxpr, consts: Tracer[]): ClosedJaxpr {
+    return new ClosedJaxpr(jaxpr, consts, "owned");
+  }
 
   /** String representation of this Jaxpr. */
   toString(): string {
@@ -905,33 +916,71 @@ export class ClosedJaxpr {
 
   /** Apply a function to the underlying Jaxpr. */
   mapJaxpr(f: (jaxpr: Jaxpr) => Jaxpr): ClosedJaxpr {
-    return new ClosedJaxpr(f(this.jaxpr), this.consts);
+    return new ClosedJaxpr(f(this.jaxpr), this.consts, this.constOwnership);
   }
 
   /** Dispose of the constants in this Jaxpr. */
   dispose() {
+    if (this.constOwnership === "owned") {
+      for (const c of this.consts) c.dispose();
+      return;
+    }
     for (const c of this.consts) {
       try {
         c.dispose();
-      } catch {
-        // Continue disposing remaining consts even if one is already freed.
-        // When retained and transient ClosedJaxprs share const objects,
-        // some consts reach rc=0 on the first dispose call. The second
-        // dispose call must not bail early — later consts may still need
-        // their refs released.
+      } catch (error) {
+        if (!(error instanceof UseAfterFreeError)) throw error;
+        // Borrowed ClosedJaxprs are transient tracing/build wrappers, so
+        // callers can legitimately hand them external const Arrays that have
+        // already been freed elsewhere. Continue releasing later const refs
+        // instead of bailing out on the first already-freed value.
       }
     }
   }
 }
 
-function retainClosedJaxpr(closedJaxpr: ClosedJaxpr): ClosedJaxpr {
-  return new ClosedJaxpr(
-    closedJaxpr.jaxpr,
-    closedJaxpr.consts.map((c) => {
-      // jax-js-lint: allow-ref
-      return c.ref;
-    }),
-  );
+// Cache-owned const environments are strict: each retained handle here is an
+// independent owner and teardown should fail loudly. Borrowed ClosedJaxpr
+// wrappers above keep the only remaining tolerant transient teardown path.
+export class OwnedConstEnv {
+  readonly values: Tracer[];
+
+  private constructor(values: Tracer[]) {
+    this.values = values;
+  }
+
+  static retain(values: Tracer[]): OwnedConstEnv {
+    return new OwnedConstEnv(
+      values.map((c) => {
+        if (c instanceof Array) return c.retainedHandle;
+        // jax-js-lint: allow-ref
+        return c.ref;
+      }),
+    );
+  }
+
+  get length(): number {
+    return this.values.length;
+  }
+
+  dispose(): void {
+    for (const c of this.values) c.dispose();
+  }
+}
+
+export interface CachedJaxprArtifact {
+  jaxpr: Jaxpr;
+  constEnv: OwnedConstEnv;
+}
+
+export function buildCachedJaxprArtifact<T extends { jaxpr: ClosedJaxpr }>(
+  traced: T,
+): Omit<T, "jaxpr"> & CachedJaxprArtifact {
+  const constEnv = OwnedConstEnv.retain(traced.jaxpr.consts);
+  const jaxpr = traced.jaxpr.jaxpr;
+  traced.jaxpr.dispose();
+  const { jaxpr: _closedJaxpr, ...rest } = traced;
+  return { ...rest, jaxpr, constEnv };
 }
 
 /** Tracer that records its operations to dynamically construct a Jaxpr. */
@@ -1007,6 +1056,7 @@ class JaxprTrace extends Trace {
       // the builder holds an independent retained handle.
       if (wasRaw) {
         tval.dispose();
+        if (tval instanceof Array) tval.markCreationRefBalancedByMakeJaxpr();
       } else if (tval instanceof Array && tval.hasUnownedCreationRef) {
         // Non-raw JaxArray created during makeJaxpr body (e.g., fudgeArray(1),
         // np.array([3]) inside traced function). Its creation ref has no
@@ -1121,12 +1171,16 @@ class JaxprBuilder {
 
     // Inline any scalar constants as Lit and remove from the input list.
     typecheckJaxpr(jaxpr);
-    const cjaxpr = new ClosedJaxpr(jaxpr, consts);
+    const cjaxpr = ClosedJaxpr.borrowed(jaxpr, consts);
     return _inlineLiterals(cjaxpr);
   }
 }
 
-function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
+function _inlineLiterals({
+  jaxpr,
+  consts,
+  constOwnership,
+}: ClosedJaxpr): ClosedJaxpr {
   const literals = new Map<Atom, Lit>();
   const constBinders: Var[] = [];
   const newConsts: Tracer[] = [];
@@ -1168,7 +1222,7 @@ function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
     newOuts,
   );
   typecheckJaxpr(newJaxpr); // Double-check for sanity.
-  return new ClosedJaxpr(newJaxpr, newConsts);
+  return new ClosedJaxpr(newJaxpr, newConsts, constOwnership);
 }
 
 type AbstractEvalRule<P extends Primitive> = (
@@ -1945,9 +1999,8 @@ export function jit<F extends (...args: any[]) => any>(
     if (existing) return existing;
   }
 
-  type JitCacheEntry = ReturnType<ReturnType<typeof makeJaxpr>> & {
-    transientOwner: ClosedJaxpr;
-  };
+  type JitCacheEntry = Omit<ReturnType<ReturnType<typeof makeJaxpr>>, "jaxpr"> &
+    CachedJaxprArtifact;
   const cache = new Map<string, JitCacheEntry>();
   const staticArgnums = new Set(opts?.staticArgnums ?? []);
 
@@ -1975,48 +2028,29 @@ export function jit<F extends (...args: any[]) => any>(
 
     const avalsIn = treeUnflatten(inTree, avalsForCache) as any[];
     const jaxprArgs = joinIdx(args.length, staticArgs, avalsIn, staticArgnums);
-    // Include backend type: ClosedJaxpr consts are concrete arrays living on
+    // Include backend type: cached const environments are concrete arrays living on
     // whichever device was active at first trace. Cross-device reuse would
     // read stale data from the wrong backend.
-    const { jaxpr, treedef: outTree } = runWithCache(
+    const { jaxpr, constEnv, treedef: outTree } = runWithCache(
       cache,
       [defaultDevice(), ...jaxprArgs],
       () => {
-        const traced = makeJaxpr(f, opts)(...jaxprArgs);
-        // Cache-owned ClosedJaxprs need independent const ownership.
-        // Execute against a retained wrapper, but keep the original traced
-        // ClosedJaxpr around as the transient owner of the builder-held refs.
-        // Outer traced scopes may consume that transient ownership before
-        // cache teardown, so disposal must tolerate already-freed consts.
-        return {
-          ...traced,
-          jaxpr: retainClosedJaxpr(traced.jaxpr),
-          transientOwner: traced.jaxpr,
-        };
+        return buildCachedJaxprArtifact(makeJaxpr(f, opts)(...jaxprArgs));
       },
     );
 
-    const outs = bind(Primitive.Jit, [...jaxpr.consts, ...argsFlat], {
+    const outs = bind(Primitive.Jit, [...constEnv.values, ...argsFlat], {
       name: f.name || "closure",
-      jaxpr: jaxpr.jaxpr,
-      numConsts: jaxpr.consts.length,
+      jaxpr,
+      numConsts: constEnv.length,
       dynamicAxes,
     });
     return treeUnflatten(outTree, outs);
   }) as OwnedFunction<F>;
 
   result.dispose = () => {
-    for (const { jaxpr, transientOwner } of cache.values()) {
-      try {
-        jaxpr.dispose();
-      } catch (error) {
-        if (!(error instanceof UseAfterFreeError)) throw error;
-      }
-      try {
-        transientOwner.dispose();
-      } catch (error) {
-        if (!(error instanceof UseAfterFreeError)) throw error;
-      }
+    for (const { constEnv } of cache.values()) {
+      constEnv.dispose();
     }
     cache.clear();
   };

@@ -86,6 +86,8 @@ import {
 } from "./core";
 import {
   abstractEvalRules,
+  buildCachedJaxprArtifact,
+  CachedJaxprArtifact,
   ClosedJaxpr,
   evalJaxpr,
   Jaxpr,
@@ -1367,7 +1369,7 @@ function partialEvalGraphToJaxpr(
     console.info("jaxpr from partial evaluation:\n" + jaxpr.toString());
   }
 
-  return new ClosedJaxpr(jaxpr, consts);
+  return ClosedJaxpr.borrowed(jaxpr, consts);
 }
 
 // implementation of vjp and grad
@@ -1879,7 +1881,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       const argOutAxes = inAxes.filter((_, i) => undefMask[numConsts + i]);
       const transposeOutAxes = [...constOutAxes, ...argOutAxes];
 
-      const jaxprConsts = transposedBody.consts;
+      const jaxprConsts = transposedBody.constEnv.values;
       const allConsts = [...jaxprConsts, ...constResiduals];
 
       // Forward halo for residual inputs; cotangent inputs (from outAxes)
@@ -1911,8 +1913,8 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       );
 
       // transposedBody comes from transposeJaxprCache. The BlockMap bind
-      // consumes only its Jaxpr/const contents, but the ClosedJaxpr wrapper is
-      // cache-owned retained state and must not be disposed here.
+      // consumes only its Jaxpr/const-environment contents; the cached const
+      // environment remains cache-owned state and must not be disposed here.
 
       const numUndefConsts = constOutAxes.length;
       const constCts = transposedOut.slice(0, numUndefConsts);
@@ -2183,7 +2185,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
       // Evaluate transposed body for this block.
       const bodyOuts = evalJaxpr(transposedBody.jaxpr, [
-        ...transposedBody.consts,
+        ...transposedBody.constEnv.values,
         ...constResiduals,
         ...blockResiduals,
         ...blockCts,
@@ -2595,11 +2597,11 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     const residuals = args.filter((x, i) => !undefPrimals[i]) as Tracer[];
     const outs = bind(
       Primitive.Jit,
-      [...newJaxpr.consts.map((c) => c.ref), ...residuals, ...cts],
+      [...newJaxpr.constEnv.values.map((c) => c.ref), ...residuals, ...cts],
       {
         name: `${name}_t`,
         jaxpr: newJaxpr.jaxpr,
-        numConsts: newJaxpr.consts.length,
+        numConsts: newJaxpr.constEnv.length,
       },
     );
     // Now pull cotangents back to the corresponding UndefPrimal inputs.
@@ -3024,7 +3026,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
         // Build transposedBody input: [tb.consts, constResiduals, primalCarry_k, xSlice_k, ctCarryIn, ctY_k]
         const transposedInputs = [
-          ...transposedBody.consts,
+          ...transposedBody.constEnv.values,
           ...constResiduals,
           ...primalCarry_k,
           ...xSlice_k,
@@ -3398,7 +3400,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         // Build transposed body inputs:
         // [tb.consts, constResiduals, yPrev, xPi, zeros_primal_ct, ctEff]
         const tbInputs: Tracer[] = [
-          ...transposedBody.consts,
+          ...transposedBody.constEnv.values,
           ...constResiduals,
         ];
         const tbDisposables: Tracer[] = [];
@@ -3688,7 +3690,10 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       const xPi = primalElems.map((e) => sliceAt(e, i));
       const yPrev = allYP[i - 1];
 
-      const tbInputs: Tracer[] = [...transposedBody.consts, ...constResiduals];
+      const tbInputs: Tracer[] = [
+        ...transposedBody.constEnv.values,
+        ...constResiduals,
+      ];
       const tbDisposables: Tracer[] = [];
       for (const y of yPrev) tbInputs.push(y);
       for (const x of xPi) tbInputs.push(x);
@@ -4084,7 +4089,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       const primals_k = bwdArgs.slice(numTangentConsts + numTangentCarry + 1);
 
       const transposedInputs = [
-        ...transposedBody.consts,
+        ...transposedBody.constEnv.values,
         ...constResiduals,
         iArr_k,
         ...primals_k,
@@ -4202,22 +4207,16 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
   },
 };
 
-const transposeJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
+const transposeJaxprCache = new Map<
+  Jaxpr,
+  Map<string, CachedJaxprArtifact>
+>();
 
 // Register for cleanup during checkLeaks.stop() to avoid leaking
-// ClosedJaxpr consts across test boundaries.
+// cached const environments across test boundaries.
 _registerJitCacheDisposer(() => {
   for (const inner of transposeJaxprCache.values()) {
-    for (const cj of inner.values()) {
-      // Guard against consts already disposed by earlier cache cleaners
-      // (e.g., jvpJaxprCache cleaned first, sharing underlying Literal
-      // arrays with transposed body consts).
-      try {
-        cj.dispose();
-      } catch {
-        // Already disposed — tolerate during bulk cleanup.
-      }
-    }
+    for (const artifact of inner.values()) artifact.constEnv.dispose();
   }
   transposeJaxprCache.clear();
 });
@@ -4227,8 +4226,11 @@ _registerCacheSizeGetter("transposeJaxpr", () => {
   return total;
 });
 
-function transposeJaxpr(jaxpr: Jaxpr, undefPrimals: boolean[]): ClosedJaxpr {
-  // Include backend type: consts in the cached ClosedJaxpr are concrete arrays
+function transposeJaxpr(
+  jaxpr: Jaxpr,
+  undefPrimals: boolean[],
+): CachedJaxprArtifact {
+  // Include backend type: consts in the cached const environment are concrete arrays
   // living on whichever device was active at first transpose. Cross-device reuse
   // would read stale data from the wrong backend.
   const cacheKey = defaultDevice() + "," + JSON.stringify(undefPrimals);
@@ -4243,24 +4245,26 @@ function transposeJaxpr(jaxpr: Jaxpr, undefPrimals: boolean[]): ClosedJaxpr {
   // Need to remove the UndefPrimals from the input types, as they are not
   // inputs to the Jaxpr while tracing.
   const forwardInTypes = inTypes.filter((_, i) => !undefPrimals[i]);
-  const { jaxpr: newJaxpr } = makeJaxpr(
-    (forwardIn: Tracer[], cotangents: Tracer[]) => {
-      const args: (Tracer | UndefPrimal)[] = [];
-      let forwardInIdx = 0; // index in forwardIn
-      for (let i = 0; i < undefPrimals.length; i++) {
-        if (undefPrimals[i]) args.push(new UndefPrimal(inTypes[i]));
-        else args.push(forwardIn[forwardInIdx++]);
-      }
-      return evalJaxprTransposed(jaxpr, args, cotangents);
-    },
-    { validateRefs: false },
-  )(forwardInTypes, outTypes);
-  typecheckJaxpr(newJaxpr.jaxpr); // sanity check
+  const artifact = buildCachedJaxprArtifact(
+    makeJaxpr(
+      (forwardIn: Tracer[], cotangents: Tracer[]) => {
+        const args: (Tracer | UndefPrimal)[] = [];
+        let forwardInIdx = 0; // index in forwardIn
+        for (let i = 0; i < undefPrimals.length; i++) {
+          if (undefPrimals[i]) args.push(new UndefPrimal(inTypes[i]));
+          else args.push(forwardIn[forwardInIdx++]);
+        }
+        return evalJaxprTransposed(jaxpr, args, cotangents);
+      },
+      { validateRefs: false },
+    )(forwardInTypes, outTypes),
+  );
+  typecheckJaxpr(artifact.jaxpr); // sanity check
 
   if (!transposeJaxprCache.has(jaxpr))
     transposeJaxprCache.set(jaxpr, new Map());
-  transposeJaxprCache.get(jaxpr)!.set(cacheKey, newJaxpr);
-  return newJaxpr;
+  transposeJaxprCache.get(jaxpr)!.set(cacheKey, artifact);
+  return artifact;
 }
 
 /**

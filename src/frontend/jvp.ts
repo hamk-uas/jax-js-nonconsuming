@@ -65,10 +65,17 @@ import {
   TracerValue,
   TreeMismatchError,
   triSolve,
-  UseAfterFreeError,
   where,
 } from "./core";
-import { ClosedJaxpr, evalJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
+import {
+  buildCachedJaxprArtifact,
+  CachedJaxprArtifact,
+  ClosedJaxpr,
+  evalJaxpr,
+  Jaxpr,
+  jaxprAsFun,
+  makeJaxpr,
+} from "./jaxpr";
 import { moveaxis } from "./vmap";
 
 class JVPTracer extends Tracer {
@@ -606,11 +613,11 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const newJaxpr = jvpJaxpr(jaxpr);
     const outs = bind(
       Primitive.Jit,
-      [...newJaxpr.consts, ...primals, ...tangents],
+      [...newJaxpr.constEnv.values, ...primals, ...tangents],
       {
         name: `${name}_jvp`,
         jaxpr: newJaxpr.jaxpr,
-        numConsts: newJaxpr.consts.length,
+        numConsts: newJaxpr.constEnv.length,
       },
     );
     const n = outs.length / 2;
@@ -661,8 +668,8 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
 
     // jvpBody.jaxpr.inBinders = [jvpConsts..., primals..., tangents...]
     //   where primals = [constsP, carryP, xP] and tangents = [constsT, carryT, xT]
-    // jvpBody.consts = the actual values for jvpConsts
-    const numJvpConsts = jvpBody.consts.length;
+    // jvpBody.constEnv.values = the actual values for jvpConsts
+    const numJvpConsts = jvpBody.constEnv.length;
     const numBodyInputs = numConsts + numCarry + numX;
 
     // Get the body input avals in JVP order (primals then tangents)
@@ -725,7 +732,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
         // Call the jvpBody jaxpr with jvpConsts (captured) first, then reordered body args
         const jvpOutputs = bind(
           Primitive.Jit,
-          [...jvpBody.consts, ...jvpOrderArgs],
+          [...jvpBody.constEnv.values, ...jvpOrderArgs],
           {
             jaxpr: jvpBody.jaxpr,
             numConsts: numJvpConsts,
@@ -816,7 +823,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
 
     // Transform body jaxpr for JVP
     const jvpBody = jvpJaxpr(jaxpr);
-    const numJvpConsts = jvpBody.consts.length;
+    const numJvpConsts = jvpBody.constEnv.length;
     const numBodyInputs = numConsts + numLeaves * 2; // consts + a + b
 
     // Get avals in JVP order (primals then tangents)
@@ -882,7 +889,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
         // evalJaxpr is non-consuming — consts stay alive (cache-owned via
         // jvpJaxprCache), no .ref needed.
         const jvpOutputs = evalJaxpr(jvpBody.jaxpr, [
-          ...jvpBody.consts,
+          ...jvpBody.constEnv.values,
           ...jvpOrderArgs,
         ]);
 
@@ -936,7 +943,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     // BlockMap groups as [consts (not tiled), inputs (tiled)], so we must
     // wrap the jvpBody to remap [constsP, constsT, inputsP, inputsT] →
     // [constsP, inputsP, constsT, inputsT] before calling jvpBody.
-    const nJvp = jvpBody.consts.length;
+    const nJvp = jvpBody.constEnv.length;
     const nC = numConsts;
     const nI = numInputs;
     const wrapperInAvals = [
@@ -1004,7 +1011,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
 
     const numElems = primals.length - numConsts;
     const jvpBody = jvpJaxpr(jaxpr);
-    const numJvpConsts = jvpBody.consts.length;
+    const numJvpConsts = jvpBody.constEnv.length;
     const numBodyInputs = numConsts + numElems * 2; // consts + a + b
 
     const jvpOrderAvals = jvpBody.jaxpr.inBinders
@@ -1050,7 +1057,10 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
         const bT = scanOrderArgs.slice(numConsts * 2 + numElems * 2 + numElems);
 
         const jvpOrderArgs = [...cP, ...aP, ...bP, ...cT, ...aT, ...bT];
-        return evalJaxpr(jvpBody.jaxpr, [...jvpBody.consts, ...jvpOrderArgs]);
+        return evalJaxpr(jvpBody.jaxpr, [
+          ...jvpBody.constEnv.values,
+          ...jvpOrderArgs,
+        ]);
       },
     )(...wrapperInAvals);
 
@@ -1117,7 +1127,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
       const carryT = args.slice(numConsts * 2 + 1 + numCarry);
 
       // jvpBody expects: [...jvpConsts, constsP, iP, carryP, constsT, iT, carryT]
-      const jvpConsts = jvpBody.consts;
+      const jvpConsts = jvpBody.constEnv.values;
       const iP = i;
       const iT = zerosLike(i);
 
@@ -1172,30 +1182,23 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   },
 };
 
-const jvpJaxprCacheByBackend = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
+const jvpJaxprCacheByBackend = new Map<
+  Jaxpr,
+  Map<string, CachedJaxprArtifact>
+>();
 
 // Register for cleanup during checkLeaks.stop() to avoid leaking
 // ClosedJaxpr consts (e.g., zerosLike tangents) across test boundaries.
 _registerJitCacheDisposer(() => {
   for (const inner of jvpJaxprCacheByBackend.values()) {
-    for (const cj of inner.values()) {
-      // Guard only the known shared-const cleanup case. When grad(foriLoop)
-      // traces through a jit-wrapped function (e.g., np.power), the foriLoop
-      // body jaxpr may dispose const Arrays that also appear in the cached
-      // JVP jaxpr. Keep other cleanup errors loud.
-      try {
-        cj.dispose();
-      } catch (error) {
-        if (!(error instanceof UseAfterFreeError)) throw error;
-      }
-    }
+    for (const artifact of inner.values()) artifact.constEnv.dispose();
   }
   jvpJaxprCacheByBackend.clear();
 });
 _registerCacheSizeGetter("jvpJaxpr", () => jvpJaxprCacheByBackend.size);
 
-function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
-  // Include backend type: consts in the cached ClosedJaxpr (e.g. zero tangents)
+function jvpJaxpr(jaxpr: Jaxpr): CachedJaxprArtifact {
+  // Include backend type: consts in the cached const environment (e.g. zero tangents)
   // are concrete arrays on whichever device was active at first JVP. Cross-device
   // reuse would read stale data from the wrong backend.
   const backendKey = defaultDevice();
@@ -1210,18 +1213,20 @@ function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
   // only happens in jvp-of-jit cases, where you understandably have to
   // sacrifice some performance versus wrapping jit() outside.
   const inAvals = jaxpr.inBinders.map((v) => v.aval);
-  const { jaxpr: newJaxpr } = makeJaxpr(
-    (primals: Tracer[], tangents: Tracer[]) =>
-      jvpFlat(jaxprAsFun(jaxpr), primals, tangents),
-  )(inAvals, inAvals);
+  const artifact = buildCachedJaxprArtifact(
+    makeJaxpr(
+      (primals: Tracer[], tangents: Tracer[]) =>
+        jvpFlat(jaxprAsFun(jaxpr), primals, tangents),
+    )(inAvals, inAvals),
+  );
 
   let inner = jvpJaxprCacheByBackend.get(jaxpr);
   if (!inner) {
     inner = new Map();
     jvpJaxprCacheByBackend.set(jaxpr, inner);
   }
-  inner.set(backendKey, newJaxpr);
-  return newJaxpr;
+  inner.set(backendKey, artifact);
+  return artifact;
 }
 
 function jvpFlat(

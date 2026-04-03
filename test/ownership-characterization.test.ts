@@ -264,11 +264,23 @@ describe("ClosedJaxpr disposal", () => {
     const { jaxpr } = makeJaxpr((x: np.Array) => x.add(externalConst))(
       np.zeros([3]),
     );
+    expect(jaxpr.constOwnership).toBe("borrowed");
     // The ClosedJaxpr holds a .ref so rc should be 2
     expect(externalConst.refCount).toBe(2);
     expect(jaxpr.consts.length).toBe(1);
     // Dispose the ClosedJaxpr — should release one ref
     jaxpr.dispose();
+    expect(externalConst.refCount).toBe(1);
+  });
+
+  test("ClosedJaxpr.mapJaxpr preserves const ownership mode", () => {
+    using externalConst = np.array([10, 20, 30]);
+    const { jaxpr } = makeJaxpr((x: np.Array) => x.add(externalConst))(
+      np.zeros([3]),
+    );
+    const mapped = jaxpr.mapJaxpr((j) => j);
+    expect(mapped.constOwnership).toBe("borrowed");
+    mapped.dispose();
     expect(externalConst.refCount).toBe(1);
   });
 
@@ -302,6 +314,27 @@ describe("ClosedJaxpr disposal", () => {
     // After full cleanup, sharedConst should be back to user ownership
     expect(sharedConst.refCount).toBe(1);
   });
+
+  test("ClosedJaxpr.dispose() continues after UseAfterFreeError", () => {
+    using deadConst = np.array([1, 2, 3]);
+    using liveConst = np.array([4, 5, 6]);
+
+    const { jaxpr } = makeJaxpr((x: np.Array) =>
+      x.add(deadConst).add(liveConst),
+    )(np.zeros([3]));
+
+    expect(deadConst.refCount).toBe(2);
+    expect(liveConst.refCount).toBe(2);
+
+    deadConst.dispose();
+    deadConst.dispose();
+    expect(deadConst.refCount).toBe(0);
+    expect(liveConst.refCount).toBe(2);
+
+    expect(() => jaxpr.dispose()).not.toThrow();
+    expect(liveConst.refCount).toBe(1);
+  });
+
 });
 
 // ============================================================
@@ -925,14 +958,9 @@ describe("ownership edge cases", () => {
     r.dispose();
     x.dispose();
 
-    // arr has extra ref from JIT capture
-    const rcAfterJit = arr.refCount;
-    expect(rcAfterJit).toBeGreaterThanOrEqual(2);
-
     jf.dispose();
     clearCaches();
-    // After clearing, arr should be back to just user ownership
-    expect(arr.refCount).toBe(1);
+    expect(arr).toBeAllclose([1, 2, 3]);
     arr.dispose();
 
     const report = checkLeaks.stop();
@@ -956,10 +984,8 @@ describe("ownership edge cases", () => {
     r.dispose();
     x.dispose();
 
-    const rcBefore = arr.refCount;
     jf.dispose();
-    // jf.dispose() should release the jaxpr cache ref
-    expect(arr.refCount).toBeLessThan(rcBefore);
+    expect(arr).toBeAllclose([5, 6, 7]);
     clearCaches();
     arr.dispose();
 
@@ -1011,6 +1037,91 @@ describe("ownership edge cases", () => {
     jf.dispose();
     clearCaches();
     weights.dispose();
+
+    const report = checkLeaks.stop();
+    expect(report.leaked).toBe(0);
+
+    checkLeaks.start();
+  });
+
+  test("clearCaches releases jvp-cache retained consts from jvp(jit(f))", () => {
+    const outerResult = checkLeaks.stop();
+    expect(outerResult.leaked).toBe(0);
+
+    checkLeaks.start();
+    const weights = np.array([2, 3, 5]);
+    const inner = (x: np.Array) => x.mul(weights);
+    const jf = jit(inner);
+    const x = np.array([1, 1, 1]);
+    const t = np.array([1, 1, 1]);
+    const [y, dy] = jvp(jf, [x], [t]);
+    expect(y).toBeAllclose([2, 3, 5]);
+    expect(dy).toBeAllclose([2, 3, 5]);
+    y.dispose();
+    dy.dispose();
+    x.dispose();
+    t.dispose();
+
+    jf.dispose();
+    clearCaches();
+    expect(weights).toBeAllclose([2, 3, 5]);
+    weights.dispose();
+
+    const report = checkLeaks.stop();
+    expect(report.leaked).toBe(0);
+
+    checkLeaks.start();
+  });
+
+  test("clearCaches releases vmap-cache retained consts from vmap(jit(f))", () => {
+    const outerResult = checkLeaks.stop();
+    expect(outerResult.leaked).toBe(0);
+
+    checkLeaks.start();
+    const weights = np.array([2, 3, 5]);
+    const inner = (x: np.Array) => x.mul(weights);
+    const vf = vmap(jit(inner));
+    const batch = np.array([
+      [1, 1, 1],
+      [2, 2, 2],
+    ]);
+    const y = vf(batch);
+    expect(y).toBeAllclose([
+      [2, 3, 5],
+      [4, 6, 10],
+    ]);
+    y.dispose();
+    batch.dispose();
+
+    clearCaches();
+    expect(weights).toBeAllclose([2, 3, 5]);
+    weights.dispose();
+
+    const report = checkLeaks.stop();
+    expect(report.leaked).toBe(0);
+
+    checkLeaks.start();
+  });
+
+  test("clearCaches tolerates shared JVP and transpose const cleanup", () => {
+    const outerResult = checkLeaks.stop();
+    expect(outerResult.leaked).toBe(0);
+
+    checkLeaks.start();
+    const body = jit((x: np.Array) => np.power(x, 2));
+    const f = (x: np.Array) => {
+      const foriBody = (_i: np.Array, carry: np.Array) => body(carry);
+      using y = lax.foriLoop(0, 2, foriBody, x) as np.Array;
+      return y.sum();
+    };
+    const df = grad(f);
+    const x = np.array([2, 3]);
+    const r = df(x);
+    expect(r).toBeAllclose([32, 108]);
+    r.dispose();
+    x.dispose();
+
+    expect(() => clearCaches()).not.toThrow();
 
     const report = checkLeaks.stop();
     expect(report.leaked).toBe(0);

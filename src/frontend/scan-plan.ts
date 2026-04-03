@@ -2295,7 +2295,7 @@ function tryBuildBlockMapAssocScanPlan(
   // The vmapped body should be const-free when the source body is pure.
   // If it has captured consts, fall back — we don't propagate vmap const
   // slots through the plan.
-  if (applyVmapClosed.consts.length > 0) {
+  if (applyVmapClosed.constEnv.length > 0) {
     if (DEBUG >= 1) {
       console.log(
         "[assoc-scan] block-map path: vmapped apply body has unexpected consts",
