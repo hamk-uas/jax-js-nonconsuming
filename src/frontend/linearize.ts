@@ -53,6 +53,7 @@ import {
   fullRaise,
   gather,
   getCustomVjpDef,
+  inMakeJaxprBody,
   insideAbstractTrace,
   max,
   min,
@@ -246,13 +247,14 @@ export function disposePeIntermediates(
   peIntermediates: Tracer[],
   protectedVals: Set<Tracer>,
 ): void {
-  if (insideAbstractTrace()) return;
   const allProtected = new Set<Tracer>(protectedVals);
   for (const v of protectedVals) {
     const concrete = unwrapToConcreteArray(v);
     if (concrete !== v) allProtected.add(concrete);
   }
   const disposed = new Set<Tracer>();
+  const hasOuterAbstractTrace = insideAbstractTrace();
+  const allowNestedBodyCleanup = hasOuterAbstractTrace && inMakeJaxprBody();
   for (const t of peIntermediates) {
     if (allProtected.has(t)) continue;
     if (disposed.has(t)) continue;
@@ -260,8 +262,28 @@ export function disposePeIntermediates(
     const concrete = unwrapToConcreteArray(t);
     if (concrete !== t && allProtected.has(concrete)) continue;
     if (concrete !== t && !concrete.isAliveForCleanup()) continue;
+
+    // Nested grad/hessian inside traced control flow runs PE cleanup while an
+    // outer abstract trace is still active. In that case, disposing tracer
+    // wrappers can cascade into outer-owned values. Restrict cleanup to the
+    // concrete arrays that were actually born in this PE scope.
+    if (allowNestedBodyCleanup) {
+      if (!(concrete instanceof JaxArray)) continue;
+      if (!concrete.hasPartialEvalCreationRef) continue;
+      disposed.add(t);
+      disposed.add(concrete);
+      try {
+        concrete.dispose();
+      } catch {
+        // Nested cleanup may race with an already-balanced path.
+      }
+      continue;
+    }
+
+    if (hasOuterAbstractTrace) continue;
+
     disposed.add(t);
-    if (concrete !== t) disposed.add(concrete);
+    if (concrete !== t) disposed.add(concrete); // eslint-disable-line jax-js/no-use-after-dispose -- false positive: dispose is behind `continue`
     try {
       t.dispose();
     } catch {

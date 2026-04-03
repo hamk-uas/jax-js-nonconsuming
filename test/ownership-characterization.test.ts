@@ -27,6 +27,7 @@ import {
   checkLeaks,
   clearCaches,
   grad,
+  hessian,
   jacfwd,
   Array as JaxArray,
   jit,
@@ -827,6 +828,61 @@ describe("scan transform compositions", () => {
     const expected0 = 3.0 * Math.pow(0.8, 5);
     const expected1 = 4.0 * Math.pow(0.8, 5);
     expect(finalCarry).toBeAllclose([expected0, expected1], { atol: 1e-5 });
+  });
+
+  test("scan -> foriLoop -> grad(gradient step) — zero leaks", () => {
+    const objective = (x: np.Array): np.Array => x.mul(x).sum();
+
+    const foriBody = (_i: np.Array, x: np.Array): np.Array => {
+      using g = grad(objective)(x);
+      using step = g.mul(0.1);
+      return x.sub(step);
+    };
+
+    const scanBody = (carry: np.Array, _: null): [np.Array, np.Array] => {
+      const next = lax.foriLoop(0, 3, foriBody, carry) as np.Array;
+      return [next, next];
+    };
+
+    using init = np.array([4.0, 3.0]);
+    const [carry, ys] = lax.scan(scanBody, init, null, { length: 1 });
+    using _carry = carry;
+    using _ys = ys;
+    const js = carry.js() as number[];
+    expect(Math.abs(js[0])).toBeLessThan(4.0);
+    expect(Math.abs(js[1])).toBeLessThan(3.0);
+  });
+
+  test("scan -> foriLoop -> hessian(newton step) — zero leaks", () => {
+    const objective = (params: np.Array): np.Array => {
+      const a = lax.dynamicIndexInDim(params, 0, 0, false);
+      const b = lax.dynamicIndexInDim(params, 1, 0, false);
+      return a.mul(a).add(b.mul(b));
+    };
+
+    const foriBody = (_i: np.Array, x: np.Array): np.Array => {
+      using g = grad(objective)(x);
+      using h = hessian(objective)(x);
+      using eye = np.eye(2, { dtype: x.dtype });
+      using reg = eye.mul(0.01);
+      using hReg = h.add(reg);
+      using step = np.linalg.solve(hReg, g);
+      using scaled = step.mul(0.1);
+      return x.sub(scaled);
+    };
+
+    const scanBody = (carry: np.Array, _: null): [np.Array, np.Array] => {
+      const next = lax.foriLoop(0, 3, foriBody, carry) as np.Array;
+      return [next, next];
+    };
+
+    using init = np.array([4.0, 3.0]);
+    const [carry, ys] = lax.scan(scanBody, init, null, { length: 1 });
+    using _carry = carry;
+    using _ys = ys;
+    const js = carry.js() as number[];
+    expect(Math.abs(js[0])).toBeLessThan(4.0);
+    expect(Math.abs(js[1])).toBeLessThan(3.0);
   });
 });
 
