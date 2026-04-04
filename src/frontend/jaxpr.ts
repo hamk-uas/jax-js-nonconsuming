@@ -1934,6 +1934,21 @@ export function makeJaxpr(
         if (c instanceof Array) c.markCreationRefBalancedByMakeJaxpr();
       }
     }
+    if (DEBUG >= 1 && constsToBalance.length > 0) {
+      // This diagnostic catches body-created *concrete* arrays captured as
+      // consts (e.g. `np.array([2])` without `using`). Traced temporaries
+      // like `x.mul(x)` are graph nodes, not real buffers, so they don't
+      // need rescuing here — the ESLint jax-js/no-array-chain and
+      // jax-js/no-nested-array-leak rules catch those structural patterns.
+      const descs = constsToBalance
+        .filter((c) => c instanceof Array)
+        .map((c) => c.toString());
+      console.warn(
+        `[jax-js] makeJaxpr rescued ${constsToBalance.length} intermediate(s) ` +
+          `that would leak in eager mode: ${descs.join(", ")}. ` +
+          `Extract to \`using\` bindings for eager/jit parity.`,
+      );
+    }
 
     if (outTree.value === undefined) {
       throw new Error("outTree was not set in makeJaxpr");

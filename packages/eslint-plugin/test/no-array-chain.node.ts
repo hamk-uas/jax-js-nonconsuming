@@ -117,33 +117,36 @@ function f(x) {
   assert.equal(output, code);
 });
 
-// --- Traced-context suppression: should NOT warn ---
+// --- Traced-context: warns with safe-to-fix message ---
 
-test("no-array-chain: suppressed inside inline jit body", async () => {
+test("no-array-chain: warns inside inline jit body with traced message", async () => {
   const code = `
 const f = jit((x) => x.add(1).mul(2));
 `;
   const messages = await lintArrayChain(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /safe inside jit\/grad\/scan/);
 });
 
-test("no-array-chain: suppressed inside inline grad body", async () => {
+test("no-array-chain: warns inside inline grad body with traced message", async () => {
   const code = `
 const r = grad((x) => x.mul(x).sum())(input);
 `;
   const messages = await lintArrayChain(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /safe inside jit\/grad\/scan/);
 });
 
-test("no-array-chain: suppressed inside inline vmap body", async () => {
+test("no-array-chain: warns inside inline vmap body with traced message", async () => {
   const code = `
 const f = vmap((x) => x.mul(2).add(3));
 `;
   const messages = await lintArrayChain(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /safe inside jit\/grad\/scan/);
 });
 
-test("no-array-chain: suppressed inside inline lax.scan body", async () => {
+test("no-array-chain: warns inside inline lax.scan body with traced message", async () => {
   const code = `
 lax.scan((carry, x) => {
   const s = carry.add(x).mul(2);
@@ -151,41 +154,46 @@ lax.scan((carry, x) => {
 }, init, xs);
 `;
   const messages = await lintArrayChain(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /safe inside jit\/grad\/scan/);
 });
 
-test("no-array-chain: suppressed for named function passed to grad", async () => {
+test("no-array-chain: warns for named function passed to grad with traced message", async () => {
   const code = `
 const f = (x) => x.mul(x).add(x);
 const df = grad(f);
 `;
   const messages = await lintArrayChain(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /safe inside jit\/grad\/scan/);
 });
 
-test("no-array-chain: suppressed for named function passed to jit", async () => {
+test("no-array-chain: warns for named function passed to jit with traced message", async () => {
   const code = `
 const f = (x) => x.add(1).mul(2).sub(3);
 const jf = jit(f);
 `;
   const messages = await lintArrayChain(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /safe inside jit\/grad\/scan/);
 });
 
-test("no-array-chain: suppressed for named function passed to hessian", async () => {
+test("no-array-chain: warns for named function passed to hessian with traced message", async () => {
   const code = `
 const f = (x) => x.mul(x).sum();
 const H = jit(hessian(f));
 `;
   const messages = await lintArrayChain(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /safe inside jit\/grad\/scan/);
 });
 
-test("no-array-chain: NOT suppressed for named function never passed to transform", async () => {
+test("no-array-chain: eager message for function never passed to transform", async () => {
   const code = `
 const f = (x) => x.mul(x).add(x);
 const y = f(input);
 `;
   const messages = await lintArrayChain(code);
   assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /unnamed eager temporaries/);
 });

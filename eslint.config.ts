@@ -110,7 +110,8 @@ export default defineConfig([
     ...(jaxJsPlugin.configs!.invariance as any),
   },
   // Internal framework code manipulates Slots, shapes, Jaxprs — not np.Arrays.
-  // Disable require-using and no-nested-array-leak (AluExp false positives).
+  // Disable require-using, no-nested-array-leak (AluExp false positives), and
+  // no-array-chain (framework bodies execute inside tracing contexts).
   {
     files: [
       "src/frontend/**/*.ts",
@@ -123,6 +124,7 @@ export default defineConfig([
     rules: {
       "jax-js/require-using": "off",
       "jax-js/no-nested-array-leak": "off",
+      "jax-js/no-array-chain": "off",
     },
   },
   // Also disable for .test.ts files inside src/ (they test internals)
@@ -175,6 +177,26 @@ export default defineConfig([
   {
     files: ["test/**/*.{js,mjs,cjs,ts}"],
     ...(jaxJsPlugin.configs!.invariance as any),
+  },
+  // Tests intentionally exercise traced-body patterns where intermediates are
+  // managed by the JIT compiler. With traced-body enforcement active, these
+  // rules fire on hundreds of existing patterns. Disable for test files since
+  // --max-warnings 0 policy means any warning blocks commits.
+  // The rules remain active for src/** and packages/** (user-facing code).
+  {
+    files: ["test/**/*.{js,mjs,cjs,ts}"],
+    rules: {
+      "jax-js/no-nested-array-leak": "off",
+      "jax-js/no-array-chain": "off",
+    },
+  },
+  // Bench files import from dist/ and exercise traced patterns.
+  {
+    files: ["bench/**/*.{js,mjs,cjs,ts}"],
+    rules: {
+      "jax-js/no-nested-array-leak": "off",
+      "jax-js/no-array-chain": "off",
+    },
   },
   {
     files: ["scripts/**/*.mjs"],

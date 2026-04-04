@@ -3,6 +3,17 @@ import type { Rule } from "eslint";
 import { isInsideTracedBody } from "../tracing-detection";
 import { getMemberName } from "../types";
 
+/**
+ * Flags deep array method chains (`.add(1).mul(2).sub(3)`) that create
+ * unnamed intermediates which cannot be disposed.
+ *
+ * In eager mode: intermediates are real GPU/WASM buffers — a silent leak.
+ * Inside traced bodies (jit/grad/vmap/scan): intermediates are managed by
+ * the JIT compiler so there is no leak. The rule still fires with a softer
+ * message noting that splitting into `using` bindings is safe and keeps
+ * eager/traced code consistent.
+ */
+
 const CHAINABLE_ARRAY_METHODS = new Set([
   "add",
   "sub",
@@ -201,6 +212,8 @@ const rule: Rule.RuleModule = {
     messages: {
       noArrayChain:
         "Array call chain depth {{depth}} creates unnamed eager temporaries. Split into `using` bindings.",
+      noArrayChainTraced:
+        "Array call chain depth {{depth}} — splitting into `using` bindings is safe inside jit/grad/scan bodies and keeps eager/traced code consistent.",
     },
   },
   create(context) {
@@ -238,14 +251,11 @@ const rule: Rule.RuleModule = {
           if (parentDepth >= minDepth) return;
         }
 
-        // Suppress inside traced contexts — jit/grad/vmap/etc. body
-        // functions are traced (not eagerly executed), so chains inside
-        // them do not create real GPU temporaries.
-        if (isInsideTracedBody(node, context)) return;
+        const inTraced = isInsideTracedBody(node, context);
 
         context.report({
           node,
-          messageId: "noArrayChain",
+          messageId: inTraced ? "noArrayChainTraced" : "noArrayChain",
           data: { depth: String(depth) },
           fix(fixer) {
             const statement = findRewriteStatement(node, context);

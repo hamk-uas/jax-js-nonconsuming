@@ -17,8 +17,9 @@ import { getMemberName, hasAllowComment } from "../types";
  *   using G_3d = np.reshape(G, [1, m, m]);
  *   np.tile(G_3d, [n, 1, 1]);
  *
- * Suppressed inside tracing transform bodies (jit, grad, vmap, scan, etc.)
- * where intermediates are automatically managed by the JIT compiler.
+ * Inside traced bodies (jit/grad/vmap/scan) intermediates are managed by the
+ * JIT compiler, but the rule still fires with a softer message: splitting
+ * into `using` bindings is safe and keeps eager/traced code consistent.
  *
  * NOTE: This rule uses heuristics (method name matching) and may produce
  * false positives on non-array objects whose methods share names with
@@ -86,6 +87,9 @@ const noNestedArrayLeak: Rule.RuleModule = {
       nestedArrayLeak:
         "Array-producing call `{{callee}}` is passed as an argument without binding — " +
         "the intermediate array is never disposed. Extract to a `using` variable.",
+      nestedArrayLeakTraced:
+        "Array-producing call `{{callee}}` is passed as an argument without binding — " +
+        "splitting into `using` bindings is safe inside jit/grad/scan bodies and keeps eager/traced code consistent.",
     },
   },
   create(context) {
@@ -98,8 +102,8 @@ const noNestedArrayLeak: Rule.RuleModule = {
         if (!isArrayProducingCall(node)) return;
         if (hasAllowComment(context, node, "jax-js-lint: allow-non-using"))
           return;
-        if (isInsideTracedBody(node, context)) return;
 
+        const inTraced = isInsideTracedBody(node, context);
         const violations: { argIdx: number; arg: any }[] = [];
 
         for (let i = 0; i < node.arguments.length; i++) {
@@ -130,7 +134,7 @@ const noNestedArrayLeak: Rule.RuleModule = {
 
           context.report({
             node: arg,
-            messageId: "nestedArrayLeak",
+            messageId: inTraced ? "nestedArrayLeakTraced" : "nestedArrayLeak",
             data: { callee: calleeName },
             fix: buildBatchFix(node, violations, context),
           });

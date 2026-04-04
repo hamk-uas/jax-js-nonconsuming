@@ -150,33 +150,38 @@ function f(G) {
   assert.equal(messages.length, 0);
 });
 
-// ── Tracing suppression: should NOT report inside traced bodies ──────────
+// ── Traced-context: warns with safe-to-fix message ──────────────────────
 
-test("no-nested-array-leak: suppressed inside inline jit body", async () => {
+test("no-nested-array-leak: warns inside inline jit body with traced message", async () => {
   const code = `
 const f = jit((x) => np.tile(np.reshape(x, [1, 2, 2]), [10, 1, 1]));
 `;
   const messages = await lint(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /safe inside jit\/grad\/scan/);
 });
 
-test("no-nested-array-leak: suppressed inside inline grad body", async () => {
+test("no-nested-array-leak: warns inside inline grad body with traced message", async () => {
   const code = `
 const g = grad((x) => np.add(np.square(x), np.eye(2)).sum());
 `;
   const messages = await lint(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 2);
+  assert.ok(
+    messages.every((m) => m.message.includes("safe inside jit/grad/scan")),
+  );
 });
 
-test("no-nested-array-leak: suppressed inside inline vmap body", async () => {
+test("no-nested-array-leak: warns inside inline vmap body with traced message", async () => {
   const code = `
 const h = vmap((x) => np.tile(np.reshape(x, [1, 3]), [2, 1]));
 `;
   const messages = await lint(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /safe inside jit\/grad\/scan/);
 });
 
-test("no-nested-array-leak: suppressed inside lax.scan step function", async () => {
+test("no-nested-array-leak: warns inside lax.scan step with traced message", async () => {
   const code = `
 const [carry, ys] = lax.scan(
   (c, x) => [np.add(c, np.reshape(x, [1, 2])), c],
@@ -185,36 +190,81 @@ const [carry, ys] = lax.scan(
 );
 `;
   const messages = await lint(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /safe inside jit\/grad\/scan/);
 });
 
-test("no-nested-array-leak: suppressed for named function passed to grad", async () => {
+test("no-nested-array-leak: warns for named function passed to grad with traced message", async () => {
   const code = `
 const f = (x) => np.tile(np.reshape(x, [1, 2]), [3, 1]).sum();
 const df = grad(f);
 `;
   const messages = await lint(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /safe inside jit\/grad\/scan/);
 });
 
-test("no-nested-array-leak: suppressed for named function passed to jit", async () => {
+test("no-nested-array-leak: warns for named function passed to jit with traced message", async () => {
   const code = `
 const f = (x) => np.add(np.square(x), np.eye(2));
 const jf = jit(f);
 `;
   const messages = await lint(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 2);
+  assert.ok(
+    messages.every((m) => m.message.includes("safe inside jit/grad/scan")),
+  );
 });
 
-test("no-nested-array-leak: suppressed inside hessian composition", async () => {
+test("no-nested-array-leak: warns inside hessian with traced message", async () => {
   const code = `
 const h = hessian((x) => np.add(np.square(x), np.eye(2)).sum());
 `;
   const messages = await lint(code);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 2);
+  assert.ok(
+    messages.every((m) => m.message.includes("safe inside jit/grad/scan")),
+  );
 });
 
-test("no-nested-array-leak: NOT suppressed outside tracing context", async () => {
+test("no-nested-array-leak: where args are flagged inside grad body with traced message", async () => {
+  const code = `
+const g = grad((x) => np.where(x.greater(0), x.sum(), x.add(1)).sum());
+`;
+  const messages = await lint(code);
+  assert.equal(messages.length, 3);
+  assert.ok(
+    messages.every((m) => m.message.includes("safe inside jit/grad/scan")),
+  );
+});
+
+test("no-nested-array-leak: where condition and branch flagged inside traced body", async () => {
+  const code = `
+const g = grad((x) => np.where(np.greater(x, 0), x, x.add(1)).sum());
+`;
+  const messages = await lint(code);
+  assert.equal(messages.length, 2);
+  assert.ok(
+    messages.every((m) => m.message.includes("safe inside jit/grad/scan")),
+  );
+});
+
+test("no-nested-array-leak: where args flagged inside lax.scan step with traced message", async () => {
+  const code = `
+const [carry, ys] = lax.scan(
+  (c, x) => [np.where(c.greater(0), c.sum(), c.add(x)), c],
+  init,
+  xs,
+);
+`;
+  const messages = await lint(code);
+  assert.equal(messages.length, 3);
+  assert.ok(
+    messages.every((m) => m.message.includes("safe inside jit/grad/scan")),
+  );
+});
+
+test("no-nested-array-leak: eager message outside tracing context", async () => {
   const code = `
 function f(x) {
   return np.tile(np.reshape(x, [1, 2, 2]), [10, 1, 1]);
@@ -222,6 +272,7 @@ function f(x) {
 `;
   const messages = await lint(code);
   assert.equal(messages.length, 1);
+  assert.match(messages[0].message, /never disposed/);
 });
 
 test("no-nested-array-leak: lax factory nested in np call flags inner", async () => {

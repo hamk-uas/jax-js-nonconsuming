@@ -255,6 +255,8 @@ export function disposePeIntermediates(
     if (concrete !== v) allProtected.add(concrete);
   }
   const disposed = new Set<Tracer>();
+  const diagSeen = DEBUG >= 1 ? new Set<Tracer>() : undefined;
+  const disposedForDiag: string[] = [];
   const hasOuterAbstractTrace = insideAbstractTrace();
   const allowNestedBodyCleanup = hasOuterAbstractTrace && inMakeJaxprBody();
   for (const t of peIntermediates) {
@@ -274,6 +276,10 @@ export function disposePeIntermediates(
       if (!concrete.hasPartialEvalCreationRef) continue;
       disposed.add(t);
       disposed.add(concrete);
+      if (diagSeen && !diagSeen.has(concrete)) {
+        diagSeen.add(concrete);
+        disposedForDiag.push(concrete.toString());
+      }
       try {
         concrete.dispose();
       } catch {
@@ -286,12 +292,27 @@ export function disposePeIntermediates(
 
     disposed.add(t);
     if (concrete !== t) disposed.add(concrete); // eslint-disable-line jax-js/no-use-after-dispose -- false positive: dispose is behind `continue`
+    /* eslint-disable jax-js/no-use-after-dispose -- false positive: earlier concrete.dispose() is in a `continue` branch that never reaches here */
+    if (diagSeen && !diagSeen.has(concrete)) {
+      diagSeen.add(concrete);
+      const desc =
+        concrete instanceof JaxArray ? concrete.toString() : "tracer";
+      disposedForDiag.push(desc);
+    }
+    /* eslint-enable jax-js/no-use-after-dispose */
     try {
       t.dispose();
     } catch {
       // Hardening for stale nested-transform wrappers. Normal cleanup should
       // have been filtered by explicit protection and liveness checks above.
     }
+  }
+  if (DEBUG >= 1 && disposedForDiag.length > 0) {
+    console.warn(
+      `[jax-js] grad/vjp rescued ${disposedForDiag.length} PE intermediate(s) ` +
+        `that would leak in eager mode: ${disposedForDiag.join(", ")}. ` +
+        `Extract to \`using\` bindings for eager/jit parity.`,
+    );
   }
 }
 
