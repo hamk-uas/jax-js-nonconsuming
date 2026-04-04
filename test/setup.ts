@@ -3,10 +3,15 @@ import {
   devices,
   getBackend,
   numpy as np,
+  setDebug,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { afterAll, afterEach, beforeEach, expect } from "vitest";
 
 beforeEach(() => {
+  // Enable ownership diagnostics. JIT compile logs and [jax-js] warnings
+  // are suppressed by vitest for passing tests; shown on failure for
+  // debugging. Ownership warnings surface via the library regression test.
+  setDebug(1);
   checkLeaks.start();
 });
 

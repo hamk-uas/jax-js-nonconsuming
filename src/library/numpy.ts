@@ -322,6 +322,23 @@ export function astype(a: ArrayLike, dtype: DType): Array {
   return fudgeArray(a).astype(dtype);
 }
 
+function createArrayScope() {
+  const values: Array[] = [];
+  return {
+    keep<T extends Array>(value: T): T {
+      values.push(value);
+      return value;
+    },
+    keepAll<T extends Array>(keptValues: T[]): T[] {
+      values.push(...keptValues);
+      return keptValues;
+    },
+    [Symbol.dispose]() {
+      for (const value of values) value[Symbol.dispose]();
+    },
+  };
+}
+
 /** Sum of the elements of the array over a given axis, or axes. */
 export function sum(
   a: ArrayLike,
@@ -1756,10 +1773,11 @@ export const cross = jit(
     }
     axisa = checkAxis(axisa, ndim(a));
     axisb = checkAxis(axisb, ndim(b));
-    a = moveaxis(a, axisa, -1);
-    b = moveaxis(b, axisb, -1);
-    const da = a.shape.at(-1)!;
-    const db = b.shape.at(-1)!;
+    using scope = createArrayScope();
+    const aM = scope.keep(moveaxis(a, axisa, -1));
+    const bM = scope.keep(moveaxis(b, axisb, -1));
+    const da = aM.shape.at(-1)!;
+    const db = bM.shape.at(-1)!;
     if ((da !== 2 && da !== 3) || (db !== 2 && db !== 3)) {
       throw new Error(
         `cross: incompatible dimensions for cross product (got ${da} and ${db})`,
@@ -1767,27 +1785,41 @@ export const cross = jit(
     }
 
     if (da === 2 && db === 2) {
-      const [a0, a1] = split(a, 2, -1);
-      const [b0, b1] = split(b, 2, -1);
-      return squeeze(a0.mul(b1).sub(a1.mul(b0)), -1);
+      const [a0, a1] = scope.keepAll(split(aM, 2, -1));
+      const [b0, b1] = scope.keepAll(split(bM, 2, -1));
+      const p1 = scope.keep(a0.mul(b1));
+      const p2 = scope.keep(a1.mul(b0));
+      const diff = scope.keep(p1.sub(p2));
+      return squeeze(diff, -1);
     }
 
     // Pad 2D inputs to 3D with a zero third component
+    let aPad = aM;
+    let bPad = bM;
     if (da === 2) {
-      const zeroShape = [...a.shape.slice(0, -1), 1];
-      a = concatenate([a, zeros(zeroShape)], -1);
+      const zeroShape = [...aM.shape.slice(0, -1), 1];
+      const z = scope.keep(zeros(zeroShape));
+      aPad = scope.keep(concatenate([aM, z], -1));
     }
     if (db === 2) {
-      const zeroShape = [...b.shape.slice(0, -1), 1];
-      b = concatenate([b, zeros(zeroShape)], -1);
+      const zeroShape = [...bM.shape.slice(0, -1), 1];
+      const z = scope.keep(zeros(zeroShape));
+      bPad = scope.keep(concatenate([bM, z], -1));
     }
 
-    const [a0, a1, a2] = split(a, 3, -1);
-    const [b0, b1, b2] = split(b, 3, -1);
-    const c0 = a1.mul(b2).sub(a2.mul(b1));
-    const c1 = a2.mul(b0).sub(a0.mul(b2));
-    const c2 = a0.mul(b1).sub(a1.mul(b0));
-    return moveaxis(concatenate([c0, c1, c2], -1), -1, axisc);
+    const [a0, a1, a2] = scope.keepAll(split(aPad, 3, -1));
+    const [b0, b1, b2] = scope.keepAll(split(bPad, 3, -1));
+    const p1 = scope.keep(a1.mul(b2));
+    const p2 = scope.keep(a2.mul(b1));
+    const c0 = scope.keep(p1.sub(p2));
+    const p3 = scope.keep(a2.mul(b0));
+    const p4 = scope.keep(a0.mul(b2));
+    const c1 = scope.keep(p3.sub(p4));
+    const p5 = scope.keep(a0.mul(b1));
+    const p6 = scope.keep(a1.mul(b0));
+    const c2 = scope.keep(p5.sub(p6));
+    const cat = scope.keep(concatenate([c0, c1, c2], -1));
+    return moveaxis(cat, -1, axisc);
   },
   { staticArgnums: [2] },
 );
@@ -1973,7 +2005,9 @@ export function sign(x: ArrayLike): Array {
 
 /** @function Return the value with the magnitude of x and the sign of y, element-wise. */
 export const copysign = jit(function copysign(x: Array, y: Array): Array {
-  return absolute(x).mul(sign(y));
+  using absX = absolute(x);
+  using signY = sign(y);
+  return absX.mul(signY);
 });
 
 /** @function Return element-wise positive values of the input (no-op). */
@@ -2011,7 +2045,10 @@ export function hann(M: number): Array {
  * - `heaviside(x1, x2) = 1` for `x1 > 0`.
  */
 export const heaviside = jit(function heaviside(x1: Array, x2: Array) {
-  return where(less(x1, 0), 0, where(equal(x1, 0), x2, 1));
+  using lt = less(x1, 0);
+  using eq = equal(x1, 0);
+  using inner = where(eq, x2, 1);
+  return where(lt, 0, inner);
 });
 
 /** Calculate element-wise square of the input array. */
@@ -2039,9 +2076,11 @@ export function tan(x: ArrayLike): Array {
  * requires a custom JVP rule to handle properly (see JAX implementation).
  */
 export const sinc = jit(function sinc(x: Array): Array {
-  const pix = x.mul(Math.PI);
-  // sinc(0) = 1, otherwise sin(πx) / (πx)
-  return where(equal(x, 0), 1, sin(pix).div(pix));
+  using pix = x.mul(Math.PI);
+  using eq = equal(x, 0);
+  using sinPix = sin(pix);
+  using ratio = sinPix.div(pix);
+  return where(eq, 1, ratio);
 });
 
 /** Element-wise inverse cosine function (inverse of cos). */
@@ -2059,7 +2098,10 @@ export function acos(x: ArrayLike): Array {
  * stability improvements.
  */
 export const hypot = jit(function hypot(x1: Array, x2: Array) {
-  return sqrt(square(x1).add(square(x2)));
+  using sq1 = square(x1);
+  using sq2 = square(x2);
+  using sum = sq1.add(sq2);
+  return sqrt(sum);
 });
 
 /**
@@ -2097,21 +2139,37 @@ export { asin as arcsin, acos as arccos, atan as arctan, atan2 as arctan2 };
 
 /** Element-wise subtraction, with broadcasting. */
 export function subtract(x: ArrayLike, y: ArrayLike): Array {
-  x = fudgeArray(x);
-  y = fudgeArray(y);
-  return x.sub(y);
+  // Use neg+add instead of fudgeArray(x).sub(y) so scalar x is inlined
+  // as a Lit in the jaxpr rather than creating a receiver-position const.
+  using negY = negative(y);
+  return add(x, negY);
 }
 
 /** Calculates the floating-point division of x by y element-wise. */
 export function trueDivide(x: ArrayLike, y: ArrayLike): Array {
-  x = fudgeArray(x);
-  y = fudgeArray(y);
-  if (!isFloatDtype(x.dtype) && !isFloatDtype(y.dtype)) {
-    using xf = x.astype(DType.Float32);
-    using yf = y.astype(DType.Float32);
-    return xf.div(yf) as Array;
+  const xFloatDtype =
+    x instanceof Array && isFloatDtype(x.dtype) ? x.dtype : null;
+  const yFloatDtype =
+    y instanceof Array && isFloatDtype(y.dtype) ? y.dtype : null;
+
+  if (xFloatDtype && yFloatDtype) {
+    using recipY = reciprocal(y);
+    return multiply(x, recipY);
   }
-  return x.div(y);
+  if (xFloatDtype) {
+    using yf = astype(y, xFloatDtype);
+    using recipY = reciprocal(yf);
+    return multiply(x, recipY);
+  }
+  if (yFloatDtype) {
+    using xf = astype(x, yFloatDtype);
+    using recipY = reciprocal(y);
+    return multiply(xf, recipY);
+  }
+  using xf = astype(x, DType.Float32);
+  using yf = astype(y, DType.Float32);
+  using recipY = reciprocal(yf);
+  return multiply(xf, recipY);
 }
 
 export { trueDivide as divide };
@@ -2154,7 +2212,9 @@ export function floorDivide(x: ArrayLike, y: ArrayLike): Array {
  * Calculate element-wise floating-point modulo operation.
  */
 export const fmod = jit(function fmod(x: Array, y: Array): Array {
-  return x.sub(y.mul(core.idiv(x, y) as Array));
+  using q = core.idiv(x, y) as Array;
+  using yq = y.mul(q);
+  return x.sub(yq);
 });
 
 /**
@@ -2213,7 +2273,9 @@ export const round = jit(
       return rint(a);
     }
     const factor = 10 ** decimals;
-    return rint(a.mul(factor)).mul(1 / factor);
+    using scaled = a.mul(factor);
+    using rounded = rint(scaled);
+    return rounded.mul(1 / factor);
   },
   { staticArgnums: [1] },
 );
@@ -2226,11 +2288,17 @@ export { round as around };
  */
 export const rint = jit(function rint(x: Array): Array {
   // Banker's rounding: round half to even.
-  const rounded = floor(x.add(0.5));
+  using added = x.add(0.5);
+  using rounded = floor(added);
   // When the fractional part is exactly 0.5, round to even.
-  const half = x.sub(floor(x)).equal(0.5);
-  const odd = remainder(rounded, 2).notEqual(0);
-  return where(half.mul(odd), rounded.sub(1), rounded);
+  using floored = floor(x);
+  using diff = x.sub(floored);
+  using half = diff.equal(0.5);
+  using rem = remainder(rounded, 2);
+  using odd = rem.notEqual(0);
+  using cond = half.mul(odd);
+  using alt = rounded.sub(1);
+  return where(cond, alt, rounded);
 });
 
 /**
@@ -2257,7 +2325,8 @@ export function frexp(x: ArrayLike): [Array, Array] {
   using floorLog = floor(log2abs);
   using shiftedExp = floorLog.add(1);
   using exponentI32 = shiftedExp.astype(DType.Int32);
-  const exponent = where(equal(x, 0), 0, exponentI32);
+  using eq = equal(x, 0);
+  const exponent = where(eq, 0, exponentI32);
   using exponentAsX = exponent.astype(x.dtype);
   using scale = exp2(exponentAsX);
   const mantissa = x.div(scale);
@@ -2400,10 +2469,11 @@ export const cosh = jit(function cosh(x: Array) {
 export const tanh = jit(function tanh(x: Array) {
   // Avoid overflow for large x by taking advantage of alternate representations:
   // tanh(x) = -tanh(-x) = (1 - e^{-2x}) / (1 + e^{-2x})
-  const negsgn = where(less(x, 0), 1, -1);
+  using ltZero = less(x, 0);
+  using negsgn = where(ltZero, 1, -1);
   using signed = x.mul(negsgn);
   using scaled = signed.mul(2);
-  const en2x = exp(scaled);
+  using en2x = exp(scaled);
   using numer = en2x.sub(1);
   using denom = en2x.add(1);
   using ratio = numer.div(denom);

@@ -89,11 +89,13 @@ export function softplus(x: ArrayLike): Array {
  * - When `x >= 1`: `x`
  */
 export const sparsePlus = jit((x: Array): Array => {
-  return where(
-    x.lessEqual(-1),
-    0,
-    where(x.less(1), square(x.add(1)).mul(0.25), x),
-  );
+  using leNeg1 = x.lessEqual(-1);
+  using lt1 = x.less(1);
+  using shifted = x.add(1);
+  using sq = square(shifted);
+  using scaled = sq.mul(0.25);
+  using inner = where(lt1, scaled, x);
+  return where(leNeg1, 0, inner);
 });
 
 /**
@@ -132,7 +134,8 @@ export function softSign(x: ArrayLike): Array {
  * Reference: https://en.wikipedia.org/wiki/Swish_function
  */
 export const silu = jit(function silu(x: Array) {
-  return x.mul(sigmoid(x));
+  using sig = sigmoid(x);
+  return x.mul(sig);
 });
 
 export { silu as swish };
@@ -228,7 +231,11 @@ export function celu(x: ArrayLike, alpha: ArrayLike = 1.0): Array {
 export const selu = jit(function selu(x: Array) {
   const alpha = 1.6732632423543772;
   const lambda = 1.0507009873554805;
-  return where(x.less(0), expm1(x).mul(alpha), x).mul(lambda);
+  using lt = x.less(0);
+  using em1 = expm1(x);
+  using branch = em1.mul(alpha);
+  using selected = where(lt, branch, x);
+  return selected.mul(lambda);
 });
 
 /**
@@ -333,7 +340,7 @@ export function softmax(x: ArrayLike, axis: Axis = -1): Array {
   }
 
   using xMax = max(x, axis, { keepdims: true });
-  const sg = stopGradient(xMax);
+  using sg = stopGradient(xMax);
   using shifted = x.sub(sg);
   using unnormalized = exp(shifted);
   using denom = unnormalized.sum(axis, { keepdims: true });
@@ -356,7 +363,7 @@ export function logSoftmax(x: ArrayLike, axis: Axis = -1): Array {
   }
 
   using xMax = max(x, axis, { keepdims: true }); // keep dims
-  const sg = stopGradient(xMax);
+  using sg = stopGradient(xMax);
   using shifted = x.sub(sg);
   using expShifted = exp(shifted);
   using sumExp = expShifted.sum(axis, { keepdims: true });
@@ -382,7 +389,7 @@ export function logsumexp(
   if (axis.length === 0) return x;
 
   using rawMax = max(x, axis, { keepdims: true });
-  const xMax = stopGradient(rawMax) as Array;
+  using xMax = stopGradient(rawMax) as Array;
   using shifted = x.sub(xMax);
   using expShifted = exp(shifted);
   using sumExp = expShifted.sum(axis, { keepdims: true });

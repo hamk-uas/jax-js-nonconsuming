@@ -11,7 +11,9 @@ import {
   clearCaches,
   grad,
   jit,
+  nn,
   numpy as np,
+  scipySpecial,
   setDebug,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -173,6 +175,35 @@ describe("ownership divergence diagnostic", () => {
       expect(rescueWarnings[0][0]).toContain("rescued 1 PE intermediate");
       const desc = concrete.toString();
       expect(rescueWarnings[0][0].split(desc).length - 1).toBe(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("public library helpers stay warning-free under debug level 1", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      setDebug(1);
+
+      const f = jit((x: np.Array) => {
+        using div = np.divide(1, x);
+        using sub = np.subtract(1, x);
+        using sinc = np.sinc(x);
+        using silu = nn.silu(x);
+        using probs = np.clip(x.mul(0.1).add(0.2), 1e-3, 1 - 1e-3);
+        using logit = scipySpecial.logit(probs);
+        using total = div.add(sub).add(sinc).add(silu).add(logit);
+        return total.sum();
+      });
+
+      using x = np.array([2, 4, 8]);
+      using _result = f(x);
+
+      const rescueWarnings = warnSpy.mock.calls.filter(
+        (args) =>
+          typeof args[0] === "string" && args[0].includes("makeJaxpr rescued"),
+      );
+      expect(rescueWarnings).toHaveLength(0);
     } finally {
       warnSpy.mockRestore();
     }
