@@ -11,18 +11,23 @@ import { checkAxis, generalBroadcast } from "../utils";
  * @param lu - Combined L/U matrix from `lax.linalg.lu(A)`.
  * @param P  - Permutation matrix derived from the LU permutation vector.
  * @param b  - Right-hand side to solve.
- * @param d  - Disposal tracker for intermediate arrays.
- * @returns Solution x; caller must push to `d` if not the final return.
+ * @param d  - DisposableStack that owns intermediate arrays.
+ * @returns Solution x (not registered on `d`; caller decides ownership).
  */
-function luSolveWithP(lu: Array, P: Array, b: Array, d: Array[]): Array {
-  const Pb = np.matmul(P, b);
-  d.push(Pb);
-  const LPb = triangularSolve(lu, Pb, {
-    leftSide: true,
-    lower: true,
-    unitDiagonal: true,
-  });
-  d.push(LPb);
+function luSolveWithP(
+  lu: Array,
+  P: Array,
+  b: Array,
+  d: DisposableStack,
+): Array {
+  const Pb = d.use(np.matmul(P, b));
+  const LPb = d.use(
+    triangularSolve(lu, Pb, {
+      leftSide: true,
+      lower: true,
+      unitDiagonal: true,
+    }),
+  );
   return triangularSolve(lu, LPb, { leftSide: true, lower: false });
 }
 
@@ -497,68 +502,59 @@ export function solve(a: ArrayLike, b: ArrayLike): Array {
   const n = checkSquare("solve", a);
   if (b.ndim === 0) throw new Error(`solve: b cannot be scalar`);
   const bIs1d = b.ndim === 1;
-  const d: Array[] = [];
-  try {
-    if (bIs1d) {
-      b = b.reshape([...b.shape, 1]);
-      d.push(b);
-    }
-    if (b.shape[b.ndim - 2] !== n) {
-      throw new Error(
-        `solve: leading dimension of b must match size of a, got a=${a.aval}, b=${b.aval}`,
-      );
-    }
-    const m = b.shape[b.ndim - 1];
-    const batchDims = generalBroadcast(
-      a.shape.slice(0, -2),
-      b.shape.slice(0, -2),
-    ) as number[];
-    const aTargetShape = [...batchDims, n, n];
-    if (
-      a.shape.length !== aTargetShape.length ||
-      a.shape.some((dim, i) => dim !== aTargetShape[i])
-    ) {
-      a = np.broadcastTo(a, aTargetShape);
-      d.push(a);
-    }
-    const bTargetShape = [...batchDims, n, m as number];
-    if (
-      b.shape.length !== bTargetShape.length ||
-      b.shape.some((dim, i) => dim !== bTargetShape[i])
-    ) {
-      b = np.broadcastTo(b, bTargetShape);
-      d.push(b);
-    }
-
-    // Factor A. Gradient flows freely through the LU JVP (TriSolve triu mask fixed).
-    // Stop gradient only on permRaw — permutation is integer-valued, no gradient.
-    // Do NOT stop gradient on 'a' itself — stopGradient(a) creates a fully-known
-    // PETracer that PE disposal cascades through, which would free 'a' early.
-    const [lu, pivotsRaw, permRaw] = lax.linalg.lu(a);
-    d.push(lu, pivotsRaw, permRaw);
-    const permutation = lax.stopGradient(permRaw);
-
-    // Build permutation matrix P (derived from stopGradient'd factorization).
-    const arangeN = np.arange(n);
-    d.push(arangeN);
-    const permR = permutation.reshape([...permutation.shape, 1]);
-    d.push(permR);
-    const eq = arangeN.equal(permR);
-    d.push(eq);
-    const P = eq.astype(b.dtype);
-    d.push(P);
-
-    // Solve x = A^{-1} b via the LU factorization.
-    // Gradient flows through both b (TriSolve transpose rule) and A (TriSolve JVP).
-    let x = luSolveWithP(lu, P, b, d);
-    if (bIs1d) {
-      d.push(x);
-      x = np.squeeze(x, -1);
-    }
-    return x;
-  } finally {
-    for (const v of d) v[Symbol.dispose]();
+  using d = new DisposableStack();
+  if (bIs1d) {
+    b = d.use(b.reshape([...b.shape, 1]));
   }
+  if (b.shape[b.ndim - 2] !== n) {
+    throw new Error(
+      `solve: leading dimension of b must match size of a, got a=${a.aval}, b=${b.aval}`,
+    );
+  }
+  const m = b.shape[b.ndim - 1];
+  const batchDims = generalBroadcast(
+    a.shape.slice(0, -2),
+    b.shape.slice(0, -2),
+  ) as number[];
+  const aTargetShape = [...batchDims, n, n];
+  if (
+    a.shape.length !== aTargetShape.length ||
+    a.shape.some((dim, i) => dim !== aTargetShape[i])
+  ) {
+    a = d.use(np.broadcastTo(a, aTargetShape));
+  }
+  const bTargetShape = [...batchDims, n, m as number];
+  if (
+    b.shape.length !== bTargetShape.length ||
+    b.shape.some((dim, i) => dim !== bTargetShape[i])
+  ) {
+    b = d.use(np.broadcastTo(b, bTargetShape));
+  }
+
+  // Factor A. Gradient flows freely through the LU JVP (TriSolve triu mask fixed).
+  // Stop gradient only on permRaw — permutation is integer-valued, no gradient.
+  // Do NOT stop gradient on 'a' itself — stopGradient(a) creates a fully-known
+  // PETracer that PE disposal cascades through, which would free 'a' early.
+  const [lu, pivotsRaw, permRaw] = lax.linalg.lu(a);
+  d.use(lu);
+  d.use(pivotsRaw);
+  d.use(permRaw);
+  const permutation = lax.stopGradient(permRaw);
+
+  // Build permutation matrix P (derived from stopGradient'd factorization).
+  const arangeN = d.use(np.arange(n));
+  const permR = d.use(permutation.reshape([...permutation.shape, 1]));
+  const eq = d.use(arangeN.equal(permR));
+  const P = d.use(eq.astype(b.dtype));
+
+  // Solve x = A^{-1} b via the LU factorization.
+  // Gradient flows through both b (TriSolve transpose rule) and A (TriSolve JVP).
+  let x = luSolveWithP(lu, P, b, d);
+  if (bIs1d) {
+    d.use(x);
+    x = np.squeeze(x, -1);
+  }
+  return x;
 }
 
 export { tensordot } from "./numpy";

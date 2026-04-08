@@ -203,9 +203,9 @@ describe("lax.associativeScan — pytree (affine composition)", () => {
     p: { a: np.Array; b: np.Array },
     q: { a: np.Array; b: np.Array },
   ) => {
+    using s = new DisposableStack();
     const newA = p.a.mul(q.a) as np.Array;
-    using tmp = q.a.mul(p.b) as np.Array; // intermediate — disposed at block end
-    const newB = tmp.add(q.b) as np.Array;
+    const newB = s.use(q.a.mul(p.b) as np.Array).add(q.b) as np.Array;
     return { a: newA, b: newB };
   };
 
@@ -447,9 +447,9 @@ describe("parallel Kalman filter via associativeScan", () => {
       p: { a: np.Array; b: np.Array },
       q: { a: np.Array; b: np.Array },
     ) => {
+      using s = new DisposableStack();
       const newA = p.a.mul(q.a) as np.Array;
-      using tmp = q.a.mul(p.b) as np.Array;
-      const newB = tmp.add(q.b) as np.Array;
+      const newB = s.use(q.a.mul(p.b) as np.Array).add(q.b) as np.Array;
       return { a: newA, b: newB };
     };
 
@@ -1198,9 +1198,9 @@ describe("lax.associativeScan — WASM compiled-loop", () => {
         p: { a: np.Array; b: np.Array },
         q: { a: np.Array; b: np.Array },
       ) => {
+        using s = new DisposableStack();
         const newA = p.a.mul(q.a) as np.Array;
-        using tmp = q.a.mul(p.b) as np.Array;
-        const newB = tmp.add(q.b) as np.Array;
+        const newB = s.use(q.a.mul(p.b) as np.Array).add(q.b) as np.Array;
         return { a: newA, b: newB };
       };
 
@@ -1259,10 +1259,10 @@ describe("lax.associativeScan — WASM compiled-loop", () => {
         p: { A: np.Array; b: np.Array },
         q: { A: np.Array; b: np.Array },
       ) => {
-        using tmp = np.matmul(q.A, p.b) as np.Array;
+        using s = new DisposableStack();
         return {
           A: np.matmul(q.A, p.A) as np.Array,
-          b: tmp.add(q.b) as np.Array,
+          b: s.use(np.matmul(q.A, p.b) as np.Array).add(q.b) as np.Array,
         };
       };
 
@@ -1477,10 +1477,10 @@ describe("lax.associativeScan — WebGPU fused shader regression", () => {
       p: { A: np.Array; b: np.Array },
       q: { A: np.Array; b: np.Array },
     ) => {
-      using tmp = np.matmul(q.A, p.b) as np.Array;
+      using s = new DisposableStack();
       return {
         A: np.matmul(q.A, p.A) as np.Array,
-        b: tmp.add(q.b) as np.Array,
+        b: s.use(np.matmul(q.A, p.b) as np.Array).add(q.b) as np.Array,
       };
     };
 
@@ -1729,11 +1729,15 @@ describe("lax.associativeScan — WebGPU fused shader regression", () => {
       a: { A: np.Array; S: np.Array },
       b: { A: np.Array; S: np.Array },
     ) {
+      using s = new DisposableStack();
       const A = np.matmul(b.A, a.A) as np.Array;
-      using bAT = np.swapaxes(b.A, -2, -1) as np.Array;
-      using tmp = np.matmul(b.A, a.S) as np.Array;
-      using triple = np.matmul(tmp, bAT) as np.Array;
-      const S = np.add(triple, b.S) as np.Array;
+      const bAT = s.use(np.swapaxes(b.A, -2, -1) as np.Array);
+      const S = np.add(
+        s.use(
+          np.matmul(s.use(np.matmul(b.A, a.S) as np.Array), bAT) as np.Array,
+        ),
+        b.S,
+      ) as np.Array;
       return { A, S };
     }
 

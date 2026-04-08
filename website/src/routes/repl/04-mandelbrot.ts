@@ -1,5 +1,7 @@
 import { jit, lax, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
 
+declare function displayImage(image: np.Array): Promise<void>;
+
 // Mandelbrot set using jit(foriLoop) — the compiler wraps the loop in a
 // block_map on WebGPU, producing a single fused shader dispatch.
 const width = 750;
@@ -26,24 +28,16 @@ using f = jit(
         const { A, B, V } = carry;
         using Asq = A.mul(A);
         using Bsq = B.mul(B);
-        using magSq = Asq.add(Bsq);
-        using mask = magSq.less(100).astype(np.float32);
+        using mask = Asq.add(Bsq).less(100).astype(np.float32);
         const newV = V.add(mask);
-        using diffSq = Asq.sub(Bsq);
-        using realShifted = diffSq.add(X);
-        const newA = np.clip(realShifted, -50, 50);
-        using cross = A.mul(B);
-        using crossScaled = cross.mul(2);
-        using imagShifted = crossScaled.add(Y);
-        const newB = np.clip(imagShifted, -50, 50);
+        const newA = np.clip(Asq.sub(Bsq).add(X), -50, 50);
+        const newB = np.clip(A.mul(B).mul(2).add(Y), -50, 50);
         return { A: newA, B: newB, V: newV };
       },
       { A, B, V },
     );
     result.A.dispose();
     result.B.dispose();
-    X.dispose();
-    Y.dispose();
     return result.V;
   },
 );
@@ -51,9 +45,10 @@ using f = jit(
 using A = np.zeros(X.shape);
 using B = np.zeros(Y.shape);
 using V = np.zeros(X.shape);
+using d = new DisposableStack();
+d.use(X);
+d.use(Y);
 using result = f(A, B, V, X, Y);
-X.dispose();
-Y.dispose();
 
 using scaled = result.div(100);
 using image = np.subtract(1, scaled);

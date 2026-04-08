@@ -29,8 +29,8 @@ describe("customRoot", () => {
 
     // Optimality condition: f(x) = diag * x - b
     const f = (x: np.Array) => {
-      using tmp = np.multiply(diag, x);
-      return np.subtract(tmp, b);
+      using s = new DisposableStack();
+      return np.subtract(s.use(np.multiply(diag, x)), b);
     };
 
     // Solver: x = b / diag
@@ -57,8 +57,8 @@ describe("customRoot", () => {
 
     const loss = (b: np.Array) => {
       const f = (x: np.Array) => {
-        using tmp = np.multiply(diag, x);
-        return np.subtract(tmp, b);
+        using s = new DisposableStack();
+        return np.subtract(s.use(np.multiply(diag, x)), b);
       };
       const solve = (_f: (x: np.Array) => np.Array, _x0: np.Array) =>
         np.divide(b, diag);
@@ -81,8 +81,8 @@ describe("customRoot", () => {
     // d(loss)/db = 2*b/25 = 2*15/25 = 1.2
     const loss = (b: np.Array) => {
       const f = (x: np.Array) => {
-        using tmp = np.multiply(5.0, x);
-        return np.subtract(tmp, b);
+        using s = new DisposableStack();
+        return np.subtract(s.use(np.multiply(5.0, x)), b);
       };
       const solve = (_f: (x: np.Array) => np.Array, _x0: np.Array) =>
         np.divide(b, np.array(5.0));
@@ -104,8 +104,8 @@ describe("customRoot", () => {
 
     const loss = (b: np.Array) => {
       const f = (x: np.Array) => {
-        using tmp = np.multiply(diag, x);
-        return np.subtract(tmp, b);
+        using s = new DisposableStack();
+        return np.subtract(s.use(np.multiply(diag, x)), b);
       };
       const solve = (_f: (x: np.Array) => np.Array, _x0: np.Array) =>
         np.divide(b, diag);
@@ -134,8 +134,8 @@ describe("customRoot", () => {
 
     const rootFn = (b: np.Array) => {
       const f = (x: np.Array) => {
-        using tmp = np.multiply(diag, x);
-        return np.subtract(tmp, b);
+        using s = new DisposableStack();
+        return np.subtract(s.use(np.multiply(diag, x)), b);
       };
       const solve = (_f: (x: np.Array) => np.Array, _x0: np.Array) =>
         np.divide(b, diag);
@@ -174,8 +174,8 @@ describe("customRoot", () => {
 
     const sqrtLoss = (a: np.Array) => {
       const f = (x: np.Array) => {
-        using tmp = np.multiply(x, x);
-        return np.subtract(tmp, a);
+        using s = new DisposableStack();
+        return np.subtract(s.use(np.multiply(x, x)), a);
       };
 
       // Newton solver: x_{k+1} = x_k - f(x_k) / f'(x_k) = (x_k + a/x_k) / 2
@@ -220,8 +220,8 @@ describe("customRoot", () => {
 
     const loss = (a: np.Array, b: np.Array) => {
       const f = (x: np.Array) => {
-        using tmp = np.multiply(a, x);
-        return np.subtract(tmp, b);
+        using s = new DisposableStack();
+        return np.subtract(s.use(np.multiply(a, x)), b);
       };
       const solve = (_f: (x: np.Array) => np.Array, _x0: np.Array) =>
         np.divide(b, a);
@@ -261,8 +261,8 @@ describe("customRoot", () => {
 
     const rootFn = (guess: np.Array) => {
       const f = (x: np.Array) => {
-        using tmp = np.multiply(diag, x);
-        return np.subtract(tmp, b);
+        using s = new DisposableStack();
+        return np.subtract(s.use(np.multiply(diag, x)), b);
       };
       // Solver ignores guess (direct formula), but customRoot still
       // blocks gradient flow through solve.

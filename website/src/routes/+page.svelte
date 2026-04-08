@@ -6,6 +6,7 @@
 
   import logo from "$lib/assets/logo-nonconsuming.svg";
   import MatmulPerfDemo from "$lib/homepage/MatmulPerfDemo.svelte";
+  import homepageExampleSource from "$lib/repl/examples/homepage?raw";
   import EmbeddedRepl from "$lib/repl/EmbeddedRepl.svelte";
 
   const installText = {
@@ -241,27 +242,7 @@
         : ""}.
     </p>
 
-    <EmbeddedRepl
-      initialText={String.raw`import { grad, numpy as np, vmap } from "@hamk-uas/jax-js-nonconsuming";
-
-const f = (x: np.Array) => {
-  using sq = x.mul(x);
-  using s = sq.sum();
-  return np.sqrt(s);
-};
-
-using x = np.array([1, 2, 3, 4]);
-
-using y0 = f(x);
-console.log(y0.js());
-
-using y1 = grad(f)(x);
-console.log(y1.js());
-
-using y2 = vmap(grad(np.square))(x);
-console.log(y2.js());
-`}
-    />
+    <EmbeddedRepl initialText={homepageExampleSource} />
   </section>
 
   <!-- Learn More section -->

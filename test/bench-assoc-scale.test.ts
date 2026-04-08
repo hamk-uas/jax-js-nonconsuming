@@ -20,10 +20,10 @@ const compose2 = (
   p: { A: np.Array; b: np.Array },
   q: { A: np.Array; b: np.Array },
 ) => {
-  using tmp = np.matmul(q.A, p.b) as np.Array;
+  using s = new DisposableStack();
   return {
     A: np.matmul(q.A, p.A) as np.Array,
-    b: tmp.add(q.b) as np.Array,
+    b: s.use(np.matmul(q.A, p.b) as np.Array).add(q.b) as np.Array,
   };
 };
 

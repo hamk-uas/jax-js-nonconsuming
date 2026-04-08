@@ -3,6 +3,7 @@
 
   import { LoaderCircle } from "@lucide/svelte";
   import { onMount } from "svelte";
+  import { bench, type CfgDef } from "./bench-runner";
 
   type Cell = { gflops: number | null; running: boolean; err?: string };
   type TableState = {
@@ -10,12 +11,6 @@
     sizes: string[];
     grid: Cell[][];
   };
-
-  interface CfgDef {
-    label: string;
-    mode: "eager" | "tiled";
-    opts?: { Br: number; Bc: number; Bk: number; threadTile?: number[] };
-  }
 
   const configs: CfgDef[] = [
     { label: "eager (ref)", mode: "eager" },
@@ -155,69 +150,9 @@
       // --- Init backend ---
       await jax.init("webgpu");
       jax.defaultDevice("webgpu");
-      const { numpy: np, lax, jit, random, blockUntilReady, clearCaches } = jax;
-      type Arr = InstanceType<typeof np.Array>;
+      const { clearCaches } = jax;
 
       let deviceDead = false;
-
-      async function bench(
-        n: number,
-        dtype: string,
-        cfg: CfgDef,
-      ): Promise<number> {
-        const dt = dtype as any;
-        const key = random.key(42);
-        const [k1, k2] = random.split(key, 2);
-        const A = random.uniform(k1, [n, n]).astype(dt);
-        const B = random.uniform(k2, [n, n]).astype(dt);
-        key.dispose();
-        k1.dispose();
-        k2.dispose();
-        await blockUntilReady([A, B]);
-
-        try {
-          if (cfg.mode === "eager") {
-            const warmup = np.matmul(A, B);
-            await blockUntilReady(warmup);
-            warmup.dispose();
-            const times: number[] = [];
-            for (let i = 0; i < 3; i++) {
-              const start = performance.now();
-              const C = np.matmul(A, B);
-              await blockUntilReady(C);
-              times.push(performance.now() - start);
-              C.dispose();
-            }
-            const avg = times.reduce((a, b) => a + b) / times.length;
-            return (2 * n ** 3) / 1e9 / (avg / 1000);
-          }
-
-          const f = jit((a: Arr, b: Arr) =>
-            lax.tiledMatmul(a, b, cfg.opts as any),
-          );
-
-          try {
-            const warmup = f(A, B);
-            await blockUntilReady(warmup);
-            warmup.dispose();
-            const times: number[] = [];
-            for (let i = 0; i < 3; i++) {
-              const start = performance.now();
-              const C = f(A, B);
-              await blockUntilReady(C);
-              times.push(performance.now() - start);
-              C.dispose();
-            }
-            const avg = times.reduce((a, b) => a + b) / times.length;
-            return (2 * n ** 3) / 1e9 / (avg / 1000);
-          } finally {
-            f.dispose();
-          }
-        } finally {
-          A.dispose();
-          B.dispose();
-        }
-      }
 
       const total = sizes.length * configs.length;
       let completed = 0;
@@ -249,7 +184,7 @@
 
           try {
             const result = await withTimeout(
-              bench(n, dtype, configs[ci]),
+              bench(jax, n, dtype, configs[ci]),
               cellTimeout(n),
             );
             if (result === undefined) {

@@ -24,22 +24,21 @@ const y = (() => {
 })();
 
 // Define loss function (binary cross-entropy).
-using lossFn = jit((w: np.Array) => {
+const baseLossFn = (w: np.Array) => {
   using logits = np.dot(X, w);
   using logP = nn.logSigmoid(logits);
   using negLogits = np.negative(logits);
   using logNotP = nn.logSigmoid(negLogits);
-  using yLogP = y.mul(logP);
   using oneMinusY = np.subtract(1, y);
+  using yLogP = y.mul(logP);
   using yBarLogNotP = oneMinusY.mul(logNotP);
-  using sumTerms = np.add(yLogP, yBarLogNotP);
-  using meanTerms = sumTerms.mean();
-  const loss = meanTerms.neg();
-  return loss;
-});
+  using meanTerms = np.add(yLogP, yBarLogNotP).mean();
+  return meanTerms.neg();
+};
 
-// Try adding jit() to lossGrad to see the code get faster.
-const lossGrad = grad(lossFn);
+using lossFn = jit(baseLossFn);
+// Comment out jit() to see the gradient step get slower.
+using lossGrad = jit(grad(baseLossFn));
 
 // Training loop.
 const steps = 100;
@@ -49,17 +48,15 @@ let w = np.zerosLike(wTrue);
 let optState = solver.init(w);
 
 for (let step = 0; step < steps; step++) {
-  using grads = lossGrad(w);
-  const [newUpdates, newOptState] = solver.update(grads, optState);
-  tree.dispose(optState);
-  const newW = applyUpdates(w, newUpdates);
-  w.dispose();
-  tree.dispose(newUpdates);
-  w = newW;
+  using d = new DisposableStack();
+  const grads = d.use(lossGrad(w));
+  const [updates, newOptState] = solver.update(grads, optState);
+  d.adopt(updates, tree.dispose);
+  d.adopt(optState, tree.dispose);
+  w = applyUpdates(d.use(w), updates);
   optState = newOptState;
   if (step % 20 === 19) {
-    using lossArr = lossFn(w);
-    const loss = await lossArr.jsAsync();
+    const loss = await d.use(lossFn(w)).jsAsync();
     console.log(`Step ${step + 1}: loss = ${loss}`);
   }
 }

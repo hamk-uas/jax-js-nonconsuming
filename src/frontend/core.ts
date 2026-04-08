@@ -1272,44 +1272,47 @@ export abstract class Tracer {
     // append the new diagonal axis to the right side / end of the shape.
     const toDispose: Tracer[] = [];
     let ar: Tracer = this;
-    if (axis1 !== ar.ndim - 2 || axis2 !== ar.ndim - 1) {
-      const perm = range(ar.ndim)
-        .filter((i) => i !== axis1 && i !== axis2)
-        .concat(axis1, axis2);
-      ar = ar.transpose(perm);
+    let result: Tracer | null = null;
+    try {
+      if (axis1 !== ar.ndim - 2 || axis2 !== ar.ndim - 1) {
+        const perm = range(ar.ndim)
+          .filter((i) => i !== axis1 && i !== axis2)
+          .concat(axis1, axis2);
+        ar = ar.transpose(perm);
+        toDispose.push(ar);
+      }
+
+      const [n, m] = ar.shape.slice(-2);
+      const diagSize = Math.min(n, m - offset);
+
+      // Pad and reshape ar into a skewed array of shape [..., diagSize, m+1].
+      ar = ar.reshape([...ar.shape.slice(0, -2), n * m]);
       toDispose.push(ar);
+      const npad = diagSize * (m + 1) - n * m;
+      if (npad > 0) {
+        ar = pad(ar, [...rep<Pair>(ar.ndim - 1, [0, 0]), [0, npad]]);
+        toDispose.push(ar);
+      } else if (npad < 0) {
+        ar = shrink(
+          ar,
+          [...ar.shape.slice(0, -1), n * m + npad].map<Pair>((x) => [0, x]),
+        );
+        toDispose.push(ar);
+      }
+      ar = ar.reshape([...ar.shape.slice(0, -1), diagSize, m + 1]);
+      toDispose.push(ar);
+
+      // Now slice the #offset element of the last axis, and this gives a diagonal.
+      const sliced = shrink(ar, [
+        ...ar.shape.slice(0, -1).map<Pair>((x) => [0, x]),
+        [offset, offset + 1],
+      ]);
+      toDispose.push(sliced);
+      result = sliced.reshape(ar.shape.slice(0, -1));
+      return result as this;
+    } finally {
+      for (const v of toDispose) if (v !== result) v[Symbol.dispose]();
     }
-
-    const [n, m] = ar.shape.slice(-2);
-    const diagSize = Math.min(n, m - offset);
-
-    // Pad and reshape ar into a skewed array of shape [..., diagSize, m+1].
-    ar = ar.reshape([...ar.shape.slice(0, -2), n * m]);
-    toDispose.push(ar);
-    const npad = diagSize * (m + 1) - n * m;
-    if (npad > 0) {
-      ar = pad(ar, [...rep<Pair>(ar.ndim - 1, [0, 0]), [0, npad]]);
-      toDispose.push(ar);
-    } else if (npad < 0) {
-      ar = shrink(
-        ar,
-        [...ar.shape.slice(0, -1), n * m + npad].map<Pair>((x) => [0, x]),
-      );
-      toDispose.push(ar);
-    }
-    ar = ar.reshape([...ar.shape.slice(0, -1), diagSize, m + 1]);
-    toDispose.push(ar);
-
-    // Now slice the #offset element of the last axis, and this gives a diagonal.
-    const sliced = shrink(ar, [
-      ...ar.shape.slice(0, -1).map<Pair>((x) => [0, x]),
-      [offset, offset + 1],
-    ]);
-    toDispose.push(sliced);
-    const result = sliced.reshape(ar.shape.slice(0, -1));
-
-    for (const v of toDispose) if (v !== result) v[Symbol.dispose]();
-    return result as this;
   }
 
   /** Flatten the array without changing its data. */

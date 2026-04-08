@@ -2919,16 +2919,15 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
         // Build full primal input for primalForwardJaxpr
         const fwdFullInputs: Tracer[] = [];
-        const fwdDisposables: Tracer[] = [];
+        using fwdDisposables = new DisposableStack();
         let constIdx = 0;
         let carryIdx = 0;
         let xIdx = 0;
         for (let i = 0; i < jaxpr.inBinders.length; i++) {
           if (bodyUndefPrimals[i]) {
             const aval = jaxpr.inBinders[i].aval;
-            const z = zerosInternal(aval.shape, aval.dtype);
+            const z = fwdDisposables.use(zerosInternal(aval.shape, aval.dtype));
             fwdFullInputs.push(z);
-            fwdDisposables.push(z);
           } else if (i < numConsts) {
             fwdFullInputs.push(constResiduals[constIdx++]);
           } else if (i < numConsts + numCarry) {
@@ -2943,7 +2942,6 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         // Dispose tangent carry and all ys (not needed)
         for (let i = numPrimalCarry; i < fwdOuts.length; i++)
           fwdOuts[i].dispose();
-        for (const d of fwdDisposables) d.dispose();
 
         // carry output = newCarry, ys = oldCarry (snapshot before this step)
         return [...newCarry, ...carryIn];
@@ -3264,41 +3262,43 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
         // Evaluate primal body: newY = body(carry, xSlice) with zero tangents
         const bodyArgs: Tracer[] = [];
-        const disposables: Tracer[] = [];
+        using disposables = new DisposableStack();
         let cri = 0;
         for (let i = 0; i < numConsts; i++) {
           if (bodyUndefPrimals[i]) {
-            const z = zerosInternal(
-              bodyJaxpr.inBinders[i].aval.shape,
-              bodyJaxpr.inBinders[i].aval.dtype,
+            const z = disposables.use(
+              zerosInternal(
+                bodyJaxpr.inBinders[i].aval.shape,
+                bodyJaxpr.inBinders[i].aval.dtype,
+              ),
             );
             bodyArgs.push(z);
-            disposables.push(z);
           } else {
             bodyArgs.push(constResiduals[cri++]);
           }
         }
         for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(carry[i]);
         for (let i = numOrigLeaves; i < numLeaves; i++) {
-          const z = zerosInternal(
-            bodyJaxpr.inBinders[numConsts + i].aval.shape,
-            bodyJaxpr.inBinders[numConsts + i].aval.dtype,
+          const z = disposables.use(
+            zerosInternal(
+              bodyJaxpr.inBinders[numConsts + i].aval.shape,
+              bodyJaxpr.inBinders[numConsts + i].aval.dtype,
+            ),
           );
           bodyArgs.push(z);
-          disposables.push(z);
         }
         for (let i = 0; i < numOrigLeaves; i++) bodyArgs.push(xSlice[i]);
         for (let i = numOrigLeaves; i < numLeaves; i++) {
-          const z = zerosInternal(
-            bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.shape,
-            bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.dtype,
+          const z = disposables.use(
+            zerosInternal(
+              bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.shape,
+              bodyJaxpr.inBinders[numConsts + numLeaves + i].aval.dtype,
+            ),
           );
           bodyArgs.push(z);
-          disposables.push(z);
         }
 
         const outs = evalJaxpr(bodyJaxpr, bodyArgs);
-        for (const d of disposables) d.dispose();
         const primalOuts = outs.slice(0, numOrigLeaves);
         for (let i = numOrigLeaves; i < outs.length; i++) outs[i].dispose();
 
@@ -3424,21 +3424,18 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
           ...transposedBody.constEnv.values,
           ...constResiduals,
         ];
-        const tbDisposables: Tracer[] = [];
+        using tbDisposables = new DisposableStack();
         for (const y of yPrev) tbInputs.push(y);
         for (const x of xPi) tbInputs.push(x);
         for (let j = 0; j < numOrigLeaves; j++) {
-          const z = zerosInternal(
-            leafElemAvals[j].shape,
-            leafElemAvals[j].dtype,
+          const z = tbDisposables.use(
+            zerosInternal(leafElemAvals[j].shape, leafElemAvals[j].dtype),
           );
           tbInputs.push(z);
-          tbDisposables.push(z);
         }
         for (const c of ctEff) tbInputs.push(c);
 
         const tbOuts = evalJaxpr(transposedBody.jaxpr, tbInputs);
-        for (const d of tbDisposables) d.dispose();
         for (const c of ctEff) c.dispose();
 
         // Extract: [ctConstsI, ctANew, ctBIter]
@@ -3631,16 +3628,17 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     // Primal-only evaluation of body
     const evalPrimalBody = (aLeaves: Tracer[], bLeaves: Tracer[]): Tracer[] => {
       const bodyArgs: Tracer[] = [];
-      const disposables: Tracer[] = [];
+      using disposables = new DisposableStack();
       let cri = 0;
       for (let i = 0; i < numConsts; i++) {
         if (bodyUndefPrimals[i]) {
-          const z = zerosInternal(
-            bodyJaxpr.inBinders[i].aval.shape,
-            bodyJaxpr.inBinders[i].aval.dtype,
+          const z = disposables.use(
+            zerosInternal(
+              bodyJaxpr.inBinders[i].aval.shape,
+              bodyJaxpr.inBinders[i].aval.dtype,
+            ),
           );
           bodyArgs.push(z);
-          disposables.push(z);
         } else {
           bodyArgs.push(constResiduals[cri++]);
         }
@@ -3648,25 +3646,26 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       for (const a of aLeaves) bodyArgs.push(a);
       // Zero tangent "a" slots
       for (let i = numOrigElems; i < numElems * 2; i++) {
-        const z = zerosInternal(
-          bodyJaxpr.inBinders[numConsts + i].aval.shape,
-          bodyJaxpr.inBinders[numConsts + i].aval.dtype,
+        const z = disposables.use(
+          zerosInternal(
+            bodyJaxpr.inBinders[numConsts + i].aval.shape,
+            bodyJaxpr.inBinders[numConsts + i].aval.dtype,
+          ),
         );
         bodyArgs.push(z);
-        disposables.push(z);
       }
       for (const b of bLeaves) bodyArgs.push(b);
       // Zero tangent "b" slots
       for (let i = numOrigElems; i < numElems * 2; i++) {
-        const z = zerosInternal(
-          bodyJaxpr.inBinders[numConsts + numElems * 2 + i].aval.shape,
-          bodyJaxpr.inBinders[numConsts + numElems * 2 + i].aval.dtype,
+        const z = disposables.use(
+          zerosInternal(
+            bodyJaxpr.inBinders[numConsts + numElems * 2 + i].aval.shape,
+            bodyJaxpr.inBinders[numConsts + numElems * 2 + i].aval.dtype,
+          ),
         );
         bodyArgs.push(z);
-        disposables.push(z);
       }
       const outs = evalJaxpr(bodyJaxpr, bodyArgs);
-      for (const d of disposables) d.dispose();
       const pOuts = outs.slice(0, numOrigElems);
       for (let i = numOrigElems; i < outs.length; i++) outs[i].dispose();
       return pOuts;
@@ -3715,19 +3714,19 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         ...transposedBody.constEnv.values,
         ...constResiduals,
       ];
-      const tbDisposables: Tracer[] = [];
+      using tbDisposables = new DisposableStack();
       for (const y of yPrev) tbInputs.push(y);
       for (const x of xPi) tbInputs.push(x);
       // Zero cotangents for primal outputs
       for (let j = 0; j < numOrigElems; j++) {
-        const z = zerosInternal(allYP[0][j].shape, allYP[0][j].dtype);
+        const z = tbDisposables.use(
+          zerosInternal(allYP[0][j].shape, allYP[0][j].dtype),
+        );
         tbInputs.push(z);
-        tbDisposables.push(z);
       }
       for (const c of ctEff) tbInputs.push(c);
 
       const tbOuts = evalJaxpr(transposedBody.jaxpr, tbInputs);
-      for (const d of tbDisposables) d.dispose();
 
       let oi = 0;
       const ctConstsI: Tracer[] = [];

@@ -203,28 +203,22 @@ function triangularSolveRoutine(
     unitDiagonal: boolean;
   },
 ): Array {
-  const d: Array[] = [];
-  try {
-    if (!leftSide) {
-      transposeA = !transposeA;
-    } else {
-      b = moveaxis(b, -2, -1);
-      d.push(b);
-    }
-    if (transposeA) {
-      a = moveaxis(a, -2, -1);
-      d.push(a);
-      lower = !lower;
-    }
-    let x = core.triSolve(a, b, { lower, unitDiagonal }) as Array;
-    if (leftSide) {
-      d.push(x);
-      x = moveaxis(x, -2, -1);
-    }
-    return x;
-  } finally {
-    for (const v of d) v[Symbol.dispose]();
+  using d = new DisposableStack();
+  if (!leftSide) {
+    transposeA = !transposeA;
+  } else {
+    b = d.use(moveaxis(b, -2, -1));
   }
+  if (transposeA) {
+    a = d.use(moveaxis(a, -2, -1));
+    lower = !lower;
+  }
+  let x = core.triSolve(a, b, { lower, unitDiagonal }) as Array;
+  if (leftSide) {
+    d.use(x);
+    x = moveaxis(x, -2, -1);
+  }
+  return x;
 }
 
 // ── Analytical small-matrix Cholesky ─────────────────────────────────────
@@ -421,59 +415,46 @@ function triangularSolve2D(
     unitDiagonal: boolean;
   },
 ): Array {
-  const d: Array[] = [];
-  try {
-    if (!leftSide) {
-      transposeA = !transposeA;
-    } else {
-      b = moveaxis(b, -2, -1);
-      d.push(b);
+  using d = new DisposableStack();
+  if (!leftSide) {
+    transposeA = !transposeA;
+  } else {
+    b = d.use(moveaxis(b, -2, -1));
+  }
+  if (transposeA) {
+    a = d.use(moveaxis(a, -2, -1));
+    lower = !lower;
+  }
+  // Now: solve upper-triangular A @ X = B, where A is [n,n], B is [nrhs,n]
+  // Core convention: A upper-triangular, A @ X^T = B^T → X = B @ A^{-T}
+  // Our polyfill solves A @ X = B directly (upper-triangular).
+  // To match core.triSolve convention: it takes (A_upper, B) where
+  // A_upper @ X^T = B^T. So X^T[:,j] = A^{-1} @ B^T[:,j].
+  // Equivalently solve A @ Y = B^T then X = Y^T.
+  if (lower) {
+    // Lower-triangular: flip to upper, solve, flip back
+    const aFlipped = d.use(core.flip(a, [-2, -1]) as Array);
+    const bFlipped = d.use(core.flip(b, [-1]) as Array);
+    // Transpose B to get RHS for A @ X = B^T convention
+    const bT = d.use(moveaxis(bFlipped, -2, -1));
+    const yT = d.use(triangularSolveUpper2D(aFlipped, bT, unitDiagonal));
+    const y = d.use(moveaxis(yT, -2, -1));
+    let x = core.flip(y, [-1]) as Array;
+    if (leftSide) {
+      d.use(x);
+      x = moveaxis(x, -2, -1);
     }
-    if (transposeA) {
-      a = moveaxis(a, -2, -1);
-      d.push(a);
-      lower = !lower;
+    return x;
+  } else {
+    // Upper-triangular: transpose B, solve, transpose back
+    const bT = d.use(moveaxis(b, -2, -1));
+    const yT = d.use(triangularSolveUpper2D(a, bT, unitDiagonal));
+    let x = moveaxis(yT, -2, -1);
+    if (leftSide) {
+      d.use(x);
+      x = moveaxis(x, -2, -1);
     }
-    // Now: solve upper-triangular A @ X = B, where A is [n,n], B is [nrhs,n]
-    // Core convention: A upper-triangular, A @ X^T = B^T → X = B @ A^{-T}
-    // Our polyfill solves A @ X = B directly (upper-triangular).
-    // To match core.triSolve convention: it takes (A_upper, B) where
-    // A_upper @ X^T = B^T. So X^T[:,j] = A^{-1} @ B^T[:,j].
-    // Equivalently solve A @ Y = B^T then X = Y^T.
-    if (lower) {
-      // Lower-triangular: flip to upper, solve, flip back
-      const aFlipped = core.flip(a, [-2, -1]) as Array;
-      d.push(aFlipped);
-      const bFlipped = core.flip(b, [-1]) as Array;
-      d.push(bFlipped);
-      // Transpose B to get RHS for A @ X = B^T convention
-      const bT = moveaxis(bFlipped, -2, -1);
-      d.push(bT);
-      const yT = triangularSolveUpper2D(aFlipped, bT, unitDiagonal);
-      d.push(yT);
-      const y = moveaxis(yT, -2, -1);
-      d.push(y);
-      let x = core.flip(y, [-1]) as Array;
-      if (leftSide) {
-        d.push(x);
-        x = moveaxis(x, -2, -1);
-      }
-      return x;
-    } else {
-      // Upper-triangular: transpose B, solve, transpose back
-      const bT = moveaxis(b, -2, -1);
-      d.push(bT);
-      const yT = triangularSolveUpper2D(a, bT, unitDiagonal);
-      d.push(yT);
-      let x = moveaxis(yT, -2, -1);
-      if (leftSide) {
-        d.push(x);
-        x = moveaxis(x, -2, -1);
-      }
-      return x;
-    }
-  } finally {
-    for (const v of d) v.dispose();
+    return x;
   }
 }
 

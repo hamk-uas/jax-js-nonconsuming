@@ -88,8 +88,22 @@ export function fft(a: ComplexPair, axis: number = -1): ComplexPair {
   checkPowerOfTwo("fft", n);
   const logN = Math.log2(n);
 
-  // Track all intermediates; dispose everything except the returned pair.
-  const d: Array[] = [];
+  using d = new DisposableStack();
+  let ownsReal = false;
+  let ownsImag = false;
+  let completed = false;
+
+  const replaceReal = (next: Array) => {
+    if (ownsReal) d.use(real);
+    real = next;
+    ownsReal = true;
+  };
+  const replaceImag = (next: Array) => {
+    if (ownsImag) d.use(imag);
+    imag = next;
+    ownsImag = true;
+  };
+
   try {
     // If axis is not at the end, move it to the end
     let perm: number[] | null = null;
@@ -97,49 +111,43 @@ export function fft(a: ComplexPair, axis: number = -1): ComplexPair {
       perm = range(real.ndim);
       perm.splice(axis, 1);
       perm.push(axis);
-      real = real.transpose(perm);
-      d.push(real);
-      imag = imag.transpose(perm);
-      d.push(imag);
+      replaceReal(real.transpose(perm));
+      replaceImag(imag.transpose(perm));
     }
 
     // Cooley-Tukey FFT (radix-2) — bit-reversal permutation
     const originalShape = real.shape;
-    const realR = real.reshape([-1, ...rep(logN, 2)]);
-    d.push(realR);
-    const realT = realR.transpose([0, ...range(1, logN + 1).reverse()]);
-    d.push(realT);
-    real = realT.flatten();
-    d.push(real);
+    replaceReal(real.reshape([-1, ...rep(logN, 2)]));
+    replaceReal(real.transpose([0, ...range(1, logN + 1).reverse()]));
+    replaceReal(real.flatten());
 
-    const imagR = imag.reshape([-1, ...rep(logN, 2)]);
-    d.push(imagR);
-    const imagT = imagR.transpose([0, ...range(1, logN + 1).reverse()]);
-    d.push(imagT);
-    imag = imagT.flatten();
-    d.push(imag);
+    replaceImag(imag.reshape([-1, ...rep(logN, 2)]));
+    replaceImag(imag.transpose([0, ...range(1, logN + 1).reverse()]));
+    replaceImag(imag.flatten());
 
     // Butterfly passes
     for (let i = 0; i < logN; i++) {
-      ({ real, imag } = fftUpdate(i, { real, imag }));
-      d.push(real, imag);
+      const next = fftUpdate(i, { real, imag });
+      replaceReal(next.real);
+      replaceImag(next.imag);
     }
-    real = real.reshape(originalShape);
-    d.push(real);
-    imag = imag.reshape(originalShape);
-    d.push(imag);
+    replaceReal(real.reshape(originalShape));
+    replaceImag(imag.reshape(originalShape));
 
     // If axis was moved, move it back
     if (perm !== null) {
-      real = real.transpose(invertPermutation(perm));
-      d.push(real);
-      imag = imag.transpose(invertPermutation(perm));
-      d.push(imag);
+      const inversePerm = invertPermutation(perm);
+      replaceReal(real.transpose(inversePerm));
+      replaceImag(imag.transpose(inversePerm));
     }
+    completed = true;
     return { real, imag };
   } finally {
-    for (const v of d) {
-      if (v !== real && v !== imag) v[Symbol.dispose]();
+    if (!completed) {
+      const liveTemps = new Set<Array>();
+      if (ownsReal) liveTemps.add(real);
+      if (ownsImag) liveTemps.add(imag);
+      for (const value of liveTemps) value[Symbol.dispose]();
     }
   }
 }

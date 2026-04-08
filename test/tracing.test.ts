@@ -585,8 +585,8 @@ suite("jax.valueAndGrad()", () => {
 suite("jax.jit()", () => {
   test("works for a simple scalar function", () => {
     const f = (x: np.Array) => {
-      using tmp = x.mul(x);
-      return tmp.mul(x);
+      using s = new DisposableStack();
+      return s.use(x.mul(x)).mul(x);
     };
     using f2 = jit(f);
     using x1 = np.array(2);

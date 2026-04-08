@@ -1471,8 +1471,11 @@ await deviceSuite((device) => {
       type Elem = { A: np.Array; b: np.Array };
       const compose = (p: Elem, q: Elem): Elem => {
         const A_comp = np.einsum("nij,njk->nik", q.A, p.A) as np.Array;
-        using tmp = np.einsum("nij,njk->nik", q.A, p.b) as np.Array;
-        const b_comp = np.add(tmp, q.b) as np.Array;
+        using s = new DisposableStack();
+        const b_comp = np.add(
+          s.use(np.einsum("nij,njk->nik", q.A, p.b) as np.Array),
+          q.b,
+        ) as np.Array;
         return { A: A_comp, b: b_comp };
       };
       using eyeM = np.eye(m, m, { dtype: DType.Float32 });

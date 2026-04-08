@@ -322,23 +322,6 @@ export function astype(a: ArrayLike, dtype: DType): Array {
   return fudgeArray(a).astype(dtype);
 }
 
-function createArrayScope() {
-  const values: Array[] = [];
-  return {
-    keep<T extends Array>(value: T): T {
-      values.push(value);
-      return value;
-    },
-    keepAll<T extends Array>(keptValues: T[]): T[] {
-      values.push(...keptValues);
-      return keptValues;
-    },
-    [Symbol.dispose]() {
-      for (const value of values) value[Symbol.dispose]();
-    },
-  };
-}
-
 /** Sum of the elements of the array over a given axis, or axes. */
 export function sum(
   a: ArrayLike,
@@ -852,63 +835,47 @@ function _blockImpl(arrays: any, depth: number): Array {
   if (arrays.length === 0) {
     throw new Error("Need at least one array to block");
   }
+  if (arrays.length === 1) {
+    // Single-element nests transfer ownership directly to the caller.
+    return _blockImpl(arrays[0], depth + 1);
+  }
 
   // Recursively process each element, then concatenate along the appropriate
   // axis. Innermost lists (highest depth) concatenate along the last axis,
   // so we track the depth and compute the axis at the end.
   const processed: Array[] = [];
-  const toDispose: Array[] = [];
-  try {
-    for (const item of arrays) {
-      const arr = _blockImpl(item, depth + 1);
-      processed.push(arr);
-      // Track only arrays we created (recursive calls), not user inputs
-      if (globalThis.Array.isArray(item)) {
-        toDispose.push(arr);
-      }
-    }
-
-    if (processed.length === 1) {
-      // If only one element, just return it without concatenation.
-      // Remove from toDispose if present — we're transferring ownership to caller.
-      const idx = toDispose.indexOf(processed[0]);
-      if (idx >= 0) toDispose.splice(idx, 1);
-      return processed[0];
-    }
-
-    // Determine the axis: depth 0 → axis 0, depth 1 → axis 1, etc.
-    // But we need to ensure arrays have enough dimensions.
-    // NumPy/JAX's block infers the total nesting depth first, then pads
-    // arrays to that rank.
-    const maxNdim = Math.max(...processed.map((a) => a.ndim));
-    const axis = depth;
-
-    // Promote all arrays to at least (axis + 1) dimensions if needed
-    const promoted: Array[] = [];
-    const promotedToDispose: Array[] = [];
-    for (const arr of processed) {
-      if (arr.ndim < maxNdim) {
-        // Prepend dimensions to match max rank
-        const newShape = [
-          ...new globalThis.Array(maxNdim - arr.ndim).fill(1),
-          ...arr.shape,
-        ];
-        const reshaped = arr.reshape(newShape);
-        promoted.push(reshaped);
-        promotedToDispose.push(reshaped);
-      } else {
-        promoted.push(arr);
-      }
-    }
-
-    try {
-      return concatenate(promoted, axis);
-    } finally {
-      for (const a of promotedToDispose) a.dispose();
-    }
-  } finally {
-    for (const a of toDispose) a.dispose();
+  using created = new DisposableStack();
+  for (const item of arrays) {
+    const arr = _blockImpl(item, depth + 1);
+    processed.push(arr);
+    // Track only arrays we created recursively, not direct user inputs.
+    if (globalThis.Array.isArray(item)) created.use(arr);
   }
+
+  // Determine the axis: depth 0 → axis 0, depth 1 → axis 1, etc.
+  // But we need to ensure arrays have enough dimensions.
+  // NumPy/JAX's block infers the total nesting depth first, then pads
+  // arrays to that rank.
+  const maxNdim = Math.max(...processed.map((a) => a.ndim));
+  const axis = depth;
+
+  // Promote all arrays to at least max rank if needed.
+  const promoted: Array[] = [];
+  using promotedTemps = new DisposableStack();
+  for (const arr of processed) {
+    if (arr.ndim < maxNdim) {
+      // Prepend dimensions to match max rank.
+      const newShape = [
+        ...new globalThis.Array(maxNdim - arr.ndim).fill(1),
+        ...arr.shape,
+      ];
+      promoted.push(promotedTemps.use(arr.reshape(newShape)));
+    } else {
+      promoted.push(arr);
+    }
+  }
+
+  return concatenate(promoted, axis);
 }
 
 /** Flip an array vertically (axis=0). */
@@ -1773,9 +1740,9 @@ export const cross = jit(
     }
     axisa = checkAxis(axisa, ndim(a));
     axisb = checkAxis(axisb, ndim(b));
-    using scope = createArrayScope();
-    const aM = scope.keep(moveaxis(a, axisa, -1));
-    const bM = scope.keep(moveaxis(b, axisb, -1));
+    using d = new DisposableStack();
+    const aM = d.use(moveaxis(a, axisa, -1));
+    const bM = d.use(moveaxis(b, axisb, -1));
     const da = aM.shape.at(-1)!;
     const db = bM.shape.at(-1)!;
     if ((da !== 2 && da !== 3) || (db !== 2 && db !== 3)) {
@@ -1785,11 +1752,15 @@ export const cross = jit(
     }
 
     if (da === 2 && db === 2) {
-      const [a0, a1] = scope.keepAll(split(aM, 2, -1));
-      const [b0, b1] = scope.keepAll(split(bM, 2, -1));
-      const p1 = scope.keep(a0.mul(b1));
-      const p2 = scope.keep(a1.mul(b0));
-      const diff = scope.keep(p1.sub(p2));
+      const [a0, a1] = split(aM, 2, -1);
+      d.use(a0);
+      d.use(a1);
+      const [b0, b1] = split(bM, 2, -1);
+      d.use(b0);
+      d.use(b1);
+      const p1 = d.use(a0.mul(b1));
+      const p2 = d.use(a1.mul(b0));
+      const diff = d.use(p1.sub(p2));
       return squeeze(diff, -1);
     }
 
@@ -1798,27 +1769,33 @@ export const cross = jit(
     let bPad = bM;
     if (da === 2) {
       const zeroShape = [...aM.shape.slice(0, -1), 1];
-      const z = scope.keep(zeros(zeroShape));
-      aPad = scope.keep(concatenate([aM, z], -1));
+      const z = d.use(zeros(zeroShape));
+      aPad = d.use(concatenate([aM, z], -1));
     }
     if (db === 2) {
       const zeroShape = [...bM.shape.slice(0, -1), 1];
-      const z = scope.keep(zeros(zeroShape));
-      bPad = scope.keep(concatenate([bM, z], -1));
+      const z = d.use(zeros(zeroShape));
+      bPad = d.use(concatenate([bM, z], -1));
     }
 
-    const [a0, a1, a2] = scope.keepAll(split(aPad, 3, -1));
-    const [b0, b1, b2] = scope.keepAll(split(bPad, 3, -1));
-    const p1 = scope.keep(a1.mul(b2));
-    const p2 = scope.keep(a2.mul(b1));
-    const c0 = scope.keep(p1.sub(p2));
-    const p3 = scope.keep(a2.mul(b0));
-    const p4 = scope.keep(a0.mul(b2));
-    const c1 = scope.keep(p3.sub(p4));
-    const p5 = scope.keep(a0.mul(b1));
-    const p6 = scope.keep(a1.mul(b0));
-    const c2 = scope.keep(p5.sub(p6));
-    const cat = scope.keep(concatenate([c0, c1, c2], -1));
+    const [a0, a1, a2] = split(aPad, 3, -1);
+    d.use(a0);
+    d.use(a1);
+    d.use(a2);
+    const [b0, b1, b2] = split(bPad, 3, -1);
+    d.use(b0);
+    d.use(b1);
+    d.use(b2);
+    const p1 = d.use(a1.mul(b2));
+    const p2 = d.use(a2.mul(b1));
+    const c0 = d.use(p1.sub(p2));
+    const p3 = d.use(a2.mul(b0));
+    const p4 = d.use(a0.mul(b2));
+    const c1 = d.use(p3.sub(p4));
+    const p5 = d.use(a0.mul(b1));
+    const p6 = d.use(a1.mul(b0));
+    const c2 = d.use(p5.sub(p6));
+    const cat = d.use(concatenate([c0, c1, c2], -1));
     return moveaxis(cat, -1, axisc);
   },
   { staticArgnums: [2] },
@@ -1866,38 +1843,30 @@ function _convImpl(name: string, x: Array, y: Array, mode: string): Array {
     [x, y] = [y, x];
     if (name === "correlate") flipOutput = true;
   }
-  const d: Array[] = [];
-  try {
-    if (name === "convolve") {
-      y = flip(y);
-      d.push(y);
-    }
-
-    let padding: lax.PaddingType;
-    if (mode === "valid") padding = "VALID";
-    else if (mode === "same") padding = "SAME_LOWER";
-    else if (mode === "full") padding = [[y.shape[0] - 1, y.shape[0] - 1]];
-    else {
-      throw new Error(
-        `${name}: invalid mode ${mode}, expected "full", "same", or "valid"`,
-      );
-    }
-
-    const xs = x.slice(null, null);
-    d.push(xs);
-    const ys = y.slice(null, null);
-    d.push(ys);
-    const convResult = lax.conv(xs, ys, [1], padding);
-    d.push(convResult);
-    const z = convResult.slice(0, 0);
-    if (flipOutput) {
-      d.push(z);
-      return flip(z);
-    }
-    return z;
-  } finally {
-    for (const v of d) v[Symbol.dispose]();
+  using d = new DisposableStack();
+  if (name === "convolve") {
+    y = d.use(flip(y));
   }
+
+  let padding: lax.PaddingType;
+  if (mode === "valid") padding = "VALID";
+  else if (mode === "same") padding = "SAME_LOWER";
+  else if (mode === "full") padding = [[y.shape[0] - 1, y.shape[0] - 1]];
+  else {
+    throw new Error(
+      `${name}: invalid mode ${mode}, expected "full", "same", or "valid"`,
+    );
+  }
+
+  const xs = d.use(x.slice(null, null));
+  const ys = d.use(y.slice(null, null));
+  const convResult = d.use(lax.conv(xs, ys, [1], padding));
+  const z = convResult.slice(0, 0);
+  if (flipOutput) {
+    d.use(z);
+    return flip(z);
+  }
+  return z;
 }
 
 /** Convolution of two one-dimensional arrays. */
@@ -2544,26 +2513,19 @@ export function var_(
   if (n === 0) {
     throw new Error("var: cannot compute variance over zero-length axis");
   }
-  const d: Array[] = [];
-  try {
-    const mu =
-      opts?.mean !== undefined
-        ? opts.mean
-        : (() => {
-            const m = mean(x, axis, { keepdims: true });
-            d.push(m);
-            return m;
-          })();
-    const centered = x.sub(mu);
-    d.push(centered);
-    const sq = square(centered);
-    d.push(sq);
-    const summed = sq.sum(axis, { keepdims: opts?.keepdims });
-    d.push(summed);
-    return summed.mul(1 / (n - (opts?.correction ?? 0)));
-  } finally {
-    for (const v of d) v[Symbol.dispose]();
-  }
+  using d = new DisposableStack();
+  const mu =
+    opts?.mean !== undefined
+      ? opts.mean
+      : (() => {
+          const m = mean(x, axis, { keepdims: true });
+          d.use(m);
+          return m;
+        })();
+  const centered = d.use(x.sub(mu));
+  const sq = d.use(square(centered));
+  const summed = d.use(sq.sum(axis, { keepdims: opts?.keepdims }));
+  return summed.mul(1 / (n - (opts?.correction ?? 0)));
 }
 
 /**
@@ -2591,35 +2553,28 @@ export function cov(
   { rowvar = true }: { rowvar?: boolean } = {},
 ): Array {
   // x should shape (M, N) or (N,), representing N observations of M variables.
-  const disposables: Array[] = [];
+  using d = new DisposableStack();
   let a = fudgeArray(x);
   if (a.ndim === 1) {
-    a = a.reshape([1, a.shape[0]]);
-    disposables.push(a);
+    a = d.use(a.reshape([1, a.shape[0]]));
   }
   // optional set of additional observations, concatenated to m
   if (y !== null) {
     let b = fudgeArray(y);
     if (b.ndim === 1) {
-      b = b.reshape([1, b.shape[0]]);
-      disposables.push(b);
+      b = d.use(b.reshape([1, b.shape[0]]));
     }
-    a = vstack([a, b]);
-    disposables.push(a);
+    a = d.use(vstack([a, b]));
   }
   if (!rowvar) {
-    a = a.transpose();
-    disposables.push(a);
+    a = d.use(a.transpose());
   }
   const [_M, N] = a.shape;
   using mean = a.mean(1, { keepdims: true });
-  const centered = a.sub(mean); // Center variables
-  disposables.push(centered);
+  const centered = d.use(a.sub(mean)); // Center variables
   using xt = centered.transpose();
   using dotResult = dot(centered, xt);
-  const result = dotResult.div(N - 1); // [M, M]
-  for (const d of disposables) d.dispose();
-  return result;
+  return dotResult.div(N - 1); // [M, M]
 }
 
 /** Compute the Pearson correlation coefficients (in range `[-1, 1]`). */

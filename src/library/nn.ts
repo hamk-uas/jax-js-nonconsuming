@@ -434,43 +434,32 @@ export function standardize(
   axis = normalizeAxis(axis, x.ndim);
   if (axis.length === 0) return x;
 
-  const d: Array[] = [];
-  try {
-    const mu =
-      opts.mean !== undefined
-        ? fudgeArray(opts.mean)
-        : (() => {
-            const m = x.mean(axis, { keepdims: true });
-            d.push(m);
-            return m;
-          })();
+  using d = new DisposableStack();
+  const mu =
+    opts.mean !== undefined
+      ? fudgeArray(opts.mean)
+      : (() => {
+          const m = x.mean(axis, { keepdims: true });
+          d.use(m);
+          return m;
+        })();
 
-    // Like JAX, we'll use the Var[X] = E[X^2] - (E[X])^2 formula for this one.
-    // It's supposed to be better in the case of neural network activations.
-    let sigma2: Array;
-    if (opts.variance !== undefined) {
-      sigma2 = fudgeArray(opts.variance);
-    } else {
-      const sq = square(x);
-      d.push(sq);
-      const sqMean = sq.mean(axis, { keepdims: true });
-      d.push(sqMean);
-      const muSq = square(mu);
-      d.push(muSq);
-      sigma2 = sqMean.sub(muSq);
-      d.push(sigma2);
-    }
-
-    const centered = x.sub(mu);
-    d.push(centered);
-    const denom = sigma2.add(opts.epsilon ?? 1e-5);
-    d.push(denom);
-    const sqrtDenom = sqrt(denom);
-    d.push(sqrtDenom);
-    return centered.div(sqrtDenom);
-  } finally {
-    for (const v of d) v[Symbol.dispose]();
+  // Like JAX, we'll use the Var[X] = E[X^2] - (E[X])^2 formula for this one.
+  // It's supposed to be better in the case of neural network activations.
+  let sigma2: Array;
+  if (opts.variance !== undefined) {
+    sigma2 = fudgeArray(opts.variance);
+  } else {
+    const sq = d.use(square(x));
+    const sqMean = d.use(sq.mean(axis, { keepdims: true }));
+    const muSq = d.use(square(mu));
+    sigma2 = d.use(sqMean.sub(muSq));
   }
+
+  const centered = d.use(x.sub(mu));
+  const denom = d.use(sigma2.add(opts.epsilon ?? 1e-5));
+  const sqrtDenom = d.use(sqrt(denom));
+  return centered.div(sqrtDenom);
 }
 
 /**
@@ -572,117 +561,93 @@ export function dotProductAttention(
     );
 
   const isRank3 = query.ndim === 3;
-  const d: Array[] = [];
-  try {
-    if (isRank3) {
-      query = expandDims(query, 0);
-      d.push(query);
-      key = expandDims(key, 0);
-      d.push(key);
-      value = expandDims(value, 0);
-      d.push(value);
-    }
-
-    const [B, L, N, H] = query.shape;
-    if (key.shape[0] !== B || key.shape[3] !== H)
-      throw new Error(
-        `dotProductAttention: query and key shapes mismatch, ` +
-          `got Q=${query.aval}, K=${key.aval}`,
-      );
-
-    const S = key.shape[1];
-    const K = key.shape[2];
-
-    if (N < K || (N != K && N % K !== 0))
-      throw new Error(
-        `dotProductAttention: number of query heads N=${N} must be ` +
-          `divisible by number of key/value heads K=${K} for GQA`,
-      );
-    const G = N / K; // number of query groups
-    key = tile(key, [1, 1, G, 1]);
-    d.push(key);
-    value = tile(value, [1, 1, G, 1]);
-    d.push(value);
-
-    const scale = opts.scale ?? 1 / Math.sqrt(H);
-    const rawScores = einsum("BLNH,BSNH->BNLS", query, key);
-    d.push(rawScores);
-    let scores = rawScores.mul(scale);
-    if (opts.bias !== undefined) {
-      d.push(scores);
-      scores = scores.add(opts.bias);
-    }
-    if (opts.mask !== undefined) {
-      d.push(scores);
-      scores = where(opts.mask, scores, -Infinity);
-    }
-    if (opts.isCausal) {
-      const causalMask = tri(L, S, 0, { dtype: DType.Bool });
-      d.push(causalMask);
-      d.push(scores);
-      scores = where(causalMask, scores, -Infinity);
-    }
-    if (opts.localWindowSize !== undefined) {
-      const [before, after] =
-        typeof opts.localWindowSize === "number"
-          ? [opts.localWindowSize, opts.localWindowSize]
-          : opts.localWindowSize;
-      if (
-        before < 0 ||
-        after < 0 ||
-        !Number.isInteger(before) ||
-        !Number.isInteger(after)
-      ) {
-        throw new Error(
-          `dotProductAttention: localWindowSize values must be non-negative, ` +
-            `got ${opts.localWindowSize}`,
-        );
-      }
-      const triAfter = tri(L, S, after, { dtype: DType.Bool });
-      d.push(triAfter);
-      const triBefore = tri(L, S, -before - 1, { dtype: DType.Bool });
-      d.push(triBefore);
-      const triBeforeNot = triBefore.notEqual(true);
-      d.push(triBeforeNot);
-      const localMask = triAfter.mul(triBeforeNot);
-      d.push(localMask);
-      d.push(scores);
-      scores = where(localMask, scores, -Infinity);
-    }
-    if (opts.querySeqLengths !== undefined) {
-      const sl = expandDims(opts.querySeqLengths, [-1, -2, -3]);
-      d.push(sl);
-      const ar = arange(L);
-      d.push(ar);
-      const arR = ar.reshape([1, 1, L, 1]);
-      d.push(arR);
-      const cond = arR.less(sl);
-      d.push(cond);
-      d.push(scores);
-      scores = where(cond, scores, -Infinity);
-    }
-    if (opts.keyValueSeqLengths !== undefined) {
-      const sl = expandDims(opts.keyValueSeqLengths, [-1, -2, -3]);
-      d.push(sl);
-      const ar = arange(S);
-      d.push(ar);
-      const arR = ar.reshape([1, 1, 1, S]);
-      d.push(arR);
-      const cond = arR.less(sl);
-      d.push(cond);
-      d.push(scores);
-      scores = where(cond, scores, -Infinity);
-    }
-    d.push(scores);
-    const attn = softmax(scores, -1);
-    d.push(attn); // BNLS
-    const out = einsum("BNLS,BSNH->BLNH", attn, value);
-    if (isRank3) {
-      d.push(out);
-      return out.reshape([L, N, H]);
-    }
-    return out;
-  } finally {
-    for (const v of d) v[Symbol.dispose]();
+  using d = new DisposableStack();
+  if (isRank3) {
+    query = d.use(expandDims(query, 0));
+    key = d.use(expandDims(key, 0));
+    value = d.use(expandDims(value, 0));
   }
+
+  const [B, L, N, H] = query.shape;
+  if (key.shape[0] !== B || key.shape[3] !== H)
+    throw new Error(
+      `dotProductAttention: query and key shapes mismatch, ` +
+        `got Q=${query.aval}, K=${key.aval}`,
+    );
+
+  const S = key.shape[1];
+  const K = key.shape[2];
+
+  if (N < K || (N != K && N % K !== 0))
+    throw new Error(
+      `dotProductAttention: number of query heads N=${N} must be ` +
+        `divisible by number of key/value heads K=${K} for GQA`,
+    );
+  const G = N / K; // number of query groups
+  key = d.use(tile(key, [1, 1, G, 1]));
+  value = d.use(tile(value, [1, 1, G, 1]));
+
+  const scale = opts.scale ?? 1 / Math.sqrt(H);
+  const rawScores = d.use(einsum("BLNH,BSNH->BNLS", query, key));
+  let scores = rawScores.mul(scale);
+  if (opts.bias !== undefined) {
+    d.use(scores);
+    scores = scores.add(opts.bias);
+  }
+  if (opts.mask !== undefined) {
+    d.use(scores);
+    scores = where(opts.mask, scores, -Infinity);
+  }
+  if (opts.isCausal) {
+    const causalMask = d.use(tri(L, S, 0, { dtype: DType.Bool }));
+    d.use(scores);
+    scores = where(causalMask, scores, -Infinity);
+  }
+  if (opts.localWindowSize !== undefined) {
+    const [before, after] =
+      typeof opts.localWindowSize === "number"
+        ? [opts.localWindowSize, opts.localWindowSize]
+        : opts.localWindowSize;
+    if (
+      before < 0 ||
+      after < 0 ||
+      !Number.isInteger(before) ||
+      !Number.isInteger(after)
+    ) {
+      throw new Error(
+        `dotProductAttention: localWindowSize values must be non-negative, ` +
+          `got ${opts.localWindowSize}`,
+      );
+    }
+    const triAfter = d.use(tri(L, S, after, { dtype: DType.Bool }));
+    const triBefore = d.use(tri(L, S, -before - 1, { dtype: DType.Bool }));
+    const triBeforeNot = d.use(triBefore.notEqual(true));
+    const localMask = d.use(triAfter.mul(triBeforeNot));
+    d.use(scores);
+    scores = where(localMask, scores, -Infinity);
+  }
+  if (opts.querySeqLengths !== undefined) {
+    const sl = d.use(expandDims(opts.querySeqLengths, [-1, -2, -3]));
+    const ar = d.use(arange(L));
+    const arR = d.use(ar.reshape([1, 1, L, 1]));
+    const cond = d.use(arR.less(sl));
+    d.use(scores);
+    scores = where(cond, scores, -Infinity);
+  }
+  if (opts.keyValueSeqLengths !== undefined) {
+    const sl = d.use(expandDims(opts.keyValueSeqLengths, [-1, -2, -3]));
+    const ar = d.use(arange(S));
+    const arR = d.use(ar.reshape([1, 1, 1, S]));
+    const cond = d.use(arR.less(sl));
+    d.use(scores);
+    scores = where(cond, scores, -Infinity);
+  }
+  d.use(scores);
+  const attn = d.use(softmax(scores, -1)); // BNLS
+  const out = einsum("BNLS,BSNH->BLNH", attn, value);
+  if (isRank3) {
+    d.use(out);
+    return out.reshape([L, N, H]);
+  }
+  return out;
 }

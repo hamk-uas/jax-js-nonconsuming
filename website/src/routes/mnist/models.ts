@@ -161,7 +161,11 @@ export function normalizeImage(X: np.Array): np.Array {
   // X.shape === [28, 28]
   using rawArange = np.arange(28);
   using arange = rawArange.astype(np.float32);
-  const [xgrid, ygrid] = np.meshgrid([arange, arange], { indexing: "ij" });
+  const [xgridRaw, ygridRaw] = np.meshgrid([arange, arange], {
+    indexing: "ij",
+  });
+  using xgrid = xgridRaw;
+  using ygrid = ygridRaw;
   using xSum = X.sum();
   using xWeightedX = X.mul(xgrid);
   using xWeightedXSum = xWeightedX.sum();
@@ -171,8 +175,6 @@ export function normalizeImage(X: np.Array): np.Array {
   using xWeightedYSum = xWeightedY.sum();
   using yCenterY = xWeightedYSum.div(xSum);
   const dy = Math.round(13.5 - (yCenterY.js() as number));
-  xgrid.dispose();
-  ygrid.dispose();
   if (dx > 0) {
     using old = X;
     using padded = np.pad(old, { 0: [dx, 0] });

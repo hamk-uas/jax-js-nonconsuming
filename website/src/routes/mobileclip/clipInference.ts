@@ -71,24 +71,18 @@ export function runMobileCLIPTextEncoder(
   }: MobileCLIPTextEncoder,
   textTokens: np.Array,
 ): np.Array {
+  using d = new DisposableStack();
   // Embed tokens and add positional embeddings
   let x = tokenEmbedding.slice(textTokens); // [L, D]
-  {
-    const old = x;
-    x = old.add(positionalEmbedding);
-    old.dispose();
-  }
+  d.use(x);
+  x = x.add(positionalEmbedding);
 
   for (const block of transformer) {
-    const old = x;
-    x = runMobileCLIPTextBlock(block, old);
-    old.dispose();
+    d.use(x);
+    x = runMobileCLIPTextBlock(block, x);
   }
-  {
-    const old = x;
-    x = runLayerNorm(lnFinal, old);
-    old.dispose();
-  }
+  d.use(x);
+  x = runLayerNorm(lnFinal, x);
 
   using argmaxIdx = np.argmax(textTokens, -1);
   using finalFeatures = x.slice(argmaxIdx);
@@ -115,34 +109,23 @@ export function runMobileCLIPTextBlock(
   { ln1, attn, ln2, mlpUp, mlpDown }: MobileCLIPTextBlock,
   x: np.Array,
 ): np.Array {
+  using d = new DisposableStack();
   // Pre-norm attention block
   using normed1 = runLayerNorm(ln1, x);
   using attnOut = runMultiHeadAttention(attn, normed1);
-  {
-    const old = x;
-    x = old.add(attnOut);
-    old.dispose();
-  }
+  d.use(x);
+  x = x.add(attnOut);
 
   // Pre-norm MLP block
   using normed2 = runLayerNorm(ln2, x);
   let mlpOut = runLinear(mlpUp, normed2);
-  {
-    const old = mlpOut;
-    mlpOut = nn.gelu(old, { approximate: false });
-    old.dispose();
-  }
-  {
-    const old = mlpOut;
-    mlpOut = runLinear(mlpDown, old);
-    old.dispose();
-  }
-  {
-    const old = x;
-    x = old.add(mlpOut);
-    old.dispose();
-  }
-  mlpOut.dispose();
+  d.use(mlpOut);
+  mlpOut = nn.gelu(mlpOut, { approximate: false });
+  d.use(mlpOut);
+  mlpOut = runLinear(mlpDown, mlpOut);
+  d.use(x);
+  x = x.add(mlpOut);
+  d.use(mlpOut);
 
   return x;
 }
@@ -162,16 +145,16 @@ export function runMultiHeadAttention(
 
   // Project to Q, K, V
   using qkv = runLinear(qkvProj, x); // [seqLen, 3 * embed]
-  const [q, k, v] = np.split(qkv, 3, -1);
+  const [qRaw, kRaw, vRaw] = np.split(qkv, 3, -1);
+  using q = qRaw;
+  using k = kRaw;
+  using v = vRaw;
 
   using qR = q.reshape([seqLen, numHeads, headDim]);
   using kR = k.reshape([seqLen, numHeads, headDim]);
   using vR = v.reshape([seqLen, numHeads, headDim]);
   using attnResult = nn.dotProductAttention(qR, kR, vR);
   using output = attnResult.reshape([seqLen, embed]);
-  q.dispose();
-  k.dispose();
-  v.dispose();
 
   // Final projection
   return runLinear(outProj, output);
@@ -200,11 +183,8 @@ export function runLayerNorm(
   // Normalize with respect to the last dimension of x.
   const dimSize = x.shape[x.ndim - 1];
   using avg = x.mean(-1, { keepdims: true });
-  {
-    const old = x;
-    x = old.sub(avg);
-    old.dispose();
-  }
+  using _preCenter = x;
+  x = x.sub(avg);
   using sq = np.square(x);
   using variance = sq.mul(1 / dimSize).sum(-1, { keepdims: true });
   using stddev = np.sqrt(variance);
