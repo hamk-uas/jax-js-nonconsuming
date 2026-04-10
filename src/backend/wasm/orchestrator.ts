@@ -26,6 +26,7 @@
  * ```
  */
 
+import { registerAsyncModule } from "./registration";
 import { DEBUG } from "../../utils";
 
 function canWaitOnThisThread(): boolean {
@@ -198,6 +199,8 @@ self.onmessage = function (e) {
     } catch (err) {
       self.postMessage({ type: "error", moduleId: msg.moduleId, error: String(err) });
     }
+  } else if (msg.type === "unregister") {
+    delete instances[msg.moduleId];
   } else if (msg.type === "destroy") {
     self.close();
   }
@@ -253,46 +256,54 @@ export class OrchestratorWorker {
    * registration step itself cannot be made synchronous safely there.
    */
   async registerModule(module: WebAssembly.Module): Promise<number> {
-    const existing = this.#moduleIds.get(module);
-    if (existing !== undefined) {
-      const pending = this.#registeringModules.get(existing);
-      if (pending) await pending;
-      return existing;
+    const { id, created } = await registerAsyncModule(
+      {
+        ownerLabel: "Orchestrator",
+        moduleIds: this.#moduleIds,
+        registeringModules: this.#registeringModules,
+        allocateModuleId: () => this.#nextModuleId++,
+        isRegistered: (existingId) => this.#registeredModules.has(existingId),
+        markRegistered: (registeredId) => {
+          this.#registeredModules.add(registeredId);
+        },
+        clearRegistered: (registeredId) => {
+          this.#registeredModules.delete(registeredId);
+        },
+      },
+      module,
+      (moduleId) =>
+        new Promise<void>((resolve, reject) => {
+          const handler = (event: MessageEvent) => {
+            if (event.data?.moduleId !== moduleId) return;
+            this.#worker.removeEventListener("message", handler);
+            if (event.data?.type === "registered") {
+              resolve();
+            } else {
+              reject(
+                new Error(
+                  event.data?.error ??
+                    `Orchestrator: failed to register mega-module (id=${moduleId})`,
+                ),
+              );
+            }
+          };
+          this.#worker.addEventListener("message", handler);
+          this.#worker.postMessage({
+            type: "register",
+            moduleId,
+            module,
+          });
+        }),
+      (moduleId) => {
+        this.#worker.postMessage({ type: "unregister", moduleId });
+      },
+    );
+
+    if (created && DEBUG >= 1) {
+      console.info(`orchestrator: registered module id=${id}`);
     }
 
-    const id = this.#nextModuleId++;
-    this.#moduleIds.set(module, id);
-
-    const registration = new Promise<void>((resolve, reject) => {
-      const handler = (event: MessageEvent) => {
-        if (event.data?.moduleId !== id) return;
-        this.#worker.removeEventListener("message", handler);
-        if (event.data?.type === "registered") {
-          resolve();
-        } else {
-          reject(
-            new Error(
-              event.data?.error ??
-                `Orchestrator: failed to register mega-module (id=${id})`,
-            ),
-          );
-        }
-      };
-      this.#worker.addEventListener("message", handler);
-      this.#worker.postMessage({ type: "register", moduleId: id, module });
-    });
-    this.#registeringModules.set(id, registration);
-
-    try {
-      await registration;
-      this.#registeredModules.add(id);
-      if (DEBUG >= 1) {
-        console.info(`orchestrator: registered module id=${id}`);
-      }
-      return id;
-    } finally {
-      this.#registeringModules.delete(id);
-    }
+    return id;
   }
 
   /**

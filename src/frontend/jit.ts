@@ -1168,6 +1168,23 @@ export class JitProgram {
     }
   }
 
+  private _startMegaModuleWarmup(
+    readinessField: "_megaModulePoolReady" | "_megaModuleOrchestratorReady",
+    start: () => Promise<void>,
+    onFailure?: () => void,
+  ): void {
+    if (this[readinessField] !== undefined) return;
+    this[readinessField] = false;
+    start()
+      .then(() => {
+        this[readinessField] = true;
+      })
+      .catch(() => {
+        this[readinessField] = undefined;
+        onFailure?.();
+      });
+  }
+
   constructor(
     readonly backend: Backend,
     readonly steps: JitStep[],
@@ -1349,6 +1366,20 @@ export class JitProgram {
       }
       if (this._megaModule) {
         const wasmBackend = this.backend as WasmBackend;
+        const megaModule = this._megaModule;
+        const parallelEligible =
+          wasmBackend.shouldUseParallelMegaModule(megaModule);
+
+        const startOrchestratorWarmup = () => {
+          if (!wasmBackend.shouldUseOrchestratorMegaModule(megaModule)) return;
+          // Orchestrator registration is asynchronous because
+          // WebAssembly.Module transfer is message-based in browser workers.
+          // Only warm it when the pool path is unavailable or has failed,
+          // so parallelizable programs do not pay a redundant cold-start cost.
+          this._startMegaModuleWarmup("_megaModuleOrchestratorReady", () =>
+            wasmBackend.registerMegaModuleOnOrchestrator(megaModule),
+          );
+        };
 
         // M6.2c: parallel mega-module dispatch for programs with large kernels.
         // First call triggers async worker registration (falls through to
@@ -1363,50 +1394,30 @@ export class JitProgram {
           return { outputs: outputSlots, pending: [] };
         }
 
-        if (
-          this._megaModulePoolReady === undefined &&
-          wasmBackend.shouldUseParallelMegaModule(this._megaModule)
-        ) {
+        if (this._megaModulePoolReady === undefined && parallelEligible) {
           // First call: kick off async registration, fall through to
           // monolithic path for this invocation.
-          this._megaModulePoolReady = false;
-          const mm = this._megaModule;
-          wasmBackend
-            .registerMegaModuleOnPool(mm)
-            .then(() => {
-              this._megaModulePoolReady = true;
-            })
-            .catch(() => {
-              // Registration failed — stay on monolithic path
-              this._megaModulePoolReady = undefined;
-            });
+          this._startMegaModuleWarmup(
+            "_megaModulePoolReady",
+            () => wasmBackend.registerMegaModuleOnPool(megaModule),
+            () => {
+              // Registration failed — stay on monolithic path and try the
+              // orchestrator path on later calls if it is available.
+              startOrchestratorWarmup();
+            },
+          );
         }
 
         if (
+          !parallelEligible &&
           this._megaModuleOrchestratorReady === undefined &&
-          wasmBackend.shouldUseOrchestratorMegaModule(this._megaModule)
+          wasmBackend.shouldUseOrchestratorMegaModule(megaModule)
         ) {
-          // Orchestrator registration is asynchronous because
-          // WebAssembly.Module transfer is message-based in browser workers.
-          // First invocation falls back to direct execution; subsequent calls
-          // can use synchronous orchestrator dispatch once the module is ready.
-          this._megaModuleOrchestratorReady = false;
-          const mm = this._megaModule;
-          wasmBackend
-            .registerMegaModuleOnOrchestrator(mm)
-            .then(() => {
-              this._megaModuleOrchestratorReady = true;
-            })
-            .catch(() => {
-              this._megaModuleOrchestratorReady = undefined;
-            });
+          startOrchestratorWarmup();
         }
 
         // Monolithic path: orchestrator (M6.2b) or direct execution
-        const outputSlots = wasmBackend.executeMegaModule(
-          this._megaModule,
-          inputs,
-        );
+        const outputSlots = wasmBackend.executeMegaModule(megaModule, inputs);
         return { outputs: outputSlots, pending: [] };
       }
     }

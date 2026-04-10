@@ -20,6 +20,8 @@
  * on Atomics.wait support.
  */
 
+import { registerAsyncModule } from "./registration";
+
 function canWaitOnThisThread(): boolean {
   try {
     const probe = new Int32Array(new SharedArrayBuffer(4));
@@ -150,6 +152,8 @@ self.onmessage = function (e) {
     } catch (err) {
       self.postMessage({ type: "error", moduleId: msg.moduleId, error: String(err) });
     }
+  } else if (msg.type === "unregister") {
+    delete instances[msg.moduleId];
   } else if (msg.type === "destroy") {
     self.close();
   }
@@ -174,6 +178,7 @@ export class WasmWorkerPool {
   #nextModuleId = 0;
   #moduleIds = new WeakMap<WebAssembly.Module, number>();
   #registeredOnWorkers = new Set<number>();
+  #registeringModules = new Map<number, Promise<void>>();
 
   constructor(memory: WebAssembly.Memory, numWorkers?: number) {
     const n =
@@ -216,29 +221,63 @@ export class WasmWorkerPool {
    * Repeated calls with the same module return the cached ID instantly.
    */
   async registerModule(module: WebAssembly.Module): Promise<number> {
-    const existing = this.#moduleIds.get(module);
-    if (existing !== undefined) return existing;
+    return this.#registerOnAllWorkers(module, "register");
+  }
 
-    const id = this.#nextModuleId++;
-    this.#moduleIds.set(module, id);
-
-    // Send module to all workers and wait for acknowledgement
-    const promises = this.#workers.map(
-      (w) =>
-        new Promise<void>((resolve, reject) => {
-          const handler = (e: MessageEvent) => {
-            if (e.data.moduleId !== id) return;
-            w.removeEventListener("message", handler);
-            if (e.data.type === "registered") resolve();
-            else
-              reject(new Error(e.data.error ?? "worker registration failed"));
-          };
-          w.addEventListener("message", handler);
-          w.postMessage({ type: "register", moduleId: id, module });
-        }),
+  async #registerOnAllWorkers(
+    module: WebAssembly.Module,
+    messageType: "register" | "register-mega",
+  ): Promise<number> {
+    const { id } = await registerAsyncModule(
+      {
+        ownerLabel: "Worker pool",
+        moduleIds: this.#moduleIds,
+        registeringModules: this.#registeringModules,
+        allocateModuleId: () => this.#nextModuleId++,
+        isRegistered: (existingId) => this.#registeredOnWorkers.has(existingId),
+        markRegistered: (registeredId) => {
+          this.#registeredOnWorkers.add(registeredId);
+        },
+        clearRegistered: (registeredId) => {
+          this.#registeredOnWorkers.delete(registeredId);
+        },
+      },
+      module,
+      (moduleId) =>
+        Promise.all(
+          this.#workers.map(
+            (worker) =>
+              new Promise<void>((resolve, reject) => {
+                const handler = (event: MessageEvent) => {
+                  if (event.data.moduleId !== moduleId) return;
+                  worker.removeEventListener("message", handler);
+                  if (event.data.type === "registered") {
+                    resolve();
+                  } else {
+                    reject(
+                      new Error(
+                        event.data.error ??
+                          `worker ${messageType === "register" ? "registration" : "mega registration"} failed`,
+                      ),
+                    );
+                  }
+                };
+                worker.addEventListener("message", handler);
+                worker.postMessage({
+                  type: messageType,
+                  moduleId,
+                  module,
+                });
+              }),
+          ),
+        ).then(() => undefined),
+      (moduleId) => {
+        for (const worker of this.#workers) {
+          worker.postMessage({ type: "unregister", moduleId });
+        }
+      },
     );
-    await Promise.all(promises);
-    this.#registeredOnWorkers.add(id);
+
     return id;
   }
 
@@ -251,32 +290,7 @@ export class WasmWorkerPool {
    * Repeated calls with the same module return the cached ID instantly.
    */
   async registerMegaModule(module: WebAssembly.Module): Promise<number> {
-    const existing = this.#moduleIds.get(module);
-    if (existing !== undefined) return existing;
-
-    const id = this.#nextModuleId++;
-    this.#moduleIds.set(module, id);
-
-    // Send module to all workers with "register-mega" type
-    const promises = this.#workers.map(
-      (w) =>
-        new Promise<void>((resolve, reject) => {
-          const handler = (e: MessageEvent) => {
-            if (e.data.moduleId !== id) return;
-            w.removeEventListener("message", handler);
-            if (e.data.type === "registered") resolve();
-            else
-              reject(
-                new Error(e.data.error ?? "worker mega registration failed"),
-              );
-          };
-          w.addEventListener("message", handler);
-          w.postMessage({ type: "register-mega", moduleId: id, module });
-        }),
-    );
-    await Promise.all(promises);
-    this.#registeredOnWorkers.add(id);
-    return id;
+    return this.#registerOnAllWorkers(module, "register-mega");
   }
 
   /**
