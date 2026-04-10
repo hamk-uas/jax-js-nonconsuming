@@ -20,7 +20,10 @@
  * on Atomics.wait support.
  */
 
-import { registerAsyncModule } from "./registration";
+import {
+  registerAsyncModule,
+  requestWorkerModuleRegistration,
+} from "./registration";
 import { canWaitOnThisThread, waitWhileState } from "./wait";
 
 // ---------------------------------------------------------------------------
@@ -221,30 +224,17 @@ export class WasmWorkerPool {
       module,
       (moduleId) =>
         Promise.all(
-          this.#workers.map(
-            (worker) =>
-              new Promise<void>((resolve, reject) => {
-                const handler = (event: MessageEvent) => {
-                  if (event.data.moduleId !== moduleId) return;
-                  worker.removeEventListener("message", handler);
-                  if (event.data.type === "registered") {
-                    resolve();
-                  } else {
-                    reject(
-                      new Error(
-                        event.data.error ??
-                          `worker ${messageType === "register" ? "registration" : "mega registration"} failed`,
-                      ),
-                    );
-                  }
-                };
-                worker.addEventListener("message", handler);
-                worker.postMessage({
-                  type: messageType,
-                  moduleId,
-                  module,
-                });
-              }),
+          this.#workers.map((worker) =>
+            requestWorkerModuleRegistration({
+              worker,
+              messageType,
+              moduleId,
+              module,
+              errorMessage:
+                messageType === "register"
+                  ? "worker registration failed"
+                  : "worker mega registration failed",
+            }),
           ),
         ).then(() => undefined),
       (moduleId) => {

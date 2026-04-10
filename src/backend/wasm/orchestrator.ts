@@ -26,7 +26,10 @@
  * ```
  */
 
-import { registerAsyncModule } from "./registration";
+import {
+  registerAsyncModule,
+  requestWorkerModuleRegistration,
+} from "./registration";
 import { canWaitOnThisThread, waitWhileState } from "./wait";
 import { DEBUG } from "../../utils";
 
@@ -248,27 +251,12 @@ export class OrchestratorWorker {
       },
       module,
       (moduleId) =>
-        new Promise<void>((resolve, reject) => {
-          const handler = (event: MessageEvent) => {
-            if (event.data?.moduleId !== moduleId) return;
-            this.#worker.removeEventListener("message", handler);
-            if (event.data?.type === "registered") {
-              resolve();
-            } else {
-              reject(
-                new Error(
-                  event.data?.error ??
-                    `Orchestrator: failed to register mega-module (id=${moduleId})`,
-                ),
-              );
-            }
-          };
-          this.#worker.addEventListener("message", handler);
-          this.#worker.postMessage({
-            type: "register",
-            moduleId,
-            module,
-          });
+        requestWorkerModuleRegistration({
+          worker: this.#worker,
+          messageType: "register",
+          moduleId,
+          module,
+          errorMessage: `Orchestrator: failed to register mega-module (id=${moduleId})`,
         }),
       (moduleId) => {
         this.#worker.postMessage({ type: "unregister", moduleId });

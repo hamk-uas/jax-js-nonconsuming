@@ -13,6 +13,40 @@ export interface AsyncModuleRegistrationResult {
   created: boolean;
 }
 
+export interface WorkerModuleRegistrationRequest {
+  worker: Worker;
+  messageType: string;
+  moduleId: number;
+  module: WebAssembly.Module;
+  errorMessage: string;
+}
+
+export function requestWorkerModuleRegistration({
+  worker,
+  messageType,
+  moduleId,
+  module,
+  errorMessage,
+}: WorkerModuleRegistrationRequest): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const handler = (event: MessageEvent) => {
+      if (event.data?.moduleId !== moduleId) return;
+      worker.removeEventListener("message", handler);
+      if (event.data?.type === "registered") {
+        resolve();
+      } else {
+        reject(new Error(event.data?.error ?? errorMessage));
+      }
+    };
+    worker.addEventListener("message", handler);
+    worker.postMessage({
+      type: messageType,
+      moduleId,
+      module,
+    });
+  });
+}
+
 export async function registerAsyncModule(
   tracker: AsyncModuleRegistrationTracker,
   module: WebAssembly.Module,
