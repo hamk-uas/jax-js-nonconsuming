@@ -370,12 +370,7 @@ export class WasmWorkerPool {
       while (true) {
         const state = Atomics.load(this.#control, base + CTRL_STATE);
         if (state === STATE_READY) break;
-        waitWhileState(
-          this.#control,
-          base + CTRL_STATE,
-          state,
-          this.#canWait,
-        );
+        waitWhileState(this.#control, base + CTRL_STATE, state, this.#canWait);
       }
     }
   }

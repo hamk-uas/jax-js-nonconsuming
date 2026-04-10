@@ -8,16 +8,14 @@ const canRunNestedWorkerWasm =
 describe.skipIf(!canRunNestedWorkerWasm)(
   "WASM nested worker shared-memory path",
   () => {
-    it(
-      "runs eager and jit WASM paths inside a browser worker",
-      async () => {
-        const jaxUrl = new URL("../src/index.ts", import.meta.url).href;
-        const backendUrl = new URL("../src/backend.ts", import.meta.url).href;
-        const orchestratorUrl = new URL(
-          "../src/backend/wasm/orchestrator.ts",
-          import.meta.url,
-        ).href;
-        const workerCode = `
+    it("runs eager and jit WASM paths inside a browser worker", async () => {
+      const jaxUrl = new URL("../src/index.ts", import.meta.url).href;
+      const backendUrl = new URL("../src/backend.ts", import.meta.url).href;
+      const orchestratorUrl = new URL(
+        "../src/backend/wasm/orchestrator.ts",
+        import.meta.url,
+      ).href;
+      const workerCode = `
 import { init, jit, numpy as np } from ${JSON.stringify(jaxUrl)};
 import { getBackend } from ${JSON.stringify(backendUrl)};
 import { OrchestratorWorker } from ${JSON.stringify(orchestratorUrl)};
@@ -99,70 +97,72 @@ self.onmessage = async (event) => {
 };
 `;
 
-  const stages: string[] = [];
-        const result = await new Promise<{
-          type?: string;
-          ok: boolean;
-          error?: string;
-          stack?: string;
-          sharedMemory?: boolean;
-          orchestrator?: boolean;
-          eagerData?: number[];
-          jitData?: number[];
-          jitData2?: number[];
-        }>((resolve, reject) => {
-          const blob = new Blob([workerCode], { type: "text/javascript" });
-          const url = URL.createObjectURL(blob);
-          const worker = new Worker(url, { type: "module" });
-          const cleanup = () => {
-            worker.terminate();
-            URL.revokeObjectURL(url);
-          };
-          const timeout = setTimeout(() => {
-            cleanup();
-            reject(
-              new Error(
-                `Timed out waiting for nested worker WASM result. Stages: ${stages.join(", ") || "none"}`,
-              ),
-            );
-          }, 10000);
-
-          worker.addEventListener("message", (event) => {
-            if (event.data?.type === "stage") {
-              stages.push(String(event.data.stage));
-              return;
-            }
-            clearTimeout(timeout);
-            cleanup();
-            resolve(event.data);
-          });
-          worker.addEventListener("error", (event) => {
-            clearTimeout(timeout);
-            cleanup();
-            reject(event.error ?? new Error(event.message));
-          });
-          worker.postMessage({ type: "run" });
-        });
-
-        if (!result.ok) {
-          throw new Error(
-            [result.error ?? "nested worker failed", result.stack]
-              .filter(Boolean)
-              .join("\n"),
+      const stages: string[] = [];
+      const result = await new Promise<{
+        type?: string;
+        ok: boolean;
+        error?: string;
+        stack?: string;
+        sharedMemory?: boolean;
+        orchestrator?: boolean;
+        eagerData?: number[];
+        jitData?: number[];
+        jitData2?: number[];
+      }>((resolve, reject) => {
+        const blob = new Blob([workerCode], { type: "text/javascript" });
+        const url = URL.createObjectURL(blob);
+        const worker = new Worker(url, { type: "module" });
+        const cleanup = () => {
+          worker.terminate();
+          URL.revokeObjectURL(url);
+        };
+        const timeout = setTimeout(() => {
+          cleanup();
+          reject(
+            new Error(
+              `Timed out waiting for nested worker WASM result. Stages: ${stages.join(", ") || "none"}`,
+            ),
           );
-        }
+        }, 10000);
 
-        expect(result.sharedMemory).toBe(true);
-        expect(result.orchestrator).toBe(true);
-        expect(result.eagerData).toEqual([2, 2, 2, 2]);
-        expect(result.jitData).toEqual([4, 6, 8, 10]);
-        expect(result.jitData2).toEqual([12, 14, 16, 18]);
-        expect(stages).toContain("orch-register-start");
-        expect(stages).toContain("orch-register-end");
-        expect(stages).toContain("orch-dispatch-start");
-        expect(stages).toContain("orch-dispatch-end");
-      },
-      15000,
-    );
+        worker.addEventListener("message", (event) => {
+          if (event.data?.type === "stage") {
+            stages.push(String(event.data.stage));
+            return;
+          }
+          clearTimeout(timeout);
+          cleanup();
+          resolve(event.data);
+        });
+        worker.addEventListener("error", (event) => {
+          clearTimeout(timeout);
+          cleanup();
+          reject(
+            event.error instanceof Error
+              ? event.error
+              : new Error(event.message || String(event.error)),
+          );
+        });
+        worker.postMessage({ type: "run" });
+      });
+
+      if (!result.ok) {
+        throw new Error(
+          [result.error ?? "nested worker failed", result.stack]
+            .filter(Boolean)
+            .join("\n"),
+        );
+      }
+
+      expect(result.sharedMemory).toBe(true);
+      expect(result.orchestrator).toBe(true);
+      expect(result.eagerData).toEqual([2, 2, 2, 2]);
+      expect(result.jitData).toEqual([4, 6, 8, 10]);
+      expect(result.jitData2).toEqual([12, 14, 16, 18]);
+      expect(stages).toContain("orch-register-start");
+      expect(stages).toContain("orch-register-end");
+      expect(stages).toContain("orch-dispatch-start");
+      expect(stages).toContain("orch-dispatch-end");
+    }, 15000);
   },
 );

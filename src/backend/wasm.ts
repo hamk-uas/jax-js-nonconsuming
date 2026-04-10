@@ -297,9 +297,9 @@ export class WasmBackend implements Backend {
 
   /**
    * Lazily create or return the WasmWorkerPool.
-    * Returns null when SharedArrayBuffer, Workers, or synchronous worker waits
-    * are unavailable (for example, browser main threads where Atomics.wait is
-    * forbidden).
+   * Returns null when SharedArrayBuffer, Workers, or synchronous worker waits
+   * are unavailable (for example, browser main threads where Atomics.wait is
+   * forbidden).
    */
   #getWorkerPool(): WasmWorkerPool | null {
     if (this.#workerPool !== undefined) return this.#workerPool;
@@ -322,8 +322,8 @@ export class WasmBackend implements Backend {
 
   /**
    * Lazily create or return the OrchestratorWorker.
-    * Returns null when SharedArrayBuffer, Workers, or synchronous worker waits
-    * are unavailable (see #getWorkerPool comment for rationale).
+   * Returns null when SharedArrayBuffer, Workers, or synchronous worker waits
+   * are unavailable (see #getWorkerPool comment for rationale).
    */
   #getOrchestrator(): OrchestratorWorker | null {
     if (this.#orchestrator !== undefined) return this.#orchestrator;

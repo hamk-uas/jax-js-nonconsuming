@@ -320,9 +320,9 @@ export class OrchestratorWorker {
   /**
    * Dispatch mega_execute to the orchestrator worker.
    *
-  * Writes input pointers to the shared control buffer, signals the worker via
-  * `STATE_DISPATCHED` + `Atomics.notify`, then waits while servicing
-  * alloc/free proxy requests.
+   * Writes input pointers to the shared control buffer, signals the worker via
+   * `STATE_DISPATCHED` + `Atomics.notify`, then waits while servicing
+   * alloc/free proxy requests.
    *
    * @param moduleId    Module ID from `registerModuleSync()`
    * @param inputPtrs   Raw memory pointers for mega-module inputs
