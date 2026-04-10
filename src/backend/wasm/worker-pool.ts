@@ -20,6 +20,7 @@
  * on Atomics.wait support.
  */
 
+import { withInlineModuleWorkerUrl } from "./inline-worker";
 import {
   registerAsyncModule,
   requestWorkerModuleRegistration,
@@ -174,22 +175,18 @@ export class WasmWorkerPool {
     this.#canWait = canWaitOnThisThread();
 
     // Create workers from inlined Blob URL
-    const code = buildWorkerCode();
-    const blob = new Blob([code], { type: "text/javascript" });
-    const url = URL.createObjectURL(blob);
-
-    this.#workers = [];
-    for (let i = 0; i < n; i++) {
-      const w = new Worker(url, { type: "module" });
-      // Init: send shared memory
-      w.postMessage({ type: "init", memory, workerIdx: i });
-      // Send control buffer so worker can start its work loop
-      w.postMessage({ type: "control", buffer: this.#controlBuf });
-      this.#workers.push(w);
-    }
-    // Defer revocation — Deno module workers may not have loaded the blob
-    // URL synchronously by the time revokeObjectURL is called.
-    setTimeout(() => URL.revokeObjectURL(url), 0);
+    this.#workers = withInlineModuleWorkerUrl(buildWorkerCode(), (url) => {
+      const workers: Worker[] = [];
+      for (let i = 0; i < n; i++) {
+        const worker = new Worker(url, { type: "module" });
+        // Init: send shared memory
+        worker.postMessage({ type: "init", memory, workerIdx: i });
+        // Send control buffer so worker can start its work loop
+        worker.postMessage({ type: "control", buffer: this.#controlBuf });
+        workers.push(worker);
+      }
+      return workers;
+    });
   }
 
   /**

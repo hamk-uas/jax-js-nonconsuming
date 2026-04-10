@@ -26,6 +26,7 @@
  * ```
  */
 
+import { withInlineModuleWorkerUrl } from "./inline-worker";
 import {
   registerAsyncModule,
   requestWorkerModuleRegistration,
@@ -212,13 +213,10 @@ export class OrchestratorWorker {
     Atomics.store(this.#control, CTRL_STATE, STATE_IDLE);
 
     // Create worker from inline Blob URL
-    const code = buildOrchestratorCode();
-    const blob = new Blob([code], { type: "text/javascript" });
-    const url = URL.createObjectURL(blob);
-    this.#worker = new Worker(url, { type: "module" });
-    // Defer revocation — module workers may not have loaded the blob
-    // URL synchronously by the time revokeObjectURL is called.
-    setTimeout(() => URL.revokeObjectURL(url), 0);
+    this.#worker = withInlineModuleWorkerUrl(
+      buildOrchestratorCode(),
+      (url) => new Worker(url, { type: "module" }),
+    );
 
     // Send init message with shared memory and control buffer
     this.#worker.postMessage({

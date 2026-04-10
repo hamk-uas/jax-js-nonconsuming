@@ -54,6 +54,7 @@ import {
   MAX_SHARED_PAGES,
   setUseSharedMemory,
 } from "./wasm/shared-memory-config";
+import { canWaitOnThisThread } from "./wasm/wait";
 import { CodeGenerator } from "./wasm/wasmblr";
 import { WasmWorkerPool } from "./wasm/worker-pool";
 
@@ -281,17 +282,7 @@ export class WasmBackend implements Backend {
 
     // Probe whether this thread can block on Atomics.wait. Browser main
     // threads throw here; browser workers and Node.js do not.
-    this.#canSpinWaitWorkers = (() => {
-      if (!shared) return false;
-      try {
-        const probe = new Int32Array(new SharedArrayBuffer(4));
-        // value !== 0, so returns "not-equal" immediately (no actual wait)
-        Atomics.wait(probe, 0, 1, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    })();
+    this.#canSpinWaitWorkers = shared && canWaitOnThisThread();
     // Workers/orchestrator are created lazily — see #getWorkerPool(), #getOrchestrator().
   }
 
