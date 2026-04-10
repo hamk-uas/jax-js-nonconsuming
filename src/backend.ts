@@ -25,7 +25,7 @@ export interface BackendCapabilities {
   readonly shaderF16: boolean;
   /** WebGPU: true if subgroups extension is available. */
   readonly subgroups?: boolean;
-  /** Wasm: true if crossOriginIsolated (SharedArrayBuffer available). */
+  /** Wasm: true if the backend can safely use SharedArrayBuffer-backed memory in the current runtime. */
   readonly sharedMemory: boolean;
   /** Whether the backend supports multi-output kernel dispatch. */
   readonly multiOutputKernel: boolean;

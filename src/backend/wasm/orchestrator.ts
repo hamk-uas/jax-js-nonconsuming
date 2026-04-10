@@ -17,7 +17,7 @@
  * Main Thread                      Orchestrator Worker
  *     │                                  │
  *     ├─ write params to controlBuf      │
- *     ├─ postMessage("dispatch")────────→│
+ *     ├─ store STATE_DISPATCHED + notify │
  *     ├─ spin-loop:                      ├─ mega_execute(...)
  *     │    ALLOC_REQ → malloc, respond   │    call $alloc → ALLOC_REQ → wait
  *     │    FREE_REQ  → free, respond     │    call $free  → FREE_REQ  → wait
@@ -27,6 +27,31 @@
  */
 
 import { DEBUG } from "../../utils";
+
+function canWaitOnThisThread(): boolean {
+  try {
+    const probe = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(probe, 0, 1, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function waitWhileState(
+  control: Int32Array,
+  index: number,
+  expected: number,
+  canWait: boolean,
+): void {
+  if (canWait) {
+    Atomics.wait(control, index, expected);
+    return;
+  }
+  while (Atomics.load(control, index) === expected) {
+    // busy wait fallback
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Control buffer layout (Int32 slots on a SharedArrayBuffer)
@@ -44,8 +69,6 @@ const STATE_FREE_REQ = 3;
 const STATE_DONE = 4;
 /** Orchestrator hit an error during mega_execute. */
 const STATE_ERROR = 5;
-/** Module registration confirmed by worker. */
-const STATE_REGISTERED = 6;
 
 // Control buffer field offsets (Int32 indices):
 const CTRL_STATE = 0;
@@ -86,11 +109,15 @@ var ALLOC_REQ = ${STATE_ALLOC_REQ};
 var FREE_REQ = ${STATE_FREE_REQ};
 var DONE = ${STATE_DONE};
 var ERROR = ${STATE_ERROR};
-var REGISTERED = ${STATE_REGISTERED};
 
 var memory = null;
 var control = null;
 var instances = Object.create(null); // moduleId -> WebAssembly.Instance
+
+function armDispatchLoop() {
+  if (!control) return;
+  setTimeout(runDispatchLoop, 0);
+}
 
 // Alloc proxy — blocks the worker until the main thread responds.
 function proxyAlloc(size) {
@@ -122,11 +149,41 @@ function runDispatch() {
   inst.exports.mega_execute.apply(null, args);
 }
 
+function runDispatchLoop() {
+  if (!control) return;
+  while (true) {
+    var state = Atomics.load(control, STATE);
+    if (state === DISPATCHED) {
+      try {
+        runDispatch();
+        Atomics.store(control, STATE, DONE);
+      } catch (err) {
+        console.error("Orchestrator error:", err);
+        Atomics.store(control, STATE, ERROR);
+      }
+      Atomics.notify(control, STATE);
+      continue;
+    }
+
+    if (state !== IDLE) {
+      armDispatchLoop();
+      return;
+    }
+
+    Atomics.wait(control, STATE, IDLE, 50);
+    if (Atomics.load(control, STATE) === IDLE) {
+      armDispatchLoop();
+      return;
+    }
+  }
+}
+
 self.onmessage = function (e) {
   var msg = e.data;
   if (msg.type === "init") {
     memory = msg.memory;
     control = new Int32Array(msg.controlBuffer);
+    armDispatchLoop();
   } else if (msg.type === "register") {
     try {
       var inst = new WebAssembly.Instance(msg.module, {
@@ -137,24 +194,10 @@ self.onmessage = function (e) {
         },
       });
       instances[msg.moduleId] = inst;
-      // Signal registration via control buffer + postMessage.
-      Atomics.store(control, STATE, REGISTERED);
-      Atomics.notify(control, STATE);
       self.postMessage({ type: "registered", moduleId: msg.moduleId });
     } catch (err) {
-      Atomics.store(control, STATE, ERROR);
-      Atomics.notify(control, STATE);
       self.postMessage({ type: "error", moduleId: msg.moduleId, error: String(err) });
     }
-  } else if (msg.type === "dispatch") {
-    try {
-      runDispatch();
-      Atomics.store(control, STATE, DONE);
-    } catch (err) {
-      console.error("Orchestrator error:", err);
-      Atomics.store(control, STATE, ERROR);
-    }
-    Atomics.notify(control, STATE);
   } else if (msg.type === "destroy") {
     self.close();
   }
@@ -170,17 +213,20 @@ export class OrchestratorWorker {
   #worker: Worker;
   #controlBuf: SharedArrayBuffer;
   #control: Int32Array;
+  #canWait: boolean;
   #destroyed = false;
 
   // Module registration tracking
   #nextModuleId = 0;
   #moduleIds = new WeakMap<WebAssembly.Module, number>();
   #registeredModules = new Set<number>();
+  #registeringModules = new Map<number, Promise<void>>();
 
   constructor(memory: WebAssembly.Memory) {
     // Create shared control buffer
     this.#controlBuf = new SharedArrayBuffer(CTRL_TOTAL * 4);
     this.#control = new Int32Array(this.#controlBuf);
+    this.#canWait = canWaitOnThisThread();
     Atomics.store(this.#control, CTRL_STATE, STATE_IDLE);
 
     // Create worker from inline Blob URL
@@ -201,53 +247,82 @@ export class OrchestratorWorker {
   }
 
   /**
-   * Register a WASM mega-module on the orchestrator.
+   * Register a WASM mega-module on the orchestrator asynchronously.
    *
-   * Uses `postMessage` to send the module (structured-cloneable), then
-   * spin-waits on the control buffer for the worker's confirmation.
-   * Called synchronously from `executeMegaModule`.
-   *
-   * @returns The module ID for use in `dispatch()`.
+   * `WebAssembly.Module` transfer is message-based in browser workers, so the
+   * registration step itself cannot be made synchronous safely there.
    */
-  registerModuleSync(module: WebAssembly.Module): number {
+  async registerModule(module: WebAssembly.Module): Promise<number> {
     const existing = this.#moduleIds.get(module);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+      const pending = this.#registeringModules.get(existing);
+      if (pending) await pending;
+      return existing;
+    }
 
     const id = this.#nextModuleId++;
     this.#moduleIds.set(module, id);
 
-    // Send module to worker
-    this.#worker.postMessage({ type: "register", moduleId: id, module });
+    const registration = new Promise<void>((resolve, reject) => {
+      const handler = (event: MessageEvent) => {
+        if (event.data?.moduleId !== id) return;
+        this.#worker.removeEventListener("message", handler);
+        if (event.data?.type === "registered") {
+          resolve();
+        } else {
+          reject(
+            new Error(
+              event.data?.error ??
+                `Orchestrator: failed to register mega-module (id=${id})`,
+            ),
+          );
+        }
+      };
+      this.#worker.addEventListener("message", handler);
+      this.#worker.postMessage({ type: "register", moduleId: id, module });
+    });
+    this.#registeringModules.set(id, registration);
 
-    // Spin-wait for confirmation via control buffer.
-    // The worker sets STATE → REGISTERED after instantiation.
-    while (true) {
-      const state = Atomics.load(this.#control, CTRL_STATE);
-      if (state === STATE_REGISTERED) {
-        Atomics.store(this.#control, CTRL_STATE, STATE_IDLE);
-        break;
+    try {
+      await registration;
+      this.#registeredModules.add(id);
+      if (DEBUG >= 1) {
+        console.info(`orchestrator: registered module id=${id}`);
       }
-      if (state === STATE_ERROR) {
-        Atomics.store(this.#control, CTRL_STATE, STATE_IDLE);
-        throw new Error(
-          `Orchestrator: failed to register mega-module (id=${id})`,
-        );
-      }
-      // Still IDLE — worker hasn't processed the message yet; keep spinning.
+      return id;
+    } finally {
+      this.#registeringModules.delete(id);
     }
+  }
 
-    this.#registeredModules.add(id);
-    if (DEBUG >= 1) {
-      console.info(`orchestrator: registered module id=${id}`);
+  /**
+   * Synchronous fast path for already-registered modules.
+   */
+  registerModuleSync(module: WebAssembly.Module): number {
+    const existing = this.#moduleIds.get(module);
+    if (existing !== undefined && this.#registeredModules.has(existing)) {
+      return existing;
     }
-    return id;
+    throw new Error(
+      "Orchestrator: module not pre-registered; call registerModule() before synchronous dispatch",
+    );
+  }
+
+  isModuleReady(module: WebAssembly.Module): boolean {
+    const id = this.#moduleIds.get(module);
+    return id !== undefined && this.#registeredModules.has(id);
+  }
+
+  getModuleId(module: WebAssembly.Module): number | undefined {
+    return this.#moduleIds.get(module);
   }
 
   /**
    * Dispatch mega_execute to the orchestrator worker.
    *
-   * Writes input pointers to the shared control buffer, sends a "dispatch"
-   * message, then spin-waits while servicing alloc/free proxy requests.
+  * Writes input pointers to the shared control buffer, signals the worker via
+  * `STATE_DISPATCHED` + `Atomics.notify`, then waits while servicing
+  * alloc/free proxy requests.
    *
    * @param moduleId    Module ID from `registerModuleSync()`
    * @param inputPtrs   Raw memory pointers for mega-module inputs
@@ -280,11 +355,9 @@ export class OrchestratorWorker {
       Atomics.store(this.#control, CTRL_INPUTS + i, inputPtrs[i]);
     }
     Atomics.store(this.#control, CTRL_STATE, STATE_DISPATCHED);
+    Atomics.notify(this.#control, CTRL_STATE);
 
-    // Send dispatch trigger via postMessage (worker's onmessage handler).
-    this.#worker.postMessage({ type: "dispatch" });
-
-    // Spin-wait servicing alloc/free proxy requests until done.
+    // Wait while servicing alloc/free proxy requests until done.
     while (true) {
       const state = Atomics.load(this.#control, CTRL_STATE);
 
@@ -309,8 +382,9 @@ export class OrchestratorWorker {
         // Mega-execute threw an error
         Atomics.store(this.#control, CTRL_STATE, STATE_IDLE);
         throw new Error("Orchestrator: mega_execute failed on worker");
+      } else {
+        waitWhileState(this.#control, CTRL_STATE, state, this.#canWait);
       }
-      // STATE_DISPATCHED → worker is running; keep spinning.
     }
   }
 

@@ -78,6 +78,42 @@ interface MegaArenaLease {
   release(): void;
 }
 
+type SharedArrayBufferCtorLike = new (byteLength: number) => {
+  byteLength: number;
+};
+
+type WasmSharedMemoryRuntimeProbe = {
+  sharedArrayBufferCtor?: SharedArrayBufferCtorLike | null;
+};
+
+function resolveSharedArrayBufferCtor(
+  probe?: WasmSharedMemoryRuntimeProbe,
+): SharedArrayBufferCtorLike | null {
+  if (probe && "sharedArrayBufferCtor" in probe) {
+    return probe.sharedArrayBufferCtor ?? null;
+  }
+  return typeof SharedArrayBuffer === "undefined"
+    ? null
+    : (SharedArrayBuffer as SharedArrayBufferCtorLike);
+}
+
+/**
+ * Whether SharedArrayBuffer-backed WASM memory is available in the current
+ * runtime. The worker/orchestrator transport may still decide separately
+ * whether synchronous waiting is supported on this thread.
+ */
+export function _canUseWasmSharedMemoryRuntime(
+  probe?: WasmSharedMemoryRuntimeProbe,
+): boolean {
+  const sharedArrayBufferCtor = resolveSharedArrayBufferCtor(probe);
+  if (sharedArrayBufferCtor === null) return false;
+  try {
+    return new sharedArrayBufferCtor(1).byteLength === 1;
+  } catch {
+    return false;
+  }
+}
+
 /** A single step in the native scan body (after analysis). */
 export interface GeneralScanStep {
   source: Kernel | Routine;
@@ -190,19 +226,10 @@ export class WasmBackend implements Backend {
   readonly capabilities: BackendCapabilities = {
     atomicF32Add: false,
     shaderF16: false,
-    // SharedArrayBuffer is available when either:
-    //   (a) crossOriginIsolated is true (COOP + COEP headers), or
-    //   (b) the browser enables it unconditionally (e.g., Chromium
-    //       --enable-features=SharedArrayBuffer; Node.js)
-    // We test constructability rather than relying on crossOriginIsolated
-    // so that the Chromium flag and non-browser runtimes work too.
-    sharedMemory: (() => {
-      try {
-        return new SharedArrayBuffer(1).byteLength === 1;
-      } catch {
-        return false;
-      }
-    })(),
+    // Shared memory is enabled when SharedArrayBuffer-backed WASM memory is
+    // available. Worker/orchestrator availability is gated separately based on
+    // whether the current thread can block on Atomics.wait.
+    sharedMemory: _canUseWasmSharedMemoryRuntime(),
     multiOutputKernel: true,
   };
 
@@ -217,20 +244,10 @@ export class WasmBackend implements Backend {
   #megaArenaSize: number = 0;
   #megaArenaInUse: boolean = false;
   /**
-   * Whether this thread can spin-wait for Workers to complete.
+   * Whether this thread can synchronously wait for worker-side state changes.
    *
-   * On browser main threads, `Atomics.wait` is forbidden (throws TypeError)
-   * and — critically — `postMessage` delivery to Worker threads requires the
-   * main thread's event loop to process the message.  A tight `Atomics.load`
-   * spin-loop blocks the event loop, so the Worker never receives the message,
-   * causing deadlock.  This affects **all** browser engines (Chrome, Firefox,
-   * Safari) running on the main thread.
-   *
-   * On Node.js, `Atomics.wait` works on the main thread and message
-   * delivery is independent of the event loop, so spin-waits work correctly.
-   *
-   * We detect this by probing `Atomics.wait` — if it throws, we're on a
-   * browser main thread where spin-wait Worker patterns are broken.
+   * On browser main threads, `Atomics.wait` is forbidden (throws TypeError),
+   * so synchronous worker orchestration is unavailable there.
    */
   #canSpinWaitWorkers: boolean;
   /**
@@ -262,8 +279,8 @@ export class WasmBackend implements Backend {
     this.#buffers = new Map();
     this.#instanceCache = new WeakMap();
 
-    // Probe whether spin-wait Worker patterns work on this thread.
-    // Atomics.wait throws on browser main threads — use that as a proxy.
+    // Probe whether this thread can block on Atomics.wait. Browser main
+    // threads throw here; browser workers and Node.js do not.
     this.#canSpinWaitWorkers = (() => {
       if (!shared) return false;
       try {
@@ -280,10 +297,9 @@ export class WasmBackend implements Backend {
 
   /**
    * Lazily create or return the WasmWorkerPool.
-   * Returns null when SharedArrayBuffer, Workers, or main-thread spin-waits
-   * are unavailable (browsers forbid Atomics.wait on the main thread, and
-   * postMessage delivery to Workers requires the event loop to process —
-   * a main-thread spin-loop prevents message delivery, causing deadlock).
+    * Returns null when SharedArrayBuffer, Workers, or synchronous worker waits
+    * are unavailable (for example, browser main threads where Atomics.wait is
+    * forbidden).
    */
   #getWorkerPool(): WasmWorkerPool | null {
     if (this.#workerPool !== undefined) return this.#workerPool;
@@ -306,8 +322,8 @@ export class WasmBackend implements Backend {
 
   /**
    * Lazily create or return the OrchestratorWorker.
-   * Returns null when SharedArrayBuffer, Workers, or main-thread spin-waits
-   * are unavailable (see #getWorkerPool comment for rationale).
+    * Returns null when SharedArrayBuffer, Workers, or synchronous worker waits
+    * are unavailable (see #getWorkerPool comment for rationale).
    */
   #getOrchestrator(): OrchestratorWorker | null {
     if (this.#orchestrator !== undefined) return this.#orchestrator;
@@ -325,6 +341,27 @@ export class WasmBackend implements Backend {
       this.#orchestrator = null;
     }
     return this.#orchestrator;
+  }
+
+  /**
+   * Whether a mega-module can use the orchestrator path in this runtime.
+   */
+  shouldUseOrchestratorMegaModule(megaModule: WasmMegaModule): boolean {
+    const orch = this.#getOrchestrator();
+    if (!orch) return false;
+    const totalDispatchInputs =
+      megaModule.numInputs + (megaModule.arenaLayout ? 1 : 0);
+    return totalDispatchInputs <= ORCHESTRATOR_MAX_INPUTS;
+  }
+
+  async registerMegaModuleOnOrchestrator(
+    megaModule: WasmMegaModule,
+  ): Promise<void> {
+    const orch = this.#getOrchestrator();
+    if (!orch) throw new Error("Orchestrator worker not available");
+    if (!orch.isModuleReady(megaModule.module)) {
+      await orch.registerModule(megaModule.module);
+    }
   }
 
   /** The worker pool, if available. Exposed for testing. */
@@ -1181,10 +1218,13 @@ export class WasmBackend implements Backend {
     try {
       const orch = this.#getOrchestrator();
       const totalDispatchInputs = inputPtrs.length + (arena ? 1 : 0);
-      if (orch && totalDispatchInputs <= ORCHESTRATOR_MAX_INPUTS) {
+      if (
+        orch &&
+        totalDispatchInputs <= ORCHESTRATOR_MAX_INPUTS &&
+        orch.isModuleReady(megaModule.module)
+      ) {
         // --- Orchestrator path (M6.2b): off-main-thread execution ---
-        // Register the module if not already known to the orchestrator.
-        const moduleId = orch.registerModuleSync(megaModule.module);
+        const moduleId = orch.getModuleId(megaModule.module)!;
         // Dispatch to orchestrator. The main thread spin-waits here,
         // servicing alloc/free proxy requests via the control buffer.
         orch.dispatch(

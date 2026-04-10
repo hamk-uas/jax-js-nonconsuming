@@ -10,16 +10,40 @@
  *   2. Main thread sends postMessage({ type: "wake" }) to worker
  *   3. Worker's onmessage fires, reads params, executes kernel
  *   4. Worker writes STATE_READY to control buffer, calls Atomics.notify
- *   5. Main thread spin-waits on Atomics.load for STATE_READY
+ *   5. Main thread waits for STATE_READY (Atomics.wait when available,
+ *      otherwise a busy-poll fallback)
  *
- * This avoids Atomics.wait (blocks worker thread) and Atomics.waitAsync
- * (creates promises that prevent browser page cleanup on exit).
- * Workers sit in the natural browser event loop between dispatches,
- * allowing onmessage events (register, destroy) to fire normally.
- *
- * Main thread spin-waits via `Atomics.load` (no `Atomics.wait` — blocked on
- * browser main thread).
+ * Workers still sit in the natural event loop so they can receive module
+ * registration messages; the main side uses `Atomics.wait` when available to
+ * avoid starving nested-worker execution.
+ * Browser main threads never construct this path because WasmBackend gates it
+ * on Atomics.wait support.
  */
+
+function canWaitOnThisThread(): boolean {
+  try {
+    const probe = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(probe, 0, 1, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function waitWhileState(
+  control: Int32Array,
+  index: number,
+  expected: number,
+  canWait: boolean,
+): void {
+  if (canWait) {
+    Atomics.wait(control, index, expected);
+    return;
+  }
+  while (Atomics.load(control, index) === expected) {
+    // busy wait fallback
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Control buffer layout constants
@@ -143,6 +167,7 @@ export class WasmWorkerPool {
   #workers: Worker[];
   #controlBuf: SharedArrayBuffer;
   #control: Int32Array;
+  #canWait: boolean;
   #destroyed = false;
 
   // Module registration tracking
@@ -162,6 +187,7 @@ export class WasmWorkerPool {
     // Shared control buffer
     this.#controlBuf = new SharedArrayBuffer(n * WORKER_STRIDE * 4);
     this.#control = new Int32Array(this.#controlBuf);
+    this.#canWait = canWaitOnThisThread();
 
     // Create workers from inlined Blob URL
     const code = buildWorkerCode();
@@ -336,14 +362,20 @@ export class WasmWorkerPool {
       fn(0, mainEnd, ...args);
     }
 
-    // Spin-wait for all active workers to finish
+    // Wait for all active workers to finish.
     for (let i = 0; i < n; i++) {
       const start = (i + 1) * chunkSize;
       if (start >= totalSize) continue;
       const base = i * WORKER_STRIDE;
-      // Spin: safe on all threads (does not block event loop, just busy-polls)
-      while (Atomics.load(this.#control, base + CTRL_STATE) !== STATE_READY) {
-        // busy wait
+      while (true) {
+        const state = Atomics.load(this.#control, base + CTRL_STATE);
+        if (state === STATE_READY) break;
+        waitWhileState(
+          this.#control,
+          base + CTRL_STATE,
+          state,
+          this.#canWait,
+        );
       }
     }
   }

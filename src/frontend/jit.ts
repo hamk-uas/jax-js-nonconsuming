@@ -1148,6 +1148,9 @@ export class JitProgram {
   /** M6.2c: worker pool registration state for parallel mega-module dispatch.
    *  undefined = not attempted, false = registering, true = ready. */
   private _megaModulePoolReady?: boolean;
+  /** M6.2b: orchestrator registration state for monolithic mega-module dispatch.
+   *  undefined = not attempted, false = registering, true = ready. */
+  private _megaModuleOrchestratorReady?: boolean;
   /** Cached command tape: undefined = not attempted, null = unsupported. */
   private _commandTape?: WebGPUCommandTape | null;
 
@@ -1376,6 +1379,26 @@ export class JitProgram {
             .catch(() => {
               // Registration failed — stay on monolithic path
               this._megaModulePoolReady = undefined;
+            });
+        }
+
+        if (
+          this._megaModuleOrchestratorReady === undefined &&
+          wasmBackend.shouldUseOrchestratorMegaModule(this._megaModule)
+        ) {
+          // Orchestrator registration is asynchronous because
+          // WebAssembly.Module transfer is message-based in browser workers.
+          // First invocation falls back to direct execution; subsequent calls
+          // can use synchronous orchestrator dispatch once the module is ready.
+          this._megaModuleOrchestratorReady = false;
+          const mm = this._megaModule;
+          wasmBackend
+            .registerMegaModuleOnOrchestrator(mm)
+            .then(() => {
+              this._megaModuleOrchestratorReady = true;
+            })
+            .catch(() => {
+              this._megaModuleOrchestratorReady = undefined;
             });
         }
 
