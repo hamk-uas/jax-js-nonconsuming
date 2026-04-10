@@ -27,32 +27,8 @@
  */
 
 import { registerAsyncModule } from "./registration";
+import { canWaitOnThisThread, waitWhileState } from "./wait";
 import { DEBUG } from "../../utils";
-
-function canWaitOnThisThread(): boolean {
-  try {
-    const probe = new Int32Array(new SharedArrayBuffer(4));
-    Atomics.wait(probe, 0, 1, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function waitWhileState(
-  control: Int32Array,
-  index: number,
-  expected: number,
-  canWait: boolean,
-): void {
-  if (canWait) {
-    Atomics.wait(control, index, expected);
-    return;
-  }
-  while (Atomics.load(control, index) === expected) {
-    // busy wait fallback
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Control buffer layout (Int32 slots on a SharedArrayBuffer)
