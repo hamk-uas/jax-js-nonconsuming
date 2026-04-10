@@ -21,10 +21,8 @@
  */
 
 import { withInlineModuleWorkerUrl } from "./inline-worker";
-import {
-  registerAsyncModule,
-  requestWorkerModuleRegistration,
-} from "./registration";
+import { ModuleRegistry } from "./module-registry";
+import { requestWorkerModuleRegistration } from "./registration";
 import { canWaitOnThisThread, waitWhileState } from "./wait";
 
 // ---------------------------------------------------------------------------
@@ -153,12 +151,7 @@ export class WasmWorkerPool {
   #control: Int32Array;
   #canWait: boolean;
   #destroyed = false;
-
-  // Module registration tracking
-  #nextModuleId = 0;
-  #moduleIds = new WeakMap<WebAssembly.Module, number>();
-  #registeredOnWorkers = new Set<number>();
-  #registeringModules = new Map<number, Promise<void>>();
+  #registry = new ModuleRegistry("Worker pool");
 
   constructor(memory: WebAssembly.Memory, numWorkers?: number) {
     const n =
@@ -204,20 +197,7 @@ export class WasmWorkerPool {
     module: WebAssembly.Module,
     messageType: "register" | "register-mega",
   ): Promise<number> {
-    const { id } = await registerAsyncModule(
-      {
-        ownerLabel: "Worker pool",
-        moduleIds: this.#moduleIds,
-        registeringModules: this.#registeringModules,
-        allocateModuleId: () => this.#nextModuleId++,
-        isRegistered: (existingId) => this.#registeredOnWorkers.has(existingId),
-        markRegistered: (registeredId) => {
-          this.#registeredOnWorkers.add(registeredId);
-        },
-        clearRegistered: (registeredId) => {
-          this.#registeredOnWorkers.delete(registeredId);
-        },
-      },
+    const { id } = await this.#registry.register(
       module,
       (moduleId) =>
         Promise.all(
@@ -261,8 +241,7 @@ export class WasmWorkerPool {
    * `registerModule` has been awaited for this module).
    */
   isModuleReady(module: WebAssembly.Module): boolean {
-    const id = this.#moduleIds.get(module);
-    return id !== undefined && this.#registeredOnWorkers.has(id);
+    return this.#registry.isReady(module);
   }
 
   /**
@@ -270,7 +249,7 @@ export class WasmWorkerPool {
    * Returns undefined if not registered.
    */
   getModuleId(module: WebAssembly.Module): number | undefined {
-    return this.#moduleIds.get(module);
+    return this.#registry.getId(module);
   }
 
   /**
@@ -294,7 +273,7 @@ export class WasmWorkerPool {
     kernelIdx: number = -1,
   ): void {
     if (this.#destroyed) throw new Error("WasmWorkerPool destroyed");
-    if (!this.#registeredOnWorkers.has(moduleId)) {
+    if (!this.#registry.hasId(moduleId)) {
       throw new Error(`Module ${moduleId} not registered on workers`);
     }
     if (args.length > MAX_ARGS) {

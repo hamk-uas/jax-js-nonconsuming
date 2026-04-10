@@ -1,4 +1,4 @@
-export interface AsyncModuleRegistrationTracker {
+interface AsyncModuleRegistrationTracker {
   ownerLabel: string;
   moduleIds: WeakMap<WebAssembly.Module, number>;
   registeringModules: Map<number, Promise<void>>;
@@ -8,7 +8,7 @@ export interface AsyncModuleRegistrationTracker {
   clearRegistered: (id: number) => void;
 }
 
-export interface AsyncModuleRegistrationResult {
+interface AsyncModuleRegistrationResult {
   id: number;
   created: boolean;
 }

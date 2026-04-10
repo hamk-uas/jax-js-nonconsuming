@@ -27,10 +27,8 @@
  */
 
 import { withInlineModuleWorkerUrl } from "./inline-worker";
-import {
-  registerAsyncModule,
-  requestWorkerModuleRegistration,
-} from "./registration";
+import { ModuleRegistry } from "./module-registry";
+import { requestWorkerModuleRegistration } from "./registration";
 import { canWaitOnThisThread, waitWhileState } from "./wait";
 import { DEBUG } from "../../utils";
 
@@ -198,12 +196,7 @@ export class OrchestratorWorker {
   #control: Int32Array;
   #canWait: boolean;
   #destroyed = false;
-
-  // Module registration tracking
-  #nextModuleId = 0;
-  #moduleIds = new WeakMap<WebAssembly.Module, number>();
-  #registeredModules = new Set<number>();
-  #registeringModules = new Map<number, Promise<void>>();
+  #registry = new ModuleRegistry("Orchestrator");
 
   constructor(memory: WebAssembly.Memory) {
     // Create shared control buffer
@@ -233,20 +226,7 @@ export class OrchestratorWorker {
    * registration step itself cannot be made synchronous safely there.
    */
   async registerModule(module: WebAssembly.Module): Promise<number> {
-    const { id, created } = await registerAsyncModule(
-      {
-        ownerLabel: "Orchestrator",
-        moduleIds: this.#moduleIds,
-        registeringModules: this.#registeringModules,
-        allocateModuleId: () => this.#nextModuleId++,
-        isRegistered: (existingId) => this.#registeredModules.has(existingId),
-        markRegistered: (registeredId) => {
-          this.#registeredModules.add(registeredId);
-        },
-        clearRegistered: (registeredId) => {
-          this.#registeredModules.delete(registeredId);
-        },
-      },
+    const { id, created } = await this.#registry.register(
       module,
       (moduleId) =>
         requestWorkerModuleRegistration({
@@ -272,22 +252,15 @@ export class OrchestratorWorker {
    * Synchronous fast path for already-registered modules.
    */
   registerModuleSync(module: WebAssembly.Module): number {
-    const existing = this.#moduleIds.get(module);
-    if (existing !== undefined && this.#registeredModules.has(existing)) {
-      return existing;
-    }
-    throw new Error(
-      "Orchestrator: module not pre-registered; call registerModule() before synchronous dispatch",
-    );
+    return this.#registry.getIdSync(module);
   }
 
   isModuleReady(module: WebAssembly.Module): boolean {
-    const id = this.#moduleIds.get(module);
-    return id !== undefined && this.#registeredModules.has(id);
+    return this.#registry.isReady(module);
   }
 
   getModuleId(module: WebAssembly.Module): number | undefined {
-    return this.#moduleIds.get(module);
+    return this.#registry.getId(module);
   }
 
   /**
@@ -311,7 +284,7 @@ export class OrchestratorWorker {
     free: (ptr: number) => void,
   ): void {
     if (this.#destroyed) throw new Error("OrchestratorWorker destroyed");
-    if (!this.#registeredModules.has(moduleId)) {
+    if (!this.#registry.hasId(moduleId)) {
       throw new Error(`Orchestrator: module ${moduleId} not registered`);
     }
     if (inputPtrs.length > MAX_INPUTS) {
