@@ -1,0 +1,597 @@
+n,sha,date,added,removed,redone_by_k20,redone_of_k20,followups_k20,corrective,subject
+1,37f237e,2026-02-08,4,4,0,0,0,0,fix: remove extra .ref calls that leak memory (#76)
+2,c1b1514,2026-02-07,11,1,0,0,0,0,scan-v2: initial scaffolding and developer infrastructure
+3,ca0e68b,2026-02-07,119,0,0,12,2,0,"scan-v2 P0.1: add Primitive.Scan, DynamicUpdateSlice, and abstract eval rules"
+4,44782ea,2026-02-07,198,0,0,6,1,0,"scan-v2 P0.2: add lax-scan.ts, wire into lax.ts, export ScanPath"
+5,fe2981a,2026-02-07,413,0,0,70,7,0,"scan-v2 P0.3: add scan-plan.ts, scan-executor.ts, copyBufferToBuffer"
+6,c8bb08e,2026-02-07,261,4,4,1,0,0,P0.4: array.ts eager impl for Scan and DynamicUpdateSlice
+7,3e88f5f,2026-02-07,177,2,0,4,1,0,P0.5: jit.ts compilation — scan JitStep and Primitive.Scan in jitCompile
+8,94d96f4,2026-02-07,15,15,15,0,0,1,P0.6: smoke tests + bug fixes for scan executor
+9,27323dc,2026-02-07,0,0,0,0,0,0,Update progress tracker: P0 done
+10,e76a1de,2026-02-07,12,6,0,0,0,0,P1: Port comprehensive scan test suite and fix JIT pending-ops bug
+11,955f99b,2026-02-07,1135,65,24,23,2,0,P2: WASM compiled-loop scan
+12,59d0605,2026-02-07,0,0,0,0,0,0,docs: update P2 progress in copilot-instructions
+13,37d57b1,2026-02-07,638,8,6,0,0,0,P3: WebGPU multi-kernel native scan
+14,beec90f,2026-02-07,953,4,4,7,1,0,P4: WebGPU preencoded-routine scan
+15,f1e8c16,2026-02-07,835,12,8,0,0,0,"P5: Autodiff — JVP, transpose, vmap rules for Scan"
+16,48eca84,2026-02-07,4,4,4,0,0,1,"P6: Cleanup — remove phase markers, update docs"
+17,6ebeffc,2026-02-07,13,8,8,0,0,1,"Add scan benchmarks, Deno WebGPU benchmarks, and v2 review docs"
+18,67f85d3,2026-02-07,3170,21,17,72,1,0,Port WASM routine infrastructure from feat/scan
+19,7539f37,2026-02-07,274,6,6,29,1,0,"docs: audit copilot-instructions against code, remove historical v1/v2 language"
+20,c0291ef,2026-02-07,9,0,0,7,1,0,fix(scan): release borrowed inputs and preserve aliasing in fallback loop to avoid leaks
+21,28cdf20,2026-02-07,18,32,29,0,0,1,fix: scan fallback carry leak + simplify alias protection
+22,547c206,2026-02-07,6,1,1,0,0,0,fix: forward acceptPath in eager Primitive.Scan impl
+23,192ef65,2026-02-07,0,2,2,0,0,0,docs: update scan-executor.ts file header to reflect implementation status
+24,6bf0b88,2026-02-07,79,75,73,0,0,1,feat(scan): implement WASM copyBufferToBuffer and dynamic routine planning
+25,a2118f9,2026-02-07,0,0,0,0,0,0,docs: update architecture notes for scan backend changes
+26,88531dc,2026-02-07,0,0,0,0,0,0,Add dist for external testing
+27,1c28c77,2026-02-07,0,0,0,0,0,0,fix: skip husky in prepare when not a git repo
+28,3b3bef0,2026-02-07,0,0,0,0,0,0,"Revert ""fix: skip husky in prepare when not a git repo"""
+29,bb755de,2026-02-07,265,6,1,0,0,0,feat: JIT buffer recycling & WebGPU buffer pool
+30,abe1bf5,2026-02-08,212,12,0,195,4,0,feat: always-autoRef tracing with post-trace ref validation
+31,ca40901,2026-02-08,37,8,5,35,2,0,feat: add source locations to ref validation errors
+32,5df7b87,2026-02-08,8,3,3,8,2,1,feat: annotate each use-site with .ref guidance in validation errors
+33,8d928d7,2026-02-08,26,6,6,26,2,0,autoref: add col numbers and .ref location tracking
+34,3b5a987,2026-02-08,0,0,0,0,0,0,docs: add _userRefLocs and parseUserFrame to copilot-instructions
+35,38ca6aa,2026-02-08,0,0,0,0,0,0,purge dist
+36,4009338,2026-02-08,0,0,0,0,0,0,add dist
+37,781afcb,2026-02-08,43,8,8,43,1,0,perf: lazy source-location capture in ref validation
+38,ca992b8,2026-02-08,0,0,0,0,0,0,update dist
+39,3c3dc43,2026-02-09,291,665,314,108,2,1,feat: non-consuming ownership model — eliminate .ref from user code
+40,3b6e94f,2026-02-09,0,0,0,0,0,0,docs: add Part 5 — Non-Consuming Ownership Model chapter
+41,85c2ed9,2026-02-09,0,0,0,0,0,0,docs: add eager-mode memory management design analysis to Part 5
+42,0524bf0,2026-02-09,124,171,0,0,0,0,refactor: extract emitKernelBody() to deduplicate WASM kernel codegen
+43,adcbe40,2026-02-09,1,2,0,0,0,0,docs: update all API docs for non-consuming ownership model
+44,fcdbcf7,2026-02-09,0,0,0,0,0,0,docs: restructure copilot-instructions — consolidate Parts 4-5 into ownership internals + friction points
+45,5233cd2,2026-02-09,0,0,0,0,0,0,docs: fix stale consuming-model references across codebase
+46,0419dce,2026-02-09,9,9,6,0,0,1,fix: realize non-contiguous arrays before cross-device copy in _put/_putSync
+47,eb5f1b4,2026-02-09,0,0,0,0,0,0,fix: Deno WebGPU leak tests + f64 LU JVP test + docs
+48,5c55013,2026-02-09,142,5,1,93,1,0,feat: implement checkLeaks diagnostic API
+49,defbeff,2026-02-09,0,0,0,0,0,0,update dist
+50,be2ec37,2026-02-10,0,0,0,0,0,0,docs: add using declaration patterns to copilot-instructions
+51,01bc390,2026-02-12,2372,657,193,127,5,0,fix: save/restore _peArrayCreationTracker in makeJaxpr
+52,278b535,2026-02-12,8,2,1,0,0,0,fix: mark evalJaxpr Lit arrays as anonymous to prevent slot leaks
+53,1f252c9,2026-02-12,9,1,0,5,1,0,fix: mark anonymous consts in FFT twiddle factors and grad seed
+54,2544ec5,2026-02-14,253,64,54,9,1,0,fix: comprehensive AD/refcount leak fixes
+55,c277a4d,2026-02-14,6,52,48,0,0,1,feat: add Deno WebGPU scan tests + KNOWN_BUG test infrastructure
+56,e2c2993,2026-02-14,110,29,28,0,0,0,fix: sign NaN propagation + insideAbstractTrace infrastructure + DPI wrapper-aware protection
+57,7cde726,2026-02-14,97,11,5,2,1,0,fix: resolve bare transform leak family with ownership-level cleanup
+58,be7d4d1,2026-02-14,8,1,1,1,0,0,fix: resolve makejaxpr(jvp) lifetime bug and update bug inventory
+59,76c6776,2026-02-14,11,1,1,0,0,0,Fix depth4 grad/vjp disposal and retire KNOWN_BUG tags
+60,2db20cf,2026-02-14,30,4,2,0,0,0,fix: implement Gather transpose and guard Sort JVP disposal for grad(sort)
+61,f9c614e,2026-02-14,55,4,0,0,0,0,fix: use copyBufferToBuffer in scan fallback + WebGPU carry-read hazard check
+62,fd17be0,2026-02-14,40,4,3,0,0,0,fix: concatenate tree-reduction + checkLeaks late-init backends
+63,7aa007b,2026-02-14,13,0,0,0,0,0,fix: protect user-disposed constants from over-disposal in grad
+64,cc9485f,2026-02-14,0,0,0,0,0,0,"docs: adopt ownership-correctness principle, remove jit-as-memory-fix framing"
+65,fd1061b,2026-02-14,0,0,0,0,0,0,"docs: recommend using inside jit bodies, clarify .donate() is hypothetical"
+66,4acbb19,2026-02-14,0,0,0,0,0,0,docs: document JaxprTracer [Symbol.dispose] no-op and enforcement path
+67,4064271,2026-02-14,0,0,0,0,0,0,docs: formalize Layer 1 using-by-default ownership policy
+68,6366374,2026-02-14,0,0,0,0,0,0,docs: add implementation-ready Layer 1 ESLint rule contract
+69,c8689b3,2026-02-15,306,0,0,29,4,0,feat(lint): add in-repo jax-js ownership eslint plugin
+70,cf5d7a1,2026-02-15,0,0,0,0,0,0,chore(lint): enable in-repo jax-js rules as warnings on codebase
+71,895c6ce,2026-02-15,38,11,11,22,3,0,fix(lint): accept explicit dispose in require-using rule
+72,ff3354e,2026-02-15,70,3,3,44,3,0,feat(lint): harden Layer 1 semantics for parity use-cases
+73,6e1aad5,2026-02-15,10,3,3,0,0,1,feat(lint): next hardening step for ownership parity
+74,a475799,2026-02-15,0,0,0,0,0,0,chore(lint): reduce test noise in ownership rollout
+75,c96d2b9,2026-02-15,0,0,0,0,0,0,docs(plan): add v1 fluent chain transform safety contract
+76,ee1204e,2026-02-15,0,0,0,0,0,0,docs(plan): clarify v1 transform behavior for map/reduce callback idioms
+77,b5d4274,2026-02-15,353,108,28,10,1,0,"eslint-plugin v0.1.0: message quality improvements, publish-ready configs, clean docs"
+78,feaa5a5,2026-02-15,56,11,1,4,2,0,fix: anonymous const scan leak + BatchTracer.ref regression
+79,42e1185,2026-02-15,21,2,2,0,0,0,fix(eslint): harden no-unnecessary-ref against false positives
+80,800eb82,2026-02-15,125,4,0,0,0,0,refactor demos and strengthen ownership lint/docs
+81,34951da,2026-02-15,0,0,0,0,0,0,"docs: polish eslint-plugin README, add multi-editor IDE setup and troubleshooting"
+82,66aefd2,2026-02-15,138,16,16,1,0,0,"feat: add tree.makeDisposable, Array.consumeData, improve require-using lint rule"
+83,fbcadc2,2026-02-15,94,0,0,26,1,0,"eslint-plugin: fix tree.dispose false positive, add numpy aliases, trace indirect returns"
+84,2eecf95,2026-02-15,61,79,73,0,0,1,eslint-plugin: track transitive pytree alias escapes
+85,44b65ea,2026-02-15,180,0,0,0,0,0,eslint-plugin: require dispose/return for lax.scan results
+86,58958e0,2026-02-15,49,0,0,0,0,0,eslint-plugin: codify ownership handoff recommendations
+87,a05700d,2026-02-15,18,1,0,0,0,0,tree: make dispose alias-safe for repeated leaves
+88,66a5746,2026-02-15,109,0,0,0,0,0,eslint-plugin: warn on makeDisposable alias literals
+89,1f8578b,2026-02-15,0,0,0,0,0,0,docs: ensure all code examples model ownership-correct patterns
+90,1d7dc3c,2026-02-15,0,0,0,0,0,0,docs: prepare README for non-consuming-ops fork publication
+91,74106ff,2026-02-15,0,0,0,0,0,0,docs: add AI-assisted development disclosure
+92,576b4d3,2026-02-15,0,0,0,0,0,0,"docs: widen AI agent list, fix Discord wording"
+93,5ab02cb,2026-02-15,41,31,1,36,2,0,chore: rename packages to @hamk-uas scope and update all references
+94,cca7f1a,2026-02-15,0,0,0,0,0,0,add dist
+95,42c5522,2026-02-15,0,0,0,0,0,0,Revise README for clarity and new features
+96,bf09f99,2026-02-15,31,31,31,1,0,1,Rename @hamk-uas/* packages to @jax-js-nonconsuming/* scope
+97,a6c8f6f,2026-02-15,0,0,0,0,0,0,Update README to clarify fork purpose and features
+98,9c2e6e7,2026-02-15,0,0,0,0,0,0,Clarify ownership model differences in README
+99,d2e7892,2026-02-15,0,0,0,0,0,0,Update README to reflect changes in supervision and tasks
+100,00257c0,2026-02-15,37,0,0,0,0,0,fix(eslint): reduce no-use-after-dispose false positives; add vitest sub-package aliases
+101,cfbd59b,2026-02-15,0,0,0,0,0,0,"chore: remove dist/ from git, auto-build on install"
+102,6a9d09c,2026-02-15,0,0,0,0,0,0,Switch docs/website URLs to GitHub Pages
+103,19e9677,2026-02-15,7,5,0,0,0,0,fix: resolve CI lint failures
+104,c58edd4,2026-02-15,4,10,0,0,0,0,fix: resolve CI lint and format failures
+105,c0dc2cc,2026-02-15,10,12,6,0,0,1,fix: eliminate all CI lint/format warnings (79 → 0)
+106,73d3159,2026-02-15,0,0,0,0,0,0,chore: add full CI checks to pre-commit hook
+107,77f3ba7,2026-02-15,0,0,0,0,0,0,"chore: remove CI workflow, fix GitHub Pages deploy"
+108,e714c9b,2026-02-16,0,0,0,0,0,0,website: rename jax-js → jax-js-nonconsuming in display text
+109,4b966f0,2026-02-16,0,0,0,0,0,0,"website: mark as non-consuming fork — add fork notice, update SEO/title, add logo-nonconsuming"
+110,fb587ca,2026-02-16,0,0,0,0,0,0,website: relink homepage to custom non-consuming logo
+111,14bfbcf,2026-02-16,0,0,0,0,0,0,repl: make demos ownership-safe and warn on live slots
+112,d4dc790,2026-02-16,0,0,0,0,0,0,docs: update install instructions to install from GitHub
+113,4def43d,2026-02-16,0,0,0,0,0,0,fix: remove BASE_PATH from deploy workflow
+114,1c3d596,2026-02-16,87,40,0,0,0,0,docs: use idiomatic non-consuming patterns in all snippets
+115,4c03631,2026-02-16,0,0,0,0,0,0,docs: add Contributing section to README
+116,32213be,2026-02-16,0,0,0,0,0,0,style: increase NON-CONSUMING text size in logo
+117,0ad3775,2026-02-16,0,0,0,0,0,0,fix: REPL leak fixes and height doubling
+118,1121ff4,2026-02-16,0,0,0,0,0,0,fix: add source maps to REPL so checkLeaks reports correct line numbers
+119,a91431f,2026-02-16,0,0,0,0,0,0,"feat: Mandelbrot REPL uses lax.scan, leak markers in editor"
+120,c4c0270,2026-02-16,0,0,0,0,0,0,Remove block curly brackets from front page REPL example
+121,375a45e,2026-02-16,0,0,0,0,0,0,Enhance 2nd level title
+122,5ff8761,2026-02-16,0,0,0,0,0,0,fix(pages): correct logo path handling and update README maintainer docs
+123,88edc02,2026-02-16,13,1,0,0,0,0,fix(repl): improve leak source mapping and unify diagnostics label
+124,cf47fc6,2026-02-16,0,0,0,0,0,0,Update readme
+125,70e1768,2026-02-16,0,0,0,0,0,0,fix(repl): remap leak diagnostics to user source lines
+126,9354b5c,2026-02-16,0,0,0,0,0,0,docs: add honest tradeoffs discussion for non-consuming ownership model
+127,cef7163,2026-02-16,0,0,0,0,0,0,docs: soften tradeoff claims for accuracy and symmetry
+128,6b915ea,2026-02-16,0,0,0,0,0,0,"docs: scope tradeoffs to eager mode, explain JIT neutralizes differences"
+129,5dc3e61,2026-02-16,0,0,0,0,0,0,fix(demos): make all demo code ownership-correct in eager mode
+130,79e9ff0,2026-02-16,327,2,0,2,1,0,chore: enforce explicit test policy modes and stabilize full precommit
+131,e59dcbb,2026-02-16,7,3,0,2,1,0,chore: clarify checkLeaks tips with using guidance
+132,6d7229d,2026-02-16,0,0,0,0,0,0,fix: REPL checkLeaks line numbers (Chrome 132+ double-mapping)
+133,389c99f,2026-02-16,143,2,2,0,0,0,"feat: invariance enforcement, fork etiquette, linter improvements"
+134,f386bce,2026-02-16,0,0,0,0,0,0,fix(repl): fix leak diagnostic line numbers and Monaco crash
+135,4742b9f,2026-02-16,136,0,0,0,0,0,eslint-plugin: add no-array-chain autofix for migration
+136,9b1d4c6,2026-02-16,0,0,0,0,0,0,fix(repl): correct source map offset for AsyncFunction wrapper (+2 lines)
+137,0ee797e,2026-02-16,0,0,0,0,0,0,Fix readme
+138,9607f81,2026-02-16,3,2,2,0,0,0,"v0.2.0: soften comparative claims, fix checkLeaks guidance"
+139,4b73f5e,2026-02-16,0,0,0,0,0,0,fix(docs): clarify disposal behavior and memory management in README
+140,10cf599,2026-02-16,0,0,0,0,0,0,docs: rewrite README tradeoffs to accurately credit using/checkLeaks mitigations
+141,4723e6b,2026-02-17,63,2,0,2,0,0,feat: Kahan compensated summation for Float64 Add reductions
+142,f0b532d,2026-02-17,0,0,0,0,0,0,chore(release): v0.2.1
+143,83267f1,2026-02-17,0,0,0,0,0,0,docs: add Float64/Kahan documentation to copilot-instructions
+144,39c91a0,2026-02-17,2,2,2,0,0,0,test: add Kahan vs naive summation comparison tests
+145,76dcd10,2026-02-17,0,0,0,0,0,0,docs: add CI timing profile to copilot-instructions
+146,af4971e,2026-02-17,0,0,0,0,0,0,fix: ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING on Node 22+
+147,d4158ab,2026-02-17,0,0,0,0,0,0,chore(release): v0.2.2
+148,064c4b2,2026-02-17,0,0,0,0,0,0,fix: fail loudly when prepare script fails to generate .d.ts
+149,1ce89dc,2026-02-17,0,0,0,0,0,0,fix: downgrade .d.ts guard from error to warning in prepare script
+150,b6e8a11,2026-02-17,0,0,0,0,0,0,feat: enable sub-package installs via pnpm &path: syntax
+151,612a4f1,2026-02-17,0,0,0,0,0,0,docs: simplify helper libraries to sub-path exports only
+152,c380284,2026-02-17,31,31,0,1,0,0,rename packages to @hamk-uas scope
+153,e9e53b3,2026-02-17,0,0,0,0,0,0,"v0.3.0: add pnpm onlyBuiltDependencies note to README, bump version"
+154,78484a8,2026-02-17,41,6,1,10,1,0,feat(optax): make treeBiasCorrection jit-compatible
+155,4d0653c,2026-02-17,33,20,10,5,1,1,feat(optax): make Schedule type array-native for full JIT compatibility
+156,0cb7823,2026-02-17,0,0,0,0,0,0,chore(release): v0.4.0
+157,767bd26,2026-02-18,6,6,5,0,0,1,docs(eslint-plugin): clarify require-using fires correctly inside grad/jit/scan bodies
+158,4bf1a59,2026-02-18,248,0,0,10,2,0,chore(release): v0.5.0
+159,3655cff,2026-02-18,0,0,0,0,0,0,test: strengthen associativeScan cumsum split coverage
+160,8c207c6,2026-02-18,884,82,0,877,2,0,feat(wasm): integrate peephole optimizer into wasmblr pipeline
+161,f370c22,2026-02-18,13,8,8,13,1,1,"feat(wasm): enable peephole optimizer by default, fix Rule 7 store bug"
+162,b067aff,2026-02-18,0,0,0,0,0,0,chore(release): v0.6.0
+163,d3777e8,2026-02-18,71,969,882,0,0,1,chore(release): v0.7.0 — remove peephole optimizer
+164,d301db1,2026-02-19,0,0,0,0,0,0,Mention AI-generated code and documentation
+165,5931857,2026-02-19,0,0,0,0,0,0,Clarify AI-generated content in README
+166,dbe62de,2026-02-19,88,0,0,0,0,0,feat(wasm): use if/else branching for Where with expensive arms
+167,e66ae2a,2026-02-19,0,0,0,0,0,0,chore(release): v0.7.1
+168,0e8c387,2026-02-19,0,0,0,0,0,0,feat(logo): update logo SVG dimensions and styles for improved appearance
+169,7599863,2026-02-19,8,1,0,3,1,0,fix: jit(scan) with einsum crashes on WebGPU due to maxArgs false-positive
+170,f09121d,2026-02-19,25,3,0,0,0,0,"fix: np.eye(N, {dtype}) API ambiguity + shape validation guard"
+171,b913a31,2026-02-19,0,0,0,0,0,0,fix: update bundle size in README for accuracy
+172,5a273b2,2026-02-19,0,0,0,0,0,0,test: document scan path behavior and jit guidance
+173,db2113d,2026-02-19,7,1,1,6,1,0,perf: jit associativeScan compose per call
+174,3112787,2026-02-19,61,12,12,0,0,0,perf: auto-jit whole associativeScan in eager mode
+175,df84b97,2026-02-19,0,0,0,0,0,0,docs: update associativeScan behavior documentation
+176,f3ff194,2026-02-19,11,3,3,0,0,0,docs: document associativeScan autodiff architecture and WebGPU limitations
+177,751afc3,2026-02-19,0,0,0,0,0,0,chore(release): v0.7.2
+178,b47efc6,2026-02-19,25,3,0,0,0,0,fix(linearize): handle mixed UndefPrimal/concrete inputs in Concatenate transpose rule
+179,9199acd,2026-02-19,0,0,0,0,0,0,chore(release): v0.7.3
+180,3d6e450,2026-02-19,23,3,3,0,0,0,fix: P2 backtrack in splitGraphDataflow for black kernel endpoints
+181,eb87774,2026-02-19,0,0,0,0,0,0,chore(release): v0.7.4
+182,c5133d2,2026-02-19,19,6,0,4,1,0,feat(eslint-plugin): treat consumeData() as consuming in no-use-after-dispose
+183,7cb0e15,2026-02-19,1,1,1,0,0,0,chore(release): v0.7.5
+184,64e1614,2026-02-19,10,3,3,0,0,1,fix(eslint-plugin): treat consumeDataSync() as consuming in no-use-after-dispose
+185,d566994,2026-02-20,5,5,0,0,0,0,fix(linalg): propagate input dtype through eye() calls
+186,0c2a5ca,2026-02-20,0,0,0,0,0,0,docs(maintainer): use npm version -m and gh release create in release steps
+187,a542039,2026-02-20,0,0,0,0,0,0,docs: expand tmp/ policy in copilot-instructions; add dispatch-count tests for associativeScan
+188,98e1a66,2026-02-20,74,20,0,25,1,0,fix: TriangularSolve JVP missing triu(dA) mask
+189,448bda1,2026-02-20,11,27,25,0,0,1,refactor: remove Newton refinement from solve/inv
+190,c703c0a,2026-02-20,0,0,0,0,0,0,docs: fix stale FEATURES.md linalg intro — LU and solve now implemented
+191,0f73e59,2026-02-20,0,0,0,0,0,0,chore(release): v0.7.8
+192,c854640,2026-02-20,0,0,0,0,0,0,docs: require title and description in release instructions
+193,4cc961c,2026-02-20,0,0,0,0,0,0,perf: docs-only fast path in pre-commit hook (~11s vs ~82s)
+194,db578f4,2026-02-20,0,0,0,0,0,0,"docs(copilot-instructions): clarify that test/ Vitest suite imports from dist/, not src/"
+195,1f74630,2026-02-20,0,0,0,0,0,0,aot-linearize: add task-board plan document
+196,36865b3,2026-02-20,0,0,0,0,0,0,aot-linearize M0.0: incorporate review feedback into plan
+197,6d9ff6c,2026-02-20,0,0,0,0,0,0,Adopt session protocol from dlm-js
+198,cdc9384,2026-02-20,0,0,0,0,0,0,Complete session protocol adoption: step 8 (copilot-instructions.md) + customize preflight for jax-js
+199,28db133,2026-02-20,67,0,0,7,1,0,aot-linearize M0: artifact type stubs and test file
+200,5d98f97,2026-02-20,281,32,7,17,2,0,aot-linearize M2: implement artifact types and aotLinearize
+201,176f909,2026-02-20,176,45,11,3,1,0,M3: rewrite vjpFlat/linearizeFlat to use AOT artifacts
+202,7ca8ff8,2026-02-20,468,334,3,0,0,0,M4: extract scan backward pass into ScanPullbackArtifact
+203,96c9554,2026-02-20,8,11,6,0,0,1,M5: cleanup & documentation
+204,5251e9f,2026-02-20,0,0,0,0,0,0,Remove agent protocol from repository
+205,3c63148,2026-02-20,0,0,0,0,0,0,effect-ir: add task-board plan document for Effect-Typed Jaxpr
+206,eece416,2026-02-20,24,2,0,1,0,0,effect-ir M0.2: create MemoryEffect enum and type stubs
+207,da5dde5,2026-02-20,0,0,0,0,0,0,effect-ir M0.3: effect-checker test file with placeholders
+208,db68e23,2026-02-20,20,1,0,0,0,0,effect-ir M1.1: update Var/JaxprEqn pprint to display effects
+209,8892641,2026-02-20,79,7,1,0,0,0,effect-ir M1.2+M1.3: default effects + explicit mutation tracing
+210,6618099,2026-02-20,102,0,0,11,1,0,effect-ir M2.1: implement verifyJaxprEffects static borrow checker
+211,432daac,2026-02-21,34,15,11,0,0,1,effect-ir M2.2: integrate verifyJaxprEffects into makeJaxpr
+212,1007d04,2026-02-21,0,0,0,0,0,0,effect-ir M2.3: zero effect violations across operation suite
+213,cba93ee,2026-02-21,113,5,0,5,1,0,effect-ir M3.1: effect-driven buffer allocator
+214,ffa32f4,2026-02-21,98,5,0,1,0,0,effect-ir M3.2: zero-copy DynamicUpdateSlice in JIT
+215,6b8ab1f,2026-02-21,0,0,0,0,0,0,effect-ir M3.3: verify transform compositions
+216,81ad185,2026-02-21,0,0,0,0,0,0,effect-ir M4.1-M4.3: scan backward pass artifacts (pre-existing)
+217,ecd0844,2026-02-21,0,84,0,0,0,0,effect-ir M5.1: remove dead insertFreeSteps and recycleBuffers
+218,1242dac,2026-02-21,0,0,0,0,0,0,effect-ir M5.2: audit cache cleanup (no changes needed)
+219,0463a8f,2026-02-21,0,0,0,0,0,0,effect-ir M5.3: update copilot-instructions with effect system docs
+220,488e674,2026-02-21,0,0,0,0,0,0,effect-ir M5.4: verify FEATURES.md already up-to-date
+221,b2b9b5c,2026-02-21,0,0,0,0,0,0,docs: add ULTIMATE-ARCHITECTURE-PLAN.md
+222,ecf44cc,2026-02-21,0,0,0,0,0,0,docs: add polymorphic shapes to ultimate architecture plan
+223,04792c7,2026-02-21,0,0,0,0,0,0,ultimate M0.5: Add technical debt cleanup milestone
+224,0cd898c,2026-02-21,0,0,0,0,0,0,docs: ultimate architecture plan — M0–M8 milestones
+225,7460f81,2026-02-21,45,53,0,0,0,0,M0+M1: BackendCapabilities + unify vjpFlat codepath
+226,2ed7c20,2026-02-21,457,22,0,4,1,0,M2: scatter_add primitive with WebGPU CAS + WASM dispatch
+227,4f2c516,2026-02-21,0,0,0,0,0,0,fix: test leak fixes and vitest config alias
+228,596a1f9,2026-02-21,633,61,0,50,4,0,M3.1: multi-output kernel support
+229,2043e0b,2026-02-21,21,1,0,0,0,0,M3.2: reduction epilogue fusion — add Compare and Where to fusable ops
+230,5d6c9dd,2026-02-21,334,83,4,23,1,0,M4.1: Symbolic Dimension Type & Shape Propagation
+231,4bfe3e7,2026-02-21,520,114,50,68,4,0,M4.2: parameterized backend codegen
+232,e50560e,2026-02-21,116,36,26,3,1,0,"chore: ESLint plugin updates, copilot-instructions, debug tooling"
+233,95a10ed,2026-02-21,135,85,25,1,0,0,"ultimate M3.1: remove backward-compat shims, add tooling helpers"
+234,0ee60d8,2026-02-21,3,0,0,0,0,0,ultimate M3.2: verify epilogue fusion dispatch counts
+235,8b9d9cb,2026-02-21,0,0,0,0,0,0,"ultimate M0.1+M1.1: record baselines, mark scan backward artifact done"
+236,25fd8d8,2026-02-21,392,41,31,86,3,0,ultimate M5: wasm multithreading foundation
+237,655a903,2026-02-21,0,0,0,0,0,0,docs: update copilot-instructions for M5 completion
+238,d5dcc27,2026-02-22,905,44,0,5,1,0,ultimate M7.1: Primitive.AssociativeScan
+239,662ab0f,2026-02-22,0,0,0,0,0,0,docs: update copilot-instructions for M7.1 completion
+240,22307d3,2026-02-22,815,3,1,24,2,0,feat(M7.2): WASM compiled Kogge-Stone for associativeScan
+241,538e155,2026-02-22,0,0,0,0,0,0,docs: fix 10 stale references in copilot-instructions after M7.2
+242,fe636f1,2026-02-22,628,18,12,12,3,0,feat(M6.1): WASM mega-module compiler — single WASM call per JitProgram
+243,b88612a,2026-02-22,0,0,0,0,0,0,"bench(M8.1): add benchmark suites for mega-module, scatter-add, and associative-scan"
+244,be10bc2,2026-02-22,0,0,0,0,0,0,"chore(M8): enable all jax-js lint rules, update docs"
+245,dc428d2,2026-02-22,182,43,30,4,1,0,M4.2: Parameterized backend codegen — symbolic reduction support
+246,4176b00,2026-02-22,20,0,0,0,0,0,tooling: wasmblr runtime guards + mega-module symbolic size safety net
+247,db99bb4,2026-02-22,0,0,0,0,0,0,ultimate M6.2: refine plan with extracted-functions + 3-phase breakdown
+248,31c5d12,2026-02-22,0,0,0,0,0,0,"ultimate docs: condense copilot-instructions.md (~6% smaller, dedup Part 2 vs Part 1)"
+249,3029629,2026-02-22,256,1,1,8,1,0,M6.2a: extract kernel functions from mega-module
+250,b4dfb05,2026-02-22,0,0,0,0,0,0,docs: mark M6.2a as DONE in plan and copilot-instructions
+251,80486ec,2026-02-22,25,4,4,4,1,0,tooling: add mega-module DEBUG logging + extract test helpers
+252,80d5312,2026-02-22,0,0,0,0,0,0,"docs: document mega-module DEBUG logging, M6.2a extracted kernels, test helpers"
+253,5522b19,2026-02-22,504,94,71,15,2,0,feat(M6.2b): orchestrator worker — off-main-thread mega-module execution
+254,3e38c72,2026-02-22,4,13,13,0,0,1,chore: fix lint warnings in orchestrator test and setup
+255,4b89193,2026-02-22,348,23,23,8,1,0,M6.2c: parallel kernel dispatch via JS-driven mega-module step execution
+256,c912f52,2026-02-22,37,9,6,0,0,0,fix: WebGPU isnan via IEEE 754 bitcast instead of min() heuristic
+257,3fe178a,2026-02-22,0,0,0,0,0,0,docs: add WebGPU NaN bitcast pitfall note to copilot-instructions
+258,900d4e2,2026-02-22,105,42,4,1,0,0,feat: polymorphic scan length via runtime WASM param; fix dimBindings const offset
+259,376552b,2026-02-22,331,14,14,0,0,0,ultimate M7.3: multithreaded Kogge-Stone via WasmWorkerPool
+260,00d6d29,2026-02-23,2,3,0,0,0,0,cleanup: remove move-semantics remnants
+261,a7f97dc,2026-02-23,0,0,0,0,0,0,ultimate M8.3: final regression run — all milestones complete
+262,b5c563a,2026-02-23,0,0,0,0,0,0,"docs(M8.2): document scatter_add, multi-output kernel fusion, epilogue fusion"
+263,178bd81,2026-02-23,55,5,5,0,0,0,enable COOP/COEP headers in Vitest; add Atomics.wait spin-wait probe
+264,e6b91f7,2026-02-23,0,0,0,0,0,0,bench(M8.1): add WASM parallel dispatch and polymorphic JIT benchmarks
+265,a1037b4,2026-02-23,1115,4,0,131,3,0,"feat: QR decomposition, scipy.linalg, np.block, PendingExecute leak fix"
+266,4e8dea1,2026-02-23,174,44,0,0,0,0,perf(webgpu): batch dispatch flushes and optimize preencoded scan offsets
+267,062eb9e,2026-02-23,267,144,27,3,1,0,"tech debt: wasmblr scatter-add, atomicF32Add, isJvpTransformed, required copyBufferToBuffer"
+268,dd97587,2026-02-24,487,35,1,27,1,0,"perf(tuner): implement tuner improvements 1-5, 7-8"
+269,fb630fc,2026-02-24,0,0,0,0,0,0,docs: add PERFORMANCE-PLAN.md (P1–P6 follow-up perf work)
+270,089b0e5,2026-02-24,54,1,0,3,1,0,fix: WASM allocator memory reclamation (reset-on-empty + top-of-heap compaction)
+271,26c6a48,2026-02-24,62,31,28,0,0,1,fix: WebGPU scan fallback batching + DTS generation reliability
+272,a82dec4,2026-02-24,0,0,0,0,0,0,docs: consolidate copilot-instructions.md
+273,c99db9a,2026-02-24,66,10,0,0,0,0,fix: matmul batch broadcasting + clearCaches() API
+274,09ddadb,2026-02-24,0,0,0,0,0,0,docs: JIT cache hierarchy & clearCaches() user guidance
+275,f5a81a4,2026-02-24,1,1,0,0,0,0,"docs: consolidate plan docs into copilot-instructions, delete 5 plan files"
+276,1426357,2026-02-24,77,143,91,0,0,1,"fix: code review fixes (M1-M5, L1, L3, L7)"
+277,070a909,2026-02-24,305,4,0,0,0,0,"perf: dlm-js optimizations (P1 einsum, P2 analytical inv, P8 auto checkpoint)"
+278,70dea65,2026-02-24,0,0,0,0,0,0,"docs+test: AEP cleanup — update stale docs, add per-size inv tests"
+279,3d68faa,2026-02-24,27,2,0,0,0,0,fix: downstream dlm-js regressions (#1 #3 #4)
+280,064f9e9,2026-02-24,21,17,17,0,0,1,fix(qr): rewrite QR JVP rule using Papanicolopulos (2024) formula
+281,65cb449,2026-02-24,5,0,0,0,0,0,fix(cast): add transpose rule for float→float cast in grad
+282,ee326d9,2026-02-24,140,15,0,1,0,0,"feat: complete transform rules for Pool, DUS, ScatterAdd primitives"
+283,a6d37da,2026-02-24,10,3,0,0,0,0,fix: WASM allocator signed-shift overflow above 2 GiB
+284,bb126c6,2026-02-24,6,4,2,0,0,0,fix: WasmAllocator int32 overflow for allocations above 2 GiB
+285,2b61935,2026-02-24,816,23,0,8,1,0,feat(M7.4): WebGPU fused associative scan shader
+286,d08dd54,2026-02-24,33,8,8,0,0,0,fix(webgpu): assocScan fused shader uses rewrite() for gidx→eidx substitution
+287,d73ce67,2026-02-25,42,0,0,0,0,0,fix: deduplicate jit() by function identity to prevent cache bloat
+288,11044ee,2026-02-25,84,4,0,0,0,0,feat: add getCacheSizes() API for JIT cache observability
+289,892e95d,2026-02-25,21,3,0,0,0,0,feat: add userLeaked/internalLeaked to LeakReport
+290,9e25ae7,2026-02-25,270,204,0,2,0,0,feat(eslint): add no-nested-array-leak rule
+291,6e6d4fe,2026-02-25,70,1,1,0,0,0,feat(lax): add sliceInDim and dynamicIndexInDim for scalar array indexing
+292,f345b0a,2026-02-25,0,0,0,0,0,0,docs: add control-flow lowering & scan performance plan v3
+293,67a1517,2026-02-25,0,0,0,0,0,0,docs: add review findings and recommendations for PREENCODED-MULTI-KERNEL-SCAN-PLAN.md
+294,cd33cd5,2026-02-25,0,0,0,0,0,0,style: format markdown files
+295,2af40bc,2026-02-25,30,4,0,24,1,0,fix: mark anonymous consts at creation time in nested traces
+296,25cd207,2026-02-25,0,0,0,0,0,0,feat: add AEP compliance gate to pre-commit hook
+297,25b76ca,2026-02-25,0,0,0,0,0,0,"fix: remove AEP=1 from copilot-instructions, point hook at AEP"
+298,ec9acec,2026-02-25,151,81,24,11,1,0,fix: always ref anonymous consts + require-mark-anonymous ESLint rule
+299,2303627,2026-02-25,0,0,0,0,0,0,docs: ADR for anonymous const leak fix and require-mark-anonymous rule
+300,12543fb,2026-02-25,0,0,0,0,0,0,"docs: update preencoded multi-kernel scan plan to v4, remove review"
+301,41b0bda,2026-02-25,50,37,1,7,1,0,"fix: mark zeros/ones as anonymous consts during tracing, guard [Symbol.dispose] for anonymous consts"
+302,a9db43d,2026-02-25,0,0,0,0,0,0,fix: improve AEP reading enforcement on commits
+303,4c7f5b2,2026-02-25,0,0,0,0,0,0,fix: improve AEP reading enforcement on commits #2
+304,99ca222,2026-02-25,186,95,17,11,1,0,refactor: make evalJaxpr non-consuming — remove move-semantics leftovers
+305,e034f26,2026-02-26,157,16,12,0,0,0,fix: drain PETracer #rc in partialEvalGraphToJaxpr to fix anonymous const leaks
+306,768acc8,2026-02-26,119,105,1,0,0,0,"eslint: add tracing suppression to no-nested-array-leak, promote to error"
+307,ee3d566,2026-02-26,17,3,0,0,0,0,fix(webgpu): workgroupBarrier uniform control flow + raise cooperative groups threshold
+308,7708d12,2026-02-26,0,0,0,0,0,0,fix(repl): use checkLeaks report for reliable leak warnings across runs
+309,8a102cb,2026-02-26,1,1,0,0,0,0,"fix(tuner): applyLocal guard, jit full MNIST training step"
+310,19638a5,2026-02-26,0,0,0,0,0,0,docs: add WebGPU device coverage data from web3dsurvey.com
+311,1276aa4,2026-02-26,0,0,0,0,0,0,docs: fix misleading 'conservative 256' alignment comments
+312,6101cd4,2026-02-26,0,0,0,0,0,0,"feat(mnist): remove jit from models, add to inference; docs: nested jit"
+313,7eb0826,2026-02-26,12,12,0,1,0,0,"fix: cap workgroup size at device limit, pin tsdown, fix Deno writeBuffer"
+314,74a8e11,2026-02-26,63,1,0,0,0,0,feat: batched GPU dispatch + TTS demo optimization
+315,74ddb7e,2026-02-26,201,134,0,0,0,0,feat: WebGPU compiled-loop scan for bodies with internal deps + carry passthrough
+316,2b25d59,2026-02-26,0,0,0,0,0,0,docs: mark Phase 1 (carry snapshot + internal locals) as complete
+317,e3b88ab,2026-02-27,116,143,1,0,0,0,perf(webgpu): batch all assocScan rounds into single queue.submit()
+318,c9ea899,2026-02-27,0,0,0,0,0,0,docs: fix documentation inconsistencies across markdown files
+319,775260a,2026-02-27,0,0,0,0,0,0,"docs: add scatterAdd, withBatch, getCacheSizes to FEATURES.md"
+320,a396105,2026-02-27,23,14,0,0,0,0,"refactor: rename core.triangularSolve to core.triSolve, add f16 tests"
+321,0972c61,2026-02-27,0,0,0,0,0,0,chore(release): v0.7.9
+322,95acd6a,2026-02-27,0,0,0,0,0,0,fix: remove DTS guard from prepare script for CI git installs
+323,836a740,2026-02-27,0,0,0,0,0,0,chore(release): v0.7.10
+324,fef0216,2026-02-27,1027,150,0,15,1,0,Phase 2: preencoded multi-step scan for WebGPU multi-kernel bodies
+325,e773dcc,2026-02-27,0,0,0,0,0,0,Phase 2 tests: preencoded-multi-step integration tests
+326,9524929,2026-02-27,28,16,15,0,0,1,Phase 3: routine support in preencoded-multi-step scan
+327,e0e9317,2026-02-27,0,0,0,0,0,0,website: add missing demo links to front page
+328,8507acc,2026-02-27,0,0,0,0,0,0,Delete stale plans
+329,47dacf6,2026-02-28,0,0,0,0,0,0,Condense copilot-instructions.md: 4811 → 597 lines
+330,a9d6814,2026-02-28,0,0,0,0,0,0,docs: add block_map implementation plan v2
+331,f3af6fb,2026-02-28,0,0,0,0,0,0,test: Phase 0 — validate block_map body tracing (8 tests)
+332,9ef4083,2026-02-28,373,1,0,10,3,0,Phase 1: BlockMap core IR + eager fallback
+333,2942b8c,2026-02-28,0,0,0,0,0,0,test(block-map): add Phase 1b tests for foriLoop and dynamicSlice
+334,cdb49cb,2026-02-28,307,3,0,69,1,0,feat(block-map): add loop primitives foriLoop and dynamicSlice
+335,23b000a,2026-02-28,352,72,69,13,3,0,"feat(block-map): Phase 2 — autodiff (grad, vmap, partial eval)"
+336,06d3da3,2026-02-28,514,3,3,12,3,0,Phase 3: BlockMap JIT compilation — fallback executor path
+337,11fcc98,2026-02-28,830,3,3,154,6,0,block_map Phase 3: fused WebGPU shader compiler
+338,7df2433,2026-02-28,114,12,12,20,2,0,block_map Phase 3.1: in-block tree reduction in fused shader
+339,321bf46,2026-02-28,47,31,31,8,1,1,block_map Phase 3.2: boundary block handling in fused shader
+340,fff00ea,2026-02-28,551,94,88,18,4,0,Phase 1b: fori_loop JIT compilation + fused shader codegen
+341,2fa0b35,2026-02-28,34,5,5,1,0,0,Phase 1b.2: dynamic_slice JIT compilation + fused shader support
+342,37ff128,2026-02-28,68,9,9,6,1,0,Phase 4.0: per-thread contraction codegen + isSliceContiguous fix
+343,f22edb7,2026-02-28,103,2,1,16,2,0,Phase 4.1: lax.tiledMatmul library function
+344,63835ab,2026-02-28,0,0,0,0,0,0,Phase 4.2: tiled matmul benchmark suite
+345,50d34ca,2026-02-28,0,0,0,0,0,0,Phase 2 tests: AD/vmap coverage for blockMap
+346,caeff44,2026-02-28,253,6,6,0,0,0,ForiLoop backward pass + BlockMap JVP const/input ordering fix
+347,5372265,2026-02-28,25,9,8,0,0,1,Fix blockMap output reassembly for mixed mapped/unmapped outAxes
+348,54f8c60,2026-02-28,1026,5,5,9,3,0,"WorkgroupAssociativeScan: primitive, JIT codegen, Kogge-Stone WGSL, T5b tests"
+349,dab2062,2026-02-28,702,2,2,0,0,0,Phase 3.9: WASM compiled block-loop (codegenBlockMapLoop)
+350,091c8a3,2026-02-28,837,2,0,0,0,0,Phase 5: blocked associative scan lowering
+351,f301725,2026-03-01,3494,2141,40,0,0,0,"Phase 5b: WebGPU blocked assocScan — interleaved shmem, subgroups, Deno tests"
+352,e613278,2026-03-01,24,1,1,18,1,0,fix(block-map): handle GlobalView in fused shader gen() + fix fori_loop epilogue carry resolution
+353,9378fe8,2026-03-01,235,35,35,6,3,0,compiler-plan: add COMPILING-EFFICIENT-SHADERS-PLAN.md + tiledMatmul improvements
+354,b14a989,2026-03-01,0,0,0,0,0,0,ci: enable WebGPU/WebGL in Playwright Chromium browser tests
+355,e893911,2026-03-01,0,0,0,0,0,0,test: port Deno WebGPU pool-memory tests to Vitest/Playwright
+356,3fce073,2026-03-01,8,10,0,0,0,0,"compiler-plan C§8 Phase 1A: eliminate select(…, true) from generated WGSL"
+357,82ca914,2026-03-01,64,2,2,11,1,0,compiler-plan C§8 Phase 1B P0a: scalar promotion for size-1 body kernels
+358,37c0d1a,2026-03-01,65,9,9,0,0,0,compiler-plan C§8 Phase 1B P1: phase-based barrier scheduling + wrap-around barrier
+359,fc51044,2026-03-01,127,2,2,2,1,0,compiler-plan C§8 Phase 1B P2b: UncheckedDynamicSlice primitive
+360,91ce81e,2026-03-01,56,6,3,4,1,0,compiler-plan C§8 audit: fix shortcuts in P2b UncheckedDynamicSlice + vmap
+361,01f7b4d,2026-03-01,4,4,4,0,0,1,compiler-plan C§8 audit: add T4.11 debug assertion test for uncheckedDynamicSlice
+362,65c927f,2026-03-01,48,2,2,0,0,0,compiler-plan C§8 Phase 1B P2c: padConcrete eliminates select() for non-aligned tiledMatmul
+363,c6ac8b2,2026-03-01,0,0,0,0,0,0,test: filter GPU backends from pure-algorithm test suites for 7x speedup
+364,3d1150f,2026-03-01,0,0,0,0,0,0,fix: WebGPU test detection + Deno shader quality tests
+365,9f5ea6d,2026-03-01,31,1,0,7,2,0,perf: O2 clean indexing — eliminate redundant mod/div in block-map shaders
+366,0f443c5,2026-03-02,7,2,2,3,1,0,fix: O2 use kernel.size for tighter gidx bound + document block-map APIs
+367,e671cb3,2026-03-02,96,14,5,8,1,0,fix: WebGPU block-map input stride remap for partially-mapped axes
+368,c2ffb36,2026-03-02,586,103,40,35,3,0,O4: register-tiled block-map codegen with threadTile option
+369,35fdb77,2026-03-02,0,0,0,0,0,0,"retire Deno testing, simplify test infrastructure"
+370,faf4107,2026-03-02,51,6,3,13,2,0,O5: structured gidx + Executable caching for block-map
+371,01d1914,2026-03-02,0,0,0,0,0,0,add WebGPU benchmark findings and tiled-matmul bench/tests
+372,01f3879,2026-03-02,0,0,0,0,0,0,docs: add headless Chromium WebGPU setup guide to README
+373,60c8201,2026-03-02,0,0,0,0,0,0,docs: add downstream library vitest.config.ts recipe for WebGPU testing
+374,b5ba37f,2026-03-02,62,27,6,0,0,0,"fix: WebGPU backend bugs, test stabilization, COOP/COEP docs"
+375,42217f8,2026-03-02,155,78,0,32,2,0,perf: WebGPU associativeScan buffer pool + reversal shader
+376,285784d,2026-03-02,27,18,0,0,0,0,perf: buffer pool for preencoded scan transient buffers
+377,5fad2fa,2026-03-02,0,0,0,0,0,0,Tighten AEP pre-commit check
+378,ba5ede3,2026-03-02,0,0,0,0,0,0,Tighten AEP pre-commit check further
+379,190faec,2026-03-02,0,0,0,0,0,0,Cross-platform pre-commit AEP GATE
+380,d4fa355,2026-03-02,39,7,5,5,1,0,fix: fused shader reduction bugs — ridx undefined + two-reduction epilogue
+381,17df986,2026-03-02,19,3,0,0,0,0,fix: DynamicSlice GlobalView direct index substitution + matmul benchmarks
+382,2191671,2026-03-02,91,7,6,3,1,0,feat: O11 bank padding for shared memory tiles
+383,64a8f28,2026-03-02,87,4,1,3,1,0,feat: GPU-adaptive tile selection for tiledMatmul
+384,f9746cc,2026-03-03,226,39,36,11,2,0,"perf: GPU-adaptive tiling, tuner fix, old-Intel f16 bypass, test infra"
+385,f42f209,2026-03-03,16,9,4,2,1,0,"Retire Deno, codegen: dead gidx elimination + bank-pad CSE"
+386,e60f800,2026-03-03,108,2,2,50,1,0,codegen: AluExp-level index remap for block_map body kernels
+387,41ad42d,2026-03-03,82,13,2,49,1,0,infra: harmonize dual-GPU testing + benchmarking
+388,4eda73d,2026-03-03,0,0,0,0,0,0,fix: correct checkLeaks accounting in bench-phase3 and timing tests
+389,253f027,2026-03-03,0,0,0,0,0,0,test: add T7 blocked associativeScan tests (Phase 5)
+390,0d2394d,2026-03-03,3,1218,30,0,0,1,"Phase 7: delete flat assocScan paths (-1,217 LOC), raise tiledMatmul threshold"
+391,1abb6ec,2026-03-03,91,20,11,0,0,0,O5: manual ridx loop unrolling for register-tiled shaders
+392,5e1c334,2026-03-03,0,0,0,0,0,0,Close out COMPILING-EFFICIENT-SHADERS-PLAN Phases 0-5
+393,da7b2a8,2026-03-03,134,4,0,0,0,0,Add subgroup-accelerated reductions for WebGPU
+394,7106293,2026-03-03,27,18,2,0,0,0,feat: DLM scan benchmark + WebGPU M=1 assocScan optimization
+395,dd5ddcf,2026-03-03,465,840,103,10,2,0,refactor: extract shared WGSL expression generator (createWgslGen)
+396,faaf2d7,2026-03-03,34,5,2,2,1,0,fix: saturating float→int casts on WebGPU
+397,59fe9eb,2026-03-03,0,0,0,0,0,0,plan: add Phase 8 — dynamic fori_loop bounds + associativeScan→block_map consolidation
+398,1a0db2d,2026-03-03,44,16,0,3,1,0,feat: Phase 8.1 — foriLoop accepts symbolic Dim bounds
+399,bb1aeef,2026-03-03,0,0,0,0,0,0,docs: mark Phase 8.1 as completed in plan
+400,e0bcff3,2026-03-04,0,0,0,0,0,0,docs: undo Phase 8.1 completion; add explicit WASM and Transpose rule tasks
+401,ee00e1e,2026-03-04,74,86,0,28,2,0,chore: dynamic ad for foriLoop
+402,287eb60,2026-03-06,314,579,26,3,1,0,refactor: replace ScanPullbackArtifact with in-graph Scan transposes
+403,9bc5900,2026-03-06,19,7,6,0,0,1,fix: foriLoop transpose leak and cotangent alignment
+404,0c16320,2026-03-06,81,22,0,59,2,0,fix: WebGPU scan shader per-buffer dtypes and reduction-with-internal rejection
+405,b64dbd8,2026-03-06,139,254,39,101,2,0,feat: fused scan reductions via var<private> arrays + createWgslGen
+406,8395a6a,2026-03-06,0,0,0,0,0,0,fix: resolve pre-existing test flakes under GPU contention
+407,aa85998,2026-03-06,149,13,11,61,2,0,fix: WGSL bool-to-i32 scan codegen + Householder QR polyfill
+408,5b26a4d,2026-03-06,46,2,0,1,0,0,feat: implement foriLoop vmap rule
+409,08cb5d8,2026-03-06,17,36,32,0,0,1,"fix: unify QR to jaxpr polyfill on all backends, fix foriLoop transpose leaks"
+410,7c26c3a,2026-03-06,314,31,0,0,0,0,feat: WASM mega-module foriLoop support — compile fori_loop into native WASM loop
+411,df008d3,2026-03-06,109,36,3,1,0,0,feat: dynamic autodiff for foriLoop — symbolic bounds in transpose rule
+412,6ab7203,2026-03-07,517,10,0,303,6,0,feat: route associativeScan through block_map (Phase 8.2)
+413,1b7d08d,2026-03-07,0,0,0,0,0,0,docs: uniform jaxpr-based assocScan plan
+414,123fb2a,2026-03-07,108,45,16,14,4,0,fix: two-level fused cache + dynamic_axes block_map SymDim resolution
+415,9f6da2f,2026-03-07,182,17,3,0,0,0,Plan 1a: BlockIndex primitive + explicit gridShape for block_map
+416,f1ffab5,2026-03-07,121,112,105,65,2,1,Plan 1c+1d: recursive summary scan + vmapped apply
+417,4c8ba31,2026-03-07,0,0,0,0,0,0,Plan 2a: parity tests for block-map associative scan
+418,db6a870,2026-03-07,1910,3839,153,25,1,0,Plan 2b: delete legacy webgpu-fused-blocked path (-1761 LOC)
+419,7c7a7f9,2026-03-07,167,79,70,0,0,1,feat: add Primitive.Reverse and canonicalize assoc-scan reverse
+420,cf90768,2026-03-07,0,0,0,0,0,0,"Plan cleanup: check all acceptance criteria, add reverse tests & benchmarks"
+421,1be318a,2026-03-07,0,0,0,0,0,0,docs: add associative scan debt retirement plan
+422,ccb3581,2026-03-07,284,178,165,37,2,1,refactor: retire assoc-scan debt — shared primitives + thin orchestrator
+423,2d7562b,2026-03-08,40,0,0,2,1,0,test: add blocked-data-movement primitive tests + tighten mapOverBlocks
+424,ee3fd51,2026-03-08,0,0,0,0,0,0,docs: consolidate 6 completed plan files into copilot-instructions
+425,8b3d379,2026-03-08,200,39,0,0,0,0,"DLM scan perf: reduction kernels in WAS, inline typed copy, debt retirement"
+426,de49049,2026-03-08,7,2,1,0,0,0,fix: Scan vmap rule numConsts must include original scan consts
+427,85232f7,2026-03-08,10,0,0,4,1,0,fix: assocScan compiled paths reject axis != 0 (vmap correctness)
+428,12f52c1,2026-03-08,1,0,0,0,0,0,fix: add Primitive.Reverse to specialBlackPrimitives
+429,af373fc,2026-03-08,25,11,0,0,0,0,"fix: B1+B3+B4 — shmem budget, tiny matrices, foriLoop leak"
+430,41e4b07,2026-03-08,43,14,0,0,0,0,feat: B2 — axis-aware DUS JIT step (fiber loop for axis > 0)
+431,120383c,2026-03-08,133,35,35,2,1,0,feat: A2.1 — axis-aware blocked-data-movement helpers
+432,dfd0b8f,2026-03-08,46,32,29,4,1,1,feat: A2.2 — WebGPU blocked assocScan axis-aware
+433,2a794ee,2026-03-08,122,9,4,0,0,0,A2.3: WASM strided boundary copies for axis > 0 assocScan
+434,85bda69,2026-03-08,0,0,0,0,0,0,A2.4: native-path regression tests for axis-aware assocScan
+435,17d2257,2026-03-08,0,0,0,0,0,0,docs: absorb assoc-scan debt retirement into copilot-instructions
+436,a6f588f,2026-03-08,6,0,0,0,0,0,perf: batch WebGPU commands in gatherAxisPoints and mapOverBlocks
+437,9b5bf7d,2026-03-08,202,135,0,4,1,0,assocScan transpose: replace O(N) loop unrolling with two Scan calls
+438,0e5a982,2026-03-08,77,57,29,0,0,1,"scan compiled-loop: support Y≠carry, fix cross-gidx rejection"
+439,39c9328,2026-03-09,257,32,0,0,0,0,fix: stable jaxpr hash for sub-jaxpr params + linalg polyfills
+440,3c37a3d,2026-03-09,128,83,0,1,0,0,perf: optimize JIT execute loop — eliminate PendingExecute overhead
+441,3e580f4,2026-03-09,56,0,0,0,0,0,feat: tree.data() and tree.consumeData() — parallel GPU readback
+442,689d8a5,2026-03-09,112,6,0,6,2,0,feat: multi-output kernel + adaptive block size + guards for assocScan
+443,4cf7398,2026-03-09,0,0,0,0,0,0,"chore: clean up stale plan files, add PLAN.md and bench-assoc-scale test"
+444,76a004f,2026-03-09,23,9,3,0,0,0,fix: WebGPU compiled-loop Y≠carry reads wrong carry value
+445,71121e7,2026-03-09,0,0,0,0,0,0,chore: bump version to 0.8.0
+446,10ae2aa,2026-03-09,167,16,3,2,1,0,feat: constants → uniform buffers for block-map fused shaders
+447,cd8d47a,2026-03-09,3,3,0,0,0,0,"chore: einsum cleanup — remove broken markers, fix misleading comments"
+448,a2062fa,2026-03-09,18,2,0,0,0,0,perf: batch all GPU ops in assocScan block-map execution
+449,2554290,2026-03-09,5,1,0,0,0,0,fix: use var<private> for workgroup_assoc_scan body intermediates
+450,53ae2e7,2026-03-09,72,13,0,3,1,0,Relax diamond heuristic for view ops in splitGraphDataflow
+451,33ded59,2026-03-10,12,0,0,0,0,0,"batch copy operations in JIT execute steps (DUS, scatter_add, reverse, fori_loop)"
+452,4fd9f8d,2026-03-10,119,3,0,2,1,0,Fuse assocScan Phase 4 into single block_map dispatch
+453,8501de9,2026-03-10,15,3,2,15,1,0,fix: guard Phase 4 fused block_map against per-element reductions
+454,7a699ee,2026-03-10,0,0,0,0,0,0,v0.8.1
+455,66670f4,2026-03-10,145,52,17,3,1,0,feat: per-element reduction & multi-element codegen in fused block_map shader
+456,4a37ac5,2026-03-10,0,0,0,0,0,0,docs: update benchmarks and architecture notes for per-element reduction codegen
+457,df765e9,2026-03-10,38,3,3,0,0,0,fix: correct output indexing for multi-element kernels in fused block_map
+458,5a74c42,2026-03-10,52,3,3,0,0,0,feat: diamond heuristic relaxation for cheap recompute ops (O1)
+459,6804ce2,2026-03-10,112,14,1,0,0,0,O2: scalar promotion — pushLit embeds constant data in malloc step
+460,7c5aadf,2026-03-10,0,0,0,0,0,0,docs: update copilot-instructions for O2 scalar promotion
+461,2fce9fb,2026-03-10,3,1,0,0,0,0,"chore: minor TODO cleanup — mark stale items, exclude bench file, fix doc refs"
+462,e2055e1,2026-03-10,0,0,0,0,0,0,docs: detailed O6 multi-reduction kernel plan
+463,1f6ace9,2026-03-11,0,0,0,0,0,0,docs: correct O6 plan — neither Strategy A nor B helps DLM on WebGPU
+464,4e7206f,2026-03-11,17,0,0,0,0,0,feat: add dispatch counter to WebGPU backend
+465,6019678,2026-03-11,0,0,0,0,0,0,docs: P7 subgroups/WMMA plan + measured dispatch data
+466,737992f,2026-03-11,0,0,0,0,0,0,docs: add Decoupled Fallback scan plan (P10/Tier 0)
+467,ed3ff73,2026-03-11,0,0,0,0,0,0,docs: add analytical small-matrix linalg plan for routine elimination
+468,b4d2a74,2026-03-11,0,0,0,0,0,0,docs: draft WebGPU command tape design (O8 — mega-module equivalent)
+469,6754d52,2026-03-11,0,0,0,0,0,0,"docs: add arena allocator (O9), dispatch roadmap, Routine jaxprification analysis"
+470,1457939,2026-03-11,0,0,0,0,0,0,docs: disambiguate scan terminology — lax.scan vs associativeScan
+471,e6891a3,2026-03-11,0,0,0,0,0,0,chore(release): v0.8.2
+472,b478a38,2026-03-12,1678,200,0,34,6,0,"fix: populate adapterArchitecture/Vendor, conservative tile config (#8)"
+473,0edd5e9,2026-03-12,23,13,7,0,0,1,fix: Dot vmap batch position + subgroup guard + fallback gridOffset
+474,5a19b0b,2026-03-12,25,0,0,0,0,0,fix: integer dtype in block-map fused WAS shader bindings
+475,cc53907,2026-03-12,0,0,0,0,0,0,chore: bump version to 0.8.4
+476,01fa3dd,2026-03-12,0,0,0,0,0,0,docs: harden AEP
+477,3cd44d6,2026-03-12,3,3,3,0,0,1,docs: update stale i32 references after v0.8.4 dtype fix
+478,fab3c47,2026-03-12,206,9,9,1,0,0,feat(O9c): constants slab + conflict-graph coloring + DISPLAY auto-detect
+479,74a6fe0,2026-03-12,147,2,2,0,0,0,feat(O9a-v2): colored multi-slab arena allocator
+480,c139b15,2026-03-12,109,2,0,4,1,0,fix: deterministic GPU teardown + GPU-enforced tests + coloring unit tests
+481,3d115c8,2026-03-12,2,4,4,2,1,1,"fix: remove test helpers from public API, enforce GPU suite for all WebGPU-only tests, enable leak detection in GPU configs"
+482,56286d0,2026-03-12,0,0,0,0,0,0,chore(release): v0.9.0
+483,634ac28,2026-03-12,298,28,7,22,1,0,"feat(webgpu): O8c — DUS, scatter_add, reverse in command tape"
+484,54c2eac,2026-03-13,8,1,1,8,1,0,"O8c: fix scatter_add alignment, add WebGPU tests to pre-commit, fix DISPLAY detection"
+485,44b31d3,2026-03-13,0,0,0,0,0,0,chore(release): v0.9.1
+486,d174a18,2026-03-13,538,102,33,1,0,0,feat(webgpu): leaf packing for 6+ tuple associative scan
+487,f19f9b8,2026-03-14,21,4,0,0,0,0,feat: cherry-pick upstream changes (ekzhang/jax-js ecdb881..6b72495)
+488,f1663c7,2026-03-14,275,10,3,23,2,0,"feat: Phase A0 observability — setCodeCapture API, wasmblr trace, REPL demo"
+489,83722e9,2026-03-14,50,2,1,22,1,0,feat: Phase A benchmarks + Phase B 1x1 conv fast path
+490,0947b53,2026-03-14,0,0,0,0,0,0,fix: conv2d benchmark materialization bug + corrected baseline
+491,987f24c,2026-03-14,48,41,21,0,0,1,"refactor: extract shared applyDotLayout for conv, fix bench + capture safety"
+492,8b90c27,2026-03-14,14,2,2,8,1,0,"P4: 3x3/5x5 classification, GPU timing data, im2col rejection"
+493,e88e3ea,2026-03-14,20,22,22,1,0,1,"P4: rename ConvLoweringKind → ConvClass, fix GFLOP comment, remove tmp/ ref"
+494,3474b61,2026-03-15,615,78,9,11,2,0,feat: C.3 Conv→BlockMap jaxpr rewrite with halo support
+495,0e3f7ae,2026-03-15,0,2,2,0,0,0,"chore: remove _setConvRewriteEnabled from public exports, fix PLAN.md"
+496,c5db66d,2026-03-15,326,11,9,6,2,0,Phase C.4 Step 1: halo VJP scatter-add fallback
+497,cbe6bb5,2026-03-15,2,4,4,0,0,1,"fix: review cleanup — rename scatter-add, remove typecheckJaxpr overhead, add T8.13 vmap test"
+498,4f686fd,2026-03-15,282,3,2,3,1,0,feat: Phase C.4 Steps 2-3: stencil body synthesis + gather-based halo VJP
+499,d22a488,2026-03-15,17,3,3,0,0,0,"fix: halo VJP review — multi-input guard, Lit bias, path-selection test"
+500,feb19ae,2026-03-16,212,19,1,0,0,0,"feat: extend setCodeCapture hooks for scan, assoc-scan, block-map, routine + profileGpuDetailed API"
+501,944038d,2026-03-16,0,0,0,0,0,0,feat: REPL compiled-code panel + mark Phase A0 complete
+502,23f5103,2026-03-16,0,0,0,0,0,0,"refactor: interleave compiled code in REPL console, remove separate tab"
+503,46099cc,2026-03-16,31,25,1,0,0,0,perf: conditionally include nan/inf helpers in WebGPU shaders
+504,7b7d610,2026-03-16,0,0,0,0,0,0,fix: update bundle size in README to reflect accurate gzip size
+505,aab0cc8,2026-03-16,32,13,0,0,0,0,fix: adapt upstream cherry-picks for non-consuming ownership model
+506,ced9aec,2026-03-16,117,1,0,0,0,0,tooling: autofix for no-nested-array-leak + upstream-adapt.sh
+507,b11ea4a,2026-03-16,3,5,0,0,0,0,"fix: address review findings (tracing leak, script scope)"
+508,fca8657,2026-03-16,56,0,0,0,0,0,Add fluid simulation demo + WebGPU interop (#98)
+509,2d3c30d,2026-03-16,0,0,0,0,0,0,"fix: update copyright year, replace fluid sim source link"
+510,bfb64fa,2026-03-16,0,0,0,0,0,0,perf: optimize fluid sim with withBatch and gpuBufferSync
+511,72e5c43,2026-03-16,13,1,0,0,0,0,feat: command tape respects active batch encoder (withBatch fix)
+512,91a1916,2026-03-16,0,0,0,0,0,0,refactor: fluid sim: merge jacobi steps
+513,d947acd,2026-03-16,183,54,0,20,1,0,feat: command tape supports scan dispatches
+514,c007e13,2026-03-16,0,0,0,0,0,0,docs: consolidate PLAN.md into copilot-instructions.md
+515,64769df,2026-03-16,0,0,0,0,0,0,fix: use resolve('/') for base-relative link in fluid-sim page
+516,f702fb1,2026-03-17,460,95,20,0,0,0,feat: WebGPU scan carry/Y source classification + Backend.fence + benchmark stability
+517,ea26438,2026-03-17,0,0,0,0,0,0,chore: bump version to 0.9.3
+518,412cf99,2026-03-19,491,20,0,32,2,0,"feat: foriLoop→BlockMap rewrite, GPU cost model refit, Mandelbrot leak fix"
+519,6117b1e,2026-03-19,0,0,0,0,0,0,style: fix prettier formatting in mandelbrot-demo test
+520,c6e414b,2026-03-19,0,0,0,0,0,0,docs: add WebGPU cost model proposal (WEBGPU-PROFILER-PROPOSAL.md)
+521,d542b0d,2026-03-24,481,0,0,4,1,0,feat: add captureJitReport + formatJitReport for JIT compiler inspection
+522,2372adf,2026-03-24,0,0,0,0,0,0,feat(repl): replace per-entry code capture with consolidated JIT report
+523,582068a,2026-03-24,23,4,1,0,0,0,"feat(repl): update mandelbrot to jit(foriLoop), show program structure in capture"
+524,c52a3d8,2026-03-24,109,16,3,0,0,0,Add semantic labels to Kernel and JitProgram
+525,fbc56a3,2026-03-24,31,3,0,0,0,0,Label captured kernel code entries
+526,81c0b10,2026-03-24,927,95,7,107,6,0,"WIP: async JIT infrastructure, microbench calibration, cost model tuning"
+527,f6db817,2026-03-24,691,86,73,29,3,0,feat: add captureJitReport + formatJitReport for JIT compiler inspection
+528,a2a2cab,2026-03-24,0,0,0,0,0,0,feat(repl): replace per-entry code capture with consolidated JIT report
+529,e8b922d,2026-03-24,24,4,2,0,0,0,"feat(repl): update mandelbrot to jit(foriLoop), show program structure in capture"
+530,c64ecc4,2026-03-24,109,16,3,0,0,0,Add semantic labels to Kernel and JitProgram
+531,37f12be,2026-03-24,31,3,0,0,0,0,Label captured kernel code entries
+532,91ff136,2026-03-24,56,35,34,0,0,1,Fix ForiLoop block-map tile feasibility
+533,09b9f51,2026-03-24,12,5,4,0,0,1,Integrate WebGPU calibration at init
+534,98c79f8,2026-03-24,0,0,0,0,0,0,Remove branch-only scratch artifacts
+535,07a219d,2026-03-24,63,23,23,2,1,1,Centralize conservative performance defaults and clean up stale profile docs
+536,4b2d6b5,2026-03-24,0,0,0,0,0,0,Retire PLAN.md: merge open items into copilot-instructions
+537,e9570c4,2026-03-24,3,22,22,0,0,1,Remove stale GPU profiling pipeline and inferredVendorClass dead code
+538,2f769e3,2026-03-24,6,2,2,0,0,0,"v0.9.4 — doc consolidation, calibration path tests, website v0.3.0"
+539,1967ddd,2026-03-25,159,522,0,29,1,0,"Step 3d: delete phantom-ref machinery, implement explicit creation-ref balancing"
+540,666356e,2026-03-26,365,240,29,0,0,0,ownership restructuring: finalize architecture and absorb into docs
+541,bbd1d2a,2026-03-26,0,0,0,0,0,0,v0.9.5
+542,33d658b,2026-03-26,0,0,0,0,0,0,delete PLAN.md — absorbed into copilot-instructions.md
+543,ad77361,2026-03-26,0,0,0,0,0,0,Remove QR test shortcuts and repair FEATURES matrix
+544,9c03f59,2026-03-26,0,0,0,0,0,0,v0.9.6
+545,503b763,2026-03-26,8,3,0,0,0,0,fix: gate arange disposal in householderQR2D on tracing context
+546,8c52656,2026-03-26,43,11,0,18,2,0,feat(P4): enable Conv2d fused-shader path on WebGPU
+547,b95049b,2026-03-26,0,0,0,0,0,0,v0.10.0
+548,4c81134,2026-03-27,33,33,14,7,1,1,refactor(P4): address review findings
+549,4491bbb,2026-03-27,49,13,11,0,0,0,fix: eliminate duplicate halo coordinate ALU and enforce conv dispatch contract
+550,0550fac,2026-03-27,3,2,0,0,0,0,fix: guard SharedArrayBuffer reference in WASM #readData for non-isolated contexts
+551,35e51f0,2026-03-27,0,0,0,0,0,0,chore(release): v0.10.1
+552,ecf2240,2026-03-27,8,0,0,0,0,0,docs: disclose foriLoop autodiff and dynamic-bound limitations
+553,da34053,2026-03-27,215,2,0,0,0,0,docs: update array-manipulation-patterns for ND dynamicUpdateSlice
+554,fa8e776,2026-03-27,266,12,0,0,0,0,feat: ND dynamicUpdateSlice with static offsets
+555,dbff3ee,2026-03-27,0,0,0,0,0,0,chore(release): v0.11.0
+556,7e2a1a3,2026-03-27,1,0,0,0,0,0,"fix: export ArrayLike type, resilient prepare script"
+557,c81550a,2026-03-30,492,0,0,14,1,0,"feat: implement customVjp, customJvp, and customLinearSolve"
+558,5fe2ffd,2026-03-30,26,14,14,0,0,1,fix: customVjp residual ownership and cotangent validation
+559,5e6593b,2026-03-31,0,0,0,0,0,0,chore(release): v0.12.0
+560,bf8f02a,2026-03-31,120,1,0,1,0,0,feat: implement customRoot for implicit differentiation via IFT
+561,c2f49ef,2026-03-31,18,1,1,0,0,0,Fix customRoot matvec primal cleanup
+562,9052eeb,2026-03-31,0,0,0,0,0,0,Bump version to 0.12.1
+563,bd8039b,2026-03-31,0,0,0,0,0,0,Bump version to 0.12.2
+564,0787d16,2026-03-31,0,0,0,0,0,0,Update pnpm lockfile for jaxopt workspace dep
+565,621bb65,2026-04-01,16,1,0,16,2,0,Fix clearCaches crash with grad inside foriLoop/scan bodies
+566,9c8d4f2,2026-04-01,8,14,14,8,1,1,Narrow clearCaches cleanup guard and add explicit regression
+567,44dd3f8,2026-04-02,324,2,0,12,2,0,Bump version to 0.12.5
+568,7c3d1a0,2026-04-02,34,11,9,27,1,0,Bump version to 0.12.6
+569,5dba122,2026-04-02,0,0,0,0,0,0,Clarify transformed-body array construction docs
+570,53388ab,2026-04-02,23,4,0,0,0,0,fix(evalJaxpr): track identity-shared values via valueBindCount
+571,b2e4dc1,2026-04-02,0,0,0,0,0,0,Bump version to 0.12.7
+572,86b51d2,2026-04-02,0,0,0,0,0,0,docs: document evalJaxpr valueBindCount and np.array identity pitfall
+573,33b3bd4,2026-04-03,21,2,0,0,0,0,fix(PE): dispose PE intermediates in nested grad/hessian inside traced scan/foriLoop bodies
+574,46be53c,2026-04-03,0,0,0,0,0,0,Bump version to 0.12.8
+575,9334498,2026-04-03,11,1,0,6,1,0,fix(jaxpr): make ClosedJaxpr.dispose resilient to already-freed consts
+576,de69bab,2026-04-03,0,0,0,0,0,0,Bump version to 0.12.9
+577,b057290,2026-04-03,190,126,44,8,1,0,refactor(ownership): explicit borrowed/owned ClosedJaxpr const ownership
+578,cc5454c,2026-04-03,8,14,10,0,0,1,Bump version to 0.12.11
+579,058a17d,2026-04-04,70,9,0,0,0,0,feat: enforce ownership lint rules in traced bodies + runtime diagnostics
+580,5d14063,2026-04-04,0,0,0,0,0,0,Bump version to 0.12.12
+581,ebd9e94,2026-04-04,135,56,0,41,1,0,fix(ownership): eliminate library intermediate leaks + enable debug(1) globally
+582,691fbb6,2026-04-04,0,0,0,0,0,0,Bump version to 0.12.13
+583,996d269,2026-04-08,309,315,41,0,0,0,feat: migrate ownership cleanup to DisposableStack
+584,0f644bc,2026-04-08,0,0,0,0,0,0,Bump version to 0.12.14
+585,b60ad3f,2026-03-30,0,0,0,0,0,0,Add WASM multithreading & performance plan
+586,9217ea0,2026-03-30,278,11,0,8,1,0,E1: WASM mega-module arena allocator
+587,924f263,2026-03-30,87,16,8,2,0,0,"Fix arena lifetime, orchestrator limit, and cleanup symmetry"
+588,133cefe,2026-03-30,0,0,0,0,0,0,website: add coi-serviceworker for COOP/COEP on GitHub Pages
+589,1209f75,2026-03-30,1,1,1,0,0,0,chore: fix import sort order in wasm.ts
+590,ae77553,2026-04-10,249,98,1,104,5,0,Fix nested-worker WASM orchestrator registration
+591,5311e97,2026-04-10,1,6,6,0,0,1,Format nested-worker WASM fix
+592,46fd24f,2026-04-10,180,100,29,57,2,0,"refactor: extract shared registration helper, add direct cleanup tests"
+593,2f914c5,2026-04-10,25,50,46,0,0,1,refactor: extract shared Atomics wait helpers into wait.ts
+594,02b930d,2026-04-10,52,42,38,8,1,1,refactor: extract shared worker registration message helper
+595,1cee4bb,2026-04-10,30,30,0,0,0,0,refactor: deduplicate wait probe and inline worker URL lifecycle
+596,fe2c9cc,2026-04-10,78,65,50,0,0,1,refactor: extract ModuleRegistry for shared registration state
