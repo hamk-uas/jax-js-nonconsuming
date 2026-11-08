@@ -87,6 +87,47 @@ describe("profileGpu", () => {
       expect(traced()).toEqual([]);
     });
 
+    test("measures nonzero pass durations", async () => {
+      defaultDevice("webgpu");
+      using a = np.ones([2048, 2048]);
+      const matmul = jit((x: np.Array, y: np.Array) => np.matmul(x, y));
+      try {
+        {
+          using _ = matmul(a, a); // compile outside the profiled region
+          await _.blockUntilReady();
+        }
+        const { timing } = await profileGpu(async () => {
+          using c = matmul(a, a);
+          await c.blockUntilReady();
+        });
+        // A 2048² matmul takes over a millisecond on a fast GPU. An invalid
+        // QuerySet (too many queries) resolves nothing, and every duration
+        // reads as 0.
+        expect(timing.passes.length).toBeGreaterThan(0);
+        expect(timing.passes[0].durationMs).toBeGreaterThan(0);
+        expect(timing.totalMs).toBeGreaterThan(0);
+      } finally {
+        matmul.dispose();
+      }
+    });
+
+    test("records at most 2048 passes, then reports truncation", async () => {
+      defaultDevice("webgpu");
+      using m = np.eye(8);
+      // Eager matmuls do not fuse with each other: one pass each.
+      const { timing } = await profileGpu(async () => {
+        let y = np.ones([8, 8]);
+        for (let i = 0; i < 2100; i++) {
+          using previous = y;
+          y = np.matmul(previous, m);
+        }
+        await y.data();
+        y.dispose();
+      });
+      expect(timing.passes.length).toBe(2048);
+      expect(timing.truncated).toBe(true);
+    });
+
     test("empty body returns no passes", async () => {
       defaultDevice("webgpu");
       const { timing } = await profileGpu(() => 42);

@@ -3,6 +3,7 @@ import {
   type Device,
   devices,
   getBackend,
+  getWebGPUDevice,
   init,
   numpy as np,
   setDebug,
@@ -24,16 +25,67 @@ if (required.length > 0) {
   }
 }
 
+// WebGPU errors: an invalid call does not throw, it only produces an error
+// event, which the backend merely logs. Each test runs inside error scopes so
+// that errors from its own calls fail it; errors outside any test (module
+// setup, work completing after a test) are collected by a listener and fail
+// the next test, or the file.
+const gpuErrorFilters: GPUErrorFilter[] = [
+  "validation",
+  "out-of-memory",
+  "internal",
+];
+const uncapturedGpuErrors: string[] = [];
+const listenedDevices = new WeakSet<GPUDevice>();
+let scopedDevice: GPUDevice | undefined;
+
+function webGpuDevice(): GPUDevice | undefined {
+  // getWebGPUDevice() throws until a test file has initialized WebGPU.
+  try {
+    return getWebGPUDevice();
+  } catch {
+    return undefined;
+  }
+}
+
+function beginGpuErrorScopes(): void {
+  scopedDevice = webGpuDevice();
+  if (!scopedDevice) return;
+  if (!listenedDevices.has(scopedDevice)) {
+    listenedDevices.add(scopedDevice);
+    scopedDevice.addEventListener("uncapturederror", (event) => {
+      uncapturedGpuErrors.push(event.error.message);
+    });
+  }
+  for (const filter of gpuErrorFilters) scopedDevice.pushErrorScope(filter);
+}
+
+async function endGpuErrorScopes(): Promise<string[]> {
+  const errors = uncapturedGpuErrors.splice(0);
+  if (scopedDevice) {
+    for (let i = 0; i < gpuErrorFilters.length; i++) {
+      const error = await scopedDevice.popErrorScope();
+      if (error) errors.push(error.message);
+    }
+    scopedDevice = undefined;
+  }
+  return errors;
+}
+
 beforeEach(() => {
   // Enable ownership diagnostics. JIT compile logs and [jax-js] warnings
   // are suppressed by vitest for passing tests; shown on failure for
   // debugging. Ownership warnings surface via the library regression test.
   setDebug(1);
+  beginGpuErrorScopes();
   checkLeaks.start();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // Both checks run before either assertion, so the scopes are always popped.
+  const gpuErrors = await endGpuErrorScopes();
   const result = checkLeaks.stop();
+  expect(gpuErrors, "WebGPU errors").toEqual([]);
   expect(result.leaked, result.summary).toBe(0);
 });
 
@@ -51,6 +103,10 @@ afterAll(() => {
       // Backend may not be initialized; ignore.
     }
   }
+  expect(
+    uncapturedGpuErrors.splice(0),
+    "WebGPU errors after the last test",
+  ).toEqual([]);
 });
 
 expect.extend({

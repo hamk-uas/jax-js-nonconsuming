@@ -324,7 +324,11 @@ interface _ProfilingState {
   /** Per-pass metadata — populated at each dispatch. */
   passMeta: _ProfilingPassMeta[];
 }
-const _MAX_PROFILING_PASSES = 4096;
+// WebGPU caps a QuerySet at 4096 queries, and each pass writes two (begin and
+// end). Asking for more makes the QuerySet invalid: every resolve then fails
+// and every pass reports 0 ms.
+const _MAX_PROFILING_QUERIES = 4096;
+const _MAX_PROFILING_PASSES = _MAX_PROFILING_QUERIES / 2;
 
 /** Return timestampWrites descriptor for the current pass, or undefined. */
 function _profilingTimestampWrites(
@@ -626,7 +630,7 @@ export class WebGPUBackend implements Backend {
     this.#profiling = {
       querySet: this.device.createQuerySet({
         type: "timestamp",
-        count: _MAX_PROFILING_PASSES * 2,
+        count: _MAX_PROFILING_QUERIES,
       }),
       passIdx: 0,
       overflow: false,

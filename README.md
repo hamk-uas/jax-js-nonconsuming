@@ -572,6 +572,8 @@ The full set of Chrome flags used (configured in `test/gpu-config.ts`):
   the file fails with "Required backend(s) did not initialize" instead of skipping its GPU tests.
   Check `vulkaninfo --summary` and that your GPU driver is installed, then items 4 and 5 above.
   `JAX_REQUIRE_DEVICES` overrides the requirement (comma-separated list; empty for none).
+- A WebGPU error (an invalid call, out of memory) fails the test that caused it; `test/setup.ts`
+  runs every test inside WebGPU error scopes.
 - If `dataSync()` on WebGPU returns all zeros or WebGL is unavailable, restrict `VK_DRIVER_FILES` to
   one GPU (item 5).
 - COOP/COEP headers (required for `SharedArrayBuffer`) are configured in `vitest.config.ts`.

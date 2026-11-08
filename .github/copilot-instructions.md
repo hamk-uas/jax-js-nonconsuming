@@ -174,10 +174,13 @@ WebGPU and WebGL need none, and an unusable X server makes `requestAdapter()` re
 readback returns zeros and WebGL2 is unavailable). Tests therefore run over SSH without a desktop
 login. See `chromiumLaunchOptions()` in `test/gpu-config.ts`.
 
-**Missing backends fail tests:** when a GPU is detected (and always in the GPU configs),
-`test/setup.ts` requires WebGPU and WebGL to initialize in every test file and fails the file
-otherwise; before, a broken GPU setup turned every GPU case into a skip and the run passed.
-`JAX_REQUIRE_DEVICES` overrides the list.
+**Missing backends and GPU errors fail tests:** when a GPU is detected (and always in the GPU
+configs), `test/setup.ts` requires WebGPU and WebGL to initialize in every test file and fails the
+file otherwise; before, a broken GPU setup turned every GPU case into a skip and the run passed.
+`JAX_REQUIRE_DEVICES` overrides the list. Every test also runs inside WebGPU error scopes
+(validation, out-of-memory, internal): an invalid GPU call does not throw, so without the scopes it
+was only logged. Errors outside any test fail the next test or the file. Never silence these; fix
+the invalid call.
 
 **At most 4 test files at once:** all files run in one Chromium, whose single GPU process compiles
 every file's shaders. At vitest's default concurrency (CPU count − 1) that queue pushed tests past
