@@ -765,26 +765,42 @@ npm version patch -m "chore(release): v%s"
 # 3. Push the commit and tag
 git push && git push --tags
 
-# 4. Create a GitHub release via the gh CLI.
-#    --title: short phrase after the version number, e.g. "fix grad(solve)" or "add lax.foo"
-#    --notes: write a human-readable description (see format below) — required, don't skip this
-gh release create "v$(node -p "require('./package.json').version")" \
-  --title "v$(node -p "require('./package.json').version") — <short description>" \
-  --notes "## <Category>: <what changed>
-
-### What was wrong / motivation
-<one paragraph>
-
-### What changed
-- **\`src/...\`** — description
-
-### Upgrade
-\`\`\`bash
-npm install github:hamk-uas/jax-js-nonconsuming#v$(node -p "require('./package.json').version")
-\`\`\`
-
-**Full Changelog**: https://github.com/hamk-uas/jax-js-nonconsuming/compare/vPREV...v$(node -p "require('./package.json').version")"
+# 4. Create the GitHub release in the browser (see below).
 ```
+
+#### Creating the GitHub release
+
+A maintainer creates every release by hand in the GitHub web interface. An agent preparing a release
+stops after step 3 and hands over the release title and notes, fully filled in and ready to paste.
+It does not create the release itself.
+
+1. Open <https://github.com/hamk-uas/jax-js-nonconsuming/releases/new>.
+2. **Choose a tag:** pick the tag pushed in step 3 (`vX.Y.Z`).
+3. **Release title:** `vX.Y.Z — <short description>`, where the description is a short phrase such
+   as "fix grad(solve)" or "add lax.foo".
+4. **Description:** paste the notes. They are required; use this format:
+
+   ````markdown
+   ## <Category>: <what changed>
+
+   ### What was wrong / motivation
+
+   <one paragraph>
+
+   ### What changed
+
+   - **`src/...`** — description
+
+   ### Upgrade
+
+   ```bash
+   npm install github:hamk-uas/jax-js-nonconsuming#vX.Y.Z
+   ```
+
+   **Full Changelog**: https://github.com/hamk-uas/jax-js-nonconsuming/compare/vPREV...vX.Y.Z
+   ````
+
+5. **Publish release.**
 
 Users install specific tags, so after releasing they can upgrade with:
 
@@ -811,8 +827,8 @@ When rebasing/syncing from upstream, the bump level depends on what user-facing 
 For simple bug-fix PRs (the common case):
 
 1. Merge the PR to `main`.
-2. Version, tag, push, and create the GitHub release — bug fixes are always a patch bump. Follow the
-   releasing steps above.
+2. Version, tag and push, then create the GitHub release in the browser — bug fixes are always a
+   patch bump. Follow the releasing steps above.
 
 ## Contributing
 

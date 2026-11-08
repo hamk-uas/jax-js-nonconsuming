@@ -567,6 +567,10 @@ checkbox.
 3. Update `FEATURES.md` for user-visible changes
 4. Export new public symbols from `src/index.ts`
 
+**Releases:** never create GitHub releases (no `gh release`, no API calls). Do the version bump, tag
+and push per the README's "Releasing" steps, then give the maintainer the filled-in release title
+and notes to paste into the GitHub web interface.
+
 ---
 
 # Part 2: Block Map & Tiled Compute
