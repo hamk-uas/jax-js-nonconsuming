@@ -119,7 +119,8 @@
   },
   "pnpm": {
     "overrides": {
-      "@tensorflow/tfjs-core>@webgpu/types": "^0.1.68"
+      "@tensorflow/tfjs-core>@webgpu/types": "^0.1.68",
+      "monaco-editor>dompurify": "^3.4.17"
     }
   },
   "prettier": {

@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { browser } from "$app/environment";
+  import { browser } from "$app/env";
 
-  import { getWebgpuDevice, importTfjs, runBenchmark } from "$lib/benchmark";
+  import { getWebgpuDevice, importTfjs, runBenchmark } from "#lib/benchmark.ts";
 
   import {
     createJaxJsMatmulStrategy,

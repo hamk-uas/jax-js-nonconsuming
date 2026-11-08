@@ -1,6 +1,6 @@
 // Utilities for profiling, especially for GPU.
 
-import { browser } from "$app/environment";
+import { browser } from "$app/env";
 
 export function isMobile(): boolean {
   return browser && /Mobi|Android/i.test(navigator.userAgent);

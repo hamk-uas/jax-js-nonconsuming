@@ -9,7 +9,7 @@
   import pThrottle from "p-throttle";
   import { onMount } from "svelte";
 
-  import LineChart from "$lib/chart/LineChart.svelte";
+  import LineChart from "#lib/chart/LineChart.svelte";
 
   import {
     ConvNet,

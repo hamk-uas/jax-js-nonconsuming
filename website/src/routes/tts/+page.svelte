@@ -13,7 +13,7 @@
   } from "@hamk-uas/jax-js-nonconsuming-loaders";
   import { AudioLinesIcon, CodeXmlIcon, DownloadIcon } from "@lucide/svelte";
 
-  import DownloadManager from "$lib/common/DownloadManager.svelte";
+  import DownloadManager from "#lib/common/DownloadManager.svelte";
   import { createStreamingPlayer } from "./audio";
   import { playTTS } from "./inference";
   import { fromSafetensors, type PocketTTS } from "./pocket-tts";
@@ -183,7 +183,7 @@
   </h1>
   <p class="text-lg text-gray-500">
     Text-to-speech AI voice model, running in your browser with <a
-      href={resolve("/")}
+      href={resolve("")}
       class="text-primary hover:underline">jax-js-nonconsuming</a
     >.
   </p>

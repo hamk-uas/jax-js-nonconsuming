@@ -1,13 +1,13 @@
 <script lang="ts">
-  import { browser } from "$app/environment";
+  import { browser } from "$app/env";
   import { resolve } from "$app/paths";
 
   import { ArrowUpRight, ExternalLinkIcon } from "@lucide/svelte";
 
-  import logo from "$lib/assets/logo-nonconsuming.svg";
-  import MatmulPerfDemo from "$lib/homepage/MatmulPerfDemo.svelte";
-  import homepageExampleSource from "$lib/repl/examples/homepage?raw";
-  import EmbeddedRepl from "$lib/repl/EmbeddedRepl.svelte";
+  import logo from "#lib/assets/logo-nonconsuming.svg";
+  import MatmulPerfDemo from "#lib/homepage/MatmulPerfDemo.svelte";
+  import homepageExampleSource from "#lib/repl/examples/homepage?raw";
+  import EmbeddedRepl from "#lib/repl/EmbeddedRepl.svelte";
 
   const installText = {
     npm: `npm install github:hamk-uas/jax-js-nonconsuming`,
@@ -27,7 +27,7 @@
     },
     {
       title: "REPL",
-      href: resolve("/repl"),
+      href: resolve("repl"),
       description: "Try out the library in this browser-based REPL.",
     },
     {
@@ -37,48 +37,48 @@
     },
     {
       title: "MobileCLIP2 Inference",
-      href: resolve("/mobileclip"),
+      href: resolve("mobileclip"),
       description:
         "Generate embeddings for books and search them in real time.",
     },
     {
       title: "Kyutai Pocket TTS",
-      href: resolve("/tts"),
+      href: resolve("tts"),
       description: "Voice cloning AI model that runs in your browser.",
     },
     {
       title: "MNIST Training",
-      href: resolve("/mnist"),
+      href: resolve("mnist"),
       description: "Demo of training a neural network on MNIST.",
     },
     {
       title: "DETR ResNet-50",
-      href: resolve("/detr-resnet-50"),
+      href: resolve("detr-resnet-50"),
       description: "Object detection with DETR via ONNX, running in-browser.",
     },
     {
       title: "Mandelbrot Set",
-      href: resolve("/mandelbrot"),
+      href: resolve("mandelbrot"),
       description: "GPU-accelerated fractal rendering with JIT-compiled scan.",
     },
     {
       title: "Fluid Simulation",
-      href: resolve("/fluid-sim"),
+      href: resolve("fluid-sim"),
       description: "Real-time Navier-Stokes fluid simulation on WebGPU.",
     },
     {
       title: "Matmul Benchmark",
-      href: resolve("/bench/matmul"),
+      href: resolve("bench/matmul"),
       description: "Measure matrix multiplication GFLOP/s on your device.",
     },
     {
       title: "Tiled Matmul Sweep",
-      href: resolve("/bench/results"),
+      href: resolve("bench/results"),
       description: "Run all tile configs on your GPU and compare GFLOP/s.",
     },
     {
       title: "Conv2d Benchmark",
-      href: resolve("/bench/conv2d"),
+      href: resolve("bench/conv2d"),
       description: "Measure convolution throughput on your device.",
     },
   ];
@@ -93,13 +93,12 @@
   class="px-6 py-4 flex items-center justify-between max-w-screen-xl mx-auto font-tiktok gap-6"
 >
   <div class="flex items-center gap-3 shrink-0">
-    <a href={resolve("/")}>
+    <a href={resolve("")}>
       <img src={logo} alt="jax-js-nonconsuming logo" class="h-8" />
     </a>
   </div>
   <nav class="flex items-center gap-6">
-    <a href={resolve("/repl")} class="hidden sm:block hover:text-primary"
-      >REPL</a
+    <a href={resolve("repl")} class="hidden sm:block hover:text-primary">REPL</a
     >
     <a
       rel="external"

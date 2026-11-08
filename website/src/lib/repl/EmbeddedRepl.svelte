@@ -30,7 +30,7 @@
   // The editor owns the text from here on; `initialText` only seeds it.
   let currentText = $state(untrack(() => initialText));
   let replLink = $derived(
-    resolve("/repl") + `?content=${encodeContent(currentText)}`,
+    resolve("repl") + `?content=${encodeContent(currentText)}`,
   );
   let device = $state<Device>("webgpu");
 
@@ -95,7 +95,7 @@
   </div>
   <div class="flex-1 min-h-0 split-pane-container">
     <SplitPane
-      type="vertical"
+      type="rows"
       pos="-224px"
       min="40px"
       max="-40px"

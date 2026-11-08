@@ -1,4 +1,4 @@
-import { runBenchmark } from "$lib/benchmark";
+import { runBenchmark } from "#lib/benchmark.ts";
 
 export function createJaxJsConv2dStrategy(
   batchSize: number,

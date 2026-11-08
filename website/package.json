@@ -15,9 +15,9 @@
   "devDependencies": {
     "@eslint/compat": "^2.1.1",
     "@eslint/js": "^10.0.1",
-    "@sveltejs/adapter-static": "^3.0.8",
-    "@sveltejs/kit": "^2.49.1",
-    "@sveltejs/vite-plugin-svelte": "^6.2.1",
+    "@sveltejs/adapter-static": "^4.0.0",
+    "@sveltejs/kit": "^3.0.0",
+    "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "@tailwindcss/vite": "^4.0.8",
     "@types/d3-array": "^3.2.1",
     "@types/d3-scale-chromatic": "^3.1.0",
@@ -29,11 +29,11 @@
     "eslint-plugin-svelte": "^3.24.1",
     "globals": "^17.14.0",
     "prettier": "^3.5.2",
-    "svelte-check": "^4.1.4",
+    "svelte-check": "^4.7.5",
     "tailwindcss": "^4.0.8",
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.72.1",
-    "vite": "^7.2.7",
+    "vite": "^8.0.12",
     "vite-plugin-lucide-preprocess": "^1.4.6"
   },
   "dependencies": {
@@ -45,7 +45,7 @@
     "@hamk-uas/jax-js-nonconsuming-optax": "workspace:^",
     "@lucide/svelte": "^1.70.0",
     "@observablehq/plot": "^0.6.17",
-    "@rich_harris/svelte-split-pane": "^2.0.0",
+    "@rich_harris/svelte-split-pane": "^3.0.0",
     "@rollup/browser": "^4.34.8",
     "@tensorflow/tfjs": "^4.22.0",
     "@tensorflow/tfjs-backend-wasm": "^4.22.0",
@@ -56,10 +56,13 @@
     "fflate": "^0.8.2",
     "js-base64": "^3.7.8",
     "merge-descriptors": "^2.0.0",
-    "monaco-editor": "^0.55.1",
+    "monaco-editor": "^0.57.0",
     "onnx-buf": "^1.20.0-1",
     "onnxruntime-web": "^1.23.2",
-    "p-throttle": "^7.0.0",
-    "svelte": "^5.20.2"
+    "p-throttle": "^8.1.1",
+    "svelte": "^5.57.2"
+  },
+  "imports": {
+    "#lib/*": "./src/lib/*"
   }
 }

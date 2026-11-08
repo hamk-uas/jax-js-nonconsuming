@@ -5,7 +5,7 @@
 
   import DownloadToast, {
     type Props as DownloadToastProps,
-  } from "$lib/common/DownloadToast.svelte";
+  } from "#lib/common/DownloadToast.svelte";
 
   let downloadState = $state<DownloadToastProps | null>(null);
 

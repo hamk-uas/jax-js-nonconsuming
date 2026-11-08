@@ -2,7 +2,7 @@
   import { CircleCheck, CircleX, LoaderCircle } from "@lucide/svelte";
   import { fly } from "svelte/transition";
 
-  import { formatBytes } from "$lib/chart/format";
+  import { formatBytes } from "#lib/chart/format.ts";
 
   export interface Props {
     name: string;

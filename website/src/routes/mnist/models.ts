@@ -6,7 +6,7 @@ import {
   random,
 } from "@hamk-uas/jax-js-nonconsuming";
 
-import { fetchMnist } from "$lib/dataset/mnist";
+import { fetchMnist } from "#lib/dataset/mnist.ts";
 
 export type Params = { [key: string]: np.Array };
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import mergeDescriptors from "merge-descriptors";
-  import type * as Monaco from "monaco-editor/esm/vs/editor/editor.api.js";
+  import type * as Monaco from "monaco-editor/editor/editor.api.js";
   import { onDestroy, onMount } from "svelte";
 
   let {
@@ -72,7 +72,7 @@
   }
 
   onMount(async () => {
-    monaco = (await import("$lib/monaco")).default;
+    monaco = (await import("#lib/monaco.ts")).default;
 
     editor = monaco.editor.create(
       containerEl,

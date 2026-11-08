@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { browser } from "$app/environment";
+  import { browser } from "$app/env";
 
   import type tf from "@tensorflow/tfjs";
 
-  import { getWebgpuDevice, importTfjs, runBenchmark } from "$lib/benchmark";
+  import { getWebgpuDevice, importTfjs, runBenchmark } from "#lib/benchmark.ts";
 
   import { createJaxJsConv2dStrategy } from "./jaxStrategy";
 

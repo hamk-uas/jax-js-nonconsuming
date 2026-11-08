@@ -11,7 +11,7 @@
   } from "@hamk-uas/jax-js-nonconsuming-loaders";
   import { BookMarkedIcon, FileTextIcon } from "@lucide/svelte";
 
-  import DownloadManager from "$lib/common/DownloadManager.svelte";
+  import DownloadManager from "#lib/common/DownloadManager.svelte";
   import { type Book, downloadBook } from "./books";
   import { fromSafetensors, type MobileCLIP } from "./clipInference";
   import {

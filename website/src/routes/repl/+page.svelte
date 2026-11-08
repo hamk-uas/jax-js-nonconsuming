@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { building } from "$app/environment";
+  import { building } from "$app/env";
   import { afterNavigate, goto } from "$app/navigation";
   import { resolve } from "$app/paths";
   import { page } from "$app/state";
@@ -14,10 +14,10 @@
   } from "@lucide/svelte";
   import { SplitPane } from "@rich_harris/svelte-split-pane";
 
-  import ConsoleLine from "$lib/repl/ConsoleLine.svelte";
-  import ReplEditor from "$lib/repl/ReplEditor.svelte";
-  import { decodeContent, encodeContent } from "$lib/repl/encode";
-  import { ReplRunner } from "$lib/repl/runner.svelte";
+  import ConsoleLine from "#lib/repl/ConsoleLine.svelte";
+  import ReplEditor from "#lib/repl/ReplEditor.svelte";
+  import { decodeContent, encodeContent } from "#lib/repl/encode.ts";
+  import { ReplRunner } from "#lib/repl/runner.svelte.ts";
 
   const src: Record<string, string> = import.meta.glob("./*.ts", {
     eager: true,
@@ -40,7 +40,7 @@
     content?: string;
   }
 
-  function getSelectionFromUrl(url: URL): URLSelection {
+  function getSelectionFromUrl(url: typeof page.url): URLSelection {
     const selection: URLSelection = {};
 
     if (!building) {
@@ -117,7 +117,7 @@
     url.searchParams.set("content", encodeContent(code));
 
     try {
-      goto(url, { replaceState: true });
+      goto(url, { replace: true });
       await navigator.clipboard.writeText(url.toString());
       mockConsole.info("Link copied to clipboard!");
     } catch (e: any) {
@@ -138,7 +138,7 @@
 
 <div class="h-dvh">
   <SplitPane
-    type="horizontal"
+    type="columns"
     pos="280px"
     min="200px"
     max="40%"
@@ -151,7 +151,7 @@
         style:scrollbar-width="thin"
       >
         <h1 class="text-xl font-light mb-4">
-          <a target="_blank" href={resolve("/")}
+          <a target="_blank" href={resolve("")}
             ><span class="font-medium">jax-js-nonconsuming</span> REPL</a
           >
         </h1>
@@ -189,7 +189,7 @@
     {/snippet}
     {#snippet b()}
       <SplitPane
-        type="vertical"
+        type="rows"
         pos="-240px"
         min="10%"
         max="-64px"

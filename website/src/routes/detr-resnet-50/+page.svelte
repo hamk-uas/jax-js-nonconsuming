@@ -11,9 +11,9 @@
   } from "@hamk-uas/jax-js-nonconsuming";
   import { ONNXModel } from "@hamk-uas/jax-js-nonconsuming-onnx";
 
-  import { runBenchmark } from "$lib/benchmark";
-  import DownloadManager from "$lib/common/DownloadManager.svelte";
-  import { countMethodCalls, isMobile } from "$lib/profiling";
+  import { runBenchmark } from "#lib/benchmark.ts";
+  import DownloadManager from "#lib/common/DownloadManager.svelte";
+  import { countMethodCalls, isMobile } from "#lib/profiling.ts";
   import { COCO_CLASSES, stringToColor } from "./coco";
 
   const width = 800;
