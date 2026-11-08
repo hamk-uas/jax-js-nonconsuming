@@ -24,6 +24,7 @@ import type { JitId, JitStep } from "../frontend/jit";
 import type { PerformanceBeliefState } from "../microbench";
 import { Routine } from "../routine";
 import { isSymbolicSize } from "../shape";
+import { isTracing } from "../tracing";
 import { tuneNullopt, tuneWebgpu, type WebGPUTuneResult } from "../tuner";
 import {
   DEBUG,
@@ -614,6 +615,13 @@ export class WebGPUBackend implements Backend {
     }
     if (this.#profiling) {
       throw new Error("Profiling already active — call stopProfiling() first");
+    }
+    // Profiling and tracing both write pass timestamps, and a pass has one
+    // set of timestampWrites; pipelineSubmit gives profiling the passes.
+    if (isTracing()) {
+      throw new Error(
+        "Tracing is active — call profiler.stopTrace() before profileGpu()",
+      );
     }
     this.#profiling = {
       querySet: this.device.createQuerySet({
@@ -4895,7 +4903,9 @@ function pipelineSubmit(
     const filteredPasses = shader.passes.filter(({ grid }) => prod(grid) > 0);
     if (filteredPasses.length === 0) continue; // No work to do.
 
-    const slot = maybeAcquireTracingSlot(device);
+    // While profiling, the passes' timestamps belong to the profiler; a
+    // tracing slot would record an entry whose timestamps are never written.
+    const slot = profiling ? undefined : maybeAcquireTracingSlot(device);
     const bindGroup = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: [
@@ -4980,15 +4990,14 @@ function pipelineSubmit(
 
     for (let i = 0; i < filteredPasses.length; i++) {
       const grid = symbolicGrid ?? filteredPasses[i].grid;
-      const tracingTsw =
-        slot && !profiling
-          ? {
-              querySet: slot.batch.querySet,
-              beginningOfPassWriteIndex: i === 0 ? slot.beginIndex : undefined,
-              endOfPassWriteIndex:
-                i === filteredPasses.length - 1 ? slot.endIndex : undefined,
-            }
-          : undefined;
+      const tracingTsw = slot
+        ? {
+            querySet: slot.batch.querySet,
+            beginningOfPassWriteIndex: i === 0 ? slot.beginIndex : undefined,
+            endOfPassWriteIndex:
+              i === filteredPasses.length - 1 ? slot.endIndex : undefined,
+          }
+        : undefined;
       const passEncoder = _beginComputePass(
         commandEncoder,
         profiling,

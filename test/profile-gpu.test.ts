@@ -5,6 +5,7 @@ import {
   numpy as np,
   profileGpu,
   profiler,
+  random,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, test } from "vitest";
 
@@ -51,6 +52,39 @@ describe("profileGpu", () => {
       } finally {
         profiler.stopTrace();
       }
+    });
+
+    test("kernels dispatched while profiling are not traced", async () => {
+      defaultDevice("webgpu");
+      using key = random.key(0);
+      using a = random.uniform(key, [4096]);
+      await a.blockUntilReady();
+      const traced = () =>
+        performance
+          .getEntriesByType("measure")
+          .filter(
+            (m) =>
+              (m as PerformanceMeasure).detail?.devtools?.trackGroup ===
+              "JAX Profiler",
+          );
+      performance.clearMeasures();
+
+      await profileGpu(async () => {
+        profiler.startTrace();
+        try {
+          using y = a.mul(3);
+          await y.data();
+        } finally {
+          profiler.stopTrace();
+        }
+      });
+      // Trace entries are emitted when their timestamp readback completes;
+      // a later readback lets any pending ones arrive.
+      await a.data();
+
+      // Profiling owns the passes' timestamp writes; a trace entry here
+      // would show timestamps that were never written.
+      expect(traced()).toEqual([]);
     });
 
     test("empty body returns no passes", async () => {

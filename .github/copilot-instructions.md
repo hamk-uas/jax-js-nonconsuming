@@ -561,7 +561,8 @@ dimensions, workgroup size, shader label/hash, and pipeline cache hit/miss flags
 `_beginComputePass()`, and accumulates pass metadata (`grid`, `workgroupSize`, `label`) for
 `stopProfiling()` to resolve. Not public API. Uses 2 timestamp queries per pass, so the 4096-query
 WebGPU limit caps one profiling session at 2048 recorded passes (`truncated=true` beyond that).
-Profiling is intentionally not composable with `startTrace()`; stop tracing first.
+Profiling and tracing both write pass timestamps, so they exclude each other: `profileGpu()` rejects
+while tracing is active, and kernels dispatched while profiling are not traced.
 
 **Hook points:** WebGPU: `ShaderPipelineCache.prepare()` on cache miss. WASM: 14 sites across
 kernels, mega-module, scan, assoc-scan, block-map, and routines (all on cache miss).
