@@ -597,47 +597,14 @@ function tryPrepareWasmNativeScan(
         outputInternalIdx: internalBase,
       });
     } else if (source instanceof Routine) {
-      // Routine step: build routineCallInfo with static params
-      const routine = source;
-      const routineName = routine.name as Routines;
+      // Routine step. Module sizes come from routineInfos[routineInfoIdx]
+      // (getScanRoutineInfo), the single source for routine shape params.
       const routineInfoIdx = stepToRoutineInfoIdx.get(i)!;
       const internalBase = stepToInternalBase.get(i)!;
-      const numOutputs = routine.type.outputShapes.length;
+      const numOutputs = source.type.outputShapes.length;
       const outputInternalIndices: number[] = [];
       for (let outIdx = 0; outIdx < numOutputs; outIdx++) {
         outputInternalIndices.push(internalBase + outIdx);
-      }
-
-      // Build static params based on routine type
-      let staticParams: number[] = [];
-      if (routineName === Routines.Cholesky) {
-        const inputShape = routine.type.inputShapes[0];
-        staticParams = [inputShape[inputShape.length - 1]];
-      } else if (routineName === Routines.Sort) {
-        const inputShape = routine.type.inputShapes[0];
-        staticParams = [inputShape[inputShape.length - 1]];
-      } else if (routineName === Routines.TriangularSolve) {
-        const aShape = routine.type.inputShapes[0];
-        const bShape = routine.type.inputShapes[1];
-        const n = aShape[aShape.length - 1];
-        const batchRows = bShape[bShape.length - 1];
-        const numBatches = 1;
-        const unitDiagonal = routine.params?.unitDiagonal ? 1 : 0;
-        const lower = 0;
-        staticParams = [n, batchRows, numBatches, unitDiagonal, lower];
-      } else if (routineName === Routines.LU) {
-        const inputShape = routine.type.inputShapes[0];
-        const m = inputShape[inputShape.length - 2];
-        const n = inputShape[inputShape.length - 1];
-        staticParams = [m, n];
-      } else if (routineName === Routines.Argsort) {
-        const inputShape = routine.type.inputShapes[0];
-        staticParams = [inputShape[inputShape.length - 1]];
-      } else if (routineName === Routines.QR) {
-        const inputShape = routine.type.inputShapes[0];
-        const m = inputShape[inputShape.length - 2];
-        const n = inputShape[inputShape.length - 1];
-        staticParams = [m, n];
       }
 
       steps.push({
@@ -645,10 +612,7 @@ function tryPrepareWasmNativeScan(
         inputSlots,
         outputInternalIdx: internalBase,
         outputInternalIndices,
-        routineCallInfo: {
-          routineInfoIdx,
-          staticParams,
-        },
+        routineCallInfo: { routineInfoIdx },
       });
     }
   }

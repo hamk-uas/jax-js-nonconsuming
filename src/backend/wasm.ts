@@ -22,7 +22,7 @@ import { isSymbolicSize, type SizeExpr } from "../dim";
 import { Routine, Routines, runCpuRoutine } from "../routine";
 import { emitTrace, isTracing, traceSourceInfo } from "../tracing";
 import { tuneNullopt } from "../tuner";
-import { DEBUG, FpHash, mapSetUnion, rep, runWithCache } from "../utils";
+import { DEBUG, FpHash, mapSetUnion, prod, rep, runWithCache } from "../utils";
 import { WasmAllocator } from "./wasm/allocator";
 import {
   wasm_asin,
@@ -122,8 +122,8 @@ export interface GeneralScanStep {
   outputInternalIdx: number;
   outputInternalIndices?: number[];
   routineCallInfo?: {
+    /** Index into the scan's routineInfos (module sizes live there). */
     routineInfoIdx: number;
-    staticParams: number[];
   };
 }
 
@@ -758,7 +758,7 @@ export class WasmBackend implements Backend {
     const bShape = routine.type.inputShapes[1];
     const n = aShape[aShape.length - 1];
     const batchRows = bShape[bShape.length - 2]; // number of rows in B
-    const numBatches = aShape.slice(0, -2).reduce((a, b) => a * b, 1);
+    const numBatches = triangularSolveNumBatches(routine);
     const dtype = elementSize === 4 ? "f32" : "f64";
     const unitDiagonal = routine.params?.unitDiagonal ?? false;
     const lower = routine.params?.lower ?? false;
@@ -3073,7 +3073,8 @@ function codegenNativeScanGeneral(
             cg.local.get(internalsBase + internalIdx); // outPtr
           } else if (routineType === Routines.Sort) {
             // Copy input to internal buffer first (sort is in-place)
-            const sortSize = callInfo.staticParams[0];
+            const sortSize =
+              routineInfos![callInfo.routineInfoIdx].sizeParams[0];
             const elemSize = params.elementSize ?? 4;
             const copySize = sortSize * elemSize;
 
@@ -3088,6 +3089,7 @@ function codegenNativeScanGeneral(
             pushSlotPtr(step.inputSlots[0]); // aPtr
             pushSlotPtr(step.inputSlots[1]); // bPtr
             cg.local.get(internalsBase + internalIdx); // xPtr (output)
+            cg.i32.const(triangularSolveNumBatches(step.source)); // numBatches
           } else if (routineType === Routines.LU) {
             const outIndices = step.outputInternalIndices!;
             pushSlotPtr(step.inputSlots[0]); // aPtr
@@ -4567,6 +4569,11 @@ function codegenBlockedAssociativeScan(
   return { bytes, wat: traceEnabled ? cg.toWat() : undefined };
 }
 
+/** Number of independent A matrices (product of A's leading batch dims). */
+function triangularSolveNumBatches(routine: Routine): number {
+  return prod(routine.type.inputShapes[0].slice(0, -2));
+}
+
 export function getScanRoutineInfo(routine: Routine): ScanRoutineInfo | null {
   const routineName = routine.name as Routines;
   const isF64 = routine.type.inputDtypes[0] === DType.Float64;
@@ -4593,14 +4600,17 @@ export function getScanRoutineInfo(routine: Routine): ScanRoutineInfo | null {
       sizeParams: [n],
     };
   } else if (routineName === Routines.TriangularSolve) {
+    // Solves A @ X.T = B.T with B shaped [..., batchRows, n]. Uses the
+    // batched export, like #dispatchTriangularSolve: the plain
+    // "triangular_solve" export solves a single row of B.
     const aShape = routine.type.inputShapes[0];
     const bShape = routine.type.inputShapes[1];
     const n = aShape[aShape.length - 1];
-    const batchRows = bShape[bShape.length - 1];
+    const batchRows = bShape[bShape.length - 2];
     return {
       routine: routineName,
-      exportName: "triangular_solve",
-      numParams: 3,
+      exportName: "triangular_solve_batched",
+      numParams: 4,
       dtype,
       sizeParams: [n, batchRows],
       unitDiagonal: routine.params?.unitDiagonal ?? false,

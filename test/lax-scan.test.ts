@@ -909,6 +909,44 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       outputs.dispose();
       f.dispose();
     });
+
+    // n > TRISOLVE_UNROLL_LIMIT (8) so the body keeps the TriangularSolve
+    // routine instead of the unrolled polyfill, and B has fewer rows (3) than
+    // A has columns (10), so the routine's batchRows parameter is exercised.
+    it("scan with TriangularSolve routine, B rows != n", async ({ skip }) => {
+      if (device === "webgl") skip(); // no TriangularSolve routine on WebGL
+      const n = 10;
+      const aData = Array.from({ length: n }, (_, i) =>
+        Array.from({ length: n }, (_, j) =>
+          j < i ? 0 : j === i ? 2 + i / n : 0.1 / (1 + j - i),
+        ),
+      );
+      using a = np.array(aData);
+      using xs = np.array(
+        Array.from({ length: 4 }, (_, t) =>
+          Array.from({ length: 3 }, (_, r) =>
+            Array.from({ length: n }, (_, c) => Math.sin(1 + t + 3 * r + c)),
+          ),
+        ),
+      );
+      const step = (carry: np.Array, b: np.Array): [np.Array, np.Array] => [
+        np.add(carry, 1),
+        lax.linalg.triangularSolve(a, b),
+      ];
+      using f = jit((bs: np.Array) =>
+        lax.scan(step, np.array(0.0), bs, {
+          // On WASM this must take the native path that the bug lived in.
+          acceptPath: device === "wasm" ? ["compiled-loop"] : undefined,
+        }),
+      );
+      const [count, solutions] = f(xs) as [np.Array, np.Array];
+      using _count = count;
+      using _solutions = solutions;
+      expect(solutions.shape).toEqual([4, 3, n]);
+      // Default triangularSolve solves X @ A = B; check the residual directly.
+      using reconstructed = np.matmul(solutions, a);
+      expect(reconstructed).toBeAllclose(xs, { atol: 1e-4 });
+    });
   });
 
   describe("acceptPath option", () => {
