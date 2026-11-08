@@ -177,10 +177,13 @@ login. See `chromiumLaunchOptions()` in `test/gpu-config.ts`.
 **Missing backends and GPU errors fail tests:** when a GPU is detected (and always in the GPU
 configs), `test/setup.ts` requires WebGPU and WebGL to initialize in every test file and fails the
 file otherwise; before, a broken GPU setup turned every GPU case into a skip and the run passed.
-`JAX_REQUIRE_DEVICES` overrides the list. Every test also runs inside WebGPU error scopes
-(validation, out-of-memory, internal): an invalid GPU call does not throw, so without the scopes it
-was only logged. Errors outside any test fail the next test or the file. Never silence these; fix
-the invalid call.
+`JAX_REQUIRE_DEVICES` overrides the list. An invalid GPU call does not throw, it is only reported
+asynchronously, so `test/webgpu-errors.ts` makes WebGPU errors fail tests: every test runs inside
+error scopes (validation, out-of-memory, internal), and every `GPUDevice` gets an `uncapturederror`
+listener when it is created, so errors while a test module loads fail its first test and errors
+after the last test fail the file (`afterAll` makes each device process work first; Dawn reports
+errors only then). A test that provokes an error on purpose declares it with
+`expectWebGpuError(pattern)`. Never silence these otherwise; fix the invalid call.
 
 **At most 4 test files at once:** all files run in one Chromium, whose single GPU process compiles
 every file's shaders. At vitest's default concurrency (CPU count − 1) that queue pushed tests past

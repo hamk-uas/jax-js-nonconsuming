@@ -10,6 +10,17 @@ import {
 } from "@hamk-uas/jax-js-nonconsuming";
 import { afterAll, afterEach, beforeEach, expect, inject } from "vitest";
 
+import {
+  beginTestGpuErrors,
+  captureErrorsOfNewDevices,
+  endTestGpuErrors,
+  remainingGpuErrors,
+} from "./webgpu-errors";
+
+// Before anything requests a GPUDevice, so that errors raised while a test
+// module loads are caught too; see test/webgpu-errors.ts.
+captureErrorsOfNewDevices();
+
 // Backends this run requires (see requiredDevices() in test/gpu-config.ts).
 // A required backend that fails to initialize fails the file here, instead of
 // turning every test for it into a skip.
@@ -25,22 +36,8 @@ if (required.length > 0) {
   }
 }
 
-// WebGPU errors: an invalid call does not throw, it only produces an error
-// event, which the backend merely logs. Each test runs inside error scopes so
-// that errors from its own calls fail it; errors outside any test (module
-// setup, work completing after a test) are collected by a listener and fail
-// the next test, or the file.
-const gpuErrorFilters: GPUErrorFilter[] = [
-  "validation",
-  "out-of-memory",
-  "internal",
-];
-const uncapturedGpuErrors: string[] = [];
-const listenedDevices = new WeakSet<GPUDevice>();
-let scopedDevice: GPUDevice | undefined;
-
 function webGpuDevice(): GPUDevice | undefined {
-  // getWebGPUDevice() throws until a test file has initialized WebGPU.
+  // getWebGPUDevice() throws until the test file has initialized WebGPU.
   try {
     return getWebGPUDevice();
   } catch {
@@ -48,42 +45,18 @@ function webGpuDevice(): GPUDevice | undefined {
   }
 }
 
-function beginGpuErrorScopes(): void {
-  scopedDevice = webGpuDevice();
-  if (!scopedDevice) return;
-  if (!listenedDevices.has(scopedDevice)) {
-    listenedDevices.add(scopedDevice);
-    scopedDevice.addEventListener("uncapturederror", (event) => {
-      uncapturedGpuErrors.push(event.error.message);
-    });
-  }
-  for (const filter of gpuErrorFilters) scopedDevice.pushErrorScope(filter);
-}
-
-async function endGpuErrorScopes(): Promise<string[]> {
-  const errors = uncapturedGpuErrors.splice(0);
-  if (scopedDevice) {
-    for (let i = 0; i < gpuErrorFilters.length; i++) {
-      const error = await scopedDevice.popErrorScope();
-      if (error) errors.push(error.message);
-    }
-    scopedDevice = undefined;
-  }
-  return errors;
-}
-
 beforeEach(() => {
   // Enable ownership diagnostics. JIT compile logs and [jax-js] warnings
   // are suppressed by vitest for passing tests; shown on failure for
   // debugging. Ownership warnings surface via the library regression test.
   setDebug(1);
-  beginGpuErrorScopes();
+  beginTestGpuErrors(webGpuDevice());
   checkLeaks.start();
 });
 
 afterEach(async () => {
   // Both checks run before either assertion, so the scopes are always popped.
-  const gpuErrors = await endGpuErrorScopes();
+  const gpuErrors = await endTestGpuErrors();
   const result = checkLeaks.stop();
   expect(gpuErrors, "WebGPU errors").toEqual([]);
   expect(result.leaked, result.summary).toBe(0);
@@ -92,7 +65,7 @@ afterEach(async () => {
 // Tear down background workers so vitest/Playwright can exit cleanly.
 // Without this, WasmWorkerPool and OrchestratorWorker threads keep the
 // browser tab alive indefinitely after all tests complete.
-afterAll(() => {
+afterAll(async () => {
   for (const dev of devices) {
     try {
       const b = getBackend(dev) as any;
@@ -103,10 +76,8 @@ afterAll(() => {
       // Backend may not be initialized; ignore.
     }
   }
-  expect(
-    uncapturedGpuErrors.splice(0),
-    "WebGPU errors after the last test",
-  ).toEqual([]);
+  const gpuErrors = await remainingGpuErrors();
+  expect(gpuErrors, "WebGPU errors after the last test").toEqual([]);
 });
 
 expect.extend({
