@@ -503,22 +503,29 @@ and 6.
    `test/webgpu-errors.test.ts` proves both the module-load and the in-test case. Round 3
    ([phase-0-3.md](remediation/reviews/phase-0-3.md)) passed.
 
-After round 3, outside the reviewed range (the next review covers it): in all three rounds the
-reviewer could not run checklist item 7 as written (`history-churn.py` needed matplotlib and wrote
-into `remediation/`) and re-implemented it; its `src` scope then read "zero rework". Review mode
-(`--since`) now writes nothing, needs only Python, and also reports the `code` scope. That scope
-shows phase 0's own fix-on-fix, all in the test harness: `43b61eb` redoes 21 lines of `bef6bb1`
-(round 1, finding 1), `648d367` redoes 42 lines of `82bb49d` (round 2, F2.1), and smaller ones in
-`8fbf8c8` (the wrong cause given in `fb8ea22`) and `a32d106`. Each was caught before sign-off, the
-two largest by the reviews.
+After round 3 (now covered by [dependency round 1](remediation/reviews/dependencies-1.md)): in all
+three rounds the reviewer could not run checklist item 7 as written (`history-churn.py` needed
+matplotlib and wrote into `remediation/`) and re-implemented it; its `src` scope then read "zero
+rework". Review mode (`--since`) now writes nothing, needs only Python, and also reports the `code`
+scope. That scope shows phase 0's own fix-on-fix, all in the test harness: `43b61eb` redoes 21 lines
+of `bef6bb1` (round 1, finding 1), `648d367` redoes 42 lines of `82bb49d` (round 2, F2.1), and
+smaller ones in `8fbf8c8` (the wrong cause given in `fb8ea22`) and `a32d106`. Each was caught before
+sign-off, the two largest by the reviews.
 
-Also outside the reviewed range: dependency updates between phases 0 and 1, at the human's request
+Also covered by that review: dependency updates between phases 0 and 1, at the human's request
 (`a31d05b` within the declared ranges, then majors in groups). Vitest 5 runs benchmarks as tests, so
 `test/setup.ts`'s per-test hooks reach them: `*.bench.ts` files get debug level 0 and a
 slot-count-only leak check (`checkLeaks.start({ trackSites: false })`). Creation-site tracking made
 a small eager chain ~2.5× slower; the count-only check measured within noise. Migrating the
 benchmarks found R26–R28; running typedoc for the TypeScript update found R29. TypeScript stays at
 6.0 until typescript-eslint, typedoc and svelte-check support 7.
+
+**Dependency review:** round 1 found one new P2 regression: ESLint 10's per-file configuration
+discovery left `lint:scan-dispose:website` without the root plugin. `3a2aaea` adds explicit root
+configuration selection. [Round 2](remediation/reviews/dependencies-2.md) passes: both website
+ownership commands exit 0 and independently reject undisposed scan outputs. Round 1's validation
+scope and limitations carry forward; R24 and R26–R29 remain open. This does not reopen Phase 0 or
+sign off Phase 1.
 
 **Exit:** working tree clean; `pnpm build && pnpm check && pnpm test` green on
 `wasm-multithreading`, in a fresh clone after `pnpm install`; a review report
