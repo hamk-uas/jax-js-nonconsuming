@@ -3,10 +3,15 @@ import { defineConfig } from "vitest/config";
 
 import {
   BROWSER_MAX_WORKERS,
-  chromiumEnv,
-  COMMON_ARGS,
+  chromiumLaunchOptions,
+  describeGpuSetup,
+  detectGpu,
+  requiredDevices,
   workspaceAliases,
 } from "./test/gpu-config";
+
+const gpu = detectGpu();
+describeGpuSetup(gpu);
 
 export default defineConfig({
   resolve: {
@@ -34,16 +39,8 @@ export default defineConfig({
       enabled: true,
       headless: true,
       screenshotFailures: false,
-      provider: playwright({
-        launchOptions: {
-          args: [
-            ...COMMON_ARGS,
-            "--enable-dawn-features=vulkan_enable_f16_on_nvidia",
-          ],
-          // No display server, one Vulkan driver; see chromiumEnv().
-          env: chromiumEnv(),
-        },
-      }),
+      // No display server, one Vulkan driver; see chromiumLaunchOptions().
+      provider: playwright({ launchOptions: chromiumLaunchOptions(gpu) }),
       instances: [{ browser: "chromium" }],
     },
     coverage: {
@@ -55,6 +52,8 @@ export default defineConfig({
     // and GPUDevice; they share the Chromium GPU process, which bounds useful
     // concurrency (see BROWSER_MAX_WORKERS).
     maxWorkers: BROWSER_MAX_WORKERS,
+    // A detected GPU must initialize; see requiredDevices().
+    provide: { requiredDevices: requiredDevices(gpu) },
     testTimeout: 10000,
     passWithNoTests: true,
     exclude: [

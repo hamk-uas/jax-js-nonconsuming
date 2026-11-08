@@ -552,12 +552,14 @@ vulkaninfo --summary   # Should show your GPU device
 5. **One Vulkan driver** — on machines with several GPUs (e.g. integrated + discrete), set
    `VK_DRIVER_FILES` to a single driver manifest such as `/usr/share/vulkan/icd.d/nvidia_icd.json`.
    Otherwise Chromium may composite canvases on a different GPU than WebGPU uses, so synchronous
-   readback (`dataSync()`) returns zeros and WebGL2 is unavailable. `chromiumEnv()` in
-   `test/gpu-config.ts` does this automatically.
+   readback (`dataSync()`) returns zeros and WebGL2 is unavailable. `test/gpu-config.ts` does this
+   automatically: `detectGpu()` picks the first GPU present (from `/sys/class/drm`) whose Vulkan
+   driver is installed, NVIDIA, then AMD, then Intel. Installed manifests alone say nothing, since
+   Mesa installs the Intel and Radeon ones on every machine.
 6. **No root / no sandbox** — the `--no-sandbox` flag avoids permission issues in containers or
    non-root environments.
 
-The full set of Chrome flags used (configured in `vitest.config.ts`):
+The full set of Chrome flags used (configured in `test/gpu-config.ts`):
 
 ```
 --no-sandbox --headless=new --use-angle=vulkan --enable-features=Vulkan
@@ -566,8 +568,10 @@ The full set of Chrome flags used (configured in `vitest.config.ts`):
 
 **Troubleshooting:**
 
-- If WebGPU tests are skipped, check `vulkaninfo --summary` and ensure your GPU driver is installed,
-  then check items 4 and 5 above.
+- When a GPU is detected, every test file requires WebGPU and WebGL: if either fails to initialize,
+  the file fails with "Required backend(s) did not initialize" instead of skipping its GPU tests.
+  Check `vulkaninfo --summary` and that your GPU driver is installed, then items 4 and 5 above.
+  `JAX_REQUIRE_DEVICES` overrides the requirement (comma-separated list; empty for none).
 - If `dataSync()` on WebGPU returns all zeros or WebGL is unavailable, restrict `VK_DRIVER_FILES` to
   one GPU (item 5).
 - COOP/COEP headers (required for `SharedArrayBuffer`) are configured in `vitest.config.ts`.

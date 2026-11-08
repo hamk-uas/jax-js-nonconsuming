@@ -1,11 +1,28 @@
 import {
   checkLeaks,
+  type Device,
   devices,
   getBackend,
+  init,
   numpy as np,
   setDebug,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { afterAll, afterEach, beforeEach, expect } from "vitest";
+import { afterAll, afterEach, beforeEach, expect, inject } from "vitest";
+
+// Backends this run requires (see requiredDevices() in test/gpu-config.ts).
+// A required backend that fails to initialize fails the file here, instead of
+// turning every test for it into a skip.
+const required = inject("requiredDevices") as Device[];
+if (required.length > 0) {
+  const initialized = await init(...required);
+  const missing = required.filter((d) => !initialized.includes(d));
+  if (missing.length > 0) {
+    throw new Error(
+      `Required backend(s) did not initialize: ${missing.join(", ")}. ` +
+        "Set JAX_REQUIRE_DEVICES to change the requirement.",
+    );
+  }
+}
 
 beforeEach(() => {
   // Enable ownership diagnostics. JIT compile logs and [jax-js] warnings

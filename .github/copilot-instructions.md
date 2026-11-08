@@ -163,15 +163,21 @@ pnpm vitest run <file> -c test/vitest.intel.config.ts
 
 **GPU config architecture:** `test/gpu-config.ts` is the shared factory;
 `test/vitest.nvidia.config.ts` and `test/vitest.intel.config.ts` are thin wrappers. The default
-`vitest.config.ts` reuses its `workspaceAliases`, `COMMON_ARGS` and `chromiumEnv()`. Intel OOMs on
-4096×4096 — bench files must handle this gracefully.
+`vitest.config.ts` reuses its `workspaceAliases`, `detectGpu()`, `chromiumLaunchOptions()` and
+`requiredDevices()`. `detectGpu()` picks a GPU by the hardware present (`/sys/class/drm` PCI vendor
+IDs) and its installed Vulkan driver, never by driver manifests alone: Mesa installs the Intel and
+Radeon manifests everywhere. Intel OOMs on 4096×4096 — bench files must handle this gracefully.
 
 **No display server for browser tests:** Chromium runs with no `DISPLAY`/`XAUTHORITY` (headless
 WebGPU and WebGL need none, and an unusable X server makes `requestAdapter()` return null) and with
 `VK_DRIVER_FILES` restricted to one GPU (with several GPUs visible, canvas-based `dataSync()`
 readback returns zeros and WebGL2 is unavailable). Tests therefore run over SSH without a desktop
-login. If WebGPU/WebGL cases show as skipped (`↓`), the backend failed to initialize — treat that as
-a failure, not as a pass. See `chromiumEnv()` in `test/gpu-config.ts`.
+login. See `chromiumLaunchOptions()` in `test/gpu-config.ts`.
+
+**Missing backends fail tests:** when a GPU is detected (and always in the GPU configs),
+`test/setup.ts` requires WebGPU and WebGL to initialize in every test file and fails the file
+otherwise; before, a broken GPU setup turned every GPU case into a skip and the run passed.
+`JAX_REQUIRE_DEVICES` overrides the list.
 
 **At most 4 test files at once:** all files run in one Chromium, whose single GPU process compiles
 every file's shaders. At vitest's default concurrency (CPU count − 1) that queue pushed tests past
