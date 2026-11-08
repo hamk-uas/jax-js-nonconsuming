@@ -374,20 +374,16 @@ function _escapeRegex(s: string): string {
 }
 
 function _bytesToHex(arr: Uint8Array): string {
-  // Use Uint8Array.toHex() if available (2025 baseline).
-  if ("toHex" in Uint8Array.prototype) {
-    return (arr as any).toHex();
-  }
+  // Uint8Array.prototype.toHex() is baseline since 2025; older runtimes lack it.
+  if (typeof arr.toHex === "function") return arr.toHex();
   return Array.from(arr)
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
 
 function _bytesFromHex(hex: string): Uint8Array {
-  // Use Uint8Array.fromHex() if available (2025 baseline).
-  if ("fromHex" in Uint8Array) {
-    return (Uint8Array as any).fromHex(hex);
-  }
+  // Uint8Array.fromHex() is baseline since 2025; older runtimes lack it.
+  if (typeof Uint8Array.fromHex === "function") return Uint8Array.fromHex(hex);
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < bytes.length; i++) {
     bytes[i] = parseInt(hex.substring(2 * i, 2 * i + 2), 16);

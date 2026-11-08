@@ -322,6 +322,7 @@ debt (**D**) and process gaps (**P**).
 | R26 | `bench/tts.bench.ts` (`74a8e11`) never ran: `// @ts-nocheck` and `/* eslint-disable */` hid that its model builders index the single `Array` returned by `random.split()` as `keys[0]`, which is `undefined`, so building the model threw. Its loops also discarded the KV caches each jitted layer returns (~3 MB of GPU memory per iteration) and every PRNG key and pre-`astype` array. Deleted in the vitest 5 migration; a replacement should drive the website's model code (`website/src/routes/tts/pocket-tts.ts`) with random weights instead of a 600-line copy                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | S     | 1     |
 | R27 | The JIT compile cache key (backend, jaxpr hash, calibration values) left out module state that changes the compiled program. `_setConvRewriteEnabled(false)` reused programs compiled with the rewrite on, so the conv2d "C.3 block_map vs generic-dot" benchmark ran generic-dot in both arms (it also called `clearCaches()` while collecting, before anything ran); fixed in the vitest 5 migration with a regression test. Still open: `_skipForiRewrite`, set while compiling nested bodies, so a jaxpr first compiled as a body is reused at top level without the foriLoop rewrite                                                                                                                                                                                                                                                                                                                                                                                                                                                        | D     | 3     |
 | R28 | On WebGPU the Conv→BlockMap rewrite (on by default) makes jitted 3×3 SAME convs 3–70× slower than the generic-dot lowering it replaces: NVIDIA B8×128ch×64² 166 ms vs 2.4 ms, B1×32ch×64² 6.5 vs 2.3 ms; Intel B8×128ch×64² 482 vs 14.6 ms (`bench/conv2d.bench.ts`, rewrite on/off with the same jit function; calibration makes it no faster). The agent docs (P4) report 1.06–1.61× speedups and 4.48 ms for the B8 case. On WASM the rewrite is 1.2–1.4× faster. Not yet bisected                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | D     | 3     |
+| R29 | `pnpm run docs` (typedoc) writes to `docs/` and empties it first, deleting the tracked `docs/array-manipulation-patterns.md` that `FEATURES.md` and `PLAN.md` link to (the rest of `docs/` is gitignored). Phase 6 item 1 would put ADRs in `docs/architecture/`, in the same directory                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | D     | 6     |
 
 ---
 
@@ -516,7 +517,8 @@ Also outside the reviewed range: dependency updates between phases 0 and 1, at t
 `test/setup.ts`'s per-test hooks reach them: `*.bench.ts` files get debug level 0 and a
 slot-count-only leak check (`checkLeaks.start({ trackSites: false })`). Creation-site tracking made
 a small eager chain ~2.5× slower; the count-only check measured within noise. Migrating the
-benchmarks found R26–R28.
+benchmarks found R26–R28; running typedoc for the TypeScript update found R29. TypeScript stays at
+6.0 until typescript-eslint, typedoc and svelte-check support 7.
 
 **Exit:** working tree clean; `pnpm build && pnpm check && pnpm test` green on
 `wasm-multithreading`, in a fresh clone after `pnpm install`; a review report
@@ -638,7 +640,7 @@ commits made before the remediation, which no review has covered (see Branches).
 
 **Exit:** every rule in `verifyJaxprEffects` has a test that triggers it; the verifier runs in CI.
 
-### Phase 6 — Documentation truth and API surface (R10, R15, R22)
+### Phase 6 — Documentation truth and API surface (R10, R15, R22, R29)
 
 1. Split `.github/copilot-instructions.md` (1,198 lines) into short agent rules plus
    `docs/architecture/` ADRs; benchmarks and roadmaps move out of agent instructions.
@@ -655,6 +657,8 @@ commits made before the remediation, which no review has covered (see Branches).
    migration note (callers delete their `calibrateGpu()` call).
 6. Decide whether `clearCaches()` also clears the WASM module and routine caches (deferred from
    phase 0, item 3; the quarantined patch does it), and make the cache table match.
+7. Give typedoc an output directory of its own (R29) before item 1 adds hand-written docs, and move
+   `docs/array-manipulation-patterns.md` out of the generated tree.
 
 **Exit:** doc-symbol check green in CI; `src/index.ts` exports no underscore-prefixed test hooks.
 
