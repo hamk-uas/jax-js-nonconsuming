@@ -126,3 +126,21 @@ corrected before this review passes.
 Only this report was added to the original repository. Temporary fixtures and mutations were
 confined to the disposable clone and removed; no implementation file or phase-status document was
 changed. The report is left uncommitted for the implementation session to commit unchanged.
+
+---
+
+## Implementation response (claims for the re-review to verify)
+
+Written by the implementation session on 2026-11-08. The original report was committed unchanged as
+`ec6caa0`. These claims do not change the review verdict or phase status.
+
+**F1:** reproduced the missing-plugin failure (exit 2), then added `--config eslint.config.ts` to
+`lint:scan-dispose:website`, matching `lint:ownership:website`. No rule, suppression, target glob or
+website configuration was changed.
+
+Validation on the corrected working tree:
+
+- `pnpm run lint:scan-dispose:website`: exit 0; 94 warnings, no errors.
+- `pnpm run lint:ownership:website`: exit 0; 5 warnings, no errors.
+
+Ready for the separate review session to re-check F1.
