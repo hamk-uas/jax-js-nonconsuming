@@ -1,35 +1,12 @@
-import path from "node:path";
-
 import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
 
+import { chromiumEnv, COMMON_ARGS, workspaceAliases } from "./test/gpu-config";
+
 export default defineConfig({
   resolve: {
-    alias: {
-      // Resolve ALL workspace packages to their TypeScript sources so that
-      // tests work without a prior `pnpm build` step.  The root package
-      // alias is essential: without it, test/*.test.ts imports resolve to
-      // dist/index.js while src/*.test.ts uses relative imports, creating
-      // two module graphs where `instanceof Tracer` fails and leak
-      // detection sees mismatched singletons.
-      "@hamk-uas/jax-js-nonconsuming": path.resolve(__dirname, "src/index.ts"),
-      "@hamk-uas/jax-js-nonconsuming-jaxopt": path.resolve(
-        __dirname,
-        "packages/jaxopt/src/index.ts",
-      ),
-      "@hamk-uas/jax-js-nonconsuming-optax": path.resolve(
-        __dirname,
-        "packages/optax/src/index.ts",
-      ),
-      "@hamk-uas/jax-js-nonconsuming-onnx": path.resolve(
-        __dirname,
-        "packages/onnx/src/index.ts",
-      ),
-      "@hamk-uas/jax-js-nonconsuming-loaders": path.resolve(
-        __dirname,
-        "packages/loaders/src/index.ts",
-      ),
-    },
+    // Workspace packages resolve to TypeScript sources; see test/gpu-config.ts.
+    alias: workspaceAliases,
   },
   esbuild: {
     supported: {
@@ -55,20 +32,11 @@ export default defineConfig({
       provider: playwright({
         launchOptions: {
           args: [
-            "--no-sandbox",
-            "--headless=new",
-            "--use-angle=vulkan",
-            "--enable-features=Vulkan",
-            "--disable-vulkan-surface",
-            "--enable-unsafe-webgpu",
+            ...COMMON_ARGS,
             "--enable-dawn-features=vulkan_enable_f16_on_nvidia",
           ],
-          env: {
-            DISPLAY: process.env.DISPLAY ?? ":0",
-            XAUTHORITY:
-              process.env.XAUTHORITY ??
-              `/run/user/${process.getuid?.() ?? 1000}/gdm/Xauthority`,
-          },
+          // No display server, one Vulkan driver; see chromiumEnv().
+          env: chromiumEnv(),
         },
       }),
       instances: [{ browser: "chromium" }],

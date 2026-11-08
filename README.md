@@ -545,10 +545,16 @@ vulkaninfo --summary   # Should show your GPU device
    includes the Dawn WebGPU implementation.
 3. **Secure context** — WebGPU requires `isSecureContext === true`. Vitest's dev server serves on
    `localhost`, which qualifies automatically. Direct `about:blank` navigation would not.
-4. **Display server** — even in headless mode, Chrome needs access to a display for GPU
-   initialization. On Linux, ensure `DISPLAY` is set (X11) or a Wayland session is active. The
-   config passes `DISPLAY` and `XAUTHORITY` from the environment.
-5. **No root / no sandbox** — the `--no-sandbox` flag avoids permission issues in containers or
+4. **No display server** — headless Chromium needs no X or Wayland session for WebGPU or WebGL;
+   tests run fine over SSH with nobody logged in. Do not pass `DISPLAY`/`XAUTHORITY` to Chromium: if
+   it points at an X server Chromium cannot use (e.g. a login screen), `requestAdapter()` returns
+   `null` and every WebGPU test is skipped.
+5. **One Vulkan driver** — on machines with several GPUs (e.g. integrated + discrete), set
+   `VK_DRIVER_FILES` to a single driver manifest such as `/usr/share/vulkan/icd.d/nvidia_icd.json`.
+   Otherwise Chromium may composite canvases on a different GPU than WebGPU uses, so synchronous
+   readback (`dataSync()`) returns zeros and WebGL2 is unavailable. `chromiumEnv()` in
+   `test/gpu-config.ts` does this automatically.
+6. **No root / no sandbox** — the `--no-sandbox` flag avoids permission issues in containers or
    non-root environments.
 
 The full set of Chrome flags used (configured in `vitest.config.ts`):
@@ -560,8 +566,10 @@ The full set of Chrome flags used (configured in `vitest.config.ts`):
 
 **Troubleshooting:**
 
-- If WebGPU tests are skipped, check `vulkaninfo --summary` and ensure your GPU driver is installed.
-- On headless servers (no display), use `Xvfb` or a virtual framebuffer.
+- If WebGPU tests are skipped, check `vulkaninfo --summary` and ensure your GPU driver is installed,
+  then check items 4 and 5 above.
+- If `dataSync()` on WebGPU returns all zeros or WebGL is unavailable, restrict `VK_DRIVER_FILES` to
+  one GPU (item 5).
 - COOP/COEP headers (required for `SharedArrayBuffer`) are configured in `vitest.config.ts`.
 
 #### Using this config in downstream libraries
@@ -601,11 +609,10 @@ export default defineConfig({
             "--disable-vulkan-surface",
             "--enable-unsafe-webgpu",
           ],
-          env: {
-            DISPLAY: process.env.DISPLAY ?? ":0",
-            XAUTHORITY:
-              process.env.XAUTHORITY ?? `/run/user/${process.getuid?.() ?? 1000}/gdm/Xauthority`,
-          },
+          // Chromium gets exactly this environment. No DISPLAY/XAUTHORITY.
+          // On multi-GPU machines, pick one Vulkan driver, e.g.:
+          // env: { VK_DRIVER_FILES: "/usr/share/vulkan/icd.d/nvidia_icd.json" },
+          env: {},
         },
       }),
       instances: [{ browser: "chromium" }],

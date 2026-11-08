@@ -162,14 +162,16 @@ pnpm vitest run <file> -c test/vitest.intel.config.ts
 ```
 
 **GPU config architecture:** `test/gpu-config.ts` is the shared factory;
-`test/vitest.nvidia.config.ts` and `test/vitest.intel.config.ts` are thin wrappers. Intel needs
-`VK_DRIVER_FILES` to bypass NVIDIA's default Vulkan adapter priority. Intel OOMs on 4096×4096 —
-bench files must handle this gracefully.
+`test/vitest.nvidia.config.ts` and `test/vitest.intel.config.ts` are thin wrappers. The default
+`vitest.config.ts` reuses its `workspaceAliases`, `COMMON_ARGS` and `chromiumEnv()`. Intel OOMs on
+4096×4096 — bench files must handle this gracefully.
 
-**DISPLAY for GPU tests:** Headless Chromium still needs a running X server to initialize the GPU
-adapter. The GPU config auto-detects `DISPLAY` by scanning `/tmp/.X11-unix/` for X server sockets
-(falls back to `:0`). If GPU tests silently skip all WebGPU cases, check `ls /tmp/.X11-unix/` and
-verify the detected socket matches a running X server.
+**No display server for browser tests:** Chromium runs with no `DISPLAY`/`XAUTHORITY` (headless
+WebGPU and WebGL need none, and an unusable X server makes `requestAdapter()` return null) and with
+`VK_DRIVER_FILES` restricted to one GPU (with several GPUs visible, canvas-based `dataSync()`
+readback returns zeros and WebGL2 is unavailable). Tests therefore run over SSH without a desktop
+login. If WebGPU/WebGL cases show as skipped (`↓`), the backend failed to initialize — treat that as
+a failure, not as a pass. See `chromiumEnv()` in `test/gpu-config.ts`.
 
 **Pre-commit CI checks**: Husky runs `lint-staged`, then build + check + lint + tests. The
 pre-commit hook (`scripts/precommit.sh`) also runs WebGPU-only correctness tests via

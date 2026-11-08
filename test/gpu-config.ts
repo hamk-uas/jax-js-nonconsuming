@@ -1,8 +1,9 @@
 /**
- * Shared GPU vitest config factory.
+ * Shared browser-test config: workspace aliases, Chromium environment, and the
+ * GPU-specific vitest config factory.
  *
- * Both NVIDIA and Intel GPU configs use this factory so that launch args,
- * server headers, aliases, and timeouts stay in sync.
+ * `vitest.config.ts` (default suite) and the per-GPU configs both use the
+ * aliases and `chromiumEnv()` from here so they cannot drift apart.
  *
  * Usage from a GPU config:
  *   import { gpuConfig } from "./gpu-config";
@@ -12,46 +13,39 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { playwright } from "@vitest/browser-playwright";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
+
+const ROOT = path.resolve(__dirname, "..");
 
 /**
- * Auto-detect DISPLAY by scanning /tmp/.X11-unix/ for X server sockets.
- * If process.env.DISPLAY is set, validate that its socket exists before
- * trusting it — stale DISPLAY values (e.g. `:0` when X server is at `:1`)
- * cause silent WebGPU adapter failures.
- * Falls back to ":0" if detection fails or no sockets are found.
+ * Resolve every workspace package to its TypeScript source, so tests need no
+ * prior `pnpm build`. The root package alias is essential: without it,
+ * test/*.test.ts imports resolve to dist/index.js while src/*.test.ts uses
+ * relative imports, creating two module graphs where `instanceof Tracer`
+ * fails and leak detection sees mismatched singletons.
  */
-function detectDisplay(): string {
-  if (process.env.DISPLAY) {
-    // Validate that the socket for this DISPLAY actually exists.
-    const m = process.env.DISPLAY.match(/^:(\d+)/);
-    if (m) {
-      try {
-        fs.accessSync(`/tmp/.X11-unix/X${m[1]}`);
-        return process.env.DISPLAY;
-      } catch {
-        // Socket doesn't exist — fall through to auto-detect.
-      }
-    } else {
-      // Non-local DISPLAY (e.g. host:0) — trust it.
-      return process.env.DISPLAY;
-    }
-  }
-  try {
-    const entries = fs.readdirSync("/tmp/.X11-unix");
-    // Entries look like "X0", "X1", etc. Pick the first one.
-    for (const e of entries) {
-      const m = e.match(/^X(\d+)$/);
-      if (m) return `:${m[1]}`;
-    }
-  } catch {
-    // /tmp/.X11-unix doesn't exist or isn't readable
-  }
-  return ":0";
-}
+export const workspaceAliases = {
+  "@hamk-uas/jax-js-nonconsuming": path.join(ROOT, "src/index.ts"),
+  "@hamk-uas/jax-js-nonconsuming-jaxopt": path.join(
+    ROOT,
+    "packages/jaxopt/src/index.ts",
+  ),
+  "@hamk-uas/jax-js-nonconsuming-optax": path.join(
+    ROOT,
+    "packages/optax/src/index.ts",
+  ),
+  "@hamk-uas/jax-js-nonconsuming-onnx": path.join(
+    ROOT,
+    "packages/onnx/src/index.ts",
+  ),
+  "@hamk-uas/jax-js-nonconsuming-loaders": path.join(
+    ROOT,
+    "packages/loaders/src/index.ts",
+  ),
+};
 
-/** Chromium args shared by all GPU configs. */
-const COMMON_ARGS = [
+/** Chromium args shared by all browser test configs. */
+export const COMMON_ARGS = [
   "--no-sandbox",
   "--headless=new",
   "--use-angle=vulkan",
@@ -60,22 +54,48 @@ const COMMON_ARGS = [
   "--enable-unsafe-webgpu",
 ];
 
-/** Per-GPU overrides: extra Chromium args and env vars. */
+/** Per-GPU overrides: extra Chromium args and the Vulkan driver manifest. */
 const GPU_PROFILES = {
   nvidia: {
     args: ["--enable-dawn-features=vulkan_enable_f16_on_nvidia"],
-    env: {},
+    vulkanIcd: "/usr/share/vulkan/icd.d/nvidia_icd.json",
   },
   intel: {
     args: ["--use-vulkan=native", "--force-gpu-mem-available-mb=4096"],
-    env: {
-      // Force Vulkan loader to only load the Intel mesa driver.
-      VK_DRIVER_FILES: "/usr/share/vulkan/icd.d/intel_icd.json",
-    },
+    vulkanIcd: "/usr/share/vulkan/icd.d/intel_icd.json",
   },
 } as const;
 
 export type GpuProfile = keyof typeof GPU_PROFILES;
+
+/**
+ * Environment for Chromium. Playwright replaces the browser's whole
+ * environment with this object.
+ *
+ * - No DISPLAY/XAUTHORITY: `--headless=new` initializes Vulkan WebGPU and
+ *   WebGL without any display server. Pointing it at an X server it cannot
+ *   use makes `requestAdapter()` return null (e.g. the login screen's
+ *   Xwayland when nobody is logged in at the desktop), which silently skips
+ *   every WebGPU case.
+ * - `VK_DRIVER_FILES` limits the Vulkan loader to one GPU. With several GPUs
+ *   visible and no display, Chromium composites canvases on a different
+ *   device than the WebGPU adapter: canvas-based sync readback (`dataSync()`)
+ *   returns zeros and WebGL2 is unavailable.
+ *
+ * Without `gpu`, picks the first installed GPU in profile order (NVIDIA
+ * first, matching WebGPU's high-performance adapter choice); with no known
+ * driver installed, leaves the loader unrestricted.
+ *
+ * Verified 2026-11-08: Ubuntu 26.04, Chromium 1208, NVIDIA 615, Mesa 26.0.
+ */
+export function chromiumEnv(gpu?: GpuProfile): Record<string, string> {
+  const icd = gpu
+    ? GPU_PROFILES[gpu].vulkanIcd
+    : Object.values(GPU_PROFILES)
+        .map((p) => p.vulkanIcd)
+        .find((f) => fs.existsSync(f));
+  return icd ? { VK_DRIVER_FILES: icd } : {};
+}
 
 /**
  * Build a complete vitest config for the given GPU.
@@ -86,15 +106,7 @@ export function gpuConfig(gpu: GpuProfile) {
   const profile = GPU_PROFILES[gpu];
 
   return defineConfig({
-    resolve: {
-      alias: {
-        "@hamk-uas/jax-js-nonconsuming": path.resolve(
-          __dirname,
-          "..",
-          "src/index.ts",
-        ),
-      },
-    },
+    resolve: { alias: workspaceAliases },
     esbuild: {
       supported: { using: false },
     },
@@ -113,17 +125,12 @@ export function gpuConfig(gpu: GpuProfile) {
         provider: playwright({
           launchOptions: {
             args: [...COMMON_ARGS, ...profile.args],
-            env: {
-              DISPLAY: detectDisplay(),
-              XAUTHORITY:
-                process.env.XAUTHORITY ??
-                `/run/user/${process.getuid?.() ?? 1000}/gdm/Xauthority`,
-              ...profile.env,
-            },
+            env: chromiumEnv(gpu),
           },
         }),
         instances: [{ browser: "chromium" }],
       },
+      exclude: [...configDefaults.exclude, "tmp/**"],
       testTimeout: 300000,
       passWithNoTests: true,
       setupFiles: ["test/setup.ts"],
