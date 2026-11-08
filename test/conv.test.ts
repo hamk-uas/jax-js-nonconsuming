@@ -16,6 +16,7 @@ import {
 import { describe, expect, test } from "vitest";
 
 import { deviceSuite } from "./device-suite.js";
+import { _setConvRewriteEnabled } from "../src/frontend/jit";
 
 await deviceSuite((_device) => {
   // ── 1×1 conv fast path tests ─────────────────────────────────────────────────
@@ -663,6 +664,27 @@ await deviceSuite((_device) => {
     expect(_lastConvClass()).toBe("block-map-3x3");
     expect(_lastConvRewritten()).toBe(false);
     expect(result.shape).toEqual([1, 3, 18, 18]);
+  });
+
+  test("C.3: disabling the rewrite compiles a separate program", () => {
+    using x = np.ones([1, 2, 16, 16]);
+    using w = np.ones([3, 2, 3, 3]);
+    const conv = (a: np.Array, b: np.Array) =>
+      lax.convGeneralDilated(a, b, [1, 1], "SAME");
+    using f = jit(conv);
+    using rewritten = f(x, w);
+    expect(_lastConvRewritten()).toBe(true);
+    _setConvRewriteEnabled(false);
+    try {
+      // Same jaxpr as f: without the toggle in the compile cache key, this
+      // reused f's block_map program and compiled nothing.
+      using g = jit(conv);
+      using generic = g(x, w);
+      expect(_lastConvRewritten()).toBe(false);
+      expect(generic).toBeAllclose(rewritten);
+    } finally {
+      _setConvRewriteEnabled(true);
+    }
   });
 
   test("C.3: grad(conv) with block_map path is correct", () => {

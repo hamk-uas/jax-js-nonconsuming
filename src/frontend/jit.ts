@@ -2401,7 +2401,15 @@ export function jitCompile(
       "r" +
       (caps.rOptWords ?? 0);
   }
-  const cacheKey = backend.type + "," + FpHash.hash(jaxpr) + capsKey;
+  // Every setting that changes the compiled program belongs in the key;
+  // otherwise toggling it silently reuses programs compiled under the other
+  // value. The conv rewrite toggle is one (A/B benchmarks flip it).
+  const cacheKey =
+    backend.type +
+    "," +
+    FpHash.hash(jaxpr) +
+    capsKey +
+    (convRewriteEnabled ? "" : ",noconvrw");
 
   const cached = jitCompileCache.get(cacheKey);
   if (cached) {
