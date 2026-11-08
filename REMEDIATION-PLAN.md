@@ -1,8 +1,9 @@
 # Remediation Plan: Restoring Architectural Integrity
 
-**Status:** proposed (2026-11-08) · **Branch audited:** `wasm-multithreading` @ `fe2c9cc` plus the
-uncommitted June work found in the working tree · **Scope:** all fork commits 2026-02-07 →
-2026-04-10
+**Status:** in progress — phase 0 done 2026-11-08
+([sign-off](remediation/reviews/phase-0-3.md#human-sign-off)) · **Branch audited:**
+`wasm-multithreading` @ `fe2c9cc` plus the uncommitted June work found in the working tree ·
+**Scope:** all fork commits 2026-02-07 → 2026-04-10
 
 This document is deliberately public. It records (1) an audit of the commit history looking for the
 point where AI-agent commits started optimizing for short-term, superficial task completion instead
@@ -378,7 +379,10 @@ status updates are _claims to verify_, not context.
 **Checklist.**
 
 1. Every exit criterion of the phase: verified, not verified, or contradicted, each with evidence
-   (command and result, `file:line`, test name, CI run).
+   (command and result, `file:line`, test name, CI run). Also every numbered item and sub-item of
+   the phase: done (with commit), deferred (with the human's decision and target phase), or open. In
+   phase 0 two undecided salvage candidates passed three rounds because only the exit criteria were
+   checked.
 2. Every completion claim in commit messages and docs in the range, checked against code (`grep`,
    type-checker, tests). Anything described as implemented must exist.
 3. Build, check, lint and test from a fresh clone of the range's last commit after `pnpm install`
@@ -405,6 +409,10 @@ human sign-off line in that report. The same applies to releases.
 
 ### Phase 0 — Freeze and quarantine (R8)
 
+**Done 2026-11-08:** review round 3 ([phase-0-3.md](remediation/reviews/phase-0-3.md)) passed and
+the human signed off, after deferring the two undecided salvage candidates of item 3 to phases 3
+and 6.
+
 1. Preserve the uncommitted June work, including the five files recovered from editor history, as
    [remediation/quarantine/wasm-async-wip.patch](remediation/quarantine/wasm-async-wip.patch) (base
    `fe2c9cc`; its header records provenance and verified state), committed through the normal
@@ -414,12 +422,14 @@ human sign-off line in that report. The same applies to releases.
    (`git apply --include=<path> remediation/quarantine/wasm-async-wip.patch`, or by hand), only
    these candidates:
    - `getWasmRoutineStaticParams` — real deduplication of routine static params out of
-     `scan-plan.ts`; its backend side is in the patch's `wasm.ts`.
+     `scan-plan.ts`; its backend side is in the patch's `wasm.ts`. Done in `dd66816`, which also
+     fixed TriangularSolve in a compiled `lax.scan`.
    - WASM QR routine changes + `bench/qr.bench.ts` — keep only if the benchmark shows a win and the
      routine's scratch requirements are declared by the routine, not re-derived by every caller (in
-     the patch, `scan-plan.ts` and `block-map-executor.ts` each compute `qrScratchSizes`).
+     the patch, `scan-plan.ts` and `block-map-executor.ts` each compute `qrScratchSizes`). Deferred
+     to phase 3 by the human (2026-11-08), to decide with QR lowering.
    - `clearCaches()` clearing WASM module/routine caches — decide deliberately and update the cache
-     table either way.
+     table either way. Deferred to phase 6 by the human (2026-11-08), with the cache table.
    - Explicitly **rejected**: `makeJaxprBodyDepth` and the backend branch in `qr()` (phase 3
      replaces them), gate removal, timed-poll worker loop, `_debug…ForTest` backend hooks.
    - **Deferred to phase 4** as input to the ADR, not merged before it: in-flight slot tracking,
@@ -550,6 +560,8 @@ This makes semantics depend on how a function is called and scatters cost decisi
    body (block_map / compiled-loop scan) and size ≤ limit; rewrite large `Dot` to the tiled
    block_map path on WebGPU. Decisions go through `evaluateTotalCost`.
 3. Delete the context checks from `src/library/` and the `makeJaxprBodyDepth` idea with them.
+4. Decide the quarantined WASM QR routine and `bench/qr.bench.ts` (deferred from phase 0, item 3):
+   keep only if the benchmark shows a win and the routine declares its own scratch requirements.
 
 **Exit:**
 `git grep -nE "getBackend\(\)|defaultDevice\(\)|inMakeJaxprBody\(\)|insideTrace\(\)" -- src/library`
@@ -600,6 +612,8 @@ documented as experimental.
    only if it wins clearly on some GPU and its values are stable; otherwise delete
    `src/microbench.ts`, the calibrated part of the JIT cache key and `calibrateGpu()`, with a
    migration note (callers delete their `calibrateGpu()` call).
+6. Decide whether `clearCaches()` also clears the WASM module and routine caches (deferred from
+   phase 0, item 3; the quarantined patch does it), and make the cache table match.
 
 **Exit:** doc-symbol check green in CI; `src/index.ts` exports no underscore-prefixed test hooks.
 

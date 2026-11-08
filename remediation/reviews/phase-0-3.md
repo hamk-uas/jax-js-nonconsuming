@@ -6,7 +6,7 @@
 - **Reviewer:** the separate, non-implementing review session (`c70303a7`).
 - **Date:** 2026-11-08.
 - **Verdict:** pass -- F2.1 is resolved.
-- **Human sign-off:** pending.
+- **Human sign-off:** given 2026-11-08; see [Human sign-off](#human-sign-off) at the end.
 
 This passing review does not itself mark Phase 0 done. The plan still requires the report to be
 committed and the human's sign-off. Only this report was added to the original repository; all
@@ -89,3 +89,20 @@ generated.
 F2.1 is closed by this review. Within the agreed re-review scope, the fixes and their capability
 tests pass. Phase 0 is ready for the human's sign-off after this report is committed; no
 implementation change or phase-status edit was made by the reviewer.
+
+---
+
+## Human sign-off
+
+Phase 0 is signed off as done by the human (@OlliNiemitalo) on 2026-11-08, answering the
+implementation session's sign-off question with "Sign off Phase 0 as done" (no note). The
+implementation session then pointed out that two salvage candidates of phase 0 item 3 were still
+undecided, which none of the rounds had checked because the exit criteria do not name them. The
+human deferred the WASM QR routine to phase 3 and the `clearCaches()` WASM-cache question to phase
+6, and confirmed the sign-off stands. Recorded by the implementation session; the reviewer's text
+above is unchanged except for the sign-off line in the header.
+
+Covered: `fe2c9cc..4e7a27e`, reviewed in rounds [1](phase-0-1.md), [2](phase-0-2.md) and 3. Carried
+to phase 1 as recorded in the plan: R23 (command-tape tracing) and R24 (four Intel accuracy
+failures). Not covered, for the next review: `b10c74c` (history-churn review mode), made after this
+round.
