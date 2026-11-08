@@ -5,45 +5,42 @@ import {
   numpy as np,
   random,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { afterAll, bench, suite } from "vitest";
+import { describe, test } from "vitest";
 
 const devices = await init();
 
-// Benchmark argreduce operations on WebGPU
-suite.skipIf(!devices.includes("webgpu"))("gpu argreduce", async () => {
-  defaultDevice("webgpu");
-
-  // 1D array benchmarks
-  const arr10k = random.uniform(random.key(0), [10000]);
-  await blockUntilReady([arr10k]);
-  afterAll(() => arr10k.dispose());
-
-  bench("argmax 10k elements", async () => {
-    const result = np.argmax(arr10k);
-    await result.blockUntilReady();
-    result.dispose();
+describe.skipIf(!devices.includes("webgpu"))("gpu argreduce", () => {
+  test("10k elements", async ({ bench }) => {
+    defaultDevice("webgpu");
+    using key = random.key(0);
+    using x = random.uniform(key, [10000]);
+    await blockUntilReady(x);
+    await bench.compare(
+      bench("argmax", async () => {
+        using r = np.argmax(x);
+        await r.blockUntilReady();
+      }),
+      bench("argmin", async () => {
+        using r = np.argmin(x);
+        await r.blockUntilReady();
+      }),
+    );
   });
 
-  bench("argmin 10k elements", async () => {
-    const result = np.argmin(arr10k);
-    await result.blockUntilReady();
-    result.dispose();
-  });
-
-  // 2D array benchmarks (reduction along axis)
-  const arr2d = random.uniform(random.key(1), [100, 1000]);
-  await blockUntilReady([arr2d]);
-  afterAll(() => arr2d.dispose());
-
-  bench("argmax along axis (100x1000)", async () => {
-    const result = np.argmax(arr2d, 1);
-    await result.blockUntilReady();
-    result.dispose();
-  });
-
-  bench("argmin along axis (100x1000)", async () => {
-    const result = np.argmin(arr2d, 1);
-    await result.blockUntilReady();
-    result.dispose();
+  test("100x1000 along axis 1", async ({ bench }) => {
+    defaultDevice("webgpu");
+    using key = random.key(1);
+    using x = random.uniform(key, [100, 1000]);
+    await blockUntilReady(x);
+    await bench.compare(
+      bench("argmax", async () => {
+        using r = np.argmax(x, 1);
+        await r.blockUntilReady();
+      }),
+      bench("argmin", async () => {
+        using r = np.argmin(x, 1);
+        await r.blockUntilReady();
+      }),
+    );
   });
 });

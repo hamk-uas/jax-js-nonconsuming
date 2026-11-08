@@ -5,54 +5,34 @@ import {
   numpy as np,
   random,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { afterAll, bench, suite } from "vitest";
+import { describe, test } from "vitest";
 
 const devices = await init("wasm", "webgpu");
 
-suite.skipIf(!devices.includes("webgpu"))("gpu sort/argsort", async () => {
-  defaultDevice("webgpu");
+// GPU supports much more parallelism, so it sorts more rows.
+const cases = [
+  { device: "webgpu", batch: 32768 },
+  { device: "wasm", batch: 128 },
+] as const;
 
-  const batch = 32768; // GPU supports much more parallelism.
-  const size = 1024;
-  const a = random.uniform(random.key(0), [batch, size]);
-  await blockUntilReady(a);
-  afterAll(() => {
-    a.dispose();
+for (const { device, batch } of cases) {
+  describe.skipIf(!devices.includes(device))(`${device} sort/argsort`, () => {
+    test(`${batch}x1024`, async ({ bench }) => {
+      defaultDevice(device);
+      using key = random.key(0);
+      using a = random.uniform(key, [batch, 1024]);
+      await blockUntilReady(a);
+
+      await bench.compare(
+        bench("sort", async () => {
+          using c = np.sort(a);
+          await c.blockUntilReady();
+        }),
+        bench("argsort", async () => {
+          using c = np.argsort(a);
+          await c.blockUntilReady();
+        }),
+      );
+    });
   });
-
-  bench("sort", async () => {
-    const c = np.sort(a);
-    await c.blockUntilReady();
-    c.dispose();
-  });
-
-  bench("argsort", async () => {
-    const c = np.argsort(a);
-    await c.blockUntilReady();
-    c.dispose();
-  });
-});
-
-suite.skipIf(!devices.includes("wasm"))("cpu sort/argsort", async () => {
-  defaultDevice("wasm");
-
-  const batch = 128;
-  const size = 1024;
-  const a = random.uniform(random.key(0), [batch, size]);
-  await blockUntilReady(a);
-  afterAll(() => {
-    a.dispose();
-  });
-
-  bench("sort", async () => {
-    const c = np.sort(a);
-    await c.blockUntilReady();
-    c.dispose();
-  });
-
-  bench("argsort", async () => {
-    const c = np.argsort(a);
-    await c.blockUntilReady();
-    c.dispose();
-  });
-});
+}

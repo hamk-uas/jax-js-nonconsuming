@@ -10,10 +10,9 @@
  *   3. Scalar cumulative product (baseline comparison)
  *
  * Run with:
- *   pnpm build && pnpm vitest bench bench/dlm-scan.bench.ts
+ *   pnpm vitest bench bench/dlm-scan.bench.ts
  */
 import {
-  blockUntilReady,
   defaultDevice,
   DType,
   grad,
@@ -23,436 +22,165 @@ import {
   numpy as np,
   tree,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { afterAll, bench, suite } from "vitest";
+import { describe, test } from "vitest";
 
 const devices = await init("wasm", "webgpu");
-const hasWebGPU = devices.includes("webgpu");
 
 // --- DLM composition functions ---
 
+type Affine = { A: np.Array; b: np.Array };
+type Sarkka = Affine & { S: np.Array };
+
 /** 2-tuple affine: compose(p, q) = { A: q.A @ p.A, b: q.A @ p.b + q.b } */
-const compose2 = (
-  p: { A: np.Array; b: np.Array },
-  q: { A: np.Array; b: np.Array },
-) => {
-  using tmp = np.matmul(q.A, p.b) as np.Array;
-  return {
-    A: np.matmul(q.A, p.A) as np.Array,
-    b: tmp.add(q.b) as np.Array,
-  };
+const compose2 = (p: Affine, q: Affine): Affine => {
+  using tmp = np.matmul(q.A, p.b);
+  return { A: np.matmul(q.A, p.A), b: tmp.add(q.b) };
 };
 
 /** 3-tuple Särkkä: adds S → q.A @ p.S @ q.A^T + q.S */
-const compose3 = (
-  p: { A: np.Array; b: np.Array; S: np.Array },
-  q: { A: np.Array; b: np.Array; S: np.Array },
-) => {
-  using tmp = np.matmul(q.A, p.b) as np.Array;
-  using AS = np.matmul(q.A, p.S) as np.Array;
-  using qAT = np.transpose(q.A, [-2, -1]) as np.Array;
-  using ASAT = np.matmul(AS, qAT) as np.Array;
-  return {
-    A: np.matmul(q.A, p.A) as np.Array,
-    b: tmp.add(q.b) as np.Array,
-    S: ASAT.add(q.S) as np.Array,
-  };
+const compose3 = (p: Sarkka, q: Sarkka): Sarkka => {
+  using tmp = np.matmul(q.A, p.b);
+  using AS = np.matmul(q.A, p.S);
+  using qAT = np.transpose(q.A, [-2, -1]);
+  using ASAT = np.matmul(AS, qAT);
+  return { A: np.matmul(q.A, p.A), b: tmp.add(q.b), S: ASAT.add(q.S) };
 };
 
-// ===================== WASM =====================
+/** Inputs for N compose elements of m×m state, owned by `stack`. */
+function affineInputs(stack: DisposableStack, N: number, m: number): Affine {
+  return {
+    A: stack.use(np.full([N, m, m], 0.95, { dtype: DType.Float32 })),
+    b: stack.use(np.full([N, m, 1], 0.1, { dtype: DType.Float32 })),
+  };
+}
 
-suite.skipIf(!devices.includes("wasm"))("wasm DLM scan", () => {
-  defaultDevice("wasm");
+/** Sequential scan of compose2 from the identity; returns the stacked ys. */
+function scanCompose2(xs: Affine): Affine {
+  const [carry, ys] = lax.scan(
+    (c: Affine, x: Affine): [Affine, Affine] => {
+      const nc = compose2(c, x);
+      return [nc, nc];
+    },
+    { A: np.eye(2, { dtype: DType.Float32 }), b: np.zeros([2, 1]) },
+    xs,
+  );
+  tree.dispose(carry);
+  return ys;
+}
 
-  // --- 2-tuple compose, 2x2, N=200 ---
-  {
-    const N = 200;
-    const A = np.full([N, 2, 2], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 2, 1], 0.1, { dtype: DType.Float32 });
+/** Sum of all leaves of a compose result, disposing the result. */
+function sumLeaves(r: Affine): np.Array {
+  using sA = r.A.sum();
+  using sB = r.b.sum();
+  tree.dispose(r);
+  return sA.add(sB);
+}
 
-    const assocJit = jit((AA: np.Array, bb: np.Array) =>
-      lax.associativeScan(compose2, { A: AA, b: bb }),
+/**
+ * A DLM workload: `make` builds its inputs and jit function (owned by
+ * `stack`) and returns one benchmark iteration.
+ */
+type DlmCase = {
+  name: string;
+  /** Also run on WebGPU (all cases run on WASM). */
+  webgpu: boolean;
+  make: (stack: DisposableStack) => () => void;
+};
+
+function assocCompose2(N: number, m: number) {
+  return (stack: DisposableStack) => {
+    const { A, b } = affineInputs(stack, N, m);
+    const f = stack.use(
+      jit((AA: np.Array, bb: np.Array) =>
+        lax.associativeScan(compose2, { A: AA, b: bb }),
+      ),
     );
-    // Warmup
-    const w = assocJit(A, b) as { A: np.Array; b: np.Array };
-    w.A.dispose();
-    w.b.dispose();
+    return () => tree.dispose(f(A, b));
+  };
+}
 
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      assocJit.dispose();
-    });
-
-    bench("assocScan 2-tuple 2×2 N=200", () => {
-      const r = assocJit(A, b) as { A: np.Array; b: np.Array };
-      r.A.dispose();
-      r.b.dispose();
-    });
-  }
-
-  // --- 2-tuple compose, 2x2, N=500 ---
+const CASES: DlmCase[] = [
   {
-    const N = 500;
-    const A = np.full([N, 2, 2], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 2, 1], 0.1, { dtype: DType.Float32 });
-
-    const assocJit = jit((AA: np.Array, bb: np.Array) =>
-      lax.associativeScan(compose2, { A: AA, b: bb }),
-    );
-    const w = assocJit(A, b) as { A: np.Array; b: np.Array };
-    w.A.dispose();
-    w.b.dispose();
-
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      assocJit.dispose();
-    });
-
-    bench("assocScan 2-tuple 2×2 N=500", () => {
-      const r = assocJit(A, b) as { A: np.Array; b: np.Array };
-      r.A.dispose();
-      r.b.dispose();
-    });
-  }
-
-  // --- 3-tuple Särkkä compose, 2x2, N=200 ---
+    name: "assocScan 2-tuple 2×2 N=200",
+    webgpu: true,
+    make: assocCompose2(200, 2),
+  },
   {
-    const N = 200;
-    const A = np.full([N, 2, 2], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 2, 1], 0.1, { dtype: DType.Float32 });
-    const S = np.full([N, 2, 2], 0.05, { dtype: DType.Float32 });
-
-    const assocJit = jit((AA: np.Array, bb: np.Array, SS: np.Array) =>
-      lax.associativeScan(compose3, { A: AA, b: bb, S: SS }),
-    );
-    const w = assocJit(A, b, S) as { A: np.Array; b: np.Array; S: np.Array };
-    w.A.dispose();
-    w.b.dispose();
-    w.S.dispose();
-
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      S.dispose();
-      assocJit.dispose();
-    });
-
-    bench("assocScan 3-tuple Särkkä 2×2 N=200", () => {
-      const r = assocJit(A, b, S) as {
-        A: np.Array;
-        b: np.Array;
-        S: np.Array;
-      };
-      r.A.dispose();
-      r.b.dispose();
-      r.S.dispose();
-    });
-  }
-
-  // --- 2-tuple compose, 4x4, N=200 ---
+    name: "assocScan 2-tuple 2×2 N=500",
+    webgpu: true,
+    make: assocCompose2(500, 2),
+  },
   {
-    const N = 200;
-    const A = np.full([N, 4, 4], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 4, 1], 0.1, { dtype: DType.Float32 });
-
-    const assocJit = jit((AA: np.Array, bb: np.Array) =>
-      lax.associativeScan(compose2, { A: AA, b: bb }),
-    );
-    const w = assocJit(A, b) as { A: np.Array; b: np.Array };
-    w.A.dispose();
-    w.b.dispose();
-
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      assocJit.dispose();
-    });
-
-    bench("assocScan 2-tuple 4×4 N=200", () => {
-      const r = assocJit(A, b) as { A: np.Array; b: np.Array };
-      r.A.dispose();
-      r.b.dispose();
-    });
-  }
-
-  // --- Sequential scan comparison, 2-tuple, 2x2, N=200 ---
-  {
-    const N = 200;
-    const A = np.full([N, 2, 2], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 2, 1], 0.1, { dtype: DType.Float32 });
-
-    const scanJit = jit((AA: np.Array, bb: np.Array) => {
-      const [carry, ys] = lax.scan(
-        (c: { A: np.Array; b: np.Array }, x: { A: np.Array; b: np.Array }) => {
-          const nc = compose2(c, x);
-          return [nc, nc];
-        },
-        { A: np.eye(2, { dtype: DType.Float32 }), b: np.zeros([2, 1]) },
-        { A: AA, b: bb },
+    name: "assocScan 3-tuple Särkkä 2×2 N=200",
+    webgpu: true,
+    make: (stack) => {
+      const { A, b } = affineInputs(stack, 200, 2);
+      const S = stack.use(np.full([200, 2, 2], 0.05, { dtype: DType.Float32 }));
+      const f = stack.use(
+        jit((AA: np.Array, bb: np.Array, SS: np.Array) =>
+          lax.associativeScan(compose3, { A: AA, b: bb, S: SS }),
+        ),
       );
-      tree.dispose(carry);
-      return ys;
-    });
-    const w = scanJit(A, b) as { A: np.Array; b: np.Array };
-    tree.dispose(w);
-
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      scanJit.dispose();
-    });
-
-    bench("scan 2-tuple 2×2 N=200", () => {
-      const r = scanJit(A, b) as { A: np.Array; b: np.Array };
-      tree.dispose(r);
-    });
-  }
-
-  // --- grad(assocScan) 2-tuple 2×2 N=200 ---
+      return () => tree.dispose(f(A, b, S));
+    },
+  },
   {
-    const N = 200;
-    const A = np.full([N, 2, 2], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 2, 1], 0.1, { dtype: DType.Float32 });
-
-    const gradFn = jit(
-      grad((AA: np.Array, bb: np.Array) => {
-        const r = lax.associativeScan(compose2, { A: AA, b: bb }) as {
-          A: np.Array;
-          b: np.Array;
-        };
-        using sA = r.A.sum();
-        using sB = r.b.sum();
-        r.A.dispose();
-        r.b.dispose();
-        return sA.add(sB) as np.Array;
-      }),
-    );
-    const w = gradFn(A, b) as np.Array;
-    w.dispose();
-
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      gradFn.dispose();
-    });
-
-    bench("grad(assocScan) 2-tuple 2×2 N=200", () => {
-      const r = gradFn(A, b) as np.Array;
-      r.dispose();
-    });
-  }
-
-  // --- grad(scan) 2-tuple 2×2 N=200 ---
+    name: "assocScan 2-tuple 4×4 N=200",
+    webgpu: false,
+    make: assocCompose2(200, 4),
+  },
   {
-    const N = 200;
-    const A = np.full([N, 2, 2], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 2, 1], 0.1, { dtype: DType.Float32 });
-
-    const gradFn = jit(
-      grad((AA: np.Array, bb: np.Array) => {
-        const scanResult = lax.scan(
-          (
-            c: { A: np.Array; b: np.Array },
-            x: { A: np.Array; b: np.Array },
-          ) => {
-            const nc = compose2(c, x);
-            return [nc, nc];
-          },
-          { A: np.eye(2, { dtype: DType.Float32 }), b: np.zeros([2, 1]) },
-          { A: AA, b: bb },
-        );
-        tree.dispose(scanResult[0]);
-        const r = scanResult[1] as { A: np.Array; b: np.Array };
-        using sA = r.A.sum();
-        using sB = r.b.sum();
-        tree.dispose(r);
-        return sA.add(sB) as np.Array;
-      }),
-    );
-    const w = gradFn(A, b) as np.Array;
-    w.dispose();
-
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      gradFn.dispose();
-    });
-
-    bench("grad(scan) 2-tuple 2×2 N=200", () => {
-      const r = gradFn(A, b) as np.Array;
-      r.dispose();
-    });
-  }
-});
-
-// ===================== WebGPU =====================
-
-suite.skipIf(!hasWebGPU)("webgpu DLM scan", async () => {
-  if (!hasWebGPU) return;
-  defaultDevice("webgpu");
-
-  // --- 2-tuple compose, 2x2, N=200 ---
-  {
-    const N = 200;
-    const A = np.full([N, 2, 2], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 2, 1], 0.1, { dtype: DType.Float32 });
-    await blockUntilReady(A);
-    await blockUntilReady(b);
-
-    const assocJit = jit((AA: np.Array, bb: np.Array) =>
-      lax.associativeScan(compose2, { A: AA, b: bb }),
-    );
-    const w = assocJit(A, b) as { A: np.Array; b: np.Array };
-    w.A.dispose();
-    w.b.dispose();
-
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      assocJit.dispose();
-    });
-
-    bench("assocScan 2-tuple 2×2 N=200", () => {
-      const r = assocJit(A, b) as { A: np.Array; b: np.Array };
-      r.A.dispose();
-      r.b.dispose();
-    });
-  }
-
-  // --- 2-tuple compose, 2x2, N=500 ---
-  {
-    const N = 500;
-    const A = np.full([N, 2, 2], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 2, 1], 0.1, { dtype: DType.Float32 });
-    await blockUntilReady(A);
-    await blockUntilReady(b);
-
-    const assocJit = jit((AA: np.Array, bb: np.Array) =>
-      lax.associativeScan(compose2, { A: AA, b: bb }),
-    );
-    const w = assocJit(A, b) as { A: np.Array; b: np.Array };
-    w.A.dispose();
-    w.b.dispose();
-
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      assocJit.dispose();
-    });
-
-    bench("assocScan 2-tuple 2×2 N=500", () => {
-      const r = assocJit(A, b) as { A: np.Array; b: np.Array };
-      r.A.dispose();
-      r.b.dispose();
-    });
-  }
-
-  // --- 3-tuple Särkkä compose, 2x2, N=200 ---
-  {
-    const N = 200;
-    const A = np.full([N, 2, 2], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 2, 1], 0.1, { dtype: DType.Float32 });
-    const S = np.full([N, 2, 2], 0.05, { dtype: DType.Float32 });
-    await blockUntilReady(A);
-    await blockUntilReady(b);
-    await blockUntilReady(S);
-
-    const assocJit = jit((AA: np.Array, bb: np.Array, SS: np.Array) =>
-      lax.associativeScan(compose3, { A: AA, b: bb, S: SS }),
-    );
-    const w = assocJit(A, b, S) as { A: np.Array; b: np.Array; S: np.Array };
-    w.A.dispose();
-    w.b.dispose();
-    w.S.dispose();
-
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      S.dispose();
-      assocJit.dispose();
-    });
-
-    bench("assocScan 3-tuple Särkkä 2×2 N=200", () => {
-      const r = assocJit(A, b, S) as {
-        A: np.Array;
-        b: np.Array;
-        S: np.Array;
-      };
-      r.A.dispose();
-      r.b.dispose();
-      r.S.dispose();
-    });
-  }
-
-  // --- Sequential scan comparison, 2-tuple, 2x2, N=200 ---
-  {
-    const N = 200;
-    const A = np.full([N, 2, 2], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 2, 1], 0.1, { dtype: DType.Float32 });
-    await blockUntilReady(A);
-    await blockUntilReady(b);
-
-    const scanJit = jit((AA: np.Array, bb: np.Array) => {
-      const [carry, ys] = lax.scan(
-        (c: { A: np.Array; b: np.Array }, x: { A: np.Array; b: np.Array }) => {
-          const nc = compose2(c, x);
-          return [nc, nc];
-        },
-        { A: np.eye(2, { dtype: DType.Float32 }), b: np.zeros([2, 1]) },
-        { A: AA, b: bb },
+    name: "scan 2-tuple 2×2 N=200",
+    webgpu: true,
+    make: (stack) => {
+      const { A, b } = affineInputs(stack, 200, 2);
+      const f = stack.use(
+        jit((AA: np.Array, bb: np.Array) => scanCompose2({ A: AA, b: bb })),
       );
-      tree.dispose(carry);
-      return ys;
-    });
-    const w = scanJit(A, b) as { A: np.Array; b: np.Array };
-    tree.dispose(w);
-
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      scanJit.dispose();
-    });
-
-    bench("scan 2-tuple 2×2 N=200", () => {
-      const r = scanJit(A, b) as { A: np.Array; b: np.Array };
-      tree.dispose(r);
-    });
-  }
-
-  // --- grad(assocScan) 2-tuple 2×2 N=200 ---
+      return () => tree.dispose(f(A, b));
+    },
+  },
   {
-    const N = 200;
-    const A = np.full([N, 2, 2], 0.95, { dtype: DType.Float32 });
-    const b = np.full([N, 2, 1], 0.1, { dtype: DType.Float32 });
-    await blockUntilReady(A);
-    await blockUntilReady(b);
+    name: "grad(assocScan) 2-tuple 2×2 N=200",
+    webgpu: true,
+    make: (stack) => {
+      const { A, b } = affineInputs(stack, 200, 2);
+      const f = stack.use(
+        jit(
+          grad((AA: np.Array, bb: np.Array) =>
+            sumLeaves(lax.associativeScan(compose2, { A: AA, b: bb })),
+          ),
+        ),
+      );
+      return () => f(A, b).dispose();
+    },
+  },
+  {
+    name: "grad(scan) 2-tuple 2×2 N=200",
+    webgpu: false,
+    make: (stack) => {
+      const { A, b } = affineInputs(stack, 200, 2);
+      const f = stack.use(
+        jit(
+          grad((AA: np.Array, bb: np.Array) =>
+            sumLeaves(scanCompose2({ A: AA, b: bb })),
+          ),
+        ),
+      );
+      return () => f(A, b).dispose();
+    },
+  },
+];
 
-    const gradFn = jit(
-      grad((AA: np.Array, bb: np.Array) => {
-        const r = lax.associativeScan(compose2, { A: AA, b: bb }) as {
-          A: np.Array;
-          b: np.Array;
-        };
-        using sA = r.A.sum();
-        using sB = r.b.sum();
-        r.A.dispose();
-        r.b.dispose();
-        return sA.add(sB) as np.Array;
-      }),
-    );
-    const w = gradFn(A, b) as np.Array;
-    w.dispose();
-
-    afterAll(() => {
-      A.dispose();
-      b.dispose();
-      gradFn.dispose();
+for (const device of ["wasm", "webgpu"] as const) {
+  describe.skipIf(!devices.includes(device))(`${device} DLM scan`, () => {
+    test("compose bodies", async ({ bench }) => {
+      defaultDevice(device);
+      using stack = new DisposableStack();
+      const registrations = CASES.filter(
+        (c) => device === "wasm" || c.webgpu,
+      ).map((c) => bench(c.name, c.make(stack)));
+      await bench.compare(...registrations);
     });
-
-    bench("grad(assocScan) 2-tuple 2×2 N=200", () => {
-      const r = gradFn(A, b) as np.Array;
-      r.dispose();
-    });
-  }
-});
+  });
+}

@@ -770,8 +770,9 @@ Conv→BlockMap jaxpr rewrite fired.
 equations to `BlockMap` nodes BEFORE `splitGraphDataflow`. Guards: stride=1, SAME-equivalent
 padding, spatial ≥ 16, concrete shapes, `vmapDims=0`. The body uses VALID conv (SAME guard prevents
 recursion). Runs on all backends. Per-axis halo bounds checking in `gen_resolve` ensures correctness
-for im2col views with non-mapped dimensions. WASM: 1.02–1.36× speedup; WebGPU: 1.06–1.61× speedup
-(growing with workload size, dispatch-bound for small shapes).
+for im2col views with non-mapped dimensions. WASM: 1.2–1.4× faster than generic-dot (A/B in
+`bench/conv2d.bench.ts`). WebGPU: currently 3–70× **slower** than generic-dot on both NVIDIA and
+Intel (R28 in `REMEDIATION-PLAN.md`); the WebGPU speedups recorded under P4 below do not reproduce.
 
 **Key finding from benchmarking:** For single-batch inference shapes (3×3, batch=1, 32–128ch,
 32²–128²), WebGPU is **dispatch-bound at ~2.5ms** with <1% GPU utilization. Kernel quality is
@@ -1037,8 +1038,18 @@ the prefix-apply phase. WASM `assocScan` uses inline typed load/store (v128, f32
 ## Benchmark suite
 
 ```bash
-pnpm build && pnpm vitest bench bench/<file>.bench.ts
+pnpm vitest bench bench/<file>.bench.ts
 ```
+
+Benchmarks use vitest's `bench` test-context fixture: one `test()` per comparison, each calling
+`await bench.compare(bench(...), ...)` (or `bench(...).run()`). The tasks of a comparison run one
+after another, not interleaved; a task's `beforeAll` option runs before both its warmup and its
+measured phase, so per-task settings (calibration, rewrite toggles) go there. `test/setup.ts` gives
+`*.bench.ts` files debug level 0 and a slot-count-only leak check
+(`checkLeaks.start({ trackSites: false })`), because site tracking made small eager ops ~2.5×
+slower. Each test must still dispose everything it creates. Vitest prints result tables with the
+`default`/`verbose` reporters; under an AI agent it defaults to `minimal`, which prints none, so
+agents pass `--reporter=default`.
 
 | File                                | What it measures                                                        |
 | ----------------------------------- | ----------------------------------------------------------------------- |
@@ -1057,11 +1068,10 @@ pnpm build && pnpm vitest bench bench/<file>.bench.ts
 | `bench/scatter-add.bench.ts`        | `scatterAdd` throughput at 1K/10K/100K elements                         |
 | `bench/sort.bench.ts`               | Sorting performance across backends                                     |
 | `bench/tiled-matmul.bench.ts`       | Tiled matmul parameter sweeps (block size, thread tile)                 |
-| `bench/tts.bench.ts`                | Text-to-speech inference pipeline                                       |
 | `bench/where-branching.bench.ts`    | WASM `AluOp.Where` branching vs branchless select                       |
 
-Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`), use
-`DType.Float32` / `DType.Int32` enums.
+Bench files import from `@hamk-uas/jax-js-nonconsuming`, which the vitest configs alias to
+`src/index.ts` (no build needed), and use `DType.Float32` / `DType.Int32` enums.
 
 ## Future performance work
 
@@ -1103,6 +1113,10 @@ _WebGPU — NVIDIA RTX 4070 Ti SUPER (TB3 eGPU), block_map path:_
 
 Larger workloads (batch=8) show 20–61% improvement over the generic-dot baseline. Single-batch
 shapes remain dispatch-bound at ~2.3ms.
+
+**Does not reproduce (R28):** with the WebGPU A/B in `bench/conv2d.bench.ts` (one jit function,
+rewrite on vs off) the same NVIDIA eGPU takes 6.5 ms (1×32ch) and 166 ms (8×128ch) with the rewrite
+against ~2.4 ms with generic-dot. The table's date predates this repository's history.
 
 ### P10: Microbenchmark calibration (open decision)
 
@@ -1157,8 +1171,9 @@ https://github.com/b0nes164/Decoupled-Fallback-Paper · https://github.com/b0nes
 
 ## Before starting work
 
-1. `pnpm build` before running benchmarks (bench files import from `dist/`). Tests resolve to source
-   via `vitest.config.ts` aliases and do NOT require a prior build.
+1. Tests and benchmarks resolve `@hamk-uas/jax-js-nonconsuming` to source via the vitest config
+   aliases and do NOT require a prior build. `pnpm check` (tsc) resolves it to `dist/` types, so run
+   `pnpm build` first after changing public signatures.
 2. `git branch` to confirm you're on the right branch
 3. `git log --oneline -10` for recent context
 
@@ -1226,7 +1241,7 @@ rules (`require-retained-release`, `require-try-finally-symmetry`,
 | Leaf packing for 6+ tuple assocScan                         | `needsLeafPacking` flag → shader emits `in_packed`/`out_packed` with compile-time offsets. Executor pack/unpack around dispatch. Binding count reduced from 2×numLeaves to 2                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | Halo zero-copy backends                                     | WebGPU: signed bounds checks in fused shader; WASM: compiled clamped-copy with interior fast path (skip `memory.fill`); JS fallback: per-block clamped slicing. No pre-pad allocation on any backend                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | Stencil body synthesis for halo-VJP                         | Forward bodies use Shrink (from `sliceInDim`), not UDS. `analyzeLinearStencil` walks body for {Shrink, Add, Mul(Lit)} targeting single halo input; `Add(stencilTerms, Lit)` allowed (additive bias drops out in adjoint). Gather-based VJP synthesizes reversed-stencil backward body via `makeJaxpr`; non-linear/unrecognized bodies fall back to pad+add. Multi-input guard: if any non-haloed tangent input is differentiated, falls through to pad+add. JVP threads `originalJaxpr`+`originalNumConsts` through BlockMap params so transpose analyzes clean forward body, not JVP-doubled body                                                       |
-| Conv→BlockMap jaxpr rewrite (C.3)                           | `rewriteConvToBlockMap()` rewrites eligible 3×3/5×5 Conv to BlockMap BEFORE `splitGraphDataflow`. Guards: stride=1, SAME-equiv padding, spatial≥16, v=0. Body uses VALID conv (SAME guard prevents recursion). Per-axis halo bounds checking in `gen_resolve` for im2col views with non-mapped dimensions. `_lastConvRewritten()` tracks. WASM 1.02–1.36×; WebGPU 1.06–1.61× (dispatch-bound at small shapes)                                                                                                                                                                                                                                            |
+| Conv→BlockMap jaxpr rewrite (C.3)                           | `rewriteConvToBlockMap()` rewrites eligible 3×3/5×5 Conv to BlockMap BEFORE `splitGraphDataflow`. Guards: stride=1, SAME-equiv padding, spatial≥16, v=0. Body uses VALID conv (SAME guard prevents recursion). Per-axis halo bounds checking in `gen_resolve` for im2col views with non-mapped dimensions. `_lastConvRewritten()` tracks. WASM 1.2–1.4×; WebGPU currently 3–70× slower than generic-dot (R28)                                                                                                                                                                                                                                            |
 | ForiLoop→BlockMap jaxpr rewrite                             | `rewriteForiLoopToBlockMap()` rewrites eligible ForiLoop to BlockMap wrapping ForiLoop BEFORE `splitGraphDataflow`. WebGPU only (WASM mega-module already compiles natively). Guards: concrete bounds, ≥2 iters, retilable body (strict `pointwisePrimitives` whitelist check), same concrete shape (rank≥1, dim≥4), consts same-shape or scalar, shmem ≤ `backend.capabilities.maxComputeWorkgroupStorageSize` (exact `byteWidth` tally). `_lastForiRewritten()` tracks rewrite. `_skipForiRewrite` blocks nested rewrites (block_map rejected by tape).                                                                                                |
 | WebGPU-only tests in GPU-enforced suite                     | Tests requiring WebGPU excluded from default vitest config; run under gpu-test.sh where adapter is guaranteed. Pre-commit runs them automatically (NVIDIA on feature, both GPUs on main)                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Scan-in-command-tape (`TapeScan`)                           | Non-fallback scan paths (compiled-loop, preencoded-routine, preencoded-multi-step) execute within the tape's command buffer. Scan dispatchers receive a `tapeCtx` with shared encoder, deferred destroys, and `Set<GPUBuffer>` for pooled transient buffers. Scan buffer indices excluded from arena coloring via `buildConflictGraphAndColor`                                                                                                                                                                                                                                                                                                           |

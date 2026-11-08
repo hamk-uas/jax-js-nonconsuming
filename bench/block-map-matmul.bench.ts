@@ -18,40 +18,38 @@ import {
   numpy as np,
   random,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { afterAll, bench, suite } from "vitest";
+import { describe, test } from "vitest";
 
 const devices = await init("webgpu");
 
-suite.skipIf(!devices.includes("webgpu"))("tiled matmul", async () => {
-  defaultDevice("webgpu");
+// tinybench runs at least 64 measured + 16 warmup iterations by default; at
+// ~0.4 s per 4096² np.matmul that exceeds the benchmark test timeout. The
+// 1 s time budget still gives fast cases many samples.
+const RUN_OPTIONS = { iterations: 10, warmupIterations: 2 };
 
+describe.skipIf(!devices.includes("webgpu"))("tiled matmul", () => {
   for (const N of [256, 512, 1024, 2048, 4096]) {
-    const a = random.uniform(random.key(0), [N, N]);
-    const b = random.uniform(random.key(1), [N, N]);
-    await blockUntilReady([a, b]);
+    test(`${N}x${N}`, async ({ bench }) => {
+      defaultDevice("webgpu");
+      using k0 = random.key(0);
+      using k1 = random.key(1);
+      using a = random.uniform(k0, [N, N]);
+      using b = random.uniform(k1, [N, N]);
+      await blockUntilReady([a, b]);
 
-    const tiledFn = jit((x: np.Array, y: np.Array) => lax.tiledMatmul(x, y));
-    // Warmup JIT compilation
-    const warmup = tiledFn(a, b);
-    await warmup.blockUntilReady();
-    warmup.dispose();
+      using tiledFn = jit((x: np.Array, y: np.Array) => lax.tiledMatmul(x, y));
 
-    afterAll(() => {
-      a.dispose();
-      b.dispose();
-      tiledFn.dispose();
-    });
-
-    bench(`np.matmul ${N}x${N}`, async () => {
-      const c = np.matmul(a, b);
-      await c.blockUntilReady();
-      c.dispose();
-    });
-
-    bench(`tiledMatmul ${N}x${N}`, async () => {
-      const c = tiledFn(a, b);
-      await c.blockUntilReady();
-      c.dispose();
+      await bench.compare(
+        bench("np.matmul", async () => {
+          using c = np.matmul(a, b);
+          await c.blockUntilReady();
+        }),
+        bench("tiledMatmul", async () => {
+          using c = tiledFn(a, b);
+          await c.blockUntilReady();
+        }),
+        RUN_OPTIONS,
+      );
     });
   }
 });

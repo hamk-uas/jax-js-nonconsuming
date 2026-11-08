@@ -190,7 +190,7 @@ export default defineConfig([
       "jax-js/no-array-chain": "off",
     },
   },
-  // Bench files import from dist/ and exercise traced patterns.
+  // Bench files exercise traced patterns.
   {
     files: ["bench/**/*.{js,mjs,cjs,ts}"],
     rules: {

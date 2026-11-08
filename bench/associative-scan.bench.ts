@@ -5,7 +5,7 @@
  * against the sequential lax.scan compiled-loop.
  *
  * Run with:
- *   pnpm build && pnpm vitest bench bench/associative-scan.bench.ts
+ *   pnpm vitest bench bench/associative-scan.bench.ts
  */
 import {
   defaultDevice,
@@ -15,134 +15,73 @@ import {
   lax,
   numpy as np,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { afterAll, bench, describe } from "vitest";
+import { describe, test } from "vitest";
 
 await init("wasm");
-defaultDevice("wasm");
+
+/** Sequential cumulative `op` via the lax.scan compiled loop. */
+function sequentialScan(
+  op: (c: np.Array, x: np.Array) => np.Array,
+  init: number,
+) {
+  return jit((xs: np.Array) => {
+    const [carry, ys] = lax.scan(
+      (c: np.Array, x: np.Array) => {
+        const nc = op(c, x);
+        return [nc, nc];
+      },
+      np.array(init, { dtype: DType.Float32 }),
+      xs,
+    );
+    carry.dispose();
+    return ys;
+  });
+}
 
 describe("associativeScan vs scan (WASM)", () => {
-  // --- Cumulative sum N=1024 ---
-  const xs1k = np.ones([1024]);
-  afterAll(() => xs1k.dispose());
+  for (const N of [1024, 4096]) {
+    test(`cumsum N=${N}`, async ({ bench }) => {
+      defaultDevice("wasm");
+      using xs = np.ones([N]);
+      using assoc = jit((v: np.Array) =>
+        lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), v),
+      );
+      using assocRev = jit((v: np.Array) =>
+        lax.associativeScan((a: np.Array, b: np.Array) => np.add(a, b), v, {
+          reverse: true,
+        }),
+      );
+      using seq = sequentialScan((c, x) => np.add(c, x), 0);
 
-  const assocCumsum1k = jit((xs: any) =>
-    lax.associativeScan((a: any, b: any) => np.add(a, b), xs),
-  );
-  assocCumsum1k(xs1k).dispose();
-  afterAll(() => assocCumsum1k.dispose());
+      await bench.compare(
+        bench("associativeScan", () => {
+          assoc(xs).dispose();
+        }),
+        bench("scan", () => {
+          seq(xs).dispose();
+        }),
+        bench("associativeScan reverse", () => {
+          assocRev(xs).dispose();
+        }),
+      );
+    });
+  }
 
-  bench("associativeScan cumsum N=1024", () => {
-    assocCumsum1k(xs1k).dispose();
-  });
-
-  const seqCumsum1k = jit((xs: any) => {
-    const [_carry, ys] = lax.scan(
-      (c: any, x: any) => {
-        const nc = np.add(c, x);
-        return [nc, nc];
-      },
-      np.array(0, { dtype: DType.Float32 }),
-      xs,
+  test("cumprod N=1024", async ({ bench }) => {
+    defaultDevice("wasm");
+    using xs = np.full([1024], 1.001);
+    using assoc = jit((v: np.Array) =>
+      lax.associativeScan((a: np.Array, b: np.Array) => a.mul(b), v),
     );
-    _carry.dispose();
-    return ys;
-  });
-  seqCumsum1k(xs1k).dispose();
-  afterAll(() => seqCumsum1k.dispose());
+    using seq = sequentialScan((c, x) => c.mul(x), 1);
 
-  bench("scan cumsum N=1024", () => {
-    seqCumsum1k(xs1k).dispose();
-  });
-
-  // --- Cumulative sum N=4096 ---
-  const xs4k = np.ones([4096]);
-  afterAll(() => xs4k.dispose());
-
-  const assocCumsum4k = jit((xs: any) =>
-    lax.associativeScan((a: any, b: any) => np.add(a, b), xs),
-  );
-  assocCumsum4k(xs4k).dispose();
-  afterAll(() => assocCumsum4k.dispose());
-
-  bench("associativeScan cumsum N=4096", () => {
-    assocCumsum4k(xs4k).dispose();
-  });
-
-  const seqCumsum4k = jit((xs: any) => {
-    const [_carry, ys] = lax.scan(
-      (c: any, x: any) => {
-        const nc = np.add(c, x);
-        return [nc, nc];
-      },
-      np.array(0, { dtype: DType.Float32 }),
-      xs,
+    await bench.compare(
+      bench("associativeScan", () => {
+        assoc(xs).dispose();
+      }),
+      bench("scan", () => {
+        seq(xs).dispose();
+      }),
     );
-    _carry.dispose();
-    return ys;
-  });
-  seqCumsum4k(xs4k).dispose();
-  afterAll(() => seqCumsum4k.dispose());
-
-  bench("scan cumsum N=4096", () => {
-    seqCumsum4k(xs4k).dispose();
-  });
-
-  // --- Cumulative product N=1024 ---
-  const xsProd = np.full([1024], 1.001);
-  afterAll(() => xsProd.dispose());
-
-  const assocCumprod = jit((xs: any) =>
-    lax.associativeScan((a: any, b: any) => a.mul(b), xs),
-  );
-  assocCumprod(xsProd).dispose();
-  afterAll(() => assocCumprod.dispose());
-
-  bench("associativeScan cumprod N=1024", () => {
-    assocCumprod(xsProd).dispose();
-  });
-
-  const seqCumprod = jit((xs: any) => {
-    const [_carry, ys] = lax.scan(
-      (c: any, x: any) => {
-        const nc = c.mul(x);
-        return [nc, nc];
-      },
-      np.array(1, { dtype: DType.Float32 }),
-      xs,
-    );
-    _carry.dispose();
-    return ys;
-  });
-  seqCumprod(xsProd).dispose();
-  afterAll(() => seqCumprod.dispose());
-
-  bench("scan cumprod N=1024", () => {
-    seqCumprod(xsProd).dispose();
-  });
-
-  // --- Reverse cumulative sum N=1024 ---
-  const assocCumsumRev1k = jit((xs: any) =>
-    lax.associativeScan((a: any, b: any) => np.add(a, b), xs, {
-      reverse: true,
-    }),
-  );
-  assocCumsumRev1k(xs1k).dispose();
-  afterAll(() => assocCumsumRev1k.dispose());
-
-  bench("associativeScan cumsum reverse N=1024", () => {
-    assocCumsumRev1k(xs1k).dispose();
-  });
-
-  // --- Reverse cumulative sum N=4096 ---
-  const assocCumsumRev4k = jit((xs: any) =>
-    lax.associativeScan((a: any, b: any) => np.add(a, b), xs, {
-      reverse: true,
-    }),
-  );
-  assocCumsumRev4k(xs4k).dispose();
-  afterAll(() => assocCumsumRev4k.dispose());
-
-  bench("associativeScan cumsum reverse N=4096", () => {
-    assocCumsumRev4k(xs4k).dispose();
   });
 });

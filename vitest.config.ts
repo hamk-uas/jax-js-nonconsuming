@@ -2,6 +2,7 @@ import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
 
 import {
+  benchmarkConfig,
   BROWSER_MAX_WORKERS,
   chromiumLaunchOptions,
   describeGpuSetup,
@@ -78,5 +79,6 @@ export default defineConfig({
       "test/vitest.intel.config.ts",
     ],
     setupFiles: ["test/setup.ts"],
+    benchmark: benchmarkConfig,
   },
 });

@@ -319,6 +319,9 @@ debt (**D**) and process gaps (**P**).
 | R23 | `profiler.startTrace()` traces only dispatches made through `pipelineSubmit` (eager ops). JIT programs run by the WebGPU command tape, which encodes its own passes, are never traced: the profiler API arrived from upstream (`397af85`) after the tape existed and was hooked into one path only. README and FEATURES promise per-kernel traces; the detr-resnet-50 demo calls `startTrace()`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | D     | 1     |
 | R24 | GPU accuracy of transcendental functions follows the vendor: WebGPU and WebGL lower `asin`/`acos`/`atan`/`atan2` to the WGSL/GLSL builtins, for which WGSL allows 4096 ULP (f32). Intel exceeds the tests' 5-decimal tolerance (`asin` error 8.6e-5 at x ≈ −0.775, `atan2` 6.5e-6), NVIDIA does not; found by the first full Intel run after the R18 script fix. Decide: own range-reduced implementations (as for `erf`) for vendor-independent accuracy, or per-op GPU tolerances derived from the spec                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | D     | 1     |
 | R25 | Opening the website homepage auto-ran a matmul benchmark sized by GPU vendor string (2048² for any AMD GPU, `f9746cc`) with 8 matmuls per submission (`f702fb1`): 184 ms (fp32) and 521 ms (fp16) per submission on the Intel iGPU here, longer on weaker GPUs, during which a GPU that drives the display cannot update it. With calibration in `init` (R22), the likely cause of the reported freeze of a laptop with an AMD GPU on just opening the website. Its `Promise.race` timeout stopped waiting but not the benchmark, so the fp16 run could overlap a still-running fp32 run; each run leaked 32 MiB of GPU memory. Fixed in phase 0. `/bench/results` still starts its benchmarks when opened (phase 1, item 11)                                                                                                                                                                                                                                                                                                                    | S/D   | 0, 1  |
+| R26 | `bench/tts.bench.ts` (`74a8e11`) never ran: `// @ts-nocheck` and `/* eslint-disable */` hid that its model builders index the single `Array` returned by `random.split()` as `keys[0]`, which is `undefined`, so building the model threw. Its loops also discarded the KV caches each jitted layer returns (~3 MB of GPU memory per iteration) and every PRNG key and pre-`astype` array. Deleted in the vitest 5 migration; a replacement should drive the website's model code (`website/src/routes/tts/pocket-tts.ts`) with random weights instead of a 600-line copy                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | S     | 1     |
+| R27 | The JIT compile cache key (backend, jaxpr hash, calibration values) left out module state that changes the compiled program. `_setConvRewriteEnabled(false)` reused programs compiled with the rewrite on, so the conv2d "C.3 block_map vs generic-dot" benchmark ran generic-dot in both arms (it also called `clearCaches()` while collecting, before anything ran); fixed in the vitest 5 migration with a regression test. Still open: `_skipForiRewrite`, set while compiling nested bodies, so a jaxpr first compiled as a body is reused at top level without the foriLoop rewrite                                                                                                                                                                                                                                                                                                                                                                                                                                                        | D     | 3     |
+| R28 | On WebGPU the Conv→BlockMap rewrite (on by default) makes jitted 3×3 SAME convs 3–70× slower than the generic-dot lowering it replaces: NVIDIA B8×128ch×64² 166 ms vs 2.4 ms, B1×32ch×64² 6.5 vs 2.3 ms; Intel B8×128ch×64² 482 vs 14.6 ms (`bench/conv2d.bench.ts`, rewrite on/off with the same jit function; calibration makes it no faster). The agent docs (P4) report 1.06–1.61× speedups and 4.48 ms for the B8 case. On WASM the rewrite is 1.2–1.4× faster. Not yet bisected                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | D     | 3     |
 
 ---
 
@@ -508,11 +511,18 @@ shows phase 0's own fix-on-fix, all in the test harness: `43b61eb` redoes 21 lin
 `8fbf8c8` (the wrong cause given in `fb8ea22`) and `a32d106`. Each was caught before sign-off, the
 two largest by the reviews.
 
+Also outside the reviewed range: dependency updates between phases 0 and 1, at the human's request
+(`a31d05b` within the declared ranges, then majors in groups). Vitest 5 runs benchmarks as tests, so
+`test/setup.ts`'s per-test hooks reach them: `*.bench.ts` files get debug level 0 and a
+slot-count-only leak check (`checkLeaks.start({ trackSites: false })`). Creation-site tracking made
+a small eager chain ~2.5× slower; the count-only check measured within noise. Migrating the
+benchmarks found R26–R28.
+
 **Exit:** working tree clean; `pnpm build && pnpm check && pnpm test` green on
 `wasm-multithreading`, in a fresh clone after `pnpm install`; a review report
 `remediation/reviews/phase-0-<n>.md` passes (rounds 1 and 2 failed).
 
-### Phase 1 — Ground truth: CI and test integrity (R9, R13, R16, R18–R21, R23, R24)
+### Phase 1 — Ground truth: CI and test integrity (R9, R13, R16, R18–R21, R23, R24, R26)
 
 1. Add a GitHub Actions workflow running `pnpm install`, `pnpm build`, `pnpm check`, `pnpm lint`,
    `pnpm test` (non-GPU) on every push and PR, including pushes to `wasm-multithreading`. GPU suites
@@ -544,6 +554,8 @@ two largest by the reviews.
     WebGPU, derive tolerances from the problem's conditioning and document the derivation inline.
 11. Website pages start GPU work only when the visitor asks (R25, remainder): `/bench/results`,
     linked from the homepage, runs matmuls up to 2048² in f32 and f16 as soon as it opens.
+12. Re-add a TTS per-step benchmark (R26) that imports the website's Pocket TTS model code and runs
+    it with random weights; it must pass the benchmark leak check.
 
 **Exit:** CI green on `wasm-multithreading`; default suite and both GPU suites green with required
 backends enforced; every skip/tolerance/timeout has a reason and issue; steady-state leak mode
@@ -572,7 +584,7 @@ returns no disposal-related hits; no `catch` of `UseAfterFreeError` in `src/`; c
 steady-state leak tests green; downstream `dlm-js` suite green against a local build _before_ any
 release.
 
-### Phase 3 — Lowering choices belong to the compiler (R5)
+### Phase 3 — Lowering choices belong to the compiler (R5, R27, R28)
 
 Library functions currently pick an algorithm based on tracing context or backend (unrolled Cholesky
 / TriSolve / Householder QR when `inMakeJaxprBody()`, `tiledMatmul` when WebGPU + traced + ≥ 512).
@@ -586,6 +598,10 @@ This makes semantics depend on how a function is called and scatters cost decisi
 3. Delete the context checks from `src/library/` and the `makeJaxprBodyDepth` idea with them.
 4. Decide the quarantined WASM QR routine and `bench/qr.bench.ts` (deferred from phase 0, item 3):
    keep only if the benchmark shows a win and the routine declares its own scratch requirements.
+5. Rewrite passes take their settings as parameters, not module state, and every setting that
+   changes the compiled program is part of the compile cache key (R27: `_skipForiRewrite`).
+6. Bisect the WebGPU conv slowdown (R28) with the A/B in `bench/conv2d.bench.ts`, then fix the
+   block_map conv path or let `evaluateTotalCost` choose between it and generic-dot.
 
 **Exit:**
 `git grep -nE "getBackend\(\)|defaultDevice\(\)|inMakeJaxprBody\(\)|insideTrace\(\)" -- src/library`

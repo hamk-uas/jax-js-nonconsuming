@@ -71,6 +71,16 @@ const COMMON_ARGS = [
 export const BROWSER_MAX_WORKERS = 4;
 
 /**
+ * Benchmark file selection for `vitest bench`. Vitest 5 runs benchmark files
+ * as a separate project with its own `exclude`, which does not inherit the
+ * test `exclude`; scratch benchmarks in the gitignored tmp/ stay out of runs
+ * like scratch tests do.
+ */
+export const benchmarkConfig = {
+  exclude: [...configDefaults.exclude, "tmp/**"],
+};
+
+/**
  * Per-GPU settings: PCI vendor ID, extra Chromium args and the Vulkan driver
  * manifest. The order is the preference when the GPU is detected (discrete
  * vendors first, matching WebGPU's high-performance adapter choice).
@@ -222,6 +232,7 @@ export function gpuConfig(gpu: GpuProfile) {
       maxWorkers: BROWSER_MAX_WORKERS,
       provide: { requiredDevices: requiredDevices(gpu) },
       exclude: [...configDefaults.exclude, "tmp/**"],
+      benchmark: benchmarkConfig,
       testTimeout: 300000,
       passWithNoTests: true,
       setupFiles: ["test/setup.ts"],

@@ -45,13 +45,20 @@ function webGpuDevice(): GPUDevice | undefined {
   }
 }
 
-beforeEach(() => {
-  // Enable ownership diagnostics. JIT compile logs and [jax-js] warnings
-  // are suppressed by vitest for passing tests; shown on failure for
+const BENCHMARK_FILE = /\.(bench|benchmark)\.[cm]?[jt]sx?$/;
+
+beforeEach(({ task }) => {
+  // Benchmark files (vitest's default `benchmark.include`) run in their own
+  // project but share this setup file. Leak-site capture made small eager
+  // ops ~2.5x slower and debug logging runs on some hot paths, so they get
+  // debug level 0 and a slot-count-only leak check.
+  const isBenchmark = BENCHMARK_FILE.test(task.file.filepath);
+  // Otherwise enable ownership diagnostics. JIT compile logs and [jax-js]
+  // warnings are suppressed by vitest for passing tests; shown on failure for
   // debugging. Ownership warnings surface via the library regression test.
-  setDebug(1);
+  setDebug(isBenchmark ? 0 : 1);
   beginTestGpuErrors(webGpuDevice());
-  checkLeaks.start();
+  checkLeaks.start({ trackSites: !isBenchmark });
 });
 
 afterEach(async () => {
@@ -82,8 +89,9 @@ afterAll(async () => {
 
 expect.extend({
   toBeAllclose(
-    actual: np.ArrayLike,
-    expected: np.ArrayLike,
+    // Whatever np.allclose accepts, as declared in test/vitest.d.ts.
+    actual: Parameters<typeof np.allclose>[0],
+    expected: Parameters<typeof np.allclose>[1],
     options: { rtol?: number; atol?: number; equalNaN?: boolean } = {},
   ) {
     const { isNot } = this;
