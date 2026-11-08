@@ -15,3 +15,6 @@ deno.lock
 # Test files from vitest
 __screenshots__/
 coverage/
+
+# Python bytecode (scripts/)
+__pycache__/

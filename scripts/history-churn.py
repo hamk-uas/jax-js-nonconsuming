@@ -18,18 +18,27 @@ Measures (all "recent" = written at most K fork commits earlier):
 
 Follow-ups look forward, so the last K commits are right-censored (biased low).
 
-Scope: src/** and packages/*/src/**, excluding *.test.ts. Upstream-authored commits are excluded
-from the x-axis and their lines never count as redone. Pass --worktree to append the uncommitted
-working tree as a final pseudo-commit "WT" (off by default so the figure is reproducible from git).
+Scopes (--scope): "src" (default, the published figure) is src/** and packages/*/src/**,
+excluding *.test.ts. "code" is all code: library source, tests, test and build configuration,
+benchmarks, scripts and the website source. Rework in the test harness and tooling only shows up in
+"code". Upstream-authored commits are excluded from the x-axis and their lines never count as
+redone. Pass --worktree to append the uncommitted working tree as a final pseudo-commit "WT" (off by
+default so the figure is reproducible from git).
 
-Outputs (in --out, default remediation/):
+Figure mode (default) writes, in --out (default remediation/):
   history-churn.csv         one row per fork commit
   history-churn-edges.csv   blame edges: commit fixer_n redid `lines` lines written by origin_n
   history-churn.png         the figure
-Requires matplotlib + numpy (pip install matplotlib).
+and needs matplotlib + numpy, e.g.
+  uv run --no-project --with matplotlib --with numpy python scripts/history-churn.py
+
+Review mode (--since REV) writes no files and needs only Python: for both scopes, it prints the
+segment table with a row for the fork commits in REV..HEAD, and lists which earlier commits each of
+them redoes.
 
 Usage: python3 scripts/history-churn.py [--k 20] [--window 40] [--bin 1500] [--worktree]
-                                        [--since REV]   # review rounds: summarize REV..HEAD
+                                        [--scope src|code] [--out DIR]
+       python3 scripts/history-churn.py --since REV     # review rounds
 """
 
 import argparse
@@ -41,6 +50,14 @@ import subprocess
 from collections import defaultdict
 
 SRC = re.compile(r"^(src/|packages/[^/]+/src/)")
+CODE = re.compile(
+    r"^(src/|packages/[^/]+/|test/|bench/|scripts/|website/src/|[^/]+\.config\.[cm]?[jt]s$)"
+)
+CODE_EXT = re.compile(r"\.(ts|js|mjs|cjs|svelte|py|sh)$")
+SCOPE_DOC = {
+    "src": "library source, excluding tests",
+    "code": "all code: library, tests, test/build config, benchmarks, scripts, website",
+}
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
 BLAME_HDR = re.compile(r"^([0-9a-f]{40}) \d+ \d+(?: \d+)?$")
 FORK_AUTHOR = re.compile(r"^Olli")
@@ -75,11 +92,13 @@ def git(*args: str) -> str:
     )
 
 
-def is_src(path: str) -> bool:
-    return bool(SRC.match(path)) and not path.endswith(".test.ts")
+def in_scope(path: str, scope: str) -> bool:
+    if scope == "src":
+        return bool(SRC.match(path)) and not path.endswith(".test.ts")
+    return bool(CODE.match(path)) and bool(CODE_EXT.search(path))
 
 
-def diff_stats(diff: str):
+def diff_stats(diff: str, scope: str):
     """Return (non-blank added lines, removed lines, {path: [(start, end)] old-side ranges})."""
     added = removed = 0
     ranges = defaultdict(list)
@@ -89,7 +108,7 @@ def diff_stats(diff: str):
             cur = line[6:] if line.startswith("--- a/") else None
         elif line.startswith("+++ "):
             cur = cur or (line[6:] if line.startswith("+++ b/") else None)
-            if cur and not is_src(cur):
+            if cur and not in_scope(cur, scope):
                 cur = None
         elif cur is None:
             continue
@@ -125,7 +144,7 @@ def blame_origins(base: str, rev: str, path: str, ranges) -> dict:
     return counts
 
 
-def collect(include_worktree: bool):
+def collect(include_worktree: bool, scope: str = "src"):
     revs = git("rev-list", "--reverse", "--topo-order", "--no-merges", "HEAD").split()
     meta = {}
     for line in git("log", "--no-merges", "--format=%H%x00%at%x00%an%x00%s", "HEAD").splitlines():
@@ -137,7 +156,9 @@ def collect(include_worktree: bool):
     fidx = {r: i for i, r in enumerate(fork)}
 
     def record(rev_old, rev_new_args, i):
-        added, removed, ranges = diff_stats(git("diff", "-w", "-U0", "--no-renames", *rev_new_args))
+        added, removed, ranges = diff_stats(
+            git("diff", "-w", "-U0", "--no-renames", *rev_new_args), scope
+        )
         for path, rs in ranges.items():
             for o, n in blame_origins(base, rev_old, path, rs).items():
                 if o in fidx and fidx[o] < i:
@@ -156,7 +177,7 @@ def collect(include_worktree: bool):
         i = len(fork)
         added, removed = record("HEAD", ("HEAD",), i)
         for path in git("ls-files", "--others", "--exclude-standard").split():
-            if is_src(path):
+            if in_scope(path, scope):
                 with open(path, errors="ignore") as f:
                     added += sum(1 for line in f if line.strip())
         if added or removed:
@@ -191,6 +212,73 @@ def measures(rows, edges, k, min_lines, min_share):
     return redone_by, redone_of, followups, corrective
 
 
+def segment_groups(rows, nc):
+    """Fork-commit index ranges between the EVENTS markers (committed history only)."""
+    sha_to_n = {r["sha"]: i + 1 for i, r in enumerate(rows)}
+    marks = [(s, sha_to_n[s] - 1) for s, _ in EVENTS if s in sha_to_n and sha_to_n[s] <= nc]
+    cuts = [("start", 0)] + marks + [("end", nc)]
+    return [(f"from {name}", list(range(a, b))) for (name, a), (_, b) in zip(cuts, cuts[1:])]
+
+
+def print_summary(rows, edges, groups, args):
+    k = args.k
+    redone_by, _, followups, corrective = measures(rows, edges, k, args.min_lines, args.min_share)
+    redone_by100, _, _, _ = measures(rows, edges, 100, args.min_lines, args.min_share)
+    print(
+        f"\n{'segment':<20}{'commits':>8}{'new lines':>11}{'ratio≤' + str(k):>10}{'ratio≤100':>11}"
+        f"{'follow-ups/change':>19}{'corrective share':>18}"
+    )
+    for name, idx in groups:
+        if not idx:
+            print(f"{name:<20}{0:>8}  (no fork commits)")
+            continue
+        code = [1 if rows[i]["added"] or rows[i]["removed"] else 0 for i in idx]
+        added = sum(rows[i]["added"] for i in idx)
+        na, nc = max(added, 1), max(sum(code), 1)
+        print(
+            f"{name:<20}{len(idx):>8}{added:>11}"
+            f"{sum(redone_by[i] for i in idx) / na:>10.2f}"
+            f"{sum(redone_by100[i] for i in idx) / na:>11.2f}"
+            f"{sum(followups[i] * c for i, c in zip(idx, code)) / nc:>19.2f}"
+            f"{sum(corrective[i] * c for i, c in zip(idx, code)) / nc:>18.2f}"
+        )
+
+
+def review(args):
+    """Review mode: summarize REV..HEAD in both scopes; write nothing."""
+    try:
+        in_range = {h[:7] for h in git("rev-list", f"{args.since}..HEAD").split()}
+    except subprocess.CalledProcessError:
+        raise SystemExit(f"--since: unknown revision {args.since!r}")
+    for scope in ("src", "code"):
+        print(f"\n=== scope {scope!r}: {SCOPE_DOC[scope]}")
+        print("collecting blame data …")
+        rows, edges = collect(False, scope)
+        idx = [i for i in range(len(rows)) if rows[i]["sha"] in in_range]
+        groups = segment_groups(rows, len(rows)) + [(f"{args.since}..HEAD", idx)]
+        print_summary(rows, edges, groups, args)
+        # Fix-on-fix pairs: which recent commits each commit in the range redoes.
+        print(f"\ncommits in {args.since}..HEAD that redo code written ≤{args.k} commits earlier:")
+        found = False
+        for i in idx:
+            redone = defaultdict(int)
+            for c, o, lines in edges:
+                if c == i and 0 < c - o <= args.k:
+                    redone[o] += lines
+            if redone:
+                found = True
+                parts = ", ".join(f"{rows[o]['sha']} ({n})" for o, n in sorted(redone.items()))
+                print(
+                    f"  {rows[i]['sha']} {rows[i]['subject'][:60]}\n      redoes lines of {parts}"
+                )
+        if not found:
+            print("  none")
+    print(
+        f"\nnote: follow-ups for the last {args.k} commits are not yet observable (biased low); "
+        "re-run after later work to complete them."
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--k", type=int, default=20, help="recency horizon in fork commits")
@@ -200,19 +288,33 @@ def main():
     ap.add_argument("--min-share", type=float, default=0.3, help="corrective commit: redone/added")
     ap.add_argument("--worktree", action="store_true", help="append uncommitted working tree")
     ap.add_argument(
-        "--since", metavar="REV", help="also summarize fork commits in REV..HEAD (review rounds)"
+        "--since",
+        metavar="REV",
+        help="review mode: summarize fork commits in REV..HEAD in both scopes; writes no files",
     )
+    ap.add_argument("--scope", choices=sorted(SCOPE_DOC), default="src", help="figure mode scope")
     ap.add_argument("--out", default="remediation")
     args = ap.parse_args()
 
-    import matplotlib
+    if args.since:
+        review(args)
+        return
+
+    try:
+        import matplotlib
+        import numpy as np
+    except ImportError:
+        raise SystemExit(
+            "figure mode needs matplotlib and numpy, e.g.\n  uv run --no-project "
+            "--with matplotlib --with numpy python scripts/history-churn.py\n"
+            "(review mode, --since REV, needs neither)"
+        )
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import numpy as np
 
     print("collecting blame data …")
-    rows, edges = collect(args.worktree)
+    rows, edges = collect(args.worktree, args.scope)
     k = args.k
     redone_by, redone_of, followups, corrective = measures(
         rows, edges, k, args.min_lines, args.min_share
@@ -471,35 +573,7 @@ def main():
     fig.savefig(path, dpi=120, bbox_inches="tight")
     print(f"wrote {path}, history-churn.csv, history-churn-edges.csv")
 
-    # Segment summary between event markers (committed history only).
-    marks = [(s, sha_to_n[s] - 1) for s, _ in EVENTS if s in sha_to_n and sha_to_n[s] <= nc]
-    cuts = [("start", 0)] + marks + [("end", nc)]
-    groups = [(f"from {name}", list(range(a, b))) for (name, a), (_, b) in zip(cuts, cuts[1:])]
-    if args.since:
-        try:
-            in_range = {h[:7] for h in git("rev-list", f"{args.since}..HEAD").split()}
-        except subprocess.CalledProcessError:
-            raise SystemExit(f"--since: unknown revision {args.since!r}")
-        # Exactly the fork commits in REV..HEAD, which need not be contiguous in topo order.
-        groups.append((f"{args.since}..HEAD", [i for i in range(nc) if rows[i]["sha"] in in_range]))
-    redone_by_a, redone_by100_a = np.array(redone_by[:nc]), np.array(redone_by100[:nc])
-    followups_a, corrective_a = np.array(followups[:nc]), np.array(corrective[:nc])
-    print(
-        f"\n{'segment':<20}{'commits':>8}{'new lines':>11}{'ratio≤' + str(k):>10}{'ratio≤100':>11}"
-        f"{'follow-ups/change':>19}{'corrective share':>18}"
-    )
-    for name, idx in groups:
-        if not idx:
-            print(f"{name:<20}{0:>8}  (no fork commits)")
-            continue
-        c = code[idx]
-        na = max(added[idx].sum(), 1)
-        print(
-            f"{name:<20}{len(idx):>8}{int(added[idx].sum()):>11}"
-            f"{redone_by_a[idx].sum() / na:>10.2f}{redone_by100_a[idx].sum() / na:>11.2f}"
-            f"{(followups_a[idx] * c).sum() / max(c.sum(), 1):>19.2f}"
-            f"{(corrective_a[idx] * c).sum() / max(c.sum(), 1):>18.2f}"
-        )
+    print_summary(rows, edges, segment_groups(rows, nc), args)
     if has_wt:
         print(
             f"uncommitted working tree: +{rows[-1]['added']} lines, "

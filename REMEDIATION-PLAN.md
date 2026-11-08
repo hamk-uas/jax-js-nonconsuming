@@ -389,9 +389,12 @@ status updates are _claims to verify_, not context.
 5. Tests prove the capability on the target runtime: they fail without the change, and assert that
    the new path ran, not only that nothing threw.
 6. Commit hygiene: subjects match content; version bumps contain only version bumps; no `WIP`.
-7. Rework for the range: `python3 scripts/history-churn.py --since <range start>` (corrective share,
-   follow-ups per change; follow-ups of the newest commits are incomplete, so compare corrective
-   share first).
+7. Rework for the range: `python3 scripts/history-churn.py --since <range start>` (writes no files,
+   needs no plotting libraries). It reports two scopes: `src` (library source) and `code` (also
+   tests, test and build configuration, benchmarks, scripts, website), and lists which earlier
+   commits each commit in the range redoes. Read `code` too: harness and tooling rework is invisible
+   in `src`. Follow-ups of the newest commits are incomplete, so compare corrective share and the
+   listed pairs first.
 
 **Output.** A short report committed as `remediation/reviews/<phase>-<n>.md`: verdict (pass / pass
 with findings / fail), the exit-criteria table, findings with severity and evidence, rework numbers.
@@ -455,7 +458,17 @@ human sign-off line in that report. The same applies to releases.
    ([phase-0-2.md](remediation/reviews/phase-0-2.md)) failed on F2.1: errors raised while a test
    module loaded were only logged. After two failed rounds the human decided to fix it rather than
    defer it: the listener is attached when each device is created, `afterAll` flushes, and
-   `test/webgpu-errors.test.ts` proves both the module-load and the in-test case.
+   `test/webgpu-errors.test.ts` proves both the module-load and the in-test case. Round 3
+   ([phase-0-3.md](remediation/reviews/phase-0-3.md)) passed.
+
+After round 3, outside the reviewed range (the next review covers it): in all three rounds the
+reviewer could not run checklist item 7 as written (`history-churn.py` needed matplotlib and wrote
+into `remediation/`) and re-implemented it; its `src` scope then read "zero rework". Review mode
+(`--since`) now writes nothing, needs only Python, and also reports the `code` scope. That scope
+shows phase 0's own fix-on-fix, all in the test harness: `43b61eb` redoes 21 lines of `bef6bb1`
+(round 1, finding 1), `648d367` redoes 42 lines of `82bb49d` (round 2, F2.1), and smaller ones in
+`8fbf8c8` (the wrong cause given in `fb8ea22`) and `a32d106`. Each was caught before sign-off, the
+two largest by the reviews.
 
 **Exit:** working tree clean; `pnpm build && pnpm check && pnpm test` green on
 `wasm-multithreading`, in a fresh clone after `pnpm install`; a review report
@@ -621,9 +634,10 @@ cherry-pick plus `upstream-adapt.sh`) cheaper.
    [Review rounds](#review-rounds-every-significant-milestone), followed by an update of the debt
    register above. Releases require a passing review of the commits since the previous release,
    which also enforces the cadence in item 3.
-6. Track rework as a health metric: re-run `scripts/history-churn.py` at the end of each phase and
-   record corrective share and follow-ups per change for the phase's commits. A phase whose own
-   commits show a corrective share above ~0.2 is landing work before it is ready.
+6. Track rework as a health metric: re-run `scripts/history-churn.py --since <phase start>` at the
+   end of each phase and record corrective share and follow-ups per change for the phase's commits,
+   in both scopes. A phase whose own commits show a corrective share above ~0.2 is landing work
+   before it is ready.
 
 ---
 
@@ -653,21 +667,26 @@ Patterns that indicate the debt described above; use them during phases 1–3 an
 - Commit survey:
   `git log --reverse --no-merges --author=Olli --format='%h %ad %s' --date=short HEAD` combined with
   per-commit `git show --unified=0` pattern counts.
-- Rework plot and data (about 15 s; needs `pip install matplotlib`):
+- Rework plot and data (about 15 s; needs matplotlib and numpy, which `uv` provides):
 
   ```bash
-  python3 scripts/history-churn.py                 # defaults: --k 20 --window 40 --bin 1500
-  python3 scripts/history-churn.py --k 10 --out tmp/k10           # sensitivity checks; same
-  python3 scripts/history-churn.py --k 40 --window 60 --out tmp/k40  # picture, see §3.6 point 2
-  python3 scripts/history-churn.py --worktree      # also score the uncommitted working tree
+  alias churn='uv run --no-project --with matplotlib --with numpy python scripts/history-churn.py'
+  churn                                            # defaults: --k 20 --window 40 --bin 1500
+  churn --k 10 --out tmp/k10                       # sensitivity checks; same
+  churn --k 40 --window 60 --out tmp/k40           # picture, see §3.6 point 2
+  churn --worktree                                 # also score the uncommitted working tree
+  churn --scope code --out tmp/code                # include tests, configs, scripts, website
+  python3 scripts/history-churn.py --since <rev>  # review mode: tables only, no files
   ```
 
   The output files go to `remediation/`. Individual chains can be read off `history-churn-edges.csv`
   (`fixer_n` redid `lines` lines written by `origin_n`; `n` matches the `n` column of
   `history-churn.csv`).
 
-- Ground truth: `git worktree add --detach <dir> HEAD`, link `node_modules`, then
-  `pnpm run build && npx tsc --noEmit -p . && pnpm vitest run`.
+- Ground truth: `git clone` the repository into a scratch directory, check out the commit, then
+  `pnpm install && pnpm build && pnpm check && pnpm lint && pnpm test`. Do not link an existing
+  `node_modules`: that skips the `prepare` scripts which build `dist/` and generate the website's
+  `.svelte-kit/`, and website tests then fail spuriously (phase 0 review round 1, finding 3).
 
 ## Appendix B: test-integrity inventory commands
 
