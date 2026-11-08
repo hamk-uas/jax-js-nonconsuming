@@ -1,110 +1,159 @@
-import type { Device, DType } from "@hamk-uas/jax-js-nonconsuming";
+import type {
+  Device,
+  DType,
+  Array as JaxArray,
+} from "@hamk-uas/jax-js-nonconsuming";
 
-export async function benchFlops(
+type Jax = typeof import("@hamk-uas/jax-js-nonconsuming");
+
+/**
+ * Target length of one submission of matmuls, in ms.
+ *
+ * While a submission runs, a GPU that also drives the display cannot update
+ * the screen. The benchmark used to submit 8 matmuls of a size picked by GPU
+ * vendor (2048² for any AMD GPU): 184 ms per submission in fp32 and 521 ms in
+ * fp16 on an Intel Arc iGPU, longer on weaker GPUs, and it was suspected of
+ * freezing a laptop with an AMD GPU. Matrix size and batch length now come
+ * from measured matmul times. Measured 2026-11-08: 46–63 ms per submission,
+ * up to 91 ms for the first batch while the GPU is still at low clocks.
+ */
+const SUBMIT_BUDGET_MS = 50;
+const MIN_N = 128;
+const MAX_N = 4096;
+const MAX_BATCH = 8;
+const NUM_BATCHES = 7;
+
+class DeadlineExceeded extends Error {}
+
+const median = (xs: number[]) =>
+  [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+
+function randomMatrix(
+  jax: Jax,
+  seed: number,
   n: number,
+  dtype: DType,
+): JaxArray {
+  using key = jax.random.key(seed);
+  const u = jax.random.uniform(key, [n, n]);
+  const m = u.astype(dtype);
+  if (m !== u) u.dispose(); // astype returns `u` itself when the dtype is unchanged
+  return m;
+}
+
+/**
+ * Measure matmul GFLOP/s on `device`. Returns undefined if the measurement
+ * fails or does not finish within `timeoutMs`; no new work is submitted after
+ * that, and the next measurement must not start before this one returns.
+ */
+export async function benchFlops(
+  jax: Jax,
   device: Device,
   dtype: DType,
   timeoutMs = 8000,
 ): Promise<number | undefined> {
-  // Race the actual benchmark against a timeout so weak GPUs that trigger
-  // TDR (GPU timeout / device-lost) don't hang the page.
+  const deadline = performance.now() + timeoutMs;
+  // Also give up waiting if the device stops responding (e.g. device lost),
+  // in which case the measurement never reaches its next deadline check.
   let timer: ReturnType<typeof setTimeout>;
-  const result = await Promise.race([
-    benchFlopsInner(n, device, dtype),
-    new Promise<undefined>((resolve) => {
-      timer = setTimeout(() => resolve(undefined), timeoutMs);
-    }),
-  ]);
-  clearTimeout(timer!);
-  return result;
+  const unresponsive = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), timeoutMs + 2000);
+  });
+  try {
+    return await Promise.race([
+      measure(jax, device, dtype, deadline),
+      unresponsive,
+    ]);
+  } finally {
+    clearTimeout(timer!);
+  }
 }
 
-async function benchFlopsInner(
-  n: number,
+async function measure(
+  jax: Jax,
   device: Device,
   dtype: DType,
+  deadline: number,
 ): Promise<number | undefined> {
+  const previousDevice = jax.defaultDevice();
+  jax.defaultDevice(device);
+  const matmul =
+    device === "webgpu"
+      ? jax.jit((a: JaxArray, b: JaxArray) => jax.lax.tiledMatmul(a, b))
+      : jax.jit((a: JaxArray, b: JaxArray) => jax.numpy.matmul(a, b));
+
+  /** Submit `count` matmuls together and wait for them; returns ms. */
+  const run = async (
+    a: JaxArray,
+    b: JaxArray,
+    count: number,
+  ): Promise<number> => {
+    if (performance.now() > deadline) throw new DeadlineExceeded();
+    const outputs: JaxArray[] = [];
+    try {
+      const start = performance.now();
+      jax.withBatch(() => {
+        for (let i = 0; i < count; i++) outputs.push(matmul(a, b));
+      });
+      await jax.blockUntilReady(outputs);
+      return performance.now() - start;
+    } finally {
+      for (const o of outputs) o.dispose();
+    }
+  };
+
+  /** Median time of one n×n matmul, after compiling for that shape. */
+  const timeOne = async (n: number): Promise<number> => {
+    using a = randomMatrix(jax, 1, n, dtype);
+    using b = randomMatrix(jax, 2, n, dtype);
+    await run(a, b, 1);
+    return median([await run(a, b, 1), await run(a, b, 1), await run(a, b, 1)]);
+  };
+
   try {
-    const jax = await import("@hamk-uas/jax-js-nonconsuming");
-    await jax.init(device);
-    jax.defaultDevice(device);
+    // Grow n while a matmul of the next size is predicted to fit the budget.
+    // A measured time is a fixed submit/fence latency, taken at MIN_N where
+    // the matmul itself is negligible, plus the work, which is predicted to
+    // grow 8× per doubling of n. GPUs are usually more efficient at larger
+    // sizes, so the prediction errs on the safe side.
+    let n = MIN_N;
+    const fixedMs = await timeOne(n);
+    let workMs = 0.05;
+    while (n < MAX_N && fixedMs + 8 * workMs <= SUBMIT_BUDGET_MS) {
+      n *= 2;
+      workMs = Math.max((await timeOne(n)) - fixedMs, 0.05);
+    }
 
-    const np = jax.numpy;
-    const lax = jax.lax;
-
-    // JIT-compile matmul — on WebGPU this uses tiledMatmul with
-    // GPU-adaptive tile config.  The first call compiles; we exclude it.
-    const matmulFn =
-      device === "webgpu"
-        ? jax.jit((a: any, b: any) => lax.tiledMatmul(a, b))
-        : jax.jit((a: any, b: any) => np.matmul(a, b));
-
-    // Allocate inputs once, reuse across all iterations
-    using key = jax.random.key(0);
-    const [k1, k2] = jax.random.split(key, 2);
-    using A = jax.random.uniform(k1, [n, n]).astype(dtype);
-    using B = jax.random.uniform(k2, [n, n]).astype(dtype);
-    k1.dispose();
-    k2.dispose();
-    await jax.blockUntilReady([A, B]);
-
-    // Warmup: triggers JIT compilation + pipeline creation + GPU clock boost
-    for (let w = 0; w < 3; w++) {
-      using C = matmulFn(A, B);
-      await jax.blockUntilReady(C);
-      if (w === 0) {
-        const sample = (await C.data())[0];
-        if (!Number.isFinite(sample))
-          throw new Error("GPU produced non-finite result");
+    using a = randomMatrix(jax, 1, n, dtype);
+    using b = randomMatrix(jax, 2, n, dtype);
+    {
+      if (performance.now() > deadline) throw new DeadlineExceeded();
+      using c = matmul(a, b);
+      if (!Number.isFinite((await c.data())[0])) {
+        throw new Error("matmul produced a non-finite result");
       }
     }
 
-    // Batch-submit timing: dispatch BATCH_SIZE matmuls back-to-back in a
-    // single queue.submit(), fence once, divide total time by BATCH_SIZE.
-    // This amortizes per-fence overhead and renderer main-thread stalls
-    // (module compilation, layout, compositor BeginFrame) across many GPU
-    // dispatches — far more stable than per-iteration fence timing.
-    const BATCH_SIZE = 8;
-    const NUM_BATCHES = 7;
-
-    // Extra warmup: run a full batch to ramp GPU clocks before timing.
-    // Single-iteration warmup above compiles shaders but doesn't generate
-    // enough sustained load to bring the GPU out of low-power state.
-    // Without this, the first 1–2 timed batches run at reduced clock speed
-    // (observed: 183ms vs ~30ms on Intel gen-9 iGPU), occasionally
-    // contaminating the median.
-    {
-      const wOutputs: any[] = [];
-      jax.withBatch(() => {
-        for (let i = 0; i < BATCH_SIZE; i++) wOutputs.push(matmulFn(A, B));
-      });
-      await jax.blockUntilReady(wOutputs[wOutputs.length - 1]);
-      for (const o of wOutputs) o.dispose();
+    const batch = Math.min(
+      MAX_BATCH,
+      Math.max(1, Math.floor((SUBMIT_BUDGET_MS - fixedMs) / workMs)),
+    );
+    await run(a, b, batch); // brings the GPU out of its low-power state
+    const rates: number[] = [];
+    for (let i = 0; i < NUM_BATCHES; i++) {
+      const ms = await run(a, b, batch);
+      rates.push((batch * 2 * n ** 3) / (ms / 1000) / 1e9);
     }
-    const measurements: number[] = [];
-    for (let b = 0; b < NUM_BATCHES; b++) {
-      const outputs: any[] = [];
-      const start = performance.now();
-      jax.withBatch(() => {
-        for (let i = 0; i < BATCH_SIZE; i++) outputs.push(matmulFn(A, B));
-      });
-      await jax.blockUntilReady(outputs[outputs.length - 1]);
-      const end = performance.now();
-      for (const o of outputs) o.dispose();
-      measurements.push((end - start) / 1000 / BATCH_SIZE);
-    }
-
-    matmulFn.dispose();
-
-    const gflops = (2 * n * n * n) / 1e9;
-    measurements.sort((a, b) => a - b);
-    const seconds = measurements[Math.floor(measurements.length / 2)];
-    const result = gflops / seconds;
-
+    const result = median(rates);
     return Number.isFinite(result) && result > 0 ? result : undefined;
-  } catch (error: any) {
-    console.error("Benchmark error:", error);
+  } catch (error) {
+    if (!(error instanceof DeadlineExceeded)) {
+      console.error("Benchmark error:", error);
+    }
     return undefined;
+  } finally {
+    matmul.dispose();
+    jax.defaultDevice(previousDevice);
   }
 }
 
@@ -118,7 +167,7 @@ export interface PerfResults {
   live: boolean;
 }
 
-// Fall back to these if live measurement fails
+// Shown until the visitor measures their own device.
 export const fallbackResults: PerfResults = {
   flops: {
     Wasm: 2.72,
@@ -130,75 +179,26 @@ export const fallbackResults: PerfResults = {
 };
 
 export async function measurePerf(): Promise<PerfResults> {
-  // See if the current browser supports WebGPU.
-  if (!navigator?.gpu?.requestAdapter) {
-    return fallbackResults;
-  }
-
-  const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) return fallbackResults;
-  const hasF16 = adapter.features.has("shader-f16");
-
-  const isApple = /iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent);
-  const isMobile = /Mobi/.test(navigator.userAgent);
-  const isNvidia = /NVIDIA/i.test(adapter.info.vendor);
-  const isIntel = /intel/i.test(adapter.info.vendor);
-  const isGoodGpu = /NVIDIA|AMD|Qualcomm|ARM/i.test(adapter.info.vendor);
-  // Intel Arc (xe-lpg, xe-hpg, …) is a discrete-class GPU; older Intel
-  // UHD/Iris iGPUs have much less compute and can trigger TDR at large N.
-  const isIntelArc =
-    isIntel &&
-    /xe-[lh]pg|alchemist|arc/i.test(
-      `${adapter.info.architecture} ${adapter.info.description}`,
-    );
-
-  let gpuDim: number;
-  if (isApple) {
-    gpuDim = isMobile ? 2048 : 4096;
-  } else if (isNvidia) {
-    gpuDim = 4096;
-  } else if (isGoodGpu) {
-    gpuDim = isMobile ? 1024 : 2048;
-  } else if (isIntelArc) {
-    // Intel Arc (xe-lpg, xe-hpg) handles 2048 comfortably (~25ms/iter).
-    gpuDim = isMobile ? 1024 : 2048;
-  } else if (isIntel) {
-    // Intel UHD / Iris iGPUs — keep it light to avoid device-lost.
-    gpuDim = 512;
-  } else {
-    gpuDim = 512;
-  }
-
-  // Older Intel iGPUs need a longer timeout: JIT compilation (~1s) + warmup
-  // dispatches eat most of the default 8s budget, leaving insufficient time
-  // for the timed batches. (Sized when init("webgpu") also ran a ~3s GPU
-  // calibration, which is now opt-in and not used here.)
-  const gpuTimeout = isIntel && !isIntelArc ? 20000 : 8000;
-
-  const fp32Result = await benchFlops(
-    gpuDim,
-    "webgpu",
-    "float32" as DType,
-    gpuTimeout,
-  );
-
-  // Flush JIT caches + buffer pool between dtype benchmarks to ensure the
-  // fp16 run starts with a clean GPU state (no stale pipeline / pool
-  // contention from fp32). Replaces the former blind 300ms setTimeout.
-  if (hasF16 && fp32Result !== undefined) {
-    const jax = await import("@hamk-uas/jax-js-nonconsuming");
+  const jax = await import("@hamk-uas/jax-js-nonconsuming");
+  const devices = await jax.init("webgpu", "wasm");
+  const flops: PerfResults["flops"] = {
+    Wasm: undefined,
+    WebGPU: undefined,
+    "WebGPU-fp16": undefined,
+  };
+  // One measurement at a time: each returns only after it has stopped
+  // submitting work.
+  if (devices.includes("webgpu")) {
+    flops.WebGPU = await benchFlops(jax, "webgpu", jax.DType.Float32);
+    if (
+      flops.WebGPU !== undefined &&
+      jax.getBackend("webgpu").capabilities.shaderF16
+    ) {
+      flops["WebGPU-fp16"] = await benchFlops(jax, "webgpu", jax.DType.Float16);
+    }
+    // Release the compiled programs and pooled GPU buffers.
     jax.clearCaches();
   }
-
-  return {
-    flops: {
-      Wasm: await benchFlops(128, "wasm", "float32" as DType),
-      WebGPU: fp32Result,
-      "WebGPU-fp16": hasF16
-        ? await benchFlops(gpuDim, "webgpu", "float16" as DType, gpuTimeout)
-        : undefined,
-    },
-    browser: "Your browser (live)",
-    live: true,
-  };
+  flops.Wasm = await benchFlops(jax, "wasm", jax.DType.Float32);
+  return { flops, browser: "Your browser (live)", live: true };
 }

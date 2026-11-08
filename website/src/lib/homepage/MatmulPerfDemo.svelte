@@ -1,11 +1,12 @@
 <script lang="ts">
   import { LoaderCircle, SquareMousePointerIcon } from "@lucide/svelte";
-  import { onMount } from "svelte";
   import { fade } from "svelte/transition";
 
   import { fallbackResults, measurePerf, type PerfResults } from "./benchFlops";
 
-  let results = $state<PerfResults | null>(null);
+  // The benchmark loads the GPU, so it runs only when the visitor asks for it;
+  // until then the chart shows stored results.
+  let results = $state<PerfResults | null>(fallbackResults);
 
   let measuring = $state(false);
 
@@ -15,14 +16,13 @@
     try {
       results = null;
       results = await measurePerf();
+    } catch (error) {
+      console.error("Benchmark error:", error);
+      results = fallbackResults;
     } finally {
       measuring = false;
     }
   }
-
-  onMount(() => {
-    measurementTask();
-  });
 
   // Bar chart configuration
   const barWidth = 80;
@@ -161,28 +161,24 @@
   </svg>
 
   <div
-    class="flex items-center gap-2 mt-4 text-sm"
-    class:animate-pulse={!results}
+    class="flex flex-col items-center gap-1 mt-4 text-sm"
+    class:animate-pulse={measuring}
   >
-    {#if !results}
-      <LoaderCircle size={16} class="animate-spin text-gray-400" />
-      <p class="text-gray-500">Running benchmark…</p>
+    {#if measuring || !results}
+      <div class="flex items-center gap-2">
+        <LoaderCircle size={16} class="animate-spin text-gray-400" />
+        <p class="text-gray-500">Running benchmark…</p>
+      </div>
     {:else}
+      <p class="text-gray-800">
+        {results.live ? results.browser : `Stored result: ${results.browser}`}
+      </p>
       <button
-        class="flex items-center gap-2"
-        onclick={() => {
-          if (results?.live) {
-            measurementTask();
-          }
-        }}
-        disabled={!results.live || measuring}
+        class="flex items-center gap-2 text-gray-600 hover:text-gray-900"
+        onclick={measurementTask}
       >
-        {#if results.live}
-          <SquareMousePointerIcon size={16} class="text-gray-500" />
-        {/if}
-        <p class="text-gray-800">
-          {results.browser}
-        </p>
+        <SquareMousePointerIcon size={16} />
+        {results.live ? "Measure again" : "Measure on this device"}
       </button>
     {/if}
   </div>
