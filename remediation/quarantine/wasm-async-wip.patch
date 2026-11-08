@@ -1,0 +1,5095 @@
+Quarantined work: wasm-multithreading async completion / workspace leasing (2026-06-02 .. 06-05)
+
+Base:    fe2c9cc (branch wasm-multithreading)
+Apply:   git apply remediation/quarantine/wasm-async-wip.patch
+         git apply --include=<path> remediation/quarantine/wasm-async-wip.patch   (one file)
+Size:    21 files, +3492 / -477 lines
+
+Provenance
+  Produced by AI chat edits between 2026-06-02 and 2026-06-05 and never committed.
+  When the remediation audit started (2026-11-08 08:59:39 UTC) the working tree held this
+  work, except that five files had been written back one second earlier, for an unknown
+  reason: src/backend/wasm.ts (to HEAD plus the worker-pool gate removal), and
+  src/backend/wasm/orchestrator.ts, src/backend/wasm/wait.ts, src/frontend/jit.ts and
+  test/wasm-nested-worker.test.ts (to HEAD). Their June versions were recovered from
+  VS Code local history (last edits 2026-06-04 06:49 .. 2026-06-05 12:06 UTC) and are
+  included here, so this patch is the complete work.
+
+State of base + patch (verified 2026-11-08)
+  pnpm build: passes.  tsc on src/: passes.
+  tsc overall: 14 errors in test/ and bench/ (tests import both the dist package and
+    ../src, giving two incompatible TracerValue types), so `pnpm check` and the
+    pre-commit hook fail. This is why it could not be committed as-is.
+  Default vitest suite: 2287 passed, 1072 skipped, 0 failed. GPU suites not run.
+  Caveat (found later the same day): the test config of that time left WebGPU and
+  WebGL uninitialized, so those cases were among the skips; GPU-facing parts of
+  this work are untested. See REMEDIATION-PLAN.md, R18.
+
+Do not apply wholesale. REMEDIATION-PLAN.md, phase 0, lists what to salvage, what is
+rejected and what is deferred to the phase 4 ADR.
+
+diff --git a/bench/qr.bench.ts b/bench/qr.bench.ts
+new file mode 100644
+index 0000000..97e27aa
+--- /dev/null
++++ b/bench/qr.bench.ts
+@@ -0,0 +1,311 @@
++/**
++ * QR cutoff benchmark for the WASM backend.
++ *
++ * Focus:
++ * - compare the current public small-shape polyfill against the direct routine path
++ * - measure the 8 -> 9 threshold in eager and jit execution
++ *
++ * Run with:
++ *   pnpm build && pnpm vitest bench bench/qr.bench.ts
++ */
++import {
++  blockUntilReady,
++  defaultDevice,
++  init,
++  jit,
++  lax,
++  numpy as np,
++  random,
++} from "@hamk-uas/jax-js-nonconsuming";
++import { afterAll, bench, describe } from "vitest";
++
++import { qr as primitiveQr } from "../src/frontend/core";
++
++await init("wasm");
++defaultDevice("wasm");
++
++type MatrixSpec = {
++  label: string;
++  shape: [number, number];
++  seed: number;
++  comparePrimitive?: boolean;
++};
++
++const eagerSpecs: MatrixSpec[] = [
++  { label: "8x8", shape: [8, 8], seed: 0, comparePrimitive: true },
++  { label: "9x9", shape: [9, 9], seed: 1 },
++  { label: "12x12", shape: [12, 12], seed: 2 },
++  { label: "16x8", shape: [16, 8], seed: 3, comparePrimitive: true },
++  { label: "16x9", shape: [16, 9], seed: 4 },
++];
++
++function makeMatrix(shape: [number, number], seed: number) {
++  const key = random.key(seed);
++  const matrix = random.uniform(key, shape);
++  key.dispose();
++  return matrix;
++}
++
++async function warmupQr(fn: () => [np.Array, np.Array]) {
++  const [q, r] = fn();
++  await blockUntilReady([q, r]);
++  q.dispose();
++  r.dispose();
++}
++
++const eagerCases: Array<{ spec: MatrixSpec; a: np.Array }> = [];
++for (const spec of eagerSpecs) {
++  const a = makeMatrix(spec.shape, spec.seed);
++  await warmupQr(() => np.linalg.qr(a));
++  if (spec.comparePrimitive) {
++    await warmupQr(() => primitiveQr(a) as [np.Array, np.Array]);
++  }
++  eagerCases.push({ spec, a });
++}
++
++afterAll(() => {
++  for (const { a } of eagerCases) a.dispose();
++});
++
++describe("QR cutoff (WASM eager)", () => {
++  for (const { spec, a } of eagerCases) {
++    bench(`public eager ${spec.label}`, async () => {
++      const [q, r] = np.linalg.qr(a);
++      await blockUntilReady([q, r]);
++      q.dispose();
++      r.dispose();
++    });
++
++    if (spec.comparePrimitive) {
++      bench(`primitive eager ${spec.label}`, async () => {
++        const [q, r] = primitiveQr(a) as [np.Array, np.Array];
++        await blockUntilReady([q, r]);
++        q.dispose();
++        r.dispose();
++      });
++    }
++  }
++});
++
++const jitSpecs: MatrixSpec[] = [
++  { label: "8x8", shape: [8, 8], seed: 10, comparePrimitive: true },
++  { label: "9x9", shape: [9, 9], seed: 11 },
++  { label: "16x8", shape: [16, 8], seed: 12, comparePrimitive: true },
++  { label: "16x9", shape: [16, 9], seed: 13 },
++];
++
++const jitCases: Array<{
++  spec: MatrixSpec;
++  a: np.Array;
++  f: (x: np.Array) => [np.Array, np.Array];
++  primitiveF?: (x: np.Array) => [np.Array, np.Array];
++}> = [];
++for (const spec of jitSpecs) {
++  const a = makeMatrix(spec.shape, spec.seed);
++  const f = jit((x: np.Array) => np.linalg.qr(x)) as (x: np.Array) => [
++    np.Array,
++    np.Array,
++  ];
++  await warmupQr(() => f(a));
++  let primitiveF:
++    | ((x: np.Array) => [np.Array, np.Array])
++    | undefined = undefined;
++  if (spec.comparePrimitive) {
++    primitiveF = jit((x: np.Array) => primitiveQr(x) as [np.Array, np.Array]) as (
++      x: np.Array,
++    ) => [np.Array, np.Array];
++    await warmupQr(() => primitiveF!(a));
++  }
++  jitCases.push({ spec, a, f, primitiveF });
++}
++
++afterAll(() => {
++  for (const { a, f, primitiveF } of jitCases) {
++    a.dispose();
++    (f as unknown as { dispose: () => void }).dispose();
++    if (primitiveF)
++      (primitiveF as unknown as { dispose: () => void }).dispose();
++  }
++});
++
++describe("QR cutoff (WASM jit)", () => {
++  for (const { spec, a, f, primitiveF } of jitCases) {
++    bench(`public jit ${spec.label}`, async () => {
++      const [q, r] = f(a);
++      await blockUntilReady([q, r]);
++      q.dispose();
++      r.dispose();
++    });
++
++    if (primitiveF) {
++      bench(`primitive jit ${spec.label}`, async () => {
++        const [q, r] = primitiveF(a);
++        await blockUntilReady([q, r]);
++        q.dispose();
++        r.dispose();
++      });
++    }
++  }
++});
++
++type ScanSpec = {
++  label: string;
++  shape: [number, number];
++  length: number;
++  seed: number;
++};
++
++const scanSpecs: ScanSpec[] = [
++  { label: "8x7 x1", shape: [8, 7], length: 1, seed: 20 },
++  { label: "8x7 x8", shape: [8, 7], length: 8, seed: 21 },
++  { label: "16x8 x1", shape: [16, 8], length: 1, seed: 22 },
++  { label: "16x8 x8", shape: [16, 8], length: 8, seed: 23 },
++];
++
++async function warmupScan(fn: () => [np.Array, np.Array]) {
++  const [carry, ys] = fn();
++  await blockUntilReady([carry, ys]);
++  carry.dispose();
++  ys.dispose();
++}
++
++const scanCases: Array<{
++  spec: ScanSpec;
++  init: np.Array;
++  publicF: (x: np.Array) => [np.Array, np.Array];
++  primitiveF: (x: np.Array) => [np.Array, np.Array];
++}> = [];
++for (const spec of scanSpecs) {
++  const init = makeMatrix(spec.shape, spec.seed);
++  const publicF = jit((x: np.Array) =>
++    lax.scan(
++      (carry) => np.linalg.qr(carry),
++      x,
++      null,
++      { length: spec.length, acceptPath: "compiled-loop" },
++    ),
++  ) as (x: np.Array) => [np.Array, np.Array];
++  const primitiveF = jit((x: np.Array) =>
++    lax.scan(
++      (carry) => primitiveQr(carry) as [np.Array, np.Array],
++      x,
++      null,
++      { length: spec.length },
++    ),
++  ) as (x: np.Array) => [np.Array, np.Array];
++  await warmupScan(() => publicF(init));
++  await warmupScan(() => primitiveF(init));
++  scanCases.push({ spec, init, publicF, primitiveF });
++}
++
++afterAll(() => {
++  for (const { init, publicF, primitiveF } of scanCases) {
++    init.dispose();
++    (publicF as unknown as { dispose: () => void }).dispose();
++    (primitiveF as unknown as { dispose: () => void }).dispose();
++  }
++});
++
++describe("QR cutoff (WASM nested scan)", () => {
++  for (const { spec, init, publicF, primitiveF } of scanCases) {
++    bench(`public scan ${spec.label}`, async () => {
++      const [carry, ys] = publicF(init);
++      await blockUntilReady([carry, ys]);
++      carry.dispose();
++      ys.dispose();
++    });
++
++    bench(`primitive scan ${spec.label}`, async () => {
++      const [carry, ys] = primitiveF(init);
++      await blockUntilReady([carry, ys]);
++      carry.dispose();
++      ys.dispose();
++    });
++  }
++});
++
++type BlockMapSpec = {
++  label: string;
++  shape: [number, number];
++  batch: number;
++  seed: number;
++};
++
++const blockMapSpecs: BlockMapSpec[] = [
++  { label: "8x7 b1", shape: [8, 7], batch: 1, seed: 30 },
++  { label: "8x7 b8", shape: [8, 7], batch: 8, seed: 31 },
++  { label: "16x8 b1", shape: [16, 8], batch: 1, seed: 32 },
++  { label: "16x8 b8", shape: [16, 8], batch: 8, seed: 33 },
++];
++
++async function warmupBlockMap(fn: () => np.Array) {
++  const out = fn();
++  await blockUntilReady(out);
++  out.dispose();
++}
++
++const blockMapCases: Array<{
++  spec: BlockMapSpec;
++  xs: np.Array;
++  publicF: (x: np.Array) => np.Array;
++  primitiveF: (x: np.Array) => np.Array;
++}> = [];
++for (const spec of blockMapSpecs) {
++  const xs = makeMatrix([spec.batch, spec.shape[0] * spec.shape[1]] as [number, number], spec.seed)
++    .reshape([spec.batch, spec.shape[0], spec.shape[1]]);
++  const publicF = jit((x: np.Array) =>
++    lax.blockMap(
++      (block: np.Array) => {
++        const [q, r] = np.linalg.qr(block);
++        using _q = q;
++        using _r = r;
++        using qSum = np.sum(q);
++        using rSum = np.sum(r);
++        return np.add(qSum, rSum);
++      },
++      x,
++      { blockShape: [1], inAxes: [0], outAxes: [0] },
++    ),
++  ) as (x: np.Array) => np.Array;
++  const primitiveF = jit((x: np.Array) =>
++    lax.blockMap(
++      (block: np.Array) => {
++        const [q, r] = primitiveQr(block) as [np.Array, np.Array];
++        using _q = q;
++        using _r = r;
++        using qSum = np.sum(q);
++        using rSum = np.sum(r);
++        return np.add(qSum, rSum);
++      },
++      x,
++      { blockShape: [1], inAxes: [0], outAxes: [0] },
++    ),
++  ) as (x: np.Array) => np.Array;
++  await warmupBlockMap(() => publicF(xs));
++  await warmupBlockMap(() => primitiveF(xs));
++  blockMapCases.push({ spec, xs, publicF, primitiveF });
++}
++
++afterAll(() => {
++  for (const { xs, publicF, primitiveF } of blockMapCases) {
++    xs.dispose();
++    (publicF as unknown as { dispose: () => void }).dispose();
++    (primitiveF as unknown as { dispose: () => void }).dispose();
++  }
++});
++
++describe("QR cutoff (WASM nested block_map)", () => {
++  for (const { spec, xs, publicF, primitiveF } of blockMapCases) {
++    bench(`public block_map ${spec.label}`, async () => {
++      const out = publicF(xs);
++      await blockUntilReady(out);
++      out.dispose();
++    });
++
++    bench(`primitive block_map ${spec.label}`, async () => {
++      const out = primitiveF(xs);
++      await blockUntilReady(out);
++      out.dispose();
++    });
++  }
++});
+\ No newline at end of file
+diff --git a/src/backend/wasm.ts b/src/backend/wasm.ts
+index c5a14a5..edbecc5 100644
+--- a/src/backend/wasm.ts
++++ b/src/backend/wasm.ts
+@@ -79,6 +79,88 @@ interface MegaArenaLease {
+   release(): void;
+ }
+ 
++interface WorkspaceLease {
++  ptr: number;
++  release(): void;
++}
++
++class WasmCompletionHandle {
++  #resolved = false;
++  #promise: Promise<void>;
++  #resolvePromise!: () => void;
++  #rejectPromise!: (error: unknown) => void;
++
++  constructor() {
++    this.#promise = new Promise<void>((resolve, reject) => {
++      this.#resolvePromise = resolve;
++      this.#rejectPromise = reject;
++    });
++    // Internal handles may reject during cleanup even when no async waiter was
++    // attached. Mark the promise as observed so test-only abandoned handles do
++    // not surface as unhandled rejections, while explicit awaiters on the
++    // original promise still observe the rejection.
++    this.#promise.catch(() => {});
++  }
++
++  wait(): Promise<void> {
++    return this.#promise;
++  }
++
++  resolve(): void {
++    if (this.#resolved) return;
++    this.#resolved = true;
++    this.#resolvePromise();
++  }
++
++  reject(error: unknown): void {
++    if (this.#resolved) return;
++    this.#resolved = true;
++    this.#rejectPromise(error);
++  }
++}
++
++type WorkspaceSectionSpec<T extends string> = {
++  key: T;
++  sizes: readonly number[];
++};
++
++type WorkspacePlan<T extends string> = {
++  totalSize: number;
++  offsets: Record<T, number[]>;
++};
++
++const WASM_WORKSPACE_ALIGN = 64;
++
++function alignWasmWorkspaceSize(size: number): number {
++  return Math.ceil(size / WASM_WORKSPACE_ALIGN) * WASM_WORKSPACE_ALIGN;
++}
++
++function computeAlignedWorkspaceLayout(sizes: readonly number[]): {
++  totalSize: number;
++  offsets: number[];
++} {
++  const offsets: number[] = [];
++  let totalSize = 0;
++  for (const size of sizes) {
++    offsets.push(totalSize);
++    totalSize += alignWasmWorkspaceSize(size);
++  }
++  return { totalSize, offsets };
++}
++
++function computeWorkspacePlan<T extends string>(
++  sections: readonly WorkspaceSectionSpec<T>[],
++): WorkspacePlan<T> {
++  const offsets = {} as Record<T, number[]>;
++  let totalSize = 0;
++  for (const section of sections) {
++    const layout = computeAlignedWorkspaceLayout(section.sizes);
++    offsets[section.key] = layout.offsets.map((offset) => totalSize + offset);
++    totalSize += layout.totalSize;
++  }
++  return { totalSize, offsets };
++}
++
+ type SharedArrayBufferCtorLike = new (byteLength: number) => {
+   byteLength: number;
+ };
+@@ -124,9 +206,22 @@ export interface GeneralScanStep {
+   routineCallInfo?: {
+     routineInfoIdx: number;
+     staticParams: number[];
++    ptrArgs?: WasmBlockMapRoutinePointerArg[];
+   };
+ }
+ 
++export type WasmBlockMapRoutinePointerArg =
++  | { kind: "input"; inputIdx: number }
++  | { kind: "output"; outputIdx: number }
++  | { kind: "qrScratch"; scratchIdx: number };
++
++export interface WasmBlockMapRoutinePlan {
++  info: ScanRoutineInfo;
++  staticParams: number[];
++  ptrArgs: WasmBlockMapRoutinePointerArg[];
++  qrScratchSizes?: [number, number, number];
++}
++
+ /** Where a carry output comes from. */
+ export type CarryOutputSource =
+   | { type: "passthrough"; carryIdx: number }
+@@ -166,6 +261,7 @@ export interface NativeScanGeneralParams {
+   reverse: boolean;
+   auxBufferSize?: number;
+   elementSize?: 4 | 8;
++  qrScratchSizes?: [number, number, number];
+   routineInfos?: ScanRoutineInfo[];
+ }
+ 
+@@ -191,8 +287,12 @@ export interface BlockMapWasmParams {
+   blockOutputSizes: number[];
+   /** Internal scratch buffer sizes produced by body kernel steps. */
+   internalSizes: number[];
++  /** Optional shared per-dispatch QR scratch sizes: [work, tau, v0]. */
++  qrScratchSizes?: [number, number, number];
+   /** Reindexed body kernel steps. */
+   steps: GeneralScanStep[];
++  /** Routine info for WASM imports in block_map codegen. */
++  routineInfos?: ScanRoutineInfo[];
+   /** Map from body output index to the producing internal buffer index. */
+   outputSources: number[];
+   /** Strides (in bytes) per dimension for each input. */
+@@ -207,8 +307,120 @@ export interface BlockMapWasmParams {
+   halo?: [number, number][][];
+ }
+ 
++export function getWasmRoutineStaticParams(routine: Routine): number[] | null {
++  const routineName = routine.name as Routines;
++
++  if (routineName === Routines.Cholesky) {
++    const inputShape = routine.type.inputShapes[0];
++    return [inputShape[inputShape.length - 1]];
++  }
++  if (routineName === Routines.Sort) {
++    const inputShape = routine.type.inputShapes[0];
++    return [inputShape[inputShape.length - 1]];
++  }
++  if (routineName === Routines.TriangularSolve) {
++    const aShape = routine.type.inputShapes[0];
++    const bShape = routine.type.inputShapes[1];
++    const n = aShape[aShape.length - 1];
++    const batchRows = bShape[bShape.length - 2];
++    const numBatches = 1;
++    const unitDiagonal = routine.params?.unitDiagonal ? 1 : 0;
++    const lower = 0;
++    return [n, batchRows, numBatches, unitDiagonal, lower];
++  }
++  if (routineName === Routines.LU) {
++    const inputShape = routine.type.inputShapes[0];
++    const m = inputShape[inputShape.length - 2];
++    const n = inputShape[inputShape.length - 1];
++    return [m, n];
++  }
++  if (routineName === Routines.Argsort) {
++    const inputShape = routine.type.inputShapes[0];
++    return [inputShape[inputShape.length - 1]];
++  }
++  if (routineName === Routines.QR) {
++    const inputShape = routine.type.inputShapes[0];
++    const m = inputShape[inputShape.length - 2];
++    const n = inputShape[inputShape.length - 1];
++    return [m, n];
++  }
++  return null;
++}
++
++export function getWasmBlockMapRoutinePlan(
++  routine: Routine,
++): WasmBlockMapRoutinePlan | null {
++  const info = getScanRoutineInfo(routine);
++  const staticParams = getWasmRoutineStaticParams(routine);
++  if (!info || !staticParams) return null;
++
++  if (routine.name === Routines.Cholesky) {
++    return {
++      info,
++      staticParams,
++      ptrArgs: [
++        { kind: "input", inputIdx: 0 },
++        { kind: "output", outputIdx: 0 },
++      ],
++    };
++  }
++
++  if (routine.name === Routines.TriangularSolve) {
++    return {
++      info,
++      staticParams,
++      ptrArgs: [
++        { kind: "input", inputIdx: 0 },
++        { kind: "input", inputIdx: 1 },
++        { kind: "output", outputIdx: 0 },
++      ],
++    };
++  }
++
++  if (routine.name === Routines.LU) {
++    return {
++      info,
++      staticParams,
++      ptrArgs: [
++        { kind: "input", inputIdx: 0 },
++        { kind: "output", outputIdx: 0 },
++        { kind: "output", outputIdx: 1 },
++        { kind: "output", outputIdx: 2 },
++      ],
++    };
++  }
++
++  if (routine.name === Routines.QR) {
++    const inputShape = routine.type.inputShapes[0];
++    const m = inputShape[inputShape.length - 2];
++    const n = inputShape[inputShape.length - 1];
++    const k = Math.min(m, n);
++    const elemBytes = byteWidth(routine.type.inputDtypes[0]);
++
++    return {
++      info,
++      staticParams,
++      ptrArgs: [
++        { kind: "input", inputIdx: 0 },
++        { kind: "output", outputIdx: 0 },
++        { kind: "output", outputIdx: 1 },
++        { kind: "qrScratch", scratchIdx: 0 },
++        { kind: "qrScratch", scratchIdx: 1 },
++        { kind: "qrScratch", scratchIdx: 2 },
++      ],
++      qrScratchSizes: [m * n * elemBytes, k * elemBytes, k * elemBytes],
++    };
++  }
++
++  return null;
++}
++
+ const moduleCache = new Map<string, WebAssembly.Module>();
+ 
++export function clearWasmModuleCache(): void {
++  moduleCache.clear();
++}
++
+ // ---------------------------------------------------------------------------
+ // Shared memory support (M5.1)
+ // ---------------------------------------------------------------------------
+@@ -264,6 +476,15 @@ export class WasmBackend implements Backend {
+    * `undefined` = not yet attempted, `null` = attempted but failed/unsupported.
+    */
+   #orchestrator: OrchestratorWorker | null | undefined = undefined;
++  /**
++   * Tracks slots participating in an in-flight dispatch.
++   *
++   * Today WASM dispatch is synchronous, so external callers should never
++   * observe a slot remaining here after `dispatch()` returns. This map exists
++   * as the ownership seam for a future async completion model.
++   */
++  #inFlightSlotRefs: Map<Slot, number> = new Map();
++  #inFlightSlotHandles: Map<Slot, WasmCompletionHandle> = new Map();
+ 
+   constructor() {
+     const shared = this.capabilities.sharedMemory;
+@@ -288,16 +509,16 @@ export class WasmBackend implements Backend {
+ 
+   /**
+    * Lazily create or return the WasmWorkerPool.
+-   * Returns null when SharedArrayBuffer, Workers, or synchronous worker waits
+-   * are unavailable (for example, browser main threads where Atomics.wait is
+-   * forbidden).
++   * Returns null when SharedArrayBuffer or Workers are unavailable.
++   * Workers use Atomics.wait to sleep and are woken via Atomics.notify,
++   * bypassing the JS event loop. The main thread busy-polls for completion
++   * when Atomics.wait is forbidden (browser main threads).
+    */
+   #getWorkerPool(): WasmWorkerPool | null {
+     if (this.#workerPool !== undefined) return this.#workerPool;
+     if (
+       !this.capabilities.sharedMemory ||
+-      typeof Worker === "undefined" ||
+-      !this.#canSpinWaitWorkers
++      typeof Worker === "undefined"
+     ) {
+       this.#workerPool = null;
+       return null;
+@@ -313,16 +534,15 @@ export class WasmBackend implements Backend {
+ 
+   /**
+    * Lazily create or return the OrchestratorWorker.
+-   * Returns null when SharedArrayBuffer, Workers, or synchronous worker waits
+-   * are unavailable (see #getWorkerPool comment for rationale).
++   * Returns null when SharedArrayBuffer or Workers are unavailable.
++   * Synchronous-wait legality is checked by the submission path: the async
++   * deferred mega-module path can use the orchestrator on browser main
++   * threads, while the synchronous path still falls back to direct execution
++   * there.
+    */
+   #getOrchestrator(): OrchestratorWorker | null {
+     if (this.#orchestrator !== undefined) return this.#orchestrator;
+-    if (
+-      !this.capabilities.sharedMemory ||
+-      typeof Worker === "undefined" ||
+-      !this.#canSpinWaitWorkers
+-    ) {
++    if (!this.capabilities.sharedMemory || typeof Worker === "undefined") {
+       this.#orchestrator = null;
+       return null;
+     }
+@@ -409,6 +629,45 @@ export class WasmBackend implements Backend {
+     this.#megaArenaSize = 0;
+   }
+ 
++  #acquireWorkspace(size: number): WorkspaceLease | null {
++    if (size === 0) return null;
++    const ptr = this.#allocator.malloc(size);
++    let released = false;
++    return {
++      ptr,
++      release: () => {
++        if (released) return;
++        released = true;
++        this.#allocator.free(ptr);
++      },
++    };
++  }
++
++  #allocateWorkspacePlan<T extends string>(plan: WorkspacePlan<T>): {
++    lease: WorkspaceLease | null;
++    ptrs: Record<T, number[]>;
++  } {
++    const lease = this.#acquireWorkspace(plan.totalSize);
++    const basePtr = lease?.ptr ?? 0;
++    const ptrs = {} as Record<T, number[]>;
++    for (const key in plan.offsets) {
++      ptrs[key as T] = plan.offsets[key as T].map((offset) => basePtr + offset);
++    }
++    return {
++      lease,
++      ptrs,
++    };
++  }
++
++  #allocateWorkspaceSections<T extends string>(
++    sections: readonly WorkspaceSectionSpec<T>[],
++  ): {
++    lease: WorkspaceLease | null;
++    ptrs: Record<T, number[]>;
++  } {
++    return this.#allocateWorkspacePlan(computeWorkspacePlan(sections));
++  }
++
+   /**
+    * Tear down background workers (worker pool + orchestrator).
+    * Called during test teardown to allow vitest/Playwright to exit cleanly.
+@@ -459,20 +718,30 @@ export class WasmBackend implements Backend {
+   }
+ 
+   decRef(slot: Slot): void {
++    this.#assertSlotReadySync(slot, "decRef");
+     const buffer = this.#buffers.get(slot);
+     if (!buffer) throw new SlotError(slot);
+     buffer.ref--;
+     if (buffer.ref === 0) {
+-      this.#allocator.free(buffer.ptr);
++      if (buffer.ptr !== 0) this.#allocator.free(buffer.ptr);
+       this.#buffers.delete(slot);
+     }
+   }
+ 
++  reserveMegaModuleOutputSlots(megaModule: WasmMegaModule): Slot[] {
++    return megaModule.outputSizes.map((size) => {
++      const slot = this.#nextSlot++;
++      this.#buffers.set(slot, { ptr: 0, size, ref: 1 });
++      return slot;
++    });
++  }
++
+   async read(
+     slot: Slot,
+     start?: number,
+     count?: number,
+   ): Promise<Uint8Array<ArrayBuffer>> {
++    await this.#waitForSlotReady(slot, "read");
+     return this.#readData(slot, start, count);
+   }
+ 
+@@ -481,9 +750,297 @@ export class WasmBackend implements Backend {
+     start?: number,
+     count?: number,
+   ): Uint8Array<ArrayBuffer> {
++    this.#assertSlotReadySync(slot, "readSync");
+     return this.#readData(slot, start, count);
+   }
+ 
++  #markSlotsInFlight(
++    slots: readonly Slot[],
++    handle: WasmCompletionHandle = new WasmCompletionHandle(),
++  ): WasmCompletionHandle {
++    for (const slot of slots) {
++      const existingHandle = this.#inFlightSlotHandles.get(slot);
++      if (existingHandle && existingHandle !== handle) {
++        throw new Error(
++          `internal: slot ${slot} cannot be tracked by multiple completion handles`,
++        );
++      }
++      this.#inFlightSlotHandles.set(slot, handle);
++      this.#inFlightSlotRefs.set(slot, (this.#inFlightSlotRefs.get(slot) ?? 0) + 1);
++    }
++    return handle;
++  }
++
++  #clearSlotsInFlight(
++    slots: readonly Slot[],
++    handle?: WasmCompletionHandle,
++  ): void {
++    for (const slot of slots) {
++      if (handle) {
++        const existingHandle = this.#inFlightSlotHandles.get(slot);
++        if (existingHandle && existingHandle !== handle) {
++          throw new Error(
++            `internal: slot ${slot} readiness resolved by the wrong completion handle`,
++          );
++        }
++      }
++      const refs = this.#inFlightSlotRefs.get(slot);
++      if (refs === undefined) continue;
++      if (refs <= 1) {
++        this.#inFlightSlotRefs.delete(slot);
++        this.#inFlightSlotHandles.delete(slot);
++      } else {
++        this.#inFlightSlotRefs.set(slot, refs - 1);
++      }
++    }
++  }
++
++  #resolveSlotsReady(
++    slots: readonly Slot[],
++    handle: WasmCompletionHandle,
++  ): void {
++    handle.resolve();
++    this.#clearSlotsInFlight(slots, handle);
++  }
++
++  #rejectSlotsReady(
++    slots: readonly Slot[],
++    handle: WasmCompletionHandle,
++    error: unknown,
++  ): void {
++    handle.reject(error);
++    this.#clearSlotsInFlight(slots, handle);
++  }
++
++  #reserveProducedSlots(sizes: readonly number[]): {
++    slots: Slot[];
++    handle: WasmCompletionHandle;
++  } {
++    const slots: Slot[] = [];
++    for (const size of sizes) {
++      const slot = this.#nextSlot++;
++      this.#buffers.set(slot, { ptr: 0, size, ref: 1 });
++      slots.push(slot);
++    }
++    return { slots, handle: this.#markSlotsInFlight(slots) };
++  }
++
++  #resolveProducedSlots(slots: readonly Slot[], ptrs: readonly number[]): void {
++    if (slots.length !== ptrs.length) {
++      throw new Error("internal: produced slot count does not match pointer count");
++    }
++    for (let i = 0; i < slots.length; i++) {
++      const buffer = this.#buffers.get(slots[i]);
++      if (!buffer) throw new SlotError(slots[i]);
++      buffer.ptr = ptrs[i];
++    }
++  }
++
++  #abandonProducedSlots(
++    slots: readonly Slot[],
++    handle: WasmCompletionHandle,
++    error: unknown = new Error(
++      "internal: produced slots were abandoned before readiness resolved",
++    ),
++  ): void {
++    this.#rejectSlotsReady(slots, handle, error);
++    for (const slot of slots) {
++      const buffer = this.#buffers.get(slot);
++      if (!buffer) continue;
++      if (buffer.ptr !== 0) {
++        this.#allocator.free(buffer.ptr);
++      }
++      this.#buffers.delete(slot);
++    }
++  }
++
++  #adoptProducedSlots(
++    targetSlots: readonly Slot[],
++    handle: WasmCompletionHandle,
++    sourceSlots: readonly Slot[],
++  ): void {
++    const ptrs = sourceSlots.map((slot) => this.#getPtr(slot));
++    this.#resolveProducedSlots(targetSlots, ptrs);
++    this.#resolveSlotsReady(targetSlots, handle);
++    for (const slot of sourceSlots) {
++      this.#buffers.delete(slot);
++    }
++  }
++
++  _debugWithReservedProducedSlotsForTest<T>(
++    sizes: readonly number[],
++    visit: (ctx: { slots: readonly Slot[]; resolve(): void }) => T | Promise<T>,
++  ): T | Promise<T> {
++    const { slots, handle } = this.#reserveProducedSlots(sizes);
++    let resolved = false;
++    const cleanup = () => {
++      if (resolved) {
++        for (const slot of slots) {
++          const buffer = this.#buffers.get(slot);
++          if (!buffer) continue;
++          if (buffer.ptr !== 0) this.#allocator.free(buffer.ptr);
++          this.#buffers.delete(slot);
++        }
++      } else {
++        this.#abandonProducedSlots(slots, handle);
++      }
++    };
++    const result = visit({
++      slots,
++      resolve: () => {
++        if (resolved) return;
++        const ptrs = sizes.map((size) => this.#allocator.malloc(size));
++        this.#resolveProducedSlots(slots, ptrs);
++        this.#resolveSlotsReady(slots, handle);
++        resolved = true;
++      },
++    });
++    if (
++      result !== null &&
++      typeof result === "object" &&
++      "then" in result &&
++      typeof result.then === "function"
++    ) {
++      return (result as Promise<T>).finally(cleanup);
++    }
++    cleanup();
++    return result;
++  }
++
++  _debugExecuteMegaModuleDeferredForTest(
++    megaModule: WasmMegaModule,
++    inputSlots: Slot[],
++  ): Slot[] {
++    const retainedInputs = [...inputSlots];
++    for (const slot of retainedInputs) this.incRef(slot);
++
++    const { slots: outputSlots, handle } = this.#reserveProducedSlots(
++      megaModule.outputSizes,
++    );
++
++    const schedule =
++      typeof queueMicrotask === "function"
++        ? queueMicrotask
++        : (cb: () => void) => {
++            Promise.resolve().then(cb);
++          };
++
++    schedule(() => {
++      let actualOutputs: Slot[] | null = null;
++      try {
++        actualOutputs = this.executeMegaModule(megaModule, inputSlots);
++        this.#adoptProducedSlots(outputSlots, handle, actualOutputs);
++        actualOutputs = null;
++      } catch (err) {
++        if (actualOutputs) {
++          for (const slot of actualOutputs) {
++            this.decRef(slot);
++          }
++        }
++        this.#abandonProducedSlots(outputSlots, handle, err);
++      } finally {
++        for (const slot of retainedInputs) this.decRef(slot);
++      }
++    });
++
++    return outputSlots;
++  }
++
++  executeMegaModuleDeferred(
++    megaModule: WasmMegaModule,
++    inputSlots: Slot[],
++  ): Slot[] {
++    const outputSlots = this.reserveMegaModuleOutputSlots(megaModule);
++    this.executeMegaModuleDeferredInto(megaModule, inputSlots, outputSlots);
++    return outputSlots;
++  }
++
++  executeMegaModuleDeferredInto(
++    megaModule: WasmMegaModule,
++    inputSlots: Slot[],
++    outputSlots: Slot[],
++  ): void {
++    const orch = this.#getOrchestrator();
++    const arena = megaModule.arenaLayout;
++    const totalDispatchInputs = inputSlots.length + (arena ? 1 : 0);
++    if (
++      !orch ||
++      totalDispatchInputs > ORCHESTRATOR_MAX_INPUTS ||
++      !orch.isModuleReady(megaModule.module)
++    ) {
++      throw new Error(
++        "Orchestrator worker not ready for deferred mega-module execution",
++      );
++    }
++
++    const moduleId = orch.getModuleId(megaModule.module);
++    if (moduleId === undefined) {
++      throw new Error(
++        "internal: ready orchestrator mega-module is missing its module id",
++      );
++    }
++
++    const retainedInputs = [...inputSlots];
++    for (const slot of retainedInputs) this.incRef(slot);
++
++    const inputPtrs = inputSlots.map((slot) => this.#getPtr(slot));
++    const outputHandle = this.#markSlotsInFlight(outputSlots);
++
++    const resultBufSize = megaModule.numOutputs * 4;
++    const { lease: resultBufLease, ptrs: resultBufPtrs } =
++      this.#allocateWorkspaceSections([
++        { key: "resultBuf", sizes: [resultBufSize] },
++      ] as const);
++    const resultBufPtr = resultBufPtrs.resultBuf[0] ?? 0;
++
++    const arenaLease = arena ? this.#acquireMegaArena(arena.totalSize) : null;
++    const arenaPtr = arenaLease?.ptr ?? 0;
++
++    void orch
++      .dispatchAsync(
++        moduleId,
++        arena ? [...inputPtrs, arenaPtr] : inputPtrs,
++        resultBufPtr,
++        (size: number) => this.#allocator.malloc(size),
++        (ptr: number) => this.#allocator.free(ptr),
++      )
++      .then(() => {
++        const view = new DataView(
++          this.#memory.buffer,
++          resultBufPtr,
++          resultBufSize,
++        );
++        const outputPtrs: number[] = [];
++        for (let i = 0; i < megaModule.numOutputs; i++) {
++          outputPtrs.push(view.getInt32(i * 4, true));
++        }
++        this.#resolveProducedSlots(outputSlots, outputPtrs);
++        this.#resolveSlotsReady(outputSlots, outputHandle);
++      })
++      .catch((err) => {
++        this.#abandonProducedSlots(outputSlots, outputHandle, err);
++      })
++      .finally(() => {
++        resultBufLease?.release();
++        arenaLease?.release();
++        for (const slot of retainedInputs) this.decRef(slot);
++      });
++  }
++
++  async #waitForSlotReady(slot: Slot, op: string): Promise<void> {
++    const handle = this.#inFlightSlotHandles.get(slot);
++    if (!handle) return;
++    await handle.wait();
++  }
++
++  #assertSlotReadySync(slot: Slot, op: string): void {
++    if (!this.#inFlightSlotRefs.has(slot)) return;
++    throw new Error(
++      `internal: slot ${slot} is still marked in-flight during ${op}; ` +
++        `pending-work tracking must resolve readiness before ${op}`,
++    );
++  }
++
+   #readData(
+     slot: Slot,
+     start?: number,
+@@ -577,89 +1134,107 @@ export class WasmBackend implements Backend {
+   ): void {
+     const tracing = isTracing();
+     const start = tracing ? performance.now() : 0;
++    const activeSlots = [...inputs, ...outputs];
++    const handle = this.#markSlotsInFlight(activeSlots);
++    let dispatchError: unknown = null;
+ 
+-    if (exe.source instanceof Routine) {
+-      const routine = exe.source;
+-      // Determine element size from dtype (f32=4, f64=8)
+-      const dtype = routine.type.inputDtypes[0];
+-      const isF32 = dtype === DType.Float32;
+-      const isF64 = dtype === DType.Float64;
+-      if (isF32 || isF64) {
+-        const elementSize: 4 | 8 = isF32 ? 4 : 8;
+-        switch (routine.name) {
+-          case Routines.Cholesky:
+-            this.#dispatchCholesky(routine, inputs, outputs, elementSize);
+-            break;
+-          case Routines.TriangularSolve:
+-            this.#dispatchTriangularSolve(
+-              routine,
+-              inputs,
+-              outputs,
+-              elementSize,
+-            );
+-            break;
+-          case Routines.LU:
+-            this.#dispatchLU(routine, inputs, outputs, elementSize);
+-            break;
+-          case Routines.Sort:
+-            this.#dispatchSort(routine, inputs, outputs, elementSize);
+-            break;
+-          case Routines.Argsort:
+-            this.#dispatchArgsort(routine, inputs, outputs, elementSize);
+-            break;
+-          // QR: fall through to CPU fallback (WASM routine has correctness issues)
+-          default:
+-            // Fall back to CPU for unimplemented routines
+-            runCpuRoutine(
+-              routine,
+-              inputs.map((slot) => this.#getBuffer(slot)),
+-              outputs.map((slot) => this.#getBuffer(slot)),
+-            );
+-            break;
++    try {
++      if (exe.source instanceof Routine) {
++        const routine = exe.source;
++        // Determine element size from dtype (f32=4, f64=8)
++        const dtype = routine.type.inputDtypes[0];
++        const isF32 = dtype === DType.Float32;
++        const isF64 = dtype === DType.Float64;
++        if (isF32 || isF64) {
++          const elementSize: 4 | 8 = isF32 ? 4 : 8;
++          switch (routine.name) {
++            case Routines.Cholesky:
++              this.#dispatchCholesky(routine, inputs, outputs, elementSize);
++              break;
++            case Routines.TriangularSolve:
++              this.#dispatchTriangularSolve(
++                routine,
++                inputs,
++                outputs,
++                elementSize,
++              );
++              break;
++            case Routines.LU:
++              this.#dispatchLU(routine, inputs, outputs, elementSize);
++              break;
++            case Routines.Sort:
++              this.#dispatchSort(routine, inputs, outputs, elementSize);
++              break;
++            case Routines.Argsort:
++              this.#dispatchArgsort(routine, inputs, outputs, elementSize);
++              break;
++            case Routines.QR:
++              this.#dispatchQR(routine, inputs, outputs, elementSize);
++              break;
++            default:
++              // Fall back to CPU for unimplemented routines
++              runCpuRoutine(
++                routine,
++                inputs.map((slot) => this.#getBuffer(slot)),
++                outputs.map((slot) => this.#getBuffer(slot)),
++              );
++              break;
++          }
++        } else {
++          // Fall back to CPU for non-float routines
++          runCpuRoutine(
++            routine,
++            inputs.map((slot) => this.#getBuffer(slot)),
++            outputs.map((slot) => this.#getBuffer(slot)),
++          );
+         }
+       } else {
+-        // Fall back to CPU for non-float routines
+-        runCpuRoutine(
+-          routine,
+-          inputs.map((slot) => this.#getBuffer(slot)),
+-          outputs.map((slot) => this.#getBuffer(slot)),
++        // Reuse cached instance if available
++        let instance = this.#instanceCache.get(exe.data.module);
++        if (!instance) {
++          instance = new WebAssembly.Instance(exe.data.module, {
++            env: { memory: this.#memory },
++          });
++          this.#instanceCache.set(exe.data.module, instance);
++        }
++        const ptrs = [...inputs, ...outputs].map(
++          (slot) => this.#buffers.get(slot)!.ptr,
+         );
++        // Kernel signature: (start, end, ...ptrs, [reduceSize]).
++        // For symbolic kernels, dynamicParams[0] is the resolved total size.
++        // dynamicParams[1] is the resolved reduction size (when kernel has symbolic reduction).
++        const totalSize = dynamicParams?.[0] ?? (exe.source.size as number);
++        const extraArgs =
++          dynamicParams && dynamicParams.length > 1
++            ? dynamicParams.slice(1)
++            : [];
++
++        // Parallel dispatch: use workers when pool is available, module is registered,
++        // and array is large enough for the overhead to pay off.
++        const pool = this.#workerPool ?? null; // use pool if already created (don't force-create here)
++        if (
++          pool &&
++          totalSize >= PARALLEL_THRESHOLD &&
++          pool.isModuleReady(exe.data.module)
++        ) {
++          const moduleId = pool.getModuleId(exe.data.module)!;
++          pool.dispatchSync(moduleId, instance, totalSize, [
++            ...ptrs,
++            ...extraArgs,
++          ]);
++        } else {
++          const func = instance.exports.kernel as (...args: number[]) => void;
++          func(0, totalSize, ...ptrs, ...extraArgs);
++        }
+       }
+-    } else {
+-      // Reuse cached instance if available
+-      let instance = this.#instanceCache.get(exe.data.module);
+-      if (!instance) {
+-        instance = new WebAssembly.Instance(exe.data.module, {
+-          env: { memory: this.#memory },
+-        });
+-        this.#instanceCache.set(exe.data.module, instance);
+-      }
+-      const ptrs = [...inputs, ...outputs].map(
+-        (slot) => this.#buffers.get(slot)!.ptr,
+-      );
+-      // Kernel signature: (start, end, ...ptrs, [reduceSize]).
+-      // For symbolic kernels, dynamicParams[0] is the resolved total size.
+-      // dynamicParams[1] is the resolved reduction size (when kernel has symbolic reduction).
+-      const totalSize = dynamicParams?.[0] ?? (exe.source.size as number);
+-      const extraArgs =
+-        dynamicParams && dynamicParams.length > 1 ? dynamicParams.slice(1) : [];
+-
+-      // Parallel dispatch: use workers when pool is available, module is registered,
+-      // and array is large enough for the overhead to pay off.
+-      const pool = this.#workerPool ?? null; // use pool if already created (don't force-create here)
+-      if (
+-        pool &&
+-        totalSize >= PARALLEL_THRESHOLD &&
+-        pool.isModuleReady(exe.data.module)
+-      ) {
+-        const moduleId = pool.getModuleId(exe.data.module)!;
+-        pool.dispatchSync(moduleId, instance, totalSize, [
+-          ...ptrs,
+-          ...extraArgs,
+-        ]);
++    } catch (err) {
++      dispatchError = err;
++      throw err;
++    } finally {
++      if (dispatchError === null) {
++        this.#resolveSlotsReady(activeSlots, handle);
+       } else {
+-        const func = instance.exports.kernel as (...args: number[]) => void;
+-        func(0, totalSize, ...ptrs, ...extraArgs);
++        this.#rejectSlotsReady(activeSlots, handle, dispatchError);
+       }
+     }
+ 
+@@ -834,8 +1409,11 @@ export class WasmBackend implements Backend {
+       new Uint8Array(this.#memory.buffer, inBuf.ptr, totalSize),
+     );
+ 
+-    // Allocate auxiliary buffer
+-    const auxPtr = this.#allocator.malloc(n * elementSize);
++    const { lease: workspaceLease, ptrs: workspacePtrs } =
++      this.#allocateWorkspaceSections([
++        { key: "aux", sizes: [n * elementSize] },
++      ] as const);
++    const auxPtr = workspacePtrs.aux[0] ?? 0;
+ 
+     // Call in-place sort on output buffer
+     const module = getSortModule({ n, dtype });
+@@ -847,7 +1425,7 @@ export class WasmBackend implements Backend {
+     ) => void;
+     func(outBuf.ptr, auxPtr, batchSize);
+ 
+-    this.#allocator.free(auxPtr);
++    workspaceLease?.release();
+   }
+ 
+   #dispatchArgsort(
+@@ -861,8 +1439,9 @@ export class WasmBackend implements Backend {
+     const batchSize = shape.slice(0, -1).reduce((a, b) => a * b, 1);
+     const dtype = elementSize === 4 ? "f32" : "f64";
+ 
+-    // Allocate auxiliary buffers (aux uses 4 bytes for indices)
+-    const auxPtr = this.#allocator.malloc(n * 4);
++    const { lease: workspaceLease, ptrs: workspacePtrs } =
++      this.#allocateWorkspaceSections([{ key: "aux", sizes: [n * 4] }] as const);
++    const auxPtr = workspacePtrs.aux[0] ?? 0;
+ 
+     const module = getArgsortModule({ n, dtype });
+     const instance = this.#getRoutineInstanceForModule(module);
+@@ -881,10 +1460,9 @@ export class WasmBackend implements Backend {
+       batchSize,
+     );
+ 
+-    this.#allocator.free(auxPtr);
++    workspaceLease?.release();
+   }
+ 
+-  // eslint-disable-next-line no-unused-private-class-members
+   #dispatchQR(
+     routine: Routine,
+     inputs: Slot[],
+@@ -894,11 +1472,19 @@ export class WasmBackend implements Backend {
+     const shape = routine.type.inputShapes[0];
+     const m = shape[shape.length - 2];
+     const n = shape[shape.length - 1];
++    const k = Math.min(m, n);
+     const batchSize = shape.slice(0, -2).reduce((a, b) => a * b, 1);
+     const dtype = elementSize === 4 ? "f32" : "f64";
+ 
+-    // Allocate m×n scratch buffer for Householder transformations
+-    const workPtr = this.#allocator.malloc(m * n * elementSize);
++    const { lease: workspaceLease, ptrs: workspacePtrs } =
++      this.#allocateWorkspaceSections([
++        { key: "work", sizes: [m * n * elementSize] },
++        { key: "tau", sizes: [k * elementSize] },
++        { key: "v0", sizes: [k * elementSize] },
++      ] as const);
++    const workPtr = workspacePtrs.work[0] ?? 0;
++    const tauPtr = workspacePtrs.tau[0] ?? 0;
++    const v0Ptr = workspacePtrs.v0[0] ?? 0;
+ 
+     const module = getQRModule({ m, n, dtype });
+     const instance = this.#getRoutineInstanceForModule(module);
+@@ -907,6 +1493,8 @@ export class WasmBackend implements Backend {
+       q: number,
+       r: number,
+       work: number,
++      tau: number,
++      v0: number,
+       batchSize: number,
+     ) => void;
+     func(
+@@ -914,10 +1502,12 @@ export class WasmBackend implements Backend {
+       this.#buffers.get(outputs[0])!.ptr,
+       this.#buffers.get(outputs[1])!.ptr,
+       workPtr,
++      tauPtr,
++      v0Ptr,
+       batchSize,
+     );
+ 
+-    this.#allocator.free(workPtr);
++    workspaceLease?.release();
+   }
+ 
+   #getBuffer(slot: Slot): Uint8Array<ArrayBuffer> {
+@@ -1022,19 +1612,23 @@ export class WasmBackend implements Backend {
+     carryOutSlots: Slot[],
+     ysStackedSlots: Slot[],
+   ): void {
+-    const { internalSizes, auxBufferSize } = params;
+-
+-    // Allocate internal scratch buffers
+-    const internalPtrs: number[] = [];
+-    for (const size of internalSizes) {
+-      internalPtrs.push(this.#allocator.malloc(size));
+-    }
+-
+-    // Allocate aux buffer if needed (for sort/argsort)
+-    let auxPtr = 0;
+-    if (auxBufferSize && auxBufferSize > 0) {
+-      auxPtr = this.#allocator.malloc(auxBufferSize);
+-    }
++    const { internalSizes, auxBufferSize, qrScratchSizes } = params;
++    const { lease: workspaceLease, ptrs: workspacePtrs } =
++      this.#allocateWorkspaceSections([
++        { key: "internal", sizes: internalSizes },
++        {
++          key: "aux",
++          sizes: auxBufferSize && auxBufferSize > 0 ? [auxBufferSize] : [],
++        },
++        ...(qrScratchSizes
++          ? ([{ key: "qrScratch", sizes: qrScratchSizes }] as const)
++          : []),
++      ] as const);
++    const internalPtrs = workspacePtrs.internal;
++    const auxPtr = workspacePtrs.aux[0] ?? 0;
++    const qrScratchPtrs = (
++      workspacePtrs as typeof workspacePtrs & { qrScratch?: number[] }
++    ).qrScratch;
+ 
+     // Copy carryIn to carryOut (initial carry values)
+     const { carrySizes } = params;
+@@ -1067,6 +1661,8 @@ export class WasmBackend implements Backend {
+     args.push(...internalPtrs);
+     // aux
+     if (auxBufferSize && auxBufferSize > 0) args.push(auxPtr);
++    // qr scratch
++    if (qrScratchPtrs) args.push(...qrScratchPtrs);
+ 
+     // Instantiate and run (reuse cached instance)
+     let instance = this.#instanceCache.get(exe.data.module);
+@@ -1093,9 +1689,7 @@ export class WasmBackend implements Backend {
+     const scanFunc = instance.exports.scan as (...args: number[]) => void;
+     scanFunc(...args);
+ 
+-    // Free scratch buffers
+-    for (const ptr of internalPtrs) this.#allocator.free(ptr);
+-    if (auxPtr) this.#allocator.free(auxPtr);
++    workspaceLease?.release();
+   }
+ 
+   // -------------------------------------------------------------------------
+@@ -1144,15 +1738,22 @@ export class WasmBackend implements Backend {
+     const pingPongSize = totalLeafElemSize * N;
+     const summarySize = totalLeafElemSize * M;
+ 
+-    const pingPtr = this.#allocator.malloc(pingPongSize);
+-    const pongPtr = this.#allocator.malloc(pingPongSize);
+-    const sPingPtr = this.#allocator.malloc(summarySize);
+-    const sPongPtr = this.#allocator.malloc(summarySize);
+-
+-    const internalPtrs: number[] = [];
+-    for (const size of internalSizes) {
+-      internalPtrs.push(this.#allocator.malloc(size));
+-    }
++    // E2 groundwork: the blocked path's scratch is formulaic in N, so carve
++    // the expected pointer layout from one aligned workspace allocation.
++    const { lease: workspaceLease, ptrs: workspacePtrs } =
++      this.#allocateWorkspaceSections([
++        { key: "ping", sizes: [pingPongSize] },
++        { key: "pong", sizes: [pingPongSize] },
++        { key: "summaryPing", sizes: [summarySize] },
++        { key: "summaryPong", sizes: [summarySize] },
++        { key: "internal", sizes: internalSizes },
++      ] as const);
++
++    const pingPtr = workspacePtrs.ping[0];
++    const pongPtr = workspacePtrs.pong[0];
++    const sPingPtr = workspacePtrs.summaryPing[0];
++    const sPongPtr = workspacePtrs.summaryPong[0];
++    const internalPtrs = workspacePtrs.internal;
+ 
+     let instance = this.#instanceCache.get(exe.data.module);
+     if (!instance) {
+@@ -1173,11 +1774,7 @@ export class WasmBackend implements Backend {
+     ) => void;
+     scanFunc(...args);
+ 
+-    for (const ptr of internalPtrs) this.#allocator.free(ptr);
+-    this.#allocator.free(sPongPtr);
+-    this.#allocator.free(sPingPtr);
+-    this.#allocator.free(pongPtr);
+-    this.#allocator.free(pingPtr);
++    workspaceLease?.release();
+   }
+ 
+   // ---------------------------------------------------------------------------
+@@ -1195,21 +1792,36 @@ export class WasmBackend implements Backend {
+    * matches an input pointer — the corresponding input Slot is incRef'd.
+    */
+   executeMegaModule(megaModule: WasmMegaModule, inputSlots: Slot[]): Slot[] {
++    const outputSlots = this.reserveMegaModuleOutputSlots(megaModule);
++    this.executeMegaModuleInto(megaModule, inputSlots, outputSlots);
++    return outputSlots;
++  }
++
++  executeMegaModuleInto(
++    megaModule: WasmMegaModule,
++    inputSlots: Slot[],
++    outputSlots: Slot[],
++  ): void {
+     // Map input Slots → raw pointers
+     const inputPtrs: number[] = inputSlots.map((s) => this.#getPtr(s));
++    const outputHandle = this.#markSlotsInFlight(outputSlots);
+ 
+     // Allocate result buffer (numOutputs * 4 bytes for i32 pointers)
+     const resultBufSize = megaModule.numOutputs * 4;
+-    const resultBufPtr = this.#allocator.malloc(resultBufSize);
++    const { lease: resultBufLease, ptrs: resultBufPtrs } =
++      this.#allocateWorkspaceSections([
++        { key: "resultBuf", sizes: [resultBufSize] },
++      ] as const);
++    const resultBufPtr = resultBufPtrs.resultBuf[0] ?? 0;
+ 
+     const arena = megaModule.arenaLayout;
+     const arenaLease = arena ? this.#acquireMegaArena(arena.totalSize) : null;
+     const arenaPtr = arenaLease?.ptr ?? 0;
+-
+     try {
+       const orch = this.#getOrchestrator();
+       const totalDispatchInputs = inputPtrs.length + (arena ? 1 : 0);
+       if (
++        this.#canSpinWaitWorkers &&
+         orch &&
+         totalDispatchInputs <= ORCHESTRATOR_MAX_INPUTS &&
+         orch.isModuleReady(megaModule.module)
+@@ -1259,22 +1871,19 @@ export class WasmBackend implements Backend {
+         resultBufPtr,
+         resultBufSize,
+       );
+-      const outputSlots: Slot[] = [];
++      const outputPtrs: number[] = [];
+ 
+       for (let i = 0; i < megaModule.numOutputs; i++) {
+-        const ptr = view.getInt32(i * 4, true); // little-endian
+-        const slot = this.#nextSlot++;
+-        this.#buffers.set(slot, {
+-          ptr,
+-          size: megaModule.outputSizes[i],
+-          ref: 1,
+-        });
+-        outputSlots.push(slot);
++        outputPtrs.push(view.getInt32(i * 4, true)); // little-endian
+       }
+ 
+-      return outputSlots;
++      this.#resolveProducedSlots(outputSlots, outputPtrs);
++      this.#resolveSlotsReady(outputSlots, outputHandle);
++    } catch (err) {
++      this.#abandonProducedSlots(outputSlots, outputHandle, err);
++      throw err;
+     } finally {
+-      this.#allocator.free(resultBufPtr);
++      resultBufLease?.release();
+       arenaLease?.release();
+     }
+   }
+@@ -1336,6 +1945,9 @@ export class WasmBackend implements Backend {
+     for (let i = 0; i < inputSlots.length; i++) {
+       locals[i] = this.#getPtr(inputSlots[i]);
+     }
++    const { slots: outputSlots, handle: outputHandle } = this.#reserveProducedSlots(
++      megaModule.outputSizes,
++    );
+ 
+     const arena = megaModule.arenaLayout;
+     const arenaLease = arena ? this.#acquireMegaArena(arena.totalSize) : null;
+@@ -1406,21 +2018,20 @@ export class WasmBackend implements Backend {
+       }
+ 
+       // Read output pointers from locals and create Slots
+-      const outputSlots: Slot[] = [];
++      const outputPtrs: number[] = [];
+       for (let i = 0; i < megaModule.numOutputs; i++) {
+         const outputLocalIdx = megaModule.outputLocalIdxs[i];
+-        const ptr = locals[outputLocalIdx];
+-        const slot = this.#nextSlot++;
+-        this.#buffers.set(slot, {
+-          ptr,
+-          size: megaModule.outputSizes[i],
+-          ref: 1,
+-        });
++        outputPtrs.push(locals[outputLocalIdx]);
+         locals[outputLocalIdx] = 0;
+-        outputSlots.push(slot);
+       }
+ 
++      this.#resolveProducedSlots(outputSlots, outputPtrs);
++      this.#resolveSlotsReady(outputSlots, outputHandle);
++
+       return outputSlots;
++    } catch (err) {
++      this.#abandonProducedSlots(outputSlots, outputHandle, err);
++      throw err;
+     } finally {
+       for (
+         let localIdx = megaModule.numInputs;
+@@ -1450,8 +2061,7 @@ export class WasmBackend implements Backend {
+     if (
+       !megaModule.canParallelize ||
+       !this.capabilities.sharedMemory ||
+-      typeof Worker === "undefined" ||
+-      !this.#canSpinWaitWorkers
++      typeof Worker === "undefined"
+     ) {
+       return false;
+     }
+@@ -1467,7 +2077,7 @@ export class WasmBackend implements Backend {
+   /**
+    * Compile a block-map loop into a single WASM module.
+    * Returns an Executable whose data is a WasmProgram, or null if the body
+-   * cannot be compiled (e.g. contains routines or unsupported steps).
++   * cannot be compiled (e.g. contains unsupported steps).
+    */
+   prepareBlockMapWasm(
+     params: BlockMapWasmParams,
+@@ -1511,25 +2121,24 @@ export class WasmBackend implements Backend {
+     inputSlots: Slot[],
+     outputSlots: Slot[],
+   ): void {
+-    const { blockInputSizes, blockOutputSizes, internalSizes } = params;
+-
+-    // Allocate scratch buffers for block inputs (body reads from these)
+-    const scratchInputPtrs: number[] = [];
+-    for (const size of blockInputSizes) {
+-      scratchInputPtrs.push(this.#allocator.malloc(size));
+-    }
+-
+-    // Allocate scratch buffers for block outputs (body writes to these)
+-    const scratchOutputPtrs: number[] = [];
+-    for (const size of blockOutputSizes) {
+-      scratchOutputPtrs.push(this.#allocator.malloc(size));
+-    }
+-
+-    // Allocate internal scratch buffers (kernel intermediates)
+-    const internalPtrs: number[] = [];
+-    for (const size of internalSizes) {
+-      internalPtrs.push(this.#allocator.malloc(size));
+-    }
++    const { blockInputSizes, blockOutputSizes, internalSizes, qrScratchSizes } =
++      params;
++
++    const { lease: workspaceLease, ptrs: workspacePtrs } =
++      this.#allocateWorkspaceSections([
++        { key: "scratchInputs", sizes: blockInputSizes },
++        { key: "scratchOutputs", sizes: blockOutputSizes },
++        { key: "internal", sizes: internalSizes },
++        ...(qrScratchSizes
++          ? ([{ key: "qrScratch", sizes: qrScratchSizes }] as const)
++          : []),
++      ] as const);
++    const scratchInputPtrs = workspacePtrs.scratchInputs;
++    const scratchOutputPtrs = workspacePtrs.scratchOutputs;
++    const internalPtrs = workspacePtrs.internal;
++    const qrScratchPtrs = (
++      workspacePtrs as typeof workspacePtrs & { qrScratch?: number[] }
++    ).qrScratch;
+ 
+     // Build args: [consts, inputs, outputs, scratchInputs, scratchOutputs, internals]
+     const args: number[] = [];
+@@ -1539,11 +2148,26 @@ export class WasmBackend implements Backend {
+     args.push(...scratchInputPtrs);
+     args.push(...scratchOutputPtrs);
+     args.push(...internalPtrs);
++    if (qrScratchPtrs) args.push(...qrScratchPtrs);
+ 
+     // Instantiate and run
+     let instance = this.#instanceCache.get(exe.data.module);
+     if (!instance) {
+       const imports: WebAssembly.Imports = { env: { memory: this.#memory } };
++
++      if (params.routineInfos && params.routineInfos.length > 0) {
++        const routineImports: Record<string, WebAssembly.ExportValue> = {};
++        for (const info of params.routineInfos) {
++          const routineModule = this.#getRoutineModuleForScan(info);
++          const routineInstance =
++            this.#getRoutineInstanceForModule(routineModule);
++          routineImports[info.exportName] = routineInstance.exports[
++            info.exportName
++          ] as WebAssembly.ExportValue;
++        }
++        imports.routines = routineImports;
++      }
++
+       instance = new WebAssembly.Instance(exe.data.module, imports);
+       this.#instanceCache.set(exe.data.module, instance);
+     }
+@@ -1552,10 +2176,7 @@ export class WasmBackend implements Backend {
+     ) => void;
+     blockMapFunc(...args);
+ 
+-    // Free scratch
+-    for (const ptr of scratchInputPtrs) this.#allocator.free(ptr);
+-    for (const ptr of scratchOutputPtrs) this.#allocator.free(ptr);
+-    for (const ptr of internalPtrs) this.#allocator.free(ptr);
++    workspaceLease?.release();
+   }
+ }
+ 
+@@ -2900,8 +3521,9 @@ function codegenNativeScanGeneral(
+ 
+   // Function arguments layout:
+   // [length, ...consts (numConsts), ...carryIn (numCarry), ...xs (numX),
+-  //  ...carryOut (numCarry), ...ysStacked (numY), ...internals (numInternal), aux?]
++  //  ...carryOut (numCarry), ...ysStacked (numY), ...internals (numInternal), aux?, qrScratch?]
+   const needsAux = (params.auxBufferSize ?? 0) > 0;
++  const hasQrScratch = !!params.qrScratchSizes;
+   const numArgs =
+     1 +
+     numConsts +
+@@ -2910,10 +3532,20 @@ function codegenNativeScanGeneral(
+     numCarry +
+     numY +
+     numInternal +
+-    (needsAux ? 1 : 0);
++    (needsAux ? 1 : 0) +
++    (hasQrScratch ? 3 : 0);
+   const auxArgIdx = needsAux
+     ? 1 + numConsts + numCarry + numX + numCarry + numY + numInternal
+     : -1;
++  const qrScratchBase =
++    1 +
++    numConsts +
++    numCarry +
++    numX +
++    numCarry +
++    numY +
++    numInternal +
++    (needsAux ? 1 : 0);
+ 
+   const scanFunc = cg.function(rep(numArgs, cg.i32), [], () => {
+     // Local variables
+@@ -3100,6 +3732,14 @@ function codegenNativeScanGeneral(
+             cg.local.get(internalsBase + outIndices[0]); // outPtr
+             cg.local.get(internalsBase + outIndices[1]); // idxPtr
+             cg.local.get(auxArgIdx); // auxPtr
++          } else if (routineType === Routines.QR) {
++            const outIndices = step.outputInternalIndices!;
++            pushSlotPtr(step.inputSlots[0]); // aPtr
++            cg.local.get(internalsBase + outIndices[0]); // qPtr
++            cg.local.get(internalsBase + outIndices[1]); // rPtr
++            cg.local.get(qrScratchBase + 0); // workPtr
++            cg.local.get(qrScratchBase + 1); // tauPtr
++            cg.local.get(qrScratchBase + 2); // v0Ptr
+           } else {
+             pushSlotPtr(step.inputSlots[0]);
+             cg.local.get(internalsBase + internalIdx);
+@@ -3292,7 +3932,8 @@ function translateExpWithBlockMapContext(
+  *
+  * Function arguments:
+  *   [...constPtrs, ...inputPtrs, ...outputPtrs,
+- *    ...scratchInputPtrs, ...scratchOutputPtrs, ...internalPtrs]
++ *    ...scratchInputPtrs, ...scratchOutputPtrs, ...internalPtrs,
++ *    ...qrScratchPtrs?]
+  */
+ function codegenBlockMapLoop(
+   params: BlockMapWasmParams,
+@@ -3312,7 +3953,9 @@ function codegenBlockMapLoop(
+     blockInputSizes,
+     blockOutputSizes,
+     internalSizes,
++    qrScratchSizes,
+     steps,
++    routineInfos,
+     outputSources,
+     inputStrides,
+     outputStrides,
+@@ -3326,6 +3969,19 @@ function codegenBlockMapLoop(
+   cg.trace = traceEnabled;
+   configureMemoryImport(cg);
+ 
++  const routineFuncIndices: number[] = [];
++  if (routineInfos) {
++    for (const info of routineInfos) {
++      const funcIdx = cg.importFunction(
++        "routines",
++        info.exportName,
++        rep(info.numParams, cg.i32),
++        [],
++      );
++      routineFuncIndices.push(funcIdx);
++    }
++  }
++
+   // Collect all helper functions needed by body kernels
+   const allOps = new Set<AluOp>();
+   for (const step of steps) {
+@@ -3341,9 +3997,16 @@ function codegenBlockMapLoop(
+ 
+   // Function arguments layout:
+   //   [consts(numConsts), inputs(numInputs), outputs(numOutputs),
+-  //    scratchInputs(numInputs), scratchOutputs(numOutputs), internals(numInternal)]
++  //    scratchInputs(numInputs), scratchOutputs(numOutputs), internals(numInternal),
++  //    qrScratch(3) if present]
+   const numArgs =
+-    numConsts + numInputs + numOutputs + numInputs + numOutputs + numInternal;
++    numConsts +
++    numInputs +
++    numOutputs +
++    numInputs +
++    numOutputs +
++    numInternal +
++    (qrScratchSizes ? 3 : 0);
+ 
+   const constsBase = 0;
+   const inputsBase = numConsts;
+@@ -3352,6 +4015,7 @@ function codegenBlockMapLoop(
+   const _scratchOutputsBase = numConsts + numInputs + numOutputs + numInputs;
+   const internalsBase =
+     numConsts + numInputs + numOutputs + numInputs + numOutputs;
++  const qrScratchBase = qrScratchSizes ? internalsBase + numInternal : -1;
+ 
+   const mainFunc = cg.function(rep(numArgs, cg.i32), [], () => {
+     // Local variables
+@@ -3618,6 +4282,44 @@ function codegenBlockMapLoop(
+               translateExpWithBlockMapContext(cg, funcs, exp, ctx);
+             },
+           });
++        } else if (step.source instanceof Routine) {
++          const callInfo = step.routineCallInfo!;
++          const funcIdx = routineFuncIndices[callInfo.routineInfoIdx];
++          const ptrArgs = callInfo.ptrArgs;
++          if (!ptrArgs) {
++            throw new Error("[wasm-block-map] missing routine pointer args");
++          }
++
++          const pushSlotPtr = (slotIdx: number) => {
++            if (slotIdx < numConsts) {
++              cg.local.get(constsBase + slotIdx);
++            } else if (slotIdx < numConsts + numInputs) {
++              cg.local.get(scratchInputsBase + (slotIdx - numConsts));
++            } else {
++              cg.local.get(
++                internalsBase + (slotIdx - numConsts - numInputs),
++              );
++            }
++          };
++
++          for (const arg of ptrArgs) {
++            if (arg.kind === "input") {
++              pushSlotPtr(step.inputSlots[arg.inputIdx]);
++            } else if (arg.kind === "output") {
++              const outIndices = step.outputInternalIndices;
++              if (!outIndices) {
++                throw new Error("[wasm-block-map] missing routine output buffers");
++              }
++              cg.local.get(internalsBase + outIndices[arg.outputIdx]);
++            } else {
++              if (qrScratchBase < 0) {
++                throw new Error("[wasm-block-map] missing QR scratch buffers");
++              }
++              cg.local.get(qrScratchBase + arg.scratchIdx);
++            }
++          }
++
++          cg.call(funcIdx);
+         }
+       }
+ 
+@@ -4596,7 +5298,7 @@ export function getScanRoutineInfo(routine: Routine): ScanRoutineInfo | null {
+     const aShape = routine.type.inputShapes[0];
+     const bShape = routine.type.inputShapes[1];
+     const n = aShape[aShape.length - 1];
+-    const batchRows = bShape[bShape.length - 1];
++    const batchRows = bShape[bShape.length - 2];
+     return {
+       routine: routineName,
+       exportName: "triangular_solve",
+@@ -4634,7 +5336,7 @@ export function getScanRoutineInfo(routine: Routine): ScanRoutineInfo | null {
+     return {
+       routine: routineName,
+       exportName: "qr",
+-      numParams: 4,
++      numParams: 6,
+       dtype,
+       sizeParams: [m, n],
+     };
+diff --git a/src/backend/wasm/orchestrator.ts b/src/backend/wasm/orchestrator.ts
+index a493a21..f10b947 100644
+--- a/src/backend/wasm/orchestrator.ts
++++ b/src/backend/wasm/orchestrator.ts
+@@ -29,7 +29,11 @@
+ import { withInlineModuleWorkerUrl } from "./inline-worker";
+ import { ModuleRegistry } from "./module-registry";
+ import { requestWorkerModuleRegistration } from "./registration";
+-import { canWaitOnThisThread, waitWhileState } from "./wait";
++import {
++  canWaitOnThisThread,
++  waitWhileState,
++  waitWhileStateAsync,
++} from "./wait";
+ import { DEBUG } from "../../utils";
+ 
+ // ---------------------------------------------------------------------------
+@@ -263,6 +267,33 @@ export class OrchestratorWorker {
+     return this.#registry.getId(module);
+   }
+ 
++  #assertDispatchInputs(moduleId: number, inputPtrs: number[]): void {
++    if (this.#destroyed) throw new Error("OrchestratorWorker destroyed");
++    if (!this.#registry.hasId(moduleId)) {
++      throw new Error(`Orchestrator: module ${moduleId} not registered`);
++    }
++    if (inputPtrs.length > MAX_INPUTS) {
++      throw new Error(
++        `Orchestrator: too many inputs (${inputPtrs.length} > ${MAX_INPUTS})`,
++      );
++    }
++  }
++
++  #writeDispatchInputs(
++    moduleId: number,
++    inputPtrs: number[],
++    resultBufPtr: number,
++  ): void {
++    Atomics.store(this.#control, CTRL_MODULE_ID, moduleId);
++    Atomics.store(this.#control, CTRL_NUM_INPUTS, inputPtrs.length);
++    Atomics.store(this.#control, CTRL_RESULT_PTR, resultBufPtr);
++    for (let i = 0; i < inputPtrs.length; i++) {
++      Atomics.store(this.#control, CTRL_INPUTS + i, inputPtrs[i]);
++    }
++    Atomics.store(this.#control, CTRL_STATE, STATE_DISPATCHED);
++    Atomics.notify(this.#control, CTRL_STATE);
++  }
++
+   /**
+    * Dispatch mega_execute to the orchestrator worker.
+    *
+@@ -283,25 +314,8 @@ export class OrchestratorWorker {
+     malloc: (size: number) => number,
+     free: (ptr: number) => void,
+   ): void {
+-    if (this.#destroyed) throw new Error("OrchestratorWorker destroyed");
+-    if (!this.#registry.hasId(moduleId)) {
+-      throw new Error(`Orchestrator: module ${moduleId} not registered`);
+-    }
+-    if (inputPtrs.length > MAX_INPUTS) {
+-      throw new Error(
+-        `Orchestrator: too many inputs (${inputPtrs.length} > ${MAX_INPUTS})`,
+-      );
+-    }
+-
+-    // Write dispatch params to control buffer
+-    Atomics.store(this.#control, CTRL_MODULE_ID, moduleId);
+-    Atomics.store(this.#control, CTRL_NUM_INPUTS, inputPtrs.length);
+-    Atomics.store(this.#control, CTRL_RESULT_PTR, resultBufPtr);
+-    for (let i = 0; i < inputPtrs.length; i++) {
+-      Atomics.store(this.#control, CTRL_INPUTS + i, inputPtrs[i]);
+-    }
+-    Atomics.store(this.#control, CTRL_STATE, STATE_DISPATCHED);
+-    Atomics.notify(this.#control, CTRL_STATE);
++    this.#assertDispatchInputs(moduleId, inputPtrs);
++    this.#writeDispatchInputs(moduleId, inputPtrs, resultBufPtr);
+ 
+     // Wait while servicing alloc/free proxy requests until done.
+     while (true) {
+@@ -334,6 +348,50 @@ export class OrchestratorWorker {
+     }
+   }
+ 
++  async dispatchAsync(
++    moduleId: number,
++    inputPtrs: number[],
++    resultBufPtr: number,
++    malloc: (size: number) => number,
++    free: (ptr: number) => void,
++  ): Promise<void> {
++    this.#assertDispatchInputs(moduleId, inputPtrs);
++    this.#writeDispatchInputs(moduleId, inputPtrs, resultBufPtr);
++
++    while (true) {
++      const state = Atomics.load(this.#control, CTRL_STATE);
++
++      if (state === STATE_ALLOC_REQ) {
++        const size = Atomics.load(this.#control, CTRL_AUX);
++        const ptr = malloc(size);
++        Atomics.store(this.#control, CTRL_AUX_RESULT, ptr);
++        Atomics.store(this.#control, CTRL_STATE, STATE_DISPATCHED);
++        Atomics.notify(this.#control, CTRL_STATE);
++        continue;
++      }
++
++      if (state === STATE_FREE_REQ) {
++        const ptr = Atomics.load(this.#control, CTRL_AUX);
++        free(ptr);
++        Atomics.store(this.#control, CTRL_STATE, STATE_DISPATCHED);
++        Atomics.notify(this.#control, CTRL_STATE);
++        continue;
++      }
++
++      if (state === STATE_DONE) {
++        Atomics.store(this.#control, CTRL_STATE, STATE_IDLE);
++        return;
++      }
++
++      if (state === STATE_ERROR) {
++        Atomics.store(this.#control, CTRL_STATE, STATE_IDLE);
++        throw new Error("Orchestrator: mega_execute failed on worker");
++      }
++
++      await waitWhileStateAsync(this.#control, CTRL_STATE, state);
++    }
++  }
++
+   /** Terminate the orchestrator worker and release resources. */
+   destroy(): void {
+     if (this.#destroyed) return;
+diff --git a/src/backend/wasm/routines/qr.ts b/src/backend/wasm/routines/qr.ts
+index a54ed96..9266260 100644
+--- a/src/backend/wasm/routines/qr.ts
++++ b/src/backend/wasm/routines/qr.ts
+@@ -11,8 +11,10 @@ import { WasmHl } from "../wasmblr-hl";
+ 
+ /**
+  * Generate size-specialized QR decomposition for single matrix.
+- * Takes 4 arguments: (aPtr, qPtr, rPtr, workPtr)
++ * Takes 6 arguments: (aPtr, qPtr, rPtr, workPtr, tauPtr, v0Ptr)
+  * workPtr must point to m×n scratch space.
++ * tauPtr must point to k scratch scalars.
++ * v0Ptr must point to k scratch scalars storing the reflector heads.
+  */
+ function genQRSizedWithWork(
+   cg: CodeGenerator,
+@@ -24,12 +26,14 @@ function genQRSizedWithWork(
+   const ty = dtype === "f32" ? cg.f32 : cg.f64;
+   const k = Math.min(m, n);
+ 
+-  // qr(aPtr, qPtr, rPtr, workPtr)
+-  return cg.function([cg.i32, cg.i32, cg.i32, cg.i32], [], () => {
++  // qr(aPtr, qPtr, rPtr, workPtr, tauPtr, v0Ptr)
++  return cg.function([cg.i32, cg.i32, cg.i32, cg.i32, cg.i32, cg.i32], [], () => {
+     const aPtr = 0;
+     const qPtr = 1;
+     const rPtr = 2;
+     const workPtr = 3;
++    const tauPtr = 4;
++    const v0Ptr = 5;
+ 
+     const idx = cg.local.declare(cg.i32);
+     const i = cg.local.declare(cg.i32);
+@@ -50,26 +54,10 @@ function genQRSizedWithWork(
+       });
+     });
+ 
+-    // Initialize Q as identity (m × k)
+-    // Zero Q first
+-    hl.forLoop(idx, 0, m * k, () => {
+-      hl.store(dtype, qPtr, hl.getExpr(idx), () => hl.const(dtype, 0));
+-    });
+-    // Set diagonal to 1
+-    hl.forLoop(idx, 0, Math.min(m, k), () => {
+-      // Q[idx, idx] = 1: index = idx * k + idx
+-      hl.store(
+-        dtype,
+-        qPtr,
+-        () => {
+-          cg.local.get(idx);
+-          cg.i32.const(k);
+-          cg.i32.mul();
+-          cg.local.get(idx);
+-          cg.i32.add();
+-        },
+-        () => hl.const(dtype, 1),
+-      );
++    // Initialize scalar scratch to zero so skipped columns become no-ops.
++    hl.forLoop(idx, 0, k, () => {
++      hl.store(dtype, tauPtr, hl.getExpr(idx), () => hl.const(dtype, 0));
++      hl.store(dtype, v0Ptr, hl.getExpr(idx), () => hl.const(dtype, 0));
+     });
+ 
+     // Householder QR
+@@ -197,12 +185,21 @@ function genQRSizedWithWork(
+       hl.binOp(dtype, "div");
+       cg.local.set(tau);
+ 
+-      // Apply Householder to work[j:m, j:n]
+-      // For each col:
+-      //   dot = v0 * work[j,col] + sum(work[i,col] * work[i,j] for i > j)
+-      //   work[j,col] -= tau * v0 * dot
+-      //   work[i,col] -= tau * work[i,j] * dot  for i > j
+-      hl.forLoop(col, hl.getExpr(j), n, () => {
++      hl.store(dtype, tauPtr, hl.getExpr(j), () => cg.local.get(tau));
++  hl.store(dtype, v0Ptr, hl.getExpr(j), () => cg.local.get(v0));
++
++      // Apply Householder to the trailing submatrix work[j:m, j+1:n].
++      // Keep work[j+1:m, j] as the compact reflector storage for later Q
++      // reconstruction instead of overwriting it during the col=j update.
++      hl.forLoop(
++        col,
++        () => {
++          cg.local.get(j);
++          cg.i32.const(1);
++          cg.i32.add();
++        },
++        n,
++        () => {
+         // dot = v0 * work[j, col]
+         cg.local.get(v0);
+         hl.load(dtype, workPtr, () => {
+@@ -318,9 +315,58 @@ function genQRSizedWithWork(
+             );
+           },
+         );
+-      });
++        },
++      );
++
++      // After applying H, set work[j,j] to alpha (the diagonal of R)
++      hl.store(
++        dtype,
++        workPtr,
++        () => {
++          cg.local.get(j);
++          cg.i32.const(n);
++          cg.i32.mul();
++          cg.local.get(j);
++          cg.i32.add();
++        },
++        () => cg.local.get(alpha),
++      );
++
++      cg.end(); // end vNormSq != 0
++      cg.end(); // end norm != 0
++    });
++
++    // Initialize thin Q as identity (m × k).
++    hl.forLoop(idx, 0, m * k, () => {
++      hl.store(dtype, qPtr, hl.getExpr(idx), () => hl.const(dtype, 0));
++    });
++    hl.forLoop(idx, 0, Math.min(m, k), () => {
++      hl.store(
++        dtype,
++        qPtr,
++        () => {
++          cg.local.get(idx);
++          cg.i32.const(k);
++          cg.i32.mul();
++          cg.local.get(idx);
++          cg.i32.add();
++        },
++        () => hl.const(dtype, 1),
++      );
++    });
++
++    // Reconstruct thin Q by replaying Householder reflectors in reverse order.
++    hl.forLoop(idx, 0, k, () => {
++      cg.i32.const(k - 1);
++      cg.local.get(idx);
++      cg.i32.sub();
++      cg.local.set(j);
++
++      hl.load(dtype, tauPtr, hl.getExpr(j));
++      cg.local.set(tau);
++      hl.load(dtype, v0Ptr, hl.getExpr(j));
++      cg.local.set(v0);
+ 
+-      // Apply Householder to Q[j:m, 0:k]
+       hl.forLoop(col, 0, k, () => {
+         // dot = v0 * Q[j, col]
+         cg.local.get(v0);
+@@ -438,54 +484,40 @@ function genQRSizedWithWork(
+           },
+         );
+       });
+-
+-      // After applying H, set work[j,j] to alpha (the diagonal of R)
+-      hl.store(
+-        dtype,
+-        workPtr,
+-        () => {
+-          cg.local.get(j);
+-          cg.i32.const(n);
+-          cg.i32.mul();
+-          cg.local.get(j);
+-          cg.i32.add();
+-        },
+-        () => cg.local.get(alpha),
+-      );
+-
+-      // Zero out work[i,j] for i > j (below diagonal — these held the v components)
+-      hl.forLoop(
+-        i,
+-        () => {
+-          cg.local.get(j);
+-          cg.i32.const(1);
+-          cg.i32.add();
+-        },
+-        m,
+-        () => {
+-          hl.store(
+-            dtype,
+-            workPtr,
+-            () => {
+-              cg.local.get(i);
+-              cg.i32.const(n);
+-              cg.i32.mul();
+-              cg.local.get(j);
+-              cg.i32.add();
+-            },
+-            () => hl.const(dtype, 0),
+-          );
+-        },
+-      );
+-
+-      cg.end(); // end vNormSq != 0
+-      cg.end(); // end norm != 0
+     });
+ 
+-    // Extract R: first k rows of work (k × n)
+-    hl.forLoop(idx, 0, k * n, () => {
+-      hl.store(dtype, rPtr, hl.getExpr(idx), () => {
+-        hl.load(dtype, workPtr, hl.getExpr(idx));
++    // Extract upper-triangular R: first k rows of work (k × n).
++    hl.forLoop(i, 0, k, () => {
++      hl.forLoop(col, 0, n, () => {
++        hl.store(
++          dtype,
++          rPtr,
++          () => {
++            cg.local.get(i);
++            cg.i32.const(n);
++            cg.i32.mul();
++            cg.local.get(col);
++            cg.i32.add();
++          },
++          () => {
++            cg.local.get(col);
++            cg.local.get(i);
++            cg.i32.ge_u();
++            hl.ifElse(
++              ty,
++              () => {
++                hl.load(dtype, workPtr, () => {
++                  cg.local.get(i);
++                  cg.i32.const(n);
++                  cg.i32.mul();
++                  cg.local.get(col);
++                  cg.i32.add();
++                });
++              },
++              () => hl.const(dtype, 0),
++            );
++          },
++        );
+       });
+     });
+   });
+@@ -507,15 +539,15 @@ function genQRBatchedSized(
+   const aBytes = m * n * elemSize;
+   const qBytes = m * k * elemSize;
+   const rBytes = k * n * elemSize;
+-  const _workBytes = m * n * elemSize;
+-
+-  // qr_batched(aPtr, qPtr, rPtr, workPtr, batchSize)
+-  return cg.function([cg.i32, cg.i32, cg.i32, cg.i32, cg.i32], [], () => {
++  // qr_batched(aPtr, qPtr, rPtr, workPtr, tauPtr, v0Ptr, batchSize)
++  return cg.function([cg.i32, cg.i32, cg.i32, cg.i32, cg.i32, cg.i32, cg.i32], [], () => {
+     const aPtr = 0;
+     const qPtr = 1;
+     const rPtr = 2;
+     const workPtr = 3;
+-    const batchSize = 4;
++    const tauPtr = 4;
++    const v0Ptr = 5;
++    const batchSize = 6;
+ 
+     const b = cg.local.declare(cg.i32);
+ 
+@@ -539,9 +571,11 @@ function genQRBatchedSized(
+       cg.i32.mul();
+       cg.i32.add();
+ 
+-      // workPtr is shared scratch — each batch item uses the same area
+-      // (sequential batching, no parallelism)
++      // Scratch sections are shared across batch items because batching here is
++      // sequential rather than parallel.
+       cg.local.get(workPtr);
++      cg.local.get(tauPtr);
++      cg.local.get(v0Ptr);
+ 
+       cg.call(singleFunc);
+     });
+@@ -556,8 +590,8 @@ function genQRBatchedSized(
+  * @param dtype - f32 or f64
+  *
+  * Exports:
+- * - qr(aPtr, qPtr, rPtr, workPtr) - single matrix
+- * - qr_batched(aPtr, qPtr, rPtr, workPtr, batchSize) - multiple matrices
++ * - qr(aPtr, qPtr, rPtr, workPtr, tauPtr, v0Ptr) - single matrix
++ * - qr_batched(aPtr, qPtr, rPtr, workPtr, tauPtr, v0Ptr, batchSize) - multiple matrices
+  */
+ export function buildQRModuleSized(
+   m: number,
+diff --git a/src/backend/wasm/wait.ts b/src/backend/wasm/wait.ts
+index 22266c3..13d8678 100644
+--- a/src/backend/wasm/wait.ts
++++ b/src/backend/wasm/wait.ts
+@@ -22,3 +22,43 @@ export function waitWhileState(
+     // busy wait fallback
+   }
+ }
++
++type WaitAsyncResult =
++  | { async: true; value: Promise<unknown> }
++  | { async: false; value: unknown };
++
++type AtomicsWithWaitAsync = typeof Atomics & {
++  waitAsync?: (
++    typedArray: Int32Array,
++    index: number,
++    value: number,
++    timeout?: number,
++  ) => WaitAsyncResult;
++};
++
++export async function waitWhileStateAsync(
++  control: Int32Array,
++  index: number,
++  expected: number,
++): Promise<void> {
++  const atomicsWithWaitAsync = Atomics as AtomicsWithWaitAsync;
++  const waitAsync = atomicsWithWaitAsync.waitAsync;
++  if (waitAsync) {
++    const result = waitAsync(control, index, expected);
++    if (result.async) {
++      await result.value;
++    }
++    return;
++  }
++
++  await new Promise<void>((resolve) => {
++    const poll = () => {
++      if (Atomics.load(control, index) !== expected) {
++        resolve();
++        return;
++      }
++      setTimeout(poll, 0);
++    };
++    poll();
++  });
++}
+diff --git a/src/backend/wasm/worker-pool.ts b/src/backend/wasm/worker-pool.ts
+index 1d82696..f60976d 100644
+--- a/src/backend/wasm/worker-pool.ts
++++ b/src/backend/wasm/worker-pool.ts
+@@ -3,21 +3,23 @@
+  *
+  * Workers share a `WebAssembly.Memory` (backed by `SharedArrayBuffer`).
+  * Coordination uses a shared Int32Array control buffer for work params
+- * and completion signaling, combined with `postMessage` for wake-up.
++ * and completion signaling.
++ *
++ * Wake mechanism:
++ *   Workers block on `Atomics.wait(control, STATE, READY)` in a tight loop,
++ *   periodically yielding to the JS event loop via `setTimeout` so that
++ *   `onmessage` handlers (register, unregister, destroy) can run.
++ *   The main thread wakes workers via `Atomics.notify`, bypassing the JS
++ *   event loop entirely. This avoids the postMessage deadlock that occurs
++ *   when the main thread spin-waits for completion after sending postMessage.
+  *
+  * Protocol (per worker):
+  *   1. Main thread writes work params to control buffer via Atomics.store
+- *   2. Main thread sends postMessage({ type: "wake" }) to worker
+- *   3. Worker's onmessage fires, reads params, executes kernel
++ *   2. Main thread stores STATE_WORK and calls Atomics.notify to wake worker
++ *   3. Worker's Atomics.wait returns "not-equal", reads params, executes kernel
+  *   4. Worker writes STATE_READY to control buffer, calls Atomics.notify
+  *   5. Main thread waits for STATE_READY (Atomics.wait when available,
+- *      otherwise a busy-poll fallback)
+- *
+- * Workers still sit in the natural event loop so they can receive module
+- * registration messages; the main side uses `Atomics.wait` when available to
+- * avoid starving nested-worker execution.
+- * Browser main threads never construct this path because WasmBackend gates it
+- * on Atomics.wait support.
++ *      otherwise a busy-poll fallback on browser main threads)
+  */
+ 
+ import { withInlineModuleWorkerUrl } from "./inline-worker";
+@@ -65,6 +67,61 @@ var control = null;
+ var workerIdx = -1;
+ var workBase = -1;
+ var instances = Object.create(null); // moduleId -> WebAssembly.Instance
++var waitLoopActive = false;
++
++function executeWork() {
++  var moduleId = Atomics.load(control, workBase + ${CTRL_MODULE_ID});
++  var start = Atomics.load(control, workBase + ${CTRL_START});
++  var end = Atomics.load(control, workBase + ${CTRL_END});
++  var kernelIdx = Atomics.load(control, workBase + ${CTRL_KERNEL_IDX});
++  var numArgs = Atomics.load(control, workBase + ${CTRL_NUM_ARGS});
++
++  var args = new Array(numArgs);
++  for (var a = 0; a < numArgs; a++) {
++    args[a] = Atomics.load(control, workBase + ${CTRL_ARGS} + a);
++  }
++
++  var instance = instances[moduleId];
++  if (instance) {
++    var fn = kernelIdx < 0
++      ? instance.exports.kernel
++      : instance.exports["kernel_" + kernelIdx];
++    fn(start, end, args[0], args[1], args[2], args[3],
++      args[4], args[5], args[6], args[7], args[8], args[9],
++      args[10], args[11], args[12], args[13], args[14], args[15],
++      args[16], args[17], args[18], args[19]);
++  }
++
++  Atomics.store(control, workBase + ${CTRL_STATE}, ${STATE_READY});
++  Atomics.notify(control, workBase + ${CTRL_STATE});
++}
++
++// Tight Atomics.wait loop: blocks the worker thread waiting for work.
++// Periodically yields to the event loop (via setTimeout) so onmessage
++// handlers for register/unregister/destroy can run.
++function waitLoop() {
++  while (true) {
++    var result = Atomics.wait(control, workBase + ${CTRL_STATE}, ${STATE_READY}, 50);
++    if (result === "not-equal") {
++      // State changed — check for work
++      var state = Atomics.load(control, workBase + ${CTRL_STATE});
++      if (state === ${STATE_WORK}) {
++        executeWork();
++        continue; // check again immediately after work
++      }
++    }
++    // Timed out or spurious — yield to event loop for onmessage processing
++    break;
++  }
++  // Re-enter via setTimeout so pending postMessages (register, destroy) can run
++  if (waitLoopActive) setTimeout(waitLoop, 0);
++}
++
++function startWaitLoop() {
++  if (waitLoopActive) return;
++  waitLoopActive = true;
++  waitLoop();
++}
+ 
+ self.onmessage = function (e) {
+   var msg = e.data;
+@@ -74,38 +131,7 @@ self.onmessage = function (e) {
+   } else if (msg.type === "control") {
+     control = new Int32Array(msg.buffer);
+     workBase = workerIdx * ${WORKER_STRIDE};
+-  } else if (msg.type === "wake") {
+-    // Main thread wrote work params — execute kernel
+-    if (workBase < 0) return;
+-    var state = Atomics.load(control, workBase + ${CTRL_STATE});
+-    if (state !== ${STATE_WORK}) return; // spurious or already processed
+-
+-    var moduleId = Atomics.load(control, workBase + ${CTRL_MODULE_ID});
+-    var start = Atomics.load(control, workBase + ${CTRL_START});
+-    var end = Atomics.load(control, workBase + ${CTRL_END});
+-    var kernelIdx = Atomics.load(control, workBase + ${CTRL_KERNEL_IDX});
+-    var numArgs = Atomics.load(control, workBase + ${CTRL_NUM_ARGS});
+-
+-    var args = new Array(numArgs);
+-    for (var a = 0; a < numArgs; a++) {
+-      args[a] = Atomics.load(control, workBase + ${CTRL_ARGS} + a);
+-    }
+-
+-    var instance = instances[moduleId];
+-    if (instance) {
+-      // M6.2c: select kernel by index (-1 = default "kernel", 0+ = "kernel_N")
+-      var fn = kernelIdx < 0
+-        ? instance.exports.kernel
+-        : instance.exports["kernel_" + kernelIdx];
+-      fn(start, end, args[0], args[1], args[2], args[3],
+-        args[4], args[5], args[6], args[7], args[8], args[9],
+-        args[10], args[11], args[12], args[13], args[14], args[15],
+-        args[16], args[17], args[18], args[19]);
+-    }
+-
+-    // Signal completion: set READY and notify main thread.
+-    Atomics.store(control, workBase + ${CTRL_STATE}, ${STATE_READY});
+-    Atomics.notify(control, workBase + ${CTRL_STATE});
++    startWaitLoop();
+   } else if (msg.type === "register") {
+     try {
+       var inst = new WebAssembly.Instance(msg.module, { env: { memory: memory } });
+@@ -115,8 +141,6 @@ self.onmessage = function (e) {
+       self.postMessage({ type: "error", moduleId: msg.moduleId, error: String(err) });
+     }
+   } else if (msg.type === "register-mega") {
+-    // Register a mega-module with stub alloc/free imports.
+-    // Workers only call extracted kernel_N functions, never mega_execute.
+     try {
+       var inst = new WebAssembly.Instance(msg.module, {
+         env: {
+@@ -133,6 +157,7 @@ self.onmessage = function (e) {
+   } else if (msg.type === "unregister") {
+     delete instances[msg.moduleId];
+   } else if (msg.type === "destroy") {
++    waitLoopActive = false;
+     self.close();
+   }
+ };
+@@ -284,7 +309,7 @@ export class WasmWorkerPool {
+     const nChunks = n + 1; // workers + main thread
+     const chunkSize = Math.ceil(totalSize / nChunks);
+ 
+-    // Write work params for each worker, then wake via postMessage
++    // Write work params for each worker, then wake via Atomics.notify
+     for (let i = 0; i < n; i++) {
+       const start = (i + 1) * chunkSize;
+       const end = Math.min(start + chunkSize, totalSize);
+@@ -299,10 +324,11 @@ export class WasmWorkerPool {
+       for (let a = 0; a < args.length; a++) {
+         Atomics.store(this.#control, base + CTRL_ARGS + a, args[a]);
+       }
+-      // Signal work (must be last — worker reads STATE_WORK on wake)
++      // Signal work (must be last — worker's Atomics.wait sees state change)
+       Atomics.store(this.#control, base + CTRL_STATE, STATE_WORK);
+-      // Wake worker via postMessage (no Atomics.waitAsync/notify needed)
+-      this.#workers[i].postMessage({ type: "wake" });
++      // Wake worker via Atomics.notify — bypasses the JS event loop entirely,
++      // so the main thread can safely spin-wait without deadlocking.
++      Atomics.notify(this.#control, base + CTRL_STATE);
+     }
+ 
+     // Main thread processes chunk [0, chunkSize)
+diff --git a/src/frontend/array.test.ts b/src/frontend/array.test.ts
+index e924f40..7184075 100644
+--- a/src/frontend/array.test.ts
++++ b/src/frontend/array.test.ts
+@@ -1,7 +1,8 @@
+ import { beforeEach, expect, suite, test } from "vitest";
+ 
+-import { defaultDevice, devices, init } from "../backend";
+-import { arange, array, eye, ones, zeros } from "./array";
++import { defaultDevice, devices, getBackend, init } from "../backend";
++import { ShapeTracker } from "../shape";
++import { Array as JaxArray, arange, array, eye, ones, zeros } from "./array";
+ import { DType } from "../alu";
+ 
+ const devicesAvailable = await init();
+@@ -122,6 +123,65 @@ suite.each(devices)("device:%s", (device) => {
+     expect((a as any) ** 2).toEqual(42 ** 2);
+   });
+ 
++  test("frontend sync surfaces guard while blockUntilReady waits on wasm produced-slot readiness", async () => {
++    if (device !== "wasm") return;
++
++    const backend = getBackend("wasm") as any;
++    const initialSlots = backend.slotCount();
++
++    await backend._debugWithReservedProducedSlotsForTest(
++      [4, 4, 4],
++      ({
++        slots: [dataSlot, disposeSlot, readySlot],
++        resolve,
++      }: {
++        slots: readonly number[];
++        resolve(): void;
++      }) => {
++        const dataArray = new JaxArray({
++          source: dataSlot,
++          st: ShapeTracker.fromShape([1]),
++          dtype: DType.Float32,
++          weakType: false,
++          backend,
++          committed: false,
++        });
++        const disposeArray = new JaxArray({
++          source: disposeSlot,
++          st: ShapeTracker.fromShape([1]),
++          dtype: DType.Float32,
++          weakType: false,
++          backend,
++          committed: false,
++        });
++        const readyArray = new JaxArray({
++          source: readySlot,
++          st: ShapeTracker.fromShape([1]),
++          dtype: DType.Float32,
++          weakType: false,
++          backend,
++          committed: false,
++        });
++
++        expect(() => dataArray.dataSync()).toThrow(/in-flight/);
++        expect(() => disposeArray.dispose()).toThrow(/in-flight/);
++        return (async () => {
++          try {
++            const readyPromise = readyArray.blockUntilReady();
++            await Promise.resolve();
++            resolve();
++            await expect(readyPromise).resolves.toBe(readyArray);
++          } finally {
++            dataArray.dispose();
++            readyArray.dispose();
++          }
++        })();
++      },
++    );
++
++    expect(backend.slotCount()).toBe(initialSlots);
++  });
++
+   test("construct bool array", () => {
+     using a = array([true, false, true]);
+     expect(a.shape).toEqual([3]);
+diff --git a/src/frontend/array.ts b/src/frontend/array.ts
+index ffe9f99..d6801ed 100644
+--- a/src/frontend/array.ts
++++ b/src/frontend/array.ts
+@@ -96,6 +96,7 @@ export interface IPendingExecute {
+   readonly backend: Backend;
+   prepared: any;
+   submitted: boolean;
++  readonly autoSubmitSync?: boolean;
+   updateRc(delta: number): void;
+   prepare(): Promise<void>;
+   prepareSync(): void;
+@@ -105,6 +106,7 @@ export interface IPendingExecute {
+ export class PendingExecute implements IPendingExecute {
+   prepared: Executable | null = null;
+   submitted = false;
++  readonly autoSubmitSync = true;
+   #promise: Promise<void> | null = null; // for prepare
+   #rc = 1; // since this could be held by multiple arrays, cancel when it hits 0
+ 
+@@ -400,19 +402,25 @@ export class Array extends Tracer {
+ 
+   dispose() {
+     this.#check();
+-    if (--this.#rc === 0) {
+-      // Leak tracking: remove from map (no-op when map is empty / tracking off).
+-      if (_leakTrackingMap.size > 0) _leakTrackingMap.delete(this);
+-      // Free any pending executables that haven't been submitted yet.
+-      // WARNING: This cancels lazy PendingExecute without running the kernel.
+-      // In benchmarks/profiling, call .dataSync() or .blockUntilReady() first
+-      // to force materialization, otherwise the operation never executes.
+-      for (const exe of this.#pending) exe.updateRc(-1);
+-      // If this has an array source, free it from the backend.
+-      if (typeof this.#source === "number") {
+-        this.#backend.decRef(this.#source);
+-      }
++    const nextRc = this.#rc - 1;
++    if (nextRc > 0) {
++      this.#rc = nextRc;
++      return;
++    }
++
++    // Free any pending executables that haven't been submitted yet.
++    // WARNING: This cancels lazy PendingExecute without running the kernel.
++    // In benchmarks/profiling, call .dataSync() or .blockUntilReady() first
++    // to force materialization, otherwise the operation never executes.
++    for (const exe of this.#pending) exe.updateRc(-1);
++    // If this has an array source, free it from the backend.
++    if (typeof this.#source === "number") {
++      this.#backend.decRef(this.#source);
+     }
++
++    this.#rc = 0;
++    // Leak tracking: remove from map (no-op when map is empty / tracking off).
++    if (_leakTrackingMap.size > 0) _leakTrackingMap.delete(this);
+   }
+ 
+   /**
+@@ -1451,19 +1459,24 @@ export class Array extends Tracer {
+         }
+ 
+         const jp = jitCompile(backend, jaxpr, dimBindings, name);
+-        const { outputs, pending } = jp.execute(slots, dimBindings);
++        const { outputs, pending } = jp.execute(slots, dimBindings, {
++          allowDeferredMegaModule: true,
++        });
+ 
+         // Batch output pending ops into one submit so the next jit call
+         // finds no unflushed ops (#pending getter filters submitted ops).
+         if (pending.length > 0) {
+-          backend.beginBatch?.();
+-          try {
+-            for (const exe of pending) {
+-              exe.prepareSync();
+-              exe.submit();
++          const syncPending = pending.filter((exe) => exe.autoSubmitSync !== false);
++          if (syncPending.length > 0) {
++            backend.beginBatch?.();
++            try {
++              for (const exe of syncPending) {
++                exe.prepareSync();
++                exe.submit();
++              }
++            } finally {
++              backend.endBatch?.();
+             }
+-          } finally {
+-            backend.endBatch?.();
+           }
+           for (const exe of pending) exe.updateRc(+outputs.length - 1);
+         }
+diff --git a/src/frontend/block-map-executor.ts b/src/frontend/block-map-executor.ts
+index e979118..186cf1d 100644
+--- a/src/frontend/block-map-executor.ts
++++ b/src/frontend/block-map-executor.ts
+@@ -9,8 +9,14 @@
+ 
+ import { byteWidth, type DType, Kernel, Reduction } from "../alu";
+ import { type Backend, Executable, type Slot } from "../backend";
+-import type { BlockMapWasmParams, GeneralScanStep } from "../backend/wasm";
++import {
++  getWasmBlockMapRoutinePlan,
++  type BlockMapWasmParams,
++  type GeneralScanStep,
++  type ScanRoutineInfo,
++} from "../backend/wasm";
+ import type { PackedLeafLayout } from "../backend/webgpu/codegen";
++import { Routine } from "../routine";
+ import { DEBUG, prod } from "../utils";
+ import type { IPendingExecute } from "./array";
+ import { _registerJitCacheDisposer } from "./check-leaks";
+@@ -125,6 +131,15 @@ const blockMapFusedCache = new Map<
+ >();
+ _registerJitCacheDisposer(() => blockMapFusedCache.clear());
+ 
++// WASM compiled block_map follows the same specialization model as the fused
++// WebGPU path: the generated module bakes grid geometry, axis mapping, strides,
++// and halo handling, so reuse must be keyed by the concrete block-map shape.
++const blockMapWasmCache = new Map<
++  JitProgram,
++  Map<string, Executable | null>
++>();
++_registerJitCacheDisposer(() => blockMapWasmCache.clear());
++
+ /**
+  * Codegen-specialization key for fused block-map executables.
+  * Includes only fields that affect the generated WGSL — excludes runtime
+@@ -268,18 +283,36 @@ function tryExecuteBlockMapWasm(
+ ): ExecuteBlockMapResult | null {
+   const wasmBackend = params.backend as import("../backend/wasm").WasmBackend;
+ 
+-  const wasmParams = buildBlockMapWasmParams(params);
+-  if (!wasmParams) return null;
++  const specKey = blockMapSpecKey(params);
++  let inner = blockMapWasmCache.get(params.bodyProgram);
++  if (!inner) {
++    inner = new Map();
++    blockMapWasmCache.set(params.bodyProgram, inner);
++  }
+ 
+-  const exe = wasmBackend.prepareBlockMapWasm(wasmParams);
+-  if (!exe) return null;
++  let cached = inner.get(specKey);
++  let wasmParams: BlockMapWasmParams | null = null;
++  if (cached === undefined) {
++    wasmParams = buildBlockMapWasmParams(params);
++    if (!wasmParams) {
++      inner.set(specKey, null);
++      return null;
++    }
++    cached = wasmBackend.prepareBlockMapWasm(wasmParams) ?? null;
++    inner.set(specKey, cached);
++  }
++
++  if (!cached) return null;
++
++  wasmParams ??= buildBlockMapWasmParams(params);
++  if (!wasmParams) return null;
+ 
+   if (DEBUG >= 1) {
+     console.info("block_map: using compiled WASM loop path");
+   }
+ 
+   wasmBackend.dispatchBlockMapWasm(
+-    exe,
++    cached,
+     wasmParams,
+     params.constSlots,
+     params.inputSlots,
+@@ -291,7 +324,7 @@ function tryExecuteBlockMapWasm(
+ 
+ /**
+  * Build BlockMapWasmParams from the body program, or return null if the body
+- * can't be compiled to WASM (routines, loops, non-contiguous slices, etc.).
++ * can't be compiled to WASM (unsupported routines, loops, non-contiguous slices, etc.).
+  */
+ function buildBlockMapWasmParams(
+   params: ExecuteBlockMapParams,
+@@ -311,14 +344,14 @@ function buildBlockMapWasmParams(
+   const gridRank = blockShape.length;
+   const numOutputs = bodyJaxpr.outs.length;
+ 
+-  // Only support kernel-only bodies (no routines, nested scans, etc.)
++  // Support kernels plus a low-complexity routine subset (QR, Cholesky).
+   type ExecuteStep = Extract<JitStep, { type: "execute" }>;
+   const executeSteps: ExecuteStep[] = [];
+   for (const step of bodyProgram.steps) {
+     if (step.type === "execute") {
+-      if (!(step.source instanceof Kernel)) {
++      if (!(step.source instanceof Kernel) && !(step.source instanceof Routine)) {
+         if (DEBUG >= 2)
+-          console.log("[wasm-block-map] rejected: non-kernel execute step");
++          console.log("[wasm-block-map] rejected: unsupported execute step source");
+         return null;
+       }
+       executeSteps.push(step as ExecuteStep);
+@@ -344,6 +377,16 @@ function buildBlockMapWasmParams(
+     return null;
+   }
+ 
++  const routineInfos = collectBlockMapRoutineInfos(executeSteps);
++  if (!routineInfos) return null;
++  const stepToRoutineInfoIdx = new Map<number, number>();
++  let routineInfoIdx = 0;
++  for (let i = 0; i < executeSteps.length; i++) {
++    if (executeSteps[i].source instanceof Routine) {
++      stepToRoutineInfoIdx.set(i, routineInfoIdx++);
++    }
++  }
++
+   // Check contiguity: for each input with axis mapping, the slice must be contiguous.
+   // A slice is contiguous if all mapped axes are "leading" — i.e., for mapped axis `ax`,
+   // all dimensions d > ax match the full input shape (not sub-sliced by a different grid dim).
+@@ -413,21 +456,56 @@ function buildBlockMapWasmParams(
+   // Build slot-to-internal mapping
+   const numBodyInputs = numConsts + numInputs;
+   const slotToInternal = new Map<number, number>();
++  const stepToInternalBase = new Map<number, number>();
+   const internalSizes: number[] = [];
++  let qrWorkSize = 0;
++  let qrTauSize = 0;
++  let qrV0Size = 0;
++
++  for (let stepIdx = 0; stepIdx < executeSteps.length; stepIdx++) {
++    const step = executeSteps[stepIdx];
++    stepToInternalBase.set(stepIdx, internalSizes.length);
++
++    if (step.source instanceof Kernel) {
++      const kernel = step.source;
++      const internalIdx = internalSizes.length;
++      slotToInternal.set(step.outputs[0], internalIdx);
++      internalSizes.push(
++        (kernel.size as number) * byteWidth(kernel.outputs[0].dtype),
++      );
++      continue;
++    }
+ 
+-  for (const step of executeSteps) {
+-    const kernel = step.source as Kernel;
+-    const internalIdx = internalSizes.length;
+-    slotToInternal.set(step.outputs[0], internalIdx);
+-    internalSizes.push(
+-      (kernel.size as number) * byteWidth(kernel.outputs[0].dtype),
+-    );
++    const routine = step.source;
++    const routinePlan = getWasmBlockMapRoutinePlan(routine);
++    if (!routinePlan) {
++      if (DEBUG >= 2) {
++        console.log(
++          `[wasm-block-map] rejected: routine ${routine.name} not yet enabled`,
++        );
++      }
++      return null;
++    }
++
++    if (routinePlan.qrScratchSizes) {
++      qrWorkSize = Math.max(qrWorkSize, routinePlan.qrScratchSizes[0]);
++      qrTauSize = Math.max(qrTauSize, routinePlan.qrScratchSizes[1]);
++      qrV0Size = Math.max(qrV0Size, routinePlan.qrScratchSizes[2]);
++    }
++
++    for (let outIdx = 0; outIdx < step.outputs.length; outIdx++) {
++      const internalIdx = internalSizes.length;
++      slotToInternal.set(step.outputs[outIdx], internalIdx);
++      const outShape = routine.type.outputShapes[outIdx];
++      const outDtype = routine.type.outputDtypes[outIdx];
++      internalSizes.push(outShape.reduce((a, b) => a * b, 1) * byteWidth(outDtype));
++    }
+   }
+ 
+-  // Build reindexed kernel steps
++  // Build reindexed steps
+   const reindexedSteps: GeneralScanStep[] = [];
+-  for (const step of executeSteps) {
+-    const kernel = step.source as Kernel;
++  for (let stepIdx = 0; stepIdx < executeSteps.length; stepIdx++) {
++    const step = executeSteps[stepIdx];
+ 
+     // Map each input JitId to a body-local index
+     const inputSlots: number[] = [];
+@@ -445,28 +523,59 @@ function buildBlockMapWasmParams(
+       }
+     }
+ 
+-    // Reindex kernel expressions
+-    const reindexMap = inputSlots;
+-    const reindexedExp = kernel.outputs[0].exp.reindexGids(reindexMap);
+-    const reindexedReduction = kernel.outputs[0].reduction
+-      ? new Reduction(
+-          kernel.outputs[0].reduction.dtype,
+-          kernel.outputs[0].reduction.op,
+-          kernel.outputs[0].reduction.size,
+-          kernel.outputs[0].reduction.epilogue.reindexGids(reindexMap),
+-        )
+-      : undefined;
+-    const reindexedKernel = Kernel.single(
+-      numBodyInputs + internalSizes.length,
+-      kernel.size,
+-      reindexedExp,
+-      reindexedReduction,
++    if (step.source instanceof Kernel) {
++      const kernel = step.source;
++      const reindexMap = inputSlots;
++      const reindexedExp = kernel.outputs[0].exp.reindexGids(reindexMap);
++      const reindexedReduction = kernel.outputs[0].reduction
++        ? new Reduction(
++            kernel.outputs[0].reduction.dtype,
++            kernel.outputs[0].reduction.op,
++            kernel.outputs[0].reduction.size,
++            kernel.outputs[0].reduction.epilogue.reindexGids(reindexMap),
++          )
++        : undefined;
++      const reindexedKernel = Kernel.single(
++        numBodyInputs + internalSizes.length,
++        kernel.size,
++        reindexedExp,
++        reindexedReduction,
++      );
++
++      reindexedSteps.push({
++        source: reindexedKernel,
++        inputSlots,
++        outputInternalIdx: slotToInternal.get(step.outputs[0])!,
++      });
++      continue;
++    }
++
++    const routine = step.source;
++    const routinePlan = getWasmBlockMapRoutinePlan(routine);
++    if (!routinePlan) {
++      if (DEBUG >= 2) {
++        console.log(
++          `[wasm-block-map] rejected: routine ${routine.name} not yet enabled`,
++        );
++      }
++      return null;
++    }
++
++    const internalBase = stepToInternalBase.get(stepIdx)!;
++    const outputInternalIndices = step.outputs.map(
++      (_, outIdx) => internalBase + outIdx,
+     );
+ 
+     reindexedSteps.push({
+-      source: reindexedKernel,
++      source: routine,
+       inputSlots,
+-      outputInternalIdx: slotToInternal.get(step.outputs[0])!,
++      outputInternalIdx: internalBase,
++      outputInternalIndices,
++      routineCallInfo: {
++        routineInfoIdx: stepToRoutineInfoIdx.get(stepIdx)!,
++        staticParams: routinePlan.staticParams,
++        ptrArgs: routinePlan.ptrArgs,
++      },
+     });
+   }
+ 
+@@ -539,7 +648,10 @@ function buildBlockMapWasmParams(
+     blockInputSizes,
+     blockOutputSizes,
+     internalSizes,
++    qrScratchSizes:
++      qrWorkSize > 0 ? [qrWorkSize, qrTauSize, qrV0Size] : undefined,
+     steps: reindexedSteps,
++    routineInfos: routineInfos.length > 0 ? routineInfos : undefined,
+     outputSources,
+     inputStrides: inputStridesArr,
+     outputStrides: outputStridesArr,
+@@ -547,6 +659,26 @@ function buildBlockMapWasmParams(
+   };
+ }
+ 
++function collectBlockMapRoutineInfos(
++  executeSteps: Extract<JitStep, { type: "execute" }>[],
++): ScanRoutineInfo[] | null {
++  const routineInfos: ScanRoutineInfo[] = [];
++  for (const step of executeSteps) {
++    if (!(step.source instanceof Routine)) continue;
++    const plan = getWasmBlockMapRoutinePlan(step.source);
++    if (!plan) {
++      if (DEBUG >= 2) {
++        console.log(
++          `[wasm-block-map] rejected: unsupported routine ${step.source.name}`,
++        );
++      }
++      return null;
++    }
++    routineInfos.push(plan.info);
++  }
++  return routineInfos;
++}
++
+ // ---------------------------------------------------------------------------
+ // Fallback: JS loop calling bodyProgram.execute() per block
+ // ---------------------------------------------------------------------------
+diff --git a/src/frontend/check-leaks.ts b/src/frontend/check-leaks.ts
+index 64ae753..c893e06 100644
+--- a/src/frontend/check-leaks.ts
++++ b/src/frontend/check-leaks.ts
+@@ -56,6 +56,8 @@
+  */
+ 
+ import { type Device, devices, getBackend } from "../backend";
++import { clearWasmModuleCache } from "../backend/wasm";
++import { clearRoutineCache } from "../backend/wasm/routine-provider";
+ 
+ // ── JIT cache disposal registry ──
+ // jit.ts registers its cache clearer at module load time.
+@@ -166,6 +168,8 @@ function _disposeAllJitCaches(): void {
+  */
+ export function clearCaches(): void {
+   _disposeAllJitCaches();
++  clearWasmModuleCache();
++  clearRoutineCache();
+ }
+ 
+ // ── Tracking state (checked on the hot path) ──
+diff --git a/src/frontend/core.ts b/src/frontend/core.ts
+index 0a50180..86aeb6d 100644
+--- a/src/frontend/core.ts
++++ b/src/frontend/core.ts
+@@ -877,12 +877,15 @@ export function insideAbstractTrace(): boolean {
+  * True while user body code is executing inside a makeJaxpr call.
+  * Set around the `fn(tracers)` call, NOT during JaxprBuilder.build().
+  */
+-let _inMakeJaxprBody = false;
++let _makeJaxprBodyDepth = 0;
+ export function inMakeJaxprBody(): boolean {
+-  return _inMakeJaxprBody;
++  return _makeJaxprBodyDepth > 0;
+ }
+-export function _setInMakeJaxprBody(v: boolean): void {
+-  _inMakeJaxprBody = v;
++export function makeJaxprBodyDepth(): number {
++  return _makeJaxprBodyDepth;
++}
++export function _setMakeJaxprBodyDepth(v: number): void {
++  _makeJaxprBodyDepth = v;
+ }
+ 
+ /**
+diff --git a/src/frontend/jaxpr.ts b/src/frontend/jaxpr.ts
+index 9085159..f2a0bcd 100644
+--- a/src/frontend/jaxpr.ts
++++ b/src/frontend/jaxpr.ts
+@@ -29,13 +29,13 @@ import { array, Array, ArrayLike, pureArray } from "./array";
+ import { _jitFunctionDisposers } from "./check-leaks";
+ import { checkConvShape, checkPoolShape } from "./convolution";
+ import {
+-  _setInMakeJaxprBody,
++  _setMakeJaxprBodyDepth,
+   AbstractValue,
+   bind,
+   flattenFun,
+   fullRaise,
+   getAval,
+-  inMakeJaxprBody,
++  makeJaxprBodyDepth,
+   ndim,
+   newDynamic,
+   newMain,
+@@ -1887,13 +1887,13 @@ export function makeJaxpr(
+       trace.newArg(typeof aval === "object" ? aval : pureArray(aval)),
+     );
+ 
+-    const prevBody = inMakeJaxprBody();
+-    _setInMakeJaxprBody(true);
++    const prevBodyDepth = makeJaxprBodyDepth();
++    _setMakeJaxprBodyDepth(prevBodyDepth + 1);
+     let outs: any;
+     try {
+       outs = fFlat(...tracersIn);
+     } finally {
+-      _setInMakeJaxprBody(prevBody);
++      _setMakeJaxprBodyDepth(prevBodyDepth);
+     }
+     const tracersOut = outs.map(
+       (out: Tracer) => fullRaise(trace, out) as JaxprTracer,
+diff --git a/src/frontend/jit.ts b/src/frontend/jit.ts
+index b8cba83..0186029 100644
+--- a/src/frontend/jit.ts
++++ b/src/frontend/jit.ts
+@@ -1132,6 +1132,73 @@ function computeSlotCount(steps: JitStep[], inputs: JitId[]): number {
+   return max;
+ }
+ 
++class WasmMegaModulePendingExecute implements IPendingExecute {
++  prepared: "sync" | "deferred" | null = null;
++  submitted = false;
++  readonly autoSubmitSync = false;
++  #rc = 1;
++
++  constructor(
++    readonly backend: WasmBackend,
++    readonly megaModule: WasmMegaModule,
++    readonly inputs: Slot[],
++    readonly outputs: Slot[],
++  ) {
++    for (const slot of inputs) this.backend.incRef(slot);
++    for (const slot of outputs) this.backend.incRef(slot);
++  }
++
++  updateRc(delta: number) {
++    if (this.#rc <= 0) throw new Error("internal: PendingExecute used rc<=0");
++    this.#rc += delta;
++    if (this.#rc <= 0 && !this.submitted) {
++      for (const slot of this.inputs) this.backend.decRef(slot);
++      for (const slot of this.outputs) this.backend.decRef(slot);
++    }
++  }
++
++  async prepare() {
++    if (this.prepared) return;
++    this.prepared = "deferred";
++  }
++
++  prepareSync() {
++    if (this.prepared) return;
++    this.prepared = "sync";
++  }
++
++  submit() {
++    if (this.submitted) return;
++    if (this.#rc <= 0) throw new Error("internal: PendingExecute used rc<=0");
++    this.submitted = true;
++    if (this.prepared === "sync") {
++      this.backend.executeMegaModuleInto(this.megaModule, this.inputs, this.outputs);
++      for (const slot of this.inputs) this.backend.decRef(slot);
++      for (const slot of this.outputs) this.backend.decRef(slot);
++    } else {
++      this.backend.executeMegaModuleDeferredInto(
++        this.megaModule,
++        this.inputs,
++        this.outputs,
++      );
++      for (const slot of this.inputs) this.backend.decRef(slot);
++      void Promise.all(this.outputs.map((slot) => this.backend.read(slot, 0, 0)))
++        .catch(() => {})
++        .finally(() => {
++          for (const slot of this.outputs) {
++            try {
++              this.backend.decRef(slot);
++            } catch {
++              // Deferred execution may abandon produced slots on failure,
++              // deleting the placeholder before this retained ref is released.
++            }
++          }
++        });
++      return;
++    }
++  }
++}
++
+ /** Result of compiling a Jaxpr. Can be evaluated on a series of inputs. */
+ export class JitProgram {
+   readonly poolHints: PoolHints;
+@@ -1350,6 +1417,7 @@ export class JitProgram {
+   execute(
+     inputs: Slot[],
+     dimBindings?: ReadonlyMap<string, number>,
++    options?: { allowDeferredMegaModule?: boolean },
+   ): { outputs: Slot[]; pending: IPendingExecute[] } {
+     // Tell the backend which buffer sizes we'll need and our peak memory,
+     // so it can evict stale pool entries and cap retained bytes.
+@@ -1416,6 +1484,26 @@ export class JitProgram {
+           startOrchestratorWarmup();
+         }
+ 
++        if (
++          options?.allowDeferredMegaModule &&
++          !parallelEligible &&
++          this._megaModuleOrchestratorReady === true &&
++          !wasmBackend.canSpinWaitWorkers
++        ) {
++          const outputSlots = wasmBackend.reserveMegaModuleOutputSlots(megaModule);
++          return {
++            outputs: outputSlots,
++            pending: [
++              new WasmMegaModulePendingExecute(
++                wasmBackend,
++                megaModule,
++                inputs,
++                outputSlots,
++              ),
++            ],
++          };
++        }
++
+         // Monolithic path: orchestrator (M6.2b) or direct execution
+         const outputSlots = wasmBackend.executeMegaModule(megaModule, inputs);
+         return { outputs: outputSlots, pending: [] };
+diff --git a/src/frontend/scan-plan.ts b/src/frontend/scan-plan.ts
+index f7b6e5c..398c833 100644
+--- a/src/frontend/scan-plan.ts
++++ b/src/frontend/scan-plan.ts
+@@ -12,6 +12,7 @@ import {
+ } from "../alu";
+ import type { Backend, Executable } from "../backend";
+ import {
++  getWasmRoutineStaticParams,
+   getScanRoutineInfo,
+   NativeAssocScanBlockedParams,
+   NativeAssocScanParams,
+@@ -507,6 +508,9 @@ function tryPrepareWasmNativeScan(
+   // Calculate aux buffer size for routines that need it
+   let auxBufferSize = 0;
+   let elementSize: 4 | 8 = 4;
++  let qrWorkSize = 0;
++  let qrTauSize = 0;
++  let qrV0Size = 0;
+   for (const step of executeSteps) {
+     if (step.source instanceof Routine) {
+       const routine = step.source;
+@@ -520,6 +524,14 @@ function tryPrepareWasmNativeScan(
+         const inputShape = routine.type.inputShapes[0];
+         const sortDim = inputShape[inputShape.length - 1];
+         auxBufferSize = Math.max(auxBufferSize, sortDim * 4);
++      } else if (routine.name === Routines.QR) {
++        const inputShape = routine.type.inputShapes[0];
++        const m = inputShape[inputShape.length - 2];
++        const n = inputShape[inputShape.length - 1];
++        const k = Math.min(m, n);
++        qrWorkSize = Math.max(qrWorkSize, m * n * elementSize);
++        qrTauSize = Math.max(qrTauSize, k * elementSize);
++        qrV0Size = Math.max(qrV0Size, k * elementSize);
+       }
+     }
+   }
+@@ -599,7 +611,6 @@ function tryPrepareWasmNativeScan(
+     } else if (source instanceof Routine) {
+       // Routine step: build routineCallInfo with static params
+       const routine = source;
+-      const routineName = routine.name as Routines;
+       const routineInfoIdx = stepToRoutineInfoIdx.get(i)!;
+       const internalBase = stepToInternalBase.get(i)!;
+       const numOutputs = routine.type.outputShapes.length;
+@@ -608,36 +619,11 @@ function tryPrepareWasmNativeScan(
+         outputInternalIndices.push(internalBase + outIdx);
+       }
+ 
+-      // Build static params based on routine type
+-      let staticParams: number[] = [];
+-      if (routineName === Routines.Cholesky) {
+-        const inputShape = routine.type.inputShapes[0];
+-        staticParams = [inputShape[inputShape.length - 1]];
+-      } else if (routineName === Routines.Sort) {
+-        const inputShape = routine.type.inputShapes[0];
+-        staticParams = [inputShape[inputShape.length - 1]];
+-      } else if (routineName === Routines.TriangularSolve) {
+-        const aShape = routine.type.inputShapes[0];
+-        const bShape = routine.type.inputShapes[1];
+-        const n = aShape[aShape.length - 1];
+-        const batchRows = bShape[bShape.length - 1];
+-        const numBatches = 1;
+-        const unitDiagonal = routine.params?.unitDiagonal ? 1 : 0;
+-        const lower = 0;
+-        staticParams = [n, batchRows, numBatches, unitDiagonal, lower];
+-      } else if (routineName === Routines.LU) {
+-        const inputShape = routine.type.inputShapes[0];
+-        const m = inputShape[inputShape.length - 2];
+-        const n = inputShape[inputShape.length - 1];
+-        staticParams = [m, n];
+-      } else if (routineName === Routines.Argsort) {
+-        const inputShape = routine.type.inputShapes[0];
+-        staticParams = [inputShape[inputShape.length - 1]];
+-      } else if (routineName === Routines.QR) {
+-        const inputShape = routine.type.inputShapes[0];
+-        const m = inputShape[inputShape.length - 2];
+-        const n = inputShape[inputShape.length - 1];
+-        staticParams = [m, n];
++      const staticParams = getWasmRoutineStaticParams(routine);
++      if (!staticParams) {
++        throw new Error(
++          `Missing WASM static params for routine ${Routines[routine.name as Routines]}`,
++        );
+       }
+ 
+       steps.push({
+@@ -732,6 +718,8 @@ function tryPrepareWasmNativeScan(
+     reverse,
+     auxBufferSize: auxBufferSize > 0 ? auxBufferSize : undefined,
+     elementSize: auxBufferSize > 0 ? elementSize : undefined,
++    qrScratchSizes:
++      qrWorkSize > 0 ? [qrWorkSize, qrTauSize, qrV0Size] : undefined,
+     routineInfos: routineInfos.length > 0 ? routineInfos : undefined,
+   };
+ 
+diff --git a/src/library/lax-linalg.ts b/src/library/lax-linalg.ts
+index d560167..f0d57ec 100644
+--- a/src/library/lax-linalg.ts
++++ b/src/library/lax-linalg.ts
+@@ -3,6 +3,7 @@
+ import * as laxLib from "./lax";
+ import { moveaxis } from "./numpy";
+ import * as numpy from "./numpy";
++import { getBackend } from "../backend";
+ import { Array, type ArrayLike, fudgeArray } from "../frontend/array";
+ import * as core from "../frontend/core";
+ import { vmap } from "../frontend/vmap";
+@@ -122,7 +123,26 @@ export function lu(x: ArrayLike): [Array, Array, Array] {
+  */
+ export function qr(a: ArrayLike): [Array, Array] {
+   const arr = fudgeArray(a);
+-  return householderQRBatched(arr);
++  const shape = arr.shape;
++  const m = shape[arr.ndim - 2] as number;
++  const n = shape[arr.ndim - 1] as number;
++  const k = Math.min(m, n);
++
++  // On WASM, the native QR routine is already faster for standalone eager QR
++  // and outermost jit-traced QR even below the old threshold. Keep the small
++  // pure-primitive path only for nested traces, where the unrolled form still
++  // enables fusion inside larger transformed bodies.
++  if (getBackend().type === "wasm") {
++    if (!core.inMakeJaxprBody() || core.makeJaxprBodyDepth() <= 1) {
++      return core.qr(arr) as [Array, Array];
++    }
++  }
++
++  if (k <= QR_UNROLL_LIMIT) {
++    return householderQRBatched(arr);
++  }
++
++  return core.qr(arr) as [Array, Array];
+ }
+ 
+ /**
+diff --git a/test/block-map.test.ts b/test/block-map.test.ts
+index 7043dd3..38dbffd 100644
+--- a/test/block-map.test.ts
++++ b/test/block-map.test.ts
+@@ -27,6 +27,8 @@ import {
+ } from "@hamk-uas/jax-js-nonconsuming";
+ import { describe, expect, test } from "vitest";
+ 
++import { qr as primitiveQr } from "../src/frontend/core";
++
+ await init();
+ 
+ describe("lax.blockMap — Phase 1 eager", () => {
+@@ -830,6 +832,106 @@ describe("lax.blockMap — halo", () => {
+     }
+   });
+ 
++  test("T8.7b: jit(blockMap(primitiveQr)) uses compiled WASM loop path", () => {
++    const logs: string[] = [];
++    const origInfo = console.info;
++    console.info = (...args: unknown[]) => {
++      logs.push(args.map(String).join(" "));
++    };
++
++    try {
++      setDebug(1);
++      const f = jit((xs: np.Array) =>
++        lax.blockMap(
++          (block: np.Array) => {
++            const [q, r] = primitiveQr(block) as [np.Array, np.Array];
++            using _q = q;
++            using _r = r;
++            using qSum = np.sum(q);
++            using rSum = np.sum(r);
++            using summed = np.add(qSum, rSum);
++            return summed.reshape([1]);
++          },
++          xs,
++          { blockShape: [1], inAxes: [0], outAxes: [0] },
++        ),
++      );
++
++      using xs = np
++        .arange(2 * 8 * 7)
++        .astype(DType.Float32)
++        .reshape([2, 8, 7]);
++      using expected = lax.blockMap(
++        (block: np.Array) => {
++          const [q, r] = primitiveQr(block) as [np.Array, np.Array];
++          using _q = q;
++          using _r = r;
++          using qSum = np.sum(q);
++          using rSum = np.sum(r);
++          using summed = np.add(qSum, rSum);
++          return summed.reshape([1]);
++        },
++        xs,
++        { blockShape: [1], inAxes: [0], outAxes: [0] },
++      );
++      using result = f(xs);
++      expect(result).toBeAllclose(expected);
++
++      const wasmLog = logs.find((l) => l.includes("compiled WASM loop path"));
++      expect(
++        wasmLog,
++        "T8.7b should use compiled WASM loop path for QR block_map bodies",
++      ).toBeDefined();
++
++      f.dispose();
++    } finally {
++      setDebug(0);
++      console.info = origInfo;
++    }
++  });
++
++  test("T8.7c: jit(blockMap(primitiveQr)) reconstructs each block via Q@R", () => {
++    const logs: string[] = [];
++    const origInfo = console.info;
++    console.info = (...args: unknown[]) => {
++      logs.push(args.map(String).join(" "));
++    };
++
++    try {
++      setDebug(1);
++      const f = jit((xs: np.Array) =>
++        lax.blockMap(
++          (block: np.Array) => {
++            const [q, r] = primitiveQr(block) as [np.Array, np.Array];
++            using _q = q;
++            using _r = r;
++            return np.matmul(q, r);
++          },
++          xs,
++          { blockShape: [1], inAxes: [0], outAxes: [0] },
++        ),
++      );
++
++      using xs = np
++        .arange(2 * 8 * 7)
++        .astype(DType.Float32)
++        .reshape([2, 8, 7]);
++      using result = f(xs);
++      expect(result).toBeAllclose(xs, { atol: 1e-4, rtol: 1e-4 });
++
++      const wasmLog = logs.find((l) => l.includes("compiled WASM loop path"));
++      expect(
++        wasmLog,
++        "T8.7c should use compiled WASM loop path for QR reconstruction bodies",
++      ).toBeDefined();
++
++      f.dispose();
++    } finally {
++      setDebug(0);
++      console.info = origInfo;
++    }
++  });
++
+   // ---- Phase C.4 Step 1: grad(blockMap) with halo ----
+ 
+   // T8.8: grad of 1D 3-point stencil with halo [1,1] matches finite differences.
+diff --git a/test/code-capture.test.ts b/test/code-capture.test.ts
+index 5215556..a6b3f80 100644
+--- a/test/code-capture.test.ts
++++ b/test/code-capture.test.ts
+@@ -8,10 +8,15 @@ import {
+   jit,
+   lax,
+   numpy as np,
++  random,
+   setCodeCapture,
+ } from "@hamk-uas/jax-js-nonconsuming";
+ import { afterEach, expect, test } from "vitest";
+ 
++import { lu as primitiveLu } from "../src/frontend/core";
++import { qr as primitiveQr } from "../src/frontend/core";
++import { cholesky as primitiveCholesky } from "../src/frontend/core";
++import { triSolve as primitiveTriSolve } from "../src/frontend/core";
+ import { deviceSuite } from "./device-suite.js";
+ 
+ afterEach(() => {
+@@ -64,6 +69,31 @@ await deviceSuite(
+       }
+     });
+ 
++    test("clearCaches refreshes wasm kernel capture", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using x = np.array([1, 2, 3, 4]);
++
++      const f0 = jit((a: typeof x) => a.mul(np.array([2, 2, 2, 2])));
++      using y0 = f0(x);
++      f0.dispose();
++
++      clearCaches();
++
++      const f1 = jit((a: typeof x) => a.mul(np.array([2, 2, 2, 2])));
++      using y1 = f1(x);
++      f1.dispose();
++
++      expect(y0).toBeAllclose(y1);
++
++      const kernelEntries = entries.filter((e) => e.kind === "kernel");
++      expect(kernelEntries).toHaveLength(2);
++      expect(kernelEntries[0].backend).toBe("wasm");
++      expect(kernelEntries[1].backend).toBe("wasm");
++    });
++
+     test("setCodeCapture(null) disables capture", () => {
+       const entries: CodeCaptureEntry[] = [];
+       setCodeCapture((e) => entries.push(e));
+@@ -170,6 +200,7 @@ await deviceSuite(
+ 
+     test("block-map code capture emits kind=block-map", () => {
+       const entries: CodeCaptureEntry[] = [];
++      clearCaches();
+       setCodeCapture((e) => entries.push(e));
+ 
+       using x = np.ones([8]);
+@@ -193,6 +224,31 @@ await deviceSuite(
+       }
+     });
+ 
++    test("block-map code capture emits only on wasm cache miss", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using x = np.ones([8]);
++      const f = jit((a: typeof x) =>
++        lax.blockMap((block) => block.mul(np.array([2, 2, 2, 2])), a, {
++          blockShape: [4],
++          inAxes: [0],
++          outAxes: [0],
++        }),
++      );
++
++      using y0 = f(x) as typeof x;
++      using y1 = f(x) as typeof x;
++      f.dispose();
++
++      expect(y0).toBeAllclose(y1);
++
++      const bmEntries = entries.filter((e) => e.kind === "block-map");
++      expect(bmEntries).toHaveLength(1);
++      expect(bmEntries[0].backend).toBe("wasm");
++    });
++
+     test("routine code capture emits kind=routine for sort", () => {
+       const entries: CodeCaptureEntry[] = [];
+       setCodeCapture((e) => entries.push(e));
+@@ -209,6 +265,601 @@ await deviceSuite(
+       expect(sortEntry!.backend).toBe("wasm");
+       expect(sortEntry!.metadata?.n).toBe(5);
+     });
++
++    test("routine code capture emits kind=routine for qr", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using flat = np.array(Array.from({ length: 90 }, (_, i) => i + 1), {
++          dtype: np.float32,
++        });
++      using a = np.reshape(flat, [10, 9]);
++      const f = jit((x: typeof a) => np.linalg.qr(x));
++      const [q, r] = f(a) as [np.Array, np.Array];
++      using _q = q;
++      using _r = r;
++      f.dispose();
++
++      const routineEntries = entries.filter((e) => e.kind === "routine");
++      expect(routineEntries.length).toBeGreaterThanOrEqual(1);
++      const qrEntry = routineEntries.find((e) => e.label === "qr");
++      expect(qrEntry).toBeDefined();
++      expect(qrEntry!.backend).toBe("wasm");
++      expect(qrEntry!.metadata?.m).toBe(10);
++      expect(qrEntry!.metadata?.n).toBe(9);
++    });
++
++    test("clearCaches refreshes wasm routine capture for qr", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using flat = np.array(Array.from({ length: 90 }, (_, i) => i + 1), {
++          dtype: np.float32,
++        });
++      using a = np.reshape(flat, [10, 9]);
++
++      const f0 = jit((x: typeof a) => np.linalg.qr(x));
++      const [q0, r0] = f0(a) as [np.Array, np.Array];
++      using _q0 = q0;
++      using _r0 = r0;
++      f0.dispose();
++
++      clearCaches();
++
++      const f1 = jit((x: typeof a) => np.linalg.qr(x));
++      const [q1, r1] = f1(a) as [np.Array, np.Array];
++      using _q1 = q1;
++      using _r1 = r1;
++      f1.dispose();
++
++      const qrEntries = entries.filter(
++        (e) => e.kind === "routine" && e.label === "qr",
++      );
++      expect(qrEntries).toHaveLength(2);
++      expect(qrEntries[0].backend).toBe("wasm");
++      expect(qrEntries[1].backend).toBe("wasm");
++    });
++
++    test("eager primitive QR emits routine capture for qr", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      const key = random.key(0);
++      using a = random.uniform(key, [11, 9]);
++      key.dispose();
++
++      const [q, r] = primitiveQr(a) as [np.Array, np.Array];
++      using _q = q;
++      using _r = r;
++      using reconstructed = np.matmul(q, r);
++
++      expect(reconstructed).toBeAllclose(a, { atol: 1e-4, rtol: 1e-4 });
++
++      const routineEntries = entries.filter((e) => e.kind === "routine");
++      expect(routineEntries.length).toBeGreaterThanOrEqual(1);
++      const qrEntry = routineEntries.find((e) => e.label === "qr");
++      expect(qrEntry).toBeDefined();
++      expect(qrEntry!.backend).toBe("wasm");
++      expect(qrEntry!.metadata?.m).toBe(11);
++      expect(qrEntry!.metadata?.n).toBe(9);
++    });
++
++    test("public eager QR emits routine capture for qr", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      const key = random.key(1);
++      using a = random.uniform(key, [10, 10]);
++      key.dispose();
++
++      const [q, r] = np.linalg.qr(a);
++      using _q = q;
++      using _r = r;
++      using reconstructed = np.matmul(q, r);
++
++      expect(reconstructed).toBeAllclose(a, { atol: 1e-4, rtol: 1e-4 });
++
++      const routineEntries = entries.filter((e) => e.kind === "routine");
++      expect(routineEntries.length).toBeGreaterThanOrEqual(1);
++      const qrEntry = routineEntries.find((e) => e.label === "qr");
++      expect(qrEntry).toBeDefined();
++      expect(qrEntry!.backend).toBe("wasm");
++      expect(qrEntry!.metadata?.m).toBe(10);
++      expect(qrEntry!.metadata?.n).toBe(10);
++    });
++
++    test("public eager small QR emits routine capture for wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      const key = random.key(2);
++      using a = random.uniform(key, [8, 8]);
++      key.dispose();
++
++      const [q, r] = np.linalg.qr(a);
++      using _q = q;
++      using _r = r;
++      using reconstructed = np.matmul(q, r);
++
++      expect(reconstructed).toBeAllclose(a, { atol: 1e-4, rtol: 1e-4 });
++
++      const routineEntries = entries.filter((e) => e.kind === "routine");
++      expect(routineEntries.length).toBeGreaterThanOrEqual(1);
++      const qrEntry = routineEntries.find((e) => e.label === "qr");
++      expect(qrEntry).toBeDefined();
++      expect(qrEntry!.backend).toBe("wasm");
++      expect(qrEntry!.metadata?.m).toBe(8);
++      expect(qrEntry!.metadata?.n).toBe(8);
++    });
++
++    test("public jit small QR emits routine capture for wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      const key = random.key(3);
++      using a = random.uniform(key, [8, 7]);
++      key.dispose();
++
++      const f = jit((x: typeof a) => np.linalg.qr(x));
++      const [q, r] = f(a) as [np.Array, np.Array];
++      using _q = q;
++      using _r = r;
++      f.dispose();
++      using reconstructed = np.matmul(q, r);
++
++      expect(reconstructed).toBeAllclose(a, { atol: 1e-4, rtol: 1e-4 });
++
++      const routineEntries = entries.filter((e) => e.kind === "routine");
++      expect(routineEntries.length).toBeGreaterThanOrEqual(1);
++      const qrEntry = routineEntries.find((e) => e.label === "qr");
++      expect(qrEntry).toBeDefined();
++      expect(qrEntry!.backend).toBe("wasm");
++      expect(qrEntry!.metadata?.m).toBe(8);
++      expect(qrEntry!.metadata?.n).toBe(7);
++    });
++
++    test("primitive scan-body small QR emits routine capture for wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      const key = random.key(40);
++      using init = random.uniform(key, [8, 7]);
++      key.dispose();
++
++      const f = jit((a: typeof init) =>
++        lax.scan(
++          (carry) => primitiveQr(carry) as [np.Array, np.Array],
++          a,
++          null,
++          { length: 1, acceptPath: "compiled-loop" },
++        ),
++      );
++      const [q, rs] = f(init) as [np.Array, np.Array];
++      using _q = q;
++      using _rs = rs;
++      f.dispose();
++
++      expect(q.shape).toEqual([8, 7]);
++      expect(rs.shape).toEqual([1, 7, 7]);
++
++      const scanEntries = entries.filter((e) => e.kind === "scan");
++      expect(scanEntries.length).toBeGreaterThanOrEqual(1);
++      const qrEntry = entries.find(
++        (e) => e.kind === "routine" && e.label === "qr",
++      );
++      expect(qrEntry).toBeDefined();
++      expect(qrEntry!.backend).toBe("wasm");
++      expect(qrEntry!.metadata?.m).toBe(8);
++      expect(qrEntry!.metadata?.n).toBe(7);
++    });
++
++    test("primitive block_map small QR emits block-map and routine capture for wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using xs = np
++        .arange(2 * 8 * 7)
++        .astype(np.float32)
++        .reshape([2, 8, 7]);
++
++      const f = jit((x: typeof xs) =>
++        lax.blockMap(
++          (block: np.Array) => {
++            const [q, r] = primitiveQr(block) as [np.Array, np.Array];
++            using _q = q;
++            using _r = r;
++            using qSum = np.sum(q);
++            using rSum = np.sum(r);
++            using summed = np.add(qSum, rSum);
++            return summed.reshape([1]);
++          },
++          x,
++          { blockShape: [1], inAxes: [0], outAxes: [0] },
++        ),
++      );
++      using out = f(xs);
++      f.dispose();
++
++      expect(out.shape).toEqual([2]);
++
++      const blockMapEntry = entries.find((e) => e.kind === "block-map");
++      expect(blockMapEntry).toBeDefined();
++      expect(blockMapEntry!.backend).toBe("wasm");
++
++      const qrEntry = entries.find(
++        (e) => e.kind === "routine" && e.label === "qr",
++      );
++      expect(qrEntry).toBeDefined();
++      expect(qrEntry!.backend).toBe("wasm");
++      expect(qrEntry!.metadata?.m).toBe(8);
++      expect(qrEntry!.metadata?.n).toBe(7);
++    });
++
++    test("nested block_map-body small QR stays off routine path on wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using xs = np
++        .arange(2 * 8 * 7)
++        .astype(np.float32)
++        .reshape([2, 8, 7]);
++
++      const f = jit((x: typeof xs) =>
++        lax.blockMap(
++          (block: np.Array) => {
++            const [q, r] = np.linalg.qr(block);
++            using _q = q;
++            using _r = r;
++            using qSum = np.sum(q);
++            using rSum = np.sum(r);
++            using summed = np.add(qSum, rSum);
++            return summed.reshape([1]);
++          },
++          x,
++          { blockShape: [1], inAxes: [0], outAxes: [0] },
++        ),
++      );
++      using out = f(xs);
++      f.dispose();
++
++      expect(out.shape).toEqual([2]);
++
++      const blockMapEntry = entries.find((e) => e.kind === "block-map");
++      expect(blockMapEntry).toBeDefined();
++      expect(blockMapEntry!.backend).toBe("wasm");
++
++      const qrEntry = entries.find(
++        (e) => e.kind === "routine" && e.label === "qr",
++      );
++      expect(qrEntry).toBeUndefined();
++    });
++
++    test("primitive block_map small Cholesky emits block-map and routine capture for wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using x0 = np.array([
++        [5, 1, 0, 0],
++        [1, 4, 1, 0],
++        [0, 1, 3, 1],
++        [0, 0, 1, 2],
++      ]).astype(np.float32);
++      using x1 = np.array([
++        [6, 2, 0, 0],
++        [2, 5, 1, 0],
++        [0, 1, 4, 1],
++        [0, 0, 1, 3],
++      ]).astype(np.float32);
++      using xs = np.stack([x0, x1]);
++
++      const f = jit((x: typeof xs) =>
++        lax.blockMap(
++          (block: np.Array) => {
++            const l = primitiveCholesky(block) as np.Array;
++            using _l = l;
++            using lt = l.transpose([0, 2, 1]);
++            return np.matmul(l, lt);
++          },
++          x,
++          { blockShape: [1], inAxes: [0], outAxes: [0] },
++        ),
++      );
++      using out = f(xs);
++      f.dispose();
++
++      expect(out).toBeAllclose(xs, { atol: 1e-4, rtol: 1e-4 });
++
++      const blockMapEntry = entries.find((e) => e.kind === "block-map");
++      expect(blockMapEntry).toBeDefined();
++      expect(blockMapEntry!.backend).toBe("wasm");
++
++      const cholEntry = entries.find(
++        (e) => e.kind === "routine" && e.label === "cholesky",
++      );
++      expect(cholEntry).toBeDefined();
++      expect(cholEntry!.backend).toBe("wasm");
++      expect(cholEntry!.metadata?.n).toBe(4);
++    });
++
++    test("nested block_map-body small Cholesky stays off routine path on wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using x0 = np.array([
++        [5, 1, 0, 0],
++        [1, 4, 1, 0],
++        [0, 1, 3, 1],
++        [0, 0, 1, 2],
++      ]).astype(np.float32);
++      using x1 = np.array([
++        [6, 2, 0, 0],
++        [2, 5, 1, 0],
++        [0, 1, 4, 1],
++        [0, 0, 1, 3],
++      ]).astype(np.float32);
++      using xs = np.stack([x0, x1]);
++
++      const f = jit((x: typeof xs) =>
++        lax.blockMap(
++          (block: np.Array) => {
++            const l = lax.linalg.cholesky(block);
++            using _l = l;
++            using lt = l.transpose([0, 2, 1]);
++            return np.matmul(l, lt);
++          },
++          x,
++          { blockShape: [1], inAxes: [0], outAxes: [0] },
++        ),
++      );
++      using out = f(xs);
++      f.dispose();
++
++      expect(out).toBeAllclose(xs, { atol: 1e-4, rtol: 1e-4 });
++
++      const cholEntry = entries.find(
++        (e) => e.kind === "routine" && e.label === "cholesky",
++      );
++      expect(cholEntry).toBeUndefined();
++    });
++
++    test("primitive block_map small TriangularSolve emits block-map and routine capture for wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using upper = np.array([
++        [
++          [2, 1],
++          [0, 3],
++        ],
++      ]).astype(np.float32);
++      using rhs0 = np.array([[4, 7]]).astype(np.float32);
++      using rhs1 = np.array([[8, 11]]).astype(np.float32);
++      using rhsBlocks = np.stack([rhs0, rhs1]);
++      using expected = np.array([
++        [[5 / 6, 7 / 3]],
++        [[13 / 6, 11 / 3]],
++      ]).astype(np.float32);
++
++      const f = jit((b: typeof rhsBlocks) =>
++        lax.blockMap(
++          (block: np.Array) =>
++            primitiveTriSolve(upper, block, { lower: false }) as np.Array,
++          b,
++          { blockShape: [1], inAxes: [0], outAxes: [0] },
++        ),
++      );
++      using out = f(rhsBlocks);
++      f.dispose();
++
++      expect(out).toBeAllclose(expected, { atol: 1e-4, rtol: 1e-4 });
++
++      const blockMapEntry = entries.find((e) => e.kind === "block-map");
++      expect(blockMapEntry).toBeDefined();
++      expect(blockMapEntry!.backend).toBe("wasm");
++
++      const triEntry = entries.find(
++        (e) => e.kind === "routine" && e.label === "triangular_solve",
++      );
++      expect(triEntry).toBeDefined();
++      expect(triEntry!.backend).toBe("wasm");
++      expect(triEntry!.metadata?.n).toBe(2);
++    });
++
++    test("nested block_map-body small TriangularSolve stays off routine path on wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using upper = np.array([
++        [
++          [2, 1],
++          [0, 3],
++        ],
++      ]).astype(np.float32);
++      using rhs0 = np.array([[4, 7]]).astype(np.float32);
++      using rhs1 = np.array([[8, 11]]).astype(np.float32);
++      using rhsBlocks = np.stack([rhs0, rhs1]);
++      using expected = np.array([
++        [[2, 5 / 3]],
++        [[4, 7 / 3]],
++      ]).astype(np.float32);
++
++      const f = jit((b: typeof rhsBlocks) =>
++        lax.blockMap(
++          (block: np.Array) =>
++            lax.linalg.triangularSolve(upper, block, {
++              leftSide: false,
++              lower: false,
++            }),
++          b,
++          { blockShape: [1], inAxes: [0], outAxes: [0] },
++        ),
++      );
++      using out = f(rhsBlocks);
++      f.dispose();
++
++      expect(out).toBeAllclose(expected, { atol: 1e-4, rtol: 1e-4 });
++
++      const triEntry = entries.find(
++        (e) => e.kind === "routine" && e.label === "triangular_solve",
++      );
++      expect(triEntry).toBeUndefined();
++    });
++
++    test("primitive block_map small LU emits block-map and routine capture for wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using x0 = np.array([
++        [4, 3],
++        [6, 3],
++      ]).astype(np.float32);
++      using x1 = np.array([
++        [2, 1],
++        [3, 4],
++      ]).astype(np.float32);
++      using xs = np.stack([x0, x1]);
++      using expected = np.array([41 / 3, 9]).astype(np.float32);
++
++      const f = jit((x: typeof xs) =>
++        lax.blockMap(
++          (block: np.Array) => {
++            const [lu, pivots, permutation] = primitiveLu(block) as [
++              np.Array,
++              np.Array,
++              np.Array,
++            ];
++            using _lu = lu;
++            using _pivots = pivots;
++            using _permutation = permutation;
++            using pivotsF = pivots.astype(np.float32);
++            using permutationF = permutation.astype(np.float32);
++            using luSum = np.sum(lu);
++            using pivotsSum = np.sum(pivotsF);
++            using permutationSum = np.sum(permutationF);
++            using total = np.add(np.add(luSum, pivotsSum), permutationSum);
++            return total.reshape([1]);
++          },
++          x,
++          { blockShape: [1], inAxes: [0], outAxes: [0] },
++        ),
++      );
++      using out = f(xs);
++      f.dispose();
++
++      expect(out).toBeAllclose(expected, { atol: 1e-4, rtol: 1e-4 });
++
++      const blockMapEntry = entries.find((e) => e.kind === "block-map");
++      expect(blockMapEntry).toBeDefined();
++      expect(blockMapEntry!.backend).toBe("wasm");
++
++      const luEntry = entries.find(
++        (e) => e.kind === "routine" && e.label === "lu",
++      );
++      expect(luEntry).toBeDefined();
++      expect(luEntry!.backend).toBe("wasm");
++      expect(luEntry!.metadata?.m).toBe(2);
++      expect(luEntry!.metadata?.n).toBe(2);
++    });
++
++    test("public block_map small LU emits block-map and routine capture for wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      using x0 = np.array([
++        [4, 3],
++        [6, 3],
++      ]).astype(np.float32);
++      using x1 = np.array([
++        [2, 1],
++        [3, 4],
++      ]).astype(np.float32);
++      using xs = np.stack([x0, x1]);
++      using expected = np.array([41 / 3, 9]).astype(np.float32);
++
++      const f = jit((x: typeof xs) =>
++        lax.blockMap(
++          (block: np.Array) => {
++            const [lu, pivots, permutation] = lax.linalg.lu(block);
++            using _lu = lu;
++            using _pivots = pivots;
++            using _permutation = permutation;
++            using pivotsF = pivots.astype(np.float32);
++            using permutationF = permutation.astype(np.float32);
++            using luSum = np.sum(lu);
++            using pivotsSum = np.sum(pivotsF);
++            using permutationSum = np.sum(permutationF);
++            using total = np.add(np.add(luSum, pivotsSum), permutationSum);
++            return total.reshape([1]);
++          },
++          x,
++          { blockShape: [1], inAxes: [0], outAxes: [0] },
++        ),
++      );
++      using out = f(xs);
++      f.dispose();
++
++      expect(out).toBeAllclose(expected, { atol: 1e-4, rtol: 1e-4 });
++
++      const blockMapEntry = entries.find((e) => e.kind === "block-map");
++      expect(blockMapEntry).toBeDefined();
++      expect(blockMapEntry!.backend).toBe("wasm");
++
++      const luEntry = entries.find(
++        (e) => e.kind === "routine" && e.label === "lu",
++      );
++      expect(luEntry).toBeDefined();
++      expect(luEntry!.backend).toBe("wasm");
++      expect(luEntry!.metadata?.m).toBe(2);
++      expect(luEntry!.metadata?.n).toBe(2);
++    });
++
++    test("nested scan-body small QR stays off routine path on wasm", () => {
++      const entries: CodeCaptureEntry[] = [];
++      clearCaches();
++      setCodeCapture((e) => entries.push(e));
++
++      const key = random.key(4);
++      using init = random.uniform(key, [8, 7]);
++      key.dispose();
++
++      const f = jit((a: typeof init) =>
++        lax.scan(
++          (carry) => np.linalg.qr(carry),
++          a,
++          null,
++          { length: 1, acceptPath: "compiled-loop" },
++        ),
++      );
++      const [q, rs] = f(init) as [np.Array, np.Array];
++      using _q = q;
++      using _rs = rs;
++      f.dispose();
++
++      expect(q.shape).toEqual([8, 7]);
++      expect(rs.shape).toEqual([1, 7, 7]);
++
++      const scanEntries = entries.filter((e) => e.kind === "scan");
++      expect(scanEntries.length).toBeGreaterThanOrEqual(1);
++      const qrEntry = entries.find(
++        (e) => e.kind === "routine" && e.label === "qr",
++      );
++      expect(qrEntry).toBeUndefined();
++    });
+   },
+   ["wasm"],
+ );
+diff --git a/test/mega-module.test.ts b/test/mega-module.test.ts
+index 8c9e612..0835c2d 100644
+--- a/test/mega-module.test.ts
++++ b/test/mega-module.test.ts
+@@ -13,13 +13,17 @@
+ import { grad, init, jit, numpy as np } from "@hamk-uas/jax-js-nonconsuming";
+ import { beforeAll, describe, expect, it } from "vitest";
+ 
++import { DType } from "../src/alu";
+ import { getBackend } from "../src/backend";
+ import {
+   compileToMegaModule,
+   type WasmMegaModule,
+ } from "../src/backend/wasm/mega-module";
++import { OrchestratorWorker } from "../src/backend/wasm/orchestrator";
++import { Array as JaxArray } from "../src/frontend/array";
+ import { makeJaxpr } from "../src/frontend/jaxpr";
+ import { jitCompile } from "../src/frontend/jit";
++import { ShapeTracker } from "../src/shape";
+ 
+ // ---------------------------------------------------------------------------
+ // Shared test helpers
+@@ -181,6 +185,221 @@ describe("mega-module (M6.1)", () => {
+         await result.data();
+       }
+     });
++
++    it("mega-module produced slots stay behind readiness guards until resolved", () => {
++      const backend = getBackend("wasm") as any;
++      const initialSlots = backend.slotCount();
++
++      backend._debugWithReservedProducedSlotsForTest([16], ({
++        slots: [slot],
++      }: {
++        slots: readonly number[];
++        resolve(): void;
++      }) => {
++        expect(() => backend.readSync(slot, 0, 0)).toThrow(/in-flight/);
++        expect(() => backend.decRef(slot)).toThrow(/in-flight/);
++      });
++
++      expect(backend.slotCount()).toBe(initialSlots);
++    });
++
++    it("deferred mega-module execution drives completion handles from real work", async () => {
++      const backend = getBackend("wasm") as any;
++
++      using x = np.array([1, 2, 3, 4]);
++      const initialSlots = backend.slotCount();
++      const mm = compileMega((a: np.Array) => a.add(1), x);
++      expect(mm).not.toBeNull();
++
++      const inputSlot = backend.malloc(
++        16,
++        new Uint8Array(new Float32Array([1, 2, 3, 4]).buffer.slice(0)),
++      );
++
++      try {
++        const [outputSlot] = backend._debugExecuteMegaModuleDeferredForTest(
++          mm,
++          [inputSlot],
++        ) as readonly number[];
++        const output = new JaxArray({
++          source: outputSlot,
++          st: ShapeTracker.fromShape([4]),
++          dtype: DType.Float32,
++          weakType: false,
++          backend,
++          committed: false,
++        });
++
++        try {
++          expect(() => output.dataSync()).toThrow(/in-flight/);
++          expect(() => output.dispose()).toThrow(/in-flight/);
++          await expect(output.blockUntilReady()).resolves.toBe(output);
++          expect(await output.data()).toEqual(new Float32Array([2, 3, 4, 5]));
++        } finally {
++          output.dispose();
++        }
++      } finally {
++        backend.decRef(inputSlot);
++      }
++
++      expect(backend.slotCount()).toBe(initialSlots);
++    });
++
++    it.skipIf(
++      !(
++        typeof Worker === "function" &&
++        typeof SharedArrayBuffer === "function" &&
++        globalThis.crossOriginIsolated === true
++      ),
++    )(
++      "allows deferred orchestrator mega-module execution on the browser main thread",
++      async () => {
++        const backend = getBackend("wasm") as any;
++        expect(backend.canSpinWaitWorkers).toBe(false);
++
++        using x = np.array([1, 2, 3, 4]);
++        const mm = compileMega((a: np.Array) => a.add(1), x);
++        expect(mm).not.toBeNull();
++
++        await backend.registerMegaModuleOnOrchestrator(mm);
++        expect(backend.orchestrator).not.toBeNull();
++
++        let dispatchStarted = false;
++        let dispatchResolved = false;
++        const originalDispatchAsync = OrchestratorWorker.prototype.dispatchAsync;
++        OrchestratorWorker.prototype.dispatchAsync = async function (...args) {
++          dispatchStarted = true;
++          await Promise.resolve();
++          try {
++            return await originalDispatchAsync.apply(this, args);
++          } finally {
++            dispatchResolved = true;
++          }
++        };
++
++        const inputSlot = backend.malloc(
++          16,
++          new Uint8Array(new Float32Array([1, 2, 3, 4]).buffer.slice(0)),
++        );
++
++        try {
++          const [outputSlot] = backend.executeMegaModuleDeferred(mm, [inputSlot]) as
++            readonly number[];
++          const output = new JaxArray({
++            source: outputSlot,
++            st: ShapeTracker.fromShape([4]),
++            dtype: DType.Float32,
++            weakType: false,
++            backend,
++            committed: false,
++          });
++
++          try {
++            expect(dispatchStarted).toBe(true);
++            expect(dispatchResolved).toBe(false);
++            expect(() => output.dataSync()).toThrow(/in-flight/);
++            await expect(output.blockUntilReady()).resolves.toBe(output);
++            expect(await output.data()).toEqual(new Float32Array([2, 3, 4, 5]));
++            expect(dispatchResolved).toBe(true);
++          } finally {
++            output.dispose();
++          }
++        } finally {
++          OrchestratorWorker.prototype.dispatchAsync = originalDispatchAsync;
++          backend.decRef(inputSlot);
++        }
++      },
++    );
++
++    it.skipIf(
++      !(
++        typeof Worker === "function" &&
++        typeof SharedArrayBuffer === "function" &&
++        globalThis.crossOriginIsolated === true
++      ),
++    )(
++      "uses deferred orchestrator submission for top-level jit outputs after warmup",
++      async () => {
++        const backend = getBackend("wasm") as any;
++        expect(backend.canSpinWaitWorkers).toBe(false);
++
++        const f = jit((a: np.Array) => a.add(1));
++
++        let resolveRegistered!: () => void;
++        const registered = new Promise<void>((resolve) => {
++          resolveRegistered = resolve;
++        });
++        const originalRegisterModule = OrchestratorWorker.prototype.registerModule;
++        OrchestratorWorker.prototype.registerModule = async function (...args) {
++          const result = await originalRegisterModule.apply(this, args);
++          resolveRegistered();
++          return result;
++        };
++
++        let dispatchStarted = false;
++        let dispatchResolved = false;
++        const originalDispatchAsync = OrchestratorWorker.prototype.dispatchAsync;
++        OrchestratorWorker.prototype.dispatchAsync = async function (...args) {
++          dispatchStarted = true;
++          await Promise.resolve();
++          try {
++            return await originalDispatchAsync.apply(this, args);
++          } finally {
++            dispatchResolved = true;
++          }
++        };
++
++        try {
++          const x0 = np.array([1, 2, 3, 4]);
++          const y0 = f(x0);
++          try {
++            expect(await y0.data()).toEqual(new Float32Array([2, 3, 4, 5]));
++          } finally {
++            y0.dispose();
++            x0.dispose();
++          }
++          await registered;
++          await Promise.resolve();
++
++          let sawDeferredPath = false;
++          for (let attempt = 0; attempt < 8; attempt++) {
++            const x1 = np.array([10 + attempt, 20 + attempt, 30 + attempt, 40 + attempt]);
++            const y1 = f(x1);
++            try {
++              const readyPromise = y1.blockUntilReady();
++              await Promise.resolve();
++
++              if (dispatchStarted) {
++                sawDeferredPath = true;
++                await readyPromise;
++                await Promise.resolve();
++                expect(await y1.data()).toEqual(
++                  new Float32Array([11 + attempt, 21 + attempt, 31 + attempt, 41 + attempt]),
++                );
++                break;
++              }
++
++              await readyPromise;
++              expect(await y1.data()).toEqual(
++                new Float32Array([11 + attempt, 21 + attempt, 31 + attempt, 41 + attempt]),
++              );
++              await Promise.resolve();
++            } finally {
++              await new Promise((resolve) => setTimeout(resolve, 0));
++              y1.dispose();
++              x1.dispose();
++            }
++          }
++
++          expect(sawDeferredPath).toBe(true);
++          expect(dispatchResolved).toBe(true);
++        } finally {
++          f.dispose();
++          OrchestratorWorker.prototype.registerModule = originalRegisterModule;
++          OrchestratorWorker.prototype.dispatchAsync = originalDispatchAsync;
++        }
++      },
++    );
+   });
+ 
+   describe("grad through mega-module", () => {
+diff --git a/test/recycle.test.ts b/test/recycle.test.ts
+index 32e6f38..27660e1 100644
+--- a/test/recycle.test.ts
++++ b/test/recycle.test.ts
+@@ -14,6 +14,12 @@ import {
+ } from "@hamk-uas/jax-js-nonconsuming";
+ import { afterAll, beforeAll, describe, expect, it } from "vitest";
+ 
++import { DType } from "../src/alu";
++import { getBackend } from "../src/backend";
++import { Array as JaxArray } from "../src/frontend/array";
++import { JitProgram } from "../src/frontend/jit";
++import { ShapeTracker } from "../src/shape";
++
+ describe("buffer recycling", () => {
+   it("chain of same-size operations is correct", () => {
+     // a → b → c → d, all same shape — intermediates b, c are recyclable.
+@@ -105,4 +111,77 @@ describe("buffer recycling (WASM)", () => {
+     using result = f(x);
+     await result.data();
+   });
++
++  it("generic JIT free step rejects unresolved slots on WASM", () => {
++    const backend = getBackend("wasm") as any;
++
++    backend._debugWithReservedProducedSlotsForTest(
++      [4],
++      ({
++        slots: [slot],
++      }: {
++        slots: readonly number[];
++        resolve(): void;
++      }) => {
++        const program = new JitProgram(
++          backend,
++          [{ type: "free", input: 0 }],
++          [0],
++          [],
++          1,
++        );
++        (program as any)._megaModule = null;
++        expect(() => program.execute([slot])).toThrow(/in-flight/);
++      },
++    );
++  });
++
++  it("generic JIT recycled outputs inherit unresolved-slot readiness on WASM", async () => {
++    const backend = getBackend("wasm") as any;
++    const initialSlots = backend.slotCount();
++
++    await backend._debugWithReservedProducedSlotsForTest(
++      [4],
++      async ({
++        slots: [slot],
++        resolve,
++      }: {
++        slots: readonly number[];
++        resolve(): void;
++      }) => {
++        const program = new JitProgram(
++          backend,
++          [{ type: "recycle", input: 0, output: 1 }],
++          [0],
++          [1],
++          2,
++        );
++        (program as any)._megaModule = null;
++        const { outputs } = program.execute([slot]);
++        expect(outputs).toEqual([slot]);
++
++        const result = new JaxArray({
++          source: outputs[0],
++          st: ShapeTracker.fromShape([1]),
++          dtype: DType.Float32,
++          weakType: false,
++          backend,
++          committed: false,
++        });
++
++        try {
++          expect(() => result.dataSync()).toThrow(/in-flight/);
++          expect(() => result.dispose()).toThrow(/in-flight/);
++          const readyPromise = result.blockUntilReady();
++          await Promise.resolve();
++          resolve();
++          await expect(readyPromise).resolves.toBe(result);
++        } finally {
++          result.dispose();
++        }
++      },
++    );
++
++    expect(backend.slotCount()).toBe(initialSlots);
++  });
+ });
+diff --git a/test/wasm-nested-worker.test.ts b/test/wasm-nested-worker.test.ts
+index d7627ae..558c765 100644
+--- a/test/wasm-nested-worker.test.ts
++++ b/test/wasm-nested-worker.test.ts
+@@ -220,6 +220,152 @@ self.onmessage = async (event) => {
+       expect(stages).not.toContain("orch-register-error");
+     }, 15000);
+ 
++    it("runs deferred orchestrator mega-module execution inside a browser worker", async () => {
++      const jaxUrl = new URL("../src/index.ts", import.meta.url).href;
++      const backendUrl = new URL("../src/backend.ts", import.meta.url).href;
++      const orchestratorUrl = new URL(
++        "../src/backend/wasm/orchestrator.ts",
++        import.meta.url,
++      ).href;
++      const megaModuleUrl = new URL(
++        "../src/backend/wasm/mega-module.ts",
++        import.meta.url,
++      ).href;
++      const jaxprUrl = new URL("../src/frontend/jaxpr.ts", import.meta.url).href;
++      const jitUrl = new URL("../src/frontend/jit.ts", import.meta.url).href;
++      const workerCode = `
++import { init, numpy as np } from ${JSON.stringify(jaxUrl)};
++import { getBackend } from ${JSON.stringify(backendUrl)};
++import { OrchestratorWorker } from ${JSON.stringify(orchestratorUrl)};
++import { compileToMegaModule } from ${JSON.stringify(megaModuleUrl)};
++import { makeJaxpr } from ${JSON.stringify(jaxprUrl)};
++import { jitCompile } from ${JSON.stringify(jitUrl)};
++
++function compileMega(f, ...args) {
++  const backend = getBackend();
++  const traced = makeJaxpr(f)(...args);
++  const program = jitCompile(backend, traced.jaxpr.jaxpr);
++  const mm = compileToMegaModule(program.steps, program.inputs, program.outputs);
++  traced.jaxpr.dispose();
++  return mm;
++}
++
++const originalRegisterModule = OrchestratorWorker.prototype.registerModule;
++OrchestratorWorker.prototype.registerModule = async function (...args) {
++  self.postMessage({ type: "stage", stage: "orch-register-start" });
++  try {
++    const result = await originalRegisterModule.apply(this, args);
++    self.postMessage({ type: "stage", stage: "orch-register-end" });
++    return result;
++  } catch (error) {
++    self.postMessage({
++      type: "stage",
++      stage: "orch-register-error",
++      error: String(error),
++    });
++    throw error;
++  }
++};
++
++const originalDispatchAsync = OrchestratorWorker.prototype.dispatchAsync;
++OrchestratorWorker.prototype.dispatchAsync = async function (...args) {
++  self.postMessage({ type: "stage", stage: "orch-dispatch-async-start" });
++  await Promise.resolve();
++  const result = await originalDispatchAsync.apply(this, args);
++  self.postMessage({ type: "stage", stage: "orch-dispatch-async-end" });
++  return result;
++};
++
++self.onmessage = async (event) => {
++  if (!event.data || event.data.type !== "run") return;
++  try {
++    self.postMessage({ type: "stage", stage: "starting" });
++    await init("wasm");
++    const backend = getBackend("wasm");
++
++    const x = np.array([1, 2, 3, 4]);
++    const mm = compileMega((a) => a.add(1), x);
++    if (!mm) {
++      throw new Error("expected mega-module");
++    }
++
++    await backend.registerMegaModuleOnOrchestrator(mm);
++    const inputSlot = backend.malloc(
++      16,
++      new Uint8Array(new Float32Array([1, 2, 3, 4]).buffer.slice(0)),
++    );
++
++    const [outputSlot] = backend.executeMegaModuleDeferred(mm, [inputSlot]);
++
++    let syncReadGuard = false;
++    let syncDecRefGuard = false;
++    try {
++      backend.readSync(outputSlot, 0, 16);
++    } catch (error) {
++      syncReadGuard = /in-flight/.test(String(error));
++    }
++    try {
++      backend.decRef(outputSlot);
++    } catch (error) {
++      syncDecRefGuard = /in-flight/.test(String(error));
++    }
++
++    const outputBytes = await backend.read(outputSlot, 0, 16);
++    const data = Array.from(new Float32Array(outputBytes.slice().buffer));
++
++    backend.decRef(outputSlot);
++    backend.decRef(inputSlot);
++    x.dispose();
++
++    self.postMessage({
++      type: "result",
++      ok: true,
++      orchestrator: backend.orchestrator !== null,
++      syncReadGuard,
++      syncDecRefGuard,
++      data,
++    });
++  } catch (error) {
++    self.postMessage({
++      type: "result",
++      ok: false,
++      error: String(error),
++      stack: error && typeof error === "object" && "stack" in error ? String(error.stack) : undefined,
++    });
++  }
++};
++`;
++
++      const { result, stages } = await runNestedWorkerScenario<{
++        type?: string;
++        ok: boolean;
++        error?: string;
++        stack?: string;
++        orchestrator?: boolean;
++        syncReadGuard?: boolean;
++        syncDecRefGuard?: boolean;
++        data?: number[];
++      }>(workerCode);
++
++      if (!result.ok) {
++        throw new Error(
++          [result.error ?? "nested worker failed", result.stack]
++            .filter(Boolean)
++            .join("\n"),
++        );
++      }
++
++      expect(result.orchestrator).toBe(true);
++      expect(result.syncReadGuard).toBe(true);
++      expect(result.syncDecRefGuard).toBe(true);
++      expect(result.data).toEqual([2, 3, 4, 5]);
++      expect(stages).toContain("orch-register-start");
++      expect(stages).toContain("orch-register-end");
++      expect(stages).toContain("orch-dispatch-async-start");
++      expect(stages).toContain("orch-dispatch-async-end");
++      expect(stages).not.toContain("orch-register-error");
++    }, 15000);
++
+     it("runs the M6.2c parallel worker-pool path inside a browser worker", async () => {
+       const jaxUrl = new URL("../src/index.ts", import.meta.url).href;
+       const backendUrl = new URL("../src/backend.ts", import.meta.url).href;
+diff --git a/wasm-multithreading-plan.md b/wasm-multithreading-plan.md
+index fd32c82..f95102b 100644
+--- a/wasm-multithreading-plan.md
++++ b/wasm-multithreading-plan.md
+@@ -8,10 +8,66 @@ The upstream `jax-js` repository achieves **2.90 GFLOP/s** on the WASM matmul be
+ Analysis of Chrome traces reveals that upstream successfully dispatches work across 8 Web Workers
+ simultaneously, while our WASM backend executes entirely on the single main thread.
+ 
+-## 2. The Root Cause: Event-Loop Deadlock & `#canSpinWaitWorkers`
+-
+-Our codebase contains a `WasmWorkerPool` and an `OrchestratorWorker`, but both are being permanently
+-disabled in the browser.
++## 1.1 Current Repository Status (2026-05-30)
++
++This plan began as a design / feasibility document. Parts of the original diagnosis are now
++historical because some of the stopgap and arena work has already landed.
++
++### Implemented
++
++- **Option B stopgap is real code now.** The steady-state worker-pool wake path no longer depends
++  on `postMessage({ type: "wake" })`. Workers sleep with `Atomics.wait`, the submitter wakes them
++  with `Atomics.notify`, and large extracted WASM kernels can run in parallel through the worker
++  pool.
++- **Parallel mega-module warmup + reuse exists.** The JIT path asynchronously registers
++  mega-modules on the worker pool and uses the parallel step-info path on later calls.
++- **Option E1 is implemented.** Mega-modules now support a fixed-size internal arena layout, so
++  arena-eligible internal buffers use pre-planned offsets instead of per-step allocator traffic.
++- **M7.3 associative-scan parallelism exists.** Large WASM associative scans already use worker-pool
++  parallel inner-round dispatch.
++- **Nested-worker orchestrator coverage exists.** The orchestrator path is exercised in browser
++  worker contexts and is no longer purely hypothetical.
++
++### Partially Implemented / Still Gated
++
++- **The synchronous orchestrator path is still gated on synchronous wait legality.** Browser main
++  threads still cannot use the legacy blocking `orch.dispatch(...)` path, so synchronous
++  mega-module execution there stays on the direct backend call. However, the explicit deferred
++  path is no longer blocked on that gate: browser main threads can now create the orchestrator,
++  register mega-modules, and use `executeMegaModuleDeferred()` via `dispatchAsync()`.
++- **The current browser worker-pool path is still a stopgap.** On browser main threads where
++  `Atomics.wait` is illegal, completion still degrades to a busy wait rather than the planned async
++  completion model.
++- **Node parallelism is still blocked on worker-runtime integration.** Plain Node can legally
++  spin-wait here, but the implementation still expects a web-style global `Worker`.
++
++### Not Yet Implemented
++
++- **Option A remains mostly design work.** There is no backend-wide async completion model yet: no
++  cross-backend post-submit pending-work ownership tracking, no `Atomics.waitAsync()` path, and no
++  async-capable backend contract for worker-backed WASM dispatch. However, the WASM backend now has
++  an explicit in-flight slot seam around `dispatch`, `read`, `readSync`, and `decRef` for
++  dispatch-backed slots, which is the first concrete ownership-audit foothold for the eventual
++  async model. Mega-module-produced slots now participate in the same seam at the backend-local
++  coarse executor boundary; the remaining work is to route higher-level ownership and read
++  assumptions through that boundary consistently.
++  A backend-local completion-handle prototype now exists inside the WASM backend: async `read()`-
++  based surfaces such as `Array.blockUntilReady()` can wait for unresolved produced slots, while
++  sync surfaces (`readSync`, `dataSync`, `dispose`, `free`, `recycle`) still fail fast on the same
++  in-flight state. The remaining gap is to drive that handle from real worker-backed completion
++  instead of test-only unresolved slots.
++- **Option E2 is partially started.** The WASM backend now has a reusable section-keyed workspace
++  allocation entrypoint plus workspace leasing, and it already backs multiple temporary-buffer
++  paths: blocked associative scan, native scan, compiled block-map loops, active routine scratch
++  for sort/argsort/QR, and mega-module result-pointer scratch. The broader
++  parametric workspace track still needs more callers for additional runtime-sized scratch patterns.
++- **Option D remains a plan, not a shipped fallback architecture.** There is no full runtime-worker
++  deployment that keeps the entire JAX runtime off the UI thread without SAB.
++
++## 2. Historical Root Cause: Event-Loop Deadlock & `#canSpinWaitWorkers`
++
++Our original codebase contained a `WasmWorkerPool` and an `OrchestratorWorker`, but both were
++effectively disabled in browser main-thread execution.
+ 
+ In `src/backend/wasm.ts`, we check if the environment supports `Atomics.wait` on the current thread
+ using `#canSpinWaitWorkers`. Because the Web Spec strictly forbids `Atomics.wait` on the main window
+@@ -27,7 +83,18 @@ synchronous dispatch:
+ _The flaw:_ In modern browsers (Chromium especially), `postMessage` goes through the browser's Event
+ Loop. By immediately entering a `while(true)` spin-loop on the main thread, the Event Loop is
+ blocked. The `postMessage` is never delivered to the worker, and the main thread spins forever
+-(deadlock). To prevent this, the system disables the worker pool entirely on the main thread.
++(deadlock).
++
++### What changed since then
++
++- **Worker pool:** The steady-state worker-pool wake path has since been redesigned around
++  `Atomics.wait` + `Atomics.notify`, with workers periodically yielding back to the event loop for
++  registration/control traffic. So the worker pool is no longer permanently disabled on browser
++  main threads when `SharedArrayBuffer` and `Worker` are available.
++- **What did not change:** Browser main threads still cannot legally block in `Atomics.wait`, so
++  the current worker-pool completion path remains a busy-wait stopgap there.
++- **Orchestrator:** The orchestrator still depends on synchronous alloc/free proxy servicing and is
++  therefore still gated behind `#canSpinWaitWorkers`.
+ 
+ ## 3. Does the Orchestrator Worker Help?
+ 
+@@ -35,10 +102,11 @@ Our `OrchestratorWorker` (M6.2b) was originally designed to solve this by moving
+ execution off the main thread. If the execution is on a worker, it has its own event loop and can
+ freely use `Atomics.wait`.
+ 
+-**Does it work right now? No.** Our current Orchestrator relies on the main thread spin-looping to
+-service `alloc` and `free` proxies (`while(true) { check alloc_req... }`). This triggers the exact
+-same event-loop starvation issue, so the Orchestrator is also gated behind `#canSpinWaitWorkers` and
+-is never activated in the browser.
++**Does it work right now? Partially.** The current orchestrator path still relies on synchronous
++`alloc` / `free` proxy servicing from the owner thread, so it remains gated behind
++`#canSpinWaitWorkers` on browser main threads. However, it is no longer purely hypothetical:
++nested-worker coverage exists, and the orchestrator does run in browser worker contexts where
++synchronous waiting is legal.
+ 
+ **Can it help if redesigned? Yes.** If the Orchestrator was redesigned to be fully
+ decentralized—managing its own WASM memory allocations without proxying to the main thread—it could
+@@ -96,24 +164,22 @@ synchronously.
+ ### Option B: Synchronous Wake via `Atomics.notify` (Stopgap / Benchmark-Only)
+ 
+ If we _must_ keep the synchronous dispatch pattern on the main thread, we can bypass the event loop
+-completely by switching workers from `onmessage`-based wake to `Atomics.wait`-based sleep.
++for steady-state kernel wakeup by switching workers from `onmessage`-driven wakeup to
++`Atomics.wait`-based sleep.
+ 
+-- **The Trick:** Instead of the workers waiting in the JS Event Loop for a
+-  `postMessage({type: 'wake'})`, the workers run an infinite loop calling
++- **The Trick:** Instead of the workers depending on a wake message to begin each dispatch, they run
++  a sleep loop calling
+   `Atomics.wait(control, STATE, READY)`.
+ - **Waking up:** The main thread writes work parameters and calls `Atomics.store(..., WORK)` and
+   `Atomics.notify(...)`. This immediately wakes the worker via futex, bypassing the browser's JS
+   Event mechanism entirely. The main thread can then safely spin-loop on `Atomics.load` without
+   deadlocking!
+-- **What about `register` / `register-mega` / `destroy` events?** A worker blocked in `Atomics.wait`
+-  can't process _any_ `onmessage` events. The current worker pool uses `onmessage` for five distinct
+-  message types: `init`, `control`, `wake`, `register`, `register-mega`, and `destroy` (see
+-  `worker-pool.ts` lines 65–131). Replacing only the wake path means either (a) adding a new
+-  `PROCESS_MESSAGES` state to the shared control buffer plus a secondary state machine so workers
+-  can yield back to the event loop for registration traffic, or (b) moving module registration
+-  itself into the shared-memory protocol (writing `WebAssembly.Module` handles via `postMessage`
+-  while the worker is temporarily yielded). Both require a new lifecycle state machine — not a
+-  narrow swap.
++- **What about `register` / `register-mega` / `unregister` / `destroy` events?** A worker blocked in
++  `Atomics.wait` still cannot process arbitrary `onmessage` traffic while asleep. The current worker
++  pool solves this in a stopgap way by using timed waits plus periodic yields back to the JS event
++  loop so registration and lifecycle messages can run. That means the wake path is no longer the
++  blocker it once was, but it also means the design still mixes futex-style compute wakeup with
++  message-based control traffic rather than replacing the lifecycle protocol end-to-end.
+ - **Pros:** Preserves synchronous `dispatchSync()` API. No Promises on the hot path. Keeps the
+   existing backend architecture.
+ - **Cons — main-thread stall (not "minor jank"):** The main browser thread enters a busy-spin
+@@ -123,8 +189,9 @@ completely by switching workers from `onmessage`-based wake to `Atomics.wait`-ba
+   `src/backend/wasm.ts` lines 208–221 already document as "fundamentally unsuitable" for browser
+   main threads. Acceptable for Node.js benchmarks or one-shot CLI tools, but not for interactive
+   browser applications.
+-- **Status:** Stopgap / proof-of-concept only. Suitable for validating that the futex wake path
+-  works in Chromium before committing to Option A.
++- **Status in this repo:** Partially implemented and in active use for the worker-pool path. It is
++  no longer just a proof-of-concept, but it should still be treated as a stopgap from an
++  architecture standpoint because browser main-thread completion still busy-waits.
+ 
+ ## 5. Updated Recommendation
+ 
+@@ -139,6 +206,10 @@ addresses the fundamental browser problem, which is main-thread/event-loop coord
+ lack of parallel work. It also aligns with the current backend contract drift we would eventually
+ have to handle anyway (`pending` work, safe disposal, sync reads).
+ 
++Current reality: the repo is not on Option A yet. The shipped browser path today is still the
++Option B-style synchronous worker-pool control plane plus busy-wait completion on browser main
++threads, with Option A remaining the recommended migration target.
++
+ Where the runtime supports it, we should also use **JSPI at selected JS↔WASM boundaries** as a
+ companion mechanism inside Option A. The important constraint is scope: JSPI is about letting a WASM
+ export suspend on async JS imports and resume later, not about replacing worker coordination,
+@@ -149,18 +220,27 @@ pending-work tracking, or the overall async dispatch model.
+ We should promote **Option E (WASM Arena / Workspace Planning)** from a speculative side option to
+ an **early implementation track**, not just a later companion to Option A.
+ 
++Current reality: **E1 is already implemented** for mega-modules, and **E2 has backend-level
++groundwork** via a reusable section-keyed workspace allocation entrypoint plus leasing that already
++serves blocked associative scan, native scan, compiled block-map loops, active routine scratch for
++sort/argsort/QR, and mega-module result-pointer scratch. The remaining recommendation is to
++continue with **E2** as a reusable parametric workspace track rather than to start arena work from
++scratch.
++
+ Recommended phasing:
+ 
+ 1. **E1: fixed-size arena for mega-modules.** Use `stepInfos` / liveness to replace internal
+    mega-module malloc/free traffic with planned offsets.
+ 2. **E2: parametric workspace arena for predictable polymorphic compiled loops.** Blocked
+-   associative scan is now the clearest example: its runtime-sized scratch is formulaic in `N`, not
+-   arbitrary.
++  associative scan is still the clearest example, but the backend now has a reusable section-keyed
++  allocation entrypoint that also covers native scan, compiled block-map loops, routine scratch
++  buffers, and the mega-module result-pointer slab. The next step is to push more formulaic
++  scratch layouts through that interface instead of open-coding per-dispatch allocations.
+ 
+ Why this changed: the code review established that Option E is stronger and lower-risk than it first
+ looked. `MegaStepInfo[]` already gives us concrete malloc/free/recycle structure for mega-modules,
+-and blocked associative scan already computes a closed-form workspace from `N`, block size, and leaf
+-widths. That makes E1/E2 independently valuable performance work that also simplifies the later
++and multiple compiled-loop paths now compute closed-form workspaces that fit a shared planner. That
++makes E1/E2 independently valuable performance work that also simplifies the later
+ async/orchestrator story, rather than work that has to wait behind it.
+ 
+ ### 5.3 Node recommendation
+@@ -170,6 +250,8 @@ this environment is that the implementation expects a web-style global `Worker`,
+ here exposes shared memory and legal spin-waits but no `Worker` global. So the first Node-specific
+ action should be a worker-runtime abstraction or `node:worker_threads` adapter.
+ 
++Current reality: this remains accurate. No worker-runtime abstraction has landed yet.
++
+ Once that exists:
+ 
+ - **Option C** becomes materially more attractive in Node than in browsers.
+@@ -218,41 +300,298 @@ Recommended sequence:
+ 1. **Keep the existing execution units.** `executeMegaModule()`, native `scan` compiled-loop,
+    blocked `associativeScan`, and other already-coarse WASM entry points stay intact. Do **not**
+    decompose them into many JS-managed sub-dispatches just to make async easier.
+-2. **Implement E1 first: fixed-size arena for mega-modules.** `stepInfos` already exposes enough
+-   local liveness information to replace internal mega-module malloc/free traffic with planned
+-   offsets. This is low-risk, gives standalone performance value, and directly simplifies any future
+-   Orchestrator path.
++2. **Treat E1 as the baseline, not the next milestone.** Fixed-size mega-module arena planning is
++  already in the repo. The practical follow-up is to keep future WASM execution work compatible
++  with that arena model and to use it to simplify any later orchestrator or ownership refactors
++  instead of reopening per-step internal allocator traffic.
+ 3. **Implement E2 next: parametric workspace for blocked associative scan and similar compiled
+    loops.** These paths already have predictable runtime-sized scratch formulas, so a single
+    workspace allocation plus offset carving is more realistic than generic allocator traffic.
+-4. **Add pending-work tracking at slot ownership boundaries.** The first async semantic change is
++4. **Audit E1 call paths before widening scope.** Verify that all mega-module execution paths
++  consistently take advantage of arena-managed internal buffers and document any remaining cases
++  where allocator traffic persists for structural reasons rather than accidental fallback.
++5. **Add pending-work tracking at slot ownership boundaries.** The first async semantic change is
+    not compiler structure; it is slot lifecycle. `dispose`, `free`, recycle, `data`, and `dataSync`
+    need clear rules for values whose producing program is still running.
+-5. **Introduce async completion at coarse program boundaries.** Make worker-pool and mega-module
++6. **Introduce async completion at coarse program boundaries.** Make worker-pool and mega-module
+    completion explicit via a completion handle / Promise, but keep the internal step orchestration
+    where it already belongs: inside WASM or inside the existing worker-side executor.
+-6. **Use Option A when SAB-backed workers are available.** In cross-origin-isolated browser
++7. **Use Option A when SAB-backed workers are available.** In cross-origin-isolated browser
+    environments, the main thread becomes an async submitter of coarse WASM jobs rather than a
+    synchronous spinner.
+-7. **Prefer `Atomics.waitAsync()` over message-only completion waits in the SAB path.** This keeps
++8. **Prefer `Atomics.waitAsync()` over message-only completion waits in the SAB path.** This keeps
+    the control protocol close to the existing shared-memory design: workers still publish state
+    through shared control words and signal completion with `Atomics.notify()`, while the main thread
+    awaits that state transition without blocking the event loop.
+-8. **Use JSPI only after there are real async host imports/exports to suspend on.** This is
++9. **Use JSPI only after there are real async host imports/exports to suspend on.** This is
+    especially attractive for coarse WASM executors that need async host calls but should otherwise
+    keep straight-line WASM control flow. We should wrap only the exports and imports that actually
+    suspend; most boundaries should stay unwrapped.
+-9. **Use Option D as the browser fallback shell, not as a different compute architecture.** Without
++10. **Use Option D as the browser fallback shell, not as a different compute architecture.** Without
+    SAB/COOP-COEP, move the same style of coarse execution into a runtime worker. The worker should
+    still favor mega-modules and other WASM-side executors; the UI thread should only handle API-edge
+    upload/download and result materialization.
+ 
++### 5.6.1 Immediate execution roadmap
++
++If work resumes on this plan today, the next concrete implementation order should be:
++
++1. **E2 reusable workspace entrypoint is now in place.** The WASM backend has a shared section-
++  keyed workspace allocation path that already covers blocked associative scan, native scan,
++  compiled block-map loops, active sort/argsort/QR routine scratch, and the
++  mega-module result-pointer slab.
++2. **Ownership audit for async migration choke points is partially started.** The WASM backend now
++  has explicit in-flight slot tracking around `dispatch`, `read`, `readSync`, and `decRef` for
++  dispatch-backed slots, so the first backend-local readiness seam exists. The remaining work is to
++  enumerate and then route the higher-level `dataSync` / disposal / recycle assumptions through
++  comparable ownership boundaries, including mega-module-produced slots.
++  The immediate backend-local follow-through is to make mega-module outputs participate in the same
++  slot-lifecycle seam: reserve the output slots before execution, resolve their pointers only at
++  the readiness boundary, and then carry that same ownership shape into any later async completion
++  prototype instead of special-casing mega-module results.
++  Frontend read/dispose surfaces and the generic JIT `free` / `recycle` runtime path now have
++  focused regressions against that seam, and `Array.dispose()` has been made exception-safe so a
++  backend readiness guard does not leave the wrapper in a spuriously-disposed state.
++3. **Async completion prototype at one coarse boundary.** Before worker-pool mega-module completion
++  becomes the first prototype target, extend equivalent readiness tracking to mega-module-produced
++  slots. Until then, prefer a coarse dispatch-backed WASM executor that already participates in the
++  new ownership seam over trying to async-convert the generic fallback JIT interpreter first.
++  That coarse-boundary prototype has now advanced one step: the internal completion-handle shape is
++  real and exercised by async reads. A test-only deferred mega-module path now drives the same
++  handle from actual WASM execution rather than from synthetic reserved slots, and the next worker-
++  backed step is now production code too: `OrchestratorWorker.dispatchAsync()` and
++  `WasmBackend.executeMegaModuleDeferred()` return unresolved output slots immediately and resolve
++  their shared completion handle when the orchestrator finishes. Coverage now exists both in a
++  browser worker (`test/wasm-nested-worker.test.ts`) and on the browser main thread
++  (`test/mega-module.test.ts`). That higher-level integration is now partially real too: the
++  top-level JIT wrapper can keep mega-module outputs lazy on browser main threads once
++  orchestrator warmup has completed, so async array surfaces (`data()`, `blockUntilReady()`) submit
++  through the deferred executor while sync composition paths still choose synchronous submission.
++  The remaining work is to widen that behavior intentionally, without forcing the generic fallback
++  JIT interpreter or internal body-program callers through the same async conversion.
++4. **Node worker abstraction only after the browser async ownership model is clear, unless Node
++  benchmarking becomes the immediate priority.** The runtime-plumbing work is still valid, but it
++  should not distract from the browser ownership/completion model if the main goal is fixing the
++  current browser stopgap path.
++
++### 5.6.2 QR implementation track
++
++QR now has **active large-shape WASM routine enablement** plus dedicated dispatch-path
++confirmation tests, but it should still be tracked as a focused follow-through item until broader
++route parity and ownership work are complete:
++
++- the WASM backend has `#dispatchQR()` and matching section-keyed workspace allocation for the
++  `work` buffer,
++- the current QR routine keeps Householder tails compact in the lower trapezoid of `work` and only
++  uses `tau` / `v0` scalar scratch per step rather than a second `m×k` reflector buffer,
++- scan-side routine-module lookup already knows how to resolve `Routines.QR`, and
++- the main routine dispatch switch now routes `Routines.QR` through the active WASM path, and
++- `lax.linalg.qr` now uses a backend-aware split: eager WASM QR and outermost jit-traced WASM QR
++  route through `Primitive.QR` for all shapes, while nested traced QR keeps the small
++  pure-primitive Householder path for `min(m, n) <= 8` and routes larger shapes through
++  `Primitive.QR`.
++
++One policy constraint should stay explicit in this track: **the non-routine QR implementation is a
++capability we intend to keep, not just a temporary fallback to delete once routine coverage is
++broader.** If future compiler facilities make fused QR bodies materially better, the analytical
++Householder path is the route that can participate. The plan should therefore treat routine QR as
++an important execution path, not as a reason to collapse QR onto a routine-only implementation.
++
++That means QR should still be tracked as a separate implementation thread with explicit exit
++criteria, not as a side effect of the generic E2 workspace work.
++
++Recommended QR sequence:
++
++1. **Keep the workspace path unchanged during follow-through.** The `work` scratch buffer should stay on
++  the shared section-keyed workspace allocation entrypoint. If QR needs additional temporary
++  buffers, add them through that same path rather than reintroducing one-off `malloc` / `free`
++  logic.
++2. **Keep transform semantics revalidated around the guarded route split.** QR already participates
++  in gradient, JVP, vmap, and JIT test surfaces. The current split is: eager WASM and outermost
++  jit-traced WASM use the routine path for all shapes, while nested traced QR keeps the
++  pure-primitive path only for `min(m, n) <= 8`. Follow-through work should preserve those
++  existing math surfaces while expanding routine coverage.
++3. **Keep the cutoff benchmark close to the route split.** `bench/qr.bench.ts` now measures the
++  eager and jit threshold region on WASM, including direct `Primitive.QR` control cases for the
++  small-shape public polyfill path.
++4. **Keep dispatch-path confirmation in the QR surface.** The WASM-specific code-capture
++  assertions are now the regression guards proving that eager and outermost traced QR calls
++  actually reach the QR routine path, while nested small-shape traced QR still stays on the
++  pure-primitive path where fusion matters.
++5. **Only then consider QR part of the async-ownership migration.** QR does not need custom async
++  architecture. It should inherit the same dispatch-backed ownership/readiness model as the other
++  WASM routines once it is on the active path.
++6. **Keep the non-routine QR path intentionally exercised.** Even if the default WASM route shifts
++  toward routines in more contexts, the pure-primitive Householder implementation should remain
++  correct, benchmarked, and reachable behind an intentional routing decision so future fusion work
++  does not have to resurrect it from bitrot.
++
++Suggested validation sequence for QR enablement:
++
++1. **Shape and reconstruction smoke tests.** Use the existing eager correctness tests in
++  `test/numpy-linalg.test.ts` and `test/lax-linalg.test.ts`:
++  `"computes thin QR for 3x2 matrix"`, `"computes QR decomposition for 3x2 matrix"`,
++  `"computes QR decomposition for square matrix"`, `"computes QR for random 4x3 matrix"`, and
++  `"QR with batched matrices"`.
++2. **JIT path.** Run `"jit(qr) produces correct decomposition"` in `test/lax-linalg.test.ts` to
++  confirm that compiled execution uses the correct route.
++3. **Transform correctness.** Run the existing QR derivative surfaces in
++  `test/lax-linalg.test.ts` and `test/numpy-linalg.test.ts`: `"gradient through QR decomposition"`,
++  `"JVP through QR decomposition"`, `"JVP through QR matches finite differences"`,
++  `"grad through QR matches finite differences"`, `"grad through QR for tall matrix"`,
++  `"grad through Q factor of QR"`, `"grad through QR is consistent across batch elements"`, and
++  `"gradient through QR"`.
++4. **Cutoff benchmarking.** Run `pnpm build && pnpm vitest bench bench/qr.bench.ts` to compare the
++  current public route against direct `Primitive.QR` in the WASM cutoff region before moving the
++  traced threshold again.
++5. **Vectorization coverage.** Run `"vmap over QR decomposition"` in `test/lax-linalg.test.ts`.
++6. **Dispatch-path confirmation.** Keep the WASM-specific code-capture assertions in
++  `test/code-capture.test.ts` so the QR tests can prove they are exercising the QR routine path on
++  eager WASM matrices of any size, outermost jit-traced small matrices, and traced matrices above
++  the analytical unroll threshold rather than silently succeeding through the pure-primitive
++  fallback. Keep the nested scan-body small-QR regression there too so the guarded split is tested
++  from both sides. Those assertions should keep distinct shapes because routine capture only fires
++  on cache miss.
++
++Exit criteria for this track:
++
++- the main WASM routine dispatch switch keeps an explicit `Routines.QR -> #dispatchQR()` branch,
++- the backend-aware QR route keeps passing its dedicated eager and traced dispatch-path
++  confirmation tests while the existing eager, JIT, batched, JVP, grad, finite-difference, and
++  vmap QR math surfaces remain green,
++- the pure-primitive QR path remains a maintained implementation surface rather than dead fallback
++  code, with at least one deliberate regression/benchmark surface continuing to exercise it,
++- the nested small-shape traced QR guard keeps proving that scan-body QR on WASM stays off the
++  routine path when the split is supposed to preserve fusion, and
++- QR scratch stays on the shared workspace allocation entrypoint, and
++- the QR path keeps active WASM routine coverage for eager WASM shapes, outermost jit-traced WASM
++  shapes, and traced large shapes without regressing back to the pure-primitive fallback.
++
+ What this migration explicitly avoids:
+ 
+ - turning mega-modules into many JS callbacks or per-step Promise chains
+ - moving orchestration out of WASM when it already composes well there
+ - treating Option D as a reason to abandon the current mega-module-heavy backend shape
+ 
++### 5.6.3 WASM block_map routine-compatibility track
++
++The next QR-specific execution-path step should be a **QR-first refactor of the WASM compiled
++block-map loop so it can execute supported Routine steps**, rather than forcing nested QR bodies to
++choose between the current kernel-only compiled path and the JS fallback.
++
++Why this belongs in the plan now:
++
++- the measured WASM data no longer supports "avoid routines for performance" as the working
++  assumption;
++- `scan` already proves that generated WASM compiled-loop bodies can import and call size-specialized
++  routines, including `Routines.QR`;
++- `block_map` transform composition lives above backend execution-path selection, so this is mainly
++  a backend/codegen refactor rather than a new AD or tracing design; and
++- the current blocker is local and explicit: the compiled WASM block-map path is kernel-only today,
++  not fundamentally routine-incompatible.
++
++This work should stay **QR-first** initially. The main objective is to unblock `Routines.QR` inside
++compiled WASM `block_map` bodies without broadening the scope to every routine in the same pass.
++`Sort` / `Argsort` / other aux-heavy routines can follow only after the QR-shaped path is proven.
++
++Recommended implementation sequence:
++
++1. **Lift the scan routine metadata model into block_map.** Extend `BlockMapWasmParams` with the
++  same routine-facing metadata already used by native scan (`routineInfos`, optional aux sizing,
++  per-step routine-call info) instead of inventing a second encoding scheme.
++2. **Relax the kernel-only planner guard only for supported routines.** Update
++  `buildBlockMapWasmParams(...)` so it stops rejecting all non-kernel execute steps and instead:
++  - accepts `Routine` steps when they have a known WASM routine descriptor,
++  - preserves multi-output routine topology (`outputInternalIndices`) where needed for `QR` / `LU`,
++  - keeps rejecting unsupported step kinds and unsupported routines, and
++  - leaves the existing contiguity and passthrough-output restrictions unchanged.
++3. **Teach `codegenBlockMapLoop(...)` to emit routine calls.** Reuse the native scan pattern:
++  import routine exports from the `routines` module, map input slots to block-local scratch or
++  internal buffers, and add per-routine call emission for the QR-first path before widening scope.
++4. **Keep dispatch semantics coarse and synchronous.** `dispatchBlockMapWasm(...)` should stay a
++  single coarse compiled-loop export invocation with the same workspace-lease lifetime model. This
++  refactor should not introduce per-block JS callbacks, per-step Promise chaining, or any new
++  async-only ownership behavior.
++5. **Only then revisit nested QR routing policy.** Once `block_map` compiled-loop can execute QR
++  routines directly, re-evaluate whether the small-shape nested QR split in `lax.linalg.qr` still
++  needs to prefer the pure-primitive path on WASM. That re-evaluation should change routing only;
++  it should not delete or de-maintain the non-routine QR implementation itself.
++
++Scope guardrails for the first pass:
++
++- **Do not widen shape/contiguity support at the same time.** The current compiled block-map path
++  already has strong layout assumptions; keep those unchanged while adding routine compatibility.
++- **Do not solve all routines in the first patch set.** QR-first is enough to answer the current
++  nested-path question and has less auxiliary-workspace complexity than `Sort` / `Argsort`.
++- **Do not turn QR into a routine-only feature.** The analytical Householder path should stay in
++  tree and intentionally testable even if routine-compatible compiled `block_map` becomes the
++  preferred executor for many WASM cases.
++- **Do not make this a multithreading project.** This is a compiled-loop codegen refactor, not a
++  worker-pool or async-ownership milestone. The resulting export can participate in later
++  multithreading work, but that is not the first objective.
++
++Primary validation sequence for this track:
++
++1. **Path validation.** Add a WASM-specific regression proving that a `block_map` body containing
++  `primitiveQr(...)` now takes the compiled WASM block-loop path instead of the JS fallback.
++2. **Correctness against fallback.** Compare `jit(block_map(qr-body))` against eager/fallback on
++  representative `8x7` and `16x8` batched inputs, including `blockShape: [1]` batched matrices.
++3. **Transform surfaces.** Re-run at least one `grad(blockMap(...))`, one `vmap(blockMap(...))`,
++  and one JIT route that exercises the new compiled path with QR in the body.
++4. **Benchmarking.** Keep the nested `block_map` QR benchmark in `bench/qr.bench.ts` and use it to
++  compare the new compiled routine path against both the current public route and the forced
++  routine fallback baseline.
++5. **Regression guard.** Keep explicit tests for the still-intended non-routine nested cases until
++  the QR route policy is changed intentionally rather than by drift.
++6. **Capability guard.** Keep at least one explicit correctness or benchmark surface that routes QR
++  through the pure-primitive implementation on WASM, so future fusion-oriented work can rely on a
++  live non-routine path rather than dead code.
++
++Exit criteria for the QR-first version of this work:
++
++- the WASM compiled `block_map` path accepts supported QR routine steps,
++- `block_map` QR bodies no longer need the JS fallback solely because the body contains
++  `Routines.QR`,
++- the existing block_map transform surfaces remain green,
++- the non-routine QR implementation remains intact and intentionally exercisable after the new
++  compiled routine path lands,
++- the new path keeps using the shared workspace allocation entrypoint rather than bespoke scratch
++  allocation, and
++- the nested QR routing decision can be revisited based on actual compiled-path behavior rather than
++  on the old "routines might be slower" assumption.
++
++Follow-up work after the QR-first milestone:
++
++1. **Re-decide the nested QR route split with the new compiled-path reality.** Once QR routines run
++  inside compiled WASM `block_map`, the plan should no longer treat the current small-shape nested
++  pure-primitive split as the default long-term answer. Re-run the nested `scan` and `block_map`
++  benchmarks and then either:
++  - broaden routine routing while still keeping a maintained non-routine QR route for future fusion
++    experiments,
++  - narrow it to a demonstrably beneficial transform/backend-specific case, or
++  - keep it only where a measured executor-path advantage still exists.
++2. **Generalize the routine-compatible block_map plumbing beyond QR.** After the QR path is proven,
++  extend the same compiled-loop mechanism to the next low-complexity routines first
++  (`Cholesky` / `LU` / `TriangularSolve` as appropriate) before attempting aux-heavy routines such
++  as `Sort` / `Argsort`.
++3. **Unify block_map and scan routine infrastructure instead of forking it.** The QR-first patch
++  should end with shared abstractions still recognizable. The follow-through should consolidate the
++  duplicated routine-metadata, import-binding, and per-step call-emission plumbing so future routine
++  enablement is not maintained twice.
++4. **Only then widen workspace and auxiliary-buffer support.** If later routines need additional
++  scratch or aux regions, route them through the same section-keyed workspace planner already used
++  by scan, block_map, and active routines rather than growing ad-hoc allocation paths.
++5. **Feed the result back into the larger WASM execution roadmap.** Once routine-compatible
++  compiled `block_map` exists, treat it as another coarse compiled-loop executor that should remain
++  compatible with the pending ownership seam, future worker-backed completion, and any later async
++  boundary work. The post-QR follow-up is still not to make `block_map` itself asynchronous, but to
++  keep the new executor shape aligned with that direction.
++
++Status update after the QR-first follow-through: the low-complexity routine family is now landed
++through `QR`, `Cholesky`, `TriangularSolve`, and `LU`, and that sidetrack should be treated as
++stable background work rather than the active multithreading milestone. Further routine widening is
++no longer the next step unless it directly serves the ownership/completion roadmap above.
++
+ One explicit caveat belongs in the migration text: the current non-mega fallback
+ `JitProgram.execute()` path is still a JS-side sequential step interpreter. Boundary-only async
+ changes map cleanly to mega-modules and native compiled loops, but not to that fallback path. We
