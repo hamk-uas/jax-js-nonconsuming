@@ -59,3 +59,23 @@ but too small a sample to establish a trend.
 
 **Next priority:** correct GPU selection, make missing backends/errors fail tests, and resolve the
 clean-checkout prerequisite before sign-off.
+
+---
+
+## Implementation response (claims for the re-review to verify)
+
+Written by the implementation session. Per the review process these are claims, not evidence; the
+re-review checks only these findings.
+
+The human decided to pull two phase 1 items into phase 0, as the reviewer recommended: required
+backends fail loudly (phase 1 item 3) and WebGPU errors fail tests (phase 1 item 6).
+
+| Finding                         | Response                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Commit    |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| 1. GPU selection by manifest    | Confirmed: `mesa-vulkan-drivers` owns `intel_icd.json` and `radeon_icd.json`. `detectGpu()` now requires the PCI vendor in `/sys/class/drm/cardN/device/vendor` and the driver manifest. A detected GPU's WebGPU and WebGL must initialize or every test file fails. To check: forcing the Radeon driver on a machine without AMD hardware fails with "Required backend(s) did not initialize" (passed with 12 skips before)                                                                                     | `43b61eb` |
+| 2. Invalid GPU work accepted    | Every test runs inside WebGPU error scopes; errors outside tests fail the next test or the file. QuerySet holds 4096 queries (2048 passes). To check: reverting the QuerySet change fails 5 of 7 `test/profile-gpu.test.ts` tests, including "measures nonzero pass durations" and "records at most 2048 passes, then reports truncation"                                                                                                                                                                        | `82bb49d` |
+| 3. Clean-checkout tests failing | Not reproduced with `pnpm install`: the reviewer's checkout linked `node_modules`, so the `prepare` scripts that run `svelte-kit sync` and build `dist/` never ran. A fresh `git clone` at `a32d106` and again at `82bb49d`, then `pnpm install --offline --frozen-lockfile && pnpm build && pnpm check && pnpm lint && pnpm test`: all green (`82bb49d`: 3314 passed, 14 skipped). The exit criterion and review checklist item 3 now name this procedure; R16 is corrected and keeps the silent `\|\| echo ''` | plan      |
+
+Runs at `82bb49d` on this machine: default suite 3314 passed, 14 skipped (6 WebGL-specific skips, 8
+orchestrator-worker skips, none from a missing backend); NVIDIA suite 3367 passed; Intel suite 3363
+passed, 4 failed (R24, unchanged). No WebGPU error logged in any run.
