@@ -45,8 +45,11 @@
  * the leaking arrays were created.
  *
  * **Hot path** (every Array create/dispose): a boolean guard + `Map.set`/`delete`.
- * `new Error()` captures V8 frame pointers cheaply; the `.stack` string is
- * only formatted on first access inside `stop()` (cold path).
+ * `new Error()` captures V8 frame pointers; the `.stack` string is only
+ * formatted on first access inside `stop()` (cold path). The capture is still
+ * not free: it made a 5-op eager chain of small WASM arrays ~2.5× slower in a
+ * vitest browser run. `start({ trackSites: false })` skips it and only diffs
+ * slot counts, for code whose speed matters (benchmarks).
  *
  * **No concurrent tests** — `checkLeaks` uses global state (one active
  * session at a time). Do not use `test.concurrent()`. Sequential test
@@ -191,6 +194,8 @@ export const _lastRefMap = new Map<object, Error>();
 
 const _startSlots = new Map<Device, number>();
 let _active = false;
+/** Whether the active session records creation sites (`trackSites`). */
+let _sitesTracked = false;
 
 // ── Cold-path helpers (only called when leaks are detected) ──
 
@@ -406,13 +411,24 @@ export const checkLeaks = {
    *
    * @param opts.trackRefs - When `true`, also records each `.ref` call site
    *   so the leak report can show `↳ last .ref at <location>` for rc≥2 leaks.
-   *   Adds one `Map.set` per `.ref` call. Off by default.
+   *   Adds one `Map.set` per `.ref` call. Off by default. Requires
+   *   `trackSites`.
+   * @param opts.trackSites - When `false`, only counts slots: no per-Array
+   *   work while active, and a leak report without creation sites
+   *   (`details` empty, `userLeaked`/`internalLeaked` 0). For measuring code
+   *   whose speed matters. On by default.
    */
-  start(opts?: { trackRefs?: boolean }): void {
-    // If already active, reset cleanly — supports befoteEach re-entrance.
+  start(opts?: { trackRefs?: boolean; trackSites?: boolean }): void {
+    const trackSites = opts?.trackSites ?? true;
+    const trackRefs = opts?.trackRefs ?? false;
+    if (trackRefs && !trackSites) {
+      throw new Error("checkLeaks.start: trackRefs requires trackSites");
+    }
+    // If already active, reset cleanly — supports beforeEach re-entrance.
     _leakTrackingMap.clear();
     _lastRefMap.clear();
-    _trackRefsEnabled = opts?.trackRefs ?? false;
+    _trackRefsEnabled = trackRefs;
+    _sitesTracked = trackSites;
 
     // Record baseline slot counts for ALL initialized backends.
     _startSlots.clear();
@@ -423,7 +439,7 @@ export const checkLeaks = {
         /* not initialized */
       }
     }
-    _leakTrackingEnabled = true;
+    _leakTrackingEnabled = trackSites;
     _active = true;
   },
 
@@ -431,7 +447,8 @@ export const checkLeaks = {
    * Return a snapshot of all currently-tracked arrays without stopping.
    *
    * Useful for mid-session debugging — you can inspect which arrays are
-   * still alive at any point between `start()` and `stop()`.
+   * still alive at any point between `start()` and `stop()`. Empty when the
+   * session was started with `trackSites: false`.
    */
   snapshot(): SnapshotEntry[] {
     const entries: SnapshotEntry[] = [];
@@ -503,6 +520,19 @@ export const checkLeaks = {
         internalLeaked: 0,
         details: [],
         summary: "No leaks detected.",
+      };
+    }
+
+    if (!_sitesTracked) {
+      return {
+        leaked,
+        userLeaked: 0,
+        internalLeaked: 0,
+        details: [],
+        summary:
+          `${leaked} slot(s) leaked. Creation sites were not tracked ` +
+          "(checkLeaks.start({ trackSites: false })); run the same code with " +
+          "site tracking to locate them.",
       };
     }
 

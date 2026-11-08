@@ -132,4 +132,22 @@ describe("checkLeaks", () => {
     const report = checkLeaks.stop();
     expect(report.leaked).toBe(0);
   });
+
+  it("trackSites: false counts leaks without recording sites", () => {
+    checkLeaks.start({ trackSites: false });
+    const x = np.array([1, 2, 3]);
+    expect(checkLeaks.snapshot()).toEqual([]);
+    const report = checkLeaks.stop();
+    expect(report.leaked).toBe(1);
+    expect(report.userLeaked).toBe(0);
+    expect(report.details).toEqual([]);
+    expect(report.summary).toContain("Creation sites were not tracked");
+    x.dispose();
+  });
+
+  it("trackRefs requires trackSites", () => {
+    expect(() =>
+      checkLeaks.start({ trackRefs: true, trackSites: false }),
+    ).toThrow("trackRefs requires trackSites");
+  });
 });
