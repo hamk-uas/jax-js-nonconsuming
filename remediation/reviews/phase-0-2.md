@@ -130,3 +130,27 @@ GPU selection, required-adapter enforcement, the profiling query limit, and the 
 procedure are verified improvements. Phase 0 still needs the human decision required after two
 failed rounds: fix F2.1 before sign-off, or explicitly accept/defer that remaining error-capture
 limitation. This report makes neither decision on the human's behalf.
+
+---
+
+## Implementation response (claims for the re-review to verify)
+
+Written by the implementation session; the round 3 re-review checks only F2.1.
+
+**Human decision after two failed rounds:** fix F2.1 now, then a round 3 review of F2.1 only. Not
+deferred.
+
+The round-1 response and R21 claimed that errors outside tests fail the next test or the file. That
+was wrong for errors raised before a file's first test, as this report showed.
+
+| Claim                                                                                                                                                          | How to check                                                                                                                                                                                      | Commit    |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| Every `GPUDevice` created in a test file gets the `uncapturederror` listener at creation (`captureErrorsOfNewDevices()` runs in `test/setup.ts` before `init`) | `test/webgpu-errors.ts`, `test/setup.ts`; without the call, "an error raised while the module loads is attributed to the next test" fails                                                         | `648d367` |
+| An error raised while a test module loads fails the file's first test                                                                                          | This report's fixture, unchanged, now fails on NVIDIA and Intel with "(raised before this test) Query count (8192) exceeds the maximum query count (4096)."                                       | `648d367` |
+| An error raised after the last test fails the file                                                                                                             | A test file whose own `afterAll` creates an invalid QuerySet fails; it passes if `remainingGpuErrors()` does not first make each device process work (Dawn delivers errors only on a device tick) | `648d367` |
+| A test can declare an error it provokes, with `expectWebGpuError(pattern)`; an undeclared error fails it, a declared one that does not occur fails it too      | `test/webgpu-errors.test.ts` (module-load and in-test cases)                                                                                                                                      | `648d367` |
+
+Runs at `648d367` on this machine: fresh clone after `pnpm install`, then build, check, lint and
+test all green, with 3316 passed and 14 skipped. NVIDIA suite 3369 passed; Intel suite 3365 passed
+and 4 failed (R24, unchanged). The only WebGPU error logged in each run is the deliberate one in
+`test/webgpu-errors.test.ts`.
