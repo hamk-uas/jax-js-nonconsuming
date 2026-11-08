@@ -176,8 +176,10 @@ a failure, not as a pass. See `chromiumEnv()` in `test/gpu-config.ts`.
 **At most 4 test files at once:** all files run in one Chromium, whose single GPU process compiles
 every file's shaders. At vitest's default concurrency (CPU count − 1) that queue pushed tests past
 their timeouts; `BROWSER_MAX_WORKERS = 4` in `test/gpu-config.ts` gave the same wall time without
-failures. A WebGPU/WebGL test that times out only under full load, followed by ±N "leaked slots" in
-the next test, points at this queue: measure before raising a timeout or the cap.
+failures. Each file also has its own `GPUDevice` and buffer pool, so the cap bounds GPU memory too
+(suite peak 1.2 GiB at 17 files, 0.9 GiB at 4; 2.7 GiB when every file's `init` calibrated). A
+WebGPU/WebGL test that times out only under full load, followed by ±N "leaked slots" in the next
+test, points at this queue: measure before raising a timeout or the cap.
 
 **Pre-commit CI checks**: Husky runs `lint-staged`, then build + check + lint + tests. The
 pre-commit hook (`scripts/precommit.sh`) also runs WebGPU-only correctness tests via

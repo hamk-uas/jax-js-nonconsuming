@@ -62,6 +62,10 @@ export const COMMON_ARGS = [
  * most full runs; with 4 the worst case was 1 s and the suite took the same
  * wall time (measured 2026-11-08: 17 → 43–63 s with failures, 6 → 44 s,
  * 4 → 46 s). More files only lengthen the queue.
+ *
+ * It also bounds GPU memory: every file has its own GPUDevice and buffer
+ * pool. Peak over the suite: 1.2 GiB with 17 files, 0.9 GiB with 4 (one
+ * test's spike; ~0.2 GiB otherwise), which matters on laptop GPUs.
  */
 export const BROWSER_MAX_WORKERS = 4;
 
