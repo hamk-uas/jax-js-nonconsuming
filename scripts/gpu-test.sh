@@ -25,6 +25,7 @@ intel_cfg="test/vitest.intel.config.ts"
 
 run_gpu() {
   local label="$1" cfg="$2"
+  shift 2
   echo ""
   echo "════════════════════════════════════════════════════════════"
   echo "  GPU: $label"

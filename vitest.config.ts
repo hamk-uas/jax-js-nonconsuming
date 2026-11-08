@@ -1,7 +1,12 @@
 import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
 
-import { chromiumEnv, COMMON_ARGS, workspaceAliases } from "./test/gpu-config";
+import {
+  BROWSER_MAX_WORKERS,
+  chromiumEnv,
+  COMMON_ARGS,
+  workspaceAliases,
+} from "./test/gpu-config";
 
 export default defineConfig({
   resolve: {
@@ -46,9 +51,10 @@ export default defineConfig({
       enabled: false,
       provider: "v8",
     },
-    // fileParallelism defaults to true — vitest runs files concurrently, each
-    // in its own iframe with its own module state and GPUDevice; they share
-    // only the Chromium process and the GPU itself.
+    // Files run concurrently, each in its own iframe with its own module state
+    // and GPUDevice; they share the Chromium GPU process, which bounds useful
+    // concurrency (see BROWSER_MAX_WORKERS).
+    maxWorkers: BROWSER_MAX_WORKERS,
     testTimeout: 10000,
     passWithNoTests: true,
     exclude: [

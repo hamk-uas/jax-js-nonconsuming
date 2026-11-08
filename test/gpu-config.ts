@@ -54,6 +54,17 @@ export const COMMON_ARGS = [
   "--enable-unsafe-webgpu",
 ];
 
+/**
+ * Test files run concurrently, each in its own iframe, but all in one
+ * Chromium whose single GPU process compiles every iframe's shaders. With
+ * vitest's default (CPU count − 1, i.e. 17 here) the compile queue made a
+ * fresh trivial kernel take up to 7 s and pushed tests past their timeout in
+ * most full runs; with 4 the worst case was 1 s and the suite took the same
+ * wall time (measured 2026-11-08: 17 → 43–63 s with failures, 6 → 44 s,
+ * 4 → 46 s). More files only lengthen the queue.
+ */
+export const BROWSER_MAX_WORKERS = 4;
+
 /** Per-GPU overrides: extra Chromium args and the Vulkan driver manifest. */
 const GPU_PROFILES = {
   nvidia: {
@@ -130,6 +141,7 @@ export function gpuConfig(gpu: GpuProfile) {
         }),
         instances: [{ browser: "chromium" }],
       },
+      maxWorkers: BROWSER_MAX_WORKERS,
       exclude: [...configDefaults.exclude, "tmp/**"],
       testTimeout: 300000,
       passWithNoTests: true,
