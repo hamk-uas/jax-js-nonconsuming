@@ -22,12 +22,9 @@ export function setDebug(level: number) {
 
 /** The execution strategy chosen for a scan loop. */
 export type ScanPath =
-  | "compiled-loop"
-  | "preencoded-routine"
-  | "preencoded-multi-step"
-  | "fallback";
+  "compiled-loop" | "preencoded-routine" | "preencoded-multi-step" | "fallback";
 
-export function assertNonNull<T>(value: T): asserts value is NonNullable<T> {}
+export function assertNonNull<T>(_value: T): asserts _value is NonNullable<T> {}
 
 export function unzip2<T, U>(pairs: Iterable<[T, U]>): [T[], U[]] {
   const lst1: T[] = [];
@@ -417,13 +414,7 @@ export class FpHash {
 
   static hash(
     ...values: (
-      | string
-      | boolean
-      | number
-      | bigint
-      | null
-      | undefined
-      | FpHashable
+      string | boolean | number | bigint | null | undefined | FpHashable
     )[]
   ): bigint {
     const h = new FpHash();

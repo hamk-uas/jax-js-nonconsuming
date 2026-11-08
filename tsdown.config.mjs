@@ -7,14 +7,18 @@ const watchMode = process.env.TSDOWN_WATCH_MODE === "1";
 // Common options for all packages.
 /** @type {import("tsdown").Options} */
 const opts = {
-  external: (/** @type {string} */ id) => {
-    // Externalize all imports by default, except for runtime helpers generated
-    // by the compiler / bundler toolchain.
-    if (id.startsWith("@oxc-project/runtime")) return false;
-    return Boolean(id.match(/^[^./]/));
+  deps: {
+    // Bundle nothing from npm, except the runtime helpers that the compiler
+    // and bundler toolchain inject.
+    neverBundle: true,
+    alwaysBundle: [/^@oxc-project\/runtime/],
   },
   format: ["cjs", "esm"],
   platform: "browser",
+  // tsdown now builds CJS for Node.js unless told otherwise. Keep both
+  // formats on the browser platform, as older tsdown did; the output is
+  // currently identical either way.
+  inputOptions: { platform: "browser" },
   dts: watchMode
     ? {
         // Without newContext, dts generation in watch mode has trouble updating

@@ -40,7 +40,9 @@
   }
 
   abstract class Strategy {
-    abstract name: string;
+    // `declare`, not `abstract`: Svelte 5.57 emits abstract properties into
+    // its JavaScript output, which then fails to parse. Subclasses assign it.
+    declare name: string;
     abstract run(): Promise<number>;
   }
 

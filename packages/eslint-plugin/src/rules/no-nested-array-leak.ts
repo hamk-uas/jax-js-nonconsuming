@@ -59,7 +59,7 @@ function nextTempName(used: Set<string>): string {
  * that we can prepend `using` bindings before.
  */
 function findEnclosingStatement(node: any, context: Rule.RuleContext): any {
-  const sourceCode = context.sourceCode ?? context.getSourceCode();
+  const sourceCode = context.sourceCode;
   const ancestors = sourceCode.getAncestors(node);
   for (let i = ancestors.length - 1; i >= 0; i--) {
     const a = ancestors[i];
@@ -153,7 +153,7 @@ const noNestedArrayLeak: Rule.RuleModule = {
       ctx: Rule.RuleContext,
     ): Rule.ReportFixer {
       return (fixer) => {
-        const sourceCode = ctx.sourceCode ?? ctx.getSourceCode();
+        const sourceCode = ctx.sourceCode;
         const sourceText = sourceCode.getText();
         const statement = findEnclosingStatement(outerNode, ctx);
         if (!statement) return null;

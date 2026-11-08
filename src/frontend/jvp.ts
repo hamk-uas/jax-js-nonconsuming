@@ -182,8 +182,7 @@ type JvpRule<P extends Primitive> = (
 type JvpRetainedHandoffKind = "sort-idx" | "argsort-idx";
 
 let _jvpRetainedHandoffObserver:
-  | ((kind: JvpRetainedHandoffKind, value: Tracer) => void)
-  | null = null;
+  ((kind: JvpRetainedHandoffKind, value: Tracer) => void) | null = null;
 
 export function _setJvpRetainedHandoffObserver(
   observer: ((kind: JvpRetainedHandoffKind, value: Tracer) => void) | null,

@@ -12,6 +12,7 @@
     UnfoldVerticalIcon,
   } from "@lucide/svelte";
   import { SplitPane } from "@rich_harris/svelte-split-pane";
+  import { untrack } from "svelte";
 
   import ConsoleLine from "./ConsoleLine.svelte";
   import ReplEditor from "./ReplEditor.svelte";
@@ -26,7 +27,8 @@
 
   let editor: ReplEditor;
   let runner = new ReplRunner();
-  let currentText = $state(initialText);
+  // The editor owns the text from here on; `initialText` only seeds it.
+  let currentText = $state(untrack(() => initialText));
   let replLink = $derived(
     resolve("/repl") + `?content=${encodeContent(currentText)}`,
   );

@@ -200,11 +200,7 @@ export type CreationRefClaimant = "jvp-lifted-tangents" | "jacfwd-eye-matrix";
 
 /** All possible states of an Array's creation-ref owner field. */
 export type CreationRefOwner =
-  | "none"
-  | "partial-eval"
-  | "makeJaxpr-body"
-  | CreationRefClaimant
-  | "balanced";
+  "none" | "partial-eval" | "makeJaxpr-body" | CreationRefClaimant | "balanced";
 
 /**
  * A multidimensional numeric array with data stored on CPU or GPU.

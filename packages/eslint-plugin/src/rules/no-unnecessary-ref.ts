@@ -39,7 +39,7 @@ const rule: Rule.RuleModule = {
           fix(fixer) {
             // Remove `.ref` from the chain: `x.ref` → `x`, `x.ref.add(1)` → `x.add(1)`
             // Range: from the dot before `ref` to the end of `ref`
-            const sourceCode = context.sourceCode ?? context.getSourceCode();
+            const sourceCode = context.sourceCode;
             const dotToken = sourceCode.getTokenBefore(node.property);
             if (!dotToken || dotToken.value !== ".") return null;
             return fixer.removeRange([

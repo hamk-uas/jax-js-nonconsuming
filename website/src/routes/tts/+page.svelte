@@ -11,7 +11,7 @@
     safetensors,
     tokenizers,
   } from "@hamk-uas/jax-js-nonconsuming-loaders";
-  import { AudioLinesIcon, DownloadIcon, GithubIcon } from "@lucide/svelte";
+  import { AudioLinesIcon, CodeXmlIcon, DownloadIcon } from "@lucide/svelte";
 
   import DownloadManager from "$lib/common/DownloadManager.svelte";
   import { createStreamingPlayer } from "./audio";
@@ -175,8 +175,10 @@
     <a
       target="_blank"
       href="https://github.com/hamk-uas/jax-js-nonconsuming/tree/main/website/src/routes/tts"
+      title="Source on GitHub"
+      aria-label="Source on GitHub"
     >
-      <GithubIcon class="inline-block ml-2 -mt-1" />
+      <CodeXmlIcon class="inline-block ml-2 -mt-1" />
     </a>
   </h1>
   <p class="text-lg text-gray-500">

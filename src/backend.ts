@@ -511,8 +511,7 @@ export function getWebGPUDevice(): GPUDevice {
 
 function initializedWebGPUBackend(): WebGPUBackend {
   const backend = initializedBackends.get("webgpu") as
-    | WebGPUBackend
-    | undefined;
+    WebGPUBackend | undefined;
   if (!backend) {
     throw new Error(
       "WebGPU backend not initialized, call init('webgpu') first",

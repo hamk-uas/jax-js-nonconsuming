@@ -92,9 +92,8 @@ describe("O9c constants slab", () => {
 });
 
 describe("conflict-graph coloring", async () => {
-  const { buildConflictGraphAndColor } = await import(
-    "../src/backend/webgpu/command-tape"
-  );
+  const { buildConflictGraphAndColor } =
+    await import("../src/backend/webgpu/command-tape");
 
   it("colors independent indices with same color", () => {
     // Two dispatches that don't share any indices → no conflicts → 1 color

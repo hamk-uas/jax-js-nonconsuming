@@ -43,7 +43,7 @@
     "@hamk-uas/jax-js-nonconsuming-loaders": "workspace:^",
     "@hamk-uas/jax-js-nonconsuming-onnx": "workspace:^",
     "@hamk-uas/jax-js-nonconsuming-optax": "workspace:^",
-    "@lucide/svelte": "^0.556.0",
+    "@lucide/svelte": "^1.70.0",
     "@observablehq/plot": "^0.6.17",
     "@rich_harris/svelte-split-pane": "^2.0.0",
     "@rollup/browser": "^4.34.8",

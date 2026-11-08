@@ -388,10 +388,10 @@ JS↔WASM boundary rather than treating it as a replacement for the worker or ow
 - **Pros:** Minimal boundary churn where it applies. Good fit for preserving the existing coarse
   WASM-side execution model. Particularly attractive if some current JS imports (allocation proxies,
   async service calls, future loader hooks) become naturally Promise-returning.
-- **Cons:** JSPI only helps at the JS↔WASM boundary. It does **not** solve worker-pool
-  coordination, pending-work tracking, disposal ordering, or `dataSync()` semantics by itself. It
-  also cannot suspend JavaScript itself; once control is back in JS, normal async rules still apply.
-  Not every export/import should be wrapped.
+- **Cons:** JSPI only helps at the JS↔WASM boundary. It does **not** solve worker-pool coordination,
+  pending-work tracking, disposal ordering, or `dataSync()` semantics by itself. It also cannot
+  suspend JavaScript itself; once control is back in JS, normal async rules still apply. Not every
+  export/import should be wrapped.
 - **Availability / rollout:** Treat as feature-detected and opportunistic. The V8 write-up presents
   it as standardized and available in modern Chrome and Firefox, but we should still gate it at
   runtime and keep the existing `waitAsync()`-based / message-based async paths as fallback.
@@ -574,8 +574,8 @@ The browser deadlock analysis should not be projected wholesale onto non-browser
   - Option F is less compelling in Node because the main reason to use it—avoiding browser UI
     starvation—is absent.
   - Option G (JSPI) is potentially interesting in V8-based runtimes as a way to simplify selected
-    async JS↔WASM boundaries, but it still does not remove the need for a worker runtime
-    abstraction in this repo.
+    async JS↔WASM boundaries, but it still does not remove the need for a worker runtime abstraction
+    in this repo.
 - **Actual blocker in Node:** The current implementation assumes a web-style global `Worker` API and
   creates Blob-URL module workers. To make parallel WASM paths work reliably in Node, we likely need
   an adapter over `node:worker_threads` (or an explicit runtime abstraction for worker creation)

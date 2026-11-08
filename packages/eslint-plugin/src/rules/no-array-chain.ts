@@ -100,7 +100,7 @@ function replaceCallObjectText(
 }
 
 function findRewriteStatement(node: any, context: Rule.RuleContext): any {
-  const sourceCode = context.sourceCode ?? context.getSourceCode();
+  const sourceCode = context.sourceCode;
   const ancestors = sourceCode.getAncestors(node);
   for (let i = ancestors.length - 1; i >= 0; i--) {
     const ancestor = ancestors[i];
@@ -118,7 +118,7 @@ function buildChainRewrite(
   node: any,
   context: Rule.RuleContext,
 ): string | null {
-  const sourceCode = context.sourceCode ?? context.getSourceCode();
+  const sourceCode = context.sourceCode;
   const sourceText = sourceCode.getText();
   const chainCalls = getChainCalls(node);
   if (chainCalls.length < 2) return null;
