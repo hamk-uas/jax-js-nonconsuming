@@ -18,8 +18,8 @@
  * 3. Transforms array accesses for xs/ys bindings from `buffer[idx]` to `buffer[offset + idx]`
  */
 
-import type { ShaderInfo } from "./codegen";
 import { DEBUG } from "../../utils";
+import type { ShaderInfo } from "./codegen";
 
 export interface BufferBinding {
   group: number;

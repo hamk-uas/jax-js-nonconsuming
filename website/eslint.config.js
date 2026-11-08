@@ -4,7 +4,7 @@ import { includeIgnoreFile } from "@eslint/compat";
 import js from "@eslint/js";
 import { defineConfig } from "eslint/config";
 import prettier from "eslint-config-prettier";
-import * as eslintImport from "eslint-plugin-import";
+import { importX } from "eslint-plugin-import-x";
 import svelte from "eslint-plugin-svelte";
 import globals from "globals";
 import ts from "typescript-eslint";
@@ -38,7 +38,8 @@ export default defineConfig(
     },
   },
   {
-    plugins: { import: eslintImport },
+    // import-x under the `import` name, so rule IDs stay `import/*`.
+    plugins: { import: importX },
     rules: {
       "@typescript-eslint/no-explicit-any": "off",
       "@typescript-eslint/no-unused-vars": [

@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 
+import { erf, erfc } from "../../alu";
 import {
   wasm_atan,
   wasm_cos,
@@ -11,7 +12,6 @@ import {
   wasm_threefry2x32,
 } from "./builtins";
 import { CodeGenerator } from "./wasmblr";
-import { erf, erfc } from "../../alu";
 
 function relativeError(wasmResult: number, jsResult: number): number {
   return Math.abs(wasmResult - jsResult) / Math.max(Math.abs(jsResult), 1e-3);

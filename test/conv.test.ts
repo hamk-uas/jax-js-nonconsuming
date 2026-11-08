@@ -15,8 +15,8 @@ import {
 } from "@hamk-uas/jax-js-nonconsuming";
 import { describe, expect, test } from "vitest";
 
-import { deviceSuite } from "./device-suite.js";
 import { _setConvRewriteEnabled } from "../src/frontend/jit";
+import { deviceSuite } from "./device-suite.js";
 
 await deviceSuite((_device) => {
   // ── 1×1 conv fast path tests ─────────────────────────────────────────────────

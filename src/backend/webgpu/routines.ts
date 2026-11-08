@@ -1,5 +1,9 @@
 // WebGPU implementations of Routines (sort, argsort, cholesky, etc.)
 
+import { DType, isFloatDtype } from "../../alu";
+import { UnsupportedRoutineError } from "../../backend";
+import { Routine, Routines, RoutineType } from "../../routine";
+import { findPow2, prod } from "../../utils";
 import {
   calculateGrid,
   dtypeToWgsl,
@@ -8,10 +12,6 @@ import {
   ShaderInfo,
   withNanInfHeader,
 } from "./codegen";
-import { DType, isFloatDtype } from "../../alu";
-import { UnsupportedRoutineError } from "../../backend";
-import { Routine, Routines, RoutineType } from "../../routine";
-import { findPow2, prod } from "../../utils";
 
 type BitonicSortPass = {
   kind: "sort" | "merge"; // sort = full sort (stages 0..k), merge is only merge steps

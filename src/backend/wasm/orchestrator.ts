@@ -26,11 +26,11 @@
  * ```
  */
 
+import { DEBUG } from "../../utils";
 import { withInlineModuleWorkerUrl } from "./inline-worker";
 import { ModuleRegistry } from "./module-registry";
 import { requestWorkerModuleRegistration } from "./registration";
 import { canWaitOnThisThread, waitWhileState } from "./wait";
-import { DEBUG } from "../../utils";
 
 // ---------------------------------------------------------------------------
 // Control buffer layout (Int32 slots on a SharedArrayBuffer)

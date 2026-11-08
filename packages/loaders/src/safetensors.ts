@@ -64,7 +64,9 @@ export function parse(data: Uint8Array<ArrayBuffer> | ArrayBuffer): File {
       ),
     );
   } catch (error) {
-    throw new Error(`Failed to parse safetensors header as JSON: ${error}`);
+    throw new Error(`Failed to parse safetensors header as JSON: ${error}`, {
+      cause: error,
+    });
   }
 
   const file: File = { tensors: {}, totalSize: len };

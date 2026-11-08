@@ -19,6 +19,19 @@
  *   - More storage bindings than maxStorageBuffersPerShaderStage
  */
 
+import {
+  AluExp,
+  AluOp,
+  byteWidth,
+  detectScalarAssocOp,
+  DType,
+  Kernel,
+  Reduction,
+} from "../../alu";
+import type { JitId, JitProgram, JitStep } from "../../frontend/jit";
+import { Routine } from "../../routine";
+import { concreteDim, isSymbolicSize } from "../../shape";
+import { DEBUG, mapSetUnion, prod, strip1 } from "../../utils";
 import { erfSrc, threefrySrc } from "./builtins";
 import {
   calculateGrid,
@@ -35,19 +48,6 @@ import {
   wgslCastReductionRhs,
   wgslReductionAccumStmt,
 } from "./wgsl-gen";
-import {
-  AluExp,
-  AluOp,
-  byteWidth,
-  detectScalarAssocOp,
-  DType,
-  Kernel,
-  Reduction,
-} from "../../alu";
-import type { JitId, JitProgram, JitStep } from "../../frontend/jit";
-import { Routine } from "../../routine";
-import { concreteDim, isSymbolicSize } from "../../shape";
-import { DEBUG, mapSetUnion, prod, strip1 } from "../../utils";
 
 // ---------------------------------------------------------------------------
 // Public interface

@@ -4,7 +4,6 @@
 import { AluOp, type DType, isFloatDtype } from "../alu";
 import { defaultDevice } from "../backend";
 import { type Dim, dimSub, hasSymbolicDims } from "../dim";
-import { jvp, lowerAux } from "./jvp";
 import {
   dispose as treeDispose,
   flatten as treeFlatten,
@@ -98,6 +97,7 @@ import {
   typecheckJaxpr,
   Var,
 } from "./jaxpr";
+import { jvp, lowerAux } from "./jvp";
 import { analyzeLinearStencil, reverseStencilSlice } from "./stencil-analysis";
 import { jacfwd, moveaxis, vmap } from "./vmap";
 

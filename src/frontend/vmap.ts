@@ -1,7 +1,16 @@
 import { DType } from "../alu";
 import { defaultDevice } from "../backend";
+import {
+  JsTree,
+  flatten as treeFlatten,
+  unflatten as treeUnflatten,
+} from "../tree";
 import { assertNonNull, checkAxis, range, rep, unzip2, zip } from "../utils";
 import { arange, eye, fullInternal, pureArray } from "./array";
+import {
+  _registerCacheSizeGetter,
+  _registerJitCacheDisposer,
+} from "./check-leaks";
 import {
   AbstractValue,
   bind,
@@ -35,15 +44,6 @@ import {
   transpose,
   TreeMismatchError,
 } from "./core";
-import {
-  JsTree,
-  flatten as treeFlatten,
-  unflatten as treeUnflatten,
-} from "../tree";
-import {
-  _registerCacheSizeGetter,
-  _registerJitCacheDisposer,
-} from "./check-leaks";
 import {
   buildCachedJaxprArtifact,
   CachedJaxprArtifact,

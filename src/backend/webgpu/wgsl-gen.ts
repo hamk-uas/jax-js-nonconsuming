@@ -6,7 +6,6 @@
  * elimination) and AluExp simplification with bounded variable ranges.
  */
 
-import { castSaturateWgsl, constToWgsl, dtypeToWgsl } from "./codegen";
 import {
   accessorGlobal,
   AluExp,
@@ -18,6 +17,7 @@ import {
 } from "../../alu";
 import { isSymbolicSize } from "../../shape";
 import { strip1 } from "../../utils";
+import { castSaturateWgsl, constToWgsl, dtypeToWgsl } from "./codegen";
 
 /**
  * Generate a WGSL reduction accumulation statement.

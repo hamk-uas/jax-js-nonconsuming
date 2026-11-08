@@ -1,9 +1,9 @@
-import * as lax from "./lax";
-import { triangularSolve } from "./lax-linalg";
-import * as np from "./numpy";
 import { Array, ArrayLike, fudgeArray } from "../frontend/array";
 import * as core from "../frontend/core";
 import { checkAxis, generalBroadcast } from "../utils";
+import * as lax from "./lax";
+import { triangularSolve } from "./lax-linalg";
+import * as np from "./numpy";
 
 /**
  * Apply a pre-computed LU factorization to solve A x = b.

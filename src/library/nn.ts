@@ -1,6 +1,17 @@
 // Common functions for neural network libraries, mirroring `jax.nn` in JAX.
 
 import { DType, isFloatDtype } from "../alu";
+import { eye, fudgeArray, tri } from "../frontend/array";
+import {
+  type Axis,
+  erfc,
+  type ReduceOpts,
+  shrink,
+  stopGradient,
+} from "../frontend/core";
+import { jit } from "../frontend/jaxpr";
+import { Pair } from "../shape";
+import { checkAxis, deepEqual, normalizeAxis } from "../utils";
 import {
   absolute,
   add,
@@ -27,17 +38,6 @@ import {
   where,
   zerosLike,
 } from "./numpy";
-import { eye, fudgeArray, tri } from "../frontend/array";
-import {
-  type Axis,
-  erfc,
-  type ReduceOpts,
-  shrink,
-  stopGradient,
-} from "../frontend/core";
-import { jit } from "../frontend/jaxpr";
-import { Pair } from "../shape";
-import { checkAxis, deepEqual, normalizeAxis } from "../utils";
 
 /**
  * Rectified Linear Unit (ReLU) activation function:

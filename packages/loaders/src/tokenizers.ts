@@ -265,7 +265,7 @@ export class BpeEncoding {
 
     let start = 0;
     while (true) {
-      let nextSpecial: RegExpExecArray | null = null;
+      let nextSpecial: RegExpExecArray | null;
       this.specialRegex.lastIndex = start;
       while (true) {
         nextSpecial = this.specialRegex.exec(text);

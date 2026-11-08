@@ -63,6 +63,6 @@ export async function getWebgpuDevice(): Promise<GPUDevice> {
       },
     });
   } catch (error) {
-    throw new Error("Error when creating device: " + error);
+    throw new Error("Error when creating device: " + error, { cause: error });
   }
 }

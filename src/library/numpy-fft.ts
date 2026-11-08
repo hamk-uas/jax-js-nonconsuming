@@ -1,9 +1,9 @@
 // Port of the `jax.numpy.fft` module, Fast Fourier Transform.
 
-import { arange, Array, concatenate, cos, sin } from "./numpy";
 import { isFloatDtype } from "../alu";
 import { jit } from "../frontend/jaxpr";
 import { checkAxis, deepEqual, invertPermutation, range, rep } from "../utils";
+import { arange, Array, concatenate, cos, sin } from "./numpy";
 
 /**
  * A pair of arrays representing real and imaginary part `a + bj`. Both arrays

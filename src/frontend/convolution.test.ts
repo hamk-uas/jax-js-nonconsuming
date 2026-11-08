@@ -1,9 +1,9 @@
 import { expect, test } from "vitest";
 
-import { ShapeTracker } from "../shape";
-import { pool, poolTranspose } from "./convolution";
 import { AluExp, DType } from "../alu";
+import { ShapeTracker } from "../shape";
 import { range } from "../utils";
+import { pool, poolTranspose } from "./convolution";
 
 function evalShape(
   st: ShapeTracker,

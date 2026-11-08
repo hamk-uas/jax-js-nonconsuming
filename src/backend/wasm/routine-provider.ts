@@ -11,6 +11,7 @@
  * The LRU cache ensures memory is bounded while keeping frequently-used
  * sizes (typical for repeated model inference) hot.
  */
+import { _emitCodeCapture, _isCodeCaptureEnabled } from "../../backend";
 import {
   buildArgsortModuleSized,
   buildCholeskyModuleSized,
@@ -21,7 +22,6 @@ import {
   buildSortModuleSized,
   buildTriangularSolveModuleSized,
 } from "./routines/index";
-import { _emitCodeCapture, _isCodeCaptureEnabled } from "../../backend";
 
 // ============================================================================
 // LRU Cache for size-specialized modules

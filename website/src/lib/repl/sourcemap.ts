@@ -21,7 +21,7 @@ export function decodeVlq(mappings: string, start: number): [number, number] {
   let result = 0;
   let shift = 0;
   let index = start;
-  let continuation = false;
+  let continuation: boolean;
 
   do {
     if (index >= mappings.length) {
@@ -78,7 +78,7 @@ export function mapGeneratedPositionToSource(
         continue;
       }
 
-      let delta = 0;
+      let delta: number;
       [delta, index] = decodeVlq(mappings, index);
       generatedColumnState += delta;
 

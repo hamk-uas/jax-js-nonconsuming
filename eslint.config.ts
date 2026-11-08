@@ -1,6 +1,6 @@
 import js from "@eslint/js";
 import { defineConfig, globalIgnores } from "eslint/config";
-import * as eslintImport from "eslint-plugin-import";
+import { importX } from "eslint-plugin-import-x";
 import globals from "globals";
 import ts from "typescript-eslint";
 
@@ -42,7 +42,8 @@ export default defineConfig([
     },
   },
   {
-    plugins: { import: eslintImport, "jax-js": jaxJsPlugin },
+    // import-x under the `import` name, so rule IDs stay `import/*`.
+    plugins: { import: importX, "jax-js": jaxJsPlugin },
     rules: {
       "@typescript-eslint/consistent-type-exports": "error",
       "@typescript-eslint/no-array-constructor": "off",
@@ -79,6 +80,9 @@ export default defineConfig([
           },
           groups: ["builtin", "external"],
           "newlines-between": "always",
+          // import-x resolves the package's self-reference into this
+          // repository and would call it internal; it is the published API.
+          pathGroups: [{ pattern: "@hamk-uas/**", group: "external" }],
         },
       ],
       "prefer-const": ["warn", { destructuring: "all" }],

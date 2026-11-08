@@ -5201,12 +5201,12 @@ class ShaderPipelineCache {
         });
         await this.device.popErrorScope();
         return pipeline;
-      } catch (_error: unknown) {
+      } catch (error: unknown) {
         // This can race with other compilations, but it shouldn't happen in
         // correct code. Any validation error here is a bug in `jax-js`.
         const scope = await this.device.popErrorScope();
         const emsg = await compileError(shaderModule, scope, shader.code);
-        throw new Error(emsg);
+        throw new Error(emsg, { cause: error });
       }
     })();
     this.inProgress.set(shader.code, promise);

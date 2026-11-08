@@ -16,30 +16,6 @@ import {
   Slot,
   staticCapabilityFingerprint,
 } from "../backend";
-import { type CostFeatures, evaluateTotalCost } from "../tuner";
-import { aluCompare, IPendingExecute } from "./array";
-import { executeBlockMap } from "./block-map-executor";
-import {
-  _registerCacheSizeGetter,
-  _registerJitCacheDisposer,
-} from "./check-leaks";
-import {
-  pool,
-  poolTranspose,
-  prepareConv,
-  prepareConv1x1,
-} from "./convolution";
-import type { ConvParams } from "./convolution";
-import {
-  Primitive,
-  PrimitiveParams,
-  promoteAvals,
-  routinePrimitives,
-  ShapedArray,
-} from "./core";
-import { type Atom, Jaxpr, JaxprEqn, Lit, Var } from "./jaxpr";
-import { executeAssociativeScan, executeScan } from "./scan-executor";
-import { planAssociativeScan, planScan } from "./scan-plan";
 import type { WasmBackend } from "../backend/wasm";
 import {
   canCompileToMegaModule,
@@ -68,6 +44,7 @@ import {
   sizeExprMul,
   unravelAlu,
 } from "../shape";
+import { type CostFeatures, evaluateTotalCost } from "../tuner";
 import {
   DEBUG,
   deepEqual,
@@ -77,8 +54,31 @@ import {
   range,
   rep,
 } from "../utils";
-import type { AssocScanPlan, ScanPlan } from "./scan-plan";
 import type { ScanPath } from "../utils";
+import { aluCompare, IPendingExecute } from "./array";
+import { executeBlockMap } from "./block-map-executor";
+import {
+  _registerCacheSizeGetter,
+  _registerJitCacheDisposer,
+} from "./check-leaks";
+import {
+  pool,
+  poolTranspose,
+  prepareConv,
+  prepareConv1x1,
+} from "./convolution";
+import type { ConvParams } from "./convolution";
+import {
+  Primitive,
+  PrimitiveParams,
+  promoteAvals,
+  routinePrimitives,
+  ShapedArray,
+} from "./core";
+import { type Atom, Jaxpr, JaxprEqn, Lit, Var } from "./jaxpr";
+import { executeAssociativeScan, executeScan } from "./scan-executor";
+import { planAssociativeScan, planScan } from "./scan-plan";
+import type { AssocScanPlan, ScanPlan } from "./scan-plan";
 
 // ── Conv classification signal (Phase A0) ─────────────────────────────────
 // Tracks which classification the last Primitive.Conv JIT rule produced.

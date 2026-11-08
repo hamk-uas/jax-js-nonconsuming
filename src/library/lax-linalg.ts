@@ -1,11 +1,11 @@
 // Linear algebra functions, mirroring `jax.lax.linalg`.
 
-import * as laxLib from "./lax";
-import { moveaxis } from "./numpy";
-import * as numpy from "./numpy";
 import { Array, type ArrayLike, fudgeArray } from "../frontend/array";
 import * as core from "../frontend/core";
 import { vmap } from "../frontend/vmap";
+import * as laxLib from "./lax";
+import { moveaxis } from "./numpy";
+import * as numpy from "./numpy";
 
 /**
  * Compute the Cholesky decomposition of a symmetric positive-definite matrix.

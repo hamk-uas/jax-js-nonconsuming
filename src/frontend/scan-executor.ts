@@ -8,12 +8,6 @@
 
 import { byteWidth } from "../alu";
 import type { Backend, Slot } from "../backend";
-import type { IPendingExecute } from "./array";
-import { Array as JaxArray } from "./array";
-import { _associativeScanCoreImpl, ShapedArray } from "./core";
-import type { Jaxpr } from "./jaxpr";
-import type { JitProgram } from "./jit";
-import { type AssocScanPlan, type ScanPlan } from "./scan-plan";
 import type { WasmBackend } from "../backend/wasm";
 import type { NativeScanMultiParams, WebGPUBackend } from "../backend/webgpu";
 import {
@@ -25,6 +19,8 @@ import {
   resolveShape,
   ShapeTracker,
 } from "../shape";
+import type { IPendingExecute } from "./array";
+import { Array as JaxArray } from "./array";
 import {
   copyAxisRange,
   executeBlockMap,
@@ -32,6 +28,10 @@ import {
   gatherAxisPoints,
   mapOverBlocks,
 } from "./block-map-executor";
+import { _associativeScanCoreImpl, ShapedArray } from "./core";
+import type { Jaxpr } from "./jaxpr";
+import type { JitProgram } from "./jit";
+import { type AssocScanPlan, type ScanPlan } from "./scan-plan";
 
 // ---------------------------------------------------------------------------
 // Public interface

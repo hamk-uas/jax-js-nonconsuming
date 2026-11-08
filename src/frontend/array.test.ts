@@ -1,8 +1,8 @@
 import { beforeEach, expect, suite, test } from "vitest";
 
+import { DType } from "../alu";
 import { defaultDevice, devices, init } from "../backend";
 import { arange, array, eye, ones, zeros } from "./array";
-import { DType } from "../alu";
 
 const devicesAvailable = await init();
 
