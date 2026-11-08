@@ -1,6 +1,7 @@
 import { DType } from "./alu";
 import {
-  _setCalibrationState,
+  _applyCalibration,
+  _resetCalibration,
   calibrateGpu,
   defaultDevice,
   Device,
@@ -94,7 +95,8 @@ export {
   type CapturedSubProgram,
   captureJitReport,
   type CodeCaptureEntry,
-  _setCalibrationState,
+  _applyCalibration,
+  _resetCalibration,
   type ConvClass,
   type Dim,
   type GpuTimingResult,

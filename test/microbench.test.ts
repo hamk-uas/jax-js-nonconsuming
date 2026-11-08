@@ -1,157 +1,111 @@
 /**
- * Tests for P10 microbenchmark auto-tuning.
- *
- * Covers: PerformanceBeliefState, calibrateGpu, calibration lifecycle,
- * cache key differentiation, _setCalibrationState reset.
+ * Tests for opt-in GPU calibration (P10): `calibrateGpu()` and the calibrated
+ * values' effect on JIT caching.
  *
  * Requires WebGPU — skipped when no WebGPU adapter is available.
  */
 import {
-  _setCalibrationState,
+  _applyCalibration,
+  _resetCalibration,
   calibrateGpu,
   clearCaches,
   defaultDevice,
   getBackend,
+  getCacheSizes,
   init,
   jit,
   numpy as np,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
-// init with calibration off so we control timing
-_setCalibrationState("off");
-const devicesAvailable = await init("webgpu", "wasm");
+const devicesAvailable = await init("webgpu");
 const hasWebGPU = devicesAvailable.includes("webgpu");
 
-describe.skipIf(!hasWebGPU)("microbench calibration", () => {
+const performanceFields = [
+  "dispatchOverheadUs",
+  "bandwidthGBs",
+  "tflops",
+  "barrierCostFactor",
+  "rOptWords",
+] as const;
+
+describe.skipIf(!hasWebGPU)("GPU calibration", () => {
   beforeEach(() => {
     defaultDevice("webgpu");
   });
 
   afterEach(() => {
     clearCaches();
-    _setCalibrationState("off");
+    _resetCalibration();
   });
 
-  test("calibrateGpu populates empirical capabilities", async () => {
-    const backend = getBackend("webgpu");
-    const capsBefore = backend.capabilities;
-
-    // Before calibration, calibrated should be falsy
-    expect(capsBefore.calibrated).toBeFalsy();
-
-    _setCalibrationState("pending");
-    await calibrateGpu();
-
-    const capsAfter = backend.capabilities;
-    expect(capsAfter.calibrated).toBe(true);
-    expect(capsAfter.bandwidthGBs).toBeGreaterThan(0);
-    expect(capsAfter.tflops).toBeGreaterThan(0);
-    expect(capsAfter.dispatchOverheadUs).toBeGreaterThan(0);
-    expect(capsAfter.rOptWords).toBeGreaterThanOrEqual(16);
-
-    // Immutable limits should be preserved
-    expect(capsAfter.maxComputeWorkgroupSizeX).toBe(
-      capsBefore.maxComputeWorkgroupSizeX,
-    );
-    expect(capsAfter.maxComputeWorkgroupStorageSize).toBe(
-      capsBefore.maxComputeWorkgroupStorageSize,
-    );
-    expect(capsAfter.shaderF16).toBe(capsBefore.shaderF16);
-    expect(capsAfter.subgroups).toBe(capsBefore.subgroups);
-  });
-
-  test("calibrateGpu is idempotent once done", async () => {
-    _setCalibrationState("pending");
-    await calibrateGpu();
-
-    const backend = getBackend("webgpu");
-    const caps1 = backend.capabilities;
-    expect(caps1.calibrated).toBe(true);
-
-    // Second call should be a no-op (state is "done")
-    await calibrateGpu();
-    const caps2 = backend.capabilities;
-    // Same object reference — capabilities not replaced
-    expect(caps2).toBe(caps1);
-  });
-
-  test("calibrateGpu skipped when state is off", async () => {
-    _setCalibrationState("off");
-    await calibrateGpu();
-
-    const backend = getBackend("webgpu");
-    expect(backend.capabilities.calibrated).toBeFalsy();
-  });
-
-  test('init("webgpu") consumes pending calibration automatically', async () => {
-    const backend = getBackend("webgpu");
-
-    _setCalibrationState("pending");
-    expect(backend.capabilities.calibrated).toBeFalsy();
-
+  test('init("webgpu") does not calibrate', async () => {
     await init("webgpu");
-
-    expect(backend.capabilities.calibrated).toBe(true);
-  });
-
-  test("_setCalibrationState resets for test isolation", async () => {
-    // Calibrate first
-    _setCalibrationState("pending");
-    await calibrateGpu();
-
-    const backend = getBackend("webgpu");
-    expect(backend.capabilities.calibrated).toBe(true);
-
-    // Reset to pending — note: capabilities remain dirty from previous calibration,
-    // but the state machine allows re-calibration
-    _setCalibrationState("pending");
-    await calibrateGpu();
-    expect(backend.capabilities.calibrated).toBe(true);
-  });
-
-  test("jit cache key differentiates calibrated vs uncalibrated", async () => {
-    // First JIT call with uncalibrated backend
-    _setCalibrationState("off");
-    using a = np.ones([64]);
-    const fn = jit((x: np.Array) => x.mul(2));
-    {
-      using _ = fn(a);
-    }
-
-    // Now calibrate
-    _setCalibrationState("pending");
-    await calibrateGpu();
-    clearCaches();
-
-    // Re-JIT after calibration — should get a fresh compilation
-    // (different cache key due to calibrated caps)
-    {
-      using _ = fn(a);
-    }
-
-    fn.dispose();
-  });
-
-  test("belief state values are within reasonable ranges", async () => {
-    _setCalibrationState("pending");
-    await calibrateGpu();
-
     const caps = getBackend("webgpu").capabilities;
+    expect(caps.calibrated).toBeFalsy();
+    for (const field of performanceFields) expect(caps[field]).toBeUndefined();
+  });
 
-    // Dispatch overhead: typically 5-500µs
+  test("calibrateGpu measures plausible values and keeps device limits", async () => {
+    const caps = getBackend("webgpu").capabilities;
+    const limitsBefore = {
+      maxComputeWorkgroupSizeX: caps.maxComputeWorkgroupSizeX,
+      maxComputeWorkgroupStorageSize: caps.maxComputeWorkgroupStorageSize,
+      shaderF16: caps.shaderF16,
+      subgroups: caps.subgroups,
+    };
+
+    const run = calibrateGpu();
+    expect(calibrateGpu()).toBe(run); // concurrent callers share one run
+    await run;
+
+    expect(caps.calibrated).toBe(true);
     expect(caps.dispatchOverheadUs!).toBeGreaterThanOrEqual(1);
     expect(caps.dispatchOverheadUs!).toBeLessThan(10_000);
-
-    // Bandwidth: typically 1-2000 GB/s
     expect(caps.bandwidthGBs!).toBeGreaterThanOrEqual(1);
     expect(caps.bandwidthGBs!).toBeLessThan(5_000);
-
-    // TFLOPS: typically 0.01-100
     expect(caps.tflops!).toBeGreaterThanOrEqual(0.01);
     expect(caps.tflops!).toBeLessThan(500);
-
-    // R_opt: one of the probed values or conservative default
+    expect(caps.barrierCostFactor!).toBeGreaterThan(0);
     expect([16, 32, 48, 64, 96, 128, 192]).toContain(caps.rOptWords);
+    expect(caps).toMatchObject(limitsBefore);
+
+    // Once calibrated, further calls do not measure again; a new measurement
+    // would almost surely give different values.
+    const measured = { ...caps };
+    await calibrateGpu();
+    expect({ ...caps }).toEqual(measured);
+  });
+
+  test("calibrated values select their own JIT cache entries", () => {
+    using x = np.ones([64]);
+    const f = jit((a: np.Array) => a.mul(2));
+    const compiledPrograms = () => getCacheSizes().jitCompile;
+    try {
+      f(x).dispose();
+      const conservative = compiledPrograms();
+      f(x).dispose();
+      expect(compiledPrograms()).toBe(conservative);
+
+      _applyCalibration({
+        dispatchOverheadUs: 20,
+        bandwidthGBs: 200,
+        tflops: 10,
+        barrierCostFactor: 2,
+        rOptWords: 64,
+      });
+      f(x).dispose();
+      expect(compiledPrograms()).toBe(conservative + 1);
+
+      _resetCalibration();
+      const caps = getBackend("webgpu").capabilities;
+      expect(caps.calibrated).toBe(false);
+      for (const field of performanceFields)
+        expect(caps[field]).toBeUndefined();
+      f(x).dispose();
+      expect(compiledPrograms()).toBe(conservative + 1);
+    } finally {
+      f.dispose();
+    }
   });
 });

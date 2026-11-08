@@ -13,6 +13,7 @@ import { AluOp, DType, Kernel } from "./alu";
 import { CpuBackend } from "./backend/cpu";
 import { WasmBackend } from "./backend/wasm";
 import type { WebGPUBackend } from "./backend/webgpu";
+import type { PerformanceBeliefState } from "./microbench";
 import { Routine, Routines } from "./routine";
 
 export type Device = "cpu" | "wasm" | "webgpu" | "webgl";
@@ -42,15 +43,15 @@ export interface BackendCapabilities {
   /** WebGPU: true if timestamp-query feature is available. */
   readonly timestampQuery?: boolean;
 
-  /** Measured or injected memory bandwidth in GB/s. Absent before calibration in the current runtime path. */
+  /** Measured or injected memory bandwidth in GB/s. Absent unless `calibrateGpu()` has run. */
   readonly bandwidthGBs?: number;
-  /** Measured or injected compute throughput in TFLOPS. Absent before calibration in the current runtime path. */
+  /** Measured or injected compute throughput in TFLOPS. Absent unless `calibrateGpu()` has run. */
   readonly tflops?: number;
-  /** Measured or injected base dispatch overhead in microseconds. Absent before calibration in the current runtime path. */
+  /** Measured or injected base dispatch overhead in microseconds. Absent unless `calibrateGpu()` has run. */
   readonly dispatchOverheadUs?: number;
   /**
    * Measured or injected per-thread register budget (words) before spill likely
-   * begins. Absent before calibration in the current runtime path.
+   * begins. Absent unless `calibrateGpu()` has run.
    */
   readonly rOptWords?: number;
   /** Measured or injected relative cost multiplier for workgroup barriers. */
@@ -187,13 +188,6 @@ export async function init(...devicesToInit: Device[]): Promise<Device[]> {
     }
   }
   await Promise.all(promises);
-
-  // WebGPU calibration must happen on an async boundary before sync JIT
-  // compilation becomes reachable. `init("webgpu")` is that boundary.
-  if (requestedDevices.has("webgpu") && initializedBackends.has("webgpu")) {
-    await _ensureCalibrated();
-  }
-
   return Array.from(initializedBackends.keys());
 }
 
@@ -512,6 +506,10 @@ export class UnsupportedRoutineError extends Error {
  * backend runs on. This is useful for sharing buffers.
  */
 export function getWebGPUDevice(): GPUDevice {
+  return initializedWebGPUBackend().device;
+}
+
+function initializedWebGPUBackend(): WebGPUBackend {
   const backend = initializedBackends.get("webgpu") as
     | WebGPUBackend
     | undefined;
@@ -520,76 +518,52 @@ export function getWebGPUDevice(): GPUDevice {
       "WebGPU backend not initialized, call init('webgpu') first",
     );
   }
-  return backend.device;
+  return backend;
 }
 
 // ── Microbenchmark calibration (P10) ─────────────────────────────────────
 
-/**
- * Calibration state for the WebGPU backend.
- * - "pending": not yet calibrated, will run during init("webgpu")
- * - "running": calibration in progress
- * - "done": calibration complete, belief state frozen
- * - "off": calibration disabled
- */
-let _calibrationState: "pending" | "running" | "done" | "off" = "pending";
-
-/** Internal test hook for forcing calibration state. Not a stable public API. */
-export function _setCalibrationState(state: "pending" | "off"): void {
-  _calibrationState = state;
-  // Reset the calibrated flag on the WebGPU backend for test isolation.
-  const backend = initializedBackends.get("webgpu") as
-    | import("./backend/webgpu").WebGPUBackend
-    | undefined;
-  if (backend && backend.capabilities.calibrated) {
-    backend.resetCalibration();
-  }
-}
+/** The calibration run in progress, shared by concurrent `calibrateGpu()` calls. */
+let _calibrationRun: Promise<void> | null = null;
 
 /**
- * Run microbenchmark calibration on the WebGPU backend. Measures fundamental
- * hardware characteristics (bandwidth, TFLOPS, dispatch overhead, register
- * budget) and updates the backend capabilities with empirical values.
+ * Measure the WebGPU device with microbenchmarks (dispatch overhead, memory
+ * bandwidth, TFLOPS, barrier cost, register budget) and let the JIT cost model
+ * use the measured values instead of conservative built-in defaults.
  *
- * This runs automatically during `init("webgpu")` when calibration is still
- * pending. Call it explicitly when you want deterministic control over when
- * calibration happens.
+ * Opt-in: `init("webgpu")` does not calibrate. The probes keep the GPU fully
+ * busy for a fraction of a second on a discrete GPU and longer on integrated
+ * ones (they are the suspected cause of freezes on a laptop with an AMD GPU),
+ * and the measured values vary between runs. Call this once after
+ * `init("webgpu")` and before compiling functions; programs compiled
+ * afterwards are cached under the calibrated values.
+ *
+ * Resolves immediately when the device is already calibrated. Rejects if a
+ * probe fails, leaving the conservative defaults in place.
  */
-export async function calibrateGpu(): Promise<void> {
-  if (_calibrationState === "done" || _calibrationState === "off") return;
+export function calibrateGpu(): Promise<void> {
+  _calibrationRun ??= runCalibration().finally(() => {
+    _calibrationRun = null;
+  });
+  return _calibrationRun;
+}
 
-  const backend = initializedBackends.get("webgpu") as
-    | WebGPUBackend
-    | undefined;
-  if (!backend) {
-    throw new Error(
-      "WebGPU backend not initialized, call init('webgpu') first",
-    );
-  }
-
-  _calibrationState = "running";
-  try {
-    const { runMicrobenchmarks } = await import("./microbench");
-    const beliefState = await runMicrobenchmarks(backend.device);
-    backend.applyCalibration(beliefState);
-    _calibrationState = "done";
-  } catch (e) {
-    // Calibration failure is non-fatal — keep real hardware limits and use
-    // conservative built-in performance defaults.
-    console.warn(
-      "[microbench] calibration failed, using conservative defaults:",
-      e,
-    );
-    _calibrationState = "done";
-  }
+async function runCalibration(): Promise<void> {
+  const backend = initializedWebGPUBackend();
+  if (backend.capabilities.calibrated) return;
+  const { runMicrobenchmarks } = await import("./microbench");
+  backend.applyCalibration(await runMicrobenchmarks(backend.device));
 }
 
 /**
- * Ensure calibration has run before sync WebGPU JIT compilation becomes
- * reachable. Called internally from the async WebGPU initialization path.
+ * Internal test hook: use the given performance values as if `calibrateGpu()`
+ * had measured them. Makes calibrated cost-model decisions deterministic.
  */
-export async function _ensureCalibrated(): Promise<void> {
-  if (_calibrationState === "pending") {
-    await calibrateGpu();
-  }
+export function _applyCalibration(state: PerformanceBeliefState): void {
+  initializedWebGPUBackend().applyCalibration(state);
+}
+
+/** Internal test hook: return the WebGPU backend to the conservative defaults. */
+export function _resetCalibration(): void {
+  initializedWebGPUBackend().resetCalibration();
 }

@@ -51,13 +51,12 @@ export async function runMicrobenchmarks(
 
   const dispatchOverheadUs = await measureDispatchOverhead(device);
 
-  const [bandwidthGBs, tflops, barrierCostFactor, rOptWords] =
-    await Promise.all([
-      measureBandwidth(device, dispatchOverheadUs),
-      measureTflops(device, dispatchOverheadUs),
-      measureBarrierCost(device),
-      measureRopt(device),
-    ]);
+  // One probe at a time: concurrent probes compete for the GPU and skew each
+  // other's timings, and together they load a weak GPU even more heavily.
+  const bandwidthGBs = await measureBandwidth(device, dispatchOverheadUs);
+  const tflops = await measureTflops(device, dispatchOverheadUs);
+  const barrierCostFactor = await measureBarrierCost(device);
+  const rOptWords = await measureRopt(device);
 
   const state: PerformanceBeliefState = {
     dispatchOverheadUs,

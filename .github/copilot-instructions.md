@@ -350,13 +350,12 @@ hardware-determined and irreducible without reducing dispatch count.
 
 ### Cost model & device characterization
 
-**Pre-calibration state:** Before `calibrateGpu()` runs (auto-triggered during `init("webgpu")`),
-the runtime has only a **strong static constraint profile**: real device limits, feature flags, and
-adapter strings. Performance fields (`bandwidthGBs`, `tflops`, `dispatchOverheadUs`, `rOptWords`)
-are absent from `BackendCapabilities`. `resolvePerformanceBelief(caps)` in `src/tuner.ts` fills
-`CONSERVATIVE_WEBGPU_PERF_DEFAULTS` (dispatch=25µs, bandwidth=50GB/s, tflops=1.5, rOptWords=128)
-when no calibrated values exist. `_setCalibrationState("off")` for tests calls `resetCalibration()`
-which deletes all performance fields for clean isolation.
+**Default (uncalibrated) state:** Unless the application calls `calibrateGpu()`, the runtime has
+only a **strong static constraint profile**: real device limits, feature flags, and adapter strings.
+Performance fields (`bandwidthGBs`, `tflops`, `dispatchOverheadUs`, `rOptWords`,
+`barrierCostFactor`) are absent from `BackendCapabilities`. `resolvePerformanceBelief(caps)` in
+`src/tuner.ts` fills `CONSERVATIVE_WEBGPU_PERF_DEFAULTS` (dispatch=25µs, bandwidth=50GB/s,
+tflops=1.5, rOptWords=128, barrier=1.0) when no calibrated values exist.
 
 **Continuous cost modeling (P9, complete):** All ad-hoc heuristic thresholds have been replaced with
 continuous execution cost penalties via `evaluateTotalCost`. Legacy string heuristics retired
@@ -387,13 +386,22 @@ associative scan block-size selection (scan-plan.ts).
 
 `src/microbench.ts` runs 5 isolated GPU microbenchmarks on raw WebGPU API (no JIT) to measure
 hardware characteristics: dispatch overhead (linear regression on no-op dispatch counts), bandwidth
-(16MB copy kernel), TFLOPS (FMA-heavy kernel), barrier cost (shared-memory vs local reduction
-ratio), R_opt (escalating register counts, 60% throughput cliff detection). Results stored in
-`PerformanceBeliefState`. Auto-triggered during `init("webgpu")`, or explicit via
-`await calibrateGpu()`. `_setCalibrationState("off")` disables for tests.
+(copy kernel, up to 64 MB per buffer), TFLOPS (FMA-heavy kernel), barrier cost (shared-memory vs
+local reduction ratio), R_opt (escalating register counts, 60% throughput cliff detection). The
+probes run one at a time; concurrent probes skewed each other's timings. Results stored in
+`PerformanceBeliefState`.
+
+**Calibration is opt-in** (REMEDIATION-PLAN.md R22): `init("webgpu")` does not calibrate; an
+application calls `await calibrateGpu()` once after `init` and before compiling. It used to run
+inside `init`, where it was the suspected cause of freezes on a laptop with an AMD GPU, gave
+different values from run to run, and gained nothing measurable (`bench/calibration.bench.ts`
+compares calibrated vs conservative decisions). Concurrent `calibrateGpu()` calls share one run; a
+failed probe rejects and leaves the defaults.
 
 When calibrated, JIT cache keys include `staticCapabilityFingerprint(caps)` + rounded performance
-values. The belief state is frozen for the session (no cache thrashing).
+values, so each jit function compiles separately under calibrated and conservative values. Tests of
+calibrated decisions inject fixed values with the internal hooks `_applyCalibration(state)` and
+`_resetCalibration()` instead of running the probes.
 
 ## JIT compiler
 
@@ -534,7 +542,7 @@ All public symbols must be exported from `src/index.ts`. Key exports: `jit`, `gr
 `profileGpuDetailed`, `setCodeCapture`, `CodeCaptureEntry`, `getWebGPUDevice`, `calibrateGpu`.
 
 Internal-only exports (underscore prefix, not public API): `_lastConvClass`, `_lastConvRewritten`,
-`_lastForiRewritten`, `_setCalibrationState`.
+`_lastForiRewritten`, `_applyCalibration`, `_resetCalibration`.
 
 ## Observability & code capture
 
@@ -1017,6 +1025,7 @@ pnpm build && pnpm vitest bench bench/<file>.bench.ts
 | `bench/assoc-scan-scaling.bench.ts` | Associative scan scaling with N                                         |
 | `bench/associative-scan.bench.ts`   | `associativeScan` vs sequential `scan` for cumsum/cumprod               |
 | `bench/block-map-matmul.bench.ts`   | Tiled matmul via `block_map` at various sizes                           |
+| `bench/calibration.bench.ts`        | Calibrated vs conservative cost-model decisions (WebGPU)                |
 | `bench/command-tape.bench.ts`       | Command tape vs step-by-step dispatch overhead                          |
 | `bench/conv2d.bench.ts`             | Conv2d throughput across backends, kernel sizes, batch sizes            |
 | `bench/dlm-scan.bench.ts`           | DLM (Kalman) scan: assocScan/scan/grad with pytree matmul compose       |
@@ -1035,15 +1044,15 @@ Bench files import from `@hamk-uas/jax-js-nonconsuming` (public API via `dist/`)
 
 ## Future performance work
 
-| ID  | Title                        | Priority        | Description                                                                                   |
-| --- | ---------------------------- | --------------- | --------------------------------------------------------------------------------------------- |
-| P2  | Relaxed SIMD FMA             | Medium          | `f32x4.relaxed_madd` for 2× WASM dot-product throughput. Safari unsupported                   |
-| P3  | i64 in wasmblr               | Medium          | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins                         |
-| P4  | Conv2d WebGPU fused shader   | **Done** ✅     | Fused-shader codegen for conv bodies on all backends. Per-axis halo bounds fix enabled WebGPU |
-| P6  | Benchmark validation         | Medium          | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions                        |
-| P7  | Cooperative matrix (WMMA)    | Blocked (~2026) | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable                         |
-| P8  | Command tape block_map       | Low             | Add `block_map` to WebGPU command tape to unlock `foriLoop→blockMap` in `Scan`                |
-| P10 | Microbenchmark scale + async | High            | Increase microbench payloads; wire `barrierCostFactor`; explore async JIT pipeline            |
+| ID  | Title                      | Priority        | Description                                                                                   |
+| --- | -------------------------- | --------------- | --------------------------------------------------------------------------------------------- |
+| P2  | Relaxed SIMD FMA           | Medium          | `f32x4.relaxed_madd` for 2× WASM dot-product throughput. Safari unsupported                   |
+| P3  | i64 in wasmblr             | Medium          | Native i64 (WASM MVP). Simplifies Threefry PRNG, unlocks f64 builtins                         |
+| P4  | Conv2d WebGPU fused shader | **Done** ✅     | Fused-shader codegen for conv bodies on all backends. Per-axis halo bounds fix enabled WebGPU |
+| P6  | Benchmark validation       | Medium          | Systematic benchmarks: matmul GFLOP/s, conv2d, SIMD chains, reductions                        |
+| P7  | Cooperative matrix (WMMA)  | Blocked (~2026) | Hardware tensor cores for 2–4× tiled matmul. WGSL spec not yet stable                         |
+| P8  | Command tape block_map     | Low             | Add `block_map` to WebGPU command tape to unlock `foriLoop→blockMap` in `Scan`                |
+| P10 | Calibration: keep or drop? | Open            | Opt-in since R22; decide from `bench/calibration.bench.ts` on several GPUs (see below)        |
 
 ### P4: Conv2d WebGPU fused shader (complete ✅)
 
@@ -1074,20 +1083,16 @@ _WebGPU — NVIDIA RTX 4070 Ti SUPER (TB3 eGPU), block_map path:_
 Larger workloads (batch=8) show 20–61% improvement over the generic-dot baseline. Single-batch
 shapes remain dispatch-bound at ~2.3ms.
 
-### P10: Microbenchmark auto-tuning (remaining Phase 2 items)
+### P10: Microbenchmark calibration (open decision)
 
-Phase 1 is complete (core infrastructure in `src/microbench.ts`, auto-calibration at
-`init("webgpu")`, conservative defaults for pre-calibration). Remaining open items:
+The infrastructure exists (`src/microbench.ts`, opt-in `calibrateGpu()`, conservative defaults).
+Whether to keep it is open (REMEDIATION-PLAN.md R22): measured values vary between runs and
+`bench/calibration.bench.ts` has shown no gain over the conservative defaults on NVIDIA or Intel.
+Decide from that benchmark on several GPUs, including weak integrated ones, before investing
+further. Do not make the probes heavier.
 
-1. **Microbenchmark scale**: Workloads are too small (~32MB payload). `queue.submit` overhead
-   dominates timing, skewing `BW_global` and `TFLOPS`. Increase payload volume iteratively until
-   overhead drops below 5% margin, or subtract a baseline linear fit.
-2. **Ghost metric — `barrierCostFactor`**: Measured by microbench but silently ignored by
-   `evaluateTotalCost`. Wire it into `dangerShmem` or shared-memory sync cost.
-3. **Async JIT architecture** (exploratory): Transition from synchronous
-   `device.createComputePipeline` to `createComputePipelineAsync`. JIT calls return immediately via
-   lazy execution or Promise-wrapped handles. Would enable in-flight calibration refinement without
-   blocking the main thread.
+Separate, exploratory idea: `createComputePipelineAsync` instead of the synchronous
+`device.createComputePipeline`, so that compiling does not block the main thread.
 
 ## Deferred items
 

@@ -169,9 +169,10 @@ export async function measurePerf(): Promise<PerfResults> {
     gpuDim = 512;
   }
 
-  // Intel iGPUs need a longer timeout: calibration (~3s) + JIT compilation
-  // (~1s) + warmup dispatches eat most of the default 8s budget, leaving
-  // insufficient time for the timed batches.
+  // Older Intel iGPUs need a longer timeout: JIT compilation (~1s) + warmup
+  // dispatches eat most of the default 8s budget, leaving insufficient time
+  // for the timed batches. (Sized when init("webgpu") also ran a ~3s GPU
+  // calibration, which is now opt-in and not used here.)
   const gpuTimeout = isIntel && !isIntelArc ? 20000 : 8000;
 
   const fp32Result = await benchFlops(

@@ -46,9 +46,9 @@ export default defineConfig({
       enabled: false,
       provider: "v8",
     },
-    // fileParallelism defaults to true — vitest runs files concurrently.
-    // All tests share one Chromium tab / GPUDevice so this is safe and
-    // eliminates the ~3 s per-file startup cost that dominates with serial.
+    // fileParallelism defaults to true — vitest runs files concurrently, each
+    // in its own iframe with its own module state and GPUDevice; they share
+    // only the Chromium process and the GPU itself.
     testTimeout: 10000,
     passWithNoTests: true,
     exclude: [

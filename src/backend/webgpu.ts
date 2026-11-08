@@ -21,6 +21,7 @@ import {
 } from "../backend";
 import type { IPendingExecute } from "../frontend/array.js";
 import type { JitId, JitStep } from "../frontend/jit";
+import type { PerformanceBeliefState } from "../microbench";
 import { Routine } from "../routine";
 import { isSymbolicSize } from "../shape";
 import { tuneNullopt, tuneWebgpu, type WebGPUTuneResult } from "../tuner";
@@ -444,8 +445,6 @@ export class WebGPUBackend implements Backend {
   readonly maxArgs: number;
   readonly capabilities: BackendCapabilities;
 
-  // Added dynamically by JIT calibration
-
   resetCalibration() {
     // Clear all calibrated metrics to prevent stale values from poisoning
     // cost model decisions across test isolation boundaries.
@@ -458,7 +457,7 @@ export class WebGPUBackend implements Backend {
     delete caps.barrierCostFactor;
   }
 
-  applyCalibration(beliefState: any) {
+  applyCalibration(beliefState: PerformanceBeliefState) {
     Object.assign(this.capabilities as any, beliefState);
     (this.capabilities as any).calibrated = true;
   }

@@ -6,9 +6,10 @@
  */
 
 import {
+  _applyCalibration,
   _fusedCacheCompileCount,
   _lastForiRewritten,
-  _setCalibrationState,
+  _resetCalibration,
   clearCaches,
   defaultDevice,
   DType,
@@ -2597,11 +2598,87 @@ describe("rewriteForiLoopToBlockMap", () => {
     expect(result_b).toBeAllclose(expected_b);
   });
 
+  test("2D foriLoop rewrite under calibrated GPU values", () => {
+    if (!hasWebGPU) return;
+
+    type Carry = { a: np.Array; b: np.Array };
+    const f = (x: np.Array, y: np.Array) => {
+      using a0 = np.zerosLike(x);
+      using b0 = np.zerosLike(x);
+      return lax.foriLoop(
+        0,
+        3,
+        (_i: np.Array, { a, b }: Carry): Carry => {
+          using asq = a.mul(a);
+          using bsq = b.mul(b);
+          using diff = asq.sub(bsq);
+          using cross = a.mul(b);
+          using scaled = cross.mul(2);
+          return { a: diff.add(x), b: scaled.add(y) };
+        },
+        { a: a0, b: b0 },
+      );
+    };
+    const inputs = () => {
+      using xFlat = np.linspace(-0.4, 0.4, 64 * 48);
+      using yFlat = np.linspace(0.3, -0.3, 64 * 48);
+      return [xFlat.reshape([64, 48]), yFlat.reshape([64, 48])];
+    };
+
+    defaultDevice("wasm");
+    const [xw, yw] = inputs();
+    using _xw = xw;
+    using _yw = yw;
+    using fWasm = jit(f);
+    const expected = fWasm(xw, yw);
+    using expectedA = expected.a;
+    using expectedB = expected.b;
+
+    defaultDevice("webgpu");
+    const [xg, yg] = inputs();
+    using _xg = xg;
+    using _yg = yg;
+    // Values a weak integrated GPU and a strong discrete GPU might measure.
+    // On typical devices they choose 16×16 and 32×32 blocks; 32 does not
+    // divide 48, so the latter also covers partial edge blocks.
+    const beliefs = [
+      {
+        dispatchOverheadUs: 60,
+        bandwidthGBs: 20,
+        tflops: 0.5,
+        barrierCostFactor: 4,
+        rOptWords: 16,
+      },
+      {
+        dispatchOverheadUs: 10,
+        bandwidthGBs: 600,
+        tflops: 40,
+        barrierCostFactor: 1.5,
+        rOptWords: 192,
+      },
+    ];
+    try {
+      for (const belief of beliefs) {
+        _applyCalibration(belief);
+        clearCaches();
+        using fGpu = jit(f);
+        const result = fGpu(xg, yg);
+        using resultA = result.a;
+        using resultB = result.b;
+        expect(_lastForiRewritten()).toBe(true);
+        expect(resultA).toBeAllclose(expectedA);
+        expect(resultB).toBeAllclose(expectedB);
+      }
+    } finally {
+      _resetCalibration();
+      clearCaches();
+    }
+  });
+
   test("mandelbrot-shaped foriLoop still rewrites on WebGPU", () => {
     if (!hasWebGPU) return;
     defaultDevice("webgpu");
     clearCaches();
-    _setCalibrationState("off");
 
     try {
       type Carry = { a: np.Array; b: np.Array; v: np.Array };
@@ -2658,7 +2735,6 @@ describe("rewriteForiLoopToBlockMap", () => {
       f.dispose();
     } finally {
       clearCaches();
-      _setCalibrationState("pending");
     }
   });
 
