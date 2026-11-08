@@ -104,5 +104,6 @@ above is unchanged except for the sign-off line in the header.
 
 Covered: `fe2c9cc..4e7a27e`, reviewed in rounds [1](phase-0-1.md), [2](phase-0-2.md) and 3. Carried
 to phase 1 as recorded in the plan: R23 (command-tape tracing) and R24 (four Intel accuracy
-failures). Not covered, for the next review: `b10c74c` (history-churn review mode), made after this
-round.
+failures). Not covered, for the next review: `a32d106` (homepage benchmark), excluded from all three
+rounds at the human's request; `b10c74c` (history-churn review mode) and `bd4540a` (this sign-off
+and the plan changes with it), made after this round.

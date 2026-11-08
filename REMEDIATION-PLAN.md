@@ -46,9 +46,12 @@ every device-parameterized WebGPU/WebGL case was silently skipped (R18). The 4 f
 tests that failed only because the audit worktree lacked a generated `.svelte-kit/`. After the
 config fix (2026-11-08, Phase 0), the default suite runs 3310 passed / 13 skipped / 5 failed: two
 deterministic WebGPU failures and three that fail only under full-suite load. Both GPU suites now
-run headless. The uncommitted June work, reconstructed in full (see §3.5), builds and passed the
-then-default suite (2287 passed / 1072 skipped / 0 failed, also without WebGPU/WebGL), but has 14
-type errors in tests and benches. It is preserved as a patch in
+run headless. At the end of phase 0 the default suite runs 3316 passed / 14 skipped / 0 failed, the
+NVIDIA suite 3369 passed, and the Intel suite 3365 passed / 4 failed (GPU transcendental accuracy,
+R24); a backend that fails to initialize, or a WebGPU error, now fails the run instead of being
+skipped or logged. The uncommitted June work, reconstructed in full (see §3.5), builds and passed
+the then-default suite (2287 passed / 1072 skipped / 0 failed, also without WebGPU/WebGL), but has
+14 type errors in tests and benches. It is preserved as a patch in
 [remediation/quarantine/](remediation/quarantine/) and is no longer in the working tree.
 
 **What needs reimplementation (not patching):** ownership internals that depend on tracing context,
@@ -315,7 +318,7 @@ debt (**D**) and process gaps (**P**).
 | R22 | GPU calibration ran inside `init("webgpu")` (`81c0b10`, `09b9f51`; path tests added in the version-bump commit `2f769e3`): four probes loaded the GPU concurrently for 0.2–0.8 s here, the suspected cause of freezes on a laptop with an AMD GPU. Memory: one calibration adds 135 MiB of GPU memory for ~0.1 s, but because every test file's `init` calibrated and 17 files started at once, the default suite peaked at 2.7 GiB (sustained 0.7–1.4 GiB), against 0.9 GiB peak (~0.2 GiB typical) with calibration opt-in and 4 files at once — enough to overflow a laptop GPU's memory; values differ between runs (rOpt 192 vs 48, barrier factor 20 vs 65, or both dispatch overhead and barrier factor at their clamping floors); no measurable gain (`bench/calibration.bench.ts`: Intel within ±3 %, NVIDIA calibrated up to 1.4× slower). Its tests could not fail: "calibrated >= conservative" accepted 1.5× slower, the cache-key test asserted nothing. Made opt-in with sequential probes in phase 0; keep-or-drop decision open | S/D   | 0, 6                                                                                            |
 | R23 | `profiler.startTrace()` traces only dispatches made through `pipelineSubmit` (eager ops). JIT programs run by the WebGPU command tape, which encodes its own passes, are never traced: the profiler API arrived from upstream (`397af85`) after the tape existed and was hooked into one path only. README and FEATURES promise per-kernel traces; the detr-resnet-50 demo calls `startTrace()`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | D     | 1                                                                                               |
 | R24 | GPU accuracy of transcendental functions follows the vendor: WebGPU and WebGL lower `asin`/`acos`/`atan`/`atan2` to the WGSL/GLSL builtins, for which WGSL allows 4096 ULP (f32). Intel exceeds the tests' 5-decimal tolerance (`asin` error 8.6e-5 at x ≈ −0.775, `atan2` 6.5e-6), NVIDIA does not; found by the first full Intel run after the R18 script fix. Decide: own range-reduced implementations (as for `erf`) for vendor-independent accuracy, or per-op GPU tolerances derived from the spec                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | D     | 1                                                                                               |
-| R25 | Opening the website homepage auto-ran a matmul benchmark sized by GPU vendor string (2048² for any AMD GPU, `f9746cc`) with 8 matmuls per submission (`f702fb1`): 184 ms (fp32) and 521 ms (fp16) per submission on the Intel iGPU here, longer on weaker GPUs, during which a GPU that drives the display cannot update it. With calibration in `init` (R22), the likely cause of the reported freeze of a laptop with an AMD GPU on just opening the website. Its `Promise.race` timeout stopped waiting but not the benchmark, so the fp16 run could overlap a still-running fp32 run; each run leaked 32 MiB of GPU memory. Fixed in phase 0. `/bench/results` still starts its benchmarks when opened                                                                                                                                                                                                                                                                                                                                       | S/D   | 0                                                                                               |
+| R25 | Opening the website homepage auto-ran a matmul benchmark sized by GPU vendor string (2048² for any AMD GPU, `f9746cc`) with 8 matmuls per submission (`f702fb1`): 184 ms (fp32) and 521 ms (fp16) per submission on the Intel iGPU here, longer on weaker GPUs, during which a GPU that drives the display cannot update it. With calibration in `init` (R22), the likely cause of the reported freeze of a laptop with an AMD GPU on just opening the website. Its `Promise.race` timeout stopped waiting but not the benchmark, so the fp16 run could overlap a still-running fp32 run; each run leaked 32 MiB of GPU memory. Fixed in phase 0. `/bench/results` still starts its benchmarks when opened (phase 1, item 11)                                                                                                                                                                                                                                                                                                                    | S/D   | 0, 1                                                                                            |
 
 ---
 
@@ -340,12 +343,31 @@ These restate the AEP in checkable form; each phase's exit criteria are derived 
    only version bumps.
 8. **The implementer does not grade its own work.** Milestones are closed by a separate review
    session that writes no code (see [Review rounds](#review-rounds-every-significant-milestone)).
+9. **Measure before explaining; repeat before declaring fixed.** Name a cause only after measuring
+   it, and show a fix for an intermittent failure green over repeated runs (say how many). Numbers
+   in commits and reports are the measured ones. In phase 0, `fb8ea22` credited the wrong change
+   with removing load-dependent failures after one green run; the measured cause came two commits
+   later.
 
 ---
 
 ## 6. Plan
 
 Dependency order: **0 → 1 → {2 → 3, 4, 5, 6} → 7**; phase 8 starts alongside phase 0.
+
+**Branches.** All remediation work happens on `wasm-multithreading` until the whole plan is done;
+nothing goes to `main` before that (the human's decision, 2026-11-08). Later phases branch from it
+or commit to it. Consequences:
+
+- The live website, deployed from `main`, keeps the behaviour fixed on this branch: GPU calibration
+  in `init` and the auto-run homepage benchmark (R22, R25). The human accepted this.
+- The branch also carries 12 multithreading commits made before the remediation (`0f644bc..fe2c9cc`:
+  E1 arena, orchestrator fixes and refactors, a coi-serviceworker for the website) that no review
+  has covered. Phase 4's review covers them.
+- At the end, a final review covers every commit no earlier round covered, then the branch reaches
+  `main` through a PR with CI green (phase 8, item 1).
+- Releases during the remediation are the human's decision; one cut from `main` would contain none
+  of this work.
 
 ### Review rounds (every significant milestone)
 
@@ -369,8 +391,10 @@ never covers more than a few days of work. Not per commit.
 **Who.** A fresh agent session with no editing role, e.g. a read-only review agent type, or a
 session instructed not to modify tracked files. Prefer a different model from the implementer to
 reduce correlated blind spots. It may build, run tests and run scripts. The reviewer does not fix
-anything. Findings go back to an implementation session, then a fresh re-review checks only the open
-findings. After two failed rounds, a human decides.
+anything. Findings go back to an implementation session, then a re-review checks only the open
+findings. Re-reviews within a phase may continue in the same review session, which keeps its
+reproductions (phase 0 did); each phase starts a fresh one. After two failed rounds, a human
+decides.
 
 **Input.** Only the commit range, this plan (the phase's exit criteria, §5 principles, §7
 signatures, the debt register) and the repository. The implementer's summary, commit messages and
@@ -401,11 +425,15 @@ status updates are _claims to verify_, not context.
    listed pairs first.
 
 **Output.** A short report committed as `remediation/reviews/<phase>-<n>.md`: verdict (pass / pass
-with findings / fail), the exit-criteria table, findings with severity and evidence, rework numbers.
-It is written for a human to read in about ten minutes.
+with findings / fail), the exit-criteria and item tables, findings with severity and evidence,
+rework numbers. It is written for a human to read in about ten minutes. The reviewer leaves the file
+uncommitted; the implementation session commits it unchanged. After a failed round, the
+implementation session appends a response to that report, marked as claims for the re-review. A
+scope exclusion requested by the human is stated in the report and carried to the next review.
 
 **Gate.** A phase is marked done in this file only with a link to a passing review report and a
-human sign-off line in that report. The same applies to releases.
+human sign-off line in that report. The same applies to releases. The sign-off question to the human
+lists the review's item table, deferrals and uncovered commits, not the implementer's summary.
 
 ### Phase 0 — Freeze and quarantine (R8)
 
@@ -487,25 +515,19 @@ two largest by the reviews.
 ### Phase 1 — Ground truth: CI and test integrity (R9, R13, R16, R18–R21, R23, R24)
 
 1. Add a GitHub Actions workflow running `pnpm install`, `pnpm build`, `pnpm check`, `pnpm lint`,
-   `pnpm test` (non-GPU) on every push and PR. GPU suites stay local via `scripts/gpu-test.sh`.
-2. Make the default suite self-contained: run `svelte-kit sync` (or equivalent) before website
-   tests; make `pnpm check` not depend on a prior build (separate `tsconfig` for `bench/`, or build
-   first in the script); move `repro-stub`/`debug-wgsl` out of `test/`.
-3. Make missing backends loud (R18): an environment variable such as
-   `JAX_REQUIRE_DEVICES=webgpu,webgl`, set by the pre-commit hook and `scripts/gpu-test.sh`, makes
-   `deviceSuite` and GPU-only files fail when a required backend did not initialize, instead of
-   skipping. Print the initialized backends at the top of every run. (Moved to phase 0, item 8.)
-4. Fix the five failures the skips had hidden (R19): root-cause the two deterministic ones; for the
-   three load-dependent ones, decide per test between test isolation and a real resource bug. (Moved
-   to phase 0, item 6.)
+   `pnpm test` (non-GPU) on every push and PR, including pushes to `wasm-multithreading`. GPU suites
+   stay local: add a pre-push hook that runs the full default suite and the full suite of the
+   detected GPU (`scripts/gpu-test.sh`). The pre-commit hook runs only 9 test files, so no gate saw
+   the R19 failures, and none noticed that `pnpm run test:gpu` had run no tests since March (R18).
+2. Make the setup honest (R16): the website's `prepare` script must fail when `svelte-kit sync`
+   fails instead of `|| echo ''`; give `bench/` a `tsconfig` that does not type-check against a
+   stale `dist/`, or build first in `pnpm check`; move `repro-stub`/`debug-wgsl` out of `test/`.
+3. Make missing backends loud (R18). Done in phase 0, item 8.
+4. Fix the five failures the skips had hidden (R19). Done in phase 0, item 6.
 5. Decouple backend initialization (R20): one backend's failure must not affect another's; add a
    test that injects a WebGL failure and asserts WebGPU still initializes.
-6. Make uncaptured WebGPU errors fail the running test (R21): `test/setup.ts` installs an
-   `uncapturederror` hook that records errors and fails the test in `afterEach`. Then fix what it
-   exposes, starting with the profiling QuerySet size, and re-check the `profileGpu`-based
-   assertions: with the invalid QuerySet every profiled pass reports 0 ms, which the existing
-   `durationMs >= 0` assertions accept. Make the command tape's passes traceable (R23) and test that
-   a `jit` call produces trace entries. (Everything but R23 moved to phase 0, item 8.)
+6. Make WebGPU errors fail tests (R21): done in phase 0, item 8. Remaining: make the command tape's
+   passes traceable (R23), and test that a `jit` call produces trace entries.
 7. Inventory every skip, early `return;`, device-specific tolerance, timeout override and config
    exclusion (commands in Appendix B). For each: keep with a written reason and an issue link, or
    turn it into a failing test plus an issue. Replace silent `return;` with `ctx.skip()` so skipped
@@ -520,10 +542,12 @@ two largest by the reviews.
    the four Intel failures stay visible.
 10. Re-derive FD tolerances: run gradient checks in f64 on CPU/WASM with tight tolerances; for f32
     WebGPU, derive tolerances from the problem's conditioning and document the derivation inline.
+11. Website pages start GPU work only when the visitor asks (R25, remainder): `/bench/results`,
+    linked from the homepage, runs matmuls up to 2048² in f32 and f16 as soon as it opens.
 
-**Exit:** CI green on `main`; default suite and both GPU suites green with required backends
-enforced; every skip/tolerance/timeout has a reason and issue; steady-state leak mode enabled for
-linalg, scan, foriLoop and transform tests.
+**Exit:** CI green on `wasm-multithreading`; default suite and both GPU suites green with required
+backends enforced; every skip/tolerance/timeout has a reason and issue; steady-state leak mode
+enabled for linalg, scan, foriLoop and transform tests.
 
 ### Phase 2 — Ownership: one semantics in eager and traced code (R1–R4)
 
@@ -586,7 +610,8 @@ returns nothing; fusion/dispatch-count tests unchanged; linalg benchmarks within
    and only after the ADR, because its lifetime rules depend on the async model.
 
 **Exit:** ADR merged; browser-main-thread parallelism test green, or the features remain gated and
-documented as experimental.
+documented as experimental. The phase's review also covers `0f644bc..fe2c9cc`, the multithreading
+commits made before the remediation, which no review has covered (see Branches).
 
 ### Phase 5 — Effect system: finish it or delete the unused half (R6)
 
@@ -673,6 +698,8 @@ Patterns that indicate the debt described above; use them during phases 1–3 an
 | "Bump version" commit touching `src/`                                           | change hidden from history readers             |
 | Workload size or timeout chosen by GPU vendor/adapter string                    | guess standing in for a measurement            |
 | `Promise.race` against a timer around work that keeps running                   | timeout that stops waiting, not the work       |
+| Listener or hook installed at first use (first test, first call)                | misses what happens before it (F2.1)           |
+| Intermittent failure called fixed after one green run                           | cause not measured (`fb8ea22`)                 |
 
 ---
 
