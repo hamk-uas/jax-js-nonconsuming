@@ -573,6 +573,11 @@ checkbox.
 and push per the README's "Releasing" steps, then give the maintainer the filled-in release title
 and notes to paste into the GitHub web interface.
 
+**Milestones:** an implementation session never marks a milestone or remediation phase done. It
+stops at "ready for review" and states the commit range. A separate review session, which writes no
+code, then follows "Review rounds" in `REMEDIATION-PLAN.md` and commits its report under
+`remediation/reviews/`; a maintainer signs off.
+
 ---
 
 # Part 2: Block Map & Tiled Compute

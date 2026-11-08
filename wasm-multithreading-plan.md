@@ -1,5 +1,24 @@
 # WASM Multithreading & Performance Plan
 
+> **Status at `HEAD` (verified 2026-11-08; keep this block describing committed code only).**
+>
+> - **Implemented:** E1, the fixed-size arena for mega-module internal buffers (`computeArenaLayout`
+>   in `src/backend/wasm/mega-module.ts`; commits `9217ea0`, `924f263`).
+> - **Gated off on browser main threads:** `WasmWorkerPool`, `OrchestratorWorker`, parallel
+>   mega-module dispatch and parallel Kogge-Stone all require `#canSpinWaitWorkers` (an
+>   `Atomics.wait` probe), so the main thread runs single-threaded, as §2 describes. They run in
+>   worker contexts; `test/wasm-nested-worker.test.ts` covers that.
+> - **Worker wake path:** still `postMessage({ type: "wake" })` plus a completion spin (§2).
+> - **Not implemented:** Options A, C, D, F and G, E2 workspace leasing, and Node `worker_threads`
+>   support (plain Node has no global `Worker`, so the pool stays off there).
+> - **Quarantined, not part of `HEAD`:** a June 2026 attempt at async completion handles, deferred
+>   mega-module dispatch, workspace leasing and an `Atomics.wait`-based wake loop, preserved in
+>   `remediation/quarantine/wasm-async-wip.patch`. Phase 4 of `REMEDIATION-PLAN.md` decides between
+>   Options A and D in an ADR before any of it is reused.
+>
+> The rest of this document is the original design analysis (written 2026-03-30); its "currently"
+> statements describe the code as of that date.
+
 ## 1. Problem Statement
 
 The upstream `jax-js` repository achieves **2.90 GFLOP/s** on the WASM matmul benchmark, while our
