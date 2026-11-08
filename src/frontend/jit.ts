@@ -650,17 +650,24 @@ function rewriteForiLoopToBlockMap(jaxpr: Jaxpr, backend: Backend): Jaxpr {
           `rewriteForiLoopToBlockMap: 1D blockShape=[${blockShape}]`,
         );
     } else if (rank === 2) {
-      // For 2D, pick from candidates via cost equation
+      // For 2D, pick from candidates via cost equation. Candidates are
+      // clamped to the carry shape (as in the 1D branch) so that carries
+      // smaller than a candidate, e.g. 4×4, still get a whole-array block
+      // instead of having no candidate at all.
       const candidates = [
         [32, 32],
         [16, 16],
         [16, 8],
         [8, 8],
-      ];
+      ]
+        .map((c) => [Math.min(c[0], cShape[0]), Math.min(c[1], cShape[1])])
+        .filter(
+          (c, i, all) =>
+            all.findIndex((d) => d[0] === c[0] && d[1] === c[1]) === i,
+        );
       let bestCost = Infinity;
-      let bestC = [8, 8];
+      let bestC = candidates[candidates.length - 1];
       for (const c of candidates) {
-        if (c[0] > cShape[0] || c[1] > cShape[1]) continue;
         if (!isFeasibleBlockShape(c)) continue;
 
         const bSize = c[0] * c[1];
