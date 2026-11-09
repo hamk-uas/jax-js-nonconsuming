@@ -108,5 +108,7 @@ None deferred by this range. No commit is left uncovered between `c6d3b05` and `
 
 ## Human sign-off
 
-Not signed off. Items 5 and 6 are ready to be marked done after F1 is addressed or consciously
-deferred, and after the human has accepted F2.
+Signed off by the human on 2026-11-09 for items 5 (R20) and 6 (R23, regular kernel/routine tape
+dispatches) of phase 1, covering `c6d3b05..f532bc9` plus the review-fix commit `5ebaad7`. F1 is
+fixed; F2 is accepted as the R20 contract and documented in the README. The dedicated scan,
+block-map, scatter-add and copy dispatch tracing stays open. This is not a phase 1 sign-off.

@@ -574,20 +574,22 @@ The separate accuracy plan remains outside remediation.
 3. Make missing backends loud (R18). Done in phase 0, item 8.
 4. Fix the five failures the skips had hidden (R19). Done in phase 0, item 6.
 5. Decouple backend initialization (R20): one backend's failure must not affect another's; add a
-   test that injects a WebGL failure and asserts WebGPU still initializes. Implementation pending
-   independent review: serialize backend creation across both a single `init()` and concurrent
-   calls. Log unexpected creation errors per backend and continue initializing the others; normal
-   unavailability still omits that backend from the returned list. A fresh-worker regression uses
-   the real WebGPU adapter/device while injecting unavailable or throwing WebGL context creation. It
-   also simulates the observed interference (an overlapping WebGL failure makes the adapter
-   unavailable), verifies no overlap, checks the diagnostic, and requires one WebGPU request even
-   across concurrent calls. All three cases pass on NVIDIA and Intel; CPU-only CI explicitly reports
-   these hardware-dependent cases as skipped.
+   test that injects a WebGL failure and asserts WebGPU still initializes. Verified by
+   [round 3](remediation/reviews/phase-1-partial-3.md) and signed off by the human (2026-11-09):
+   serialize backend creation across both a single `init()` and concurrent calls. Log unexpected
+   creation errors per backend and continue initializing the others; normal unavailability still
+   omits that backend from the returned list. A fresh-worker regression uses the real WebGPU
+   adapter/device while injecting unavailable or throwing WebGL context creation. It also simulates
+   the observed interference (an overlapping WebGL failure makes the adapter unavailable), verifies
+   no overlap, checks the diagnostic, and requires one WebGPU request even across concurrent calls.
+   All three cases pass on NVIDIA and Intel; CPU-only CI explicitly reports these hardware-dependent
+   cases as skipped.
 6. Make WebGPU errors fail tests (R21): done in phase 0, item 8. Remaining: make the command tape's
-   passes traceable (R23), and test that a `jit` call produces trace entries. Implementation pending
-   independent review: regular kernel/routine tape dispatches now retain their source metadata and
-   share tracing with eager execution, without bypassing the tape. A warmed JIT call produces one
-   real `performance.measure` entry with its operation properties and WGSL source; a multi-pass sort
+   passes traceable (R23), and test that a `jit` call produces trace entries. Verified by
+   [round 3](remediation/reviews/phase-1-partial-3.md) and signed off by the human (2026-11-09):
+   regular kernel/routine tape dispatches now retain their source metadata and share tracing with
+   eager execution, without bypassing the tape. A warmed JIT call produces one real
+   `performance.measure` entry with its operation properties and WGSL source; a multi-pass sort
    contributes one measurement across its passes. Middle passes must omit `timestampWrites`, not
    supply a descriptor with both indices undefined. Query batches belong to their encoder and
    resolve alongside their writes before submission, so stopping inside `withBatch` or exceeding
@@ -645,14 +647,14 @@ The separate accuracy plan remains outside remediation.
 12. Re-add a TTS per-step benchmark (R26) that imports the website's Pocket TTS model code and runs
     it with random weights; it must pass the benchmark leak check.
 
-**Current continuation validation (2026-11-09, pending independent review):** build, source
-type-check, full lint and touched-file formatting pass. The full CPU/WASM suite passes 2270 tests
-with 1082 explicit skips (three new skips require real WebGPU). The real `test:push` gate exits 0:
-default 3338 passed / 14 skipped, NVIDIA and Intel each 3388 passed / 14 skipped, with WebGPU/WebGL
-required in all three runs. Compared with round 2, the default suite gains the three initialization
-regressions; each GPU suite also gains three tape-tracing regressions. No existing test, tolerance,
-timeout or backend requirement was weakened. Hosted CI and phase exit criteria remain unverified or
-unmet as recorded above; no phase sign-off is inferred.
+**Continuation validation (2026-11-09, verified by round 3):** build, source type-check, full lint
+and touched-file formatting pass. The full CPU/WASM suite passes 2270 tests with 1082 explicit skips
+(three new skips require real WebGPU). The real `test:push` gate exits 0: default 3338 passed / 14
+skipped, NVIDIA and Intel each 3388 passed / 14 skipped, with WebGPU/WebGL required in all three
+runs. Compared with round 2, the default suite gains the three initialization regressions; each GPU
+suite also gains three tape-tracing regressions. No existing test, tolerance, timeout or backend
+requirement was weakened. Hosted CI and phase exit criteria remain unverified or unmet as recorded
+above; no phase sign-off is inferred.
 
 **Exit:** CI green on `wasm-multithreading`; default suite and both GPU suites green with required
 backends enforced; every skip/tolerance/timeout has a reason and issue; steady-state leak mode
