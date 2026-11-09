@@ -397,8 +397,12 @@ session instructed not to modify tracked files. Prefer a different model from th
 reduce correlated blind spots. It may build, run tests and run scripts. The reviewer does not fix
 anything. Findings go back to an implementation session, then a re-review checks only the open
 findings. Re-reviews within a phase may continue in the same review session, which keeps its
-reproductions (phase 0 did); each phase starts a fresh one. After two failed rounds, a human
-decides.
+reproductions (phase 0 did); each phase starts a fresh one. After two failed rounds a fresh arbiter
+review session (a different model from the implementer and the earlier reviewers where possible)
+decides each open finding in its report: fix it, checked by a round limited to that finding, or
+defer it with a reason and a target phase. Its decision is final for the phase. A finding that
+contradicts one of the phase's exit criteria cannot be deferred out of that phase; the phase stays
+open until it is fixed.
 
 **Input.** Only the commit range, this plan (the phase's exit criteria, §5 principles, §7
 signatures, the debt register) and the repository. The implementer's summary, commit messages and
@@ -408,9 +412,9 @@ status updates are _claims to verify_, not context.
 
 1. Every exit criterion of the phase: verified, not verified, or contradicted, each with evidence
    (command and result, `file:line`, test name, CI run). Also every numbered item and sub-item of
-   the phase: done (with commit), deferred (with the human's decision and target phase), or open. In
-   phase 0 two undecided salvage candidates passed three rounds because only the exit criteria were
-   checked.
+   the phase: done (with commit), deferred (with the reviewer's decision, reason and target phase),
+   or open. In phase 0 two undecided salvage candidates passed three rounds because only the exit
+   criteria were checked.
 2. Every completion claim in commit messages and docs in the range, checked against code (`grep`,
    type-checker, tests). Anything described as implemented must exist.
 3. Build, check, lint and test from a fresh clone of the range's last commit after `pnpm install`
@@ -440,8 +444,10 @@ and carried to the next review.
 **Gate.** A phase is marked done in this file only with a link to a passing review report whose
 Sign-off section the reviewer has signed. The same applies to releases. The reviewer's sign-off
 covers the review's item table, deferrals and uncovered commits, not the implementer's summary. A
-reviewer must not sign off a range it contradicts or could not verify; deferrals still need the
-human's decision, recorded in the report.
+reviewer must not sign off a range it contradicts or could not verify. The reviewer decides
+deferrals: each is recorded in the report with its reason and a target phase that the dependency
+order allows, and the implementation session adds it to that phase's item list. An exit criterion
+cannot be deferred.
 
 ### Phase 0 — Freeze and quarantine (R8)
 
