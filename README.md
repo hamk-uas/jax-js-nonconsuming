@@ -523,7 +523,7 @@ You can also run linting and formatting manually:
 pnpm lint          # Run ESLint (includes @hamk-uas/eslint-plugin-jax-js ownership rules)
 pnpm format        # Format all files with Prettier
 pnpm format:check  # Check formatting without writing
-pnpm check         # Run TypeScript type checking
+pnpm check         # Type-check source, including benchmarks; no prior build needed
 pnpm run test:eslint-plugin   # Rule-level tests for in-repo ESLint plugin
 pnpm run lint:ownership:internal  # Maintainer transform ownership checks
 ```

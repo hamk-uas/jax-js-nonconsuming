@@ -97,7 +97,7 @@ gpu_only_tests=(
   test/command-tape-gpu.test.ts
   test/pool-memory.test.ts
   test/blocked-data-movement.test.ts
-  test/repro-stub.test.ts
+  test/lax-associative-scan.test.ts
   test/conv.test.ts
 )
 if [[ "$profile" == "full" ]]; then

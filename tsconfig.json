@@ -6,7 +6,7 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "paths": {
-      "@hamk-uas/jax-js-nonconsuming": ["."],
+      "@hamk-uas/jax-js-nonconsuming": ["./src/index.ts"],
       "@hamk-uas/jax-js-nonconsuming-jaxopt": ["./packages/jaxopt/src"],
       "@hamk-uas/jax-js-nonconsuming-optax": ["./packages/optax/src"],
       "@hamk-uas/jax-js-nonconsuming-onnx": ["./packages/onnx/src"],
