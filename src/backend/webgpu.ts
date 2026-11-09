@@ -4909,128 +4909,141 @@ function pipelineSubmit(
 ) {
   const commandEncoder = batchEncoder ?? device.createCommandEncoder();
   const uniformBuffersToDestroy: GPUBuffer[] = [];
-  for (const { pipeline, ...shader } of pipelines) {
-    if (
-      inputs.length !== shader.numInputs ||
-      outputs.length !== shader.numOutputs
-    ) {
-      throw new Error(
-        `webgpu: expected ${shader.numInputs} inputs and ${shader.numOutputs} outputs, ` +
-          `got ${inputs.length} inputs and ${outputs.length} outputs`,
-      );
-    }
-
-    const filteredPasses = shader.passes.filter(({ grid }) => prod(grid) > 0);
-    if (filteredPasses.length === 0) continue; // No work to do.
-
-    // While profiling, the passes' timestamps belong to the profiler; a
-    // tracing slot would record an entry whose timestamps are never written.
-    const slot =
-      profiling || !source
-        ? undefined
-        : maybeAcquireTracingSlot(device, commandEncoder);
-    const bindGroup = device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        ...inputs.map((buffer, i) => ({
-          binding: i,
-          resource: { buffer },
-        })),
-        ...outputs.map((buffer, i) => ({
-          binding: inputs.length + i,
-          resource: { buffer },
-        })),
-      ],
-    });
-
-    let uniformBindGroup: GPUBindGroup | null = null;
-    let uniformAlignment = 0;
-
-    // Symbolic shaders: compute grid dynamically from dynamicParams and
-    // create a uniform buffer with resolved dimension values.
-    // struct Dims layout matches the shader:
-    //   isSymbolic + hasSymbolicReduction → { total_size: u32, reduce_size: u32 }
-    //   isSymbolic only                   → { total_size: u32 }
-    //   hasSymbolicReduction only         → { reduce_size: u32 }
-    let symbolicGrid: [number, number] | null = null;
-    const needsSymbolicUniform =
-      (shader.isSymbolic || shader.hasSymbolicReduction) &&
-      dynamicParams &&
-      dynamicParams.length > 0;
-    if (needsSymbolicUniform) {
-      if (shader.isSymbolic) {
-        const totalSize = dynamicParams[0];
-        const wgSize =
-          typeof shader.workgroupSize === "number"
-            ? shader.workgroupSize
-            : (shader.workgroupSize?.[0] ?? 256);
-        const gridSize = Math.ceil(totalSize / wgSize);
-        symbolicGrid = calculateGrid(gridSize);
+  let encoded = false;
+  try {
+    for (const { pipeline, ...shader } of pipelines) {
+      if (
+        inputs.length !== shader.numInputs ||
+        outputs.length !== shader.numOutputs
+      ) {
+        throw new Error(
+          `webgpu: expected ${shader.numInputs} inputs and ${shader.numOutputs} outputs, ` +
+            `got ${inputs.length} inputs and ${outputs.length} outputs`,
+        );
       }
 
-      // Build uniform data matching the shader's struct Dims field order
-      const uniformFields: number[] = [];
-      if (shader.isSymbolic) uniformFields.push(dynamicParams[0]); // total_size
-      if (shader.hasSymbolicReduction) uniformFields.push(dynamicParams[1]); // reduce_size
-      const dataSize = uniformFields.length * 4;
-      const uniformData = new Uint8Array(dataSize);
-      const dv = new DataView(uniformData.buffer);
-      for (let fi = 0; fi < uniformFields.length; fi++) {
-        dv.setUint32(fi * 4, uniformFields[fi], true);
+      const filteredPasses = shader.passes.filter(({ grid }) => prod(grid) > 0);
+      if (filteredPasses.length === 0) continue; // No work to do.
+
+      // While profiling, the passes' timestamps belong to the profiler; a
+      // tracing slot would record an entry whose timestamps are never written.
+      const slot =
+        profiling || !source
+          ? undefined
+          : maybeAcquireTracingSlot(device, commandEncoder);
+      const bindGroup = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          ...inputs.map((buffer, i) => ({
+            binding: i,
+            resource: { buffer },
+          })),
+          ...outputs.map((buffer, i) => ({
+            binding: inputs.length + i,
+            resource: { buffer },
+          })),
+        ],
+      });
+
+      let uniformBindGroup: GPUBindGroup | null = null;
+      let uniformAlignment = 0;
+
+      // Symbolic shaders: compute grid dynamically from dynamicParams and
+      // create a uniform buffer with resolved dimension values.
+      // struct Dims layout matches the shader:
+      //   isSymbolic + hasSymbolicReduction → { total_size: u32, reduce_size: u32 }
+      //   isSymbolic only                   → { total_size: u32 }
+      //   hasSymbolicReduction only         → { reduce_size: u32 }
+      let symbolicGrid: [number, number] | null = null;
+      const needsSymbolicUniform =
+        (shader.isSymbolic || shader.hasSymbolicReduction) &&
+        dynamicParams &&
+        dynamicParams.length > 0;
+      if (needsSymbolicUniform) {
+        if (shader.isSymbolic) {
+          const totalSize = dynamicParams[0];
+          const wgSize =
+            typeof shader.workgroupSize === "number"
+              ? shader.workgroupSize
+              : (shader.workgroupSize?.[0] ?? 256);
+          const gridSize = Math.ceil(totalSize / wgSize);
+          symbolicGrid = calculateGrid(gridSize);
+        }
+
+        // Build uniform data matching the shader's struct Dims field order
+        const uniformFields: number[] = [];
+        if (shader.isSymbolic) uniformFields.push(dynamicParams[0]); // total_size
+        if (shader.hasSymbolicReduction) uniformFields.push(dynamicParams[1]); // reduce_size
+        const dataSize = uniformFields.length * 4;
+        const uniformData = new Uint8Array(dataSize);
+        const dv = new DataView(uniformData.buffer);
+        for (let fi = 0; fi < uniformFields.length; fi++) {
+          dv.setUint32(fi * 4, uniformFields[fi], true);
+        }
+
+        const minAlign = device.limits.minUniformBufferOffsetAlignment;
+        const alignment = Math.ceil(dataSize / minAlign) * minAlign;
+        const uniformBuffer = device.createBuffer({
+          size: alignment,
+          usage: GPUBufferUsage.UNIFORM,
+          mappedAtCreation: true,
+        });
+        new Uint8Array(uniformBuffer.getMappedRange()).set(uniformData);
+        uniformBuffer.unmap();
+        uniformBuffersToDestroy.push(uniformBuffer);
+        uniformAlignment = alignment;
+        uniformBindGroup = device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(1),
+          entries: [
+            {
+              binding: 0,
+              resource: { buffer: uniformBuffer, size: alignment },
+            },
+          ],
+        });
+      } else if (shader.hasUniform) {
+        // Non-symbolic shader with uniforms: create a shared buffer with uniform
+        // values for each pass of the shader (use dynamic offsets).
+        const uniforms = filteredPasses.map(({ uniform }) => uniform!);
+        const [uniformBuffer, alignment] = combineUniforms(device, uniforms);
+        uniformBuffersToDestroy.push(uniformBuffer);
+        uniformAlignment = alignment;
+        uniformBindGroup = device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(1),
+          entries: [
+            {
+              binding: 0,
+              resource: { buffer: uniformBuffer, size: alignment },
+            },
+          ],
+        });
       }
 
-      const minAlign = device.limits.minUniformBufferOffsetAlignment;
-      const alignment = Math.ceil(dataSize / minAlign) * minAlign;
-      const uniformBuffer = device.createBuffer({
-        size: alignment,
-        usage: GPUBufferUsage.UNIFORM,
-        mappedAtCreation: true,
-      });
-      new Uint8Array(uniformBuffer.getMappedRange()).set(uniformData);
-      uniformBuffer.unmap();
-      uniformBuffersToDestroy.push(uniformBuffer);
-      uniformAlignment = alignment;
-      uniformBindGroup = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(1),
-        entries: [
-          { binding: 0, resource: { buffer: uniformBuffer, size: alignment } },
-        ],
-      });
-    } else if (shader.hasUniform) {
-      // Non-symbolic shader with uniforms: create a shared buffer with uniform
-      // values for each pass of the shader (use dynamic offsets).
-      const uniforms = filteredPasses.map(({ uniform }) => uniform!);
-      const [uniformBuffer, alignment] = combineUniforms(device, uniforms);
-      uniformBuffersToDestroy.push(uniformBuffer);
-      uniformAlignment = alignment;
-      uniformBindGroup = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(1),
-        entries: [
-          { binding: 0, resource: { buffer: uniformBuffer, size: alignment } },
-        ],
-      });
-    }
+      for (let i = 0; i < filteredPasses.length; i++) {
+        const grid = symbolicGrid ?? filteredPasses[i].grid;
+        const passEncoder = _beginComputePass(
+          commandEncoder,
+          profiling,
+          undefined,
+          tracingTimestampWrites(slot, i, filteredPasses.length),
+        );
+        passEncoder.setPipeline(pipeline);
+        passEncoder.setBindGroup(0, bindGroup);
+        if (uniformBindGroup)
+          passEncoder.setBindGroup(1, uniformBindGroup, [i * uniformAlignment]);
+        passEncoder.dispatchWorkgroups(grid[0], grid[1]);
+        _dispatchCount++;
+        passEncoder.end();
+      }
 
-    for (let i = 0; i < filteredPasses.length; i++) {
-      const grid = symbolicGrid ?? filteredPasses[i].grid;
-      const passEncoder = _beginComputePass(
-        commandEncoder,
-        profiling,
-        undefined,
-        tracingTimestampWrites(slot, i, filteredPasses.length),
-      );
-      passEncoder.setPipeline(pipeline);
-      passEncoder.setBindGroup(0, bindGroup);
-      if (uniformBindGroup)
-        passEncoder.setBindGroup(1, uniformBindGroup, [i * uniformAlignment]);
-      passEncoder.dispatchWorkgroups(grid[0], grid[1]);
-      _dispatchCount++;
-      passEncoder.end();
+      if (slot && source) {
+        recordTrace(slot, source, filteredPasses.length, shader.code);
+      }
     }
-
-    if (slot && source) {
-      recordTrace(slot, source, filteredPasses.length, shader.code);
-    }
+    encoded = true;
+  } finally {
+    // An own encoder that is never submitted still holds trace resources.
+    if (!encoded && !batchEncoder) discardTracingEncoder(commandEncoder);
   }
   if (batchEncoder) {
     // In batch mode: collect uniforms for caller to destroy after submit

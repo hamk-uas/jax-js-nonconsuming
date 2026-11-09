@@ -5,7 +5,6 @@ import { isSymbolicSize, type SizeExpr } from "./dim";
 import { Routine } from "./routine";
 
 let traceEnabled = false;
-const flushCallbacks: (() => void)[] = [];
 
 /**
  * Start collecting kernel traces.
@@ -25,18 +24,11 @@ export function startTrace(): void {
  */
 export function stopTrace(): void {
   traceEnabled = false;
-  const cbs = flushCallbacks.splice(0);
-  for (const cb of cbs) cb();
 }
 
 /** Check if tracing is currently enabled. */
 export function isTracing(): boolean {
   return traceEnabled;
-}
-
-/** Register a callback to flush pending trace data when tracing stops. */
-export function onFlushTrace(cb: () => void): void {
-  flushCallbacks.push(cb);
 }
 
 export interface TraceInfo {

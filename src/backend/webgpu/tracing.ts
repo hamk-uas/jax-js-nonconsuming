@@ -177,9 +177,9 @@ function readTracingBatch(batch: TracingBatch): void {
       try {
         const times = new BigInt64Array(batch.dst.getMappedRange());
 
-        // Establish baseline on the flush: pair the last GPU timestamp with
-        // flushCpuMs. We need to do this QuerySet because browsers insert jitter
-        // to prevent them being used as absolute timestamps.
+        // Anchor this batch's last GPU timestamp to the CPU clock at readback;
+        // browsers add jitter to timestamp queries, so they are only usable
+        // relative to each other.
         const anchorGpuNs = times[entries[entries.length - 1].endIndex];
         const anchorCpuMs = performance.now();
 
