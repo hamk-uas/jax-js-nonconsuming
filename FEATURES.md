@@ -81,6 +81,19 @@ functions.
 | `scatterAdd`         | 🟢      | scatter-add with autodiff (JVP, transpose, vmap)               |
 | `withBatch`          | 🟢      | batch GPU dispatches into single queue.submit()                |
 
+`checkLeaks.steadyState(body)` runs `body` twice sequentially, leaving JIT caches intact.
+Synchronous bodies return a `LeakReport`; promises and thenables from any realm are awaited, with
+their resolved values ignored. Possibly asynchronous bodies return
+`LeakReport | Promise<LeakReport>`. Its `leaked` field sums absolute per-backend slot-count changes
+in the second run, including releases; zero means every backend is unchanged. The summary retains
+each backend's signed delta.
+
+**Migration:** `const report: LeakReport = checkLeaks.steadyState(async () => value)` becomes
+`const report = await checkLeaks.steadyState(async () => value)`. Delete adapters that discard an
+async body's result solely to satisfy the former `Promise<void>` overload, and cross-realm promise
+normalization wrappers used solely for this API. Backend-specific checks used to avoid cancellation
+can become one `steadyState` call; do not interpret `leaked` as a signed net delta.
+
 Array primitives need to be called with methods like `a.add(b)` / `a.mul(b)` instead of `a + b` and
 `a * b` as in Python, which has overloading.
 

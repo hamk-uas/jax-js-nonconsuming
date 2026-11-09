@@ -539,6 +539,11 @@ approved native GPU float32 trig contract resolves the four Intel R24 test failu
 default/NVIDIA/Intel push gate passes. It does not improve runtime accuracy or sign off the phase.
 The separate accuracy plan remains outside remediation.
 
+[Round 4](remediation/reviews/phase-1-partial-4.md) verifies the item 7 cleanup and item 10 QR
+checks in `9b880b5..e42a033`, but rejects item 8 for async typing, cross-realm promise sequencing,
+and opposite backend deltas canceling. The implementation response below is ready for re-review, not
+a sign-off; Phase 1 remains incomplete.
+
 1. Add a GitHub Actions workflow running `pnpm install`, `pnpm build`, `pnpm check`, `pnpm lint`,
    `pnpm test` (non-GPU) on every push and PR, including pushes to `wasm-multithreading`. GPU suites
    stay local: add a pre-push hook that runs the full default suite and the full suite of the
@@ -608,7 +613,7 @@ The separate accuracy plan remains outside remediation.
    no test and only prints, and passes because the config sets `passWithNoTests: true`;
    `test/timing-tiled-matmul.test.ts` is a 35 s benchmark with no assertions and a 300 s timeout in
    the default suite (its header says to run it from `tmp/`; `bench/tiled-matmul.bench.ts` exists).
-   **Implementation, partial (pending review):** the 36 silent `if (!hasWebGPU) return;` in
+   **Implementation, partial (verified by round 4):** the 36 silent `if (!hasWebGPU) return;` in
    `block-map-jit.test.ts` and `lax-scan.test.ts` are now `skip()`, so a CPU-only run reports them
    as skipped (default suite unchanged: 3342 passed / 14 skipped). `test_cost.test.ts` (printed
    only) is replaced by `cost-model.test.ts`, five assertions on `evaluateTotalCost`'s documented
@@ -626,16 +631,27 @@ The separate accuracy plan remains outside remediation.
    GPU suites with `testTimeout: 300000`; they belong in `bench/`.
 8. Add a **steady-state leak mode** to `checkLeaks`: run the body twice and require zero slot growth
    on the second run _without_ flushing JIT caches. This catches the class of leak that `aa85998`
-   hid, while tolerating warm caches. **Implementation (pending review):**
+   hid, while tolerating warm caches. **Implementation (round 4 fixes pending re-review):**
    `checkLeaks.steadyState(body)` (sync or async) runs `body` once to warm up, then again, and
    reports any slot-count change of the second run with caches left intact; it does not touch an
    active `start()`/`stop()` session. `test/steady-state-leaks.test.ts` applies it on every device
    to linalg (cholesky, qr, lu, triangularSolve, jit), scan (eager, jit, jit∘grad), foriLoop (eager,
    jit, grad) and the transforms (grad, valueAndGrad, hessian, jacfwd, jvp, vjp, linearize,
-   jit∘vmap∘grad): 44 passed, 4 skipped (no routines on WebGL). `check-leaks.test.ts` proves the
-   mode catches a per-run leak, a leak into an unflushed cache (a fresh `jit` per run, which
-   `stop()` would free), and awaits async bodies. No leak was found in those areas. Not yet applied
-   to the existing per-area test files.
+   jit∘vmap∘grad): 48 passed, 4 skipped (no routines on WebGL; round 4 F4 corrects the former count
+   of 44). `check-leaks.test.ts` proves the mode catches a per-run leak, a leak into an unflushed
+   cache (a fresh `jit` per run, which `stop()` would free), and awaits async bodies. No leak was
+   found in those areas. Not yet applied to the existing per-area test files. **Round 4 response
+   (F1-F3):** infer the return type from the callback's result, including non-void async and
+   possibly async callbacks; await promises and thenables independently of their realm before
+   measuring or reporting; sum absolute per-backend slot changes, preserving signed deltas in the
+   summary, so allocations and releases cannot cancel. The last change also makes a decrease a
+   positive non-steady result rather than a negative `leaked` value. Focused regressions reproduce
+   the original type errors, premature cross-realm completion and cancellation, and cover mixed
+   sync/async runs, ignored sync results, thenables, rejection in either run and a decrease-only
+   body. The two leak-check files pass 53 tests / 26 skipped on CPU/WASM and 75 / 4 skipped on each
+   of NVIDIA and Intel; build, source type-check and targeted lint pass. The full default suite
+   passes 3406 tests / 18 skipped across 92 files. See the [migration notes](FEATURES.md) for
+   updated result types and report semantics. Existing per-area suite integration remains open.
 9. Decide R24 (own implementations vs spec-derived tolerances for GPU transcendentals). **Human
    decision, 2026-11-09:** accept native GPU float32 accuracy, following
    [WebNN #914](https://github.com/webmachinelearning/webnn/issues/914). Implementation verified by

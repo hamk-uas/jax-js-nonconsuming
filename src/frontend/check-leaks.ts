@@ -378,9 +378,13 @@ function safeRefCount(arr: object): string {
 
 // ── Public API ──
 
-/** Result returned by {@link checkLeaks.stop}. */
+/** Result returned by {@link checkLeaks.stop} or {@link checkLeaks.steadyState}. */
 export interface LeakReport {
-  /** Number of unreleased backend slots (0 = no leaks). */
+  /**
+   * Number of unreleased backend slots (0 = no leaks).
+   * For `steadyState`, the sum of absolute per-backend slot-count changes
+   * (0 = unchanged on every backend), including releases.
+   */
   leaked: number;
   /** Tracked leaks originating from user code (not inside a library package). */
   userLeaked: number;
@@ -676,7 +680,11 @@ export const checkLeaks = {
    * instead of being freed before counting. `body` must dispose everything it
    * creates, and must not depend on state that differs between runs.
    *
-   * Returns a promise when `body` does. It does not touch an active
+   * Callback results are ignored; promises and thenables from any realm are
+   * awaited before the next run or report. Returns a promise when either run
+   * does. `leaked` sums absolute per-backend changes, so releases cannot
+   * cancel allocations on another backend; the summary keeps their signs.
+   * It does not touch an active
    * `start()`/`stop()` session, so it can run inside one; the report has no
    * creation sites; rerun `body` under a `start()` session to locate them.
    */
@@ -710,7 +718,7 @@ function steadyStateReport(
     // A backend initialized by the second run has no baseline; all its
     // surviving slots count.
     const delta = count - (before.get(d) ?? 0);
-    leaked += delta;
+    leaked += Math.abs(delta);
     if (delta !== 0) perDevice.push(`${d}: ${delta > 0 ? "+" : ""}${delta}`);
   }
   return {
@@ -721,27 +729,41 @@ function steadyStateReport(
     summary:
       leaked === 0
         ? "No leaks detected."
-        : `Not steady: the second run changed the slot count by ${leaked} ` +
+        : `Not steady: the second run changed backend slot counts by ${leaked} in total ` +
           `(${perDevice.join(", ")}) with JIT caches left intact. Creation ` +
           "sites were not tracked; run the body under checkLeaks.start() " +
           "to locate them.",
   };
 }
 
-// The Promise overload comes first: an async body is also assignable to
-// `() => void`, which would give it a synchronous report type.
-function steadyState(body: () => Promise<void>): Promise<LeakReport>;
-function steadyState(body: () => void): LeakReport;
-function steadyState(
-  body: () => void | Promise<void>,
-): LeakReport | Promise<LeakReport> {
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    "then" in value &&
+    typeof value.then === "function"
+  );
+}
+
+function steadyState<R>(
+  body: () => R,
+): R extends PromiseLike<unknown>
+  ? Promise<LeakReport>
+  : PromiseLike<unknown> extends R
+    ? LeakReport | Promise<LeakReport>
+    : LeakReport;
+function steadyState(body: () => unknown): LeakReport | Promise<LeakReport> {
   const warmUp = body();
   const measure = (): LeakReport | Promise<LeakReport> => {
     const before = slotCounts();
     const second = body();
-    return second instanceof Promise
-      ? second.then(() => steadyStateReport(before, slotCounts()))
+    return isPromiseLike(second)
+      ? Promise.resolve(second).then(() =>
+          steadyStateReport(before, slotCounts()),
+        )
       : steadyStateReport(before, slotCounts());
   };
-  return warmUp instanceof Promise ? warmUp.then(measure) : measure();
+  return isPromiseLike(warmUp)
+    ? Promise.resolve(warmUp).then(measure)
+    : measure();
 }

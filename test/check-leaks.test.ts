@@ -8,9 +8,10 @@ import {
   checkLeaks,
   init,
   jit,
+  type LeakReport,
   numpy as np,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 
 await init();
 
@@ -210,6 +211,150 @@ describe("checkLeaks.steadyState", () => {
       expect(report.leaked).toBe(1);
     } finally {
       for (const x of kept) x.dispose();
+    }
+  });
+
+  it("types an async body with an ignored result as a promise", async () => {
+    let completed = 0;
+    const result = checkLeaks.steadyState(async () => ++completed);
+    expectTypeOf(result).toEqualTypeOf<Promise<LeakReport>>();
+    const report = await result;
+    expect(completed).toBe(2);
+    expect(report.leaked).toBe(0);
+    expect(report.summary).toBe("No leaks detected.");
+  });
+
+  it("keeps an ignored synchronous result synchronous", () => {
+    let completed = 0;
+    const report = checkLeaks.steadyState(() => ++completed);
+    expectTypeOf(report).toEqualTypeOf<LeakReport>();
+    expect(completed).toBe(2);
+    expect(report.summary).toBe("No leaks detected.");
+  });
+
+  it.each([true, false])(
+    "handles a possibly async body (async warm-up: %s)",
+    async (asyncWarmUp) => {
+      let calls = 0;
+      const body = (): void | Promise<number> => {
+        calls++;
+        if ((calls === 1) === asyncWarmUp) return Promise.resolve(calls);
+      };
+      const result = checkLeaks.steadyState(body);
+      expectTypeOf(result).toEqualTypeOf<LeakReport | Promise<LeakReport>>();
+      const report = await result;
+      expect(calls).toBe(2);
+      expect(report.summary).toBe("No leaks detected.");
+    },
+  );
+
+  it("allows an unknown callback result to be asynchronous", async () => {
+    const body = (): unknown => Promise.resolve(123);
+    const result = checkLeaks.steadyState(body);
+    expectTypeOf(result).toEqualTypeOf<LeakReport | Promise<LeakReport>>();
+    expect((await result).summary).toBe("No leaks detected.");
+  });
+
+  it("awaits thenables with ignored results sequentially", async () => {
+    let completed = 0;
+    const starts: number[] = [];
+    const body = (): PromiseLike<number> => {
+      starts.push(completed);
+      return {
+        then: (resolve, reject) =>
+          Promise.resolve()
+            .then(() => ++completed)
+            .then(resolve, reject),
+      };
+    };
+    const result = checkLeaks.steadyState(body);
+    expectTypeOf(result).toEqualTypeOf<Promise<LeakReport>>();
+    const report = await result;
+    expect(completed).toBe(2);
+    expect(starts).toEqual([0, 1]);
+    expect(report.summary).toBe("No leaks detected.");
+  });
+
+  it.each([1, 2])("propagates rejection from run %s", async (failedRun) => {
+    let calls = 0;
+    const error = new Error("body failed");
+    const body = async () => {
+      if (++calls === failedRun) throw error;
+    };
+    await expect(checkLeaks.steadyState(body)).rejects.toBe(error);
+    expect(calls).toBe(failedRun);
+  });
+
+  it("awaits cross-realm promises sequentially", async () => {
+    const frame = document.createElement("iframe");
+    document.body.append(frame);
+    const pending: Promise<void>[] = [];
+    const kept: np.Array[] = [];
+    let completed = 0;
+    const starts: number[] = [];
+    try {
+      if (!frame.contentWindow) throw new Error("Missing iframe window");
+      const OtherPromise = Reflect.get(
+        frame.contentWindow,
+        "Promise",
+      ) as PromiseConstructor;
+      const report = await checkLeaks.steadyState(() => {
+        starts.push(completed);
+        const promise = new OtherPromise<void>((resolve) => {
+          setTimeout(() => {
+            kept.push(np.array([1, 2], { device: "cpu" }));
+            completed++;
+            resolve();
+          }, 0);
+        });
+        pending.push(promise);
+        return promise;
+      });
+      expect(completed).toBe(2);
+      expect(starts).toEqual([0, 1]);
+      expect(report.leaked).toBe(1);
+      expect(report.summary).toContain("cpu: +1");
+    } finally {
+      await Promise.all(pending);
+      for (const x of kept) x.dispose();
+      frame.remove();
+    }
+  });
+
+  it("does not cancel opposite backend slot changes", () => {
+    // Nonuniform data forces backend storage instead of inline constants.
+    const inputs = [
+      np.array([1, 2], { device: "cpu" }),
+      np.array([2, 3], { device: "cpu" }),
+    ];
+    const kept: np.Array[] = [];
+    try {
+      const report = checkLeaks.steadyState(() => {
+        inputs.pop()!.dispose();
+        kept.push(np.array([3, 4], { device: "wasm" }));
+      });
+      expect(report.leaked).toBe(2);
+      expect(report.summary).toContain("Not steady");
+      expect(report.summary).toContain("cpu: -1");
+      expect(report.summary).toContain("wasm: +1");
+    } finally {
+      for (const x of inputs) x.dispose();
+      for (const x of kept) x.dispose();
+    }
+  });
+
+  it("reports a decrease rather than claiming steady state", () => {
+    const inputs = [
+      np.array([1, 2], { device: "cpu" }),
+      np.array([2, 3], { device: "cpu" }),
+    ];
+    try {
+      const report = checkLeaks.steadyState(() => inputs.pop()!.dispose());
+      expect(report.leaked).toBe(1);
+      expect(report.summary).toContain("Not steady");
+      expect(report.summary).toContain("cpu: -1");
+    } finally {
+      for (const x of inputs) x.dispose();
     }
   });
 
