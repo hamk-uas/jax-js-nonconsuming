@@ -748,6 +748,15 @@ Available `tree` utilities:
 The `jax.profiler` module has `startTrace()` and `stopTrace()`. When traces are started, `jax-js`
 emits per-kernel timings that appear in browser development tools.
 
+On WebGPU devices with `timestamp-query`, regular kernel and routine dispatches are traced in eager
+execution and in JIT command tapes. Each shader contributes one measurement spanning all its passes,
+with operation properties and WGSL source. Entries arrive asynchronously after command submission;
+`withBatch` delays submission until the batch ends, even if `stopTrace()` is called inside it.
+Traces can span multiple query sets without truncation. Timestamp resolution stays in the encoder
+that wrote the queries: a separate resolution submission produced partially converted results on
+Intel/Dawn. Dedicated scan, block-map, scatter-add and copy dispatch paths remain outside this
+tracing coverage. `profileGpu` owns its passes' timestamps and does not also emit trace entries.
+
 **WebGPU interop:**
 
 - `getWebGPUDevice()` — return the `GPUDevice` used by the WebGPU backend

@@ -59,6 +59,11 @@ describe("profileGpu", () => {
       using key = random.key(0);
       using a = random.uniform(key, [4096]);
       await a.blockUntilReady();
+      using fn = jit((x: np.Array) => x.mul(2).add(1));
+      {
+        using warmup = fn(a);
+        await warmup.blockUntilReady();
+      }
       const traced = () =>
         performance
           .getEntriesByType("measure")
@@ -74,6 +79,8 @@ describe("profileGpu", () => {
         try {
           using y = a.mul(3);
           await y.data();
+          using z = fn(a);
+          await z.data();
         } finally {
           profiler.stopTrace();
         }

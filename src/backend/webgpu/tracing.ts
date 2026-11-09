@@ -3,7 +3,6 @@ import { Routine } from "../../routine";
 import {
   emitTrace,
   isTracing,
-  onFlushTrace,
   type TraceInfo,
   traceSourceInfo,
 } from "../../tracing";
@@ -23,7 +22,7 @@ interface TracingBatch {
   entries: TracingEntry[];
 }
 
-const activeBatch = new WeakMap<GPUDevice, TracingBatch>();
+const encoderBatches = new WeakMap<GPUCommandEncoder, TracingBatch[]>();
 
 function createTracingBatch(device: GPUDevice): TracingBatch {
   return {
@@ -50,24 +49,18 @@ export interface TracingSlot {
   endIndex: number;
 }
 
-function acquireTracingSlot(device: GPUDevice): TracingSlot | undefined {
+function acquireTracingSlot(
+  device: GPUDevice,
+  encoder: GPUCommandEncoder,
+): TracingSlot | undefined {
   if (!device.features.has("timestamp-query")) return undefined;
 
-  let batch = activeBatch.get(device);
-  if (batch && batch.nextIndex >= MAX_TIMESTAMP_QUERIES) {
-    flushTracingBatch(device, batch);
-    batch = undefined;
-  }
-  if (!batch) {
+  let batches = encoderBatches.get(encoder);
+  if (!batches) encoderBatches.set(encoder, (batches = []));
+  let batch = batches.at(-1);
+  if (!batch || batch.nextIndex >= MAX_TIMESTAMP_QUERIES) {
     batch = createTracingBatch(device);
-    activeBatch.set(device, batch);
-    onFlushTrace(() => {
-      const b = activeBatch.get(device);
-      if (b && b.entries.length > 0) {
-        flushTracingBatch(device, b);
-      }
-      activeBatch.delete(device);
-    });
+    batches.push(batch);
   }
 
   const beginIndex = batch.nextIndex;
@@ -84,16 +77,84 @@ function acquireTracingSlot(device: GPUDevice): TracingSlot | undefined {
  */
 export function maybeAcquireTracingSlot(
   device: GPUDevice,
+  encoder: GPUCommandEncoder,
 ): TracingSlot | undefined {
   if (!isTracing()) return undefined;
-  return acquireTracingSlot(device);
+  return acquireTracingSlot(device, encoder);
+}
+
+/** Resolve timestamps in the encoder that wrote them, then submit and read back. */
+export function submitWithTracing(
+  device: GPUDevice,
+  encoder: GPUCommandEncoder,
+): void {
+  const batches = encoderBatches.get(encoder);
+  if (!batches) {
+    device.queue.submit([encoder.finish()]);
+    return;
+  }
+  let submitted = false;
+  try {
+    // Intel/Dawn produced partially converted timestamps with a separate
+    // resolve submission. Keeping writes and resolves together also prevents
+    // stopTrace() or query rollover from resolving unsubmitted writes.
+    for (const batch of batches) {
+      if (batch.entries.length === 0) continue;
+      encoder.resolveQuerySet(
+        batch.querySet,
+        0,
+        batch.nextIndex,
+        batch.resolve,
+        0,
+      );
+      encoder.copyBufferToBuffer(
+        batch.resolve,
+        0,
+        batch.dst,
+        0,
+        batch.nextIndex * 8,
+      );
+    }
+    device.queue.submit([encoder.finish()]);
+    submitted = true;
+  } finally {
+    if (!submitted) discardTracingEncoder(encoder);
+  }
+  encoderBatches.delete(encoder);
+  for (const batch of batches) {
+    if (batch.entries.length > 0) readTracingBatch(batch);
+    else destroyTracingBatch(batch);
+  }
+}
+
+/** Release trace resources for an encoder abandoned on an encoding error. */
+export function discardTracingEncoder(encoder: GPUCommandEncoder): void {
+  const batches = encoderBatches.get(encoder);
+  if (!batches) return;
+  encoderBatches.delete(encoder);
+  for (const batch of batches) destroyTracingBatch(batch);
+}
+
+/** Only the first and last passes of a dispatch write its timestamps. */
+export function tracingTimestampWrites(
+  slot: TracingSlot | undefined,
+  passIndex: number,
+  numPasses: number,
+): GPUComputePassTimestampWrites | undefined {
+  if (!slot || (passIndex !== 0 && passIndex !== numPasses - 1))
+    return undefined;
+  return {
+    querySet: slot.batch.querySet,
+    beginningOfPassWriteIndex: passIndex === 0 ? slot.beginIndex : undefined,
+    endOfPassWriteIndex:
+      passIndex === numPasses - 1 ? slot.endIndex : undefined,
+  };
 }
 
 /**
- * Record a tracing entry for a pipeline dispatch and schedule an auto-flush.
+ * Record a tracing entry for a pipeline dispatch.
  */
 export function recordTrace(
-  device: GPUDevice,
   slot: TracingSlot,
   source: Kernel | Routine,
   numPasses: number,
@@ -107,58 +168,42 @@ export function recordTrace(
     beginIndex: slot.beginIndex,
     endIndex: slot.endIndex,
   });
-  scheduleAutoFlush(device);
 }
 
-/**
- * If the active batch has pending entries, flush and replace it so traces
- * are emitted without waiting for the batch to fill or stopTrace().
- *
- * Called after each dispatch records its entry via a microtask so that
- * synchronous back-to-back dispatches are still batched together.
- */
-function scheduleAutoFlush(device: GPUDevice): void {
-  queueMicrotask(() => {
-    const batch = activeBatch.get(device);
-    if (batch && batch.entries.length > 0) {
-      flushTracingBatch(device, batch);
-      activeBatch.set(device, createTracingBatch(device));
-    }
-  });
-}
-
-function flushTracingBatch(device: GPUDevice, batch: TracingBatch): void {
-  if (batch.entries.length === 0) return;
-
-  const usedQueries = batch.nextIndex;
-  const encoder = device.createCommandEncoder();
-  encoder.resolveQuerySet(batch.querySet, 0, usedQueries, batch.resolve, 0);
-  encoder.copyBufferToBuffer(batch.resolve, 0, batch.dst, 0, usedQueries * 8);
-  device.queue.submit([encoder.finish()]);
-
+function readTracingBatch(batch: TracingBatch): void {
   const { entries } = batch;
-  batch.dst.mapAsync(GPUMapMode.READ).then(() => {
-    try {
-      const times = new BigInt64Array(batch.dst.getMappedRange());
+  batch.dst.mapAsync(GPUMapMode.READ).then(
+    () => {
+      try {
+        const times = new BigInt64Array(batch.dst.getMappedRange());
 
-      // Establish baseline on the flush: pair the last GPU timestamp with
-      // flushCpuMs. We need to do this QuerySet because browsers insert jitter
-      // to prevent them being used as absolute timestamps.
-      const anchorGpuNs = times[entries[entries.length - 1].endIndex];
-      const anchorCpuMs = performance.now();
+        // Establish baseline on the flush: pair the last GPU timestamp with
+        // flushCpuMs. We need to do this QuerySet because browsers insert jitter
+        // to prevent them being used as absolute timestamps.
+        const anchorGpuNs = times[entries[entries.length - 1].endIndex];
+        const anchorCpuMs = performance.now();
 
-      for (const entry of entries) {
-        const startMs =
-          anchorCpuMs + Number(times[entry.beginIndex] - anchorGpuNs) / 1e6;
-        const endMs =
-          anchorCpuMs + Number(times[entry.endIndex] - anchorGpuNs) / 1e6;
-        emitTrace("webgpu", entry, startMs, endMs);
+        for (const entry of entries) {
+          const startMs =
+            anchorCpuMs + Number(times[entry.beginIndex] - anchorGpuNs) / 1e6;
+          const endMs =
+            anchorCpuMs + Number(times[entry.endIndex] - anchorGpuNs) / 1e6;
+          emitTrace("webgpu", entry, startMs, endMs);
+        }
+      } finally {
+        batch.dst.unmap();
+        destroyTracingBatch(batch);
       }
-    } finally {
-      batch.dst.unmap();
-      batch.querySet.destroy();
-      batch.resolve.destroy();
-      batch.dst.destroy();
-    }
-  });
+    },
+    (error: unknown) => {
+      destroyTracingBatch(batch);
+      console.error("Failed to read WebGPU trace timestamps:", error);
+    },
+  );
+}
+
+function destroyTracingBatch(batch: TracingBatch): void {
+  batch.querySet.destroy();
+  batch.resolve.destroy();
+  batch.dst.destroy();
 }

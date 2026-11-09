@@ -73,7 +73,13 @@ import {
   type ScanBindingInfo,
   wrapRoutineForScan,
 } from "./webgpu/scan-wrapper";
-import { maybeAcquireTracingSlot, recordTrace } from "./webgpu/tracing";
+import {
+  discardTracingEncoder,
+  maybeAcquireTracingSlot,
+  recordTrace,
+  submitWithTracing,
+  tracingTimestampWrites,
+} from "./webgpu/tracing";
 import { createWgslGen, type ResolveGlobalIndex } from "./webgpu/wgsl-gen";
 
 interface ShaderDispatch extends ShaderInfo {
@@ -2334,7 +2340,7 @@ export class WebGPUBackend implements Backend {
       const encoder = this.#batchEncoder;
       if (!encoder) return;
       this.#batchEncoder = null;
-      this.device.queue.submit([encoder.finish()]);
+      submitWithTracing(this.device, encoder);
       // Destroy uniform buffers created during batch encoding
       for (const buf of this.#batchUniformsToDestroy) buf.destroy();
       this.#batchUniformsToDestroy = [];
@@ -2360,7 +2366,7 @@ export class WebGPUBackend implements Backend {
   flushBatch(): void {
     const encoder = this.#batchEncoder;
     if (!encoder) return;
-    this.device.queue.submit([encoder.finish()]);
+    submitWithTracing(this.device, encoder);
     // Destroy any uniform buffers from the flushed encoder
     for (const buf of this.#batchUniformsToDestroy) buf.destroy();
     this.#batchUniformsToDestroy = [];
@@ -2461,6 +2467,7 @@ export class WebGPUBackend implements Backend {
             ops.push({
               type: "dispatch",
               dispatch: {
+                source: step.source,
                 pipeline,
                 shader,
                 bindGroupLayout,
@@ -2845,10 +2852,9 @@ export class WebGPUBackend implements Backend {
     const pooledDuringTape = new Set<GPUBuffer>();
     let submitted = false;
     const ownEncoder = !this.#batchEncoder;
+    const encoder = this.#batchEncoder ?? this.device.createCommandEncoder();
 
     try {
-      const encoder = this.#batchEncoder ?? this.device.createCommandEncoder();
-
       for (const op of tape.ops) {
         switch (op.type) {
           case "malloc": {
@@ -2994,10 +3000,16 @@ export class WebGPUBackend implements Backend {
               d._bgCache = { key, value: bindGroup };
             }
 
+            const slot = this.#profiling
+              ? undefined
+              : maybeAcquireTracingSlot(this.device, encoder);
             for (let i = 0; i < d.passes.length; i++) {
-              const pe = _beginComputePass(encoder, this.#profiling, {
-                grid: d.passes[i].grid,
-              });
+              const pe = _beginComputePass(
+                encoder,
+                this.#profiling,
+                { grid: d.passes[i].grid },
+                tracingTimestampWrites(slot, i, d.passes.length),
+              );
               pe.setPipeline(d.pipeline);
               pe.setBindGroup(0, bindGroup);
               if (d.uniformBindGroup) {
@@ -3008,6 +3020,9 @@ export class WebGPUBackend implements Backend {
               pe.dispatchWorkgroups(d.passes[i].grid[0], d.passes[i].grid[1]);
               _dispatchCount++;
               pe.end();
+            }
+            if (slot) {
+              recordTrace(slot, d.source, d.passes.length, d.shader.code);
             }
             break;
           }
@@ -3229,11 +3244,12 @@ export class WebGPUBackend implements Backend {
       }
 
       if (ownEncoder) {
-        this.device.queue.submit([encoder.finish()]);
+        submitWithTracing(this.device, encoder);
       }
       submitted = true;
     } finally {
       if (!submitted) {
+        if (ownEncoder) discardTracingEncoder(encoder);
         // Remove buffers pushed to pool during this (failed) tape execution
         // to prevent pool poisoning (destroyed GPUBuffer refs in pool).
         for (const buf of pooledDuringTape) {
@@ -4909,7 +4925,10 @@ function pipelineSubmit(
 
     // While profiling, the passes' timestamps belong to the profiler; a
     // tracing slot would record an entry whose timestamps are never written.
-    const slot = profiling ? undefined : maybeAcquireTracingSlot(device);
+    const slot =
+      profiling || !source
+        ? undefined
+        : maybeAcquireTracingSlot(device, commandEncoder);
     const bindGroup = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: [
@@ -4994,19 +5013,11 @@ function pipelineSubmit(
 
     for (let i = 0; i < filteredPasses.length; i++) {
       const grid = symbolicGrid ?? filteredPasses[i].grid;
-      const tracingTsw = slot
-        ? {
-            querySet: slot.batch.querySet,
-            beginningOfPassWriteIndex: i === 0 ? slot.beginIndex : undefined,
-            endOfPassWriteIndex:
-              i === filteredPasses.length - 1 ? slot.endIndex : undefined,
-          }
-        : undefined;
       const passEncoder = _beginComputePass(
         commandEncoder,
         profiling,
         undefined,
-        tracingTsw,
+        tracingTimestampWrites(slot, i, filteredPasses.length),
       );
       passEncoder.setPipeline(pipeline);
       passEncoder.setBindGroup(0, bindGroup);
@@ -5018,14 +5029,14 @@ function pipelineSubmit(
     }
 
     if (slot && source) {
-      recordTrace(device, slot, source, filteredPasses.length, shader.code);
+      recordTrace(slot, source, filteredPasses.length, shader.code);
     }
   }
   if (batchEncoder) {
     // In batch mode: collect uniforms for caller to destroy after submit
     batchUniformCollector!.push(...uniformBuffersToDestroy);
   } else {
-    device.queue.submit([commandEncoder.finish()]);
+    submitWithTracing(device, commandEncoder);
     for (const buf of uniformBuffersToDestroy) buf.destroy();
   }
 }

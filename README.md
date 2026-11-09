@@ -435,6 +435,12 @@ if (devices.includes("webgpu")) {
 }
 ```
 
+Backend initialization is serialized, including concurrent `init()` calls, so failing graphics setup
+cannot overlap another backend's request. Unavailable backends are omitted from the result;
+unexpected initialization errors are logged without cancelling the other requested backends. Check
+the returned list before selecting a device. Separate `init("webgpu")` and `init("webgl")` calls are
+no longer needed solely to isolate their initialization failures.
+
 You can also place individual arrays on specific devices:
 
 ```ts

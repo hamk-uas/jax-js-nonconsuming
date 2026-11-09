@@ -12,6 +12,7 @@
 
 import { DType, Kernel } from "../../alu";
 import type { JitStep } from "../../frontend/jit";
+import type { Routine } from "../../routine";
 import { isSymbolicSize } from "../../shape";
 
 // ---------------------------------------------------------------------------
@@ -20,6 +21,8 @@ import { isSymbolicSize } from "../../shape";
 
 /** Pre-resolved representation of a single shader dispatch (one per ShaderDispatch). */
 export interface TapeDispatch {
+  /** Original operation for profiler labels and properties. */
+  source: Kernel | Routine;
   /** Pre-compiled GPU pipeline. */
   pipeline: GPUComputePipeline;
   /** Un-compiled raw shader struct (kept for PendingCommandTape.prepare). */

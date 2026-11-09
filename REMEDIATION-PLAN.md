@@ -535,7 +535,10 @@ sign off Phase 1.
 
 [Partial review round 1](remediation/reviews/phase-1-partial-1.md) passes for `3a2aaea..0b3c72a`:
 local gates and setup integrity are verified, hosted CI remains unverified, and Phase 1 is not
-signed off. The review's four Intel R24 failures are the baseline for item 9 below.
+signed off. [Round 2](remediation/reviews/phase-1-partial-2.md) passes for `0b3c72a..83e0e32`: the
+approved native GPU float32 trig contract resolves the four Intel R24 test failures, and the real
+default/NVIDIA/Intel push gate passes. It does not improve runtime accuracy or sign off the phase.
+The separate accuracy plan remains outside remediation.
 
 1. Add a GitHub Actions workflow running `pnpm install`, `pnpm build`, `pnpm check`, `pnpm lint`,
    `pnpm test` (non-GPU) on every push and PR, including pushes to `wasm-multithreading`. GPU suites
@@ -571,9 +574,32 @@ signed off. The review's four Intel R24 failures are the baseline for item 9 bel
 3. Make missing backends loud (R18). Done in phase 0, item 8.
 4. Fix the five failures the skips had hidden (R19). Done in phase 0, item 6.
 5. Decouple backend initialization (R20): one backend's failure must not affect another's; add a
-   test that injects a WebGL failure and asserts WebGPU still initializes.
+   test that injects a WebGL failure and asserts WebGPU still initializes. Implementation pending
+   independent review: serialize backend creation across both a single `init()` and concurrent
+   calls. Log unexpected creation errors per backend and continue initializing the others; normal
+   unavailability still omits that backend from the returned list. A fresh-worker regression uses
+   the real WebGPU adapter/device while injecting unavailable or throwing WebGL context creation. It
+   also simulates the observed interference (an overlapping WebGL failure makes the adapter
+   unavailable), verifies no overlap, checks the diagnostic, and requires one WebGPU request even
+   across concurrent calls. All three cases pass on NVIDIA and Intel; CPU-only CI explicitly reports
+   these hardware-dependent cases as skipped.
 6. Make WebGPU errors fail tests (R21): done in phase 0, item 8. Remaining: make the command tape's
-   passes traceable (R23), and test that a `jit` call produces trace entries.
+   passes traceable (R23), and test that a `jit` call produces trace entries. Implementation pending
+   independent review: regular kernel/routine tape dispatches now retain their source metadata and
+   share tracing with eager execution, without bypassing the tape. A warmed JIT call produces one
+   real `performance.measure` entry with its operation properties and WGSL source; a multi-pass sort
+   contributes one measurement across its passes. Middle passes must omit `timestampWrites`, not
+   supply a descriptor with both indices undefined. Query batches belong to their encoder and
+   resolve alongside their writes before submission, so stopping inside `withBatch` or exceeding
+   2048 begin/end pairs cannot resolve unwritten queries. The stress regression requires all 2049
+   entries and nonzero measured work, not merely acceptance of zero-filled timestamps. A raw WebGPU
+   diagnostic reproduced partially converted/zero timestamps on Intel when resolution used a
+   separate command buffer; resolving in the writing encoder fixes that case on both GPUs. Resources
+   are released after readback (including rejection) or abandoned tape encoding, without allocating
+   a replacement empty batch. Profiling still suppresses tracing of both eager and tape dispatches.
+   Focused initialization/tracing/profiling/batching coverage: 22 tests pass on each GPU. Dedicated
+   scan, block-map, scatter-add and copy dispatch tracing remains open; this is not a claim that
+   every specialized pass is now traced.
 7. Inventory every skip, early `return;`, device-specific tolerance, timeout override and config
    exclusion (commands in Appendix B). For each: keep with a written reason and an issue link, or
    turn it into a failing test plus an issue. Replace silent `return;` with `ctx.skip()` so skipped
@@ -586,38 +612,47 @@ signed off. The review's four Intel R24 failures are the baseline for item 9 bel
    hid, while tolerating warm caches.
 9. Decide R24 (own implementations vs spec-derived tolerances for GPU transcendentals). **Human
    decision, 2026-11-09:** accept native GPU float32 accuracy, following
-   [WebNN #914](https://github.com/webmachinelearning/webnn/issues/914). Implementation pending
-   review: `sin`/`cos` tests use WGSL's `2^-11` absolute bound only inside `[-pi,pi]`; `atan` uses
-   4096 ULP of the reference value. The current WGSL `asin` bound is the worse of `6.81e-5` absolute
-   and inherited `atan2(x,sqrt(1-x*x))` error, not simply 4096 ULP. For the existing corpus's
-   non-endpoint values (`|x| <= 0.7`, `1-x*x >= 0.51`), `8*epsilon` covers the inherited
-   expression's arithmetic perturbation of the angle; add its 4096-ULP `atan2` error. The library's
-   `acos = pi/2 - asin` adds less than `3*epsilon` absolute from constant/subtraction rounding. Here
-   `epsilon = 2^-23`. The library's `atan2 = 2*atan(q)` doubles the native atan error. For the
-   existing moderate finite corpus, squares/add/sqrt perturb `r` by less than `7*epsilon`
-   relatively, forming `r+|x|` by less than `9*epsilon`, and reciprocal/multiply produce `q` with
-   less than `14*epsilon` relative error. Since the half-angle formula's sensitivity to relative `q`
-   error is at most 1, `16*epsilon` bounds the propagated absolute angle error. Endpoints, axis
-   values and infinity retain compatibility smoke assertions without claiming general WGSL
-   guarantees. New tangent tests propagate `sin/cos` error and reciprocal/multiply rounding only for
-   `|cos(x)| >= 0.5` on all devices. An exploratory WASM float32 sample at `x=-1.5` differed by
-   `9.08e-6` at an output of `-14.1014`; no WASM threshold was relaxed to accommodate it. WebGL
-   adopts the same budget by project policy; GLSL ES leaves trig accuracy unspecified. Boundary
-   controls require rejection above the allowed error and of NaN, and verify that CPU/WASM and
-   non-f32 metadata still use the original 5-decimal requirement. Runtime lowering, skips,
-   float16/float64 and gradient thresholds are unchanged. See
-   [accuracy notes](FEATURES.md#gpu-float32-trigonometric-accuracy). Local validation: the former
-   four Intel failures reproduce before the change. The updated focused trig/control selection
-   passes all 29 selected tests on each GPU. CPU/WASM full suite: 2270 passed / 1079 skipped. The
-   real `test:push` gate now exits 0: default 3335 passed / 14 skipped; NVIDIA and Intel each 3382
-   passed / 14 skipped, with WebGPU/WebGL required. Type-check and targeted lint pass. These are
-   implementation claims for independent review, not a Phase 1 sign-off or evidence of hosted CI.
+   [WebNN #914](https://github.com/webmachinelearning/webnn/issues/914). Implementation verified by
+   [round 2](remediation/reviews/phase-1-partial-2.md): `sin`/`cos` tests use WGSL's `2^-11`
+   absolute bound only inside `[-pi,pi]`; `atan` uses 4096 ULP of the reference value. The current
+   WGSL `asin` bound is the worse of `6.81e-5` absolute and inherited `atan2(x,sqrt(1-x*x))` error,
+   not simply 4096 ULP. For the existing corpus's non-endpoint values (`|x| <= 0.7`,
+   `1-x*x >= 0.51`), `8*epsilon` covers the inherited expression's arithmetic perturbation of the
+   angle; add its 4096-ULP `atan2` error. The library's `acos = pi/2 - asin` adds less than
+   `3*epsilon` absolute from constant/subtraction rounding. Here `epsilon = 2^-23`. The library's
+   `atan2 = 2*atan(q)` doubles the native atan error. For the existing moderate finite corpus,
+   squares/add/sqrt perturb `r` by less than `7*epsilon` relatively, forming `r+|x|` by less than
+   `9*epsilon`, and reciprocal/multiply produce `q` with less than `14*epsilon` relative error.
+   Since the half-angle formula's sensitivity to relative `q` error is at most 1, `16*epsilon`
+   bounds the propagated absolute angle error. Endpoints, axis values and infinity retain
+   compatibility smoke assertions without claiming general WGSL guarantees. New tangent tests
+   propagate `sin/cos` error and reciprocal/multiply rounding only for `|cos(x)| >= 0.5` on all
+   devices. An exploratory WASM float32 sample at `x=-1.5` differed by `9.08e-6` at an output of
+   `-14.1014`; no WASM threshold was relaxed to accommodate it. WebGL adopts the same budget by
+   project policy; GLSL ES leaves trig accuracy unspecified. Boundary controls require rejection
+   above the allowed error and of NaN, and verify that CPU/WASM and non-f32 metadata still use the
+   original 5-decimal requirement. Runtime lowering, skips, float16/float64 and gradient thresholds
+   are unchanged. See [accuracy notes](FEATURES.md#gpu-float32-trigonometric-accuracy). Local
+   validation: the former four Intel failures reproduce before the change. The updated focused
+   trig/control selection passes all 29 selected tests on each GPU. CPU/WASM full suite: 2270 passed
+   / 1079 skipped. The real `test:push` gate now exits 0: default 3335 passed / 14 skipped; NVIDIA
+   and Intel each 3382 passed / 14 skipped, with WebGPU/WebGL required. Type-check and targeted lint
+   pass. These are verified by round 2, not a Phase 1 sign-off or evidence of hosted CI.
 10. Re-derive FD tolerances: run gradient checks in f64 on CPU/WASM with tight tolerances; for f32
     WebGPU, derive tolerances from the problem's conditioning and document the derivation inline.
 11. Website pages start GPU work only when the visitor asks (R25, remainder): `/bench/results`,
     linked from the homepage, runs matmuls up to 2048² in f32 and f16 as soon as it opens.
 12. Re-add a TTS per-step benchmark (R26) that imports the website's Pocket TTS model code and runs
     it with random weights; it must pass the benchmark leak check.
+
+**Current continuation validation (2026-11-09, pending independent review):** build, source
+type-check, full lint and touched-file formatting pass. The full CPU/WASM suite passes 2270 tests
+with 1082 explicit skips (three new skips require real WebGPU). The real `test:push` gate exits 0:
+default 3338 passed / 14 skipped, NVIDIA and Intel each 3388 passed / 14 skipped, with WebGPU/WebGL
+required in all three runs. Compared with round 2, the default suite gains the three initialization
+regressions; each GPU suite also gains three tape-tracing regressions. No existing test, tolerance,
+timeout or backend requirement was weakened. Hosted CI and phase exit criteria remain unverified or
+unmet as recorded above; no phase sign-off is inferred.
 
 **Exit:** CI green on `wasm-multithreading`; default suite and both GPU suites green with required
 backends enforced; every skip/tolerance/timeout has a reason and issue; steady-state leak mode

@@ -16,8 +16,10 @@ import {
   jit,
   lax,
   numpy as np,
+  profiler,
   reverse,
   scatterAdd,
+  withBatch,
 } from "@hamk-uas/jax-js-nonconsuming";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
@@ -27,6 +29,16 @@ await init("webgpu");
 
 function vals(a: np.Array): number[] {
   return Array.from(a.dataSync() as Float32Array);
+}
+
+function webGpuTraces(): PerformanceMeasure[] {
+  return (
+    performance.getEntriesByType("measure") as PerformanceMeasure[]
+  ).filter(
+    (entry) =>
+      entry.detail?.devtools?.trackGroup === "JAX Profiler" &&
+      entry.detail.devtools.track === "webgpu",
+  );
 }
 
 describe("O8c command tape GPU correctness", () => {
@@ -86,5 +98,102 @@ describe("O8c command tape GPU correctness", () => {
     expect(stats.length).toBeGreaterThanOrEqual(1);
 
     f.dispose();
+  });
+
+  it("traces a warmed JIT command-tape dispatch", async () => {
+    using f = jit((x: np.Array) => x.mul(2).add(1));
+    using x = np.array([1, 2, 3, 4]);
+    {
+      using warmup = f(x);
+      await warmup.blockUntilReady();
+    }
+    expect(_getCommandTapeStats().length).toBeGreaterThan(0);
+    performance.clearMeasures();
+
+    profiler.startTrace();
+    try {
+      using result = f(x);
+      expect(Array.from(await result.data())).toEqual([3, 5, 7, 9]);
+    } finally {
+      profiler.stopTrace();
+    }
+
+    try {
+      await expect.poll(() => webGpuTraces().length).toBe(1);
+      const trace = webGpuTraces()[0];
+      expect(trace.name).toMatch(/^Kernel\[/);
+      expect(trace.duration).toBeGreaterThanOrEqual(0);
+      expect(trace.detail.devtools.properties).toEqual(
+        expect.arrayContaining([
+          ["passes", "1"],
+          ["source", expect.stringContaining("@compute")],
+        ]),
+      );
+    } finally {
+      performance.clearMeasures();
+    }
+  });
+
+  it("traces all passes of a multi-pass routine on the tape", async () => {
+    using f = jit((x: np.Array) => np.sort(x));
+    using x = np.array(Array.from({ length: 4096 }, (_, i) => 4095 - i));
+    {
+      using warmup = f(x);
+      await warmup.blockUntilReady();
+    }
+    expect(_getCommandTapeStats().length).toBeGreaterThan(0);
+    performance.clearMeasures();
+
+    profiler.startTrace();
+    try {
+      using result = f(x);
+      expect(Array.from(await result.data())).toEqual(
+        Array.from({ length: 4096 }, (_, i) => i),
+      );
+    } finally {
+      profiler.stopTrace();
+    }
+    try {
+      await expect.poll(() => webGpuTraces().length).toBe(1);
+      const trace = webGpuTraces()[0];
+      expect(trace.name).toMatch(/sort/i);
+      expect(
+        Number(
+          trace.detail.devtools.properties.find(
+            ([key]: [string, string]) => key === "passes",
+          )[1],
+        ),
+      ).toBeGreaterThan(1);
+    } finally {
+      performance.clearMeasures();
+    }
+  });
+
+  it("rolls timestamp batches over before stopping inside withBatch", async () => {
+    using f = jit((x: np.Array) => x.add(1));
+    using x = np.ones([8192]);
+    {
+      using warmup = f(x);
+      await warmup.blockUntilReady();
+    }
+    performance.clearMeasures();
+    try {
+      // One more than a QuerySet's 2048 begin/end pairs, all in one encoder.
+      withBatch(() => {
+        profiler.startTrace();
+        try {
+          for (let i = 0; i < 2049; i++) {
+            using _result = f(x);
+          }
+        } finally {
+          profiler.stopTrace();
+        }
+      });
+      await expect.poll(() => webGpuTraces().length).toBe(2049);
+      expect(webGpuTraces().every((trace) => trace.duration >= 0)).toBe(true);
+      expect(webGpuTraces().some((trace) => trace.duration > 0)).toBe(true);
+    } finally {
+      performance.clearMeasures();
+    }
   });
 });

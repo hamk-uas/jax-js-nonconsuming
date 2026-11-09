@@ -141,6 +141,7 @@ export function _isCodeCaptureEnabled(): boolean {
 }
 
 const initializedBackends = new Map<Device, Backend>();
+let backendInitialization = Promise.resolve();
 
 // Default backends, initialized at startup.
 initializedBackends.set("cpu", new CpuBackend());
@@ -167,27 +168,34 @@ export function defaultDevice(device?: Device): Device {
  *
  * By default, this will initialize all available backends. If one or more
  * backends is provided, only attempt to initialize those. Returns a list of
- * available backends.
+ * available backends. Initialization is serialized, including concurrent calls,
+ * so a failing graphics context cannot interfere with another backend's request.
+ * Unexpected initialization failures are logged and leave that backend unavailable.
  */
 export async function init(...devicesToInit: Device[]): Promise<Device[]> {
   if (devicesToInit.length === 0) {
     devicesToInit = devices;
   }
   const requestedDevices = new Set(devicesToInit);
-  const promises: Promise<void>[] = [];
-  for (const device of requestedDevices) {
-    if (!initializedBackends.has(device)) {
-      promises.push(
-        (async () => {
+  const initialization = backendInitialization.then(async () => {
+    for (const device of requestedDevices) {
+      if (!initializedBackends.has(device)) {
+        try {
           const backend = await createBackend(device);
           if (backend) {
             initializedBackends.set(device, backend);
           }
-        })(),
-      );
+        } catch (error) {
+          console.error(
+            `Unexpected error initializing ${device} backend:`,
+            error,
+          );
+        }
+      }
     }
-  }
-  await Promise.all(promises);
+  });
+  backendInitialization = initialization;
+  await initialization;
   return Array.from(initializedBackends.keys());
 }
 
@@ -226,22 +234,15 @@ async function createBackend(device: Device): Promise<Backend | null> {
       "subgroups" as GPUFeatureName, // SIMD-width operations (shuffle, reduce within wave).
     ];
 
-    try {
-      const device = await adapter.requestDevice({
-        requiredLimits: Object.fromEntries(
-          importantLimits.map((limit) => [limit, adapter.limits[limit]]),
-        ),
-        requiredFeatures: requestedFeatures.filter((feature) =>
-          adapter.features.has(feature),
-        ),
-      });
-      return new WebGPUBackend(device);
-    } catch (error) {
-      // Browsers can throw a TypeError if features are not supported by the
-      // adapter, or limits have not been set properly.
-      console.error("Unexpected error requesting WebGPU device:", error);
-      return null;
-    }
+    const gpuDevice = await adapter.requestDevice({
+      requiredLimits: Object.fromEntries(
+        importantLimits.map((limit) => [limit, adapter.limits[limit]]),
+      ),
+      requiredFeatures: requestedFeatures.filter((feature) =>
+        adapter.features.has(feature),
+      ),
+    });
+    return new WebGPUBackend(gpuDevice);
   } else if (device === "webgl") {
     if (typeof WebGL2RenderingContext === "undefined") return null; // WebGL2 is not available.
     const canvas = new OffscreenCanvas(0, 0);

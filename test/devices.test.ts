@@ -2,9 +2,12 @@ import {
   defaultDevice,
   devicePut,
   devices,
+  init,
   numpy as np,
 } from "@hamk-uas/jax-js-nonconsuming";
-import { expect, test } from "vitest";
+import { expect, suite, test } from "vitest";
+
+const availableDevices = await init();
 
 defaultDevice("cpu");
 
@@ -72,3 +75,51 @@ test("devicePut works with scalars", async () => {
   expect(z.device).toBe("wasm");
   expect(z.js()).toBe(15);
 });
+
+// R20 requires real WebGPU initialization; CPU-only CI reports these as skips.
+suite.skipIf(!availableDevices.includes("webgpu"))(
+  "independent backend initialization (R20)",
+  () => {
+    test.each([
+      { failure: "unavailable", concurrent: false },
+      { failure: "throw", concurrent: false },
+      { failure: "throw", concurrent: true },
+    ])(
+      "WebGPU survives WebGL $failure (concurrent calls: $concurrent)",
+      async ({ failure, concurrent }) => {
+        // Blob workers lack Vitest's dynamic-import runtime; use Vite's worker pipeline.
+        const worker = new Worker(
+          new URL("./backend-init.worker.ts", import.meta.url),
+          { type: "module" },
+        );
+        try {
+          const result = await new Promise<{
+            available?: string[];
+            overlap: boolean;
+            adapterRequests: number;
+            diagnostics: string[];
+            error?: string;
+          }>((resolve, reject) => {
+            worker.onmessage = (event) => resolve(event.data);
+            worker.onerror = (event) => reject(new Error(event.message));
+            worker.postMessage({ failure, concurrent });
+          });
+          expect(result.error).toBeUndefined();
+          expect(result.available, JSON.stringify(result)).toContain("webgpu");
+          expect(result.available).not.toContain("webgl");
+          expect(result.overlap).toBe(false);
+          expect(result.adapterRequests).toBe(1);
+          expect(result.diagnostics).toEqual(
+            failure === "throw"
+              ? [
+                  "Unexpected error initializing webgl backend: Error: injected WebGL context failure",
+                ]
+              : [],
+          );
+        } finally {
+          worker.terminate();
+        }
+      },
+    );
+  },
+);
