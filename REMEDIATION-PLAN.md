@@ -397,12 +397,8 @@ session instructed not to modify tracked files. Prefer a different model from th
 reduce correlated blind spots. It may build, run tests and run scripts. The reviewer does not fix
 anything. Findings go back to an implementation session, then a re-review checks only the open
 findings. Re-reviews within a phase may continue in the same review session, which keeps its
-reproductions (phase 0 did); each phase starts a fresh one. After two failed rounds a fresh arbiter
-review session (a different model from the implementer and the earlier reviewers where possible)
-decides each open finding in its report: fix it, checked by a round limited to that finding, or
-defer it with a reason and a target phase. Its decision is final for the phase. A finding that
-contradicts one of the phase's exit criteria cannot be deferred out of that phase; the phase stays
-open until it is fixed.
+reproductions (phase 0 did); each phase starts a fresh one. Implement and review alternate until the
+review passes; there is no round limit.
 
 **Input.** Only the commit range, this plan (the phase's exit criteria, §5 principles, §7
 signatures, the debt register) and the repository. The implementer's summary, commit messages and
@@ -444,10 +440,8 @@ and carried to the next review.
 **Gate.** A phase is marked done in this file only with a link to a passing review report whose
 Sign-off section the reviewer has signed. The same applies to releases. The reviewer's sign-off
 covers the review's item table, deferrals and uncovered commits, not the implementer's summary. A
-reviewer must not sign off a range it contradicts or could not verify. The reviewer decides
-deferrals: each is recorded in the report with its reason and a target phase that the dependency
-order allows, and the implementation session adds it to that phase's item list. An exit criterion
-cannot be deferred.
+reviewer must not sign off a range it contradicts or could not verify. Deferrals are the reviewer's
+call, recorded in the report with a reason and a target phase.
 
 ### Phase 0 — Freeze and quarantine (R8)
 
