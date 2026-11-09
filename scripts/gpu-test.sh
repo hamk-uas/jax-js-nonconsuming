@@ -11,6 +11,7 @@
 # GPU selection:
 #   GPU=nvidia scripts/gpu-test.sh bench bench/matmul.bench.ts   # NVIDIA only
 #   GPU=intel  scripts/gpu-test.sh bench bench/matmul.bench.ts   # Intel only
+#   GPU=amd    scripts/gpu-test.sh run                         # AMD only
 #   GPU=both   scripts/gpu-test.sh bench bench/matmul.bench.ts   # both (default)
 #
 set -euo pipefail
@@ -22,6 +23,7 @@ shift || true
 
 nvidia_cfg="test/vitest.nvidia.config.ts"
 intel_cfg="test/vitest.intel.config.ts"
+amd_cfg="test/vitest.amd.config.ts"
 
 run_gpu() {
   local label="$1" cfg="$2"
@@ -46,8 +48,12 @@ if [[ "$gpu" == "intel" || "$gpu" == "both" ]]; then
   run_gpu "Intel" "$intel_cfg" "$@" || exit_code=$?
 fi
 
-if [[ "$gpu" != "nvidia" && "$gpu" != "intel" && "$gpu" != "both" ]]; then
-  echo "Error: GPU must be 'nvidia', 'intel', or 'both' (got '$gpu')"
+if [[ "$gpu" == "amd" ]]; then
+  run_gpu "AMD" "$amd_cfg" "$@" || exit_code=$?
+fi
+
+if [[ "$gpu" != "nvidia" && "$gpu" != "intel" && "$gpu" != "amd" && "$gpu" != "both" ]]; then
+  echo "Error: GPU must be 'nvidia', 'intel', 'amd', or 'both' (got '$gpu')"
   exit 1
 fi
 

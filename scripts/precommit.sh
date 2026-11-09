@@ -70,6 +70,7 @@ pnpm check
 pnpm lint --max-warnings 0
 pnpm format:check
 pnpm run test:eslint-plugin
+pnpm run test:push-gate
 pnpm run lint:ownership:website
 
 if [[ "$arch_mode" == "1" ]]; then

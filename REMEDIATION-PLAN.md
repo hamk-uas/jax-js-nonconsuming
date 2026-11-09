@@ -538,6 +538,17 @@ sign off Phase 1.
    stay local: add a pre-push hook that runs the full default suite and the full suite of the
    detected GPU (`scripts/gpu-test.sh`). The pre-commit hook runs only 9 test files, so no gate saw
    the R19 failures, and none noticed that `pnpm run test:gpu` had run no tests since March (R18).
+   Implementation now adds `.github/workflows/checks.yaml` for all pushes and PRs, using the full
+   CPU/WASM suite in Chromium (a Node-only probe failed on OPFS and WASM fixture assumptions). The
+   pre-push hook runs `test:push`: full default suite, then full GPU suites through
+   `scripts/gpu-test.sh`. The human chose **all detected supported GPUs**, not just the preferred
+   one, and an explicit CPU/WASM-only fallback when none is detected. GPU failures are not
+   suppressed; Intel R24 therefore still blocks pushes here. Local validation: CPU/WASM 2265 passed
+   / 1071 skipped; default 3322 passed / 14 skipped; NVIDIA 3375 passed / 14 skipped; Intel 3371
+   passed / 14 skipped / 4 unchanged R24 failures. The real push gate ran all three local suites and
+   exited 1 on Intel. Five push-gate tests cover multi-GPU selection, required backend enforcement,
+   failure propagation, CPU-only fallback and a terminated runner. Ready for independent review; no
+   GitHub CI run is claimed yet.
 2. Make the setup honest (R16): the website's `prepare` script must fail when `svelte-kit sync`
    fails instead of `|| echo ''`; give `bench/` a `tsconfig` that does not type-check against a
    stale `dist/`, or build first in `pnpm check`; move `repro-stub`/`debug-wgsl` out of `test/`.

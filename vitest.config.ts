@@ -11,8 +11,13 @@ import {
   workspaceAliases,
 } from "./test/gpu-config";
 
-const gpu = detectGpu();
-describeGpuSetup(gpu);
+const cpuOnly = process.env.JAX_TEST_CPU_ONLY === "1";
+const gpu = cpuOnly ? undefined : detectGpu();
+if (cpuOnly) {
+  console.log("[test config] CPU/WASM only; GPU backends disabled");
+} else {
+  describeGpuSetup(gpu);
+}
 
 export default defineConfig({
   resolve: {
@@ -41,7 +46,20 @@ export default defineConfig({
       headless: true,
       screenshotFailures: false,
       // No display server, one Vulkan driver; see chromiumLaunchOptions().
-      provider: playwright({ launchOptions: chromiumLaunchOptions(gpu) }),
+      provider: playwright({
+        launchOptions: cpuOnly
+          ? {
+              args: [
+                "--no-sandbox",
+                "--headless=new",
+                "--disable-gpu",
+                "--disable-webgpu",
+                "--disable-software-rasterizer",
+              ],
+              env: {},
+            }
+          : chromiumLaunchOptions(gpu),
+      }),
       instances: [{ browser: "chromium" }],
     },
     coverage: {
@@ -54,7 +72,10 @@ export default defineConfig({
     // concurrency (see BROWSER_MAX_WORKERS).
     maxWorkers: BROWSER_MAX_WORKERS,
     // A detected GPU must initialize; see requiredDevices().
-    provide: { requiredDevices: requiredDevices(gpu) },
+    provide: {
+      requiredDevices: cpuOnly ? ["cpu", "wasm"] : requiredDevices(gpu),
+      cpuOnly,
+    },
     testTimeout: 10000,
     passWithNoTests: true,
     exclude: [

@@ -16,7 +16,7 @@ import path from "node:path";
 import { playwright } from "@vitest/browser-playwright";
 import { configDefaults, defineConfig } from "vitest/config";
 
-const ROOT = path.resolve(__dirname, "..");
+const ROOT = path.resolve(import.meta.dirname, "..");
 
 /**
  * Resolve every workspace package to its TypeScript source, so tests need no
@@ -136,8 +136,16 @@ export function detectGpu(
   present: Set<number> | null = gpuVendorsPresent(),
   installed = (manifest: string) => fs.existsSync(manifest),
 ): GpuProfile | undefined {
-  if (!present) return undefined;
-  return (Object.keys(GPU_PROFILES) as GpuProfile[]).find(
+  return detectGpus(present, installed)[0];
+}
+
+/** All supported GPUs present with installed drivers, in preference order. */
+export function detectGpus(
+  present: Set<number> | null = gpuVendorsPresent(),
+  installed = (manifest: string) => fs.existsSync(manifest),
+): GpuProfile[] {
+  if (!present) return [];
+  return (Object.keys(GPU_PROFILES) as GpuProfile[]).filter(
     (gpu) =>
       present.has(GPU_PROFILES[gpu].pciVendor) &&
       installed(GPU_PROFILES[gpu].vulkanIcd),
@@ -230,7 +238,7 @@ export function gpuConfig(gpu: GpuProfile) {
         instances: [{ browser: "chromium" }],
       },
       maxWorkers: BROWSER_MAX_WORKERS,
-      provide: { requiredDevices: requiredDevices(gpu) },
+      provide: { requiredDevices: requiredDevices(gpu), cpuOnly: false },
       exclude: [...configDefaults.exclude, "tmp/**"],
       benchmark: benchmarkConfig,
       testTimeout: 300000,
@@ -244,5 +252,7 @@ declare module "vitest" {
   export interface ProvidedContext {
     /** Backends that test/setup.ts requires to initialize. */
     requiredDevices: string[];
+    /** CPU/WASM CI must not initialize a GPU backend, even a software one. */
+    cpuOnly: boolean;
   }
 }

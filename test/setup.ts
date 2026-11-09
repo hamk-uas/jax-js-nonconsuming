@@ -36,6 +36,16 @@ if (required.length > 0) {
   }
 }
 
+if (inject("cpuOnly")) {
+  const available = await init();
+  const gpuBackends = available.filter((d) => d === "webgpu" || d === "webgl");
+  if (gpuBackends.length > 0) {
+    throw new Error(
+      `CPU-only test run initialized GPU backend(s): ${gpuBackends.join(", ")}`,
+    );
+  }
+}
+
 function webGpuDevice(): GPUDevice | undefined {
   // getWebGPUDevice() throws until the test file has initialized WebGPU.
   try {

@@ -500,8 +500,18 @@ pnpm run build:watch
 
 The `pnpm install` command automatically sets up Git hooks via
 [Husky](https://typicode.github.io/husky/). This repository intentionally shifts verification left:
-we run the necessary quality and release-safety checks in local pre-commit rather than relying on
-heavy CI gates for GitHub Pages deployment confidence.
+pre-commit runs targeted checks, and pre-push runs the full default suite plus the full suite of
+every detected supported GPU via `scripts/gpu-test.sh`. GPU suites run sequentially; any failure
+blocks the push, even if later suites pass. With no detected supported GPU, pre-push runs CPU/WASM
+only and explicitly reports that GPU coverage was not validated. Detection uses hardware and
+installed drivers, not driver manifests alone.
+
+The Checks workflow runs on every push and pull request, including feature branches. It installs
+dependencies and Chromium, builds, type-checks, lints, tests the lint plugin and push gate, and runs
+the full CPU/WASM browser suite. Chromium's GPU and software rasterizer are disabled for this
+profile; test setup requires CPU/WASM and rejects initialized GPU backends. Browser APIs such as
+OPFS and workers remain available. GPU correctness stays in the local gates. The four known Intel
+R24 accuracy failures remain visible and currently block pre-push on machines with that GPU.
 
 ### Local check workflow
 
@@ -523,6 +533,9 @@ Then you can run tests in a headless browser using [Vitest](https://vitest.dev/)
 ```bash
 pnpm exec playwright install
 pnpm test
+pnpm run test:cpu            # Full CPU/WASM browser suite, also used by CI
+pnpm run test:push           # Full local default + all detected GPU suites
+pnpm run test:push-gate      # Push-gate failure-path tests (no GPU needed)
 pnpm run test:policy:strict  # Strict mode: no expected-failure debt
 pnpm run test:arch           # Architectural mode: failures gated by manifest
 pnpm run test:website:smoke  # Website build + smoke checks
