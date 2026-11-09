@@ -613,9 +613,34 @@ The separate accuracy plan remains outside remediation.
    no test and only prints, and passes because the config sets `passWithNoTests: true`;
    `test/timing-tiled-matmul.test.ts` is a 35 s benchmark with no assertions and a 300 s timeout in
    the default suite (its header says to run it from `tmp/`; `bench/tiled-matmul.bench.ts` exists).
+   **Implementation, partial (pending review):** the 36 silent `if (!hasWebGPU) return;` in
+   `block-map-jit.test.ts` and `lax-scan.test.ts` are now `skip()`, so a CPU-only run reports them
+   as skipped (default suite unchanged: 3342 passed / 14 skipped). `test_cost.test.ts` (printed
+   only) is replaced by `cost-model.test.ts`, five assertions on `evaluateTotalCost`'s documented
+   cliffs and normalization; `timing-tiled-matmul.test.ts` is deleted (the bench exists);
+   `passWithNoTests` is removed from both configs, so a filter that matches nothing fails. The
+   device-specific QR tolerances in `lax-linalg.test.ts` (WebGPU 0.1/0.05 gradient atol, CPU/other
+   JVP split) were not needed: measured on NVIDIA and Intel the gradient checks pass at 1e-3, and
+   the JVP check now uses central differences in f32 on every device with a derived 1e-3 bound. The
+   remaining 14 skips of the default suite: 6 WebGL-only (Cholesky/TriangularSolve routines, int32
+   floor semantics, 3 + 2 + 1 sites, each commented), and the 8-test orchestrator-worker suite that
+   never runs in the browser suite because `crossOriginIsolated` is false (R7, phase 4). **Still
+   open:** an issue link for each kept skip; the 30 s timeout overrides (7 sites) lack a written
+   reason; the four benchmark-shaped tests (`scan-bench`, `bench-phase3`, `bench-assoc-scale`,
+   `gpu-bench`, ~1,000 lines, one `expect` each) are excluded from the default suite but run in the
+   GPU suites with `testTimeout: 300000`; they belong in `bench/`.
 8. Add a **steady-state leak mode** to `checkLeaks`: run the body twice and require zero slot growth
    on the second run _without_ flushing JIT caches. This catches the class of leak that `aa85998`
-   hid, while tolerating warm caches.
+   hid, while tolerating warm caches. **Implementation (pending review):**
+   `checkLeaks.steadyState(body)` (sync or async) runs `body` once to warm up, then again, and
+   reports any slot-count change of the second run with caches left intact; it does not touch an
+   active `start()`/`stop()` session. `test/steady-state-leaks.test.ts` applies it on every device
+   to linalg (cholesky, qr, lu, triangularSolve, jit), scan (eager, jit, jit∘grad), foriLoop (eager,
+   jit, grad) and the transforms (grad, valueAndGrad, hessian, jacfwd, jvp, vjp, linearize,
+   jit∘vmap∘grad): 44 passed, 4 skipped (no routines on WebGL). `check-leaks.test.ts` proves the
+   mode catches a per-run leak, a leak into an unflushed cache (a fresh `jit` per run, which
+   `stop()` would free), and awaits async bodies. No leak was found in those areas. Not yet applied
+   to the existing per-area test files.
 9. Decide R24 (own implementations vs spec-derived tolerances for GPU transcendentals). **Human
    decision, 2026-11-09:** accept native GPU float32 accuracy, following
    [WebNN #914](https://github.com/webmachinelearning/webnn/issues/914). Implementation verified by
@@ -646,6 +671,10 @@ The separate accuracy plan remains outside remediation.
    pass. These are verified by round 2, not a Phase 1 sign-off or evidence of hosted CI.
 10. Re-derive FD tolerances: run gradient checks in f64 on CPU/WASM with tight tolerances; for f32
     WebGPU, derive tolerances from the problem's conditioning and document the derivation inline.
+    **Started:** the QR JVP check in `lax-linalg.test.ts` has a derived bound and no device split;
+    the other eight finite-difference sites in that file keep `rtol: 0.05` and `eps = 1e-4` (f32
+    rounding noise there is about `4 |f| 2^-23 / eps`, up to ~0.07), and the rest of the suite is
+    not yet reviewed.
 11. Website pages start GPU work only when the visitor asks (R25, remainder): `/bench/results`,
     linked from the homepage, runs matmuls up to 2048² in f32 and f16 as soon as it opens.
 12. Re-add a TTS per-step benchmark (R26) that imports the website's Pocket TTS model code and runs
