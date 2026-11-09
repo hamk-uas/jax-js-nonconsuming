@@ -77,7 +77,6 @@ export default defineConfig({
       cpuOnly,
     },
     testTimeout: 10000,
-    passWithNoTests: true,
     exclude: [
       "**/node_modules/**",
       "**/dist/**",

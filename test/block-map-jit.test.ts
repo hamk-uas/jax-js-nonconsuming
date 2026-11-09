@@ -182,8 +182,8 @@ describe("lax.blockMap — Phase 3 JIT", () => {
 // Fused path verification
 // ---------------------------------------------------------------------------
 describe("lax.blockMap — fused shader path", () => {
-  test("fused path is taken for divisible elementwise body", () => {
-    if (!hasWebGPU) return;
+  test("fused path is taken for divisible elementwise body", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const logs: string[] = [];
@@ -216,8 +216,8 @@ describe("lax.blockMap — fused shader path", () => {
     }
   });
 
-  test("fused path handles identity pass-through body", () => {
-    if (!hasWebGPU) return;
+  test("fused path handles identity pass-through body", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const logs: string[] = [];
@@ -245,8 +245,10 @@ describe("lax.blockMap — fused shader path", () => {
     }
   });
 
-  test("fused path handles non-divisible dimensions (boundary blocks)", () => {
-    if (!hasWebGPU) return;
+  test("fused path handles non-divisible dimensions (boundary blocks)", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const logs: string[] = [];
@@ -300,8 +302,10 @@ describe("lax.blockMap — fused shader guards", () => {
     f_jit.dispose();
   });
 
-  test("blockSize exceeding maxInvocations logs fallback on WebGPU", () => {
-    if (!hasWebGPU) return;
+  test("blockSize exceeding maxInvocations logs fallback on WebGPU", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const logs: string[] = [];
@@ -367,8 +371,8 @@ describe("lax.blockMap — fused shader guards", () => {
     f_jit.dispose();
   });
 
-  test("shmem budget exceeded logs fallback on WebGPU", () => {
-    if (!hasWebGPU) return;
+  test("shmem budget exceeded logs fallback on WebGPU", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     // Query the actual device shmem limit so this test works on any GPU.
@@ -498,8 +502,8 @@ describe("lax.blockMap — in-block reductions", () => {
     f_jit.dispose();
   });
 
-  test("fused path is taken for reduce-then-elementwise body", () => {
-    if (!hasWebGPU) return;
+  test("fused path is taken for reduce-then-elementwise body", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const logs: string[] = [];
@@ -578,8 +582,8 @@ describe("lax.blockMap — in-block reductions", () => {
 // Boundary block tests (non-divisible dimensions)
 // ---------------------------------------------------------------------------
 describe("lax.blockMap — boundary blocks", () => {
-  test("elementwise with non-divisible N uses fused path", () => {
-    if (!hasWebGPU) return;
+  test("elementwise with non-divisible N uses fused path", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const logs: string[] = [];
@@ -996,8 +1000,10 @@ describe("lax.blockMap — boundary blocks", () => {
     expect(result).toBeAllclose(expected);
   });
 
-  test("jit(blockMap(foriLoop)) multi-carry WebGPU fused shader", () => {
-    if (!hasWebGPU) return;
+  test("jit(blockMap(foriLoop)) multi-carry WebGPU fused shader", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
 
     // Same test as above but on WebGPU to exercise the fused shader path
     // where carry input/output shmem aliasing can cause incorrect results.
@@ -1303,8 +1309,10 @@ describe("lax.tiledMatmul", () => {
     expect(g_tiled).toBeAllclose(g_ref, { atol: 1e-3 });
   });
 
-  test("32x32 arange×arange on WebGPU (multi-block stride remap)", () => {
-    if (!hasWebGPU) return;
+  test("32x32 arange×arange on WebGPU (multi-block stride remap)", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
     const f = jit((A: np.Array, B: np.Array) =>
       lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
@@ -1532,8 +1540,10 @@ describe("shader quality gates", () => {
     return shaders;
   }
 
-  test("P2a: tile-aligned tiledMatmul emits no select() in fused shader", () => {
-    if (!hasWebGPU) return;
+  test("P2a: tile-aligned tiledMatmul emits no select() in fused shader", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const f = jit((A: np.Array, B: np.Array) =>
@@ -1562,8 +1572,10 @@ describe("shader quality gates", () => {
     f.dispose();
   });
 
-  test("P2a: non-aligned inputs still produce select() where needed", () => {
-    if (!hasWebGPU) return;
+  test("P2a: non-aligned inputs still produce select() where needed", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     // Non-divisible: 5 elements with blockShape=4 → boundary block needs select
@@ -1593,8 +1605,10 @@ describe("shader quality gates", () => {
     f.dispose();
   });
 
-  test("P0a: scalar intermediates promoted to let bindings (no tidx < 1u guard)", () => {
-    if (!hasWebGPU) return;
+  test("P0a: scalar intermediates promoted to let bindings (no tidx < 1u guard)", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     // Two reductions whose results are combined by a size-1 non-reduction
@@ -1639,8 +1653,10 @@ describe("shader quality gates", () => {
     f.dispose();
   });
 
-  test("P1: tiledMatmul fori_loop has exactly 2 barriers per iteration", () => {
-    if (!hasWebGPU) return;
+  test("P1: tiledMatmul fori_loop has exactly 2 barriers per iteration", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     // Tiled matmul K-loop: load A, load B, compute.
@@ -1681,8 +1697,10 @@ describe("shader quality gates", () => {
     f.dispose();
   });
 
-  test("P2b: tiledMatmul uses unchecked dynamic slice (no min/max clamping)", () => {
-    if (!hasWebGPU) return;
+  test("P2b: tiledMatmul uses unchecked dynamic slice (no min/max clamping)", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     // Use Br=32,Bc=32,Bk=32 (different from P2a/P1) to avoid shader cache hit.
@@ -1726,8 +1744,10 @@ describe("shader quality gates", () => {
     f.dispose();
   });
 
-  test("O2: fused shader has no redundant modular arithmetic from unravelAlu", () => {
-    if (!hasWebGPU) return;
+  test("O2: fused shader has no redundant modular arithmetic from unravelAlu", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     // 128x128 tiledMatmul with Br=Bc=Bk=16 → blockSize=256, gidx ∈ [0,255].
@@ -1775,8 +1795,10 @@ describe("shader quality gates", () => {
     f.dispose();
   });
 
-  test("P2c: non-aligned tiledMatmul produces no select() (padConcrete)", () => {
-    if (!hasWebGPU) return;
+  test("P2c: non-aligned tiledMatmul produces no select() (padConcrete)", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     // 64x60 @ 60x64: K=60 not divisible by 8, triggers padding to K=64
@@ -1819,8 +1841,10 @@ describe("shader quality gates", () => {
     expect(result).toBeAllclose(expected, { atol: 1 });
   });
 
-  test("P2c: tiny non-aligned tiledMatmul also benefits from padConcrete", () => {
-    if (!hasWebGPU) return;
+  test("P2c: tiny non-aligned tiledMatmul also benefits from padConcrete", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     // 4x5 @ 5x4: non-aligned but small — padConcrete still applies
@@ -1881,8 +1905,8 @@ describe("O4: register-tiled tiledMatmul", () => {
   // ShaderPipelineCache hits (the cache is GPUDevice-lifetime and not cleared
   // by clearCaches()).
 
-  test("SHADER-DUMP: threadTile=[4,4] shader inspection", () => {
-    if (!hasWebGPU) return;
+  test("SHADER-DUMP: threadTile=[4,4] shader inspection", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
     const f = jit((A: np.Array, B: np.Array) =>
       lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16, threadTile: [4, 4] }),
@@ -1920,8 +1944,10 @@ describe("O4: register-tiled tiledMatmul", () => {
     expect(fusedShader).toBeDefined();
   });
 
-  test("SHADER-DUMP: register-tiled shader uses var<private> arrays", () => {
-    if (!hasWebGPU) return;
+  test("SHADER-DUMP: register-tiled shader uses var<private> arrays", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const logs: string[] = [];
@@ -1952,8 +1978,8 @@ describe("O4: register-tiled tiledMatmul", () => {
     }
   });
 
-  test("threadTile=[2,2] 16x16 matches np.matmul", () => {
-    if (!hasWebGPU) return;
+  test("threadTile=[2,2] 16x16 matches np.matmul", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
     const f = jit((A: np.Array, B: np.Array) =>
       lax.tiledMatmul(A, B, { Br: 8, Bc: 8, Bk: 8, threadTile: [2, 2] }),
@@ -1967,8 +1993,8 @@ describe("O4: register-tiled tiledMatmul", () => {
     f.dispose();
   });
 
-  test("threadTile=[4,4] 32x32 matches np.matmul", () => {
-    if (!hasWebGPU) return;
+  test("threadTile=[4,4] 32x32 matches np.matmul", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     // First run a single-block case to isolate tile size from multi-block
@@ -1996,8 +2022,8 @@ describe("O4: register-tiled tiledMatmul", () => {
     f.dispose();
   });
 
-  test("standard (no threadTile) 32x32 arange on WebGPU", () => {
-    if (!hasWebGPU) return;
+  test("standard (no threadTile) 32x32 arange on WebGPU", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
     const f = jit((A: np.Array, B: np.Array) =>
       lax.tiledMatmul(A, B, { Br: 16, Bc: 16, Bk: 16 }),
@@ -2012,8 +2038,8 @@ describe("O4: register-tiled tiledMatmul", () => {
     f.dispose();
   });
 
-  test("threadTile=[8,8] 64x64 matches np.matmul", () => {
-    if (!hasWebGPU) return;
+  test("threadTile=[8,8] 64x64 matches np.matmul", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
     const f = jit((A: np.Array, B: np.Array) =>
       lax.tiledMatmul(A, B, { Br: 64, Bc: 64, Bk: 16, threadTile: [8, 8] }),
@@ -2027,8 +2053,10 @@ describe("O4: register-tiled tiledMatmul", () => {
     f.dispose();
   });
 
-  test("grad(tiledMatmul) matches grad(np.matmul) with threadTile", () => {
-    if (!hasWebGPU) return;
+  test("grad(tiledMatmul) matches grad(np.matmul) with threadTile", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
     using B = np.eye(16, { dtype: DType.Float32 });
     const f_tiled = (A: np.Array) => {
@@ -2202,8 +2230,8 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
   });
 
   // T7.2+T7.4 on WebGPU: verify webgpu-block-map path.
-  test("T7-WebGPU: N=1024 and N=300 cumsum correct on WebGPU", () => {
-    if (!hasWebGPU) return;
+  test("T7-WebGPU: N=1024 and N=300 cumsum correct on WebGPU", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const f = jit((xs: np.Array) => lax.associativeScan(add, xs));
@@ -2228,8 +2256,10 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
   });
 
   // T7.5 on WebGPU: verify non-add carry propagation on GPU path.
-  test("T7.5-WebGPU: cumulative max (N=300) carry propagation on WebGPU", () => {
-    if (!hasWebGPU) return;
+  test("T7.5-WebGPU: cumulative max (N=300) carry propagation on WebGPU", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const f = jit((xs: np.Array) => lax.associativeScan(maxFn, xs));
@@ -2250,8 +2280,10 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
   // so a single JitProgram is reused across invocations with different N,
   // while the fused WebGPU shader requires distinct executables per gridShape.
   // Verifies both correctness and cache partitioning via compile counter.
-  test("T7.8-WebGPU: dynamic_axes blockMap — one JitProgram, multiple fused executables", () => {
-    if (!hasWebGPU) return;
+  test("T7.8-WebGPU: dynamic_axes blockMap — one JitProgram, multiple fused executables", ({
+    skip,
+  }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const f = jit(
@@ -2321,8 +2353,8 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
     f.dispose();
   });
 
-  test("blockIndex() works with fused WebGPU path", () => {
-    if (!hasWebGPU) return;
+  test("blockIndex() works with fused WebGPU path", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const f = jit((xs: np.Array) =>
@@ -2448,8 +2480,8 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
     expect(js[N - 1]).toBeCloseTo(N, 4); // last element
   });
 
-  test("T7.12: reverse cumsum N=500 on WebGPU block-map path", () => {
-    if (!hasWebGPU) return;
+  test("T7.12: reverse cumsum N=500 on WebGPU block-map path", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
     const N = 500;
     using xs = np.array(
@@ -2496,8 +2528,8 @@ describe("lax.associativeScan — blocked path (Phase 5)", () => {
 describe("rewriteForiLoopToBlockMap", () => {
   afterEach(() => setDebug(0));
 
-  test("1D elementwise foriLoop is rewritten on WebGPU", () => {
-    if (!hasWebGPU) return;
+  test("1D elementwise foriLoop is rewritten on WebGPU", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const f = (x: np.Array) =>
@@ -2517,8 +2549,8 @@ describe("rewriteForiLoopToBlockMap", () => {
     expect(result).toBeAllclose(np.full([64], 5));
   });
 
-  test("2D elementwise foriLoop is rewritten on WebGPU", () => {
-    if (!hasWebGPU) return;
+  test("2D elementwise foriLoop is rewritten on WebGPU", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     type Carry = { a: np.Array; b: np.Array };
@@ -2598,8 +2630,8 @@ describe("rewriteForiLoopToBlockMap", () => {
     expect(result_b).toBeAllclose(expected_b);
   });
 
-  test("2D foriLoop rewrite under calibrated GPU values", () => {
-    if (!hasWebGPU) return;
+  test("2D foriLoop rewrite under calibrated GPU values", ({ skip }) => {
+    if (!hasWebGPU) skip();
 
     type Carry = { a: np.Array; b: np.Array };
     const f = (x: np.Array, y: np.Array) => {
@@ -2675,8 +2707,8 @@ describe("rewriteForiLoopToBlockMap", () => {
     }
   });
 
-  test("mandelbrot-shaped foriLoop still rewrites on WebGPU", () => {
-    if (!hasWebGPU) return;
+  test("mandelbrot-shaped foriLoop still rewrites on WebGPU", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
     clearCaches();
 
@@ -2738,8 +2770,8 @@ describe("rewriteForiLoopToBlockMap", () => {
     }
   });
 
-  test("foriLoop with non-elementwise body is NOT rewritten", () => {
-    if (!hasWebGPU) return;
+  test("foriLoop with non-elementwise body is NOT rewritten", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     // Dot product in body → not elementwise → no rewrite
@@ -2758,8 +2790,8 @@ describe("rewriteForiLoopToBlockMap", () => {
     expect(_lastForiRewritten()).toBe(false);
   });
 
-  test("foriLoop with scalar carries is NOT rewritten", () => {
-    if (!hasWebGPU) return;
+  test("foriLoop with scalar carries is NOT rewritten", ({ skip }) => {
+    if (!hasWebGPU) skip();
     defaultDevice("webgpu");
 
     const f = (x: np.Array) =>

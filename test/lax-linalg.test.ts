@@ -724,17 +724,20 @@ await deviceSuite((device) => {
       using _R = R;
       using _dR = dR;
 
-      // Finite-difference verification: (f(A + eps*dA) - f(A)) / eps ≈ dR
-      const eps = device === "cpu" ? 3e-3 : 1e-4;
+      // Central differences, (f(A + eps*dA) - f(A - eps*dA)) / (2 eps) ≈ dR,
+      // in float32 on every device. Each entry of R (|R| <= 5) carries about
+      // 4 ulps of rounding error, e = 4 * 5 * 2^-23 = 2.4e-6, so the quotient
+      // is off by at most 2e / (2 eps) = 2.4e-4 for eps = 1e-2. Truncation is
+      // O((eps |dA|)^2) < 1e-6. atol is 4x the rounding bound.
+      const eps = 1e-2;
       using dAe = dA.mul(eps);
       using Ape = A.add(dAe);
-      using R2 = f(Ape);
-      using R2subR = R2.sub(R);
-      using dR_fd = R2subR.div(eps);
-      // The CPU Householder polyfill is float32-only, so a larger step avoids
-      // forward-difference cancellation that does not affect the JVP itself.
-      const jvpFdAtol = device === "cpu" ? 2e-3 : 0.05;
-      expect(dR).toBeAllclose(dR_fd, { rtol: 0.05, atol: jvpFdAtol });
+      using Ame = A.sub(dAe);
+      using Rp = f(Ape);
+      using Rm = f(Ame);
+      using RpRm = Rp.sub(Rm);
+      using dR_fd = RpRm.div(2 * eps);
+      expect(dR).toBeAllclose(dR_fd, { rtol: 0, atol: 1e-3 });
     });
 
     test("grad through QR matches finite differences", () => {
@@ -773,8 +776,7 @@ await deviceSuite((device) => {
           expected[i][j] = (fp - fm) / (2 * eps);
         }
       }
-      const gradFdAtol = device === "webgpu" ? 0.1 : 1e-3;
-      expect(dA).toBeAllclose(expected, { rtol: 0.05, atol: gradFdAtol });
+      expect(dA).toBeAllclose(expected, { rtol: 0.05, atol: 1e-3 });
     });
 
     test("grad through QR for tall matrix", () => {
@@ -813,8 +815,7 @@ await deviceSuite((device) => {
           expected[i][j] = (fp - fm) / (2 * eps);
         }
       }
-      const tallGradAtol = device === "webgpu" ? 0.05 : 1e-3;
-      expect(dA).toBeAllclose(expected, { rtol: 0.05, atol: tallGradAtol });
+      expect(dA).toBeAllclose(expected, { rtol: 0.05, atol: 1e-3 });
     });
 
     test("grad through Q factor of QR", () => {
@@ -905,11 +906,7 @@ await deviceSuite((device) => {
             expected[i][j] = (fp - fm) / (2 * eps);
           }
         }
-        const batchGradAtol = device === "webgpu" ? 0.05 : 1e-3;
-        expect(dA).toBeAllclose(expected, {
-          rtol: 0.05,
-          atol: batchGradAtol,
-        });
+        expect(dA).toBeAllclose(expected, { rtol: 0.05, atol: 1e-3 });
       }
     });
 

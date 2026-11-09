@@ -242,7 +242,6 @@ export function gpuConfig(gpu: GpuProfile) {
       exclude: [...configDefaults.exclude, "tmp/**"],
       benchmark: benchmarkConfig,
       testTimeout: 300000,
-      passWithNoTests: true,
       setupFiles: ["test/setup.ts"],
     },
   });

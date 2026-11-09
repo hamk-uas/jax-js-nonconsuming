@@ -2227,12 +2227,14 @@ describe("preencoded multi-step scan (WebGPU)", () => {
     expect(dxs).toBeAllclose([[3], [5], [7]]);
   });
 
-  test("compiled-loop Y≠carry: Y-only step reads updated carry (regression)", () => {
+  test("compiled-loop Y≠carry: Y-only step reads updated carry (regression)", ({
+    skip,
+  }) => {
     // Regression test for carry-live gid mapping. When Y outputs differ from
     // carry outputs, Y-only steps must read the UPDATED carry (computed in the
     // same iteration), not the snapshot or an aliased internal variable.
     // Before fix: Y-only step read stale/wrong data → catastrophic errors.
-    if (!hasWebGPU) return;
+    if (!hasWebGPU) skip();
 
     // Backward RTS smoother pattern: carry={r,N}, Y={x_smooth,C_smooth}
     // x_smooth = x_pred + C_pred * r_new (reads carry r_new from same iter)
