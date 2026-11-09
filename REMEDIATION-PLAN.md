@@ -430,14 +430,18 @@ status updates are _claims to verify_, not context.
 
 **Output.** A short report committed as `remediation/reviews/<phase>-<n>.md`: verdict (pass / pass
 with findings / fail), the exit-criteria and item tables, findings with severity and evidence,
-rework numbers. It is written for a human to read in about ten minutes. The reviewer leaves the file
-uncommitted; the implementation session commits it unchanged. After a failed round, the
-implementation session appends a response to that report, marked as claims for the re-review. A
-scope exclusion requested by the human is stated in the report and carried to the next review.
+rework numbers, and a final **Sign-off** section in which the reviewer either signs off the reviewed
+scope (naming the items and range) or states that it does not. It is written for a human to read in
+about ten minutes. The reviewer leaves the file uncommitted; the implementation session commits it
+unchanged. After a failed round, the implementation session appends a response to that report,
+marked as claims for the re-review. A scope exclusion requested by the human is stated in the report
+and carried to the next review.
 
-**Gate.** A phase is marked done in this file only with a link to a passing review report and a
-human sign-off line in that report. The same applies to releases. The sign-off question to the human
-lists the review's item table, deferrals and uncovered commits, not the implementer's summary.
+**Gate.** A phase is marked done in this file only with a link to a passing review report whose
+Sign-off section the reviewer has signed. The same applies to releases. The reviewer's sign-off
+covers the review's item table, deferrals and uncovered commits, not the implementer's summary. A
+reviewer must not sign off a range it contradicts or could not verify; deferrals still need the
+human's decision, recorded in the report.
 
 ### Phase 0 — Freeze and quarantine (R8)
 
@@ -575,7 +579,7 @@ The separate accuracy plan remains outside remediation.
 4. Fix the five failures the skips had hidden (R19). Done in phase 0, item 6.
 5. Decouple backend initialization (R20): one backend's failure must not affect another's; add a
    test that injects a WebGL failure and asserts WebGPU still initializes. Verified by
-   [round 3](remediation/reviews/phase-1-partial-3.md) and signed off by the human (2026-11-09):
+   [round 3](remediation/reviews/phase-1-partial-3.md) and signed off by the reviewer (2026-11-09):
    serialize backend creation across both a single `init()` and concurrent calls. Log unexpected
    creation errors per backend and continue initializing the others; normal unavailability still
    omits that backend from the returned list. A fresh-worker regression uses the real WebGPU
@@ -586,7 +590,7 @@ The separate accuracy plan remains outside remediation.
    cases as skipped.
 6. Make WebGPU errors fail tests (R21): done in phase 0, item 8. Remaining: make the command tape's
    passes traceable (R23), and test that a `jit` call produces trace entries. Verified by
-   [round 3](remediation/reviews/phase-1-partial-3.md) and signed off by the human (2026-11-09):
+   [round 3](remediation/reviews/phase-1-partial-3.md) and signed off by the reviewer (2026-11-09):
    regular kernel/routine tape dispatches now retain their source metadata and share tracing with
    eager execution, without bypassing the tape. A warmed JIT call produces one real
    `performance.measure` entry with its operation properties and WGSL source; a multi-pass sort

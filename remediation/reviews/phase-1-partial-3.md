@@ -9,7 +9,7 @@
 - **Verdict:** **pass with findings.** Every completion claim in the range is verified, and both new
   regressions fail without the change. Two low findings; no blocking one.
 - **Phase status:** phase 1 remains incomplete (hosted CI, items 7, 8, 10-12 and the exit criteria
-  are outside this range). **This is not human sign-off.**
+  are outside this range). **This is not a phase sign-off.**
 - **Exclusion:** homepage content remains excluded.
 
 ## Verification (fresh clone of `f532bc9`, `pnpm install --frozen-lockfile`)
@@ -106,9 +106,11 @@ observable.
 
 None deferred by this range. No commit is left uncovered between `c6d3b05` and `f532bc9`.
 
-## Human sign-off
+## Sign-off
 
-Signed off by the human on 2026-11-09 for items 5 (R20) and 6 (R23, regular kernel/routine tape
-dispatches) of phase 1, covering `c6d3b05..f532bc9` plus the review-fix commit `5ebaad7`. F1 is
-fixed; F2 is accepted as the R20 contract and documented in the README. The dedicated scan,
-block-map, scatter-add and copy dispatch tracing stays open. This is not a phase 1 sign-off.
+Signed off by the reviewer session on 2026-11-09 for items 5 (R20) and 6 (R23, regular
+kernel/routine tape dispatches) of phase 1, covering `c6d3b05..f532bc9` and the follow-up commit
+`5ebaad7`. F1 is fixed; the `pipelineSubmit` cleanup is fixed; F2 is the R20 contract and is
+documented in the README. `5ebaad7` was written in this session after the review, checked by
+type-check, lint, the default suite and the focused GPU tests on both GPUs, and the pre-commit gate.
+Dedicated scan, block-map, scatter-add and copy dispatch tracing stays open. Not a phase 1 sign-off.
