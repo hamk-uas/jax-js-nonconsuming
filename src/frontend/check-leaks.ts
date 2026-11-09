@@ -51,6 +51,11 @@
  * vitest browser run. `start({ trackSites: false })` skips it and only diffs
  * slot counts, for code whose speed matters (benchmarks).
  *
+ * **Steady state.** `stop()` flushes JIT caches, so a leak that lands in a
+ * cache is freed before counting. `checkLeaks.steadyState(body)` runs `body`
+ * twice and requires the second run to leave the slot count unchanged with the
+ * caches intact; it can run inside a `start()`/`stop()` session.
+ *
  * **No concurrent tests** — `checkLeaks` uses global state (one active
  * session at a time). Do not use `test.concurrent()`. Sequential test
  * execution is the default in vitest.
@@ -661,8 +666,82 @@ export const checkLeaks = {
     return { leaked, userLeaked, internalLeaked, details, summary };
   },
 
+  /**
+   * Check that repeating `body` allocates nothing that stays alive.
+   *
+   * Runs `body` once to warm up (compiled programs and their constants may
+   * stay cached), then runs it again and compares backend slot counts around
+   * that second run. Unlike {@link stop}, JIT caches are **not** flushed, so
+   * a leak that lands in a cache (a new constant per call) is reported
+   * instead of being freed before counting. `body` must dispose everything it
+   * creates, and must not depend on state that differs between runs.
+   *
+   * Returns a promise when `body` does. It does not touch an active
+   * `start()`/`stop()` session, so it can run inside one; the report has no
+   * creation sites; rerun `body` under a `start()` session to locate them.
+   */
+  steadyState,
+
   /** Whether leak tracking is currently active. */
   get active(): boolean {
     return _active;
   },
 };
+
+function slotCounts(): Map<Device, number> {
+  const counts = new Map<Device, number>();
+  for (const d of devices) {
+    try {
+      counts.set(d, getBackend(d).slotCount());
+    } catch {
+      /* not initialized */
+    }
+  }
+  return counts;
+}
+
+function steadyStateReport(
+  before: Map<Device, number>,
+  after: Map<Device, number>,
+): LeakReport {
+  let leaked = 0;
+  const perDevice: string[] = [];
+  for (const [d, count] of after) {
+    // A backend initialized by the second run has no baseline; all its
+    // surviving slots count.
+    const delta = count - (before.get(d) ?? 0);
+    leaked += delta;
+    if (delta !== 0) perDevice.push(`${d}: ${delta > 0 ? "+" : ""}${delta}`);
+  }
+  return {
+    leaked,
+    userLeaked: 0,
+    internalLeaked: 0,
+    details: [],
+    summary:
+      leaked === 0
+        ? "No leaks detected."
+        : `Not steady: the second run changed the slot count by ${leaked} ` +
+          `(${perDevice.join(", ")}) with JIT caches left intact. Creation ` +
+          "sites were not tracked; run the body under checkLeaks.start() " +
+          "to locate them.",
+  };
+}
+
+// The Promise overload comes first: an async body is also assignable to
+// `() => void`, which would give it a synchronous report type.
+function steadyState(body: () => Promise<void>): Promise<LeakReport>;
+function steadyState(body: () => void): LeakReport;
+function steadyState(
+  body: () => void | Promise<void>,
+): LeakReport | Promise<LeakReport> {
+  const warmUp = body();
+  const measure = (): LeakReport | Promise<LeakReport> => {
+    const before = slotCounts();
+    const second = body();
+    return second instanceof Promise
+      ? second.then(() => steadyStateReport(before, slotCounts()))
+      : steadyStateReport(before, slotCounts());
+  };
+  return warmUp instanceof Promise ? warmUp.then(measure) : measure();
+}

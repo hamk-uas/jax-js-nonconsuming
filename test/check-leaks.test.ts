@@ -151,3 +151,76 @@ describe("checkLeaks", () => {
     ).toThrow("trackRefs requires trackSites");
   });
 });
+
+describe("checkLeaks.steadyState", () => {
+  it("accepts a balanced body whose jit cache stays warm", () => {
+    const f = jit((a: np.Array) => a.mul(2));
+    try {
+      const report = checkLeaks.steadyState(() => {
+        using x = np.array([1, 2, 3]);
+        using y = f(x);
+        y.js();
+      });
+      expect(report.leaked).toBe(0);
+      expect(report.summary).toBe("No leaks detected.");
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("reports a body that leaks on every run", () => {
+    const kept: np.Array[] = [];
+    try {
+      const report = checkLeaks.steadyState(() => {
+        kept.push(np.array([1, 2, 3]));
+      });
+      expect(report.leaked).toBe(1);
+      expect(report.summary).toContain("Not steady");
+    } finally {
+      for (const x of kept) x.dispose();
+    }
+  });
+
+  it("reports a leak into a cache that stop() would flush", () => {
+    // A fresh jit function per run keeps its compiled constants until it is
+    // disposed or caches are cleared.
+    const fns: ReturnType<typeof jit>[] = [];
+    try {
+      const report = checkLeaks.steadyState(() => {
+        const f = jit((a: np.Array) => a.add(np.array([1, 1, 1])));
+        fns.push(f);
+        using x = np.array([1, 2, 3]);
+        using y = f(x);
+        y.js();
+      });
+      expect(report.leaked).toBeGreaterThan(0);
+    } finally {
+      for (const f of fns) f.dispose();
+    }
+  });
+
+  it("awaits an async body", async () => {
+    const kept: np.Array[] = [];
+    try {
+      const report = await checkLeaks.steadyState(async () => {
+        using x = np.array([1, 2, 3]);
+        await x.data();
+        kept.push(np.array([4, 5]));
+      });
+      expect(report.leaked).toBe(1);
+    } finally {
+      for (const x of kept) x.dispose();
+    }
+  });
+
+  it("leaves an active session untouched", () => {
+    checkLeaks.start();
+    const report = checkLeaks.steadyState(() => {
+      using x = np.array([1, 2, 3]);
+      x.js();
+    });
+    expect(report.leaked).toBe(0);
+    expect(checkLeaks.active).toBe(true);
+    expect(checkLeaks.stop().leaked).toBe(0);
+  });
+});

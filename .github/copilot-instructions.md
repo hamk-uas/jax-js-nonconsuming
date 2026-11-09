@@ -275,7 +275,10 @@ reading multiple outputs, use `tree.data()` / `tree.consumeData()` or `Promise.a
 readbacks. Sequential readback of N outputs costs ~12ms × N; parallel costs ~12ms total.
 
 **Leak detection:** `checkLeaks.start()` / `checkLeaks.stop()` — snapshots slot counts, tracks
-creations. Used in `test/setup.ts` to wrap every test.
+creations. Used in `test/setup.ts` to wrap every test. `stop()` flushes JIT caches before counting,
+so it cannot see a leak into a cache. `checkLeaks.steadyState(body)` runs `body` twice and requires
+the second run to leave the slot count unchanged with caches intact
+(`test/steady-state-leaks.test.ts` covers linalg, scan, foriLoop and transforms).
 
 **JIT cache hierarchy:**
 
