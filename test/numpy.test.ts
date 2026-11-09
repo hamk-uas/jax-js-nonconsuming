@@ -11,6 +11,54 @@ import { expect, suite, test } from "vitest";
 
 import { deviceSuite } from "./device-suite.js";
 
+const F32_EPSILON = 2 ** -23;
+
+// WGSL uses the smaller spacing at binade boundaries, including subnormal spacing at zero.
+// https://www.w3.org/TR/WGSL/#ulp
+function float32Ulp(x: number): number {
+  return 2 ** Math.max(-149, Math.ceil(Math.log2(Math.abs(x))) - 24);
+}
+
+// R24: native GPU f32 accuracy, not a change to CPU/WASM or other dtypes.
+// https://www.w3.org/TR/WGSL/#concrete-float-accuracy
+// GLSL ES 3.00 section 4.5.1 leaves trig precision undefined; WebGL uses the same test budget.
+function expectTrigClose(
+  result: Pick<np.Array, "device" | "dtype">,
+  actual: number,
+  expected: number,
+  gpuAbsoluteError: number,
+): void {
+  if (
+    (result.device === "webgpu" || result.device === "webgl") &&
+    result.dtype === np.float32
+  ) {
+    expect(Math.abs(actual - expected)).toBeLessThanOrEqual(gpuAbsoluteError);
+  } else {
+    expect(actual).toBeCloseTo(expected, 5);
+  }
+}
+
+test("native trig accuracy policy rejects excess error and stays GPU float32 only", () => {
+  const bound = 2 ** -11;
+  for (const device of ["cpu", "wasm", "webgpu", "webgl"] as const) {
+    for (const dtype of [np.float32, np.float64]) {
+      const result = { device, dtype };
+      expectTrigClose(result, 0.5 + 1e-6, 0.5, bound);
+      if ((device === "webgpu" || device === "webgl") && dtype === np.float32) {
+        expectTrigClose(result, 0.5 + bound, 0.5, bound);
+      } else {
+        expect(() =>
+          expectTrigClose(result, 0.5 + bound, 0.5, bound),
+        ).toThrow();
+      }
+      expect(() =>
+        expectTrigClose(result, 0.5 + bound + F32_EPSILON, 0.5, bound),
+      ).toThrow();
+      expect(() => expectTrigClose(result, NaN, 0.5, bound)).toThrow();
+    }
+  }
+});
+
 await deviceSuite((device) => {
   suite("jax.numpy.sum()", () => {
     test("can take multiple axes", () => {
@@ -2453,27 +2501,83 @@ await deviceSuite((device) => {
     });
   });
 
+  suite("jax.numpy.trigonometric()", () => {
+    // Exactly representable f32 inputs inside [-pi, pi]; no range-reduction guarantee outside it.
+    const vals = [-3.125, -3, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 3, 3.125];
+
+    test("sin and cos values in native accuracy range", () => {
+      using x = np.array(vals, { dtype: np.float32 });
+      using s = np.sin(x);
+      using c = np.cos(x);
+      const sinvals: number[] = s.js();
+      const cosvals: number[] = c.js();
+      for (let i = 0; i < vals.length; i++) {
+        expectTrigClose(s, sinvals[i], Math.sin(vals[i]), 2 ** -11);
+        expectTrigClose(c, cosvals[i], Math.cos(vals[i]), 2 ** -11);
+      }
+    });
+
+    test("tan values away from poles", () => {
+      // Require |cos(x)| >= 0.5 on every backend; near-pole conditioning is a separate concern.
+      const vals = [-3.125, -3, -1, -0.5, 0, 0.5, 1, 3, 3.125];
+      using x = np.array(vals, { dtype: np.float32 });
+      using r = np.tan(x);
+      const tanvals: number[] = r.js();
+      for (let i = 0; i < vals.length; i++) {
+        const s = Math.abs(Math.sin(vals[i]));
+        const c = Math.abs(Math.cos(vals[i]));
+        const e = 2 ** -11;
+        // Propagate |ds|,|dc| <= e through sin/cos. Reciprocal (2.5 ULP) plus
+        // multiplication (1 ULP) adds < 4*epsilon relative error to the quotient.
+        expect(c).toBeGreaterThanOrEqual(0.5);
+        const quotientError = (e * (c + s)) / (c * (c - e));
+        const roundoff = (4 * F32_EPSILON * (s + e)) / (c - e);
+        expectTrigClose(
+          r,
+          tanvals[i],
+          Math.tan(vals[i]),
+          quotientError + roundoff,
+        );
+      }
+    });
+  });
+
   suite("jax.numpy.atan()", () => {
     test("arctan values", () => {
       const vals = [-1000, -100, -10, -1, 0, 1, 10, 100, 1000, Infinity];
-      using _a = np.array(vals);
+      using _a = np.array(vals, { dtype: np.float32 });
       using _r = np.atan(_a);
       const atanvals: number[] = _r.js();
       for (let i = 0; i < vals.length; i++) {
-        expect(atanvals[i]).toBeCloseTo(Math.atan(vals[i]), 5);
+        const expected = Math.atan(vals[i]);
+        expectTrigClose(_r, atanvals[i], expected, 4096 * float32Ulp(expected));
       }
     });
 
     test("arcsin and arccos values", () => {
-      const vals = [-1, -0.7, 0, 0.5, 1];
-      using _a = np.array(vals);
+      const vals = [-1, -0.7, 0, 0.5, 1].map(Math.fround);
+      using _a = np.array(vals, { dtype: np.float32 });
       using _asin = np.asin(_a);
       using _acos = np.acos(_a);
       const asinvals: number[] = _asin.js();
       const acosvals: number[] = _acos.js();
       for (let i = 0; i < vals.length; i++) {
-        expect(asinvals[i]).toBeCloseTo(Math.asin(vals[i]), 5);
-        expect(acosvals[i]).toBeCloseTo(Math.acos(vals[i]), 5);
+        const expectedAsin = Math.asin(vals[i]);
+        // WGSL asin: worse of 6.81e-5 absolute and inherited atan2(x,sqrt(1-x*x)).
+        // For this corpus's non-endpoints, |x| <= 0.7 and 1-x*x >= 0.51:
+        // square/subtract/sqrt perturb the angle by < 8*epsilon; atan2 adds 4096 ULP.
+        // Endpoints and zero retain finite-value smoke checks, not a general conformance claim.
+        const asinError =
+          Math.max(6.81e-5, 4096 * float32Ulp(expectedAsin)) + 8 * F32_EPSILON;
+        expectTrigClose(_asin, asinvals[i], expectedAsin, asinError);
+        // Our acos is pi/2 - asin, not a native acos: <= 0.5 ULP constant error
+        // plus <= 1 ULP subtraction over [0,pi] is < 3*epsilon absolute.
+        expectTrigClose(
+          _acos,
+          acosvals[i],
+          Math.acos(vals[i]),
+          asinError + 3 * F32_EPSILON,
+        );
       }
     });
 
@@ -2497,12 +2601,19 @@ await deviceSuite((device) => {
       // Test all four quadrants and special cases with various values
       const y = [3, 5, -7, -2, 4, -6, 0, 0, 1.5, -2.5];
       const x = [4, -2, -3, 8, 0, 0, 5, -9, 1.5, -2.5];
-      using _ya = np.array(y);
-      using _xa = np.array(x);
+      using _ya = np.array(y, { dtype: np.float32 });
+      using _xa = np.array(x, { dtype: np.float32 });
       using _r = np.atan2(_ya, _xa);
       const result: number[] = _r.js();
       for (let i = 0; i < y.length; i++) {
-        expect(result[i]).toBeCloseTo(Math.atan2(y[i], x[i]), 5);
+        const expected = Math.atan2(y[i], x[i]);
+        // Our atan2 is 2*atan(q). For these moderate inputs, no branch subtracts
+        // nearly equal positive values: squares/add/sqrt contribute < 7*epsilon
+        // relative error to r, r+|x| < 9*epsilon, and q < 14*epsilon.
+        // Since |d(2*atan(q))/d(log |q|)| <= 1, < 16*epsilon covers propagation;
+        // scaling atan's 4096-ULP error by 2 is exact. Axis cases remain smoke checks.
+        const error = 2 * 4096 * float32Ulp(expected / 2) + 16 * F32_EPSILON;
+        expectTrigClose(_r, result[i], expected, error);
       }
     });
   });

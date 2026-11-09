@@ -317,7 +317,7 @@ debt (**D**) and process gaps (**P**).
 | R21 | Uncaptured WebGPU errors are only `console.error`ed, never fail a test. Example: `profileGpu()` creates a timestamp QuerySet of 8192 (`_MAX_PROFILING_PASSES = 4096` × 2, from `b478a38`) against the 4096 limit, so every profiling session submits invalid GPU work while the conv dispatch-count tests that use it pass; the agent docs claim a 2048-pass cap. Fixed in phase 0: every test runs inside WebGPU error scopes; every device gets an `uncapturederror` listener at creation, so errors while a test module loads fail its first test and errors after the last test fail the file (review round 2, F2.1: the listener had been attached at the first test); the QuerySet holds 4096 queries (2048 passes)                                                                                                                                                                                                                                                                                                                        | S/D   | 1     |
 | R22 | GPU calibration ran inside `init("webgpu")` (`81c0b10`, `09b9f51`; path tests added in the version-bump commit `2f769e3`): four probes loaded the GPU concurrently for 0.2–0.8 s here, the suspected cause of freezes on a laptop with an AMD GPU. Memory: one calibration adds 135 MiB of GPU memory for ~0.1 s, but because every test file's `init` calibrated and 17 files started at once, the default suite peaked at 2.7 GiB (sustained 0.7–1.4 GiB), against 0.9 GiB peak (~0.2 GiB typical) with calibration opt-in and 4 files at once — enough to overflow a laptop GPU's memory; values differ between runs (rOpt 192 vs 48, barrier factor 20 vs 65, or both dispatch overhead and barrier factor at their clamping floors); no measurable gain (`bench/calibration.bench.ts`: Intel within ±3 %, NVIDIA calibrated up to 1.4× slower). Its tests could not fail: "calibrated >= conservative" accepted 1.5× slower, the cache-key test asserted nothing. Made opt-in with sequential probes in phase 0; keep-or-drop decision open | S/D   | 0, 6  |
 | R23 | `profiler.startTrace()` traces only dispatches made through `pipelineSubmit` (eager ops). JIT programs run by the WebGPU command tape, which encodes its own passes, are never traced: the profiler API arrived from upstream (`397af85`) after the tape existed and was hooked into one path only. README and FEATURES promise per-kernel traces; the detr-resnet-50 demo calls `startTrace()`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | D     | 1     |
-| R24 | GPU accuracy of transcendental functions follows the vendor: WebGPU and WebGL lower `asin`/`acos`/`atan`/`atan2` to the WGSL/GLSL builtins, for which WGSL allows 4096 ULP (f32). Intel exceeds the tests' 5-decimal tolerance (`asin` error 8.6e-5 at x ≈ −0.775, `atan2` 6.5e-6), NVIDIA does not; found by the first full Intel run after the R18 script fix. Decide: own range-reduced implementations (as for `erf`) for vendor-independent accuracy, or per-op GPU tolerances derived from the spec                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | D     | 1     |
+| R24 | Native GPU trig accuracy differs from CPU/WASM libm. Intel exceeded the former 5-decimal value tests (`asin` error 8.6e-5, `atan2` 6.5e-6); NVIDIA did not. The 2026-11-09 human decision is native-accuracy GPU float32 tests, not replacement shader math. Implementation pending review: per-operation WGSL budgets, with propagated arithmetic error for the library's `acos` and `atan2` compositions; WebGL uses the same budget as policy, not a GLSL guarantee. CPU/WASM and other-dtype requirements stay unchanged. See Phase 1 item 9                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | D     | 1     |
 | R25 | Opening the website homepage auto-ran a matmul benchmark sized by GPU vendor string (2048² for any AMD GPU, `f9746cc`) with 8 matmuls per submission (`f702fb1`): 184 ms (fp32) and 521 ms (fp16) per submission on the Intel iGPU here, longer on weaker GPUs, during which a GPU that drives the display cannot update it. With calibration in `init` (R22), the likely cause of the reported freeze of a laptop with an AMD GPU on just opening the website. Its `Promise.race` timeout stopped waiting but not the benchmark, so the fp16 run could overlap a still-running fp32 run; each run leaked 32 MiB of GPU memory. Fixed in phase 0. `/bench/results` still starts its benchmarks when opened (phase 1, item 11)                                                                                                                                                                                                                                                                                                                    | S/D   | 0, 1  |
 | R26 | `bench/tts.bench.ts` (`74a8e11`) never ran: `// @ts-nocheck` and `/* eslint-disable */` hid that its model builders index the single `Array` returned by `random.split()` as `keys[0]`, which is `undefined`, so building the model threw. Its loops also discarded the KV caches each jitted layer returns (~3 MB of GPU memory per iteration) and every PRNG key and pre-`astype` array. Deleted in the vitest 5 migration; a replacement should drive the website's model code (`website/src/routes/tts/pocket-tts.ts`) with random weights instead of a 600-line copy                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | S     | 1     |
 | R27 | The JIT compile cache key (backend, jaxpr hash, calibration values) left out module state that changes the compiled program. `_setConvRewriteEnabled(false)` reused programs compiled with the rewrite on, so the conv2d "C.3 block_map vs generic-dot" benchmark ran generic-dot in both arms (it also called `clearCaches()` while collecting, before anything ran); fixed in the vitest 5 migration with a regression test. Still open: `_skipForiRewrite`, set while compiling nested bodies, so a jaxpr first compiled as a body is reused at top level without the foriLoop rewrite                                                                                                                                                                                                                                                                                                                                                                                                                                                        | D     | 3     |
@@ -533,6 +533,10 @@ sign off Phase 1.
 
 ### Phase 1 — Ground truth: CI and test integrity (R9, R13, R16, R18–R21, R23, R24, R26)
 
+[Partial review round 1](remediation/reviews/phase-1-partial-1.md) passes for `3a2aaea..0b3c72a`:
+local gates and setup integrity are verified, hosted CI remains unverified, and Phase 1 is not
+signed off. The review's four Intel R24 failures are the baseline for item 9 below.
+
 1. Add a GitHub Actions workflow running `pnpm install`, `pnpm build`, `pnpm check`, `pnpm lint`,
    `pnpm test` (non-GPU) on every push and PR, including pushes to `wasm-multithreading`. GPU suites
    stay local: add a pre-push hook that runs the full default suite and the full suite of the
@@ -543,27 +547,27 @@ sign off Phase 1.
    pre-push hook runs `test:push`: full default suite, then full GPU suites through
    `scripts/gpu-test.sh`. The human chose **all detected supported GPUs**, not just the preferred
    one, and an explicit CPU/WASM-only fallback when none is detected. GPU failures are not
-   suppressed; Intel R24 therefore still blocks pushes here. Local validation: CPU/WASM 2265 passed
-   / 1071 skipped; default 3322 passed / 14 skipped; NVIDIA 3375 passed / 14 skipped; Intel 3371
-   passed / 14 skipped / 4 unchanged R24 failures. The real push gate ran all three local suites and
-   exited 1 on Intel. Five push-gate tests cover multi-GPU selection, required backend enforcement,
-   failure propagation, CPU-only fallback and a terminated runner. Ready for independent review; no
+   suppressed; Intel R24 blocked pushes at this point. Local validation: CPU/WASM 2265 passed / 1071
+   skipped; default 3322 passed / 14 skipped; NVIDIA 3375 passed / 14 skipped; Intel 3371 passed /
+   14 skipped / 4 unchanged R24 failures. The real push gate ran all three local suites and exited 1
+   on Intel. Five push-gate tests cover multi-GPU selection, required backend enforcement, failure
+   propagation, CPU-only fallback and a terminated runner. Verified by partial review round 1; no
    GitHub CI run is claimed yet.
 2. Make the setup honest (R16): the website's `prepare` script must fail when `svelte-kit sync`
    fails instead of `|| echo ''`; give `bench/` a `tsconfig` that does not type-check against a
    stale `dist/`, or build first in `pnpm check`; move `repro-stub`/`debug-wgsl` out of `test/`.
-   Implementation ready for review: remove the sync suppression and resolve the root package to
-   `src/index.ts` in the existing TypeScript paths, matching the auxiliary packages' source aliases.
-   No separate bench config or prerequisite build is needed for type-checking. A compiler file-list
-   check includes benchmarks and reads zero workspace `dist/` declarations. Real website prepare and
-   type-check pass; an intentional sync failure exits 73 with the new recipe, while the old
-   suppressed recipe exits 0. Preserve the diagnostic's assertions rather than move them outside the
-   gates: all six `repro-stub` cases (N=65,128,200, both directions, m=5) now use the existing
-   associative-scan regression body. The two N=65 cases were duplicates. No tolerance changed; the
-   pre-commit GPU list runs the consolidated test instead of the deleted diagnostic. `debug-wgsl`
-   was already absent; remove its stale exclusion. Default suite: 3326 passed / 14 skipped;
-   associative-scan file: all 65 passed on each GPU. This is implementation evidence, not phase
-   sign-off.
+   Implementation verified by partial review round 1: remove the sync suppression and resolve the
+   root package to `src/index.ts` in the existing TypeScript paths, matching the auxiliary packages'
+   source aliases. No separate bench config or prerequisite build is needed for type-checking. A
+   compiler file-list check includes benchmarks and reads zero workspace `dist/` declarations. Real
+   website prepare and type-check pass; an intentional sync failure exits 73 with the new recipe,
+   while the old suppressed recipe exits 0. Preserve the diagnostic's assertions rather than move
+   them outside the gates: all six `repro-stub` cases (N=65,128,200, both directions, m=5) now use
+   the existing associative-scan regression body. The two N=65 cases were duplicates. No tolerance
+   changed; the pre-commit GPU list runs the consolidated test instead of the deleted diagnostic.
+   `debug-wgsl` was already absent; remove its stale exclusion. Default suite: 3326 passed / 14
+   skipped; associative-scan file: all 65 passed on each GPU. This is implementation evidence, not
+   phase sign-off.
 3. Make missing backends loud (R18). Done in phase 0, item 8.
 4. Fix the five failures the skips had hidden (R19). Done in phase 0, item 6.
 5. Decouple backend initialization (R20): one backend's failure must not affect another's; add a
@@ -580,8 +584,34 @@ sign off Phase 1.
 8. Add a **steady-state leak mode** to `checkLeaks`: run the body twice and require zero slot growth
    on the second run _without_ flushing JIT caches. This catches the class of leak that `aa85998`
    hid, while tolerating warm caches.
-9. Decide R24 (own implementations vs spec-derived tolerances for GPU transcendentals); until then
-   the four Intel failures stay visible.
+9. Decide R24 (own implementations vs spec-derived tolerances for GPU transcendentals). **Human
+   decision, 2026-11-09:** accept native GPU float32 accuracy, following
+   [WebNN #914](https://github.com/webmachinelearning/webnn/issues/914). Implementation pending
+   review: `sin`/`cos` tests use WGSL's `2^-11` absolute bound only inside `[-pi,pi]`; `atan` uses
+   4096 ULP of the reference value. The current WGSL `asin` bound is the worse of `6.81e-5` absolute
+   and inherited `atan2(x,sqrt(1-x*x))` error, not simply 4096 ULP. For the existing corpus's
+   non-endpoint values (`|x| <= 0.7`, `1-x*x >= 0.51`), `8*epsilon` covers the inherited
+   expression's arithmetic perturbation of the angle; add its 4096-ULP `atan2` error. The library's
+   `acos = pi/2 - asin` adds less than `3*epsilon` absolute from constant/subtraction rounding. Here
+   `epsilon = 2^-23`. The library's `atan2 = 2*atan(q)` doubles the native atan error. For the
+   existing moderate finite corpus, squares/add/sqrt perturb `r` by less than `7*epsilon`
+   relatively, forming `r+|x|` by less than `9*epsilon`, and reciprocal/multiply produce `q` with
+   less than `14*epsilon` relative error. Since the half-angle formula's sensitivity to relative `q`
+   error is at most 1, `16*epsilon` bounds the propagated absolute angle error. Endpoints, axis
+   values and infinity retain compatibility smoke assertions without claiming general WGSL
+   guarantees. New tangent tests propagate `sin/cos` error and reciprocal/multiply rounding only for
+   `|cos(x)| >= 0.5` on all devices. An exploratory WASM float32 sample at `x=-1.5` differed by
+   `9.08e-6` at an output of `-14.1014`; no WASM threshold was relaxed to accommodate it. WebGL
+   adopts the same budget by project policy; GLSL ES leaves trig accuracy unspecified. Boundary
+   controls require rejection above the allowed error and of NaN, and verify that CPU/WASM and
+   non-f32 metadata still use the original 5-decimal requirement. Runtime lowering, skips,
+   float16/float64 and gradient thresholds are unchanged. See
+   [accuracy notes](FEATURES.md#gpu-float32-trigonometric-accuracy). Local validation: the former
+   four Intel failures reproduce before the change. The updated focused trig/control selection
+   passes all 29 selected tests on each GPU. CPU/WASM full suite: 2270 passed / 1079 skipped. The
+   real `test:push` gate now exits 0: default 3335 passed / 14 skipped; NVIDIA and Intel each 3382
+   passed / 14 skipped, with WebGPU/WebGL required. Type-check and targeted lint pass. These are
+   implementation claims for independent review, not a Phase 1 sign-off or evidence of hosted CI.
 10. Re-derive FD tolerances: run gradient checks in f64 on CPU/WASM with tight tolerances; for f32
     WebGPU, derive tolerances from the problem's conditioning and document the derivation inline.
 11. Website pages start GPU work only when the visitor asks (R25, remainder): `/bench/results`,

@@ -510,8 +510,9 @@ The Checks workflow runs on every push and pull request, including feature branc
 dependencies and Chromium, builds, type-checks, lints, tests the lint plugin and push gate, and runs
 the full CPU/WASM browser suite. Chromium's GPU and software rasterizer are disabled for this
 profile; test setup requires CPU/WASM and rejects initialized GPU backends. Browser APIs such as
-OPFS and workers remain available. GPU correctness stays in the local gates. The four known Intel
-R24 accuracy failures remain visible and currently block pre-push on machines with that GPU.
+OPFS and workers remain available. GPU correctness stays in the local gates.
+[GPU float32 trig tests use native-accuracy budgets](FEATURES.md#gpu-float32-trigonometric-accuracy),
+not CPU/WASM's tighter decimal-place requirements; no GPU failures are suppressed.
 
 ### Local check workflow
 

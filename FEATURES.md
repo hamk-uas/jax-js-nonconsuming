@@ -120,6 +120,33 @@ possible._
 Most operations behave the same way as they do in JAX.
 [API docs](https://hamk-uas.github.io/jax-js-nonconsuming/docs/modules/_jax-js_jax.numpy.html).
 
+### GPU float32 trigonometric accuracy
+
+GPU trig operations use native shader math, not vendor-independent libm accuracy. Following the
+[WebNN accuracy discussion](https://github.com/webmachinelearning/webnn/issues/914), float32 WebGPU
+value tests use [WGSL's per-operation bounds](https://www.w3.org/TR/WGSL/#concrete-float-accuracy):
+
+- `sin` and `cos`: absolute error at most `2^-11` for inputs in `[-pi, pi]`. There is no native
+  accuracy guarantee outside that interval; this library does not add range reduction.
+- `atan`: 4096 ULP of the mathematical result, not a fixed number of decimal places.
+- `asin`: the worse of `6.81e-5` absolute error and the error inherited from
+  `atan2(x, sqrt(1 - x*x))`. Its test budget includes that expression's arithmetic error.
+- `tan`, `acos` and `atan2` are library compositions (`sin/cos`, `pi/2 - asin` and a doubled
+  half-angle `atan`, respectively). Their tests propagate the constituent error bounds and float32
+  rounding, rather than treating them as native builtins.
+
+The composed-function budgets are derived for the test inputs, not universal error guarantees: the
+tangent corpus requires `|cos(x)| >= 0.5`, and inverse-trig tests avoid ill-conditioned interior
+inputs. Existing axis, endpoint and infinity checks remain compatibility smoke tests, not claims
+that WGSL guarantees every special case. Near poles, domain boundaries, overflow and subnormal
+inputs require separate analysis.
+
+WebGL float32 tests use the same native-accuracy budget as a project policy.
+[GLSL ES 3.00 section 4.5.1](https://registry.khronos.org/OpenGL/specs/es/3.0/GLSL_ES_Specification_3.00.pdf)
+leaves trigonometric precision unspecified, so this is not a GLSL guarantee. CPU/WASM tests retain
+their tighter requirements; float16, float64 and autodiff tolerances are unchanged. No runtime
+implementation or API changed.
+
 | API                   | Support | Notes                                                    |
 | --------------------- | ------- | -------------------------------------------------------- |
 | `ndarray.at`          | ⚪️      | Python-specific                                          |
