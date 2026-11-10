@@ -1,9 +1,11 @@
 # Remediation Plan: Restoring Architectural Integrity
 
 **Status:** in progress — phase 0 done 2026-11-08
-([sign-off](remediation/reviews/phase-0-3.md#human-sign-off)) · **Branch audited:**
-`wasm-multithreading` @ `fe2c9cc` plus the uncommitted June work found in the working tree ·
-**Scope:** all fork commits 2026-02-07 → 2026-04-10
+([sign-off](remediation/reviews/phase-0-3.md#human-sign-off)); phase 1 incomplete;
+[round 6](remediation/reviews/phase-1-partial-6.md#sign-off) accepts the steady-state API fix,
+committed as `58fe24f`; 1A readiness still requires hosted CI and independent sign-off · **Branch
+audited:** `wasm-multithreading` @ `fe2c9cc` plus the uncommitted June work found in the working
+tree · **Scope:** all fork commits 2026-02-07 → 2026-04-10
 
 This document is deliberately public. It records (1) an audit of the commit history looking for the
 point where AI-agent commits started optimizing for short-term, superficial task completion instead
@@ -39,25 +41,42 @@ fixing too.
 
 See the plot and numbers in [§3.6](#36-quantitative-view-rework-indexed-by-work-not-time).
 
-**Current state.** `HEAD` (`fe2c9cc`) builds and type-checks. Its default suite reported 2226 passed
-/ 1070 skipped / 4 failed, but that run **did not exercise WebGPU or WebGL**: the browser-test
-config pointed Chromium at an X display it could not use, so both backends failed to initialize and
-every device-parameterized WebGPU/WebGL case was silently skipped (R18). The 4 failures were website
-tests that failed only because the audit worktree lacked a generated `.svelte-kit/`. After the
-config fix (2026-11-08, Phase 0), the default suite runs 3310 passed / 13 skipped / 5 failed: two
-deterministic WebGPU failures and three that fail only under full-suite load. Both GPU suites now
-run headless. At the end of phase 0 the default suite runs 3316 passed / 14 skipped / 0 failed, the
-NVIDIA suite 3369 passed, and the Intel suite 3365 passed / 4 failed (GPU transcendental accuracy,
-R24); a backend that fails to initialize, or a WebGPU error, now fails the run instead of being
-skipped or logged. The uncommitted June work, reconstructed in full (see §3.5), builds and passed
-the then-default suite (2287 passed / 1072 skipped / 0 failed, also without WebGPU/WebGL), but has
-14 type errors in tests and benches. It is preserved as a patch in
-[remediation/quarantine/](remediation/quarantine/) and is no longer in the working tree.
+**Audit baseline.** `fe2c9cc` builds and type-checks. Its default suite reported 2226 passed / 1070
+skipped / 4 failed, but that run **did not exercise WebGPU or WebGL**: the browser-test config
+pointed Chromium at an X display it could not use, so both backends failed to initialize and every
+device-parameterized WebGPU/WebGL case was silently skipped (R18). The 4 failures were website tests
+that failed only because the audit worktree lacked a generated `.svelte-kit/`. After the config fix
+(2026-11-08, Phase 0), the default suite runs 3310 passed / 13 skipped / 5 failed: two deterministic
+WebGPU failures and three that fail only under full-suite load. Both GPU suites now run headless. At
+the end of phase 0 the default suite runs 3316 passed / 14 skipped / 0 failed, the NVIDIA suite 3369
+passed, and the Intel suite 3365 passed / 4 failed (GPU transcendental accuracy, R24); a backend
+that fails to initialize, or a WebGPU error, now fails the run instead of being skipped or logged.
+The uncommitted June work, reconstructed in full (see §3.5), builds and passed the then-default
+suite (2287 passed / 1072 skipped / 0 failed, also without WebGPU/WebGL), but has 14 type errors in
+tests and benches. It is preserved as a patch in [remediation/quarantine/](remediation/quarantine/)
+and is no longer in the working tree.
 
-**What needs reimplementation (not patching):** ownership internals that depend on tracing context,
-library-level algorithm selection, and the WASM multithreading control plane. **What needs
-verify-or-delete:** the effect system's `Consume` half, the quarantined async/workspace work, and
-documentation that has drifted from the code.
+**Recovery direction, revised 2026-11-09:** continue from the remediation branch, not a wholesale
+rollback. The sampled pre-sprint (`db578f4`, February 20) and pre-WIP (`c6e414b`, March 19) source
+snapshots already contain tracing-dependent disposal and special-case constant ownership. Neither is
+a demonstrated clean architectural baseline; these snapshots were inspected, not retested. Keep the
+stronger test harness and verified fixes, and replace unsound ownership mechanisms in bounded
+slices. Reconsider a much earlier restart only with an explicit decision to reduce the supported
+feature set and evidence from the same regression cases on the proposed baseline.
+
+**Assessment at `0891af9`.** Source type-check and the full default suite pass (3406 passed / 18
+skipped); the two leak-check files pass on both NVIDIA and Intel (75 passed / 4 skipped each). Full
+GPU suites were last verified in [round 4](remediation/reviews/phase-1-partial-4.md).
+[Round 5](remediation/reviews/phase-1-partial-5.md) still rejects item 8's structural-thenable
+typing; no hosted workflow runs were returned for `wasm-multithreading` at this assessment. These
+results support retaining the foundation, not declaring the architecture sound. This plan revision
+signs off no implementation or phase.
+
+**What needs reimplementation (not patching):** ownership internals that depend on tracing context
+and library-level algorithm selection. **Contain first:** WASM multithreading stays gated to its
+verified contexts; new async execution and workspace leasing are not required to finish remediation.
+**What needs verify-or-delete:** the effect system's `Consume` half, the quarantined async/workspace
+work, and documentation that has drifted from the code.
 
 ---
 
@@ -283,9 +302,6 @@ What the numbers say, and what they do not:
 5. The quarantined June work adds 1,292 non-test source lines and redoes only 15 recent ones. Its
    problems are design choices and an uncommittable test setup, not churn.
 
-Re-run the script after each remediation phase. Corrective share and follow-ups per change should
-fall, and the line ratio should stay low without long flat stretches of unrevisited code.
-
 ---
 
 ## 4. Debt register
@@ -333,7 +349,8 @@ These restate the AEP in checkable form; each phase's exit criteria are derived 
 
 1. **Capability over checkboxes.** A milestone closes only with a test that fails without the
    change, running on the runtime the feature targets. "Pre-existing" or "no changes needed" closes
-   nothing.
+   nothing. File sizes, symbol counts and grep results are inspection aids, not architectural
+   acceptance criteria.
 2. **One ownership semantics.** No disposal decision may depend on `insideAbstractTrace()`,
    `inMakeJaxprBody()`, or any other tracing flag. `jit()` must not change ownership.
 3. **Fail loudly.** No `catch` that converts an ownership error into "continue". If a handle can be
@@ -358,7 +375,20 @@ These restate the AEP in checkable form; each phase's exit criteria are derived 
 
 ## 6. Plan
 
-Dependency order: **0 → 1 → {2 → 3, 4, 5, 6} → 7**; phase 8 starts alongside phase 0.
+**Critical path:** **0 → 1A (ownership readiness) → 2A (first ownership slice and review) → 2B
+(remaining ownership) → 3**. Phase 1B retains the remaining test-integrity work and may run
+alongside phase 2 after 1A passes. Phases 5–6 may also proceed after 1A, but must not displace the
+ownership milestone. Phase 7 follows phases 2–3; phase 8 starts alongside phase 0.
+
+Phase 4 defaults to containment and review of the existing worker implementation, not expanding
+runtime support. Any expansion waits for the reviewed ownership contract and its own ADR. No new
+performance project, general-purpose diagnostic framework or broad module split is a prerequisite
+for the first ownership slice.
+
+This is a sequencing change requested by the maintainer after the recovery assessment, not a
+deferral or sign-off of unresolved findings. **1A is a readiness gate, not completion of phase 1.**
+Phase 1B remains required before final remediation sign-off. The existing numbered phase 1 items are
+retained below so prior reviews remain traceable.
 
 **Branches.** All remediation work happens on `wasm-multithreading` until the whole plan is done;
 nothing goes to `main` before that (the human's decision, 2026-11-08). Later phases branch from it
@@ -391,7 +421,8 @@ can also edit, review turns into more coding.
 
 **When.** At the end of every phase; after each ADR (phases 2 and 4); before every release and every
 merge to `main`; and within phases 2, 4 and 7 after each guard family or module is done, so a review
-never covers more than a few days of work. Not per commit.
+never covers more than a few days of work. Also review the 1A readiness gate and the 2A checkpoint
+before dependent implementation begins. Not per commit.
 
 **Who.** A fresh agent session with no editing role, e.g. a read-only review agent type, or a
 session instructed not to modify tracked files. Prefer a different model from the implementer to
@@ -541,8 +572,31 @@ The separate accuracy plan remains outside remediation.
 
 [Round 4](remediation/reviews/phase-1-partial-4.md) verifies the item 7 cleanup and item 10 QR
 checks in `9b880b5..e42a033`, but rejects item 8 for async typing, cross-realm promise sequencing,
-and opposite backend deltas canceling. The implementation response below is ready for re-review, not
-a sign-off; Phase 1 remains incomplete.
+and opposite backend deltas canceling. [Round 5](remediation/reviews/phase-1-partial-5.md) reviews
+`9a19712..ea88cbf`: F2–F4 are signed off, but F1 remains open for ordinary structural thenables.
+Item 8 and phase 1 are not signed off.
+
+[Round 6](remediation/reviews/phase-1-partial-6.md) accepts the always-async fix and the 1A scope of
+item 8, conditional on committing the reviewed snapshot. It also accepts the 1A/1B and 2A/2B
+sequencing. It does not sign off 1A or phase 1. The first-slice audit below is a subsequent
+implementation-session assessment, not part of that review. The accepted fix and unchanged review
+were committed as `58fe24f` on 2026-11-10; that commit satisfies the review's commit condition.
+
+#### Sequencing: 1A readiness and 1B completion
+
+| Scope        | 1A: required before ownership implementation                                                                              | 1B: still required, not a blocker for starting phase 2                                                                          |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Items 1–5, 9 | Reviewed setup, enforced backends/errors, local full-suite gates and a green hosted CI run for the readiness commit       | Maintain these gates throughout subsequent work                                                                                 |
+| Item 6       | Preserve GPU error enforcement and accepted regular tape tracing                                                          | Complete specialized scan/block-map/scatter-add/copy tracing                                                                    |
+| Items 7, 10  | Audit skips, tolerances and timeouts affecting the selected ownership slice; establish usable numerical assertions for it | Complete the suite-wide inventory, issue links, FD derivations and benchmark relocation                                         |
+| Item 8       | Resolve round 5 F1 and retain the existing cross-area steady-state checks with caches intact                              | Integrate steady-state coverage into the remaining per-area suites; phase 2 adds its own path-specific cases before each change |
+| Items 11–12  | Not ownership prerequisites                                                                                               | Website opt-in work and TTS benchmark restoration; website work must precede public deployment of the affected page             |
+
+Do not treat a green slot-count smoke test as an ownership proof. Phase 2 must additionally test
+alias lifetime, retained-reference release and failure cleanup. New unsupported cases are not
+silently moved to 1B: a missing oracle for the selected slice blocks that slice.
+
+#### Item register and implementation evidence
 
 1. Add a GitHub Actions workflow running `pnpm install`, `pnpm build`, `pnpm check`, `pnpm lint`,
    `pnpm test` (non-GPU) on every push and PR, including pushes to `wasm-multithreading`. GPU suites
@@ -631,8 +685,8 @@ a sign-off; Phase 1 remains incomplete.
    GPU suites with `testTimeout: 300000`; they belong in `bench/`.
 8. Add a **steady-state leak mode** to `checkLeaks`: run the body twice and require zero slot growth
    on the second run _without_ flushing JIT caches. This catches the class of leak that `aa85998`
-   hid, while tolerating warm caches. **Implementation (round 4 fixes pending re-review):**
-   `checkLeaks.steadyState(body)` (sync or async) runs `body` once to warm up, then again, and
+   hid, while tolerating warm caches. **Implementation (F1 response awaiting review):**
+   `await checkLeaks.steadyState(body)` runs a sync or async `body` once to warm up, then again, and
    reports any slot-count change of the second run with caches left intact; it does not touch an
    active `start()`/`stop()` session. `test/steady-state-leaks.test.ts` applies it on every device
    to linalg (cholesky, qr, lu, triangularSolve, jit), scan (eager, jit, jit∘grad), foriLoop (eager,
@@ -640,18 +694,39 @@ a sign-off; Phase 1 remains incomplete.
    jit∘vmap∘grad): 48 passed, 4 skipped (no routines on WebGL; round 4 F4 corrects the former count
    of 44). `check-leaks.test.ts` proves the mode catches a per-run leak, a leak into an unflushed
    cache (a fresh `jit` per run, which `stop()` would free), and awaits async bodies. No leak was
-   found in those areas. Not yet applied to the existing per-area test files. **Round 4 response
-   (F1-F3):** infer the return type from the callback's result, including non-void async and
-   possibly async callbacks; await promises and thenables independently of their realm before
-   measuring or reporting; sum absolute per-backend slot changes, preserving signed deltas in the
-   summary, so allocations and releases cannot cancel. The last change also makes a decrease a
-   positive non-steady result rather than a negative `leaked` value. Focused regressions reproduce
-   the original type errors, premature cross-realm completion and cancellation, and cover mixed
-   sync/async runs, ignored sync results, thenables, rejection in either run and a decrease-only
-   body. The two leak-check files pass 53 tests / 26 skipped on CPU/WASM and 75 / 4 skipped on each
-   of NVIDIA and Intel; build, source type-check and targeted lint pass. The full default suite
-   passes 3406 tests / 18 skipped across 92 files. See the [migration notes](FEATURES.md) for
-   updated result types and report semantics. Existing per-area suite integration remains open.
+   found in these sampled cases; this is not comprehensive coverage of those areas. Not yet applied
+   to the existing per-area test files. **Round 4 response (F1-F3):** infer the return type from the
+   callback's result, including non-void async and possibly async callbacks; await promises and
+   thenables independently of their realm before measuring or reporting; sum absolute per-backend
+   slot changes, preserving signed deltas in the summary, so allocations and releases cannot cancel.
+   The last change also makes a decrease a positive non-steady result rather than a negative
+   `leaked` value. Focused regressions reproduce the original type errors, premature cross-realm
+   completion and cancellation, and cover mixed sync/async runs, ignored sync results, thenables,
+   rejection in either run and a decrease-only body. The two leak-check files pass 53 tests / 26
+   skipped on CPU/WASM and 75 / 4 skipped on each of NVIDIA and Intel; build, source type-check and
+   targeted lint pass. The full default suite passes 3406 tests / 18 skipped across 92 files. See
+   the [migration notes](FEATURES.md) for updated result types and report semantics. **Round 5
+   disposition:** cross-realm sequencing, backend-delta reporting and the coverage count are
+   verified fixed. A structural thenable whose `then` returns `void` still receives a synchronous
+   report type despite being awaited at runtime in the reviewed implementation. **Implementation
+   response, 2026-11-09 (not sign-off):** replace conditional return typing and manual thenable
+   detection with one `async` function returning `Promise<LeakReport>` and sequential `await body()`
+   calls. All callers now await it, including synchronous bodies; throws from either run reject the
+   promise. Public migration notes cover result types, error handling and shared-resource lifetime.
+   Structural thenables whose `then` returns `void`, mixed sync/thenable runs and callbacks typed as
+   `() => void` have type regressions. Against the old source the updated tests produce six type
+   errors and three runtime failures; all pass with the new source. Build/check/lint and formatting
+   pass. Focused CPU/WASM: 59 passed / 26 skipped; each GPU: 81 passed / 4 skipped. Full CPU/WASM:
+   2287 passed / 1143 skipped. The real local push gate passes: default 3412 passed / 18 skipped,
+   NVIDIA and Intel each 3462 passed / 18 skipped. See the
+   [implementation response](remediation/reviews/phase-1-partial-5.md#implementation-response-2026-11-09)
+   for scope and limitations. Independent re-review and hosted CI remain open; this is not 1A or
+   phase 1 completion. **Round 6:** the response is accepted and committed as reviewed in `58fe24f`.
+   The review report's 1A table incorrectly assigns 48 passed / 4 skipped to the per-area file in
+   CPU-only mode: that file has 26 passed / 26 skipped there (the combined two-file CPU count is
+   correctly reported as 59 passed / 26 skipped). The report is preserved unchanged; this count
+   clarification does not extend its sign-off. Existing per-area suite integration remains open
+   under 1B.
 9. Decide R24 (own implementations vs spec-derived tolerances for GPU transcendentals). **Human
    decision, 2026-11-09:** accept native GPU float32 accuracy, following
    [WebNN #914](https://github.com/webmachinelearning/webnn/issues/914). Implementation verified by
@@ -700,32 +775,163 @@ suite also gains three tape-tracing regressions. No existing test, tolerance, ti
 requirement was weakened. Hosted CI and phase exit criteria remain unverified or unmet as recorded
 above; no phase sign-off is inferred.
 
-**Exit:** CI green on `wasm-multithreading`; default suite and both GPU suites green with required
-backends enforced; every skip/tolerance/timeout has a reason and issue; steady-state leak mode
-enabled for linalg, scan, foriLoop and transform tests.
+**1A exit (independent readiness review required):** round 5 F1 resolved with type and runtime
+regressions; build/check/lint, default suite and both full GPU suites green with required backends
+enforced; hosted CPU/WASM CI green for the readiness commit (record the run URL and SHA); existing
+cross-area steady-state checks green without cache flushing; the first ownership slice named, with
+its relevant test gaps and oracle requirements recorded. Previously accepted work is preserved; the
+reviewer checks the readiness scope and carries every 1B item forward explicitly.
+
+**Full phase 1 exit, after 1B:** all numbered items complete or explicitly deferred by review with a
+reason and destination; CI and local gates remain green; every skip/tolerance/timeout has a reason
+and issue; steady-state coverage is integrated into linalg, scan, foriLoop and transform tests. A
+passing 1A report alone must never be recorded as phase 1 completion.
+
+#### First-slice readiness audit (2026-11-10; awaiting review)
+
+**Selected slice:** body-created constant capture, from the builder's retained reference through
+literal inlining, the transient `ClosedJaxpr`, cache-owned retention and final release. The first
+family to replace is **builder-produced constant environments labeled borrowed but disposed as
+owners**, including their `mapJaxpr` aliases and tolerant teardown. The intended deletion is that
+family's reliance on the `UseAfterFreeError` swallow, not a renaming or blanket removal of all
+creation-ref tracking. R4's remaining states and unrelated PE guard families stay in 2B unless the
+reviewed contract proves them inseparable. This is a scope and oracle audit, not the ADR or
+authorization to change ownership semantics.
+
+Current ownership path, inspected against `0891af9` (unchanged by the checker fix):
+
+| Boundary                     | Current owner/transfer/release mechanism                                                                                                                                                       | Requirement for the reviewed contract                                                                                                        |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Concrete creation            | `Array` constructor marks PE/body birth; creator has the initial reference (`src/frontend/array.ts:252–281`)                                                                                   | Distinguish creator-owned values, raw-value temporaries and graph-only intermediates; a JS alias is not automatically another owner          |
+| Capture                      | `getOrMakeConstTracer` takes one same-wrapper `.ref` per builder; raw creation is balanced immediately, body-created arrays may enter `constsNeedingCreationRefBalance` (`jaxpr.ts:1037–1073`) | Captured ownership must survive creator cleanup and be released exactly once, including a failed trace                                       |
+| Build and inline             | `JaxprBuilder.build` constructs a borrowed wrapper; `_inlineLiterals` releases inlined builder refs and passes remaining values onward (`jaxpr.ts:1164–1225`)                                  | Specify transfer of the remaining environment and what happens if inlining/build fails                                                       |
+| Simplification and balancing | `makeJaxpr` snapshots `refCount > 1` before build, balances creation refs, then calls `mapJaxpr`; `mapJaxpr` shares the const array without retaining (`jaxpr.ts:918–919,1901–1960`)           | Define whether the old wrapper transfers or borrows after a map; two wrappers must not imply two owners                                      |
+| Cache handoff                | `buildCachedJaxprArtifact` retains via `OwnedConstEnv` then disposes the transient wrapper; concrete values get independent wrappers, tracers get `.ref` (`jaxpr.ts:945–984`)                  | Preserve independent cache ownership and clean up partially completed retention or handoff on failure                                        |
+| Evaluation and teardown      | `evalJaxpr` borrows inputs, retains pass-through results and cleans intermediates/Lits; JIT wrapper disposal frees cache environments (`jaxpr.ts:774–885,2050–2072`)                           | Disposing a result or one environment must not kill another owner; test successful reuse and error cleanup without relying on cache flushing |
+
+`makeJaxpr` currently restores the tracing flag in a `finally`, but does not put all builder-held
+constants under a corresponding failure cleanup. `OwnedConstEnv.retain` maps retains without
+rollback if a later retain throws. These are inspection-based failure-path risks to characterize,
+not reproduced defects or justification to add broad catches. Nested PE/JVP/cache consumers must be
+included in the ADR before altering the handoff.
+
+**Existing evidence and gaps:**
+
+| Evidence                                                                | What it establishes                                                               | Missing oracle before changing this path                                                                                                            |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ownership-characterization.test.ts`, ClosedJaxpr/nested-builder groups | External refcounts return to baseline; inner disposal leaves a shared const alive | Body-created non-scalar capture, explicit creator cleanup, mapped-environment transfer and two genuinely distinct retained owners                   |
+| Same file, literal and named-owner groups                               | Current balancing states and several scalar/gradient results                      | Assert whether a value was actually inlined versus retained; assert final release rather than only the state name                                   |
+| Same file, cache groups                                                 | Repeated values and cleanup with explicit `clearCaches` or the test harness flush | Steady-state runs with caches intact, then separately asserted final environment teardown                                                           |
+| `jit-cache-const-ownership.test.ts` (3 cases)                           | Nested scan/foriLoop cache clearing does not throw                                | Nonzero/nonuniform numerical results, input survival and exact lifetime checks; two cases use zero initial vectors and none asserts computed values |
+| `steady-state-leaks.test.ts`                                            | Cross-device sampled slot balance with caches intact                              | References retained on an existing live slot, aliases, tracing/evaluation failure and post-failure reuse                                            |
+
+**Skip/tolerance/timeout audit:** neither of the first two files has a skip, an early-return
+coverage escape, a per-test timeout override or a config exclusion. They also have no `deviceSuite`
+or explicit device selection: the default is WASM (`src/backend.ts:146–153`). Thus the observed **79
+passed** under CPU-only, NVIDIA and Intel configs is the same WASM coverage in three launch
+environments, not three-backend ownership verification. New path-specific cases must use
+`deviceSuite` and cover CPU/WASM/WebGPU/WebGL where the operations exist. Default and GPU configs
+currently allow 10 s and 300 s per test respectively; keep the small ownership cases under the
+ordinary 10 s limit rather than relying on the GPU-suite allowance.
+
+Most value assertions use `allclose` defaults (`rtol=1e-5`, `atol=1e-7`); one decimal scan
+recurrence uses `atol=1e-5`. There are no finite-difference checks in these two files. For the new
+capture cases use small exactly representable f32 constants and closed-form add/multiply/gradient
+results, with exact expected values and exact ref/slot deltas; no device-specific tolerance is
+needed. Existing nonlinear or matrix checks retain their current scope, not a new numerical-accuracy
+claim.
+
+The provisional eager-scan case at `ownership-characterization.test.ts:220` only asserts
+`leaked > 0` when the count is already positive. It is not a leak oracle. The nested optimization
+cases at lines 865/888 assert only that magnitudes shrink. Neither may serve as acceptance coverage
+for this slice. The `ClosedJaxpr.dispose() continues after UseAfterFreeError` case deliberately pins
+the old workaround; replace its expected behavior only together with the reviewed ownership
+contract, preserving a test for the underlying alias/cleanup scenario. The two `jit(f)` calls in the
+sequential-cache test deduplicate by function identity and do not prove independent owners.
+
+**Next step after 1A review:** write the ADR and add the missing characterization cases before any
+production ownership edit. The cases must prove creator/borrower/owner distinctions, scalar inlining
+and non-scalar retention, identity outputs, two independent captures, failure cleanup and subsequent
+successful reuse in eager/JIT/grad/nested scan/foriLoop. Use negative controls for each new
+capability; do not convert the vacuous checks into passing tests by weakening their oracle. The
+first-slice test gaps are named, not resolved by this audit.
 
 ### Phase 2 — Ownership: one semantics in eager and traced code (R1–R4)
 
-1. **Characterize first.** For every guarded site in R1, add a test that runs the same user code
-   eagerly, under `jit`, under `grad`, and nested inside `scan`/`foriLoop` bodies, asserting
-   identical results and zero steady-state leaks. These pin behaviour before refactoring.
-2. **ADR: constant capture.** Hypothesis to validate: the guards exist because constant capture
-   during tracing does not take an independent owning handle, so library code cannot know whether
-   disposing an array it created is safe. Proposed contract: capture always retains an independent
-   handle (owned const env), the creator always disposes what it created, and borrowed `ClosedJaxpr`
-   wrappers never dispose consts at all.
-3. Implement the contract, then remove guards one site per commit: the `arange_*` gate, the 11
-   `insideAbstractTrace()` disposal sites, `allowNestedBodyCleanup`.
-4. Remove the `UseAfterFreeError` swallow in `ClosedJaxpr.dispose()` (R2) and the `rc > 0` tolerance
-   in `[Symbol.dispose]` (R3); double-dispose must throw.
-5. Collapse `#creationRefOwner` (R4) to the states that are still needed after step 3 (target:
-   none), and delete the balancing machinery it existed for.
+**Starting facts, not a diagnosis:** `getOrMakeConstTracer` already takes `.ref`.
+[`Array.ref`](src/frontend/array.ts) increments the same wrapper's count and returns that wrapper;
+`retainedHandle` creates a separate wrapper. [`JaxprBuilder.build`](src/frontend/jaxpr.ts) labels
+its result borrowed, yet borrowed `ClosedJaxpr.dispose()` releases constants and suppresses
+`UseAfterFreeError`. Creation-ref balancing and partial-eval cleanup then infer which references
+remain. Adding another `.ref`, renaming borrowed to owned, or replacing every `.ref` with
+`retainedHandle` is not a demonstrated solution; identity-based caches and tracer wrappers also
+depend on these choices.
 
-**Exit:**
+#### 2A — One end-to-end ownership slice
+
+1. **Bound the scope.** Start with body-created constant capture: construction, builder retention,
+   literal inlining, the resulting constant environment, evaluation/cache retention and teardown.
+   Identify one dependent disposal-guard or balancing family to eliminate, including its nested
+   transform consumers. Record the current owners, transfer points and release sites before editing.
+   Preserve unrelated kernels and execution paths.
+2. **Characterize before changing semantics.** Reuse
+   [ownership-characterization.test.ts](test/ownership-characterization.test.ts) and
+   [jit-cache-const-ownership.test.ts](test/jit-cache-const-ownership.test.ts) where appropriate.
+   Cover eager/JIT execution and relevant grad and nested scan/foriLoop compositions, with numerical
+   assertions as well as ownership checks. Include early disposal of a creator's local value after
+   capture, shared constants and aliases, caller inputs surviving result disposal, repeated warm
+   execution without cache flushing, and exceptions during tracing or evaluation followed by
+   cleanup. Run retained values again after another owner is released. Distinguish borrowed access
+   from a genuine second release of an owned handle.
+3. **ADR before implementation.** Specify whether each boundary borrows, retains an independent
+   ownership token or transfers ownership, and give every owned token one release path, including
+   exceptions. Define wrapper identity versus storage identity, literal-inlining releases,
+   environment copying, cache ownership, and interaction with partial evaluation. Borrowed wrappers
+   must not release someone else's ownership. Distinguish graph-only intermediates from concrete
+   resource-owning arrays; the contract is equal user ownership obligations, not identical physical
+   allocations in eager and JIT execution. Review the ADR before implementing it. Keep it under
+   `remediation/` until R29 separates generated docs from hand-written documents.
+4. **Implement and delete together.** Update the chosen ownership path and its dependent callers as
+   a coherent change, then remove the guard/balancing family it makes unnecessary. Do not remove
+   safety checks first and repair the resulting crashes with broader catches or tracing flags.
+   Preserve the non-consuming user API; document any intentional public contract change with
+   deterministic migration mappings and obsolete workaround signatures.
+
+**2A checkpoint, before widening scope:** an independent review verifies the new contract, targeted
+negative controls, full default/dual-GPU regressions and explicit release/error-path assertions.
+Zero slot growth alone is insufficient: extra references to already-live slots can evade it. The
+report names the old guard/state/balancing family actually removed and explains why its replacement
+needs fewer ownership exceptions, rather than merely moving them.
+
+- **Pass:** continue to 2B using the reviewed contract.
+- **Not established:** revise the ADR or replace the bounded subsystem on this branch before
+  extending the change. Do not accumulate more ownership exceptions to obtain a green suite.
+- **Broader restart proposed:** compare candidate baselines using the same characterization cases
+  and state which supported capabilities would be dropped or rebuilt; obtain the maintainer's
+  decision. A failed slice does not authorize resetting history.
+
+There is no arbitrary review-round limit. Repeated failure of the same invariant is a reason to
+change the design, not weaken the invariant or start another large milestone dump.
+
+#### 2B — Extend the proven contract
+
+1. Characterize each remaining guarded family before changing it, then apply the contract and remove
+   the corresponding `arange_*` gate, `insideAbstractTrace()` disposal guards and
+   `allowNestedBodyCleanup`. Review by coherent ownership family, not by isolated guard count.
+2. Remove ownership-error suppression, including broad cleanup catches, and the `rc > 0` tolerance
+   in `[Symbol.dispose]`; genuine double-dispose must throw. Fix ownership transfers before removing
+   these masks, and retain regressions for their original failure cases.
+3. Delete creation-ref balancing and `#creationRefOwner` states made redundant by the contract. Any
+   surviving state must represent a named owner with an explicit transfer/release rule, not an
+   inference from tracing context or a target state-count quota.
+
+**Full phase 2 exit:** the contract covers all R1–R4 paths with no suppressed ownership errors;
 `git grep -nE "(insideAbstractTrace|inMakeJaxprBody)\(\)" -- src/frontend/linearize.ts src/library`
-returns no disposal-related hits; no `catch` of `UseAfterFreeError` in `src/`; characterization and
-steady-state leak tests green; downstream `dlm-js` suite green against a local build _before_ any
-release.
+finds no disposal decisions dependent on tracing context (inspect helpers as well as direct hits);
+characterization, explicit release checks and steady-state tests are green, as are the default and
+both GPU suites. Run the downstream `dlm-js` suite against a local build before release; an
+unavailable downstream checkout is an unverified gate, never a pass. Review and sign-off are still
+required after 2B; passing 2A alone closes no full phase.
 
 ### Phase 3 — Lowering choices belong to the compiler (R5, R27, R28)
 
@@ -746,31 +952,42 @@ This makes semantics depend on how a function is called and scatters cost decisi
 6. Bisect the WebGPU conv slowdown (R28) with the A/B in `bench/conv2d.bench.ts`, then fix the
    block_map conv path or let `evaluateTotalCost` choose between it and generic-dot.
 
-**Exit:**
+**Exit:** library functions no longer choose algorithms by backend or tracing context; numerical and
+ownership contracts are unchanged, and tests assert the intended lowering actually ran.
 `git grep -nE "getBackend\(\)|defaultDevice\(\)|inMakeJaxprBody\(\)|insideTrace\(\)" -- src/library`
-returns nothing; fusion/dispatch-count tests unchanged; linalg benchmarks within noise.
+is an inventory to inspect, not a demand to hide legitimate device access behind helpers.
+Fusion/dispatch-count tests remain green; compare linalg performance on both GPUs and WASM with the
+recorded baseline, investigating regressions beyond measured run-to-run noise.
 
-### Phase 4 — WASM multithreading: design first, then an honest control plane (R7, R8)
+### Phase 4 — WASM multithreading: containment first (R7, R8)
 
 1. **Status truth now:** document in `FEATURES.md` and the plan that the worker pool, orchestrator,
    parallel mega-module and parallel Kogge-Stone run only in worker contexts today; mark them
-   experimental. Keep the `#canSpinWaitWorkers` gate.
-2. **ADR before code:** choose between async completion on the main thread (`Atomics.waitAsync`,
-   pending-work ownership across backends) and running the runtime in a worker. Record why the other
-   was rejected.
-3. Replace the timed-poll worker loop with an explicit control state in the shared control buffer
-   (e.g. a `STATE_CONTROL` that makes the worker return to its event loop on demand), so compute and
-   control use one protocol and there is no 50 ms polling.
-4. Prove the feature on its target: a Playwright test on the browser main thread asserting that
-   worker executions actually happened (a counter), not merely that nothing threw.
+   experimental. Keep the `#canSpinWaitWorkers` gate. Review the existing implementation and fix
+   defects in its supported contexts; containment does not excuse known cleanup or correctness bugs.
+2. **ADR before expansion:** default to retaining the gated implementation and leaving new async
+   execution/workspace leasing outside remediation. Record the supported contexts and limitations.
+   If expansion is explicitly chosen after the ownership contract is reviewed, choose between async
+   main-thread completion (`Atomics.waitAsync`, pending-work ownership across backends) and hosting
+   the runtime in a worker. Record why the alternative was rejected.
+3. For that expansion, replace timed polling with an explicit control protocol (e.g. a
+   `STATE_CONTROL` that returns workers to their event loops on demand), and prove registration,
+   cancellation/failure cleanup and completion ownership rather than restoring the June patch.
+4. Prove the retained feature in its declared worker contexts: assert actual worker execution, not
+   merely successful fallback. Test that the browser main thread retains the non-blocking gate.
+   Claim main-thread parallelism only after a browser test proves worker execution and main-thread
+   responsiveness there; this extra capability is not required for containment.
 5. Node: either a `worker_threads` adapter or an explicit "unsupported" in docs and capability
    detection.
-6. E1 arena stays (committed and tested). E2 workspace leasing is re-implemented only with tests,
-   and only after the ADR, because its lifetime rules depend on the async model.
+6. Preserve E1 arena subject to review of its lifetime rules. E2 workspace leasing stays quarantined
+   unless expansion is chosen; re-implement it only with tests and an accepted ownership/async ADR.
 
-**Exit:** ADR merged; browser-main-thread parallelism test green, or the features remain gated and
-documented as experimental. The phase's review also covers `0f644bc..fe2c9cc`, the multithreading
-commits made before the remediation, which no review has covered (see Branches).
+**Exit:** the reviewer accepts either verified containment with explicit capability limits and
+expansion recorded as post-remediation feature work, or the implemented expansion and its ADR with
+target-runtime tests. In both cases the phase's review covers `0f644bc..fe2c9cc`, the multithreading
+commits made before remediation that no review has covered (see Branches), including actual worker
+execution and cleanup. Gated or unsupported capabilities must not be reported as shipped on the
+browser main thread. The quarantined patch is not promoted wholesale.
 
 ### Phase 5 — Effect system: finish it or delete the unused half (R6)
 
@@ -787,8 +1004,11 @@ commits made before the remediation, which no review has covered (see Branches).
    `docs/architecture/` ADRs; benchmarks and roadmaps move out of agent instructions.
 2. Fix known drift: `recycleBuffers()`, the cache hierarchy table, multithreading status, plan
    status sections.
-3. Add `scripts/check-doc-symbols`: extract back-ticked identifiers from architecture docs and fail
-   if they do not exist in `src/` (with an allowlist). Run it in pre-commit and CI.
+3. Add narrowly scoped checks for documented public exports and referenced file paths, reusing
+   TypeScript/export information where practical. Back-ticked text also contains examples and
+   proposed designs; do not make a blanket identifier regex and a growing allowlist the truth gate.
+   Verify behavioral claims with linked contract tests or executable examples. Run mechanical checks
+   in pre-commit and CI without building a general-purpose documentation framework.
 4. Move test hooks off `src/index.ts` to a `./testing` sub-path export (or reach them through the
    Vitest source alias), so the public API contains only public API.
 5. Decide whether to keep GPU calibration (R22), from `bench/calibration.bench.ts` run on NVIDIA,
@@ -801,7 +1021,9 @@ commits made before the remediation, which no review has covered (see Branches).
 7. Give typedoc an output directory of its own (R29) before item 1 adds hand-written docs, and move
    `docs/array-manipulation-patterns.md` out of the generated tree.
 
-**Exit:** doc-symbol check green in CI; `src/index.ts` exports no underscore-prefixed test hooks.
+**Exit:** targeted documentation checks green in CI; architecture and capability claims match
+reviewed implementation and tests; no internal test hooks on the public entry point, including
+renamed hooks without an underscore. Symbol existence alone does not establish a truthful claim.
 
 ### Phase 7 — Decompose monoliths (R14, R17)
 
@@ -810,13 +1032,20 @@ Only after phases 2–3, so code is not moved while it is being rewritten.
 - `linearize.ts` → partial eval, transpose rules per primitive family, PE cleanup.
 - `jit.ts` → compile, rewrite passes (`conv`, `fori`, `linalg`, `dot`), allocation, execution.
 - `wasm.ts` / `webgpu.ts` → core backend vs scan / assoc-scan / block-map / mega-module dispatch.
-- Pure moves, one module per commit, no behaviour change, suite green at every step. Remove `as any`
-  in code that is touched.
+- Extract cohesive responsibilities behind explicit interfaces, with ownership remaining visible at
+  module boundaries. Do not split files merely to meet a line limit or relocate the same hidden
+  global coupling.
+- Keep mechanical moves separate from behavior or type-safety fixes, suite green at every step.
+  Remove unsafe casts with proper types and guards, not equivalent assertions under another
+  spelling.
 
 This also keeps fork-specific subsystems isolated, which makes upstream syncs (currently via
 cherry-pick plus `upstream-adapt.sh`) cheaper.
 
-**Exit:** no non-generated `src/` file above ~2,000 lines; `as any` count in `src/` decreasing.
+**Exit:** the extracted modules have clear responsibilities and dependencies, preserve behavior, and
+leave each resource's owner and release path identifiable. Review the resulting boundaries and run
+the affected regression suites. Files above ~2,000 lines and remaining unsafe casts are review
+prompts, not pass/fail quotas.
 
 ### Phase 8 — Process guardrails (R11–R13)
 
@@ -827,8 +1056,8 @@ cherry-pick plus `upstream-adapt.sh`) cheaper.
    no more than one release per day without a written reason. A human publishes every release in the
    GitHub web interface; agents only bump, tag, push and supply the release text (in place since
    2026-11-08, see the README's "Creating the GitHub release").
-4. Keep the AEP gate, but complement it with mechanical checks (this plan's exit criteria,
-   doc-symbol check, CI). The hash gate verifies that the protocol was _quoted_, not that it was
+4. Keep the AEP gate, but complement it with mechanical checks (this plan's exit criteria, targeted
+   documentation checks, CI). The hash gate verifies that the protocol was _quoted_, not that it was
    _followed_.
 5. Each phase ends with a review round as defined in
    [Review rounds](#review-rounds-every-significant-milestone), followed by an update of the debt
