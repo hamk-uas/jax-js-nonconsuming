@@ -81,18 +81,27 @@ functions.
 | `scatterAdd`         | 🟢      | scatter-add with autodiff (JVP, transpose, vmap)               |
 | `withBatch`          | 🟢      | batch GPU dispatches into single queue.submit()                |
 
-`checkLeaks.steadyState(body)` runs `body` twice sequentially, leaving JIT caches intact.
-Synchronous bodies return a `LeakReport`; promises and thenables from any realm are awaited, with
-their resolved values ignored. Possibly asynchronous bodies return
-`LeakReport | Promise<LeakReport>`. Its `leaked` field sums absolute per-backend slot-count changes
-in the second run, including releases; zero means every backend is unchanged. The summary retains
-each backend's signed delta.
+`await checkLeaks.steadyState(body)` runs `body` twice sequentially, leaving JIT caches intact. It
+always returns `Promise<LeakReport>`, even for synchronous bodies. Promises and thenables from any
+realm are awaited, with their resolved values ignored; a synchronous throw or asynchronous rejection
+from either run rejects the returned promise. Its `leaked` field sums absolute per-backend
+slot-count changes in the second run, including releases; zero means every backend is unchanged. The
+summary retains each backend's signed delta. Await the report before disposing resources shared by
+the two runs or ending an enclosing `start()`/`stop()` session; do not overlap the measurement with
+other allocations or disposals on the same backends.
 
-**Migration:** `const report: LeakReport = checkLeaks.steadyState(async () => value)` becomes
-`const report = await checkLeaks.steadyState(async () => value)`. Delete adapters that discard an
-async body's result solely to satisfy the former `Promise<void>` overload, and cross-realm promise
-normalization wrappers used solely for this API. Backend-specific checks used to avoid cancellation
-can become one `steadyState` call; do not interpret `leaked` as a signed net delta.
+**Migration:** `const report = checkLeaks.steadyState(body)` becomes
+`const report = await checkLeaks.steadyState(body)` for **every** callback, including synchronous
+ones. Propagate `async`/`await` through calling helpers and tests; helpers returning a report now
+return `Promise<LeakReport>`, not `LeakReport` or a union. To catch a synchronous body error, use
+`try { await checkLeaks.steadyState(body); } catch (error) { ... }` rather than calling without
+`await` inside the `try`.
+
+Delete sync/async result-discrimination branches, `Promise.resolve` wrappers around the checker,
+adapters that discard callback results solely for the former `Promise<void>` overload, and
+cross-realm promise normalization wrappers used solely for this API. Backend-specific checks used to
+avoid cancellation can become one awaited `steadyState` call; do not interpret `leaked` as a signed
+net delta.
 
 Array primitives need to be called with methods like `a.add(b)` / `a.mul(b)` instead of `a + b` and
 `a * b` as in Python, which has overloading.

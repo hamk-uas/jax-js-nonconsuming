@@ -26,8 +26,8 @@ import { expect, suite, test } from "vitest";
 
 import { deviceSuite } from "./device-suite.js";
 
-function expectSteady(body: () => void) {
-  const report = checkLeaks.steadyState(body);
+async function expectSteady(body: () => unknown) {
+  const report = await checkLeaks.steadyState(body);
   expect(report.leaked, report.summary).toBe(0);
 }
 
@@ -35,9 +35,9 @@ await deviceSuite((device) => {
   suite("linalg", () => {
     const hasRoutines = device !== "webgl";
 
-    test("cholesky, eager and under grad", ({ skip }) => {
+    test("cholesky, eager and under grad", async ({ skip }) => {
       if (!hasRoutines) skip();
-      expectSteady(() => {
+      await expectSteady(() => {
         using A = np.array([
           [4, 1],
           [1, 3],
@@ -53,9 +53,9 @@ await deviceSuite((device) => {
       });
     });
 
-    test("qr, eager and under jvp", ({ skip }) => {
+    test("qr, eager and under jvp", async ({ skip }) => {
       if (!hasRoutines) skip();
-      expectSteady(() => {
+      await expectSteady(() => {
         using A = np.array([
           [3, 1],
           [1, 4],
@@ -74,9 +74,9 @@ await deviceSuite((device) => {
       });
     });
 
-    test("lu and triangularSolve", ({ skip }) => {
+    test("lu and triangularSolve", async ({ skip }) => {
       if (!hasRoutines) skip();
-      expectSteady(() => {
+      await expectSteady(() => {
         using A = np.array([
           [4, 3],
           [6, 3],
@@ -98,13 +98,13 @@ await deviceSuite((device) => {
       });
     });
 
-    test("jit(cholesky solve)", ({ skip }) => {
+    test("jit(cholesky solve)", async ({ skip }) => {
       if (!hasRoutines) skip();
       using f = jit((a: np.Array) => {
         using l = lax.linalg.cholesky(a);
         return l.sum();
       });
-      expectSteady(() => {
+      await expectSteady(() => {
         using A = np.array([
           [4, 1],
           [1, 3],
@@ -121,8 +121,8 @@ await deviceSuite((device) => {
       return [next, next];
     };
 
-    test("eager scan", () => {
-      expectSteady(() => {
+    test("eager scan", async () => {
+      await expectSteady(() => {
         using init = np.array([0.0]);
         using xs = np.array([[1.0], [2.0], [3.0]]);
         const [c, ys] = lax.scan(step, init, xs);
@@ -132,13 +132,13 @@ await deviceSuite((device) => {
       });
     });
 
-    test("jit of scan", () => {
+    test("jit of scan", async () => {
       using f = jit((init: np.Array, xs: np.Array) => {
         const [c, ys] = lax.scan(step, init, xs);
         ys.dispose();
         return c;
       });
-      expectSteady(() => {
+      await expectSteady(() => {
         using init = np.array([0.0]);
         using xs = np.array([[1.0], [2.0], [3.0]]);
         using c = f(init, xs);
@@ -146,7 +146,7 @@ await deviceSuite((device) => {
       });
     });
 
-    test("jit of grad of scan", () => {
+    test("jit of grad of scan", async () => {
       using f = jit(
         grad((xs: np.Array) => {
           using init = np.array([0.0]);
@@ -155,7 +155,7 @@ await deviceSuite((device) => {
           return c.sum();
         }),
       );
-      expectSteady(() => {
+      await expectSteady(() => {
         using xs = np.array([[1.0], [2.0], [3.0]]);
         using g = f(xs);
         g.js();
@@ -164,8 +164,8 @@ await deviceSuite((device) => {
   });
 
   suite("foriLoop", () => {
-    test("eager foriLoop", () => {
-      expectSteady(() => {
+    test("eager foriLoop", async () => {
+      await expectSteady(() => {
         using init = np.array([0.0, 1.0]);
         using r = lax.foriLoop(
           0,
@@ -177,7 +177,7 @@ await deviceSuite((device) => {
       });
     });
 
-    test("jit of foriLoop", () => {
+    test("jit of foriLoop", async () => {
       using f = jit((init: np.Array) =>
         lax.foriLoop(
           0,
@@ -186,14 +186,14 @@ await deviceSuite((device) => {
           init,
         ),
       );
-      expectSteady(() => {
+      await expectSteady(() => {
         using init = np.array([0.0, 1.0]);
         using r = f(init);
         r.js();
       });
     });
 
-    test("grad of foriLoop", () => {
+    test("grad of foriLoop", async () => {
       const g = grad((x: np.Array) =>
         lax
           .foriLoop(
@@ -204,7 +204,7 @@ await deviceSuite((device) => {
           )
           .sum(),
       );
-      expectSteady(() => {
+      await expectSteady(() => {
         using x = np.array([1.5, 2.0]);
         using r = g(x);
         r.js();
@@ -215,8 +215,8 @@ await deviceSuite((device) => {
   suite("transforms", () => {
     const fn = (x: np.Array) => np.sin(x).mul(x).sum();
 
-    test("grad, valueAndGrad, hessian, jacfwd", () => {
-      expectSteady(() => {
+    test("grad, valueAndGrad, hessian, jacfwd", async () => {
+      await expectSteady(() => {
         using x = np.array([0.5, 1.5]);
         using g = grad(fn)(x);
         const [v, g2] = valueAndGrad(fn)(x);
@@ -230,8 +230,8 @@ await deviceSuite((device) => {
       });
     });
 
-    test("jvp, vjp, linearize", () => {
-      expectSteady(() => {
+    test("jvp, vjp, linearize", async () => {
+      await expectSteady(() => {
         using x = np.array([0.5, 1.5]);
         using t = np.ones([2]);
         const [y, dy] = jvp(fn, [x], [t]);
@@ -250,10 +250,10 @@ await deviceSuite((device) => {
       });
     });
 
-    test("jit(vmap(grad)) and jit(grad)", () => {
+    test("jit(vmap(grad)) and jit(grad)", async () => {
       using f = jit(vmap(grad((x: np.Array) => np.sin(x).sum())));
       using h = jit(grad(fn));
-      expectSteady(() => {
+      await expectSteady(() => {
         using xs = np.array([
           [0.5, 1.5],
           [1.0, 2.0],

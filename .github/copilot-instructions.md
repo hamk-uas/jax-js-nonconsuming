@@ -276,9 +276,10 @@ readbacks. Sequential readback of N outputs costs ~12ms × N; parallel costs ~12
 
 **Leak detection:** `checkLeaks.start()` / `checkLeaks.stop()` — snapshots slot counts, tracks
 creations. Used in `test/setup.ts` to wrap every test. `stop()` flushes JIT caches before counting,
-so it cannot see a leak into a cache. `checkLeaks.steadyState(body)` runs `body` twice and requires
-the second run to leave the slot count unchanged with caches intact
-(`test/steady-state-leaks.test.ts` covers linalg, scan, foriLoop and transforms).
+so it cannot see a leak into a cache. `await checkLeaks.steadyState(body)` runs `body` twice and
+requires the second run to leave the slot count unchanged with caches intact
+(`test/steady-state-leaks.test.ts` covers linalg, scan, foriLoop and transforms). Always await it,
+even for a synchronous body, before releasing shared resources or calling `stop()`.
 
 **JIT cache hierarchy:**
 

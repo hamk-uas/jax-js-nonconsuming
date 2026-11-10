@@ -129,3 +129,72 @@ No new deferral is approved. No churn tooling or statistics were run or updated.
 F2, F3 and F4 are signed off for `9a19712..ea88cbf`. F1 remains open for structural thenable typing,
 so **item 8 and phase 1 are not signed off**. Round 4's acceptance of the item 7 cleanup and item 10
 QR checks is unchanged. This report is left uncommitted for the implementation session.
+
+---
+
+## Implementation response (2026-11-09)
+
+**Implementation claims for re-review, not reviewer findings or sign-off.** Base: `0891af9`; the
+response is in the working tree, not yet committed. The maintainer-requested plan revision is also
+uncommitted. The original review above is unchanged.
+
+### F1: one completion contract
+
+`checkLeaks.steadyState(body)` now always returns `Promise<LeakReport>`. A single `async` function
+awaits warm-up, snapshots backend slot counts, awaits measurement, and reports the delta. This
+deletes both the conditional result type and manual callable-`then` detection. Native await
+semantics handle structural thenables and foreign promises without equating their runtime behavior
+with TypeScript's stricter `PromiseLike` interface.
+
+All repository callers now await the result, including the per-area helper and its test callbacks.
+Synchronous throws from either run now reject the promise rather than escaping the call.
+[FEATURES.md](../../FEATURES.md) and API/agent documentation describe this intentional change:
+`const report = checkLeaks.steadyState(body)` becomes
+`const report = await checkLeaks.steadyState(body)`, helper result types become
+`Promise<LeakReport>`, and error handlers await inside `try`. Async ownership propagates through
+callers so shared resources and the enclosing leak session outlive both runs.
+
+The migration also identifies obsolete sync/async discrimination, `Promise.resolve` wrappers and
+callback-result adapters. Cache handling, active-session behavior and per-backend delta semantics
+are unchanged.
+
+### Regression evidence
+
+Before changing the checker source, ran the updated API tests against the implementation at
+`0891af9`:
+
+- `pnpm check`: six type assertion failures, including the review's ordinary structural thenable, a
+  union with that thenable, and a callback whose declared `void` return erases its promise.
+- `pnpm run test:cpu test/check-leaks.test.ts --reporter=dot`: 30 passed / 3 failed. The failures
+  are the newly required promise result for a synchronous body and rejected synchronous throws from
+  runs 1 and 2. The structural-thenable regression is a type failure on the old source, not a claim
+  that the old runtime failed to await it.
+
+With the new source, the structural-thenable case verifies sequential starts `[0, 1]`, completion
+count 2, and one leaked CPU slot before cleaning up its retained arrays. The union cases exercise
+both asynchronous warm-up and asynchronous measurement. Existing cross-realm, cache-held leak,
+opposite-backend delta and async-rejection regressions remain intact.
+
+One test-local `no-misused-promises` suppression deliberately creates the erased-`void` callback; it
+models an input TypeScript accepts and is not a production lint relaxation. No skip, tolerance,
+timeout, cache flush or production test hook was added.
+
+### Validation and remaining gates
+
+Validation ran in the current working tree, not a fresh clone:
+
+| Check                                         | Result                                                               |
+| --------------------------------------------- | -------------------------------------------------------------------- |
+| `pnpm build`, `pnpm check`, `pnpm lint`       | Pass                                                                 |
+| Generated ESM/CJS declarations                | Both declare `steadyState(body: () => unknown): Promise<LeakReport>` |
+| Focused leak-check files, CPU/WASM            | 59 passed / 26 skipped                                               |
+| Focused leak-check files, NVIDIA and Intel    | Each 81 passed / 4 skipped                                           |
+| Full `pnpm run test:cpu`                      | 89 files passed / 3 skipped; 2287 tests passed / 1143 skipped        |
+| `pnpm run test:push`, default                 | 92 files passed; 3412 tests passed / 18 skipped                      |
+| Same gate, NVIDIA and Intel                   | Each 101 files passed; 3462 tests passed / 18 skipped                |
+| Touched-file formatting and whitespace checks | Pass                                                                 |
+
+The real local push-gate command exited 0 with WebGPU/WebGL required; it does not push commits. No
+commit, push or hosted CI run is claimed. F1 awaits independent re-review; neither item 8 nor the
+new phase 1A readiness gate is signed off. The remaining readiness requirements and phase 1B work
+are retained in the plan. No phase 2 ownership implementation has begun.

@@ -52,7 +52,7 @@
  * slot counts, for code whose speed matters (benchmarks).
  *
  * **Steady state.** `stop()` flushes JIT caches, so a leak that lands in a
- * cache is freed before counting. `checkLeaks.steadyState(body)` runs `body`
+ * cache is freed before counting. `await checkLeaks.steadyState(body)` runs `body`
  * twice and requires the second run to leave the slot count unchanged with the
  * caches intact; it can run inside a `start()`/`stop()` session.
  *
@@ -681,8 +681,9 @@ export const checkLeaks = {
    * creates, and must not depend on state that differs between runs.
    *
    * Callback results are ignored; promises and thenables from any realm are
-   * awaited before the next run or report. Returns a promise when either run
-   * does. `leaked` sums absolute per-backend changes, so releases cannot
+   * awaited before the next run or report. Always returns a promise, including
+   * for synchronous bodies; a throw or rejection from either run rejects it.
+   * `leaked` sums absolute per-backend changes, so releases cannot
    * cancel allocations on another backend; the summary keeps their signs.
    * It does not touch an active
    * `start()`/`stop()` session, so it can run inside one; the report has no
@@ -736,34 +737,9 @@ function steadyStateReport(
   };
 }
 
-function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
-  return (
-    value !== null &&
-    (typeof value === "object" || typeof value === "function") &&
-    "then" in value &&
-    typeof value.then === "function"
-  );
-}
-
-function steadyState<R>(
-  body: () => R,
-): R extends PromiseLike<unknown>
-  ? Promise<LeakReport>
-  : PromiseLike<unknown> extends R
-    ? LeakReport | Promise<LeakReport>
-    : LeakReport;
-function steadyState(body: () => unknown): LeakReport | Promise<LeakReport> {
-  const warmUp = body();
-  const measure = (): LeakReport | Promise<LeakReport> => {
-    const before = slotCounts();
-    const second = body();
-    return isPromiseLike(second)
-      ? Promise.resolve(second).then(() =>
-          steadyStateReport(before, slotCounts()),
-        )
-      : steadyStateReport(before, slotCounts());
-  };
-  return isPromiseLike(warmUp)
-    ? Promise.resolve(warmUp).then(measure)
-    : measure();
+async function steadyState(body: () => unknown): Promise<LeakReport> {
+  await body();
+  const before = slotCounts();
+  await body();
+  return steadyStateReport(before, slotCounts());
 }
