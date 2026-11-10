@@ -3,9 +3,9 @@
 **Status:** in progress — phase 0 done 2026-11-08
 ([sign-off](remediation/reviews/phase-0-3.md#human-sign-off)); phase 1 incomplete;
 [round 6](remediation/reviews/phase-1-partial-6.md#sign-off) accepts the steady-state API fix,
-committed as `58fe24f`; 1A readiness still requires hosted CI and independent sign-off · **Branch
-audited:** `wasm-multithreading` @ `fe2c9cc` plus the uncommitted June work found in the working
-tree · **Scope:** all fork commits 2026-02-07 → 2026-04-10
+committed as `58fe24f`; hosted CI is green at `4a00f82`, and 1A is ready for independent readiness
+review, not signed off · **Branch audited:** `wasm-multithreading` @ `fe2c9cc` plus the uncommitted
+June work found in the working tree · **Scope:** all fork commits 2026-02-07 → 2026-04-10
 
 This document is deliberately public. It records (1) an audit of the commit history looking for the
 point where AI-agent commits started optimizing for short-term, superficial task completion instead
@@ -613,7 +613,8 @@ silently moved to 1B: a missing oracle for the selected slice blocks that slice.
    14 skipped / 4 unchanged R24 failures. The real push gate ran all three local suites and exited 1
    on Intel. Five push-gate tests cover multi-GPU selection, required backend enforcement, failure
    propagation, CPU-only fallback and a terminated runner. Verified by partial review round 1; no
-   GitHub CI run is claimed yet.
+   GitHub CI run was claimed in that review. **2026-11-10:** hosted CI now passes at `4a00f82`; see
+   the readiness evidence below. This closes the missing-run evidence, not the 1A review gate.
 2. Make the setup honest (R16): the website's `prepare` script must fail when `svelte-kit sync`
    fails instead of `|| echo ''`; give `bench/` a `tsconfig` that does not type-check against a
    stale `dist/`, or build first in `pnpm check`; move `repro-stub`/`debug-wgsl` out of `test/`.
@@ -786,6 +787,27 @@ reviewer checks the readiness scope and carries every 1B item forward explicitly
 reason and destination; CI and local gates remain green; every skip/tolerance/timeout has a reason
 and issue; steady-state coverage is integrated into linalg, scan, foriLoop and transform tests. A
 passing 1A report alone must never be recorded as phase 1 completion.
+
+#### 1A readiness evidence (2026-11-10; ready for review)
+
+The accepted implementation and unchanged round-6 report are committed in `58fe24f`. The plan
+revision and first-slice audit are committed in `4a00f82`. Both are pushed to
+`origin/wasm-multithreading`; `main` and releases are untouched.
+
+| Requirement                             | Evidence                                                                                                                                                                                                      |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hosted checks                           | [Checks run 42759479814](https://github.com/hamk-uas/jax-js-nonconsuming/actions/runs/42759479814), attempt 1, **success** for full SHA `4a00f82e08e40b32fab7ab90537f3f528d549a82`                            |
+| Hosted validation scope                 | Fresh checkout/install, Chromium installation, build, type-check, lint, ESLint-plugin tests, push-gate tests and CPU/WASM suite; CPU/WASM result: **2287 passed / 1143 skipped**, 89 files passed / 3 skipped |
+| Local pre-push gate for the same commit | Default: **3412 passed / 18 skipped**; NVIDIA and Intel: **3462 passed / 18 skipped each**, with WebGPU/WebGL required                                                                                        |
+| Full local CPU/WASM rerun               | **2287 passed / 1143 skipped**, matching hosted CI                                                                                                                                                            |
+| First ownership slice                   | Named and audited below; no production ownership change is included                                                                                                                                           |
+
+This evidence is recorded by the implementation session, not a phase sign-off. The review range
+starts at `0891af9`; round 6 already accepts the checker snapshot now in `58fe24f`. The next review
+must assess the subsequent first-slice/oracle audit, verify the hosted run against its SHA, and
+decide 1A readiness while carrying every 1B requirement forward. Only after a passing readiness
+review may 2A characterization/ADR work proceed; production ownership changes still require ADR
+review.
 
 #### First-slice readiness audit (2026-11-10; awaiting review)
 
